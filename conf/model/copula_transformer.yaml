@@ -1,8 +1,18 @@
-d_model: 256
+# ---------------------------------------------------------------------------
+# Copula Transformer — inter-instance correlation model
+# ---------------------------------------------------------------------------
+
+d_model: 128
 n_heads: 8
-n_layers: 24
-d_ff: null      # null = auto (8/3 * d_model rounded to nearest 64)
-p_max: 20   # pad/truncate features to this size (handles large UCI p)
-d_max: 8       # max target dims; sets dim_enc and mask-token sizes
-rank: 4      # null = auto: max(1, int(sqrt(d_max)))
+
+# Stage counts
+L_col: 3        # column-wise ISA blocks
+L_row: 3        # row-wise transformer blocks
+L_ICL: 12       # ICL transformer blocks
+
+n_inducing: 128  # inducing points in column-wise ISA
+n_cls: 4         # CLS tokens per row (d_ICL = n_cls * d_model = 512)
+
+rank: 4          # copula output rank (W_tilde ∈ R^{N×(rank+1)})
+
 dropout: 0.0
