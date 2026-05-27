@@ -13,6 +13,7 @@ joint distribution are the N query instances themselves.
 
 from __future__ import annotations
 
+import math
 import random
 from typing import Dict
 
@@ -20,16 +21,44 @@ import torch
 from torch import Tensor
 
 # ---------------------------------------------------------------------------
-# GP posterior helper
+# Kernel functions
 # ---------------------------------------------------------------------------
 
 
 def rbf_kernel(X1: Tensor, X2: Tensor, l: float, alpha2: float) -> Tensor:
-    """Compute RBF kernel matrix K(X1, X2) = alpha2 * exp(-||x1-x2||^2 / (2l^2))."""
-    # X1: (n1, d), X2: (n2, d)
     diff = X1.unsqueeze(1) - X2.unsqueeze(0)  # (n1, n2, d)
-    sq_dist = (diff**2).sum(-1)  # (n1, n2)
+    sq_dist = (diff**2).sum(-1)
     return alpha2 * torch.exp(-sq_dist / (2 * l**2))
+
+
+def matern32_kernel(X1: Tensor, X2: Tensor, l: float, alpha2: float) -> Tensor:
+    diff = X1.unsqueeze(1) - X2.unsqueeze(0)  # (n1, n2, d)
+    r = (diff**2).sum(-1).clamp(min=0).sqrt()
+    s = math.sqrt(3) * r / l
+    return alpha2 * (1.0 + s) * torch.exp(-s)
+
+
+def matern52_kernel(X1: Tensor, X2: Tensor, l: float, alpha2: float) -> Tensor:
+    diff = X1.unsqueeze(1) - X2.unsqueeze(0)  # (n1, n2, d)
+    r = (diff**2).sum(-1).clamp(min=0).sqrt()
+    s = math.sqrt(5) * r / l
+    return alpha2 * (1.0 + s + s**2 / 3.0) * torch.exp(-s)
+
+
+def periodic_kernel(
+    X1: Tensor, X2: Tensor, l: float, alpha2: float, period: float
+) -> Tensor:
+    diff = X1.unsqueeze(1) - X2.unsqueeze(0)  # (n1, n2, d)
+    r = (diff**2).sum(-1).clamp(min=0).sqrt()
+    return alpha2 * torch.exp(-2.0 * torch.sin(math.pi * r / period) ** 2 / l**2)
+
+
+_KERNEL_REGISTRY = {
+    "rbf": rbf_kernel,
+    "matern32": matern32_kernel,
+    "matern52": matern52_kernel,
+    "periodic": periodic_kernel,
+}
 
 
 def gp_posterior(
@@ -39,8 +68,10 @@ def gp_posterior(
     l: float,
     alpha2: float,
     noise: float,
+    kernel_fn,
+    kernel_kwargs: dict,
 ) -> tuple[Tensor, Tensor]:
-    """Analytical GP posterior for RBF kernel.
+    """Analytical GP posterior for any stationary kernel.
 
     Returns:
         mu_star   : (N,)   — posterior mean at test points
@@ -48,11 +79,11 @@ def gp_posterior(
     """
     P, N = x_train.shape[0], x_test.shape[0]
 
-    K_ff = rbf_kernel(x_train, x_train, l, alpha2)  # (P, P)
-    K_ff = K_ff + noise * torch.eye(P, device=K_ff.device)  # add noise diagonal
+    K_ff = kernel_fn(x_train, x_train, l, alpha2, **kernel_kwargs)  # (P, P)
+    K_ff = K_ff + noise * torch.eye(P, device=K_ff.device)
 
-    K_sf = rbf_kernel(x_test, x_train, l, alpha2)  # (N, P)
-    K_ss = rbf_kernel(x_test, x_test, l, alpha2)  # (N, N)
+    K_sf = kernel_fn(x_test, x_train, l, alpha2, **kernel_kwargs)  # (N, P)
+    K_ss = kernel_fn(x_test, x_test, l, alpha2, **kernel_kwargs)  # (N, N)
     K_ss = K_ss + noise * torch.eye(N, device=K_ss.device)
 
     # K_ff^{-1} y_train via Cholesky
@@ -88,7 +119,11 @@ def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def generate_gp_task(cfg) -> Dict[str, Tensor]:
-    """Sample one GP task and return a dict of tensors.
+    """Sample one GP task with a randomly chosen kernel family.
+
+    Kernels sampled uniformly from: RBF, Matérn-3/2, Matérn-5/2, Periodic.
+    This creates diverse correlation structures (smooth, rough, oscillatory)
+    that the copula model must learn to capture from features alone.
 
     Keys returned:
         x_norm_train : (P, d_x)  normalised train features
@@ -100,16 +135,22 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         sigma_star   : (N,)      GP posterior marginal std at test points
         n_train      : int       P (as 0-dim tensor)
         n_test       : int       N (as 0-dim tensor)
-        l            : float     kernel length scale (scalar tensor)
-        alpha2       : float     kernel variance (scalar tensor)
-        noise        : float     noise variance (scalar tensor)
+        kernel       : str       kernel family name
     """
     d = cfg.data.d_features
 
-    # 1. Sample GP hyperparameters
+    # 1. Sample kernel family and hyperparameters
+    kernel_name = random.choice(["rbf", "matern32", "matern52", "periodic"])
+    kernel_fn = _KERNEL_REGISTRY[kernel_name]
+
     l = random.uniform(cfg.data.l_min, cfg.data.l_max)
     alpha2 = random.uniform(cfg.data.alpha2_min, cfg.data.alpha2_max)
     noise = random.uniform(cfg.data.noise_min, cfg.data.noise_max)
+
+    kernel_kwargs = {}
+    if kernel_name == "periodic":
+        period = random.uniform(cfg.data.period_min, cfg.data.period_max)
+        kernel_kwargs["period"] = period
 
     # 2. Sample dataset sizes
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
@@ -125,14 +166,12 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 
     # 5. Build kernel and sample y ~ GP(0, K + noise*I) jointly
     x_all = x_norm  # (P+N, d)
-    K_all = rbf_kernel(x_all, x_all, l, alpha2)
+    K_all = kernel_fn(x_all, x_all, l, alpha2, **kernel_kwargs)
     K_all = K_all + noise * torch.eye(P + N)
 
-    # Cholesky sample
     try:
         L_all = torch.linalg.cholesky(K_all)
     except torch.linalg.LinAlgError:
-        # Add extra jitter if needed (rare)
         K_all = K_all + 1e-4 * torch.eye(P + N)
         L_all = torch.linalg.cholesky(K_all)
     y_all = L_all @ torch.randn(P + N)
@@ -145,7 +184,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 
     # 7. Compute GP posterior at test points (for oracle evaluation)
     mu_star, Sigma_star = gp_posterior(
-        x_norm_train, y_train, x_norm_test, l, alpha2, noise
+        x_norm_train, y_train, x_norm_test, l, alpha2, noise, kernel_fn, kernel_kwargs
     )
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
@@ -159,7 +198,5 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "sigma_star": sigma_star,  # (N,)
         "n_train": torch.tensor(P),
         "n_test": torch.tensor(N),
-        "l": torch.tensor(l),
-        "alpha2": torch.tensor(alpha2),
-        "noise": torch.tensor(noise),
+        "kernel": kernel_name,
     }

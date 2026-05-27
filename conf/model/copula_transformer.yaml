@@ -13,6 +13,6 @@ L_ICL: 12       # ICL transformer blocks
 n_inducing: 128  # inducing points in column-wise ISA
 n_cls: 4         # CLS tokens per row (d_ICL = n_cls * d_model = 512)
 
-rank: 4          # copula output rank (W_tilde ∈ R^{N×(rank+1)})
+rank: 32         # copula output rank (W ∈ R^{N×rank}); higher = richer correlation structures
 
-dropout: 0.0
+dropout: 0.1

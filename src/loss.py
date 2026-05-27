@@ -559,33 +559,42 @@ def kl_gaussian(
 
 
 def copula_nll(
-    W_tilde: torch.Tensor,
+    W: torch.Tensor,
     z_test: torch.Tensor,
     test_mask: torch.Tensor,
-    eps: float = 1e-4,
+    eps: float = 0.1,
 ) -> torch.Tensor:
     """Gaussian copula NLL using the Woodbury identity and Matrix Determinant Lemma.
 
-    Correlation matrix:  R_ε = ε I + W_tilde @ W_tilde^T
-    (PSD, approximately unit-diagonal since ||w̃_j|| = 1 → R_ii = ε + 1)
+    Parameterization (W is raw, NOT unit-normalized):
+        R_ε = eps * I + W @ W^T                  (PSD by construction)
+        C   = D^{-1/2} R_ε D^{-1/2}             (proper correlation matrix, C_ii = 1)
+              where D = diag(R_ε) = eps + ||w_i||^2 per row
 
-    Loss (per test instance, averaged over batch):
-        L = 0.5 * (log|R_ε| + z^T R_ε^{-1} z - z^T z) / N
+    Copula NLL:
+        L = 0.5 * (log|C| + z^T C^{-1} z - z^T z) / N
 
-    Complexity: O(N (r+1)²) per task — the Cholesky is on (r+1)×(r+1), not N×N.
+    With z̃ = sqrt(D) ⊙ z (element-wise rescaling):
+        log|C| = log|R_ε| - Σ_i log(R_ε_ii)     (via det lemma on D)
+        z^T C^{-1} z = z̃^T R_ε^{-1} z̃           (Woodbury on R_ε)
+
+    Initialization property: W ≈ 0 → R_ε ≈ eps*I → C ≈ I → L ≈ 0 (independence).
+    No catastrophic 1/eps amplification at init since log|C| → 0 and z̃^T R^{-1} z̃ → z^T z.
+
+    Complexity: O(N r²) per task — Cholesky is on r×r, not N×N.
 
     Args:
-        W_tilde  : (B, N_max, r+1) — unit-row-norm factor from CopulaHead
-        z_test   : (B, N_max)      — test z-scores (0 for padding)
-        test_mask: (B, N_max)      — BoolTensor, True for valid test instances
-        eps      : diagonal jitter (R_ε = eps*I + W W^T)
+        W        : (B, N_max, r) — raw factor from CopulaHead (not unit-normalized)
+        z_test   : (B, N_max)   — test z-scores (0 for padding)
+        test_mask: (B, N_max)   — BoolTensor, True for valid test instances
+        eps      : diagonal regularizer (R_ε = eps*I + W W^T)
 
     Returns:
-        Scalar mean loss.
+        Scalar mean copula NLL over the batch.
     """
-    B, device = W_tilde.shape[0], W_tilde.device
-    r1 = W_tilde.shape[-1]  # r+1
-    eye_r = torch.eye(r1, device=device)
+    B, device = W.shape[0], W.device
+    rank = W.shape[-1]
+    eye_r = torch.eye(rank, device=device)
 
     losses = []
     for b in range(B):
@@ -593,28 +602,37 @@ def copula_nll(
         if N == 0:
             continue
 
-        W = W_tilde[b, :N]  # (N, r+1)
+        Wb = W[b, :N]  # (N, rank)
         z = z_test[b, :N]  # (N,)
 
-        # Capacitance matrix M = I_{r+1} + (1/ε) W^T W     shape (r+1, r+1)
-        M = eye_r + (W.T @ W) / eps
-        L_M = _safe_cholesky(M)  # (r+1, r+1)
+        # Per-row diagonal of R_ε: R_ii = eps + ||w_i||^2
+        R_diag = eps + (Wb * Wb).sum(dim=-1)  # (N,)
 
-        # Matrix Determinant Lemma: log|R_ε| = N log(ε) + log|M|
+        # Rescaled z for the Woodbury quadratic form
+        z_tilde = R_diag.sqrt() * z  # (N,)
+
+        # Capacitance matrix M = I_r + W^T W / eps      shape (r, r)
+        M = eye_r + (Wb.T @ Wb) / eps
+        L_M = _safe_cholesky(M)
+
+        # log|R_ε| = N log(ε) + log|M|   (Matrix Determinant Lemma)
         log_det_M = 2.0 * L_M.diagonal().log().sum()
-        log_det = N * math.log(eps) + log_det_M
+        log_det_R = N * math.log(eps) + log_det_M
 
-        # Woodbury: R_ε^{-1} z = (1/ε)[z - W M^{-1} (W^T z / ε)]
-        WTz = W.T @ z  # (r+1,)
-        v = torch.cholesky_solve((WTz / eps).unsqueeze(-1), L_M).squeeze(-1)  # (r+1,)
-        R_inv_z = (z - W @ v) / eps  # (N,)
+        # log|C| = log|R_ε| - Σ_i log(R_ii)
+        log_det_C = log_det_R - R_diag.log().sum()
 
-        # Copula NLL: 0.5 * (log|R| + z^T R^{-1} z - z^T z) / N
-        loss_b = 0.5 * (log_det + z @ R_inv_z - z @ z) / N
+        # Woodbury: R_ε^{-1} z̃ = (1/ε)[z̃ - W M^{-1} (W^T z̃ / ε)]
+        WTz = Wb.T @ z_tilde  # (rank,)
+        v = torch.cholesky_solve((WTz / eps).unsqueeze(-1), L_M).squeeze(-1)  # (rank,)
+        R_inv_ztilde = (z_tilde - Wb @ v) / eps  # (N,)
+
+        # z^T C^{-1} z = z̃^T R_ε^{-1} z̃
+        loss_b = 0.5 * (log_det_C + z_tilde @ R_inv_ztilde - z @ z) / N
         losses.append(loss_b)
 
     if len(losses) == 0:
-        return W_tilde.sum() * 0.0  # differentiable zero
+        return W.sum() * 0.0  # differentiable zero
 
     return torch.stack(losses).mean()
 

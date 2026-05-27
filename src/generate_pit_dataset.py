@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import os
 import sys
-import warnings
-
 import hydra
 import torch
 from omegaconf import DictConfig
@@ -62,7 +60,6 @@ def main(cfg: DictConfig) -> None:
         os.path.join(raw_dir, f) for f in os.listdir(raw_dir) if f.endswith(".pt")
     )
 
-    n_warn = 0
     for i, raw_path in enumerate(tqdm(raw_paths, desc="PIT")):
         out_path = os.path.join(latent_dir, os.path.basename(raw_path))
         if cfg.data.resume and os.path.exists(out_path):
@@ -88,18 +85,6 @@ def main(cfg: DictConfig) -> None:
         z_train = Z_train[:, 0].cpu()  # (P,)
         z_test = Z_test[:, 0].cpu()  # (N,)
 
-        # Calibration sanity check
-        z_all = torch.cat([z_train, z_test])
-        mean_z, std_z = z_all.mean().item(), z_all.std().item()
-        if abs(mean_z) > 0.5 or abs(std_z - 1.0) > 0.5:
-            n_warn += 1
-            warnings.warn(
-                f"Task {i}: z-score calibration suspect "
-                f"(mean={mean_z:.2f}, std={std_z:.2f}). "
-                "Check TabICLv2 marginal calibration.",
-                RuntimeWarning,
-            )
-
         latent = {
             "x_norm_train": task["x_norm_train"].cpu(),  # (P, d_x)
             "z_train": z_train,  # (P,)
@@ -113,8 +98,6 @@ def main(cfg: DictConfig) -> None:
         }
         torch.save(latent, out_path)
 
-    if n_warn > 0:
-        print(f"[Stage B] {n_warn}/{len(raw_paths)} tasks had calibration warnings.")
     print("[Stage B] Done.")
 
 

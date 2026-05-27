@@ -1,21 +1,26 @@
 """
 model.py — Copula Transformer for inter-instance joint distributions.
 
-Architecture (three stages, then copula head):
+Architecture (four stages, then copula head):
 
-  Stage 0: Input embedding (features + z-score TAE)
   Stage 1: Column-wise ISA (Set Transformer, reused from TabICLv2)
   Stage 2: Row-wise aggregation with CLS tokens + RoPE (reused from TabICLv2)
   Stage 3: ICL transformer — all tokens attend only to train tokens
-  Stage 4: CopulaHead — test embeddings → W_tilde (unit rows)
-             R_ij = w̃_i^T w̃_j   (correlation matrix by construction)
+  Stage 4: CopulaHead — test embeddings → W ∈ R^{N×rank} (raw factor, NOT unit-norm)
 
-The model output is W_tilde ∈ R^{N×(rank+1)}, not the full N×N matrix R.
-The loss function uses W_tilde directly via Woodbury / determinant lemma.
+Correlation matrix parameterization:
+  R_ε = eps * I + W @ W^T          (PSD by construction)
+  C_ij = R_ε_ij / sqrt(R_ε_ii * R_ε_jj)   (proper correlation matrix, C_ii = 1)
+
+Initializing W ≈ 0 gives C ≈ I (independence), so the model starts at the
+trivial copula and learns correlations from there. The loss function
+(copula_nll in loss.py) handles the eps-I + WW^T parameterization directly
+via Woodbury / determinant lemma.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from typing import Dict
@@ -66,13 +71,15 @@ def build_icl_mask(P: int, N: int, device) -> Tensor:
 
 
 class CopulaHead(nn.Module):
-    """Map test token embeddings → unit-norm factor W_tilde.
+    """Map test token embeddings → raw factor W ∈ R^{N×rank}.
 
-    W_tilde ∈ R^{N × (rank+1)} with unit row norms, so that
-        R_ij = w̃_i^T w̃_j
-    is a valid correlation matrix (PSD, unit diagonal).
+    The correlation matrix is NOT computed here — loss.py builds:
+        R_ε = eps * I + W @ W^T
+        C_ij = R_ε_ij / sqrt(R_ε_ii * R_ε_jj)   (proper correlation matrix)
 
-    The model returns W_tilde, NOT the full R matrix.
+    Initializing the last layer near zero means W ≈ 0 at the start of training,
+    which gives C ≈ I (independence copula). The model learns to deviate from
+    independence as training progresses — no positive-correlation bias.
     """
 
     def __init__(self, d_ICL: int, rank: int):
@@ -82,8 +89,8 @@ class CopulaHead(nn.Module):
             nn.GELU(),
             nn.Linear(256, rank),
         )
-        # Small init so W_tilde starts near uniform on the sphere but not degenerate
-        nn.init.normal_(self.mlp[-1].weight, std=0.01)
+        # Tiny init: W ≈ 0 → C ≈ I (independence) at the start of training.
+        nn.init.normal_(self.mlp[-1].weight, std=0.001)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, s_test: Tensor) -> Tensor:
@@ -92,13 +99,10 @@ class CopulaHead(nn.Module):
             s_test : (B, N_max, d_ICL) — test token ICL embeddings
 
         Returns:
-            W_tilde : (B, N_max, rank+1) — unit-row-norm factor
+            W : (B, N_max, rank) — raw (non-normalized) factor matrix.
+                The caller builds C from eps*I + W @ W^T.
         """
-        w = self.mlp(s_test)  # (B, N_max, rank)
-        ones = torch.ones(*w.shape[:-1], 1, device=w.device)  # (B, N_max, 1)
-        w_tilde = torch.cat([ones, w], dim=-1)  # (B, N_max, rank+1)
-        w_tilde = F.normalize(w_tilde, p=2, dim=-1)  # unit row norms
-        return w_tilde
+        return self.mlp(s_test)  # (B, N_max, rank)
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +199,8 @@ class CopulaTransformer(nn.Module):
                 test_mask  : BoolTensor (B, N_max)
 
         Returns:
-            W_tilde : (B, N_max, rank+1) — unit-row-norm factor.
-                      R_ij = W_tilde[b,i] @ W_tilde[b,j]   (for valid i,j)
+            W : (B, N_max, rank) — raw factor (NOT unit-norm).
+                loss.py builds R_ε = eps*I + W @ W^T and normalizes to C.
         """
         x_train = batch["x_train"]  # (B, P_max, d_x)
         z_train = batch["z_train"]  # (B, P_max)
@@ -206,12 +210,19 @@ class CopulaTransformer(nn.Module):
         P_max = x_train.shape[1]
         N_max = x_test.shape[1]
 
-        # Concatenate train + test features for column/row processing
+        # Concatenate train + test features so both get column embeddings in one pass.
+        # embed_with_test=False (explicit): ISAB inducing points attend only to the
+        # first P_max rows (train positions), so test features do not contribute to
+        # the column statistics.  Test tokens receive embeddings shaped by those
+        # train-derived statistics via Stage-2 of ISAB — which is the desired
+        # transductive behaviour: test features are interpreted in the context of
+        # the training column distribution, without influencing that distribution.
         X = torch.cat([x_train, x_test], dim=1)  # (B, T, d_x)
 
         # ---- Stage 1: column-wise ISA ----
-        # y_train = z_train: (B, P_max) passed as regression targets for TAE
-        col_emb = self.col_embedder(X, y_train=z_train)  # (B, T, G+C, d_model)
+        col_emb = self.col_embedder(
+            X, y_train=z_train, embed_with_test=False
+        )  # (B, T, G+C, d_model)
 
         # ---- Stage 2: row-wise interaction ----
         row_repr = self.row_interactor(col_emb)  # (B, T, d_ICL)
@@ -237,9 +248,9 @@ class CopulaTransformer(nn.Module):
 
         # ---- Stage 4: copula head on test tokens only ----
         s_test = s[:, P_max:]  # (B, N_max, d_ICL)
-        W_tilde = self.copula_head(s_test)  # (B, N_max, rank+1)
+        W = self.copula_head(s_test)  # (B, N_max, rank)
 
-        return W_tilde
+        return W
 
 
 # ---------------------------------------------------------------------------

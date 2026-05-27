@@ -15,6 +15,7 @@ training:
   steps: 50000
   lr: 3.0e-4
   lr_min: 1.0e-5
+  weight_decay: 1.0e-2
   warmup_steps: 1000
   clip_grad_norm: 1.0
   log_every: 100
