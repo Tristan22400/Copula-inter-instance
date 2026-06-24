@@ -31,6 +31,8 @@ from typing import Callable, Dict, List, Optional
 import torch
 from torch import Tensor
 
+from loss import _safe_cholesky
+
 # ---------------------------------------------------------------------------
 # Distance helpers
 # ---------------------------------------------------------------------------
@@ -212,7 +214,7 @@ def gp_posterior(
     if not latent:
         K_ss = K_ss + noise * torch.eye(N, device=x_test.device)
 
-    L_ff = torch.linalg.cholesky(K_ff)
+    L_ff = _safe_cholesky(K_ff)
     alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)  # (P,)
 
     mu_star = K_sf @ alpha  # (N,)
@@ -321,19 +323,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     kernel_fn = build_kernel_fn(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
     K_all = kernel_fn(x_k, x_k) + effective_noise * torch.eye(P + N)
 
-    L_all = None
-    for _jitter in (0.0, 1e-4, 1e-3, 1e-2, 1e-1):
-        try:
-            L_all = torch.linalg.cholesky(K_all + _jitter * torch.eye(P + N))
-            break
-        except torch.linalg.LinAlgError:
-            continue
-    if L_all is None:
-        raise RuntimeError(
-            f"Kernel '{kernel_name}' matrix not PD even with jitter=1e-1; "
-            "increase nugget_min or reduce alpha2."
-        )
-    y_all = L_all @ torch.randn(P + N)
+    y_all = _safe_cholesky(K_all) @ torch.randn(P + N)
 
     # 7. Split into train / test (full features returned to model)
     x_norm_train = x_norm[:P]
