@@ -36,11 +36,61 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from dataset import CopulaDataset, collate_fn
-from loss import gp_oracle_y_nll, oracle_copula_nll, y_space_nll
+from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
 
 _MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
+
+
+def _sigma_stats(Sigma: torch.Tensor, mask: torch.Tensor) -> dict:
+    """Cheap off-diagonal and diagonal statistics over a batch of correlation matrices.
+
+    Key diagnostic: if offdiag_mean ≈ 0, the model is outputting near-identity
+    matrices and has not learned any inter-instance correlation structure.
+
+    Args:
+        Sigma : (B, N_max, N_max) float32 — predicted correlation matrices
+        mask  : (B, N_max) bool           — True for valid (non-padded) instances
+
+    Returns dict with float scalars: offdiag_mean, offdiag_std, diag_mean
+    """
+    off_vals, diag_vals = [], []
+    for b in range(Sigma.shape[0]):
+        n = int(mask[b].sum().item())
+        if n < 2:
+            continue
+        S = Sigma[b, :n, :n]
+        ri, ci = torch.triu_indices(n, n, offset=1, device=Sigma.device)
+        off_vals.append(S[ri, ci])
+        diag_vals.append(S.diagonal())
+    if not off_vals:
+        return {"offdiag_mean": 0.0, "offdiag_std": 0.0, "diag_mean": 1.0}
+    off_cat = torch.cat(off_vals)
+    diag_cat = torch.cat(diag_vals)
+    return {
+        "offdiag_mean": off_cat.mean().item(),
+        "offdiag_std":  off_cat.std().item(),
+        "diag_mean":    diag_cat.mean().item(),
+    }
+
+
+def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
+    """MSE, MAE, Pearson r, and signed bias between predicted and oracle off-diagonal values.
+
+    Args:
+        off_pred : 1-D float array — predicted off-diagonal correlations
+        off_ora  : 1-D float array — oracle off-diagonal correlations (same length)
+
+    Returns dict with float scalars: mse, mae, pearson, bias
+    """
+    diff = off_pred - off_ora
+    mse  = float(np.mean(diff ** 2))
+    mae  = float(np.mean(np.abs(diff)))
+    bias = float(np.mean(diff))
+    std_p, std_o = off_pred.std(), off_ora.std()
+    pearson = float(np.corrcoef(off_pred, off_ora)[0, 1]) if (std_p > 1e-12 and std_o > 1e-12) else 0.0
+    return {"mse": mse, "mae": mae, "pearson": pearson, "bias": bias}
 
 
 def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
@@ -113,6 +163,13 @@ def validate(
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
 
     tot, cop, mar, ora, ora_cop, ora_mar, ora_cop_z = [], [], [], [], [], [], []
+    cop_per_task: list[float] = []
+    all_W_norms: list[float] = []
+    all_s_vals: list[float] = []
+    all_sigma_off: list[float] = []
+    all_sigma_diag: list[float] = []
+    all_off_pred_flat: list[np.ndarray] = []
+    all_off_ora_flat: list[np.ndarray] = []
     all_off_pred: list[np.ndarray] = []
     all_off_ora: list[np.ndarray] = []
     plot_episodes: list[dict] = []
@@ -148,6 +205,36 @@ def validate(
         ora_mar.append(oracle_parts["marginal"].item())
         ora_cop_z.append(ora_cop_z_val.item())
 
+        # ---- Per-task diagnostics (unconditional — runs every val step) ----
+        B_cur = Sigma.shape[0]
+        for b in range(B_cur):
+            n = int(batch["test_mask"][b].sum().item())
+            if n < 2:
+                continue
+            S_b = Sigma[b, :n, :n]
+            z_b = batch["z_test"][b, :n].float()
+
+            # Per-task copula NLL (for std across tasks)
+            L_b = _safe_cholesky(S_b)
+            ld_b = 2.0 * L_b.diagonal().log().sum()
+            S_inv_z_b = torch.cholesky_solve(z_b.unsqueeze(-1), L_b).squeeze(-1)
+            cop_b = 0.5 * (ld_b + z_b @ S_inv_z_b - z_b @ z_b) / n
+            cop_per_task.append(cop_b.item())
+
+            # W row-norm and s mean
+            all_W_norms.append(float(out["W"][b, :n].float().norm(dim=-1).mean().item()))
+            all_s_vals.append(float(out["s"][b, :n].float().mean().item()))
+
+            # Sigma off-diagonal and diagonal statistics
+            ri_b, ci_b = torch.triu_indices(n, n, offset=1, device=Sigma.device)
+            all_sigma_off.extend(S_b[ri_b, ci_b].cpu().tolist())
+            all_sigma_diag.extend(S_b.diagonal().cpu().tolist())
+
+            # Off-diagonal vs oracle for correlation quality metrics
+            R_ora_b = batch["R_star"][b, :n, :n].float()
+            all_off_pred_flat.append(S_b[ri_b, ci_b].cpu().numpy())
+            all_off_ora_flat.append(R_ora_b[ri_b, ci_b].cpu().numpy())
+
         # ---- Collect data for plots ----
         if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
             B = Sigma.shape[0]
@@ -167,17 +254,57 @@ def validate(
                         "label": f"ep{batch_idx * B + b}\nN={n}",
                     })
 
+    mean_cop       = sum(cop)     / len(cop)
+    mean_ora_cop_z = sum(ora_cop_z) / len(ora_cop_z)
+
     metrics = {
-        "y_nll_total": sum(tot) / len(tot),
-        "y_nll_copula": sum(cop) / len(cop),
-        "y_nll_marginal": sum(mar) / len(mar),
-        "y_nll_oracle": sum(ora) / len(ora),
-        "y_nll_oracle_copula": sum(ora_cop) / len(ora_cop),
+        "y_nll_total":           sum(tot) / len(tot),
+        "y_nll_copula":          mean_cop,
+        "y_nll_marginal":        sum(mar) / len(mar),
+        "y_nll_oracle":          sum(ora) / len(ora),
+        "y_nll_oracle_copula":   sum(ora_cop) / len(ora_cop),
         "y_nll_oracle_marginal": sum(ora_mar) / len(ora_mar),
-        "y_nll_oracle_copula_z": sum(ora_cop_z) / len(ora_cop_z),
+        "y_nll_oracle_copula_z": mean_ora_cop_z,
     }
     metrics["oracle_gap"] = metrics["y_nll_total"] - metrics["y_nll_oracle"]
-    metrics["copula_gap"] = metrics["y_nll_copula"] - metrics["y_nll_oracle_copula_z"]
+    metrics["copula_gap"] = mean_cop - mean_ora_cop_z
+
+    # Copula improvement fraction: 0 = identity baseline (R=I → NLL=0), 1 = oracle.
+    # Negative means model is worse than outputting identity.
+    metrics["copula_improvement"] = (
+        mean_cop / mean_ora_cop_z if abs(mean_ora_cop_z) > 1e-12 else float("nan")
+    )
+
+    # Per-task copula NLL std — high value means unstable or heterogeneous tasks
+    metrics["y_nll_copula_std"] = float(np.std(cop_per_task)) if cop_per_task else float("nan")
+
+    # Sigma statistics — offdiag_mean ≈ 0 means model outputs near-identity
+    if all_sigma_off:
+        off_arr = np.array(all_sigma_off, dtype=np.float32)
+        metrics["sigma_offdiag_mean"] = float(off_arr.mean())
+        metrics["sigma_offdiag_std"]  = float(off_arr.std())
+        metrics["sigma_offdiag_abs_mean"] = float(np.abs(off_arr).mean())
+    else:
+        metrics["sigma_offdiag_mean"] = metrics["sigma_offdiag_std"] = metrics["sigma_offdiag_abs_mean"] = 0.0
+    metrics["sigma_diag_mean"] = float(np.mean(all_sigma_diag)) if all_sigma_diag else 1.0
+
+    # Model output statistics
+    metrics["W_norm_mean"] = float(np.mean(all_W_norms)) if all_W_norms else 0.0
+    metrics["s_mean"]      = float(np.mean(all_s_vals))  if all_s_vals  else 0.0
+
+    # Correlation quality vs oracle
+    if all_off_pred_flat:
+        off_p_all = np.concatenate(all_off_pred_flat)
+        off_o_all = np.concatenate(all_off_ora_flat)
+        cq = _corr_quality(off_p_all, off_o_all)
+        metrics["corr_mse"]     = cq["mse"]
+        metrics["corr_mae"]     = cq["mae"]
+        metrics["corr_pearson"] = cq["pearson"]
+        metrics["corr_bias"]    = cq["bias"]
+    else:
+        metrics["corr_mse"] = metrics["corr_mae"] = float("nan")
+        metrics["corr_pearson"] = metrics["corr_bias"] = float("nan")
+
     model.train()
 
     plot_figs: list = []
@@ -285,6 +412,8 @@ def main(cfg: DictConfig) -> None:
 
     model.train()
     data_iter = cycle(train_loader)
+    loss_ema: float | None = None
+    _EMA_ALPHA = 0.98
 
     for step in range(t.steps + 1):
         batch = next(data_iter)
@@ -308,31 +437,48 @@ def main(cfg: DictConfig) -> None:
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
             optimizer.step()
+        grad_norm_val = float(grad_norm)
 
         scheduler.step()
 
+        loss_val = loss.item()
+        loss_ema = loss_val if loss_ema is None else _EMA_ALPHA * loss_ema + (1.0 - _EMA_ALPHA) * loss_val
+
         if step % t.log_every == 0:
             lr_now = scheduler.get_last_lr()[0]
+            amp_scale = scaler.get_scale() if scaler is not None else 1.0
+            cop_val = parts["copula"].item()
+            mar_val = parts["marginal"].item()
+            with torch.no_grad():
+                w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
+                sig_stats = _sigma_stats(Sigma, batch["test_mask"])
             wandb.log(
                 {
-                    "train/y_nll_total": loss.item(),
-                    "train/y_nll_copula": parts["copula"].item(),
-                    "train/y_nll_marginal": parts["marginal"].item(),
-                    "train/lr": lr_now,
+                    "train/y_nll_total":        loss_val,
+                    "train/y_nll_copula":       cop_val,
+                    "train/y_nll_marginal":     mar_val,
+                    "train/lr":                 lr_now,
+                    "train/grad_norm":          grad_norm_val,
+                    "train/amp_scale":          amp_scale,
+                    "train/loss_ema":           loss_ema,
+                    "train/W_norm_mean":        w_norm_mean,
+                    "train/sigma_offdiag_mean": sig_stats["offdiag_mean"],
                 },
                 step=step,
             )
             print(
-                f"[{step:6d}] total={loss.item():.4f} "
-                f"cop={parts['copula'].item():.4f} "
-                f"mar={parts['marginal'].item():.4f}  lr={lr_now:.2e}"
+                f"[{step:6d}] loss={loss_val:.4f} "
+                f"(cop={cop_val:.4f} ema={loss_ema:.4f} mar={mar_val:.4f}) "
+                f"| grad={grad_norm_val:.3f} "
+                f"| offdiag={sig_stats['offdiag_mean']:+.4f} "
+                f"| lr={lr_now:.2e}"
             )
 
         if step % t.val_every == 0 and step > 0:
@@ -349,15 +495,20 @@ def main(cfg: DictConfig) -> None:
                 for f in plot_figs:
                     plt.close(f)
             wandb.log(log_dict, step=step)
+            improv = metrics["copula_improvement"]
+            improv_str = f"{improv*100:.1f}%" if math.isfinite(improv) else "n/a"
+            pearson = metrics["corr_pearson"]
+            pearson_str = f"{pearson:.3f}" if math.isfinite(pearson) else "n/a"
             print(
-                f"[{step:6d}] val total={metrics['y_nll_total']:.4f} "
-                f"oracle={metrics['y_nll_oracle']:.4f} "
+                f"[{step:6d}] VAL  "
                 f"gap={metrics['oracle_gap']:.4f}  "
-                f"cop={metrics['y_nll_copula']:.4f} "
-                f"ora_cop_z={metrics['y_nll_oracle_copula_z']:.4f} "
+                f"improv={improv_str}  "
                 f"cop_gap={metrics['copula_gap']:.4f}  "
-                f"ora_cop_y={metrics['y_nll_oracle_copula']:.4f} "
-                f"ora_mar={metrics['y_nll_oracle_marginal']:.4f}"
+                f"corr_r={pearson_str}  "
+                f"corr_mse={metrics['corr_mse']:.4f}  "
+                f"offdiag_mu={metrics['sigma_offdiag_mean']:+.4f}  "
+                f"cop_std={metrics['y_nll_copula_std']:.4f}  "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
         if step % t.save_every == 0 and step > 0:
