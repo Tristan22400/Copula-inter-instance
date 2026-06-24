@@ -1,0 +1,15 @@
+# ---------------------------------------------------------------------------
+# Copula Transformer — feature-extractor architecture
+#
+# Backbone: pretrained TabICL regressor (loaded from HuggingFace by
+# `cfg.tabicl.ckpt`) with its quantile decoder replaced by nn.Identity().
+# Architectural hyperparameters (d_model, n_heads, n_blocks, …) come from
+# the checkpoint config — they are NOT specified here.
+#
+# The backbone is fine-tuned by default — copula correlation prediction is a
+# different task from quantile regression so the features need to adapt.
+# ---------------------------------------------------------------------------
+
+rank: 4                  # low-rank dimension r in W ∈ R^{N×r}
+sigma_jitter: 1.0e-4     # added to diag(Σ) for Cholesky stability
+unfreeze_backbone: true  # train TabICL end-to-end alongside the head

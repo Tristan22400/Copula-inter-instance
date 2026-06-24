@@ -1,0 +1,77 @@
+name: 'test'
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - '*'
+  schedule:
+    # Nightly run at 02:30 UTC, useful for running the tests against the
+    # development branch of upstream dependencies.
+    - cron: "30 2 * * *"
+  # Manual run, useful to manually trigger the dev dependencies tests.
+  workflow_dispatch:
+
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          # Install a specific version of uv.
+          version: "0.5.4"
+      - name: Install hatch
+        run: uv pip install --system hatch
+      - name: Run tests
+        run: hatch test
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v4.5.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: soda-inria/tabicl
+
+  test-dev-deps:
+    # Only run on scheduled builds or manual triggers to avoid causing random
+    # failure in regular CI run on PRs.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.4"
+      - name: Install hatch
+        run: uv pip install --system hatch
+      - name: Install package and dev dependencies
+        run: |
+          uv pip install --system -e ".[all]"
+          uv pip install --system --pre --upgrade \
+            --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple \
+            numpy scipy scikit-learn
+          uv pip install --system --pre --upgrade \
+            --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
+            torch
+      - name: Run tests
+        run: hatch test

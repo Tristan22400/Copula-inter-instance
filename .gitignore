@@ -1,0 +1,9 @@
+wandb/
+outputs/
+results/
+checkpoints/
+data/
+src/__pycache__/
+src/models/__pycache__/
+**/__pycache__/
+*.pyc
