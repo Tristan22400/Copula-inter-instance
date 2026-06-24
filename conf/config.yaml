@@ -23,6 +23,7 @@ training:
   ckpt_dir: ./checkpoints/copula_transformer
   dataset_dir: ./data/pit_episodes_v2
   val_fraction: 0.05   # fraction of episodes held out for validation
+  plot_val_every: 5000  # generate val plots every N steps (0 = never)
 
 tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt

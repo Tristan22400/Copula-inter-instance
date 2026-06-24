@@ -19,6 +19,10 @@ from glob import glob
 from itertools import cycle
 
 import hydra
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
@@ -35,6 +39,50 @@ from dataset import CopulaDataset, collate_fn
 from loss import gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
 
+_MAX_PLOT_EPISODES = 8
+_PLOT_COLLECT_BATCHES = 5
+
+
+def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
+    """2-row × n_ep subplot grid showing oracle (top) vs predicted (bottom) correlation matrices."""
+    n_ep = len(plot_episodes)
+    fig, axes = plt.subplots(2, n_ep, figsize=(max(n_ep * 1.8, 4), 4),
+                             squeeze=False)
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad(color="lightgrey")
+
+    for col, ep in enumerate(plot_episodes):
+        R_pred = ep["R_pred"].copy()
+        R_ora = ep["R_ora"].copy()
+        n = R_pred.shape[0]
+        diag = np.arange(n)
+
+        # Compute per-episode upper-triangle MSE
+        ri, ci = np.triu_indices(n, k=1)
+        mse = float(np.mean((R_pred[ri, ci] - R_ora[ri, ci]) ** 2))
+
+        # Blank diagonal so it doesn't dominate the colour scale
+        R_pred[diag, diag] = np.nan
+        R_ora[diag, diag] = np.nan
+
+        for row, (mat, row_label) in enumerate([(R_ora, "Oracle"), (R_pred, "Pred")]):
+            ax = axes[row, col]
+            im = ax.imshow(mat, cmap=cmap, vmin=-1, vmax=1,
+                           interpolation="nearest", aspect="auto")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if col == 0:
+                ax.set_ylabel(row_label, fontsize=7)
+            if row == 0:
+                ax.set_title(ep["label"], fontsize=6)
+            if row == 1:
+                ax.set_xlabel(f"MSE={mse:.3f}", fontsize=6)
+
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.5, pad=0.02)
+    fig.suptitle(f"step {step} — oracle vs predicted correlations", fontsize=8)
+    fig.tight_layout()
+    return fig
+
 
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
     if step < warmup:
@@ -46,7 +94,14 @@ def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> 
 
 
 @torch.no_grad()
-def validate(model: nn.Module, val_files: list, cfg: DictConfig, device: str) -> dict:
+def validate(
+    model: nn.Module,
+    val_files: list,
+    cfg: DictConfig,
+    device: str,
+    step: int = 0,
+    do_plot: bool = False,
+) -> tuple[dict, list]:
     model.eval()
     val_loader = DataLoader(
         CopulaDataset(file_list=val_files),
@@ -58,7 +113,11 @@ def validate(model: nn.Module, val_files: list, cfg: DictConfig, device: str) ->
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
 
     tot, cop, mar, ora, ora_cop, ora_mar, ora_cop_z = [], [], [], [], [], [], []
-    for batch in val_loader:
+    all_off_pred: list[np.ndarray] = []
+    all_off_ora: list[np.ndarray] = []
+    plot_episodes: list[dict] = []
+
+    for batch_idx, batch in enumerate(val_loader):
         batch = {k: v.to(device) for k, v in batch.items()}
         out = model(batch)
         Sigma = low_rank_correlation(
@@ -89,6 +148,25 @@ def validate(model: nn.Module, val_files: list, cfg: DictConfig, device: str) ->
         ora_mar.append(oracle_parts["marginal"].item())
         ora_cop_z.append(ora_cop_z_val.item())
 
+        # ---- Collect data for plots ----
+        if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
+            B = Sigma.shape[0]
+            for b in range(B):
+                n = int(batch["test_mask"][b].sum())
+                if n < 2:
+                    continue
+                R_pred_b = Sigma[b, :n, :n].float().cpu().numpy()
+                R_ora_b = batch["R_star"][b, :n, :n].float().cpu().numpy()
+                ri, ci = np.triu_indices(n, k=1)
+                all_off_pred.append(R_pred_b[ri, ci])
+                all_off_ora.append(R_ora_b[ri, ci])
+                if len(plot_episodes) < _MAX_PLOT_EPISODES:
+                    plot_episodes.append({
+                        "R_pred": R_pred_b,
+                        "R_ora": R_ora_b,
+                        "label": f"ep{batch_idx * B + b}\nN={n}",
+                    })
+
     metrics = {
         "y_nll_total": sum(tot) / len(tot),
         "y_nll_copula": sum(cop) / len(cop),
@@ -101,7 +179,30 @@ def validate(model: nn.Module, val_files: list, cfg: DictConfig, device: str) ->
     metrics["oracle_gap"] = metrics["y_nll_total"] - metrics["y_nll_oracle"]
     metrics["copula_gap"] = metrics["y_nll_copula"] - metrics["y_nll_oracle_copula_z"]
     model.train()
-    return metrics
+
+    plot_figs: list = []
+    if do_plot:
+        # — 2D hexbin density of off-diagonal correlations —
+        if all_off_pred:
+            off_p = np.concatenate(all_off_pred)
+            off_o = np.concatenate(all_off_ora)
+            lo = min(float(off_o.min()), float(off_p.min()))
+            hi = max(float(off_o.max()), float(off_p.max()))
+            fig_den, ax_den = plt.subplots(figsize=(5, 5))
+            hb = ax_den.hexbin(off_o, off_p, gridsize=60, cmap="YlOrRd", mincnt=1, bins="log")
+            fig_den.colorbar(hb, ax=ax_den, label="log10(count)")
+            ax_den.plot([lo, hi], [lo, hi], "b--", lw=1)
+            ax_den.set_xlabel("Oracle off-diag corr")
+            ax_den.set_ylabel("Predicted off-diag corr")
+            ax_den.set_title(f"step {step} — density ({len(off_p):,} values)")
+            fig_den.tight_layout()
+            plot_figs.append(fig_den)
+
+        # — Oracle vs predicted correlation matrix grid —
+        if plot_episodes:
+            plot_figs.append(_corr_grid_fig(plot_episodes, step))
+
+    return metrics, plot_figs
 
 
 def save_checkpoint(model, optimizer, scheduler, cfg, step: int) -> None:
@@ -235,8 +336,19 @@ def main(cfg: DictConfig) -> None:
             )
 
         if step % t.val_every == 0 and step > 0:
-            metrics = validate(model, val_files, cfg, device)
-            wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=step)
+            plot_val_every = int(t.get("plot_val_every", 5000))
+            do_plot = plot_val_every > 0 and step % plot_val_every == 0
+            metrics, plot_figs = validate(
+                model, val_files, cfg, device, step=step, do_plot=do_plot
+            )
+            log_dict = {f"val/{k}": v for k, v in metrics.items()}
+            if plot_figs:
+                log_dict["val/corr_density"] = wandb.Image(plot_figs[0])
+                if len(plot_figs) > 1:
+                    log_dict["val/corr_grid"] = wandb.Image(plot_figs[1])
+                for f in plot_figs:
+                    plt.close(f)
+            wandb.log(log_dict, step=step)
             print(
                 f"[{step:6d}] val total={metrics['y_nll_total']:.4f} "
                 f"oracle={metrics['y_nll_oracle']:.4f} "
