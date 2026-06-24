@@ -374,7 +374,7 @@ def main(cfg: DictConfig) -> None:
         raise RuntimeError(
             f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first."
         )
-    n_val = max(1, int(len(all_files) * t.val_fraction))
+    n_val = min(49, max(1, int(len(all_files) * t.val_fraction)))
     val_files = all_files[:n_val]
     train_files = all_files[n_val:]
     print(f"Train: {len(train_files)} | Val: {len(val_files)} episodes")
