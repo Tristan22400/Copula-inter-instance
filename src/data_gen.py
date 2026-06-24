@@ -214,7 +214,7 @@ def gp_posterior(
     if not latent:
         K_ss = K_ss + noise * torch.eye(N, device=x_test.device)
 
-    L_ff = _safe_cholesky(K_ff)
+    L_ff = _safe_cholesky(K_ff, max_attempts=12)
     alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)  # (P,)
 
     mu_star = K_sf @ alpha  # (N,)
@@ -283,7 +283,13 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 
     # 2. Sample shared GP hyperparameters
     l = random.uniform(cfg.data.l_min, cfg.data.l_max)
-    alpha2 = random.uniform(cfg.data.alpha2_min, cfg.data.alpha2_max)
+    if kernel_name == "dot_product":
+        a2_min = float(getattr(cfg.data, "dot_product_alpha2_min", -1.0))
+        a2_max = float(getattr(cfg.data, "dot_product_alpha2_max", 1.0))
+    else:
+        a2_min = float(cfg.data.alpha2_min)
+        a2_max = float(cfg.data.alpha2_max)
+    alpha2 = random.uniform(a2_min, a2_max)
 
     # Nugget: single diagonal regulariser ~ U[nugget_min, nugget_max].
     # Replaces the separate noise parameter (the two were always summed anyway).
@@ -320,7 +326,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     kernel_fn = build_kernel_fn(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
     K_all = kernel_fn(x_k, x_k) + nugget * torch.eye(P + N)
 
-    y_all = _safe_cholesky(K_all) @ torch.randn(P + N)
+    y_all = _safe_cholesky(K_all, max_attempts=12) @ torch.randn(P + N)
 
     # 7. Split into train / test (full features returned to model)
     x_norm_train = x_norm[:P]
