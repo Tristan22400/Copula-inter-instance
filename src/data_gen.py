@@ -249,8 +249,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 
     cosine and periodic kernels are capped to k=1 (they are PSD only for scalar inputs).
 
-    A nugget ~ U[nugget_min, nugget_max] is added to the diagonal for guaranteed PSD.
-    Both sampling and GP posterior use effective_noise = noise + nugget.
+    A nugget ~ U[nugget_min, nugget_max] is added to the diagonal for guaranteed PSD
+    and controls posterior tightness (replaces the former separate noise parameter).
 
     Keys returned:
         x_norm_train          : (P, d_features)  normalised train features (full)
@@ -264,8 +264,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         n_test                : int              N (as 0-dim tensor)
         l                     : float            kernel length scale (scalar tensor)
         alpha2                : float            kernel variance / bias (scalar tensor)
-        noise                 : float            observational noise variance (scalar tensor)
-        nugget                : float            diagonal jitter for PSD (scalar tensor)
+        nugget                : float            diagonal regulariser ~ U[nugget_min, nugget_max]
         kernel                : str              name of the kernel used
         period                : float            period param (periodic kernel only, else 0.0)
         rq_alpha              : float            alpha param (rational_quadratic only, else 0.0)
@@ -285,14 +284,12 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # 2. Sample shared GP hyperparameters
     l = random.uniform(cfg.data.l_min, cfg.data.l_max)
     alpha2 = random.uniform(cfg.data.alpha2_min, cfg.data.alpha2_max)
-    noise = random.uniform(cfg.data.noise_min, cfg.data.noise_max)
 
-    # Nugget: random diagonal addition that guarantees PSD for all kernels.
-    # Sampled from cfg.data.nugget_min / nugget_max (default [0.1, 1.0]).
+    # Nugget: single diagonal regulariser ~ U[nugget_min, nugget_max].
+    # Replaces the separate noise parameter (the two were always summed anyway).
     nugget_min = float(getattr(cfg.data, "nugget_min", 0.1))
     nugget_max = float(getattr(cfg.data, "nugget_max", 1.0))
     nugget = random.uniform(nugget_min, nugget_max)
-    effective_noise = noise + nugget  # used for both sampling and GP inference
 
     # 3. Extra hyperparameters for specific kernels
     period: Optional[float] = None
@@ -319,9 +316,9 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_norm = (x_raw - mu_x) / std_x                    # full (P+N, d_features)
     x_k = x_norm[:, kernel_cols]                        # kernel sub-matrix (P+N, k)
 
-    # 6. Build kernel function and sample y ~ GP(0, K + effective_noise·I) jointly
+    # 6. Build kernel function and sample y ~ GP(0, K + nugget·I) jointly
     kernel_fn = build_kernel_fn(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
-    K_all = kernel_fn(x_k, x_k) + effective_noise * torch.eye(P + N)
+    K_all = kernel_fn(x_k, x_k) + nugget * torch.eye(P + N)
 
     y_all = _safe_cholesky(K_all) @ torch.randn(P + N)
 
@@ -337,7 +334,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # latent=True: posterior over f* (no noise in K_ss) so R* reflects kernel
     # correlation structure rather than being diluted by the noise diagonal.
     mu_star, Sigma_star = gp_posterior(
-        x_k_train, y_train, x_k_test, kernel_fn, effective_noise, latent=True
+        x_k_train, y_train, x_k_test, kernel_fn, nugget, latent=True
     )
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
@@ -353,7 +350,6 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "n_test": torch.tensor(N),
         "l": torch.tensor(l),
         "alpha2": torch.tensor(alpha2),
-        "noise": torch.tensor(noise),
         "nugget": torch.tensor(nugget),
         "kernel": kernel_name,
         "period": torch.tensor(period if period is not None else 0.0),
