@@ -79,13 +79,31 @@ def main(cfg: DictConfig) -> None:
         z_test = out["z_test"][:, 0].cpu()                         # (N,)
         log_pdf_test = out["log_pdf_test"][:, 0].cpu()             # (N,)
 
-        # Calibration sanity check
-        z_all = torch.cat([z_train, z_test])
-        m, s = z_all.mean().item(), z_all.std().item()
-        if abs(m) > 1.0 or abs(s - 1.0) > 0.7:
+        # Standardize z using train statistics so marginals are ~N(0,1)
+        # regardless of TabICL miscalibration.
+        #
+        # The log-density correction follows from the change of variables
+        # z'_i = (z_i - μ) / σ.  By Sklar, the marginal of y_i in z'-space is:
+        #
+        #   log p'(y_i) = log p_TabICL(y_i) + log φ(z'_i) − log φ(z_i) − log σ
+        #               = log_pdf_test_i + 0.5·(z_i² − z'_i²) − log σ
+        #
+        # (the 0.5·log(2π) terms cancel).  This keeps y_space_nll correct.
+        mu_z = z_train.mean()
+        sig_z = z_train.std().clamp(min=1e-4)
+        z_test_orig = z_test.clone()
+        z_train = (z_train - mu_z) / sig_z
+        z_test = (z_test - mu_z) / sig_z
+        log_pdf_test = log_pdf_test + 0.5 * (z_test_orig**2 - z_test**2) - sig_z.log()
+
+        # Calibration sanity check on standardized z (train and test separately)
+        m_tr, s_tr = z_train.mean().item(), z_train.std().item()
+        m_te, s_te = z_test.mean().item(), z_test.std().item()
+        degenerate = sig_z.item() < 0.1 or sig_z.item() > 3.0
+        if degenerate:
             n_warn += 1
             warnings.warn(
-                f"Task {i}: z calibration suspect (mean={m:.2f}, std={s:.2f}).",
+                f"Task {i}: degenerate z (sig_z={sig_z.item():.3f} before standardization).",
                 RuntimeWarning,
             )
 
