@@ -21,7 +21,7 @@ training:
   val_every: 500
   save_every: 5000
   ckpt_dir: ./checkpoints/copula_transformer
-  dataset_dir: ./data/pit_episodes_v2
+  dataset_dir: ./data/pit_episodes_cosine
   val_fraction: 0.05   # fraction of episodes held out for validation
 
 tabicl:

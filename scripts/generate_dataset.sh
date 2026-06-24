@@ -10,8 +10,8 @@
 #     mkdir -p logs
 #     oarsub -S ./scripts/generate_dataset.sh
 #
-# Override defaults via extra args, e.g.:
-#     oarsub -S "./scripts/generate_dataset.sh data.n_tasks=5000 tabicl.k_folds=10"
+# Override config values via extra args, e.g.:
+#     oarsub -S "./scripts/generate_dataset.sh data.n_tasks=5000 data.kernel=cosine"
 
 set -euo pipefail
 
@@ -25,23 +25,11 @@ export PYTHONNOUSERSITE=1
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# ----- Defaults (override via CLI args passed to this script) -----
-# The episode schema changed (now carries y_test, log_pdf_test, Sigma_star),
-# so old episodes under ./data/pit_episodes are not compatible. Use a fresh
-# directory for the new dataset by default.
-DEFAULTS=(
-    "data.n_tasks=50000"
-    "data.raw_dir=./data/gp_raw_tasks_v2"
-    "data.latent_dir=./data/pit_episodes_v2"
-    "tabicl.k_folds=10"
-)
-
 echo "[$(date +%H:%M:%S)] OAR job $OAR_JOB_ID — host: $(hostname)"
 echo "[$(date +%H:%M:%S)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
 echo "[$(date +%H:%M:%S)] Generating PIT dataset..."
-echo "    defaults : ${DEFAULTS[*]}"
 echo "    overrides: $*"
 
-python src/generate_pit_dataset.py "${DEFAULTS[@]}" "$@"
+python src/generate_pit_dataset.py "$@"
 
 echo "[$(date +%H:%M:%S)] Generation complete."
