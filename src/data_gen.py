@@ -148,6 +148,20 @@ def build_kernel_fn(
     return lambda X1, X2: fn(X1, X2, **kwargs)
 
 
+def _sample_kernel_cols(d_total: int, cfg) -> List[int]:
+    """Return a sorted list of column indices that the kernel will use.
+
+    k ~ Uniform[d_kernel_min, d_kernel_max]; falls back to all columns when
+    the config keys are absent (backward compat with old episode files).
+    """
+    d_min = int(getattr(cfg.data, "d_kernel_min", d_total))
+    d_max = int(getattr(cfg.data, "d_kernel_max", d_total))
+    d_min = min(d_min, d_total)
+    d_max = min(d_max, d_total)
+    k = random.randint(d_min, d_max)
+    return sorted(random.sample(range(d_total), k))
+
+
 def _resolve_kernel_name(cfg) -> str:
     """Pick which kernel to use for one task based on config."""
     data = cfg.data
@@ -218,27 +232,33 @@ def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
 def generate_gp_task(cfg) -> Dict[str, Tensor]:
     """Sample one GP task and return a dict of tensors.
 
+    The kernel operates on a random subset of k columns (k ~ Uniform[d_kernel_min,
+    d_kernel_max]); the full d_features columns are returned so the model must
+    identify which features drive the correlations.
+
     Keys returned:
-        x_norm_train : (P, d_x)  normalised train features
-        y_train      : (P,)      train targets
-        x_norm_test  : (N, d_x)  normalised test features
-        y_test       : (N,)      test targets
-        R_star       : (N, N)    ground-truth test correlation matrix
-        mu_star      : (N,)      GP posterior mean at test points
-        sigma_star   : (N,)      GP posterior marginal std at test points
-        n_train      : int       P (as 0-dim tensor)
-        n_test       : int       N (as 0-dim tensor)
-        l            : float     kernel length scale (scalar tensor)
-        alpha2       : float     kernel variance / bias (scalar tensor)
-        noise        : float     noise variance (scalar tensor)
-        kernel       : str       name of the kernel used
-        period       : float     period param (periodic kernel only, else 0.0)
-        rq_alpha     : float     alpha param (rational_quadratic only, else 0.0)
+        x_norm_train          : (P, d_features)  normalised train features (full)
+        y_train               : (P,)             train targets
+        x_norm_test           : (N, d_features)  normalised test features (full)
+        y_test                : (N,)             test targets
+        R_star                : (N, N)           ground-truth test correlation matrix
+        mu_star               : (N,)             GP posterior mean at test points
+        sigma_star            : (N,)             GP posterior marginal std at test points
+        n_train               : int              P (as 0-dim tensor)
+        n_test                : int              N (as 0-dim tensor)
+        l                     : float            kernel length scale (scalar tensor)
+        alpha2                : float            kernel variance / bias (scalar tensor)
+        noise                 : float            noise variance (scalar tensor)
+        kernel                : str              name of the kernel used
+        period                : float            period param (periodic kernel only, else 0.0)
+        rq_alpha              : float            alpha param (rational_quadratic only, else 0.0)
+        kernel_feature_indices: (k,)             column indices used by the kernel (metadata)
     """
     d = cfg.data.d_features
 
-    # 1. Choose kernel
+    # 1. Choose kernel and active columns
     kernel_name = _resolve_kernel_name(cfg)
+    kernel_cols = _sample_kernel_cols(d, cfg)
 
     # 2. Sample shared GP hyperparameters
     l = random.uniform(cfg.data.l_min, cfg.data.l_max)
@@ -267,11 +287,12 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_raw = torch.rand(P + N, d) * 10.0 - 5.0
     mu_x = x_raw.mean(0)
     std_x = x_raw.std(0).clamp(min=1e-8)
-    x_norm = (x_raw - mu_x) / std_x
+    x_norm = (x_raw - mu_x) / std_x                    # full (P+N, d_features)
+    x_k = x_norm[:, kernel_cols]                        # kernel sub-matrix (P+N, k)
 
     # 6. Build kernel function and sample y ~ GP(0, K + noise·I) jointly
     kernel_fn = build_kernel_fn(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
-    K_all = kernel_fn(x_norm, x_norm) + noise * torch.eye(P + N)
+    K_all = kernel_fn(x_k, x_k) + noise * torch.eye(P + N)
 
     try:
         L_all = torch.linalg.cholesky(K_all)
@@ -280,22 +301,24 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         L_all = torch.linalg.cholesky(K_all)
     y_all = L_all @ torch.randn(P + N)
 
-    # 7. Split into train / test
+    # 7. Split into train / test (full features returned to model)
     x_norm_train = x_norm[:P]
     y_train = y_all[:P]
     x_norm_test = x_norm[P:]
     y_test = y_all[P:]
 
-    # 8. Compute GP posterior at test points (for oracle evaluation)
+    # 8. Compute GP posterior at test points using kernel-column sub-matrices
+    x_k_train = x_k[:P]
+    x_k_test = x_k[P:]
     mu_star, Sigma_star = gp_posterior(
-        x_norm_train, y_train, x_norm_test, kernel_fn, noise
+        x_k_train, y_train, x_k_test, kernel_fn, noise
     )
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
     return {
-        "x_norm_train": x_norm_train,                           # (P, d_x)
+        "x_norm_train": x_norm_train,                           # (P, d_features)
         "y_train": y_train,                                      # (P,)
-        "x_norm_test": x_norm_test,                             # (N, d_x)
+        "x_norm_test": x_norm_test,                             # (N, d_features)
         "y_test": y_test,                                        # (N,)
         "R_star": R_star,                                        # (N, N)
         "mu_star": mu_star,                                      # (N,)
@@ -308,4 +331,5 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "kernel": kernel_name,
         "period": torch.tensor(period if period is not None else 0.0),
         "rq_alpha": torch.tensor(rq_alpha if rq_alpha is not None else 0.0),
+        "kernel_feature_indices": torch.tensor(kernel_cols, dtype=torch.long),
     }
