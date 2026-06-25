@@ -55,23 +55,18 @@ def _sigma_stats(Sigma: torch.Tensor, mask: torch.Tensor) -> dict:
 
     Returns dict with float scalars: offdiag_mean, offdiag_std, diag_mean
     """
-    off_vals, diag_vals = [], []
-    for b in range(Sigma.shape[0]):
-        n = int(mask[b].sum().item())
-        if n < 2:
-            continue
-        S = Sigma[b, :n, :n]
-        ri, ci = torch.triu_indices(n, n, offset=1, device=Sigma.device)
-        off_vals.append(S[ri, ci])
-        diag_vals.append(S.diagonal())
-    if not off_vals:
+    B, N, _ = Sigma.shape
+    ri, ci = torch.triu_indices(N, N, offset=1, device=Sigma.device)
+    mask_2d = mask.unsqueeze(-1) & mask.unsqueeze(-2)  # (B, N, N)
+    valid_off = mask_2d[:, ri, ci]                     # (B, n_pairs)
+    off_vals = Sigma[:, ri, ci][valid_off]             # flat valid off-diagonal entries
+    diag_vals = Sigma.diagonal(dim1=-2, dim2=-1)[mask] # flat valid diagonal entries
+    if off_vals.numel() == 0:
         return {"offdiag_mean": 0.0, "offdiag_std": 0.0, "diag_mean": 1.0}
-    off_cat = torch.cat(off_vals)
-    diag_cat = torch.cat(diag_vals)
     return {
-        "offdiag_mean": off_cat.mean().item(),
-        "offdiag_std":  off_cat.std().item(),
-        "diag_mean":    diag_cat.mean().item(),
+        "offdiag_mean": off_vals.mean().item(),
+        "offdiag_std":  off_vals.std().item(),
+        "diag_mean":    diag_vals.mean().item(),
     }
 
 
@@ -161,7 +156,9 @@ def validate(
         batch_size=cfg.training.batch_size,
         collate_fn=collate_fn,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
     )
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
 
@@ -209,35 +206,46 @@ def validate(
         ora_mar.append(oracle_parts["marginal"].item())
         ora_cop_z.append(ora_cop_z_val.item())
 
-        # ---- Per-task diagnostics (unconditional — runs every val step) ----
-        B_cur = Sigma.shape[0]
-        for b in range(B_cur):
-            n = int(batch["test_mask"][b].sum().item())
-            if n < 2:
-                continue
-            S_b = Sigma[b, :n, :n]
-            z_b = batch["z_test"][b, :n].float()
+        # ---- Per-task diagnostics (vectorized — no Python loop over batch) ----
+        n_test_cur = batch["test_mask"].sum(-1).float()   # (B,)
+        valid_cur = n_test_cur >= 2
 
-            # Per-task copula NLL (for std across tasks)
-            L_b = _safe_cholesky(S_b)
-            ld_b = 2.0 * L_b.diagonal().log().sum()
-            S_inv_z_b = torch.cholesky_solve(z_b.unsqueeze(-1), L_b).squeeze(-1)
-            cop_b = 0.5 * (ld_b + z_b @ S_inv_z_b - z_b @ z_b) / n
-            cop_per_task.append(cop_b.item())
+        if valid_cur.any():
+            N_cur = Sigma.shape[1]
+            mask_2d_cur = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
+            eye_cur = torch.eye(N_cur, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
+            S_safe_cur = torch.where(mask_2d_cur, Sigma, eye_cur)
+            L_cur, info_cur = torch.linalg.cholesky_ex(S_safe_cur)
+            if info_cur.any():
+                S_safe_cur = S_safe_cur + 1e-4 * eye_cur
+                L_cur = torch.linalg.cholesky(S_safe_cur)
 
-            # W row-norm and s mean
-            all_W_norms.append(float(out["W"][b, :n].float().norm(dim=-1).mean().item()))
-            all_s_vals.append(float(out["s"][b, :n].float().mean().item()))
+            log_det_cur = 2.0 * L_cur.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)
+            z_f = batch["z_test"].float()
+            tmp_cur = torch.linalg.solve_triangular(L_cur, z_f.unsqueeze(-1), upper=False)
+            S_inv_z_cur = torch.linalg.solve_triangular(L_cur.mT, tmp_cur, upper=True).squeeze(-1)
+            n_safe_cur = n_test_cur.clamp(min=1)
+            cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f ** 2).sum(-1)) / n_safe_cur
+            cop_per_task.extend(cop_cur[valid_cur].cpu().tolist())
 
-            # Sigma off-diagonal and diagonal statistics
-            ri_b, ci_b = torch.triu_indices(n, n, offset=1, device=Sigma.device)
-            all_sigma_off.extend(S_b[ri_b, ci_b].cpu().tolist())
-            all_sigma_diag.extend(S_b.diagonal().cpu().tolist())
+            # W row-norms and s means (masked mean over valid test instances)
+            W_f = out["W"].float()
+            s_f = out["s"].float()
+            mask_f = batch["test_mask"].float()
+            W_norm_cur = (W_f.norm(dim=-1) * mask_f).sum(-1) / n_safe_cur
+            s_mean_cur = (s_f * mask_f).sum(-1) / n_safe_cur
+            all_W_norms.extend(W_norm_cur[valid_cur].cpu().tolist())
+            all_s_vals.extend(s_mean_cur[valid_cur].cpu().tolist())
 
-            # Off-diagonal vs oracle for correlation quality metrics
-            R_ora_b = batch["R_star"][b, :n, :n].float()
-            all_off_pred_flat.append(S_b[ri_b, ci_b].cpu().numpy())
-            all_off_ora_flat.append(R_ora_b[ri_b, ci_b].cpu().numpy())
+            # Off-diagonal and diagonal statistics (all valid entries in one shot)
+            ri_cur, ci_cur = torch.triu_indices(N_cur, N_cur, offset=1, device=Sigma.device)
+            valid_off_cur = mask_2d_cur[:, ri_cur, ci_cur]  # (B, n_pairs) bool
+            off_vals_cur = Sigma[:, ri_cur, ci_cur][valid_off_cur]
+            R_star_off_cur = batch["R_star"].float()[:, ri_cur, ci_cur][valid_off_cur]
+            all_sigma_off.extend(off_vals_cur.cpu().tolist())
+            all_sigma_diag.extend(Sigma.diagonal(dim1=-2, dim2=-1)[batch["test_mask"]].cpu().tolist())
+            all_off_pred_flat.append(off_vals_cur.cpu().numpy())
+            all_off_ora_flat.append(R_star_off_cur.cpu().numpy())
 
         # ---- Collect data for plots ----
         if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
@@ -388,12 +396,14 @@ def main(cfg: DictConfig) -> None:
         batch_size=t.batch_size,
         collate_fn=collate_fn,
         shuffle=True,
-        num_workers=2,
+        num_workers=4,
         pin_memory=(device == "cuda"),
+        persistent_workers=True,
     )
 
     torch._dynamo.config.capture_scalar_outputs = True
     model = build_copula_transformer(cfg).to(device)
+    model = torch.compile(model, dynamic=True)
     wandb.watch(model, log="gradients", log_freq=500)
 
     n_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
