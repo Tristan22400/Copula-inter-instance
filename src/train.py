@@ -489,9 +489,9 @@ def main(cfg: DictConfig) -> None:
             )
             print(
                 f"[{step:6d}] loss={loss_val:.4f} "
-                f"(cop={cop_val:.4f} ema={loss_ema:.4f} mar={mar_val:.4f}) "
-                f"| grad={grad_norm_val:.3f} "
-                f"| offdiag={sig_stats['offdiag_mean']:+.4f} "
+                f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}) "
+                f"| grad_norm={grad_norm_val:.3f} "
+                f"| od_μ={sig_stats['offdiag_mean']:+.4f} od_σ={sig_stats['offdiag_std']:.4f} "
                 f"| lr={lr_now:.2e}"
             )
 
@@ -518,7 +518,7 @@ def main(cfg: DictConfig) -> None:
                 f"cop={cop_str}  "
                 f"corr_r={pearson_str}  "
                 f"corr_mse={metrics['corr_mse']:.4f}  "
-                f"offdiag_mu={metrics['sigma_offdiag_mean']:+.4f}  "
+                f"od_μ={metrics['sigma_offdiag_mean']:+.4f} od_σ={metrics['sigma_offdiag_std']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean']:.4f}  "
                 f"cop_std={metrics['y_nll_copula_std']:.4f}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
