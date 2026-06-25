@@ -152,7 +152,10 @@ def validate(
     step: int = 0,
     do_plot: bool = False,
 ) -> tuple[dict, list]:
-    model.eval()
+    # Do NOT call model.eval() here: TabICL's eval mode triggers _inference_forward
+    # which uses InferenceManager with its own float16 autocast on CUDA, producing
+    # NaN for certain inputs. There is no dropout in this model so eval mode has no
+    # benefit. Use torch.no_grad() for efficiency instead.
     val_loader = DataLoader(
         CopulaDataset(file_list=val_files),
         batch_size=cfg.training.batch_size,
@@ -176,7 +179,8 @@ def validate(
 
     for batch_idx, batch in enumerate(val_loader):
         batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(batch)
+        with torch.no_grad():
+            out = model(batch)
         Sigma = low_rank_correlation(
             out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
         )
@@ -495,15 +499,13 @@ def main(cfg: DictConfig) -> None:
                 for f in plot_figs:
                     plt.close(f)
             wandb.log(log_dict, step=step)
-            improv = metrics["copula_improvement"]
-            improv_str = f"{improv*100:.1f}%" if math.isfinite(improv) else "n/a"
             pearson = metrics["corr_pearson"]
             pearson_str = f"{pearson:.3f}" if math.isfinite(pearson) else "n/a"
+            cop_nll = metrics["y_nll_copula"]
+            cop_str = f"{cop_nll:.4f}" if math.isfinite(cop_nll) else "nan"
             print(
                 f"[{step:6d}] VAL  "
-                f"gap={metrics['oracle_gap']:.4f}  "
-                f"improv={improv_str}  "
-                f"cop_gap={metrics['copula_gap']:.4f}  "
+                f"cop={cop_str}  "
                 f"corr_r={pearson_str}  "
                 f"corr_mse={metrics['corr_mse']:.4f}  "
                 f"offdiag_mu={metrics['sigma_offdiag_mean']:+.4f}  "

@@ -605,8 +605,11 @@ def copula_nll(
         log_det = N * math.log(eps) + log_det_M
 
         # Woodbury: R_ε^{-1} z = (1/ε)[z - W M^{-1} (W^T z / ε)]
+        # Use solve_triangular — cholesky_solve is missing sm_75 kernels in PyTorch 2.11+cu130.
         WTz = W.T @ z  # (r+1,)
-        v = torch.cholesky_solve((WTz / eps).unsqueeze(-1), L_M).squeeze(-1)  # (r+1,)
+        rhs_v = (WTz / eps).unsqueeze(-1)
+        tmp_v = torch.linalg.solve_triangular(L_M, rhs_v, upper=False)
+        v = torch.linalg.solve_triangular(L_M.T, tmp_v, upper=True).squeeze(-1)  # (r+1,)
         R_inv_z = (z - W @ v) / eps  # (N,)
 
         # Copula NLL: 0.5 * (log|R| + z^T R^{-1} z - z^T z) / N
@@ -644,7 +647,9 @@ def oracle_copula_nll(
         R = R_star[b, :N, :N]
         L = _safe_cholesky(R)
         log_det = 2.0 * L.diagonal().log().sum()
-        R_inv_z = torch.cholesky_solve(z.unsqueeze(-1), L).squeeze(-1)
+        rhs_z = z.unsqueeze(-1)
+        tmp_z = torch.linalg.solve_triangular(L, rhs_z, upper=False)
+        R_inv_z = torch.linalg.solve_triangular(L.T, tmp_z, upper=True).squeeze(-1)
         loss_b = 0.5 * (log_det + z @ R_inv_z - z @ z) / N
         losses.append(loss_b)
 
@@ -702,7 +707,9 @@ def y_space_nll(
 
         L = _safe_cholesky(S)                          # (N, N)
         log_det = 2.0 * L.diagonal().log().sum()
-        S_inv_z = torch.cholesky_solve(z.unsqueeze(-1), L).squeeze(-1)
+        rhs_z = z.unsqueeze(-1)
+        tmp_z = torch.linalg.solve_triangular(L, rhs_z, upper=False)
+        S_inv_z = torch.linalg.solve_triangular(L.T, tmp_z, upper=True).squeeze(-1)
         # 0.5 * (log|Σ| + z^T (Σ^{-1} − I) z) per instance
         copula = 0.5 * (log_det + z @ S_inv_z - z @ z) / N
         marginal = -logp.sum() / N
@@ -756,7 +763,9 @@ def gp_oracle_y_nll(
         r = y_test[b, :N] - mu_star[b, :N]
         L = _safe_cholesky(S)
         log_det = 2.0 * L.diagonal().log().sum()
-        S_inv_r = torch.cholesky_solve(r.unsqueeze(-1), L).squeeze(-1)
+        rhs_r = r.unsqueeze(-1)
+        tmp_r = torch.linalg.solve_triangular(L, rhs_r, upper=False)
+        S_inv_r = torch.linalg.solve_triangular(L.T, tmp_r, upper=True).squeeze(-1)
         quad = r @ S_inv_r
 
         diag = S.diagonal()
