@@ -38,6 +38,7 @@ if _HERE not in sys.path:
 from dataset import CopulaDataset, collate_fn
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
+from muon import Muon
 
 _MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
@@ -411,7 +412,32 @@ def main(cfg: DictConfig) -> None:
     wandb.config.update({"n_trainable_params": n_train_params})
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=t.lr, weight_decay=0.0)
+    muon_params  = [p for p in trainable if p.ndim >= 2]
+    adamw_params = [p for p in trainable if p.ndim < 2]
+    optimizer = Muon(
+        [
+            {
+                "params": muon_params,
+                "use_muon": True,
+                "lr": t.muon_lr,
+                "weight_decay": t.muon_weight_decay,
+                "momentum": t.muon_momentum,
+                "matched_adamw_rms": t.muon_matched_adamw_rms,
+                "ns_steps": t.muon_ns_steps,
+                "nesterov": t.muon_nesterov,
+                "adamw_betas": tuple(t.muon_adamw_betas),
+                "adamw_eps": t.muon_adamw_eps,
+            },
+            {
+                "params": adamw_params,
+                "use_muon": False,
+                "lr": t.lr,
+                "weight_decay": 0.0,
+                "adamw_betas": tuple(t.muon_adamw_betas),
+                "adamw_eps": t.muon_adamw_eps,
+            },
+        ]
+    )
     lr_min_frac = t.lr_min / t.lr
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
