@@ -637,26 +637,29 @@ def oracle_copula_nll(
         z_test   : (B, N_max)
         test_mask: (B, N_max)
     """
-    B = R_star.shape[0]
-    losses = []
-    for b in range(B):
-        N = int(test_mask[b].sum().item())
-        if N == 0:
-            continue
-        z = z_test[b, :N]
-        R = R_star[b, :N, :N]
-        L = _safe_cholesky(R)
-        log_det = 2.0 * L.diagonal().log().sum()
-        rhs_z = z.unsqueeze(-1)
-        tmp_z = torch.linalg.solve_triangular(L, rhs_z, upper=False)
-        R_inv_z = torch.linalg.solve_triangular(L.T, tmp_z, upper=True).squeeze(-1)
-        loss_b = 0.5 * (log_det + z @ R_inv_z - z @ z) / N
-        losses.append(loss_b)
+    B, N_max, _ = R_star.shape
+    n_test = test_mask.sum(-1).float()  # (B,)
 
-    if len(losses) == 0:
+    mask_2d = test_mask.unsqueeze(-1) & test_mask.unsqueeze(-2)
+    eye = torch.eye(N_max, device=R_star.device, dtype=R_star.dtype).unsqueeze(0)
+    R_safe = torch.where(mask_2d, R_star, eye)
+
+    L, info = torch.linalg.cholesky_ex(R_safe)
+    if info.any():
+        R_safe = R_safe + 1e-4 * eye
+        L = torch.linalg.cholesky(R_safe)
+
+    # Padded L-diagonal = 1 → log(1) = 0, padded z = 0 → no contribution
+    log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)  # (B,)
+    rhs = z_test.unsqueeze(-1)
+    tmp = torch.linalg.solve_triangular(L, rhs, upper=False)
+    R_inv_z = torch.linalg.solve_triangular(L.mT, tmp, upper=True).squeeze(-1)
+    losses = 0.5 * (log_det + (z_test * R_inv_z).sum(-1) - (z_test ** 2).sum(-1)) / n_test.clamp(min=1)
+
+    valid = n_test > 0
+    if not valid.any():
         return z_test.sum() * 0.0
-
-    return torch.stack(losses).mean()
+    return losses[valid].mean()
 
 
 # ---------------------------------------------------------------------------
@@ -694,35 +697,40 @@ def y_space_nll(
         copula     : copula NLL term
         marginal   : marginal NLL term
     """
-    B = Sigma.shape[0]
-    copula_losses, marginal_losses = [], []
+    B, N_max, _ = Sigma.shape
+    n_test = test_mask.sum(-1).float()  # (B,)
 
-    for b in range(B):
-        N = int(test_mask[b].sum().item())
-        if N == 0:
-            continue
-        S = Sigma[b, :N, :N]
-        z = z_test[b, :N]
-        logp = log_pdf_test[b, :N]
+    # Pad masked blocks to identity — batched Cholesky works without any Python loop.
+    # Correctness relies on collate_fn zero-padding z_test and log_pdf_test:
+    #   padded L-diagonal = 1  →  log(1) = 0  (no contribution to log-det)
+    #   padded z_test     = 0  →  quadratic terms vanish for padded positions
+    mask_2d = test_mask.unsqueeze(-1) & test_mask.unsqueeze(-2)  # (B, N_max, N_max)
+    eye = torch.eye(N_max, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
+    S_safe = torch.where(mask_2d, Sigma, eye)
 
-        L = _safe_cholesky(S)                          # (N, N)
-        log_det = 2.0 * L.diagonal().log().sum()
-        rhs_z = z.unsqueeze(-1)
-        tmp_z = torch.linalg.solve_triangular(L, rhs_z, upper=False)
-        S_inv_z = torch.linalg.solve_triangular(L.T, tmp_z, upper=True).squeeze(-1)
-        # 0.5 * (log|Σ| + z^T (Σ^{-1} − I) z) per instance
-        copula = 0.5 * (log_det + z @ S_inv_z - z @ z) / N
-        marginal = -logp.sum() / N
+    L, info = torch.linalg.cholesky_ex(S_safe)  # (B, N_max, N_max)
+    if info.any():
+        # Extremely rare fallback: add extra jitter and retry
+        S_safe = S_safe + 1e-4 * eye
+        L = torch.linalg.cholesky(S_safe)
 
-        copula_losses.append(copula)
-        marginal_losses.append(marginal)
+    log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)  # (B,)
 
-    if not copula_losses:
+    rhs = z_test.unsqueeze(-1)  # (B, N_max, 1)
+    tmp = torch.linalg.solve_triangular(L, rhs, upper=False)
+    S_inv_z = torch.linalg.solve_triangular(L.mT, tmp, upper=True).squeeze(-1)  # (B, N_max)
+
+    n_safe = n_test.clamp(min=1)
+    copula = 0.5 * (log_det + (z_test * S_inv_z).sum(-1) - (z_test ** 2).sum(-1)) / n_safe
+    marginal = -log_pdf_test.sum(-1) / n_safe
+
+    valid = n_test > 0
+    if not valid.any():
         zero = Sigma.sum() * 0.0
         return {"total": zero, "copula": zero, "marginal": zero}
 
-    copula_mean = torch.stack(copula_losses).mean()
-    marginal_mean = torch.stack(marginal_losses).mean()
+    copula_mean = copula[valid].mean()
+    marginal_mean = marginal[valid].mean()
     return {
         "total": copula_mean + marginal_mean,
         "copula": copula_mean,
@@ -752,39 +760,44 @@ def gp_oracle_y_nll(
     Returns:
         Dict with keys "total", "copula", "marginal" — scalar means over batch.
     """
-    B = Sigma_star.shape[0]
+    B, N_max, _ = Sigma_star.shape
     log_2pi = math.log(2.0 * math.pi)
-    out_total, out_cop, out_mar = [], [], []
-    for b in range(B):
-        N = int(test_mask[b].sum().item())
-        if N == 0:
-            continue
-        S = Sigma_star[b, :N, :N]
-        r = y_test[b, :N] - mu_star[b, :N]
-        L = _safe_cholesky(S)
-        log_det = 2.0 * L.diagonal().log().sum()
-        rhs_r = r.unsqueeze(-1)
-        tmp_r = torch.linalg.solve_triangular(L, rhs_r, upper=False)
-        S_inv_r = torch.linalg.solve_triangular(L.T, tmp_r, upper=True).squeeze(-1)
-        quad = r @ S_inv_r
+    n_test = test_mask.sum(-1).float()  # (B,)
 
-        diag = S.diagonal()
-        log_det_diag = diag.log().sum()
-        quad_diag = (r ** 2 / diag).sum()
+    mask_2d = test_mask.unsqueeze(-1) & test_mask.unsqueeze(-2)
+    eye = torch.eye(N_max, device=Sigma_star.device, dtype=Sigma_star.dtype).unsqueeze(0)
+    S_safe = torch.where(mask_2d, Sigma_star, eye)
 
-        total_nll = 0.5 * (log_det + quad + N * log_2pi) / N
-        mar_nll = 0.5 * (log_det_diag + quad_diag + N * log_2pi) / N
-        cop_nll = total_nll - mar_nll
+    L, info = torch.linalg.cholesky_ex(S_safe)
+    if info.any():
+        S_safe = S_safe + 1e-4 * eye
+        L = torch.linalg.cholesky(S_safe)
 
-        out_total.append(total_nll)
-        out_cop.append(cop_nll)
-        out_mar.append(mar_nll)
+    log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)  # (B,)
 
-    if not out_total:
+    # Zero-padded residuals: y_test and mu_star are 0-padded by collate_fn
+    r = (y_test - mu_star) * test_mask  # (B, N_max)
+    rhs = r.unsqueeze(-1)
+    tmp = torch.linalg.solve_triangular(L, rhs, upper=False)
+    S_inv_r = torch.linalg.solve_triangular(L.mT, tmp, upper=True).squeeze(-1)
+    quad = (r * S_inv_r).sum(-1)  # (B,)
+
+    # Diagonal marginal — mask padded positions to 1 to avoid log(0)
+    diag = Sigma_star.diagonal(dim1=-2, dim2=-1).masked_fill(~test_mask, 1.0)  # (B, N_max)
+    log_det_diag = diag.log().sum(-1)  # (B,), padded entries: log(1) = 0
+    quad_diag = ((y_test - mu_star).pow(2) / diag * test_mask).sum(-1)  # (B,)
+
+    n_safe = n_test.clamp(min=1)
+    total_nll = 0.5 * (log_det + quad + n_test * log_2pi) / n_safe
+    mar_nll   = 0.5 * (log_det_diag + quad_diag + n_test * log_2pi) / n_safe
+    cop_nll   = total_nll - mar_nll
+
+    valid = n_test > 0
+    if not valid.any():
         zero = Sigma_star.sum() * 0.0
         return {"total": zero, "copula": zero, "marginal": zero}
     return {
-        "total": torch.stack(out_total).mean(),
-        "copula": torch.stack(out_cop).mean(),
-        "marginal": torch.stack(out_mar).mean(),
+        "total":    total_nll[valid].mean(),
+        "copula":   cop_nll[valid].mean(),
+        "marginal": mar_nll[valid].mean(),
     }

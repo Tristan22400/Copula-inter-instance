@@ -230,8 +230,11 @@ def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
     sigma = Sigma.diagonal().clamp(min=1e-10).sqrt()  # (N,)
     D_inv = torch.diag(1.0 / sigma)
     R = D_inv @ Sigma @ D_inv
-    R = R / R.diagonal().clamp(min=1e-10).sqrt().unsqueeze(0)
-    R = R / R.diagonal().clamp(min=1e-10).sqrt().unsqueeze(1)
+    # One-shot re-normalization using the original sigma (symmetric in i,j).
+    # D_inv @ Sigma @ D_inv already gives diagonal=1 for PSD Sigma; this just
+    # corrects any float32 rounding drift without introducing asymmetry.
+    d = R.diagonal().clamp(min=1e-10).sqrt()
+    R = R / (d.unsqueeze(0) * d.unsqueeze(1))
     return R, sigma
 
 
@@ -342,6 +345,13 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     mu_star, Sigma_star = gp_posterior(
         x_k_train, y_train, x_k_test, kernel_fn, nugget, latent=True
     )
+    # Project Sigma_star to PSD. Non-stationary kernels (e.g. dot_product with
+    # negative alpha2) can produce a K_ss with negative eigenvalues; without
+    # nugget on K_ss (latent=True), those survive into Sigma_star and cause
+    # division-by-near-zero overflow in sigma_to_correlation.
+    Sigma_star = 0.5 * (Sigma_star + Sigma_star.T)
+    L_star = _safe_cholesky(Sigma_star, max_attempts=12)
+    Sigma_star = L_star @ L_star.T  # guaranteed PSD, diagonal > 0
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
     return {

@@ -31,6 +31,16 @@ class CopulaDataset(Dataset):
         else:
             raise ValueError("Provide either episode_dir or file_list.")
 
+        # Filter out files that don't exist (NFS race / incomplete generation)
+        existing = [f for f in self.files if os.path.isfile(f)]
+        if len(existing) < len(self.files):
+            import warnings
+            warnings.warn(
+                f"CopulaDataset: {len(self.files) - len(existing)} file(s) listed "
+                f"but missing on disk — they will be skipped."
+            )
+        self.files = existing
+
         if not self.files:
             raise RuntimeError(f"No .pt files found in {episode_dir}")
 
@@ -38,7 +48,11 @@ class CopulaDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx: int) -> dict:
-        return torch.load(self.files[idx], map_location="cpu", weights_only=True)
+        try:
+            return torch.load(self.files[idx], map_location="cpu", weights_only=True)
+        except FileNotFoundError:
+            # File disappeared after init (NFS eviction); fall back to next slot
+            return torch.load(self.files[(idx + 1) % len(self.files)], map_location="cpu", weights_only=True)
 
 
 def collate_fn(samples: List[dict]) -> dict:

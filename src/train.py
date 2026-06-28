@@ -141,7 +141,7 @@ def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> 
 @torch.no_grad()
 def validate(
     model: nn.Module,
-    val_files: list,
+    val_loader: DataLoader,
     cfg: DictConfig,
     device: str,
     step: int = 0,
@@ -151,15 +151,6 @@ def validate(
     # which uses InferenceManager with its own float16 autocast on CUDA, producing
     # NaN for certain inputs. There is no dropout in this model so eval mode has no
     # benefit. Use torch.no_grad() for efficiency instead.
-    val_loader = DataLoader(
-        CopulaDataset(file_list=val_files),
-        batch_size=cfg.training.batch_size,
-        collate_fn=collate_fn,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-    )
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
 
     tot, cop, mar, ora, ora_cop, ora_mar, ora_cop_z = [], [], [], [], [], [], []
@@ -400,6 +391,15 @@ def main(cfg: DictConfig) -> None:
         pin_memory=(device == "cuda"),
         persistent_workers=True,
     )
+    val_loader = DataLoader(
+        CopulaDataset(file_list=val_files),
+        batch_size=t.batch_size,
+        collate_fn=collate_fn,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=(device == "cuda"),
+        persistent_workers=True,
+    )
 
     torch._dynamo.config.capture_scalar_outputs = True
     model = build_copula_transformer(cfg).to(device)
@@ -431,8 +431,10 @@ def main(cfg: DictConfig) -> None:
 
     for step in range(t.steps + 1):
         batch = next(data_iter)
-        batch = {k: v.to(device) for k, v in batch.items()}
+        # non_blocking overlaps H→D transfer with previous GPU work (pin_memory=True)
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
+        optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
             out = model(batch)
         # Loss in float32 — Cholesky / log-det want full precision.
@@ -447,7 +449,6 @@ def main(cfg: DictConfig) -> None:
         )
         loss = parts["total"]
 
-        optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -458,14 +459,14 @@ def main(cfg: DictConfig) -> None:
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
             optimizer.step()
-        grad_norm_val = float(grad_norm)
 
         scheduler.step()
 
-        loss_val = loss.item()
-        loss_ema = loss_val if loss_ema is None else _EMA_ALPHA * loss_ema + (1.0 - _EMA_ALPHA) * loss_val
-
+        # Defer .item() / float() GPU syncs to logging steps — saves 2+ syncs/step
         if step % t.log_every == 0:
+            loss_val = loss.item()
+            loss_ema = loss_val if loss_ema is None else _EMA_ALPHA * loss_ema + (1.0 - _EMA_ALPHA) * loss_val
+            grad_norm_val = float(grad_norm)
             lr_now = scheduler.get_last_lr()[0]
             amp_scale = scaler.get_scale() if scaler is not None else 1.0
             cop_val = parts["copula"].item()
@@ -499,7 +500,7 @@ def main(cfg: DictConfig) -> None:
             plot_val_every = int(t.get("plot_val_every", 5000))
             do_plot = plot_val_every > 0 and step % plot_val_every == 0
             metrics, plot_figs = validate(
-                model, val_files, cfg, device, step=step, do_plot=do_plot
+                model, val_loader, cfg, device, step=step, do_plot=do_plot
             )
             log_dict = {f"val/{k}": v for k, v in metrics.items()}
             if plot_figs:

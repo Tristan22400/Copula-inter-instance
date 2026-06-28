@@ -141,18 +141,57 @@ def _load_pretrained_tabicl(ckpt_name: str) -> TabICL:
     return base
 
 
+def _build_tabicl_scratch(cfg: DictConfig) -> TabICL:
+    """Instantiate a randomly-initialised TabICL from cfg.tabicl.arch."""
+    a = cfg.tabicl.get("arch", {})
+    return TabICL(
+        max_classes=int(a.get("max_classes", 0)),
+        num_quantiles=int(a.get("num_quantiles", 999)),
+        embed_dim=int(a.get("embed_dim", 128)),
+        col_num_blocks=int(a.get("col_num_blocks", 3)),
+        col_nhead=int(a.get("col_nhead", 8)),
+        col_num_inds=int(a.get("col_num_inds", 128)),
+        col_affine=bool(a.get("col_affine", False)),
+        col_feature_group=a.get("col_feature_group", "same"),
+        col_feature_group_size=int(a.get("col_feature_group_size", 3)),
+        col_target_aware=bool(a.get("col_target_aware", True)),
+        col_ssmax=a.get("col_ssmax", "qassmax-mlp-elementwise"),
+        row_num_blocks=int(a.get("row_num_blocks", 3)),
+        row_nhead=int(a.get("row_nhead", 8)),
+        row_num_cls=int(a.get("row_num_cls", 4)),
+        row_rope_base=float(a.get("row_rope_base", 100000)),
+        row_rope_interleaved=bool(a.get("row_rope_interleaved", False)),
+        icl_num_blocks=int(a.get("icl_num_blocks", 12)),
+        icl_nhead=int(a.get("icl_nhead", 8)),
+        icl_ssmax=a.get("icl_ssmax", "qassmax-mlp-elementwise"),
+        ff_factor=int(a.get("ff_factor", 2)),
+        dropout=float(a.get("dropout", 0.0)),
+        activation=a.get("activation", "gelu"),
+        norm_first=bool(a.get("norm_first", True)),
+        bias_free_ln=bool(a.get("bias_free_ln", False)),
+        recompute=bool(a.get("recompute", False)),
+    )
+
+
 def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
-    """Construct CopulaTabICL with the pretrained TabICL as feature extractor.
+    """Construct CopulaTabICL with either a pretrained or scratch TabICL backbone.
 
     Reads:
         cfg.model.rank
-        cfg.tabicl.ckpt
-        cfg.model.unfreeze_backbone (optional, default False)
+        cfg.tabicl.pretrained          (default True)
+        cfg.tabicl.ckpt                (only when pretrained=True)
+        cfg.tabicl.arch.*              (only when pretrained=False)
+        cfg.model.unfreeze_backbone    (default True)
     """
-    base = _load_pretrained_tabicl(cfg.tabicl.ckpt)
+    pretrained = bool(cfg.tabicl.get("pretrained", True))
+    if pretrained:
+        base = _load_pretrained_tabicl(cfg.tabicl.ckpt)
+    else:
+        base = _build_tabicl_scratch(cfg)
+
     model = CopulaTabICL(base=base, rank=int(cfg.model.rank))
 
-    unfreeze = bool(cfg.model.get("unfreeze_backbone", False))
+    unfreeze = bool(cfg.model.get("unfreeze_backbone", True))
     if not unfreeze:
         for p in model.feature_extractor.parameters():
             p.requires_grad_(False)
