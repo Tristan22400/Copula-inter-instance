@@ -1,12 +1,11 @@
 """
 test_dataset_corr_uniform.py — Verify structural properties of R_star in a dataset folder.
 
-Since data_gen uses latent=False (posterior over noisy y*, not latent f*), R_star
-captures the *observable* correlation — bounded by alpha2/(alpha2+nugget) < 1.
-The tests below check properties appropriate for this regime:
-  - Well-conditioned (min_eig ≥ 0.01): oracle NLL cannot explode
+data_gen uses the GP *prior* K_ss = kernel(X_test, X_test) + nugget·I as R_star.
+This gives:
+  - Well-conditioned (min_eig ≥ nugget/(alpha2+nugget) ≥ 0.033): oracle NLL cannot explode
+  - Wide arcsine-like distribution spanning ±alpha2/(alpha2+nugget): rich training signal
   - Symmetric: mean ≈ 0, ~50% negative entries
-  - Some diversity: positive std, both signs present
   - Unit diagonal: R_star is a proper correlation matrix
 
 Run against a specific folder:
@@ -106,9 +105,15 @@ def test_correlations_have_both_signs(off_diag):
 
 
 def test_correlations_mean_near_zero(off_diag):
-    """Distribution should be symmetric: mean of off-diagonal R_star ≈ 0."""
+    """Mean of off-diagonal R_star should not be extreme.
+
+    The cosine prior with l ~ U(1, 10) has a slight positive mean (~0.20) because
+    large l values keep 2π*dist/l small (near cos(0)=1). Threshold is 0.30 to
+    catch degenerate cases (e.g. all-ones or collapsed kernel) while tolerating
+    this natural bias.
+    """
     mean = off_diag.mean().item()
-    assert abs(mean) < 0.15, f"Mean {mean:.3f} too far from 0 — distribution is skewed"
+    assert abs(mean) < 0.30, f"Mean {mean:.3f} too far from 0 — distribution may be degenerate"
 
 
 def test_correlations_negative_fraction(off_diag):
@@ -119,9 +124,17 @@ def test_correlations_negative_fraction(off_diag):
 
 
 def test_correlations_std_nonzero(off_diag):
-    """Standard deviation must be positive — not all the same value."""
+    """Standard deviation must be substantial — prior R_star has arcsine distribution.
+
+    With the GP prior, off-diagonal correlations span ±alpha2/(alpha2+nugget).
+    Expected std ≈ 0.25–0.55. A value below 0.10 indicates the posterior
+    Schur complement was accidentally re-introduced (narrow posterior regime).
+    """
     std = off_diag.std().item()
-    assert std > 0.02, f"Std {std:.3f} essentially zero — all correlations identical"
+    assert std > 0.10, (
+        f"Std {std:.3f} too low — expected ≥ 0.10 for prior-based R_star. "
+        f"Check that gp_posterior Schur complement is not subtracted in data_gen.py."
+    )
 
 
 def test_unit_diagonal(dataset_dir):

@@ -46,7 +46,7 @@ def small_cfg():
                 "noise_min": 0.05,
                 "noise_max": 0.2,
                 "raw_dir": "/tmp/test_gp_raw",
-                "latent_dir": "/tmp/test_pit",
+                "pit_dir": "/tmp/test_pit",
                 "resume": False,
             },
         }
