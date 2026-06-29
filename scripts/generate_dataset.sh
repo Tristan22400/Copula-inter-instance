@@ -1,6 +1,6 @@
 #!/bin/bash
 #OAR -n CopulaPIT_Generate
-#OAR -l gpu=1,walltime=16:00:00
+#OAR -l gpu=1,walltime=24:00:00
 #OAR -O logs/generate_%jobid%.out
 #OAR -E logs/generate_%jobid%.err
 #

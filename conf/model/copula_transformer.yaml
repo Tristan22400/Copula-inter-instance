@@ -10,6 +10,6 @@
 # different task from quantile regression so the features need to adapt.
 # ---------------------------------------------------------------------------
 
-rank: 4                  # low-rank dimension r in W ∈ R^{N×r}
+rank: 32                  # low-rank dimension r in W ∈ R^{N×r}
 sigma_jitter: 1.0e-4     # added to diag(Σ) for Cholesky stability
 unfreeze_backbone: true  # train TabICL end-to-end alongside the head

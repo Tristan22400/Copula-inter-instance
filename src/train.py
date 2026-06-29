@@ -364,7 +364,7 @@ def main(cfg: DictConfig) -> None:
     t = cfg.training
     run_name = (
         f"copula_r={cfg.model.rank}"
-        f"_lr={t.lr}_steps={t.steps}"
+        f"_lr={t.muon_lr}_steps={t.steps}"
         f"_unfreeze={bool(cfg.model.get('unfreeze_backbone', False))}"
     )
     wandb.init(
@@ -432,14 +432,14 @@ def main(cfg: DictConfig) -> None:
             {
                 "params": adamw_params,
                 "use_muon": False,
-                "lr": t.lr,
+                "lr": t.muon_lr,
                 "weight_decay": 0.0,
                 "adamw_betas": tuple(t.muon_adamw_betas),
                 "adamw_eps": t.muon_adamw_eps,
             },
         ]
     )
-    lr_min_frac = t.lr_min / t.lr
+    lr_min_frac = t.muon_lr_min / t.muon_lr
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=lambda s: cosine_lr_lambda(s, t.warmup_steps, t.steps, lr_min_frac),
@@ -450,6 +450,7 @@ def main(cfg: DictConfig) -> None:
     scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
+    nll_weight = float(t.get("nll_weight", 1.0))
     aux_mse_weight = float(t.get("aux_mse_weight", 0.0))
 
     model.train()
@@ -475,7 +476,7 @@ def main(cfg: DictConfig) -> None:
             batch["log_pdf_test"].float(),
             batch["test_mask"],
         )
-        loss = parts["total"]
+        loss = nll_weight * parts["total"]
 
         # Auxiliary MSE on off-diagonal correlations vs oracle R_star.
         # Gives a direct gradient toward the oracle structure; weight=0 disables.

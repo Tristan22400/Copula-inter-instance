@@ -682,7 +682,7 @@ def main() -> None:
     if isinstance(icl_cfg, dict):
         icl_cfg = OmegaConf.create(icl_cfg)
     icl_model = build_copula_transformer(icl_cfg).to(device)
-    icl_model.load_state_dict(ckpt["model_state"])
+    icl_model.load_state_dict(ckpt.get("model_state", ckpt.get("state_dict")))
     icl_model.eval()
     icl_rank = int(icl_cfg.model.rank)
     n_params = sum(p.numel() for p in icl_model.parameters())
