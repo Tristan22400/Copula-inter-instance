@@ -644,10 +644,7 @@ def oracle_copula_nll(
     eye = torch.eye(N_max, device=R_star.device, dtype=R_star.dtype).unsqueeze(0)
     R_safe = torch.where(mask_2d, R_star, eye)
 
-    L, info = torch.linalg.cholesky_ex(R_safe)
-    if info.any():
-        R_safe = R_safe + 1e-4 * eye
-        L = torch.linalg.cholesky(R_safe)
+    L = _safe_cholesky(R_safe)
 
     # Padded L-diagonal = 1 → log(1) = 0, padded z = 0 → no contribution
     log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)  # (B,)
@@ -708,11 +705,7 @@ def y_space_nll(
     eye = torch.eye(N_max, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
     S_safe = torch.where(mask_2d, Sigma, eye)
 
-    L, info = torch.linalg.cholesky_ex(S_safe)  # (B, N_max, N_max)
-    if info.any():
-        # Extremely rare fallback: add extra jitter and retry
-        S_safe = S_safe + 1e-4 * eye
-        L = torch.linalg.cholesky(S_safe)
+    L = _safe_cholesky(S_safe)  # (B, N_max, N_max)
 
     log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)  # (B,)
 
@@ -768,10 +761,7 @@ def gp_oracle_y_nll(
     eye = torch.eye(N_max, device=Sigma_star.device, dtype=Sigma_star.dtype).unsqueeze(0)
     S_safe = torch.where(mask_2d, Sigma_star, eye)
 
-    L, info = torch.linalg.cholesky_ex(S_safe)
-    if info.any():
-        S_safe = S_safe + 1e-4 * eye
-        L = torch.linalg.cholesky(S_safe)
+    L = _safe_cholesky(S_safe)
 
     log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)  # (B,)
 

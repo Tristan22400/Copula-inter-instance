@@ -340,18 +340,22 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # 8. Compute GP posterior at test points using kernel-column sub-matrices
     x_k_train = x_k[:P]
     x_k_test = x_k[P:]
-    # latent=True: posterior over f* (no noise in K_ss) so R* reflects kernel
-    # correlation structure rather than being diluted by the noise diagonal.
+    # latent=False (default): posterior over noisy y* (nugget on K_ss diagonal).
+    # R_star then reflects the correlation of observable y_test — consistent with
+    # the z_test values produced by the PIT pipeline (probit of TabICL CDF of y).
+    # The nugget floor on K_ss prevents near-singular R_star for stationary kernels.
     mu_star, Sigma_star = gp_posterior(
-        x_k_train, y_train, x_k_test, kernel_fn, nugget, latent=True
+        x_k_train, y_train, x_k_test, kernel_fn, nugget
     )
-    # Project Sigma_star to PSD. Non-stationary kernels (e.g. dot_product with
-    # negative alpha2) can produce a K_ss with negative eigenvalues; without
-    # nugget on K_ss (latent=True), those survive into Sigma_star and cause
-    # division-by-near-zero overflow in sigma_to_correlation.
+    # Project Sigma_star to PSD via eigenvalue clipping. Floating-point accumulation
+    # in the Schur complement can produce tiny negative eigenvalues; clipping at 1e-6
+    # keeps sigma_star accurate without distorting the marginal stds.
     Sigma_star = 0.5 * (Sigma_star + Sigma_star.T)
-    L_star = _safe_cholesky(Sigma_star, max_attempts=12)
-    Sigma_star = L_star @ L_star.T  # guaranteed PSD, diagonal > 0
+    eigvals, eigvecs = torch.linalg.eigh(Sigma_star)
+    if eigvals.min() < 1e-6:
+        eigvals = eigvals.clamp(min=1e-6)
+        Sigma_star = eigvecs @ torch.diag(eigvals) @ eigvecs.T
+        Sigma_star = 0.5 * (Sigma_star + Sigma_star.T)  # restore symmetry after matmul
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
     return {
