@@ -338,6 +338,8 @@ def validate(
 
 
 def save_checkpoint(model, optimizer, scheduler, cfg, step: int) -> None:
+    if cfg.training.ckpt_dir is None:
+        return
     os.makedirs(cfg.training.ckpt_dir, exist_ok=True)
     path = os.path.join(cfg.training.ckpt_dir, f"step_{step:07d}.pt")
     raw = getattr(model, "_orig_mod", model)
