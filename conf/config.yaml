@@ -33,6 +33,9 @@ training:
   muon_nesterov: true
   muon_adamw_betas: [0.95, 0.95]
   muon_adamw_eps: 1.0e-8
+  # Auxiliary MSE loss on off-diagonal correlations vs oracle R_star.
+  # Provides a direct gradient signal; 0.0 disables it entirely.
+  aux_mse_weight: 0.0
 
 tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt

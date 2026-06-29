@@ -449,6 +449,7 @@ def main(cfg: DictConfig) -> None:
     scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
+    aux_mse_weight = float(t.get("aux_mse_weight", 0.0))
 
     model.train()
     data_iter = cycle(train_loader)
@@ -475,6 +476,20 @@ def main(cfg: DictConfig) -> None:
         )
         loss = parts["total"]
 
+        # Auxiliary MSE on off-diagonal correlations vs oracle R_star.
+        # Gives a direct gradient toward the oracle structure; weight=0 disables.
+        aux_mse = Sigma.new_tensor(0.0)
+        if aux_mse_weight > 0.0:
+            N_t = Sigma.shape[1]
+            mask_2d_t = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
+            ri_t, ci_t = torch.triu_indices(N_t, N_t, offset=1, device=Sigma.device)
+            valid_off_t = mask_2d_t[:, ri_t, ci_t]  # (B, n_pairs)
+            if valid_off_t.any():
+                pred_off = Sigma[:, ri_t, ci_t][valid_off_t]
+                ora_off = batch["R_star"].float()[:, ri_t, ci_t][valid_off_t]
+                aux_mse = ((pred_off - ora_off) ** 2).mean()
+            loss = loss + aux_mse_weight * aux_mse
+
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -497,6 +512,7 @@ def main(cfg: DictConfig) -> None:
             amp_scale = scaler.get_scale() if scaler is not None else 1.0
             cop_val = parts["copula"].item()
             mar_val = parts["marginal"].item()
+            aux_mse_val = aux_mse.item()
             with torch.no_grad():
                 w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
                 sig_stats = _sigma_stats(Sigma, batch["test_mask"])
@@ -505,6 +521,7 @@ def main(cfg: DictConfig) -> None:
                     "train/y_nll_total":        loss_val,
                     "train/y_nll_copula":       cop_val,
                     "train/y_nll_marginal":     mar_val,
+                    "train/aux_mse":            aux_mse_val,
                     "train/lr":                 lr_now,
                     "train/grad_norm":          grad_norm_val,
                     "train/amp_scale":          amp_scale,
@@ -514,9 +531,10 @@ def main(cfg: DictConfig) -> None:
                 },
                 step=step,
             )
+            aux_str = f" aux_mse={aux_mse_val:.4f}" if aux_mse_weight > 0.0 else ""
             print(
                 f"[{step:6d}] loss={loss_val:.4f} "
-                f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}) "
+                f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}{aux_str}) "
                 f"| grad_norm={grad_norm_val:.3f} "
                 f"| od_μ={sig_stats['offdiag_mean']:+.4f} od_σ={sig_stats['offdiag_std']:.4f} "
                 f"| lr={lr_now:.2e}"
