@@ -182,6 +182,11 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
         cfg.tabicl.ckpt                (only when pretrained=True)
         cfg.tabicl.arch.*              (only when pretrained=False)
         cfg.model.unfreeze_backbone    (default True)
+        cfg.lora.enabled               (default False)
+        cfg.lora.rank                  (default 8)
+        cfg.lora.alpha                 (default 16.0)
+        cfg.lora.target                (default "qkvo")
+        cfg.lora.stages                (default ["icl"])
     """
     pretrained = bool(cfg.tabicl.get("pretrained", True))
     if pretrained:
@@ -190,6 +195,22 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
         base = _build_tabicl_scratch(cfg)
 
     model = CopulaTabICL(base=base, rank=int(cfg.model.rank))
+
+    lora_cfg = cfg.get("lora", {})
+    if bool(lora_cfg.get("enabled", False)):
+        from lora import apply_lora  # type: ignore[import]
+        n = apply_lora(
+            backbone=model.feature_extractor,
+            rank=int(lora_cfg.get("rank", 8)),
+            alpha=float(lora_cfg.get("alpha", 16.0)),
+            target=str(lora_cfg.get("target", "qkvo")),
+            stages=list(lora_cfg.get("stages", ["icl"])),
+        )
+        print(f"LoRA applied: {n} MultiheadAttention modules replaced "
+              f"(rank={lora_cfg.get('rank', 8)}, alpha={lora_cfg.get('alpha', 16.0)}, "
+              f"target={lora_cfg.get('target', 'qkvo')}, stages={list(lora_cfg.get('stages', ['icl']))})")
+        # copula_head is always trainable; backbone LoRA params set by apply_lora
+        return model
 
     unfreeze = bool(cfg.model.get("unfreeze_backbone", True))
     if not unfreeze:

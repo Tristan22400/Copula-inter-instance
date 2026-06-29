@@ -41,3 +41,13 @@ tabicl:
   ckpt: tabicl-regressor-v2-20260212.ckpt
   k_folds: 10        # number of folds for training-set PIT (true LOO = P, slow)
   pit_eps: 1.0e-6
+
+# LoRA fine-tuning of the TabICL backbone.
+# Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]
+lora:
+  enabled: false
+  rank: 8
+  alpha: 16.0
+  target: "qkvo"
+  stages:
+    - icl
