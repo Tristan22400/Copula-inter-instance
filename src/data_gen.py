@@ -106,14 +106,14 @@ def rational_quadratic_kernel(
 
 
 def dot_product_kernel(
-    X1: Tensor, X2: Tensor, *, alpha2: float, **_
+    X1: Tensor, X2: Tensor, *, **_
 ) -> Tensor:
     """Linear + bias: alpha2 + X1 @ X2ᵀ.
 
-    PSD because K = alpha2·1·1ᵀ + XᵀX is a sum of two PSD matrices.
+    PSD because K = XᵀX is a sum of two PSD matrices.
     Length-scale l is unused; geometry is determined by the feature space.
     """
-    return alpha2 + X1 @ X2.T
+    return X1 @ X2.T
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +287,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # 2. Sample shared GP hyperparameters
     l = random.uniform(cfg.data.l_min, cfg.data.l_max)
     if kernel_name == "dot_product":
-        a2_min = float(getattr(cfg.data, "dot_product_alpha2_min", -1.0))
-        a2_max = float(getattr(cfg.data, "dot_product_alpha2_max", 1.0))
+        a2_min = float(0.0)
+        a2_max = float(0.0)
     else:
         a2_min = float(cfg.data.alpha2_min)
         a2_max = float(cfg.data.alpha2_max)
@@ -337,25 +337,16 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_norm_test = x_norm[P:]
     y_test = y_all[P:]
 
-    # 8. Compute GP posterior at test points using kernel-column sub-matrices
+    # 8. Compute R_star from the GP prior at test points.
+    # K_ss = kernel(X_test, X_test) + nugget·I.  The nugget floor guarantees
+    # min_eig(K_ss) ≥ nugget > 0 (no near-singular oracle).  Off-diagonal
+    # correlations span ±alpha2/(alpha2+nugget) with an arcsine distribution,
+    # giving a rich and diverse training signal.  mu_star is set to the GP
+    # posterior mean so the Y-space marginals remain accurate.
     x_k_train = x_k[:P]
     x_k_test = x_k[P:]
-    # latent=False (default): posterior over noisy y* (nugget on K_ss diagonal).
-    # R_star then reflects the correlation of observable y_test — consistent with
-    # the z_test values produced by the PIT pipeline (probit of TabICL CDF of y).
-    # The nugget floor on K_ss prevents near-singular R_star for stationary kernels.
-    mu_star, Sigma_star = gp_posterior(
-        x_k_train, y_train, x_k_test, kernel_fn, nugget
-    )
-    # Project Sigma_star to PSD via eigenvalue clipping. Floating-point accumulation
-    # in the Schur complement can produce tiny negative eigenvalues; clipping at 1e-6
-    # keeps sigma_star accurate without distorting the marginal stds.
-    Sigma_star = 0.5 * (Sigma_star + Sigma_star.T)
-    eigvals, eigvecs = torch.linalg.eigh(Sigma_star)
-    if eigvals.min() < 1e-6:
-        eigvals = eigvals.clamp(min=1e-6)
-        Sigma_star = eigvecs @ torch.diag(eigvals) @ eigvecs.T
-        Sigma_star = 0.5 * (Sigma_star + Sigma_star.T)  # restore symmetry after matmul
+    Sigma_star = kernel_fn(x_k_test, x_k_test) + nugget * torch.eye(N)
+    mu_star, _ = gp_posterior(x_k_train, y_train, x_k_test, kernel_fn, nugget)
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
     return {

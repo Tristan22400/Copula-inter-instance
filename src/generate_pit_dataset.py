@@ -47,9 +47,9 @@ def main(cfg: DictConfig) -> None:
         torch.save(task, path)
 
     # ----- Stage B: PIT projection -----
-    latent_dir = cfg.data.latent_dir
-    os.makedirs(latent_dir, exist_ok=True)
-    print(f"[Stage B] Running TabICL PIT → {latent_dir}")
+    pit_dir = cfg.data.pit_dir
+    os.makedirs(pit_dir, exist_ok=True)
+    print(f"[Stage B] Running TabICL PIT → {pit_dir}")
     tabicl = load_tabicl(cfg.tabicl.ckpt, device)
 
     k_folds = int(cfg.tabicl.get("k_folds", DEFAULT_K_FOLDS))
@@ -61,7 +61,7 @@ def main(cfg: DictConfig) -> None:
 
     n_warn = 0
     for i, raw_path in enumerate(tqdm(raw_paths, desc="PIT")):
-        out_path = os.path.join(latent_dir, os.path.basename(raw_path))
+        out_path = os.path.join(pit_dir, os.path.basename(raw_path))
         if cfg.data.resume and os.path.exists(out_path):
             continue
 
