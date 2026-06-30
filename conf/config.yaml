@@ -12,14 +12,14 @@ wandb:
 training:
   device: auto
   batch_size: 64
-  steps: 50000
+  steps: 500000
   warmup_steps: 1000
   clip_grad_norm: 10.0
   log_every: 100
   val_every: 500
   save_every: 5000
-  ckpt_dir: null
-  dataset_dir: ./data/pit_cosine-new
+  ckpt_dir: ./checkpoints/test-full-model
+  dataset_dir: ./data/dot-product-posterior/pit
   val_fraction: 0.05   # fraction of episodes held out for validation
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
@@ -42,8 +42,6 @@ training:
 tabicl:
   pretrained: true   # false → randomly-initialised backbone (uses arch section below)
   ckpt: tabicl-regressor-v2-20260212.ckpt  # ignored when pretrained=false
-  k_folds: 10        # number of folds for training-set PIT (true LOO = P, slow)
-  pit_eps: 1.0e-6
   # Architecture params — only used when pretrained=false.
   # Defaults match the released tabicl-regressor-v2 checkpoint.
   # arch:

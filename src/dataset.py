@@ -1,14 +1,22 @@
 """
 dataset.py — CopulaDataset and collate_fn for inter-instance copula training.
 
-Each episode file (one .pt per task) carries both the Y- and Z-space tensors
-plus the per-instance marginal log-PDF emitted by the PIT pipeline.  The
-collate_fn pads variable-length tasks to the batch maximum P and N.
+Supports two on-disk layouts (auto-detected):
+
+  Individual files   task_XXXXXX.pt   — one episode per file (legacy)
+  Sharded files      shard_XXXXXX.pt  — list of B episodes per file (new)
+
+The sharded layout is produced by generate_pit_dataset.py and is much faster
+on NFS because it reduces file-metadata operations by a factor of B.
+A small LRU shard cache (default 4 shards) keeps recently accessed shards
+in memory to amortise repeated random accesses within a DataLoader.
 """
 
 from __future__ import annotations
 
 import os
+import random
+from collections import OrderedDict
 from glob import glob
 from typing import List, Optional
 
@@ -17,7 +25,12 @@ from torch.utils.data import Dataset
 
 
 class CopulaDataset(Dataset):
-    """Dataset of pre-computed PIT episodes (one .pt file per task)."""
+    """Dataset of pre-computed PIT episodes.
+
+    Auto-detects individual (task_*.pt) or sharded (shard_*.pt + meta.pt) layout.
+    """
+
+    _SHARD_CACHE_SIZE = 4   # shards kept in memory per worker process
 
     def __init__(
         self,
@@ -25,44 +38,102 @@ class CopulaDataset(Dataset):
         file_list: Optional[List[str]] = None,
     ):
         if file_list is not None:
-            self.files = sorted(file_list)
-        elif episode_dir is not None:
-            self.files = sorted(glob(os.path.join(episode_dir, "*.pt")))
-        else:
+            # Explicit list → individual-file mode (backward compat)
+            self._init_individual(sorted(file_list))
+            return
+
+        if episode_dir is None:
             raise ValueError("Provide either episode_dir or file_list.")
 
-        # Filter out files that don't exist (NFS race / incomplete generation)
-        existing = [f for f in self.files if os.path.isfile(f)]
-        if len(existing) < len(self.files):
+        meta_path   = os.path.join(episode_dir, "meta.pt")
+        shard_files = sorted(glob(os.path.join(episode_dir, "shard_*.pt")))
+
+        if shard_files and os.path.exists(meta_path):
+            self._init_sharded(shard_files, meta_path)
+        else:
+            indiv_files = sorted(glob(os.path.join(episode_dir, "task_*.pt")))
+            if not indiv_files:
+                raise RuntimeError(
+                    f"No episode files found in {episode_dir}. "
+                    "Expected shard_*.pt+meta.pt or task_*.pt files."
+                )
+            self._init_individual(indiv_files)
+
+    # ------------------------------------------------------------------
+    # Initialisation helpers
+    # ------------------------------------------------------------------
+
+    def _init_individual(self, files: List[str]) -> None:
+        self._mode  = "individual"
+        existing = [f for f in files if os.path.isfile(f)]
+        if len(existing) < len(files):
             import warnings
             warnings.warn(
-                f"CopulaDataset: {len(self.files) - len(existing)} file(s) listed "
-                f"but missing on disk — they will be skipped."
+                f"CopulaDataset: {len(files) - len(existing)} listed file(s) missing on disk."
             )
-        self.files = existing
+        if not existing:
+            raise RuntimeError("No .pt files available.")
+        self._files = existing
 
-        if not self.files:
-            if episode_dir is not None:
-                raise RuntimeError(f"No .pt files found in {episode_dir}")
-            else:
-                raise RuntimeError(
-                    f"No .pt files available — all {len(file_list)} file(s) in file_list are missing on disk"
-                )
+    def _init_sharded(self, shard_files: List[str], meta_path: str) -> None:
+        self._mode         = "sharded"
+        self._shard_files  = shard_files
+        meta               = torch.load(meta_path, map_location="cpu", weights_only=True)
+        self._n_total      = int(meta["n_total"])
+        self._shard_size   = int(meta["shard_size"])
+        self._shard_cache: OrderedDict[str, list] = OrderedDict()
+
+    # ------------------------------------------------------------------
+    # Dataset protocol
+    # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.files)
+        if self._mode == "individual":
+            return len(self._files)
+        return self._n_total
 
     def __getitem__(self, idx: int) -> dict:
+        if self._mode == "individual":
+            return self._get_individual(idx)
+        return self._get_sharded(idx)
+
+    # ------------------------------------------------------------------
+    # Individual-file loading
+    # ------------------------------------------------------------------
+
+    def _get_individual(self, idx: int) -> dict:
         try:
-            return torch.load(self.files[idx], map_location="cpu", weights_only=True)
+            return torch.load(self._files[idx], map_location="cpu", weights_only=True)
         except FileNotFoundError:
-            # File disappeared after init (NFS eviction); pick a random other slot.
-            # (idx+1)%len would loop to itself when len==1, so exclude idx explicitly.
-            import random
-            candidates = [i for i in range(len(self.files)) if i != idx]
+            candidates = [i for i in range(len(self._files)) if i != idx]
             if not candidates:
-                raise  # only one file and it's gone — nothing to fall back to
-            return torch.load(self.files[random.choice(candidates)], map_location="cpu", weights_only=True)
+                raise
+            return torch.load(
+                self._files[random.choice(candidates)], map_location="cpu", weights_only=True
+            )
+
+    # ------------------------------------------------------------------
+    # Sharded loading with LRU cache
+    # ------------------------------------------------------------------
+
+    def _get_sharded(self, idx: int) -> dict:
+        shard_idx  = min(idx // self._shard_size, len(self._shard_files) - 1)
+        local_idx  = idx  - shard_idx * self._shard_size
+        shard_path = self._shard_files[shard_idx]
+
+        if shard_path not in self._shard_cache:
+            if len(self._shard_cache) >= self._SHARD_CACHE_SIZE:
+                self._shard_cache.popitem(last=False)   # evict LRU
+            self._shard_cache[shard_path] = torch.load(
+                shard_path, map_location="cpu", weights_only=False
+            )
+        else:
+            # Move to end to mark as most-recently used
+            self._shard_cache.move_to_end(shard_path)
+
+        shard     = self._shard_cache[shard_path]
+        local_idx = min(local_idx, len(shard) - 1)   # guard for last shard
+        return shard[local_idx]
 
 
 def collate_fn(samples: List[dict]) -> dict:
@@ -85,60 +156,60 @@ def collate_fn(samples: List[dict]) -> dict:
         n_train      : LongTensor (B,)
         n_test       : LongTensor (B,)
     """
-    B = len(samples)
+    B   = len(samples)
     d_x = samples[0]["x_norm_train"].shape[-1]
 
     P_list = [int(s["n_train"].item()) for s in samples]
-    N_list = [int(s["n_test"].item()) for s in samples]
-    P_max = max(P_list)
-    N_max = max(N_list)
+    N_list = [int(s["n_test"].item())  for s in samples]
+    P_max  = max(P_list)
+    N_max  = max(N_list)
 
-    x_train = torch.zeros(B, P_max, d_x)
-    x_test = torch.zeros(B, N_max, d_x)
-    y_train = torch.zeros(B, P_max)
-    y_test = torch.zeros(B, N_max)
-    z_train = torch.zeros(B, P_max)
-    z_test = torch.zeros(B, N_max)
+    x_train      = torch.zeros(B, P_max, d_x)
+    x_test       = torch.zeros(B, N_max, d_x)
+    y_train      = torch.zeros(B, P_max)
+    y_test       = torch.zeros(B, N_max)
+    z_train      = torch.zeros(B, P_max)
+    z_test       = torch.zeros(B, N_max)
     log_pdf_test = torch.zeros(B, N_max)
-    train_mask = torch.zeros(B, P_max, dtype=torch.bool)
-    test_mask = torch.zeros(B, N_max, dtype=torch.bool)
-    R_star = torch.zeros(B, N_max, N_max)
-    Sigma_star = torch.zeros(B, N_max, N_max)
-    mu_star = torch.zeros(B, N_max)
-    sigma_star = torch.zeros(B, N_max)
+    train_mask   = torch.zeros(B, P_max, dtype=torch.bool)
+    test_mask    = torch.zeros(B, N_max, dtype=torch.bool)
+    R_star       = torch.zeros(B, N_max, N_max)
+    Sigma_star   = torch.zeros(B, N_max, N_max)
+    mu_star      = torch.zeros(B, N_max)
+    sigma_star   = torch.zeros(B, N_max)
 
     for b, s in enumerate(samples):
         P = P_list[b]
         N = N_list[b]
 
-        x_train[b, :P] = s["x_norm_train"]
-        x_test[b, :N] = s["x_norm_test"]
-        y_train[b, :P] = s["y_train"]
-        y_test[b, :N] = s["y_test"]
-        z_train[b, :P] = s["z_train"]
-        z_test[b, :N] = s["z_test"]
+        x_train[b, :P]      = s["x_norm_train"]
+        x_test[b,  :N]      = s["x_norm_test"]
+        y_train[b, :P]      = s["y_train"]
+        y_test[b,  :N]      = s["y_test"]
+        z_train[b, :P]      = s["z_train"]
+        z_test[b,  :N]      = s["z_test"]
         log_pdf_test[b, :N] = s["log_pdf_test"]
-        train_mask[b, :P] = True
-        test_mask[b, :N] = True
-        R_star[b, :N, :N] = s["R_star"]
+        train_mask[b, :P]   = True
+        test_mask[b,  :N]   = True
+        R_star[b,    :N, :N] = s["R_star"]
         Sigma_star[b, :N, :N] = s["Sigma_star"]
-        mu_star[b, :N] = s["mu_star"]
-        sigma_star[b, :N] = s["sigma_star"]
+        mu_star[b,   :N]    = s["mu_star"]
+        sigma_star[b, :N]   = s["sigma_star"]
 
     return {
-        "x_train": x_train,
-        "x_test": x_test,
-        "y_train": y_train,
-        "y_test": y_test,
-        "z_train": z_train,
-        "z_test": z_test,
+        "x_train":      x_train,
+        "x_test":       x_test,
+        "y_train":      y_train,
+        "y_test":       y_test,
+        "z_train":      z_train,
+        "z_test":       z_test,
         "log_pdf_test": log_pdf_test,
-        "train_mask": train_mask,
-        "test_mask": test_mask,
-        "R_star": R_star,
-        "Sigma_star": Sigma_star,
-        "mu_star": mu_star,
-        "sigma_star": sigma_star,
-        "n_train": torch.tensor(P_list, dtype=torch.long),
-        "n_test": torch.tensor(N_list, dtype=torch.long),
+        "train_mask":   train_mask,
+        "test_mask":    test_mask,
+        "R_star":       R_star,
+        "Sigma_star":   Sigma_star,
+        "mu_star":      mu_star,
+        "sigma_star":   sigma_star,
+        "n_train":      torch.tensor(P_list, dtype=torch.long),
+        "n_test":       torch.tensor(N_list, dtype=torch.long),
     }

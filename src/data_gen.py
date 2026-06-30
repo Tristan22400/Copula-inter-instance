@@ -106,7 +106,7 @@ def rational_quadratic_kernel(
 
 
 def dot_product_kernel(
-    X1: Tensor, X2: Tensor, *, **_
+    X1: Tensor, X2: Tensor, **_
 ) -> Tensor:
     """Linear + bias: alpha2 + X1 @ X2ᵀ.
 
@@ -194,17 +194,22 @@ def gp_posterior(
     noise: float,
     *,
     latent: bool = False,
-) -> tuple[Tensor, Tensor]:
+    return_factors: bool = False,
+) -> tuple:
     """Analytical GP posterior for an arbitrary stationary kernel.
 
     Args:
         latent: if True, return posterior over f* (latent GP), not noisy y*.
                 K_ss excludes the noise term so that R* reflects kernel structure
                 rather than being diluted by σ² in the diagonal.
+        return_factors: if True, also return (L_ff, alpha) so the caller can
+                reuse them for the LOO PIT without a second Cholesky.
 
     Returns:
         mu_star   : (N,)   — posterior mean at test points
         Sigma_star: (N, N) — posterior covariance at test points
+        L_ff      : (P, P) — Cholesky of K_ff  (only if return_factors=True)
+        alpha     : (P,)   — K_ff^{-1} y_train (only if return_factors=True)
     """
     P, N = x_train.shape[0], x_test.shape[0]
 
@@ -222,6 +227,8 @@ def gp_posterior(
     V = torch.linalg.solve_triangular(L_ff, K_sf.T, upper=False)  # (P, N)
     Sigma_star = K_ss - V.T @ V  # (N, N)
     Sigma_star = 0.5 * (Sigma_star + Sigma_star.T)
+    if return_factors:
+        return mu_star, Sigma_star, L_ff, alpha
     return mu_star, Sigma_star
 
 
@@ -337,16 +344,16 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_norm_test = x_norm[P:]
     y_test = y_all[P:]
 
-    # 8. Compute R_star from the GP prior at test points.
-    # K_ss = kernel(X_test, X_test) + nugget·I.  The nugget floor guarantees
-    # min_eig(K_ss) ≥ nugget > 0 (no near-singular oracle).  Off-diagonal
-    # correlations span ±alpha2/(alpha2+nugget) with an arcsine distribution,
-    # giving a rich and diverse training signal.  mu_star is set to the GP
-    # posterior mean so the Y-space marginals remain accurate.
+    # 8. Compute R_star from the GP posterior at test points.
+    # Sigma_star_posterior = K_ss + nugget·I − K_st K_ff⁻¹ K_ts  accounts for
+    # what the training context already explains.  Off-diagonal entries shrink
+    # relative to the prior, giving the correct oracle for the copula the model
+    # must learn: residual dependence after conditioning on training data.
     x_k_train = x_k[:P]
     x_k_test = x_k[P:]
-    Sigma_star = kernel_fn(x_k_test, x_k_test) + nugget * torch.eye(N)
-    mu_star, _ = gp_posterior(x_k_train, y_train, x_k_test, kernel_fn, nugget)
+    mu_star, Sigma_star, L_ff, alpha = gp_posterior(
+        x_k_train, y_train, x_k_test, kernel_fn, nugget, return_factors=True
+    )
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
     return {
@@ -366,4 +373,239 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "period": torch.tensor(period if period is not None else 0.0),
         "rq_alpha": torch.tensor(rq_alpha if rq_alpha is not None else 0.0),
         "kernel_feature_indices": torch.tensor(kernel_cols, dtype=torch.long),
+        # Ephemeral Cholesky factors — consumed by gp_analytical_pit, not saved to disk.
+        "_L_ff": L_ff,    # (P, P) Cholesky of K_ff
+        "_alpha": alpha,  # (P,)   K_ff^{-1} y_train
     }
+
+
+# ---------------------------------------------------------------------------
+# Batched generation (C: vectorised over B episodes simultaneously)
+# ---------------------------------------------------------------------------
+
+
+def _batched_cholesky(K: Tensor) -> Tensor:
+    """Batched Cholesky (B, N, N) → (B, N, N) with automatic jitter for failures."""
+    L, info = torch.linalg.cholesky_ex(K)
+    failed = info.ne(0)
+    if not failed.any():
+        return L
+    eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
+    for jitter in (1e-5, 1e-4, 1e-3, 1e-2, 0.1):
+        if not failed.any():
+            break
+        K = K.clone()
+        K[failed] = K[failed] + jitter * eye
+        L_new, info_new = torch.linalg.cholesky_ex(K)
+        L[failed] = L_new[failed]
+        failed = info_new.ne(0)
+    if failed.any():
+        # Last resort: replace with identity so the episode is invalid but non-crashing.
+        L[failed] = eye.unsqueeze(0).expand_as(L[failed])
+    return L
+
+
+def _batched_kernel_matrix(
+    kernel_name: str,
+    x_k: Tensor,                        # (B, T, k)
+    l: Tensor,                          # (B,)
+    alpha2: Tensor,                     # (B,)
+    period: Optional[Tensor] = None,    # (B,) — periodic kernel only
+    rq_alpha: Optional[Tensor] = None,  # (B,) — rational_quadratic only
+) -> Tensor:
+    """Build B kernel matrices for T points in one vectorised call.
+
+    Returns (B, T, T) WITHOUT nugget on the diagonal.
+    The caller is responsible for adding nugget * I.
+    """
+    B, T, _ = x_k.shape
+    l3     = l.view(B, 1, 1)
+    alpha3 = alpha2.view(B, 1, 1)
+
+    if kernel_name == "dot_product":
+        return x_k @ x_k.permute(0, 2, 1)  # (B, T, T)
+
+    diff  = x_k.unsqueeze(2) - x_k.unsqueeze(1)  # (B, T, T, k)
+    sq    = (diff ** 2).sum(-1)                    # (B, T, T)
+    r     = sq.clamp(min=0.0).sqrt()
+
+    if kernel_name == "rbf":
+        return alpha3 * torch.exp(-sq / (2.0 * l3 ** 2))
+
+    if kernel_name == "matern32":
+        s = math.sqrt(3.0) * r / l3
+        return alpha3 * (1.0 + s) * torch.exp(-s)
+
+    if kernel_name == "cosine":
+        return alpha3 * torch.cos(2.0 * math.pi * r / l3)
+
+    if kernel_name == "periodic":
+        p3 = period.view(B, 1, 1)
+        return alpha3 * torch.exp(-2.0 * torch.sin(math.pi * r / p3) ** 2 / l3 ** 2)
+
+    if kernel_name == "rational_quadratic":
+        r3 = rq_alpha.view(B, 1, 1)
+        return alpha3 * (1.0 + sq / (2.0 * r3 * l3 ** 2)) ** (-r3)
+
+    raise ValueError(f"Unknown kernel '{kernel_name}' in _batched_kernel_matrix.")
+
+
+def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor]]:
+    """Generate B GP episodes in a single vectorised call.
+
+    All B episodes share one kernel type and one (P, N) size (both sampled
+    once per call) but have independent hyperparameters and feature draws.
+    This removes the Python-loop overhead of B separate generate_gp_task calls
+    and enables GPU or CPU-SIMD acceleration for the linear-algebra steps.
+
+    The returned dicts have the same schema as the episodes saved by
+    generate_pit_dataset.py (no kernel metadata).
+
+    Args:
+        cfg    : Hydra config (same as generate_gp_task).
+        B      : number of episodes to generate in this batch.
+        device : torch device string ("cpu" or "cuda").
+
+    Returns:
+        list of B episode dicts ready for torch.save.
+    """
+    import warnings
+
+    d          = cfg.data.d_features
+    nugget_min = float(getattr(cfg.data, "nugget_min", 0.1))
+    nugget_max = float(getattr(cfg.data, "nugget_max", 1.0))
+
+    # --- Shared settings for this batch ---
+    kernel_name = _resolve_kernel_name(cfg)
+    P = random.randint(cfg.data.P_min, cfg.data.P_max)
+    N = random.randint(cfg.data.N_min, cfg.data.N_max)
+    T = P + N
+
+    if kernel_name in ("cosine", "periodic"):
+        k = 1
+    elif kernel_name == "dot_product":
+        k = d
+    else:
+        k = random.randint(
+            int(getattr(cfg.data, "d_kernel_min", 1)),
+            min(int(getattr(cfg.data, "d_kernel_max", 4)), d),
+        )
+
+    # --- Per-episode hyperparameters ---
+    l      = torch.rand(B, device=device) * (cfg.data.l_max      - cfg.data.l_min)      + cfg.data.l_min
+    nugget = torch.rand(B, device=device) * (nugget_max           - nugget_min)           + nugget_min
+    alpha2 = (
+        torch.zeros(B, device=device)
+        if kernel_name == "dot_product"
+        else torch.rand(B, device=device) * (cfg.data.alpha2_max - cfg.data.alpha2_min) + cfg.data.alpha2_min
+    )
+
+    period = rq_alpha = None
+    if kernel_name == "periodic":
+        p_min  = float(getattr(cfg.data, "period_min",   0.5))
+        p_max  = float(getattr(cfg.data, "period_max",   3.0))
+        period = torch.rand(B, device=device) * (p_max - p_min) + p_min
+    if kernel_name == "rational_quadratic":
+        rq_min  = float(getattr(cfg.data, "rq_alpha_min", 0.1))
+        rq_max  = float(getattr(cfg.data, "rq_alpha_max", 5.0))
+        rq_alpha = torch.rand(B, device=device) * (rq_max - rq_min) + rq_min
+
+    # --- Features (B, T, d) ~ U[-5, 5], normalised per episode ---
+    x_raw  = torch.rand(B, T, d, device=device) * 10.0 - 5.0
+    x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
+
+    # --- Select kernel columns ---
+    if kernel_name == "dot_product":
+        x_k = x_norm                                                                # (B, T, d)
+    elif kernel_name in ("cosine", "periodic"):
+        col = torch.randint(0, d, (B,), device=device)                             # (B,)
+        x_k = x_norm.gather(2, col.view(B, 1, 1).expand(B, T, 1))                 # (B, T, 1)
+    else:
+        # Vectorised random column selection: argsort of uniform noise picks k cols
+        col_idx = torch.rand(B, d, device=device).argsort(dim=1)[:, :k]           # (B, k)
+        x_k = x_norm.gather(2, col_idx.unsqueeze(1).expand(B, T, k))              # (B, T, k)
+
+    # --- Build K_all (B, T, T) and sample y jointly ---
+    K_all = _batched_kernel_matrix(kernel_name, x_k, l, alpha2, period, rq_alpha)
+    K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
+    K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
+
+    L_all = _batched_cholesky(K_all)                              # (B, T, T)
+    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # (B, T)
+
+    x_norm_train = x_norm[:, :P]   # (B, P, d)
+    x_norm_test  = x_norm[:, P:]   # (B, N, d)
+    y_train      = y_all[:,  :P]   # (B, P)
+    y_test       = y_all[:,  P:]   # (B, N)
+
+    # --- Sub-matrices of K_all (nugget already on diagonal) ---
+    K_ff = K_all[:, :P, :P]   # (B, P, P)
+    K_sf = K_all[:, P:, :P]   # (B, N, P)
+    K_ss = K_all[:, P:, P:]   # (B, N, N)
+
+    # --- GP posterior (batched) ---
+    L_ff  = _batched_cholesky(K_ff)
+    alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)          # (B, P)
+    mu_star  = (K_sf @ alpha.unsqueeze(-1)).squeeze(-1)                             # (B, N)
+
+    V          = torch.linalg.solve_triangular(L_ff, K_sf.permute(0, 2, 1), upper=False)  # (B, P, N)
+    Sigma_star = K_ss - V.permute(0, 2, 1) @ V                                     # (B, N, N)
+    Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
+
+    # sigma_to_correlation (batched)
+    var_diag   = Sigma_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10)              # (B, N)
+    sigma_star = var_diag.sqrt()
+    inv_s      = var_diag.rsqrt()
+    R_star     = Sigma_star * inv_s.unsqueeze(1) * inv_s.unsqueeze(2)             # (B, N, N)
+    d_diag     = R_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
+    R_star     = R_star / (d_diag.unsqueeze(1) * d_diag.unsqueeze(2))
+
+    # --- LOO PIT for z_train (R&W Eq. 5.12, batched) ---
+    # diag(K_ff^{-1}) = column-squared-norm of L_ff^{-1}
+    eye_P      = torch.eye(P, device=device)
+    L_inv      = torch.linalg.solve_triangular(
+        L_ff, eye_P.unsqueeze(0).expand(B, -1, -1), upper=False
+    )                                                                               # (B, P, P)
+    K_inv_diag = (L_inv ** 2).sum(dim=1).clamp(min=1e-12)                         # (B, P)
+    z_train    = alpha * K_inv_diag.rsqrt()                                       # (B, P)
+
+    # --- Posterior PIT for z_test ---
+    sig_c        = sigma_star.clamp(min=1e-8)
+    z_test       = (y_test - mu_star) / sig_c                                      # (B, N)
+    log_pdf_test = (
+        -0.5 * math.log(2.0 * math.pi) - sig_c.log() - 0.5 * z_test ** 2
+    )                                                                               # (B, N)
+
+    # LOO residuals are N(0,1) by construction (R&W Eq. 5.12); no empirical
+    # rescaling needed.  Filter degenerate episodes instead.
+    z_std = z_train.std(dim=1)
+    degen = (z_std < 0.1) | (z_std > 3.0)
+    if degen.any():
+        warnings.warn(
+            f"generate_gp_batch: {int(degen.sum())}/{B} episodes have degenerate LOO z.",
+            RuntimeWarning,
+        )
+
+    # Reconstruct full posterior covariance (for Y-space oracle)
+    Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
+
+    # --- Pack into list of dicts (single D→H transfer) ---
+    tensors = {
+        "x_norm_train": x_norm_train.cpu(),
+        "x_norm_test":  x_norm_test.cpu(),
+        "y_train":      y_train.cpu(),
+        "y_test":       y_test.cpu(),
+        "z_train":      z_train.cpu(),
+        "z_test":       z_test.cpu(),
+        "log_pdf_test": log_pdf_test.cpu(),
+        "R_star":       R_star.cpu(),
+        "Sigma_star":   Sigma_full.cpu(),
+        "mu_star":      mu_star.cpu(),
+        "sigma_star":   sigma_star.cpu(),
+    }
+    n_tr = torch.tensor(P)
+    n_te = torch.tensor(N)
+    return [
+        {key: val[b] for key, val in tensors.items()} | {"n_train": n_tr, "n_test": n_te}
+        for b in range(B)
+    ]

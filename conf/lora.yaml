@@ -28,3 +28,5 @@ alpha: 16.0
 target: "qkvo"
 stages:
   - icl
+  - row
+  - col
