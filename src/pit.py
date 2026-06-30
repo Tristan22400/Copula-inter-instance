@@ -38,6 +38,7 @@ _TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
 if _TABICL_SRC not in sys.path:
     sys.path.insert(0, _TABICL_SRC)
 
+from data_gen import build_kernel_fn, _safe_cholesky  # noqa: E402
 
 DEFAULT_K_FOLDS = 10
 
@@ -165,3 +166,82 @@ def run_pit(
         "z_test": z_test,
         "log_pdf_test": log_pdf_test,
     }
+
+
+# ---------------------------------------------------------------------------
+# Analytical GP PIT (no model inference required)
+# ---------------------------------------------------------------------------
+
+
+def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
+    """Exact PIT from GP LOO (train) and posterior (test) marginals.
+
+    Since all data is generated from a GP with known hyperparameters, the
+    marginal CDFs are available in closed form — no learned regressor needed.
+
+    Test instances:
+        y_test[i] | D_train ~ N(mu_star[i], sigma_star[i]²)  (exact)
+        z_test[i] = (y_test[i] - mu_star[i]) / sigma_star[i]
+
+    Training instances — exact GP LOO (Rasmussen & Williams, GPML Eq. 5.12):
+        sigma²_i^LOO  = 1 / [K_ff⁻¹]_ii
+        z_train[i]    = alpha_i / sqrt([K_ff⁻¹]_ii)
+        where alpha = K_ff⁻¹ y_train
+
+    Cost: one O(P³) Cholesky per episode vs. O(K × P × forward_pass) for
+    the TabICL K-fold approach.
+
+    Args:
+        task: raw task dict returned by generate_gp_task (must contain
+              kernel, l, alpha2, nugget, period, rq_alpha,
+              kernel_feature_indices, x_norm_train, y_train, y_test,
+              mu_star, sigma_star).
+        eps:  unused (kept for API symmetry with run_pit).
+
+    Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
+    """
+    kernel_name = task["kernel"]
+    l      = task["l"].item()
+    alpha2 = task["alpha2"].item()
+    nugget = task["nugget"].item()
+    # 0.0 sentinel means the param is not applicable for this kernel
+    period   = task["period"].item()   if task["period"].item()   != 0.0 else None
+    rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
+
+    kernel_fn  = build_kernel_fn(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
+    cols       = task["kernel_feature_indices"]
+    x_k_train  = task["x_norm_train"][:, cols]   # (P, k)
+    y_train    = task["y_train"]                  # (P,)
+    y_test     = task["y_test"]                   # (N,)
+    mu_star    = task["mu_star"]                  # (N,) posterior mean
+    sigma_star = task["sigma_star"]               # (N,) posterior marginal std
+
+    # --- Test: posterior marginals are exact Gaussians ---
+    sig_clamped  = sigma_star.clamp(min=1e-8)
+    z_test       = (y_test - mu_star) / sig_clamped
+    log_pdf_test = (
+        -0.5 * math.log(2.0 * math.pi)
+        - sig_clamped.log()
+        - 0.5 * z_test**2
+    )
+
+    # --- Train: exact GP LOO (R&W Eq. 5.12) ---
+    # Reuse L_ff and alpha from generate_gp_task when available (B: no double Cholesky).
+    # Fall back to kernel reconstruction for tasks loaded from disk.
+    P = y_train.shape[0]
+    if "_L_ff" in task and "_alpha" in task:
+        L     = task["_L_ff"]
+        alpha = task["_alpha"]
+    else:
+        K_ff  = kernel_fn(x_k_train, x_k_train) + nugget * torch.eye(P, device=y_train.device)
+        L     = _safe_cholesky(K_ff)
+        alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L).squeeze(-1)   # (P,)
+
+    # diag(K_ff^{-1}) = column-wise squared-norm of L^{-1}
+    L_inv      = torch.linalg.solve_triangular(
+        L, torch.eye(P, device=L.device, dtype=L.dtype), upper=False
+    )                                                                      # (P, P)
+    K_inv_diag = (L_inv**2).sum(dim=0).clamp(min=1e-12)                   # (P,)
+    z_train    = alpha * K_inv_diag.rsqrt()                               # alpha_i/√[K⁻¹]_ii
+
+    return {"z_train": z_train, "z_test": z_test, "log_pdf_test": log_pdf_test}

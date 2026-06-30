@@ -1,12 +1,12 @@
 """
 test_dataset_corr_uniform.py — Verify structural properties of R_star in a dataset folder.
 
-data_gen uses the GP *prior* K_ss = kernel(X_test, X_test) + nugget·I as R_star.
+data_gen uses the GP *posterior* covariance K_ss + nugget·I − K_st K_ff⁻¹ K_ts as R_star.
 This gives:
-  - Well-conditioned (min_eig ≥ nugget/(alpha2+nugget) ≥ 0.033): oracle NLL cannot explode
-  - Wide arcsine-like distribution spanning ±alpha2/(alpha2+nugget): rich training signal
-  - Symmetric: mean ≈ 0, ~50% negative entries
+  - PSD (residual uncertainty after conditioning on training data)
   - Unit diagonal: R_star is a proper correlation matrix
+  - Off-diagonal entries smaller than the prior (training data explains part of the correlation)
+  - Both positive and negative entries (oscillatory kernels like cosine)
 
 Run against a specific folder:
     DATASET_DIR=./data/pit_episodes pytest tests/test_dataset_corr_uniform.py -v
@@ -40,21 +40,32 @@ _N_EPISODES = 500   # episodes to sample
 _SEED = 0
 
 
-def _load_episodes(folder: str, n: int, seed: int):
-    """Load up to *n* episodes; return (off_diag_values, min_eigenvalues)."""
+def _iter_episodes(folder: str):
+    """Yield episode dicts from a folder — handles both shard and individual layout."""
     paths = sorted(
         os.path.join(folder, f)
         for f in os.listdir(folder)
-        if f.endswith(".pt")
+        if f.endswith(".pt") and f != "meta.pt"
     )
+    for p in paths:
+        obj = torch.load(p, map_location="cpu", weights_only=False)
+        if isinstance(obj, list):           # shard: list of episode dicts
+            yield from obj
+        elif isinstance(obj, dict):         # individual task_*.pt
+            yield obj
+
+
+def _load_episodes(folder: str, n: int, seed: int):
+    """Load up to *n* episodes; return (off_diag_values, min_eigenvalues)."""
+    # Collect all episodes first, then subsample deterministically.
+    all_eps = list(_iter_episodes(folder))
     rng = random.Random(seed)
-    rng.shuffle(paths)
-    paths = paths[:n]
+    rng.shuffle(all_eps)
+    episodes = all_eps[:n]
 
     values = []
     min_eigs = []
-    for p in paths:
-        ep = torch.load(p, map_location="cpu", weights_only=False)
+    for ep in episodes:
         R = ep["R_star"]          # (N, N)
         N = R.shape[0]
         mask = ~torch.eye(N, dtype=torch.bool)
@@ -124,28 +135,31 @@ def test_correlations_negative_fraction(off_diag):
 
 
 def test_correlations_std_nonzero(off_diag):
-    """Standard deviation must be substantial — prior R_star has arcsine distribution.
+    """Standard deviation must be non-trivial — posterior R_star has residual structure.
 
-    With the GP prior, off-diagonal correlations span ±alpha2/(alpha2+nugget).
-    Expected std ≈ 0.25–0.55. A value below 0.10 indicates the posterior
-    Schur complement was accidentally re-introduced (narrow posterior regime).
+    With the GP posterior, off-diagonal correlations are shrunk by the Schur complement
+    (training data explains part of the prior correlation). Expected std ≈ 0.02–0.30
+    depending on the kernel and the P/N ratio. A value below 0.01 indicates a degenerate
+    kernel (all correlations collapsed to zero).
     """
     std = off_diag.std().item()
-    assert std > 0.10, (
-        f"Std {std:.3f} too low — expected ≥ 0.10 for prior-based R_star. "
-        f"Check that gp_posterior Schur complement is not subtracted in data_gen.py."
+    assert std > 0.01, (
+        f"Std {std:.4f} too low — posterior R_star correlations appear degenerate."
     )
 
 
 def test_unit_diagonal(dataset_dir):
     """R_star must have unit diagonal (proper correlation matrix)."""
-    pts = sorted(f for f in os.listdir(dataset_dir) if f.endswith(".pt"))[:20]
-    for fname in pts:
-        ep = torch.load(os.path.join(dataset_dir, fname), map_location="cpu", weights_only=False)
+    if not os.path.isdir(dataset_dir):
+        pytest.skip(f"Dataset folder not found: {dataset_dir}")
+    episodes = list(_iter_episodes(dataset_dir))
+    if not episodes:
+        pytest.skip(f"Dataset folder is empty: {dataset_dir}")
+    for i, ep in enumerate(episodes[:20]):
         R = ep["R_star"]
         diag_err = (R.diagonal() - 1.0).abs().max().item()
         assert diag_err < 1e-4, (
-            f"{fname}: diagonal of R_star deviates from 1 by {diag_err:.2e}"
+            f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
         )
 
 

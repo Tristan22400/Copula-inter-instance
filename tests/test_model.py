@@ -13,7 +13,7 @@ Tests verify:
 from __future__ import annotations
 
 import pytest
-import torchs
+import torch
 from conftest import make_batch
 
 from model import build_copula_transformer, build_icl_mask

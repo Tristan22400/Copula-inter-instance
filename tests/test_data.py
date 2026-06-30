@@ -110,11 +110,13 @@ def test_r_star_values_in_minus1_1(small_cfg):
 
 def test_gp_posterior_helper():
     """gp_posterior should return correct shapes and PSD Sigma_star."""
+    from data_gen import build_kernel_fn
     P, N, d = 20, 8, 1
     x_train = torch.randn(P, d)
     y_train = torch.randn(P)
     x_test = torch.randn(N, d)
-    mu, Sigma = gp_posterior(x_train, y_train, x_test, l=1.0, alpha2=1.0, noise=0.1)
+    kernel_fn = build_kernel_fn("rbf", l=1.0, alpha2=1.0)
+    mu, Sigma = gp_posterior(x_train, y_train, x_test, kernel_fn, noise=0.1)
 
     assert mu.shape == (N,)
     assert Sigma.shape == (N, N)
@@ -146,10 +148,14 @@ def test_sigma_to_correlation():
 def _make_sample(P: int, N: int, d: int = 1) -> dict:
     return {
         "x_norm_train": torch.randn(P, d),
-        "z_train": torch.randn(P),
         "x_norm_test": torch.randn(N, d),
+        "y_train": torch.randn(P),
+        "y_test": torch.randn(N),
+        "z_train": torch.randn(P),
         "z_test": torch.randn(N),
+        "log_pdf_test": torch.randn(N),
         "R_star": torch.eye(N),
+        "Sigma_star": torch.eye(N),
         "mu_star": torch.zeros(N),
         "sigma_star": torch.ones(N),
         "n_train": torch.tensor(P),

@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 import wandb
 
@@ -376,18 +376,29 @@ def main(cfg: DictConfig) -> None:
         config=OmegaConf.to_container(cfg, resolve=True),
     )
 
-    all_files = sorted(glob(os.path.join(t.dataset_dir, "*.pt")))
-    if not all_files:
-        raise RuntimeError(
-            f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first."
-        )
-    n_val = min(49, max(1, int(len(all_files) * t.val_fraction)))
-    val_files = all_files[:n_val]
-    train_files = all_files[n_val:]
-    print(f"Train: {len(train_files)} | Val: {len(val_files)} episodes")
+    meta_path   = os.path.join(t.dataset_dir, "meta.pt")
+    shard_files = sorted(glob(os.path.join(t.dataset_dir, "shard_*.pt")))
+
+    if shard_files and os.path.exists(meta_path):
+        full_dataset = CopulaDataset(episode_dir=t.dataset_dir)
+        n = len(full_dataset)
+        n_val = min(49, max(1, int(n * t.val_fraction)))
+        train_dataset = Subset(full_dataset, range(n_val, n))
+        val_dataset   = Subset(full_dataset, range(n_val))
+    else:
+        all_files = sorted(glob(os.path.join(t.dataset_dir, "task_*.pt")))
+        if not all_files:
+            raise RuntimeError(
+                f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first."
+            )
+        n_val = min(49, max(1, int(len(all_files) * t.val_fraction)))
+        train_dataset = CopulaDataset(file_list=all_files[n_val:])
+        val_dataset   = CopulaDataset(file_list=all_files[:n_val])
+
+    print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} episodes")
 
     train_loader = DataLoader(
-        CopulaDataset(file_list=train_files),
+        train_dataset,
         batch_size=t.batch_size,
         collate_fn=collate_fn,
         shuffle=True,
@@ -396,7 +407,7 @@ def main(cfg: DictConfig) -> None:
         persistent_workers=True,
     )
     val_loader = DataLoader(
-        CopulaDataset(file_list=val_files),
+        val_dataset,
         batch_size=t.batch_size,
         collate_fn=collate_fn,
         shuffle=False,
