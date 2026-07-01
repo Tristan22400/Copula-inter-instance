@@ -10,9 +10,18 @@ Methods
   gp_prior_rbf       : RBF prior correlation at test points (median bandwidth,
                        no conditioning on z_train)
   gp_mle_rbf         : GP posterior with MLE-fitted RBF {l, α², σ²_n}
+  gp_mle_ard_rbf     : Same, with one lengthscale per input dimension (ARD)
   gp_mle_matern32    : GP posterior with MLE-fitted Matérn-3/2 kernel
+  gp_mle_ard_matern32: Matérn-3/2 with ARD lengthscales
   gp_mle_periodic    : GP posterior with MLE-fitted Periodic kernel (+ period)
   gp_mle_rq          : GP posterior with MLE-fitted Rational Quadratic (+ rq_α)
+  gp_mle_ard_rq      : Rational Quadratic with ARD lengthscales
+  gp_mle_dot_product : GP posterior with MLE-fitted linear/dot-product kernel
+                       (no lengthscale — only the noise term is fitted)
+  dkl_rbf/matern32/rq/dot_product :
+                       Deep Kernel Learning — MLP(d_x→32→16) feature extractor
+                       feeding a GP layer (chosen kernel), trained jointly by
+                       maximising the marginal log-likelihood
   per_ep_transformer : Small set-transformer trained from scratch on this episode
   icl                : Pretrained CopulaTabICL checkpoint (in-context learning)
   oracle             : Ground-truth R_star from episode file (lower bound)
@@ -24,8 +33,10 @@ Usage
         --ckpt   ./checkpoints/copula_transformer/step_XXXXXX_final.pt \\
         [--n_episodes 50]         # episodes to evaluate
         [--episode_idx 0]         # starting episode index
-        [--n_steps_mle 300]       # Adam steps for GP MLE fitting
+        [--n_steps_mle 300]       # Adam steps for GP MLE fitting (also used for ARD variants)
         [--lr_mle 0.05]           # learning rate for GP MLE
+        [--n_steps_dkl 300]       # Adam steps for Deep Kernel Learning (MLP+GP) fitting
+        [--lr_dkl 0.01]           # learning rate for DKL Adam
         [--n_steps_per_ep 500]    # training steps for PerEpisodeTransformer
         [--patience_per_ep 100]   # early stopping patience (steps without improvement)
         [--plot_episode 0]        # local episode index to plot corr_grid for
@@ -57,6 +68,7 @@ sys.path.insert(0, _HERE)
 from data_gen import (
     _sq_dist,
     _dist,
+    dot_product_kernel,
     matern32_kernel,
     periodic_kernel,
     rational_quadratic_kernel,
@@ -99,25 +111,82 @@ def _gp_lml(
     return -0.5 * (log_det + quad + P * math.log(2.0 * math.pi))
 
 
+def _safe_dist(X1: Tensor, X2: Tensor, eps: float = 1e-12) -> Tensor:
+    """Euclidean distance, safe to backprop through even when X1/X2 depend on
+    a fitted parameter (e.g. after prescaling by a learnable lengthscale).
+
+    data_gen._dist computes sq_dist.clamp(min=0.0).sqrt(), whose gradient is
+    infinite at sq_dist == 0 (every diagonal entry of a self-kernel matrix).
+    When X1/X2 are the raw, non-differentiable input data this never surfaces
+    (autograd never traces through _dist at all), but once X1/X2 are computed
+    as X/l for a learnable l, that diagonal-zero point IS on the graph and the
+    infinite local gradient poisons the whole parameter with NaN on the very
+    first backward call. Adding eps under the sqrt keeps the gradient finite.
+    """
+    return (_sq_dist(X1, X2) + eps).sqrt()
+
+
+# Kernels with a lengthscale that can be fitted by prescaling the inputs
+# (X_scaled = X / l) and dropping l from the kernel formula itself. This is
+# exactly equivalent to the scalar-l formula when l has shape (1,), and
+# generalises correctly to the standard ARD (diagonal-Mahalanobis) distance
+# when l has shape (d_x,). NOT valid for "periodic": its l divides the output
+# of a sin^2 nonlinearity rather than the raw distance, so prescaling would
+# conflate lengthscale with period. "dot_product" has no lengthscale at all.
+# "matern32" is deliberately excluded here (see _safe_dist): its formula needs
+# a sqrt-distance, which requires the NaN-safe helper above rather than
+# data_gen.matern32_kernel's plain _dist when the inputs are prescaled and
+# require grad; it's handled as its own branch in the training loops below.
+_KERNEL_FNS = {
+    "rbf": rbf_kernel,
+    "rational_quadratic": rational_quadratic_kernel,
+}
+
+_ARD_ELIGIBLE = {
+    "rbf": True,
+    "matern32": True,
+    "periodic": False,
+    "rational_quadratic": True,
+    "dot_product": False,
+}
+
+
 def gp_mle_fit(
     X_train: Tensor,
     z_train: Tensor,
     kernel_name: str,
     n_steps: int = 300,
     lr: float = 0.05,
+    ard: bool = False,
 ) -> dict:
     """Fit GP kernel hyperparameters by maximising the log marginal likelihood.
 
-    Returns a dict of fitted scalar tensors: l, alpha2, noise (and period or
-    rq_alpha for kernels that need them).
-    """
-    dtype, device = X_train.dtype, X_train.device
-    P = X_train.shape[0]
-    I = torch.eye(P, dtype=dtype, device=device)
+    Args:
+        ard: if True, fit one lengthscale per input dimension instead of a
+             single shared scalar (only valid for rbf/matern32/rational_quadratic;
+             see _ARD_ELIGIBLE).
 
-    log_l      = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
-    log_alpha2 = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
-    log_noise  = nn.Parameter(torch.full((1,), -2.0, dtype=dtype, device=device))
+    Returns a dict of fitted hyperparameters. "l" (kept as a tensor, not a
+    Python float, so gp_posterior_corr can reuse it for per-dimension
+    rescaling) and "alpha2" are present for every kernel except "dot_product",
+    which has neither (its formula is just X @ Xᵀ). "noise" is always present.
+    "period" / "rq_alpha" are present only for their respective kernels.
+    """
+    assert not (ard and not _ARD_ELIGIBLE[kernel_name]), (
+        f"ard=True is not valid for kernel '{kernel_name}'"
+    )
+    dtype, device = X_train.dtype, X_train.device
+    P, d_x = X_train.shape
+    I = torch.eye(P, dtype=dtype, device=device)
+    has_lengthscale = kernel_name != "dot_product"
+
+    log_noise = nn.Parameter(torch.full((1,), -2.0, dtype=dtype, device=device))
+    params_list: list[nn.Parameter] = [log_noise]
+
+    if has_lengthscale:
+        log_l = nn.Parameter(torch.zeros(d_x if ard else 1, dtype=dtype, device=device))
+        log_alpha2 = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
+        params_list += [log_l, log_alpha2]
 
     extra_params: list[nn.Parameter] = []
     if kernel_name == "periodic":
@@ -126,32 +195,38 @@ def gp_mle_fit(
     elif kernel_name == "rational_quadratic":
         log_rq_alpha = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
         extra_params.append(log_rq_alpha)
+    params_list += extra_params
 
-    opt = Adam([log_l, log_alpha2, log_noise] + extra_params, lr=lr)
+    opt = Adam(params_list, lr=lr)
 
     for _ in range(n_steps):
         opt.zero_grad()
 
-        l       = log_l.clamp(-4.0, 4.0).exp()
-        alpha2  = log_alpha2.clamp(-3.0, 3.0).exp()
-        noise   = log_noise.clamp(-8.0, 2.0).exp()
+        noise = log_noise.clamp(-8.0, 2.0).exp()
 
-        if kernel_name == "rbf":
-            K_prior = alpha2 * torch.exp(-_sq_dist(X_train, X_train) / (2.0 * l**2))
-        elif kernel_name == "matern32":
-            r = _dist(X_train, X_train)
-            s = math.sqrt(3.0) * r / l
-            K_prior = alpha2 * (1.0 + s) * torch.exp(-s)
-        elif kernel_name == "periodic":
-            period  = log_period.clamp(-2.0, 2.0).exp()   # type: ignore[possibly-undefined]
-            r = _dist(X_train, X_train)
-            K_prior = alpha2 * torch.exp(-2.0 * torch.sin(math.pi * r / period) ** 2 / l**2)
-        elif kernel_name == "rational_quadratic":
-            rq_a   = log_rq_alpha.clamp(-2.0, 2.0).exp()  # type: ignore[possibly-undefined]
-            sq     = _sq_dist(X_train, X_train)
-            K_prior = alpha2 * (1.0 + sq / (2.0 * rq_a * l**2)) ** (-rq_a)
+        if kernel_name == "dot_product":
+            # Unmodified — this kernel has no fittable hyperparameter besides noise.
+            K_prior = dot_product_kernel(X_train, X_train)
         else:
-            raise ValueError(f"Unknown kernel: {kernel_name}")
+            l      = log_l.clamp(-4.0, 4.0).exp()          # type: ignore[possibly-undefined]
+            alpha2 = log_alpha2.clamp(-3.0, 3.0).exp()      # type: ignore[possibly-undefined]
+
+            if kernel_name == "periodic":
+                period  = log_period.clamp(-2.0, 2.0).exp()   # type: ignore[possibly-undefined]
+                K_prior = periodic_kernel(X_train, X_train, l=l, alpha2=alpha2, period=period)
+            else:
+                X_s = X_train / l
+                if kernel_name == "matern32":
+                    # Use _safe_dist, not matern32_kernel/data_gen._dist — see _safe_dist docstring.
+                    s_ = math.sqrt(3.0) * _safe_dist(X_s, X_s)
+                    K_prior = alpha2 * (1.0 + s_) * torch.exp(-s_)
+                elif kernel_name == "rational_quadratic":
+                    rq_a    = log_rq_alpha.clamp(-2.0, 2.0).exp()  # type: ignore[possibly-undefined]
+                    K_prior = rational_quadratic_kernel(X_s, X_s, l=1.0, alpha2=alpha2, rq_alpha=rq_a)
+                elif kernel_name in _KERNEL_FNS:
+                    K_prior = _KERNEL_FNS[kernel_name](X_s, X_s, l=1.0, alpha2=alpha2)
+                else:
+                    raise ValueError(f"Unknown kernel: {kernel_name}")
 
         K = K_prior + noise * I
         lml = _gp_lml(z_train, K)
@@ -159,11 +234,10 @@ def gp_mle_fit(
         opt.step()
 
     with torch.no_grad():
-        result = {
-            "l":      log_l.clamp(-4.0, 4.0).exp().item(),
-            "alpha2": log_alpha2.clamp(-3.0, 3.0).exp().item(),
-            "noise":  log_noise.clamp(-8.0, 2.0).exp().item(),
-        }
+        result = {"noise": log_noise.clamp(-8.0, 2.0).exp().item()}
+        if has_lengthscale:
+            result["l"]      = log_l.clamp(-4.0, 4.0).exp().detach()       # type: ignore[possibly-undefined]
+            result["alpha2"] = log_alpha2.clamp(-3.0, 3.0).exp().item()    # type: ignore[possibly-undefined]
         if kernel_name == "periodic":
             result["period"]   = log_period.clamp(-2.0, 2.0).exp().item()   # type: ignore[possibly-undefined]
         elif kernel_name == "rational_quadratic":
@@ -178,6 +252,7 @@ def gp_posterior_corr(
     kernel_name: str,
     params: dict,
     jitter: float = 1e-6,
+    ard: bool = False,
 ) -> Tensor:
     """GP posterior correlation matrix at test points given training context.
 
@@ -185,33 +260,52 @@ def gp_posterior_corr(
         X_train : (P, d_x)
         z_train : (P,)
         X_test  : (N, d_x)
-        kernel_name: one of rbf | matern32 | periodic | rational_quadratic
-        params  : dict with l, alpha2, noise (+ period or rq_alpha)
+        kernel_name: one of rbf | matern32 | periodic | rational_quadratic | dot_product
+        params  : dict as returned by gp_mle_fit
         jitter  : added to posterior covariance diagonal for numerical stability
+        ard     : must match the ard flag used to fit params (only affects a
+                  sanity assertion — the actual scaling is driven by params["l"]'s
+                  shape, which broadcasts correctly either way)
 
     Returns:
         R : (N, N) correlation matrix
     """
     P, N = X_train.shape[0], X_test.shape[0]
     dtype, device = X_train.dtype, X_train.device
-    l, alpha2, noise = params["l"], params["alpha2"], params["noise"]
-    period   = params.get("period", 1.0)
-    rq_alpha = params.get("rq_alpha", 1.0)
-
-    kw = dict(l=l, alpha2=alpha2, period=period, rq_alpha=rq_alpha)
-
-    _KERNELS = {
-        "rbf": rbf_kernel,
-        "matern32": matern32_kernel,
-        "periodic": periodic_kernel,
-        "rational_quadratic": rational_quadratic_kernel,
-    }
-    kfn = _KERNELS[kernel_name]
+    noise = params["noise"]
 
     with torch.no_grad():
-        K_ff = kfn(X_train, X_train, **kw) + noise * torch.eye(P, dtype=dtype, device=device)
-        K_sf = kfn(X_test, X_train, **kw)    # (N, P)
-        K_ss = kfn(X_test, X_test, **kw)     # (N, N)
+        if kernel_name == "dot_product":
+            K_ff = dot_product_kernel(X_train, X_train) + noise * torch.eye(P, dtype=dtype, device=device)
+            K_sf = dot_product_kernel(X_test, X_train)
+            K_ss = dot_product_kernel(X_test, X_test)
+        else:
+            l, alpha2 = params["l"], params["alpha2"]
+            if not ard:
+                assert torch.as_tensor(l).numel() == 1, "ard=False but params['l'] is not scalar"
+
+            if kernel_name == "periodic":
+                period = params.get("period", 1.0)
+                K_ff = periodic_kernel(X_train, X_train, l=l, alpha2=alpha2, period=period) \
+                    + noise * torch.eye(P, dtype=dtype, device=device)
+                K_sf = periodic_kernel(X_test, X_train, l=l, alpha2=alpha2, period=period)
+                K_ss = periodic_kernel(X_test, X_test, l=l, alpha2=alpha2, period=period)
+            else:
+                # No backward pass happens in this no_grad block, so it's safe to use
+                # data_gen.matern32_kernel's plain (unstabilized) distance here even
+                # though the training loop needs _safe_dist instead (see its docstring).
+                Xtr, Xte = X_train / l, X_test / l
+                rq_alpha = params.get("rq_alpha", 1.0)
+                if kernel_name == "matern32":
+                    kfn = matern32_kernel
+                elif kernel_name == "rational_quadratic":
+                    kfn = rational_quadratic_kernel
+                else:
+                    kfn = _KERNEL_FNS[kernel_name]
+                kw  = dict(l=1.0, alpha2=alpha2, rq_alpha=rq_alpha)
+                K_ff = kfn(Xtr, Xtr, **kw) + noise * torch.eye(P, dtype=dtype, device=device)
+                K_sf = kfn(Xte, Xtr, **kw)    # (N, P)
+                K_ss = kfn(Xte, Xte, **kw)     # (N, N)
 
         L_ff = _safe_cholesky(K_ff)
         V = torch.linalg.solve_triangular(L_ff, K_sf.T, upper=False)  # (P, N)
@@ -250,6 +344,116 @@ class _MLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+# Deep Kernel Learning (DKL)
+# ---------------------------------------------------------------------------
+
+# _MLP is already exactly Linear(d_x,32) -> SiLU -> Dropout -> Linear(32,16)
+# when instantiated with dropout=0.0 (a no-op) — reused here under a
+# descriptive alias rather than duplicating the class.
+DKLFeatureExtractor = _MLP
+
+
+def eval_dkl_mle(
+    X_train: Tensor,
+    z_train: Tensor,
+    X_test: Tensor,
+    kernel_name: str = "rbf",
+    n_steps: int = 300,
+    lr: float = 0.01,
+    hidden_dim: int = 32,
+    latent_dim: int = 16,
+) -> Tensor:
+    """Deep Kernel Learning: MLP feature extractor + GP layer, trained jointly
+    by maximising the marginal log-likelihood, evaluated on the test set.
+
+    The GP hyperparameters on the latent space use a single scalar lengthscale
+    (never ARD) — the MLP's own linear output layer can already learn an
+    arbitrary per-latent-dimension scaling, so a separate ARD lengthscale
+    would be redundant and would only add optimisation instability.
+
+    kernel_name: one of rbf | matern32 | rational_quadratic | dot_product.
+    "periodic" is not supported here: it is only a valid PD kernel in 1D, but
+    the latent space has a fixed dimensionality (latent_dim), so it cannot be
+    routed around the way ARD-periodic is (see gp_mle_fit).
+
+    Returns:
+        R : (N, N) posterior correlation matrix at the test points.
+    """
+    if kernel_name == "periodic":
+        raise ValueError("eval_dkl_mle does not support kernel_name='periodic' "
+                          "(not PD in a >1D latent space)")
+
+    dtype, device = X_train.dtype, X_train.device
+    d_x = X_train.shape[1]
+    P = X_train.shape[0]
+    I = torch.eye(P, dtype=dtype, device=device)
+    has_lengthscale = kernel_name != "dot_product"
+
+    mlp = DKLFeatureExtractor(d_x, hidden_dim, latent_dim, dropout=0.0).to(device)
+
+    log_noise = nn.Parameter(torch.full((1,), -2.0, dtype=dtype, device=device))
+    params_list: list[nn.Parameter] = list(mlp.parameters()) + [log_noise]
+
+    if has_lengthscale:
+        log_l = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))  # scalar — no ARD in latent space
+        log_alpha2 = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
+        params_list += [log_l, log_alpha2]
+
+    extra_params: list[nn.Parameter] = []
+    if kernel_name == "rational_quadratic":
+        log_rq_alpha = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
+        extra_params.append(log_rq_alpha)
+    params_list += extra_params
+
+    opt = Adam(params_list, lr=lr)
+
+    mlp.train()
+    for _ in range(n_steps):
+        opt.zero_grad()
+
+        Z = mlp(X_train)
+        noise = log_noise.clamp(-8.0, 2.0).exp()
+
+        if kernel_name == "dot_product":
+            K_prior = dot_product_kernel(Z, Z)
+        else:
+            l      = log_l.clamp(-4.0, 4.0).exp()          # type: ignore[possibly-undefined]
+            alpha2 = log_alpha2.clamp(-3.0, 3.0).exp()      # type: ignore[possibly-undefined]
+            Z_s = Z / l
+            if kernel_name == "matern32":
+                # Z always requires grad here (through the MLP), so — same as
+                # gp_mle_fit — data_gen.matern32_kernel's plain _dist would give a
+                # NaN gradient at the diagonal (zero self-distance); use _safe_dist.
+                s_ = math.sqrt(3.0) * _safe_dist(Z_s, Z_s)
+                K_prior = alpha2 * (1.0 + s_) * torch.exp(-s_)
+            elif kernel_name == "rational_quadratic":
+                rq_a    = log_rq_alpha.clamp(-2.0, 2.0).exp()  # type: ignore[possibly-undefined]
+                K_prior = rational_quadratic_kernel(Z_s, Z_s, l=1.0, alpha2=alpha2, rq_alpha=rq_a)
+            elif kernel_name in _KERNEL_FNS:
+                K_prior = _KERNEL_FNS[kernel_name](Z_s, Z_s, l=1.0, alpha2=alpha2)
+            else:
+                raise ValueError(f"Unknown kernel: {kernel_name}")
+
+        K = K_prior + noise * I
+        lml = _gp_lml(z_train, K)
+        (-lml).backward()
+        opt.step()
+
+    with torch.no_grad():
+        mlp.eval()
+        Z_train, Z_test = mlp(X_train), mlp(X_test)
+
+        params = {"noise": log_noise.clamp(-8.0, 2.0).exp().item()}
+        if has_lengthscale:
+            params["l"]      = log_l.clamp(-4.0, 4.0).exp().detach()       # type: ignore[possibly-undefined]
+            params["alpha2"] = log_alpha2.clamp(-3.0, 3.0).exp().item()    # type: ignore[possibly-undefined]
+        if kernel_name == "rational_quadratic":
+            params["rq_alpha"] = log_rq_alpha.clamp(-2.0, 2.0).exp().item()  # type: ignore[possibly-undefined]
+
+    return gp_posterior_corr(Z_train, z_train, Z_test, kernel_name, params, ard=False)
 
 
 class _SelfAttn(nn.Module):
@@ -503,6 +707,8 @@ def _eval_episode(
     icl_rank: int,
     n_steps_mle: int,
     lr_mle: float,
+    n_steps_dkl: int,
+    lr_dkl: float,
     n_steps_per_ep: int,
     patience_per_ep: int,
     device: torch.device,
@@ -535,30 +741,58 @@ def _eval_episode(
     nlls["gp_prior_rbf"] = _corr_nll_single(R_prior, z_test)
     R_dict["gp_prior_rbf"] = R_prior
 
-    # --- GP MLE baselines ---
-    _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic"]
+    # --- GP MLE baselines (plain + ARD for lengthscale kernels) ---
+    _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic", "dot_product"]
     _LABEL_MAP  = {
-        "rbf":                "gp_mle_rbf",
-        "matern32":           "gp_mle_matern32",
-        "periodic":           "gp_mle_periodic",
-        "rational_quadratic": "gp_mle_rq",
+        ("rbf", False):                "gp_mle_rbf",
+        ("rbf", True):                 "gp_mle_ard_rbf",
+        ("matern32", False):           "gp_mle_matern32",
+        ("matern32", True):            "gp_mle_ard_matern32",
+        ("periodic", False):           "gp_mle_periodic",
+        ("rational_quadratic", False): "gp_mle_rq",
+        ("rational_quadratic", True):  "gp_mle_ard_rq",
+        ("dot_product", False):        "gp_mle_dot_product",
     }
     # The exp-sine-squared (periodic) kernel applied to Euclidean distance is
     # only a valid PD kernel for 1D inputs. For d > 1 the kernel matrix is not
-    # PSD regardless of hyperparameters, so MLE fitting diverges wildly.
+    # PSD regardless of hyperparameters, so MLE fitting diverges wildly. It's
+    # also excluded from ARD (see _ARD_ELIGIBLE): with a single input dimension,
+    # a per-dimension lengthscale is a no-op, so there's nothing to add.
     _periodic_valid = (d_x == 1)
     for kname in _GP_KERNELS:
-        label = _LABEL_MAP[kname]
-        if kname == "periodic" and not _periodic_valid:
-            nlls[label]  = float("nan")
-            R_dict[label] = R_I.clone()
-            continue
+        for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
+            label = _LABEL_MAP[(kname, ard)]
+            if kname == "periodic" and not _periodic_valid:
+                nlls[label]  = float("nan")
+                R_dict[label] = R_I.clone()
+                continue
+            try:
+                params = gp_mle_fit(X_train, z_train, kname,
+                                    n_steps=n_steps_mle, lr=lr_mle, ard=ard)
+                R_gp = gp_posterior_corr(X_train, z_train, X_test, kname, params, ard=ard)
+                nlls[label]  = _corr_nll_single(R_gp, z_test)
+                R_dict[label] = R_gp
+            except Exception as exc:
+                print(f"  [{label}] failed: {exc}")
+                nlls[label]  = float("nan")
+                R_dict[label] = R_I.clone()
+
+    # --- Deep Kernel Learning (MLP + GP, jointly trained), across multiple kernels ---
+    # "periodic" excluded: not PD in the fixed 16-dim latent space at any dimensionality.
+    _DKL_KERNELS   = ["rbf", "matern32", "rational_quadratic", "dot_product"]
+    _DKL_LABEL_MAP = {
+        "rbf":                "dkl_rbf",
+        "matern32":           "dkl_matern32",
+        "rational_quadratic": "dkl_rq",
+        "dot_product":        "dkl_dot_product",
+    }
+    for kname in _DKL_KERNELS:
+        label = _DKL_LABEL_MAP[kname]
         try:
-            params = gp_mle_fit(X_train, z_train, kname,
-                                n_steps=n_steps_mle, lr=lr_mle)
-            R_gp = gp_posterior_corr(X_train, z_train, X_test, kname, params)
-            nlls[label]  = _corr_nll_single(R_gp, z_test)
-            R_dict[label] = R_gp
+            R_dkl = eval_dkl_mle(X_train, z_train, X_test, kernel_name=kname,
+                                  n_steps=n_steps_dkl, lr=lr_dkl)
+            nlls[label]  = _corr_nll_single(R_dkl, z_test)
+            R_dict[label] = R_dkl
         except Exception as exc:
             print(f"  [{label}] failed: {exc}")
             nlls[label]  = float("nan")
@@ -614,15 +848,23 @@ def _eval_episode(
 
 
 _METHOD_ORDER = [
-    ("independence",       "Independence"),
-    ("gp_prior_rbf",       "GP-Prior-RBF"),
-    ("gp_mle_rbf",         "GP-MLE-RBF"),
-    ("gp_mle_matern32",    "GP-MLE-Matern32"),
-    ("gp_mle_periodic",    "GP-MLE-Periodic"),
-    ("gp_mle_rq",          "GP-MLE-RQ"),
-    ("per_ep_transformer", "PerEp-Transformer"),
-    ("icl",                "ICL (pretrained)"),
-    ("oracle",             "Oracle"),
+    ("independence",        "Independence"),
+    ("gp_prior_rbf",        "GP-Prior-RBF"),
+    ("gp_mle_rbf",          "GP-MLE-RBF"),
+    ("gp_mle_ard_rbf",      "GP-MLE-ARD-RBF"),
+    ("gp_mle_matern32",     "GP-MLE-Matern32"),
+    ("gp_mle_ard_matern32", "GP-MLE-ARD-Matern32"),
+    ("gp_mle_periodic",     "GP-MLE-Periodic"),
+    ("gp_mle_rq",           "GP-MLE-RQ"),
+    ("gp_mle_ard_rq",       "GP-MLE-ARD-RQ"),
+    ("gp_mle_dot_product",  "GP-MLE-DotProduct"),
+    ("dkl_rbf",             "Deep Kernel Learning (RBF)"),
+    ("dkl_matern32",        "Deep Kernel Learning (Matern32)"),
+    ("dkl_rq",              "Deep Kernel Learning (RQ)"),
+    ("dkl_dot_product",     "Deep Kernel Learning (DotProduct)"),
+    ("per_ep_transformer",  "PerEp-Transformer"),
+    ("icl",                 "ICL (pretrained)"),
+    ("oracle",              "Oracle"),
 ]
 
 
@@ -632,7 +874,7 @@ def _print_table(all_nlls: list[dict[str, float]]) -> None:
     stds  = {k: float(np.nanstd( [m.get(k, float("nan")) for m in all_nlls]))
              for k, _ in _METHOD_ORDER}
 
-    col = 22
+    col = max(22, max(len(label) for _, label in _METHOD_ORDER) + 2)
     total = col + 2 * 12
     print(f"\n{'─' * total}")
     print(f"Inter-instance copula NLL (z-space) — lower is better  [N={len(all_nlls)} episodes]")
@@ -664,9 +906,13 @@ def main() -> None:
     parser.add_argument("--n_episodes",   type=int,   default=50)
     parser.add_argument("--episode_idx",  type=int,   default=0)
     parser.add_argument("--n_steps_mle",  type=int,   default=300,
-                        help="Adam steps for GP kernel MLE fitting")
+                        help="Adam steps for GP kernel MLE fitting (also used for ARD variants)")
     parser.add_argument("--lr_mle",       type=float, default=0.05,
                         help="Learning rate for GP MLE Adam")
+    parser.add_argument("--n_steps_dkl",  type=int,   default=300,
+                        help="Adam steps for Deep Kernel Learning (MLP+GP) fitting")
+    parser.add_argument("--lr_dkl",       type=float, default=0.01,
+                        help="Learning rate for DKL Adam")
     parser.add_argument("--n_steps_per_ep", type=int, default=500,
                         help="Training steps for PerEpisodeTransformer")
     parser.add_argument("--patience_per_ep", type=int, default=100,
@@ -714,8 +960,8 @@ def main() -> None:
 
     print(f"\nEvaluating {n_ep} episodes from {dataset_dir} (start={args.episode_idx})")
     print(f"  Dataset size: {n_available} episodes")
-    print(f"  GP MLE: {args.n_steps_mle} steps | PerEp: {args.n_steps_per_ep} steps "
-          f"(patience={args.patience_per_ep})")
+    print(f"  GP MLE: {args.n_steps_mle} steps | DKL: {args.n_steps_dkl} steps | "
+          f"PerEp: {args.n_steps_per_ep} steps (patience={args.patience_per_ep})")
 
     for local_i in range(n_ep):
         ep_i = args.episode_idx + local_i
@@ -730,6 +976,8 @@ def main() -> None:
             icl_rank=icl_rank,
             n_steps_mle=args.n_steps_mle,
             lr_mle=args.lr_mle,
+            n_steps_dkl=args.n_steps_dkl,
+            lr_dkl=args.lr_dkl,
             n_steps_per_ep=args.n_steps_per_ep,
             patience_per_ep=args.patience_per_ep,
             device=device,
