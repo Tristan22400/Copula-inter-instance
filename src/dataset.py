@@ -18,10 +18,10 @@ import os
 import random
 from collections import OrderedDict
 from glob import glob
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 class CopulaDataset(Dataset):
@@ -30,13 +30,21 @@ class CopulaDataset(Dataset):
     Auto-detects individual (task_*.pt) or sharded (shard_*.pt + meta.pt) layout.
     """
 
-    _SHARD_CACHE_SIZE = 4   # shards kept in memory per worker process
+    _SHARD_CACHE_SIZE = 4   # default shards kept in memory per worker process
 
     def __init__(
         self,
         episode_dir: Optional[str] = None,
         file_list: Optional[List[str]] = None,
+        shard_cache_size: Optional[int] = None,
     ):
+        # Override the default cache size — needed so it can be sized to hold
+        # a full ShardBlockSampler block (otherwise the 4-slot default
+        # thrashes against a larger block, since each worker still touches
+        # every shard in the active block).
+        if shard_cache_size is not None:
+            self._SHARD_CACHE_SIZE = shard_cache_size
+
         if file_list is not None:
             # Explicit list → individual-file mode (backward compat)
             self._init_individual(sorted(file_list))
@@ -86,6 +94,13 @@ class CopulaDataset(Dataset):
     # ------------------------------------------------------------------
     # Dataset protocol
     # ------------------------------------------------------------------
+
+    @property
+    def shard_size(self) -> int:
+        """Episodes per shard (only meaningful in sharded mode)."""
+        if self._mode != "sharded":
+            raise AttributeError("shard_size is only defined for sharded-layout datasets.")
+        return self._shard_size
 
     def __len__(self) -> int:
         if self._mode == "individual":
@@ -213,3 +228,44 @@ def collate_fn(samples: List[dict]) -> dict:
         "n_train":      torch.tensor(P_list, dtype=torch.long),
         "n_test":       torch.tensor(N_list, dtype=torch.long),
     }
+
+
+class ShardBlockSampler(Sampler[int]):
+    """Epoch sampler for sharded datasets: shuffles at shard-block granularity
+    instead of globally, so at most ``block_shards`` shards need to be
+    resident at once (avoids one-full-shard-load-per-sample thrashing on
+    network storage when the dataset spans thousands of shards).
+
+    Still yields a true permutation of ``range(len(subset_indices))`` each
+    epoch — every position is produced exactly once, nothing is skipped or
+    repeated — identical contract to ``shuffle=True``. Only the *order* is
+    weaker: fully random within a block of ``block_shards`` shards, but not
+    reshuffled across blocks.
+
+    ``subset_indices`` maps each local position (what the sampler yields,
+    i.e. what a wrapping ``Subset`` expects) to its *global* dataset index,
+    used only to look up which shard that position lives in. Pass
+    ``train_dataset.indices`` when wrapping a ``torch.utils.data.Subset``.
+    """
+
+    def __init__(self, subset_indices: Sequence[int], shard_size: int, block_shards: int = 16):
+        self.subset_indices = list(subset_indices)
+        self.shard_size = shard_size
+        self.block_shards = block_shards
+
+    def __len__(self) -> int:
+        return len(self.subset_indices)
+
+    def __iter__(self):
+        groups: dict[int, list[int]] = {}
+        for local_pos, global_idx in enumerate(self.subset_indices):
+            groups.setdefault(global_idx // self.shard_size, []).append(local_pos)
+        shard_ids = list(groups.keys())
+
+        shard_order = [shard_ids[i] for i in torch.randperm(len(shard_ids)).tolist()]
+        for start in range(0, len(shard_order), self.block_shards):
+            block_positions: list[int] = []
+            for sid in shard_order[start : start + self.block_shards]:
+                block_positions.extend(groups[sid])
+            for i in torch.randperm(len(block_positions)).tolist():
+                yield block_positions[i]

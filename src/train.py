@@ -15,8 +15,8 @@ from __future__ import annotations
 import math
 import os
 import sys
+import time
 from glob import glob
-from itertools import cycle
 
 import hydra
 import matplotlib
@@ -35,7 +35,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from dataset import CopulaDataset, collate_fn
+from dataset import CopulaDataset, ShardBlockSampler, collate_fn
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
 from muon import Muon
@@ -364,10 +364,23 @@ def main(cfg: DictConfig) -> None:
     )
 
     t = cfg.training
+    dataset_path = os.path.normpath(t.dataset_dir)
+    dataset_parent, dataset_leaf = os.path.split(dataset_path)
+    dataset_name = f"{os.path.basename(dataset_parent)}_{dataset_leaf}" if dataset_parent else dataset_leaf
+    lora_cfg = cfg.get("lora", None)
+    lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
+    if lora_enabled:
+        lora_stages = "+".join(lora_cfg.get("stages", ["icl"]))
+        lora_str = f"_lora-r{lora_cfg.get('rank', 8)}-a{lora_cfg.get('alpha', 16.0)}-{lora_stages}"
+    else:
+        lora_str = "_nolora"
+    unfreeze = bool(cfg.model.get("unfreeze_backbone", False))
     run_name = (
-        f"copula_r={cfg.model.rank}"
-        f"_lr={t.muon_lr}_steps={t.steps}"
-        f"_unfreeze={bool(cfg.model.get('unfreeze_backbone', False))}"
+        f"{dataset_name}"
+        f"_r={cfg.model.rank}"
+        f"_lr={t.muon_lr}"
+        f"_unfreeze={unfreeze}"
+        f"{lora_str}"
     )
     wandb.init(
         project=cfg.wandb.project,
@@ -379,12 +392,30 @@ def main(cfg: DictConfig) -> None:
     meta_path   = os.path.join(t.dataset_dir, "meta.pt")
     shard_files = sorted(glob(os.path.join(t.dataset_dir, "shard_*.pt")))
 
+    train_sampler = None
     if shard_files and os.path.exists(meta_path):
-        full_dataset = CopulaDataset(episode_dir=t.dataset_dir)
+        shard_block_shards = int(t.get("shard_block_shards", 16))
+        # Cache must hold a full active block, or each worker still thrashes
+        # against the block's shards one-by-one (+4 margin: workers process
+        # batches round-robin, so a worker can straddle two blocks briefly).
+        full_dataset = CopulaDataset(
+            episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4
+        )
         n = len(full_dataset)
         n_val = min(49, max(1, int(n * t.val_fraction)))
         train_dataset = Subset(full_dataset, range(n_val, n))
         val_dataset   = Subset(full_dataset, range(n_val))
+        # Sharded datasets can span thousands of shards; a global shuffle
+        # scatters each batch across dozens of them, thrashing the shard LRU
+        # cache (dataset.py) with repeated full-shard reloads from disk/NFS.
+        # Shuffle at shard-block granularity instead — still a true
+        # per-epoch permutation (see ShardBlockSampler docstring), just with
+        # locality-friendly ordering.
+        train_sampler = ShardBlockSampler(
+            train_dataset.indices,
+            shard_size=full_dataset.shard_size,
+            block_shards=shard_block_shards,
+        )
     else:
         all_files = sorted(glob(os.path.join(t.dataset_dir, "task_*.pt")))
         if not all_files:
@@ -401,10 +432,12 @@ def main(cfg: DictConfig) -> None:
         train_dataset,
         batch_size=t.batch_size,
         collate_fn=collate_fn,
-        shuffle=True,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
         num_workers=4,
         pin_memory=(device == "cuda"),
         persistent_workers=True,
+        prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -414,12 +447,14 @@ def main(cfg: DictConfig) -> None:
         num_workers=4,
         pin_memory=(device == "cuda"),
         persistent_workers=True,
+        prefetch_factor=4,
     )
 
-    torch._dynamo.config.capture_scalar_outputs = True
     model = build_copula_transformer(cfg).to(device)
-    model = torch.compile(model, dynamic=True)
-    wandb.watch(model, log="gradients", log_freq=500)
+    if bool(t.get("compile", False)):
+        torch._dynamo.config.capture_scalar_outputs = True
+        model = torch.compile(model, dynamic=True)
+    wandb.watch(model, log="gradients", log_freq=5000)
 
     n_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_train_params:,}")
@@ -467,19 +502,66 @@ def main(cfg: DictConfig) -> None:
     aux_mse_weight = float(t.get("aux_mse_weight", 0.0))
 
     model.train()
-    data_iter = cycle(train_loader)
+    # NOT itertools.cycle(train_loader): cycle() caches every yielded batch
+    # forever to replay on the next lap, which (a) freezes the sample order
+    # after the first epoch — no reshuffling ever again — and (b) for a
+    # multi-million-episode dataset means caching hundreds of GB of batch
+    # tensors in RAM. Re-creating the iterator on StopIteration instead reuses
+    # the persistent workers but calls the sampler fresh each epoch, so both
+    # the plain RandomSampler and ShardBlockSampler reshuffle every pass.
+    train_iter = iter(train_loader)
     loss_ema: float | None = None
     _EMA_ALPHA = 0.98
+    _triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    # ---- Lightweight per-phase profiling -----------------------------------
+    # GPU phases are timed with cuda.Event pairs (queued async, no sync cost);
+    # they're only read out (which syncs) once per log_every window, matching
+    # the existing "defer syncs to logging steps" pattern below. The data-fetch
+    # phase is plain CPU wall time (waiting on the DataLoader iterator).
+    _prof_phases = ("forward", "loss", "backward_step")
+    _prof_ms = {k: 0.0 for k in ("data",) + _prof_phases}
+    _prof_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = (
+        {k: [] for k in _prof_phases} if device == "cuda" else {}
+    )
+    _prof_n = 0
+    _last_log_wall = time.perf_counter()
+    _last_log_step = 0
+
+    def _phase_start():
+        if device == "cuda":
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            return ev
+        return time.perf_counter()
+
+    def _phase_end(name, start):
+        if device == "cuda":
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            _prof_events[name].append((start, end))
+        else:
+            _prof_ms[name] += (time.perf_counter() - start) * 1000.0
 
     for step in range(t.steps + 1):
-        batch = next(data_iter)
+        _t_data0 = time.perf_counter()
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
         # non_blocking overlaps H→D transfer with previous GPU work (pin_memory=True)
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
 
         optimizer.zero_grad(set_to_none=True)
+        _ev_fwd0 = _phase_start()
         with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
             out = model(batch)
+        _phase_end("forward", _ev_fwd0)
+
         # Loss in float32 — Cholesky / log-det want full precision.
+        _ev_loss0 = _phase_start()
         Sigma = low_rank_correlation(
             out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
         )
@@ -497,14 +579,18 @@ def main(cfg: DictConfig) -> None:
         if aux_mse_weight > 0.0:
             N_t = Sigma.shape[1]
             mask_2d_t = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
-            ri_t, ci_t = torch.triu_indices(N_t, N_t, offset=1, device=Sigma.device)
+            if N_t not in _triu_cache:
+                _triu_cache[N_t] = torch.triu_indices(N_t, N_t, offset=1, device=Sigma.device)
+            ri_t, ci_t = _triu_cache[N_t]
             valid_off_t = mask_2d_t[:, ri_t, ci_t]  # (B, n_pairs)
             if valid_off_t.any():
                 pred_off = Sigma[:, ri_t, ci_t][valid_off_t]
                 ora_off = batch["R_star"].float()[:, ri_t, ci_t][valid_off_t]
                 aux_mse = ((pred_off - ora_off) ** 2).mean()
             loss = loss + aux_mse_weight * aux_mse
+        _phase_end("loss", _ev_loss0)
 
+        _ev_bwd0 = _phase_start()
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -517,6 +603,8 @@ def main(cfg: DictConfig) -> None:
             optimizer.step()
 
         scheduler.step()
+        _phase_end("backward_step", _ev_bwd0)
+        _prof_n += 1
 
         # Defer .item() / float() GPU syncs to logging steps — saves 2+ syncs/step
         if step % t.log_every == 0:
@@ -531,28 +619,79 @@ def main(cfg: DictConfig) -> None:
             with torch.no_grad():
                 w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
                 sig_stats = _sigma_stats(Sigma, batch["test_mask"])
+                # Diagnostic for the non-finite-slice masking in _safe_cholesky
+                # (loss.py), which silently substitutes identity for any
+                # corrupted episode rather than warning per-occurrence.
+                sigma_nonfinite = int(
+                    (~torch.isfinite(Sigma).flatten(1).all(-1)).sum().item()
+                )
+
+            # ---- Profiling readout (one sync here, piggy-backing on the ----
+            # ---- syncs the .item() calls above already forced) ------------
+            if device == "cuda" and _prof_n > 0:
+                torch.cuda.synchronize()
+                for name in _prof_phases:
+                    _prof_ms[name] += sum(s.elapsed_time(e) for s, e in _prof_events[name])
+                    _prof_events[name].clear()
+            now = time.perf_counter()
+            steps_done = max(step - _last_log_step, 1)
+            step_ms = {k: v / _prof_n for k, v in _prof_ms.items()} if _prof_n else {k: 0.0 for k in _prof_ms}
+            wall_step_ms = (now - _last_log_wall) / steps_done * 1000.0
+            steps_per_sec = steps_done / max(now - _last_log_wall, 1e-9)
+            _last_log_wall = now
+            _last_log_step = step
+            for k in _prof_ms:
+                _prof_ms[k] = 0.0
+            _prof_n = 0
+
+            # ---- GPU memory share: fraction of device VRAM capacity held ----
+            # (distinct from wandb's system "GPU Memory Access %" panel, which
+            # is a time-based bandwidth-utilization metric, not a capacity share)
+            if device == "cuda":
+                _free_b, _total_b = torch.cuda.mem_get_info()
+                mem_alloc_pct = 100.0 * torch.cuda.memory_allocated() / _total_b
+                mem_reserved_pct = 100.0 * torch.cuda.memory_reserved() / _total_b
+                mem_peak_pct = 100.0 * torch.cuda.max_memory_allocated() / _total_b
+            else:
+                mem_alloc_pct = mem_reserved_pct = mem_peak_pct = 0.0
+
             wandb.log(
                 {
-                    "train/y_nll_total":        loss_val,
-                    "train/y_nll_copula":       cop_val,
-                    "train/y_nll_marginal":     mar_val,
-                    "train/aux_mse":            aux_mse_val,
-                    "train/lr":                 lr_now,
-                    "train/grad_norm":          grad_norm_val,
-                    "train/amp_scale":          amp_scale,
-                    "train/loss_ema":           loss_ema,
-                    "train/W_norm_mean":        w_norm_mean,
-                    "train/sigma_offdiag_mean": sig_stats["offdiag_mean"],
+                    "train/y_nll_total":          loss_val,
+                    "train/y_nll_copula":         cop_val,
+                    "train/y_nll_marginal":       mar_val,
+                    "train/aux_mse":              aux_mse_val,
+                    "train/lr":                   lr_now,
+                    "train/grad_norm":            grad_norm_val,
+                    "train/amp_scale":            amp_scale,
+                    "train/loss_ema":             loss_ema,
+                    "train/W_norm_mean":          w_norm_mean,
+                    "train/sigma_offdiag_mean":   sig_stats["offdiag_mean"],
+                    "train/sigma_nonfinite_count": sigma_nonfinite,
+                    "perf/step_ms":                wall_step_ms,
+                    "perf/steps_per_sec":          steps_per_sec,
+                    "perf/data_ms":                step_ms["data"],
+                    "perf/forward_ms":             step_ms["forward"],
+                    "perf/loss_ms":                step_ms["loss"],
+                    "perf/backward_step_ms":       step_ms["backward_step"],
+                    "perf/mem_allocated_pct":      mem_alloc_pct,
+                    "perf/mem_reserved_pct":        mem_reserved_pct,
+                    "perf/mem_peak_pct":           mem_peak_pct,
                 },
                 step=step,
             )
             aux_str = f" aux_mse={aux_mse_val:.4f}" if aux_mse_weight > 0.0 else ""
+            nonfinite_str = f" | sigma_nonfinite={sigma_nonfinite}" if sigma_nonfinite else ""
             print(
                 f"[{step:6d}] loss={loss_val:.4f} "
                 f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}{aux_str}) "
                 f"| grad_norm={grad_norm_val:.3f} "
                 f"| od_μ={sig_stats['offdiag_mean']:+.4f} od_σ={sig_stats['offdiag_std']:.4f} "
-                f"| lr={lr_now:.2e}"
+                f"| lr={lr_now:.2e}{nonfinite_str}\n"
+                f"         perf: step={wall_step_ms:.1f}ms ({steps_per_sec:.2f} it/s) "
+                f"data={step_ms['data']:.1f} fwd={step_ms['forward']:.1f} "
+                f"loss={step_ms['loss']:.1f} bwd+opt={step_ms['backward_step']:.1f} "
+                f"mem={mem_alloc_pct:.1f}%/{mem_reserved_pct:.1f}% (peak {mem_peak_pct:.1f}%)"
             )
 
         if step % t.val_every == 0 and step > 0:

@@ -67,8 +67,8 @@ def _safe_cholesky(K: torch.Tensor, max_attempts: int = 8) -> torch.Tensor:
     """Cholesky decomposition with adaptive jitter.
 
     Handles two failure modes:
-      1. Non-finite entries (NaN/Inf) — jitter is useless here; fall back to
-         identity so training does not crash, and print a warning.
+      1. Non-finite entries (NaN/Inf) — jitter is useless here; the offending
+         matrix slice is replaced with identity before factorization.
       2. Slightly non-PSD due to floating-point asymmetry — symmetrize first,
          then retry with progressively larger jitter (1e-6 → 1e-1).
 
@@ -82,19 +82,14 @@ def _safe_cholesky(K: torch.Tensor, max_attempts: int = 8) -> torch.Tensor:
     n = K.shape[-1]
     eye = torch.eye(n, dtype=K.dtype, device=K.device)
 
-    # Non-finite guard: NaN/Inf + jitter = NaN/Inf — no point trying.
-    if not torch.isfinite(K).all():
-        import warnings
-
-        warnings.warn(
-            f"_safe_cholesky: non-finite values in K "
-            f"(shape={tuple(K.shape)}, "
-            f"nan={K.isnan().sum().item()}, inf={K.isinf().sum().item()}). "
-            "Falling back to identity Cholesky — check D/V for NaN/Inf.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return eye.expand_as(K).clone()
+    # Replace non-finite matrix slices with identity, entirely on-GPU (no
+    # CPU sync from .item()/bool()). A blocking `if not K.isfinite().all()`
+    # check is unsafe here anyway: for a batched K, torch.linalg.cholesky can
+    # succeed without raising even though one slice is NaN/Inf (e.g. Inf on
+    # the diagonal, or one corrupted slice among otherwise-PD batch slices),
+    # so an eager check on the *input* wouldn't even catch every case.
+    finite = torch.isfinite(K).flatten(-2).all(-1)[..., None, None]
+    K = torch.where(finite, K, eye)
 
     # Symmetrize to eliminate floating-point asymmetry from batched matmuls.
     K = 0.5 * (K + K.transpose(-2, -1))

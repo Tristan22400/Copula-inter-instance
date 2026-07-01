@@ -164,6 +164,51 @@ def _sample_kernel_cols(d_total: int, cfg) -> List[int]:
     return sorted(random.sample(range(d_total), k))
 
 
+def _length_scale_range(cfg, k: int, P: int) -> tuple[float, float]:
+    """(l_min, l_max), optionally scaled by sqrt(k) and/or P-density — see _sample_length_scale."""
+    l_min = float(cfg.data.l_min)
+    l_max = float(cfg.data.l_max)
+    if getattr(cfg.data, "l_scale_by_sqrt_k", False):
+        scale = math.sqrt(max(k, 1))
+        l_min *= scale
+        l_max *= scale
+    if getattr(cfg.data, "l_scale_by_P", False):
+        P_ref = float(getattr(cfg.data, "l_P_ref", 32.0))
+        density_scale = (P_ref / max(P, 1)) ** (1.0 / max(k, 1))
+        l_min *= density_scale
+        l_max *= density_scale
+    return l_min, l_max
+
+
+def _sample_length_scale(cfg, k: int, P: int) -> float:
+    """Sample the GP length-scale l, honouring three optional cfg flags.
+
+    l_scale_by_sqrt_k: multiplies [l_min, l_max] by sqrt(k) before sampling.
+        Squared distance sum_{i=1}^k (x1_i - x2_i)^2 grows ~linearly with k
+        (active kernel dims), so without this correction, k=1 and k=4 tasks
+        sample from very different effective-correlation regimes even though
+        l is drawn from the same range — this is what produces a bimodal
+        (collapsed-to-0 vs. spread-out) mixture in R_star.
+    l_scale_by_P: multiplies [l_min, l_max] by (l_P_ref / P)^(1/k) before
+        sampling. Train/test points are drawn i.i.d. from the same fixed
+        domain, so larger P packs training points more densely — any test
+        point ends up with a training neighbour within one length-scale,
+        and GP conditioning shrinks R_star towards 0 regardless of the
+        kernel hyperparameters. Shrinking l with P keeps the *local*
+        neighbour count (and hence how much conditioning explains away)
+        roughly constant across the whole P range, so R_star stays
+        meaningful even at large, realistic P (e.g. 32-512).
+    l_log_uniform: samples l ~ LogUniform instead of Uniform. RBF correlation
+        decays as exp(-k / l^2), so a linear-uniform l barely visits the
+        high-correlation regime; log-uniform spreads mass evenly across
+        decades of l and gives a much more uniform R_star.
+    """
+    l_min, l_max = _length_scale_range(cfg, k, P)
+    if getattr(cfg.data, "l_log_uniform", False):
+        return math.exp(random.uniform(math.log(l_min), math.log(l_max)))
+    return random.uniform(l_min, l_max)
+
+
 def _resolve_kernel_name(cfg) -> str:
     """Pick which kernel to use for one task based on config."""
     data = cfg.data
@@ -291,8 +336,12 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     else:
         kernel_cols = _sample_kernel_cols(d, cfg)
 
-    # 2. Sample shared GP hyperparameters
-    l = random.uniform(cfg.data.l_min, cfg.data.l_max)
+    # 2. Sample dataset sizes (needed before l — see l_scale_by_P)
+    P = random.randint(cfg.data.P_min, cfg.data.P_max)
+    N = random.randint(cfg.data.N_min, cfg.data.N_max)
+
+    # 3. Sample shared GP hyperparameters
+    l = _sample_length_scale(cfg, len(kernel_cols), P)
     if kernel_name == "dot_product":
         a2_min = float(0.0)
         a2_max = float(0.0)
@@ -307,7 +356,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     nugget_max = float(getattr(cfg.data, "nugget_max", 1.0))
     nugget = random.uniform(nugget_min, nugget_max)
 
-    # 3. Extra hyperparameters for specific kernels
+    # 4. Extra hyperparameters for specific kernels
     period: Optional[float] = None
     rq_alpha: Optional[float] = None
 
@@ -320,10 +369,6 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         rq_min = float(getattr(cfg.data, "rq_alpha_min", 0.1))
         rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
         rq_alpha = random.uniform(rq_min, rq_max)
-
-    # 4. Sample dataset sizes
-    P = random.randint(cfg.data.P_min, cfg.data.P_max)
-    N = random.randint(cfg.data.N_min, cfg.data.N_max)
 
     # 5. Sample features x ~ U([-5, 5]^d), normalise over all P+N instances
     x_raw = torch.rand(P + N, d) * 10.0 - 5.0
@@ -492,7 +537,13 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         )
 
     # --- Per-episode hyperparameters ---
-    l      = torch.rand(B, device=device) * (cfg.data.l_max      - cfg.data.l_min)      + cfg.data.l_min
+    l_min, l_max = _length_scale_range(cfg, k, P)
+    if getattr(cfg.data, "l_log_uniform", False):
+        l = torch.exp(
+            torch.rand(B, device=device) * (math.log(l_max) - math.log(l_min)) + math.log(l_min)
+        )
+    else:
+        l = torch.rand(B, device=device) * (l_max - l_min) + l_min
     nugget = torch.rand(B, device=device) * (nugget_max           - nugget_min)           + nugget_min
     alpha2 = (
         torch.zeros(B, device=device)
