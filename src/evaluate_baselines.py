@@ -63,6 +63,7 @@ from data_gen import (
     rbf_kernel,
     sigma_to_correlation,
 )
+from dataset import CopulaDataset
 from loss import _safe_cholesky, oracle_copula_nll
 from model import build_copula_transformer, low_rank_correlation
 
@@ -317,7 +318,13 @@ class PerEpisodeTransformer(nn.Module):
         self.cross_attn = _CrossAttn(m, n_heads, dropout)
         self.head      = nn.Linear(m, r + 1)
 
-        nn.init.zeros_(self.head.weight)
+        # NOTE: zero-initializing head.weight is a dead end here — Sigma is
+        # built from W @ W.T (a bilinear form in the first r head outputs),
+        # so dSigma/dW ∝ W vanishes exactly at W=0, and the unit-diagonal
+        # normalization makes Sigma == I regardless of s when W=0. Both paths
+        # have zero gradient, so the model can never leave Sigma=I. Use a
+        # small random init to break the saddle point.
+        nn.init.normal_(self.head.weight, std=1e-2)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, X_ctx: Tensor, z_ctx: Tensor, X_qry: Tensor) -> tuple[Tensor, Tensor]:
@@ -491,7 +498,7 @@ def plot_corr_grid(
 
 
 def _eval_episode(
-    ep_path: str,
+    ep: dict,
     icl_model: nn.Module,
     icl_rank: int,
     n_steps_mle: int,
@@ -507,7 +514,6 @@ def _eval_episode(
         R_dict    : {method_name: (N, N) correlation tensor} — for plotting
         R_oracle  : (N, N) oracle correlation tensor
     """
-    ep         = torch.load(ep_path, map_location=device, weights_only=True)
     X_train    = ep["x_norm_train"].to(device)   # (P, d_x)
     z_train    = ep["z_train"].to(device)         # (P,)
     X_test     = ep["x_norm_test"].to(device)     # (N, d_x)
@@ -537,8 +543,16 @@ def _eval_episode(
         "periodic":           "gp_mle_periodic",
         "rational_quadratic": "gp_mle_rq",
     }
+    # The exp-sine-squared (periodic) kernel applied to Euclidean distance is
+    # only a valid PD kernel for 1D inputs. For d > 1 the kernel matrix is not
+    # PSD regardless of hyperparameters, so MLE fitting diverges wildly.
+    _periodic_valid = (d_x == 1)
     for kname in _GP_KERNELS:
         label = _LABEL_MAP[kname]
+        if kname == "periodic" and not _periodic_valid:
+            nlls[label]  = float("nan")
+            R_dict[label] = R_I.clone()
+            continue
         try:
             params = gp_mle_fit(X_train, z_train, kname,
                                 n_steps=n_steps_mle, lr=lr_mle)
@@ -691,23 +705,27 @@ def main() -> None:
     dataset_dir = cfg.training.dataset_dir
     n_ep = args.n_episodes
 
+    dataset = CopulaDataset(episode_dir=dataset_dir)
+    n_available = len(dataset)
+
     all_nlls: list[dict[str, float]] = []
     plot_R_dict: dict[str, Tensor] | None = None
     plot_R_oracle: Tensor | None = None
 
     print(f"\nEvaluating {n_ep} episodes from {dataset_dir} (start={args.episode_idx})")
+    print(f"  Dataset size: {n_available} episodes")
     print(f"  GP MLE: {args.n_steps_mle} steps | PerEp: {args.n_steps_per_ep} steps "
           f"(patience={args.patience_per_ep})")
 
     for local_i in range(n_ep):
-        ep_i   = args.episode_idx + local_i
-        ep_path = os.path.join(dataset_dir, f"task_{ep_i:06d}.pt")
-        if not os.path.exists(ep_path):
-            print(f"  [ep {ep_i}] file not found, skipping")
+        ep_i = args.episode_idx + local_i
+        if ep_i >= n_available:
+            print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")
             continue
 
+        ep = dataset[ep_i]
         nlls, R_dict, R_oracle = _eval_episode(
-            ep_path=ep_path,
+            ep=ep,
             icl_model=icl_model,
             icl_rank=icl_rank,
             n_steps_mle=args.n_steps_mle,
