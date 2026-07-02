@@ -50,6 +50,7 @@ def main(cfg: DictConfig) -> None:
     n_tasks    = cfg.data.n_tasks
     B          = int(cfg.data.get("shard_size", 256))
     n_shards   = (n_tasks + B - 1) // B
+    base_seed  = getattr(cfg, "seed", None)
 
     print(f"Generating {n_tasks} episodes → {pit_dir}")
     print(f"Batch/shard size: {B}  |  Total shards: {n_shards}  |  Device: {device}")
@@ -66,6 +67,10 @@ def main(cfg: DictConfig) -> None:
                 pbar.update(n_this)
                 continue
 
+            # generate_gp_batch reads cfg.seed to seed torch's RNG; vary it per
+            # shard so shards don't restart from the identical RNG state.
+            if base_seed is not None:
+                cfg.seed = base_seed + shard_idx
             episodes = generate_gp_batch(cfg, n_this, device)
             torch.save(episodes, out_path)
 

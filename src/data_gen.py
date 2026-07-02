@@ -28,10 +28,21 @@ import math
 import random
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import torch
 from torch import Tensor
 
 from loss import _safe_cholesky
+
+
+def _seed_everything(seed: int) -> None:
+    """Seed python/numpy/torch RNGs for reproducible data generation."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # safe even with a single GPU / no GPU
+
 
 # ---------------------------------------------------------------------------
 # Distance helpers
@@ -307,6 +318,12 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     A nugget ~ U[nugget_min, nugget_max] is added to the diagonal for guaranteed PSD
     and controls posterior tightness (replaces the former separate noise parameter).
 
+    If cfg.seed is set (same field train.py uses via `torch.manual_seed(cfg.seed)`),
+    it seeds python/numpy/torch RNGs, making the kernel/hyperparameter choice
+    (kernel_name, P, N, l, alpha2, nugget, ...), the feature warp, and y
+    sampling all reproducible. Calling this repeatedly with the same cfg.seed
+    restarts every RNG at the same point every time.
+
     Keys returned:
         x_norm_train          : (P, d_features)  normalised train features (full)
         y_train               : (P,)             train targets
@@ -325,6 +342,10 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         rq_alpha              : float            alpha param (rational_quadratic only, else 0.0)
         kernel_feature_indices: (k,)             column indices used by the kernel (metadata)
     """
+    seed = getattr(cfg, "seed", None)
+    if seed is not None:
+        _seed_everything(seed)
+
     d = cfg.data.d_features
 
     # 1. Choose kernel and active columns
@@ -370,8 +391,10 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
         rq_alpha = random.uniform(rq_min, rq_max)
 
-    # 5. Sample features x ~ U([-5, 5]^d), normalise over all P+N instances
-    x_raw = torch.rand(P + N, d) * 10.0 - 5.0
+    # 5. Sample features x ~ N(0, 1)^d, warp marginals (TabICLv2-style feature
+    # heterogeneity), normalise over all P+N instances
+    x_raw = torch.randn(P + N, d)
+    x_raw = tabiclv2_warp_features(x_raw)
     mu_x = x_raw.mean(0)
     std_x = x_raw.std(0).clamp(min=1e-8)
     x_norm = (x_raw - mu_x) / std_x                    # full (P+N, d_features)
@@ -495,6 +518,72 @@ def _batched_kernel_matrix(
     raise ValueError(f"Unknown kernel '{kernel_name}' in _batched_kernel_matrix.")
 
 
+def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
+    """Warp each feature column with one of 8 random marginal transforms.
+
+    Simulates the extreme marginal heterogeneity of real tabular data
+    (TabICLv2): heavy tails, power laws, ordinal steps, bimodal mixtures,
+    periodicity, and Cauchy outliers, applied on top of a Standard Normal
+    baseline. Intended to run before any per-episode mean/std normalisation,
+    so downstream kernel/covariance code keeps operating on calibrated,
+    unit-scale features while the model still sees the warped shape.
+
+    Args:
+        x: (B, T, d) or (T, d) tensor of Standard Normal features.
+        seed: if given, seeds python/numpy/torch RNGs so the warp choice and
+            all sampled transform parameters are reproducible. Leave None
+            when called from generate_gp_task/generate_gp_batch — those
+            already seed globally before calling this, so reseeding here
+            would just restart the same streams.
+
+    Returns:
+        Tensor of the same shape as `x`, with each (episode, column) warped
+        independently by a randomly chosen transform.
+    """
+    if seed is not None:
+        _seed_everything(seed)
+
+    added_batch_dim = x.dim() == 2
+    if added_batch_dim:
+        x = x.unsqueeze(0)
+
+    B, T, d = x.shape
+    warped_x = x.clone()
+    choices = torch.randint(0, 8, (B, d), device=x.device)
+
+    for b in range(B):
+        for col in range(d):
+            c = choices[b, col].item()
+            col_data = warped_x[b, :, col]
+
+            if c == 0:  # Identity — Standard Normal baseline
+                continue
+            elif c == 1:  # Signed-square — mild heavy tails
+                warped_x[b, :, col] = torch.sign(col_data) * (col_data ** 2)
+            elif c == 2:  # Cube — Student-T-like heavy tails
+                warped_x[b, :, col] = col_data ** 3
+            elif c == 3:  # Log-normal / exponential — right-skewed power law
+                # Clamp before exp() to avoid float overflow.
+                warped_x[b, :, col] = torch.exp(col_data.clamp(min=-5.0, max=4.0))
+            elif c == 4:  # Quantization — ordinal / discrete steps
+                warped_x[b, :, col] = torch.round(col_data * 2.0) / 2.0
+            elif c == 5:  # Bimodal mixture — mixed populations
+                mask = torch.rand_like(col_data) > 0.5
+                shift = torch.randn(1, device=x.device).item() * 4.0
+                col_data[mask] += shift
+            elif c == 6:  # Cyclic — seasonal / periodic features
+                freq = torch.rand(1, device=x.device).item() * 3.0 + 0.5
+                warped_x[b, :, col] = torch.sin(col_data * freq)
+            elif c == 7:  # Cauchy — extreme heavy tails, undefined variance
+                u = torch.erf(col_data / math.sqrt(2.0))
+                # Scale by 0.95 to keep tan() away from its asymptotes.
+                warped_x[b, :, col] = torch.tan(u * (math.pi / 2.0 * 0.95))
+
+    if added_batch_dim:
+        warped_x = warped_x.squeeze(0)
+    return warped_x
+
+
 def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor]]:
     """Generate B GP episodes in a single vectorised call.
 
@@ -506,6 +595,14 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     The returned dicts have the same schema as the episodes saved by
     generate_pit_dataset.py (no kernel metadata).
 
+    If cfg.seed is set, it seeds python/numpy/torch RNGs, making the
+    kernel/shape choice (kernel_name, P, N, k), hyperparameters (l, nugget,
+    alpha2, ...), feature sampling/warp, and y sampling all reproducible.
+    Note that calling this repeatedly with the same cfg.seed (e.g. once per
+    shard in generate_pit_dataset.py) restarts every RNG at the same point
+    every call — vary cfg.seed per call (e.g. `cfg.seed + shard_idx`) if you
+    need distinct shards.
+
     Args:
         cfg    : Hydra config (same as generate_gp_task).
         B      : number of episodes to generate in this batch.
@@ -515,6 +612,10 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         list of B episode dicts ready for torch.save.
     """
     import warnings
+
+    seed = getattr(cfg, "seed", None)
+    if seed is not None:
+        _seed_everything(seed)
 
     d          = cfg.data.d_features
     nugget_min = float(getattr(cfg.data, "nugget_min", 0.1))
@@ -561,8 +662,9 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         rq_max  = float(getattr(cfg.data, "rq_alpha_max", 5.0))
         rq_alpha = torch.rand(B, device=device) * (rq_max - rq_min) + rq_min
 
-    # --- Features (B, T, d) ~ U[-5, 5], normalised per episode ---
-    x_raw  = torch.rand(B, T, d, device=device) * 10.0 - 5.0
+    # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
+    x_raw  = torch.randn(B, T, d, device=device)
+    x_raw  = tabiclv2_warp_features(x_raw)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
     # --- Select kernel columns ---
