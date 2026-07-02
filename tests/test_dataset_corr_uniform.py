@@ -40,13 +40,20 @@ _N_EPISODES = 500   # episodes to sample
 _SEED = 0
 
 
-def _iter_episodes(folder: str):
-    """Yield episode dicts from a folder — handles both shard and individual layout."""
+def _iter_episodes(folder: str, shuffle_seed: int | None = None):
+    """Yield episode dicts from a folder — handles both shard and individual layout.
+
+    Shard files are shuffled (not their contents) before reading, so callers that
+    only need the first *n* episodes can stop early without loading every shard —
+    important for datasets with hundreds of GB across many shards.
+    """
     paths = sorted(
         os.path.join(folder, f)
         for f in os.listdir(folder)
         if f.endswith(".pt") and f != "meta.pt"
     )
+    if shuffle_seed is not None:
+        random.Random(shuffle_seed).shuffle(paths)
     for p in paths:
         obj = torch.load(p, map_location="cpu", weights_only=False)
         if isinstance(obj, list):           # shard: list of episode dicts
@@ -56,12 +63,12 @@ def _iter_episodes(folder: str):
 
 
 def _load_episodes(folder: str, n: int, seed: int):
-    """Load up to *n* episodes; return (off_diag_values, min_eigenvalues)."""
-    # Collect all episodes first, then subsample deterministically.
-    all_eps = list(_iter_episodes(folder))
-    rng = random.Random(seed)
-    rng.shuffle(all_eps)
-    episodes = all_eps[:n]
+    """Load up to *n* episodes (stopping early); return (off_diag_values, min_eigenvalues)."""
+    episodes = []
+    for ep in _iter_episodes(folder, shuffle_seed=seed):
+        episodes.append(ep)
+        if len(episodes) >= n:
+            break
 
     values = []
     min_eigs = []
@@ -138,12 +145,13 @@ def test_correlations_std_nonzero(off_diag):
     """Standard deviation must be non-trivial — posterior R_star has residual structure.
 
     With the GP posterior, off-diagonal correlations are shrunk by the Schur complement
-    (training data explains part of the prior correlation). Expected std ≈ 0.02–0.30
-    depending on the kernel and the P/N ratio. A value below 0.01 indicates a degenerate
-    kernel (all correlations collapsed to zero).
+    (training data explains part of the prior correlation). Expected std ≈ 0.1–0.30
+    depending on the kernel and the P/N ratio. A value below 0.1 indicates the posterior
+    correlations have collapsed near zero (e.g. a rank-limited kernel like dot_product
+    with P >> d_features, where training data pins down the signal almost completely).
     """
     std = off_diag.std().item()
-    assert std > 0.01, (
+    assert std > 0.1, (
         f"Std {std:.4f} too low — posterior R_star correlations appear degenerate."
     )
 
@@ -152,10 +160,14 @@ def test_unit_diagonal(dataset_dir):
     """R_star must have unit diagonal (proper correlation matrix)."""
     if not os.path.isdir(dataset_dir):
         pytest.skip(f"Dataset folder not found: {dataset_dir}")
-    episodes = list(_iter_episodes(dataset_dir))
+    episodes = []
+    for ep in _iter_episodes(dataset_dir):
+        episodes.append(ep)
+        if len(episodes) >= 20:
+            break
     if not episodes:
         pytest.skip(f"Dataset folder is empty: {dataset_dir}")
-    for i, ep in enumerate(episodes[:20]):
+    for i, ep in enumerate(episodes):
         R = ep["R_star"]
         diag_err = (R.diagonal() - 1.0).abs().max().item()
         assert diag_err < 1e-4, (

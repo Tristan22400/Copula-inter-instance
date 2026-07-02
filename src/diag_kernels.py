@@ -1,12 +1,18 @@
 """
 diag_kernels.py — Quick sanity check: does each kernel produce meaningful R_star?
 
-Generates N_PER_KERNEL tasks per kernel, prints per-task stats and a summary.
+Generates N_PER_KERNEL tasks per kernel, prints per-task stats and a summary,
+then (Stage 3) pools the off-diagonal R_star entries across N_STAGE3 tasks per
+kernel to check the family isn't collapsing toward independence (screening
+effect) or degenerating toward triviality (near-1 correlations everywhere).
 Run from the project root:
     python src/diag_kernels.py
+    python src/diag_kernels.py --n-stage3 200   # smaller/faster batch
+    python src/diag_kernels.py --skip-stage3    # per-task checks only
 """
 from __future__ import annotations
 
+import argparse
 import math
 import random
 import sys
@@ -125,8 +131,148 @@ def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Stage 3 — information-theoretic bounds on the off-diagonal distribution
+# ---------------------------------------------------------------------------
+# The task is only learnable if the training context P leaves a meaningful
+# residual dependence in R_star at the test points N: too little (posterior
+# collapses toward independence — the "screening effect") and the model just
+# learns to predict I_N; too much (R_star saturates near +-1 everywhere) and
+# the task is trivially degenerate (test instances are basically identical).
+
+COLLAPSE_THRESHOLD   = 0.01  # E[|R*_offdiag|] below this -> screening effect
+DEGENERATE_THRESHOLD = 0.95  # E[|R*_offdiag|] above this -> trivial task
+HEALTHY_LOW, HEALTHY_HIGH = 0.1, 0.8  # target band for a "Goldilocks" mean|r|
+
+
+def _ascii_histogram(values: torch.Tensor, n_bins: int = 20, width: int = 40) -> str:
+    """Text histogram of |R*_offdiag| in [0, 1], for a quick look without a display."""
+    counts = torch.histc(values.abs(), bins=n_bins, min=0.0, max=1.0)
+    max_count = counts.max().item()
+    lines = []
+    for i, c in enumerate(counts.tolist()):
+        lo, hi = i / n_bins, (i + 1) / n_bins
+        bar_len = int(width * c / max_count) if max_count > 0 else 0
+        lines.append(f"    |r| in [{lo:.2f},{hi:.2f})  {'#' * bar_len:<{width}}  {int(c)}")
+    return "\n".join(lines)
+
+
+def batch_off_diagonal_stats(kernel_name: str, cfg: "Cfg", n_tasks: int) -> dict:
+    """Generate n_tasks GP tasks for kernel_name and pool all off-diagonal R_star entries."""
+    cfg.data.kernel = kernel_name
+    pooled: List[torch.Tensor] = []
+    for _ in range(n_tasks):
+        task = generate_gp_task(cfg)
+        R = task["R_star"]
+        N = R.shape[0]
+        mask = ~torch.eye(N, dtype=torch.bool)
+        pooled.append(R[mask])
+    off_diag = torch.cat(pooled)
+    abs_off_diag = off_diag.abs()
+
+    mean_abs = abs_off_diag.mean().item()
+    if mean_abs < COLLAPSE_THRESHOLD:
+        verdict = "COLLAPSED (screening effect — model will just learn identity)"
+    elif mean_abs > DEGENERATE_THRESHOLD:
+        verdict = "DEGENERATE (trivially near-identical instances)"
+    elif HEALTHY_LOW <= mean_abs <= HEALTHY_HIGH:
+        verdict = "HEALTHY"
+    else:
+        verdict = "BORDERLINE (outside the [0.1, 0.8] Goldilocks band)"
+
+    quantiles = torch.quantile(
+        abs_off_diag.float(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95])
+    ).tolist()
+
+    return {
+        "kernel": kernel_name,
+        "n_tasks": n_tasks,
+        "n_pairs": off_diag.numel(),
+        "mean": off_diag.mean().item(),
+        "mean_abs": mean_abs,
+        "std": off_diag.std().item(),
+        "p5": quantiles[0], "p25": quantiles[1], "p50": quantiles[2],
+        "p75": quantiles[3], "p95": quantiles[4],
+        "frac_collapsed": (abs_off_diag < COLLAPSE_THRESHOLD).float().mean().item(),
+        "frac_degenerate": (abs_off_diag > DEGENERATE_THRESHOLD).float().mean().item(),
+        "verdict": verdict,
+        "off_diag": off_diag,
+    }
+
+
+def run_stage3(cfg: "Cfg", n_tasks: int) -> bool:
+    """Runs the batch off-diagonal check for every kernel; returns True iff all HEALTHY."""
+    print(f"\n{SEP}")
+    print(f"  STAGE 3 — INFORMATION-THEORETIC BOUNDS (n_tasks={n_tasks} per kernel)")
+    print(SEP)
+
+    all_healthy = True
+    fig_axes = []
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        fig_axes = list(axes.flat)
+    except ImportError:
+        fig = None
+
+    for i, kernel_name in enumerate(ALL_KERNELS):
+        stats = batch_off_diagonal_stats(kernel_name, cfg, n_tasks)
+        if stats["verdict"] != "HEALTHY":
+            all_healthy = False
+
+        print(f"\n  {kernel_name.upper()}  ({stats['n_pairs']:,} pooled off-diagonal entries)")
+        print(
+            f"    E[|R*_offdiag|]={stats['mean_abs']:.4f}  "
+            f"mean={stats['mean']:+.4f}  std={stats['std']:.4f}"
+        )
+        print(
+            f"    percentiles(|r|): p5={stats['p5']:.3f} p25={stats['p25']:.3f} "
+            f"p50={stats['p50']:.3f} p75={stats['p75']:.3f} p95={stats['p95']:.3f}"
+        )
+        print(
+            f"    frac(|r|<{COLLAPSE_THRESHOLD})={stats['frac_collapsed']*100:.2f}%   "
+            f"frac(|r|>{DEGENERATE_THRESHOLD})={stats['frac_degenerate']*100:.2f}%"
+        )
+        print(f"    verdict: {stats['verdict']}")
+        if stats["verdict"] == "COLLAPSED (screening effect — model will just learn identity)":
+            print("    fix: increase l_min (or l_log_uniform range) so training context "
+                  "explains less of the test set, or decrease nugget_max.")
+        elif stats["verdict"] == "DEGENERATE (trivially near-identical instances)":
+            print("    fix: decrease l_max so instances decorrelate faster, "
+                  "or increase nugget_min.")
+        print(_ascii_histogram(stats["off_diag"]))
+
+        if fig is not None:
+            ax = fig_axes[i]
+            ax.hist(stats["off_diag"].numpy(), bins=40, range=(-1, 1), color="steelblue")
+            ax.axvline(0, color="black", linewidth=0.8)
+            ax.set_title(f"{kernel_name}\nE[|r|]={stats['mean_abs']:.3f} ({stats['verdict'].split()[0]})",
+                         fontsize=9)
+
+    if fig is not None:
+        fig.suptitle(f"Off-diagonal R_star distribution ({n_tasks} tasks/kernel)")
+        fig.tight_layout()
+        out_path = "plots/off_diag_distribution.png"
+        import os
+        os.makedirs("plots", exist_ok=True)
+        fig.savefig(out_path, dpi=120)
+        print(f"\n  Saved histogram grid to: {out_path}")
+
+    print(f"\n  STAGE 3: {'ALL FAMILIES HEALTHY' if all_healthy else '*** SOME FAMILIES OUT OF BAND ***'}")
+    return all_healthy
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--n-stage3", type=int, default=1000,
+                     help="Tasks per kernel for the Stage 3 batch distribution check (default: 1000)")
+parser.add_argument("--skip-stage3", action="store_true",
+                     help="Skip the Stage 3 batch distribution check")
+args = parser.parse_args()
 
 N_PER_KERNEL = 5
 SEED = 42
@@ -178,3 +324,7 @@ for kernel_name in ALL_KERNELS:
 print(f"\n{SEP}")
 print(f"  OVERALL: {'ALL KERNELS OK' if all_ok else 'SOME FAILURES — see above'}")
 print(SEP)
+
+if not args.skip_stage3:
+    stage3_ok = run_stage3(cfg, args.n_stage3)
+    all_ok = all_ok and stage3_ok

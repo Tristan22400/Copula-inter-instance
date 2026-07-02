@@ -13,7 +13,7 @@ Supported kernels
   cosine              — Cosine (spectral): k(r) = alpha2 * cos(2π r / l)
   periodic            — Periodic: k(r) = alpha2 * exp(-2 sin²(π r / period) / l²)
   rational_quadratic  — Rational Quadratic: k(r) = alpha2 * (1 + r²/(2α l²))^{-α}
-  dot_product         — Linear + bias: k(x1,x2) = alpha2 + x1ᵀx2
+  dot_product         — Linear (dot product): k(x1,x2) = x1ᵀx2
 
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
@@ -108,10 +108,10 @@ def rational_quadratic_kernel(
 def dot_product_kernel(
     X1: Tensor, X2: Tensor, **_
 ) -> Tensor:
-    """Linear + bias: alpha2 + X1 @ X2ᵀ.
+    """Linear (dot product): X1 @ X2ᵀ.
 
-    PSD because K = XᵀX is a sum of two PSD matrices.
-    Length-scale l is unused; geometry is determined by the feature space.
+    PSD because K = XᵀX is PSD. Has no lengthscale or variance hyperparameter;
+    geometry is determined entirely by the feature space.
     """
     return X1 @ X2.T
 

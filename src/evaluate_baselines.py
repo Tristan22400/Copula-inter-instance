@@ -269,16 +269,24 @@ def gp_posterior_corr(
 
     Returns:
         R : (N, N) correlation matrix
+
+    Adds `noise` to K_ss (not just K_ff), mirroring data_gen.gp_posterior's
+    latent=False convention used to build the oracle R_star. For stationary
+    kernels this barely changes anything (K_ss is already full rank), but for
+    dot_product — rank <= d_x, frequently < N — omitting it left K_ss rank
+    deficient, so the posterior correlation matrix came out numerically
+    singular and its z-space NLL exploded.
     """
     P, N = X_train.shape[0], X_test.shape[0]
     dtype, device = X_train.dtype, X_train.device
     noise = params["noise"]
 
     with torch.no_grad():
+        I_N = noise * torch.eye(N, dtype=dtype, device=device)
         if kernel_name == "dot_product":
             K_ff = dot_product_kernel(X_train, X_train) + noise * torch.eye(P, dtype=dtype, device=device)
             K_sf = dot_product_kernel(X_test, X_train)
-            K_ss = dot_product_kernel(X_test, X_test)
+            K_ss = dot_product_kernel(X_test, X_test) + I_N
         else:
             l, alpha2 = params["l"], params["alpha2"]
             if not ard:
@@ -289,7 +297,7 @@ def gp_posterior_corr(
                 K_ff = periodic_kernel(X_train, X_train, l=l, alpha2=alpha2, period=period) \
                     + noise * torch.eye(P, dtype=dtype, device=device)
                 K_sf = periodic_kernel(X_test, X_train, l=l, alpha2=alpha2, period=period)
-                K_ss = periodic_kernel(X_test, X_test, l=l, alpha2=alpha2, period=period)
+                K_ss = periodic_kernel(X_test, X_test, l=l, alpha2=alpha2, period=period) + I_N
             else:
                 # No backward pass happens in this no_grad block, so it's safe to use
                 # data_gen.matern32_kernel's plain (unstabilized) distance here even
@@ -305,7 +313,7 @@ def gp_posterior_corr(
                 kw  = dict(l=1.0, alpha2=alpha2, rq_alpha=rq_alpha)
                 K_ff = kfn(Xtr, Xtr, **kw) + noise * torch.eye(P, dtype=dtype, device=device)
                 K_sf = kfn(Xte, Xtr, **kw)    # (N, P)
-                K_ss = kfn(Xte, Xte, **kw)     # (N, N)
+                K_ss = kfn(Xte, Xte, **kw) + I_N     # (N, N)
 
         L_ff = _safe_cholesky(K_ff)
         V = torch.linalg.solve_triangular(L_ff, K_sf.T, upper=False)  # (P, N)
@@ -574,6 +582,16 @@ def train_per_episode(
     """
     d_x = X_train.shape[1]
     P   = X_train.shape[0]
+
+    # r is normally icl_rank (the pretrained model's rank, e.g. 32) — sized for
+    # a model pretrained across millions of episodes. Trained from scratch on a
+    # single episode's P instances (as few as ~13, ~8 after the support/query
+    # split below), that many free low-rank factors overfits badly: verified
+    # empirically that more training steps at r=32 makes some episodes *worse*
+    # (correlation matrix collapses to near-singular, off-the-charts NLL),
+    # while capping r relative to P keeps it stable. r=4 (the class default)
+    # is never exceeded for very small P.
+    r = max(2, min(r, P // 4))
 
     n_val  = max(2, int(round(0.2 * P)))
     perm   = torch.randperm(P, device=device)
@@ -905,17 +923,17 @@ def main() -> None:
     parser.add_argument("--ckpt",         required=True)
     parser.add_argument("--n_episodes",   type=int,   default=50)
     parser.add_argument("--episode_idx",  type=int,   default=0)
-    parser.add_argument("--n_steps_mle",  type=int,   default=300,
+    parser.add_argument("--n_steps_mle",  type=int,   default=1000,
                         help="Adam steps for GP kernel MLE fitting (also used for ARD variants)")
     parser.add_argument("--lr_mle",       type=float, default=0.05,
                         help="Learning rate for GP MLE Adam")
-    parser.add_argument("--n_steps_dkl",  type=int,   default=300,
+    parser.add_argument("--n_steps_dkl",  type=int,   default=5000,
                         help="Adam steps for Deep Kernel Learning (MLP+GP) fitting")
     parser.add_argument("--lr_dkl",       type=float, default=0.01,
                         help="Learning rate for DKL Adam")
-    parser.add_argument("--n_steps_per_ep", type=int, default=500,
+    parser.add_argument("--n_steps_per_ep", type=int, default=5000,
                         help="Training steps for PerEpisodeTransformer")
-    parser.add_argument("--patience_per_ep", type=int, default=100,
+    parser.add_argument("--patience_per_ep", type=int, default=500,
                         help="Early stopping patience for PerEpisodeTransformer")
     parser.add_argument("--plot_episode", type=int,   default=0,
                         help="Local episode index to generate the corr_grid plot for")
