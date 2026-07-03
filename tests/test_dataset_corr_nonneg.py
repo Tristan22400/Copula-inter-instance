@@ -3,8 +3,10 @@
 
 Unlike cosine (oscillatory, tests/test_dataset_corr_uniform.py), these kernels have
 a non-negative prior: K(x1, x2) >= 0 everywhere. Posterior conditioning on training
-data can still push a handful of entries slightly negative (Simpson's-paradox-style
-explaining-away), but the bulk of R_star should be non-negative and spread across
+data pushes some entries negative (Simpson's-paradox-style explaining-away: two points
+both correlated with the training context can become negatively correlated once
+conditioned on it) — a total absence of negative entries would mean the training
+context isn't doing any conditioning at all. R_star should also be spread across
 [0, 1] rather than collapsed near 0 (no structure) or saturated near 1 (near-singular).
 
 Run against a specific folder:
@@ -94,11 +96,17 @@ def min_eigenvalues(episode_data):
 # ---------------------------------------------------------------------------
 
 
-def test_correlations_mostly_nonnegative(off_diag):
-    """A non-negative-kernel prior should leave only a small negative tail after conditioning."""
+def test_correlations_have_negative_tail(off_diag):
+    """Posterior conditioning on a non-negative-prior kernel must produce some negative
+    entries (Simpson's-paradox-style explaining-away): two points both correlated with
+    the training context can become negatively correlated once conditioned on it. Zero
+    (or near-zero) negative entries means the posterior barely differs from the prior —
+    i.e. the training context isn't doing any conditioning at all.
+    """
     neg_frac = (off_diag < -0.01).float().mean().item()
-    assert neg_frac < 0.15, (
-        f"{neg_frac:.1%} of entries are negative — too much for a non-negative-prior kernel"
+    assert neg_frac > 0.01, (
+        f"Only {neg_frac:.1%} of entries are negative — posterior shows no explaining-away, "
+        f"suggests conditioning on the training context isn't having any effect"
     )
 
 
