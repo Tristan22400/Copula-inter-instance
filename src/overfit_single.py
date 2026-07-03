@@ -17,6 +17,7 @@ Usage:
     python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --task-idx 3
     python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --k-realizations 500 --steps 5000 --lr 1e-3
     python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --freeze-backbone
+    python src/overfit_single.py --kernel lsh_forest   # fresh episode, no dataset needed
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_ROOT, "tabicl_upstream", "src"))
 
+from data_gen import generate_gp_batch
 from dataset import collate_fn
 from loss import _safe_cholesky, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
@@ -47,9 +49,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--episode",
-        required=True,
+        default=None,
         help="Path to .pt episode file: either a single-episode task_*.pt, or a "
-        "sharded shard_*.pt (a list of episodes — one is picked via --task-idx).",
+        "sharded shard_*.pt (a list of episodes — one is picked via --task-idx). "
+        "Required unless --kernel is given.",
     )
     p.add_argument(
         "--task-idx",
@@ -57,6 +60,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Which episode to select when --episode points at a shard_*.pt file "
         "(list of episodes). Ignored for single-episode files. Default: 0.",
+    )
+    p.add_argument(
+        "--kernel",
+        default=None,
+        help="Generate a single fresh episode for this kernel on the fly "
+        "(conf/data/gp_tasks.yaml hyperparameter ranges) instead of loading "
+        "--episode from disk. Takes precedence over --episode.",
     )
     p.add_argument(
         "--k-realizations",
@@ -145,26 +155,35 @@ def main() -> None:
     model_cfg = OmegaConf.load(
         os.path.join(_ROOT, "conf", "model", "copula_transformer.yaml")
     )
+    data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
-    cfg = OmegaConf.merge(base_cfg, OmegaConf.create({"model": model_cfg}))
+    cfg = OmegaConf.merge(base_cfg, OmegaConf.create({"model": model_cfg, "data": data_cfg}))
     if args.freeze_backbone:
         cfg.model.unfreeze_backbone = False
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Load episode.
-    episode_path = args.episode
-    loaded = torch.load(episode_path, map_location="cpu", weights_only=True)
-    if isinstance(loaded, list):
-        # Sharded layout (shard_XXXXXX.pt from generate_pit_dataset.py): a list
-        # of B episode dicts, same convention as CopulaDataset._get_sharded.
-        task_idx = min(args.task_idx, len(loaded) - 1)
-        episode = loaded[task_idx]
-        print(f"Episode : {os.path.basename(episode_path)}  (shard of {len(loaded)}, task_idx={task_idx})")
+    # Load episode: either a single fresh draw for --kernel, or a saved .pt file
+    # (single-episode task_*.pt or a sharded shard_*.pt list).
+    if args.kernel is not None:
+        cfg.data.kernel = args.kernel
+        cfg.data.kernels = []
+        episode = generate_gp_batch(cfg, 1, device)[0]
+        print(f"Episode : fresh draw ({args.kernel})")
+    elif args.episode is not None:
+        loaded = torch.load(args.episode, map_location="cpu", weights_only=True)
+        if isinstance(loaded, list):
+            # Sharded layout (shard_XXXXXX.pt from generate_pit_dataset.py): a list
+            # of B episode dicts, same convention as CopulaDataset._get_sharded.
+            task_idx = min(args.task_idx, len(loaded) - 1)
+            episode = loaded[task_idx]
+            print(f"Episode : {os.path.basename(args.episode)}  (shard of {len(loaded)}, task_idx={task_idx})")
+        else:
+            episode = loaded
+            print(f"Episode : {os.path.basename(args.episode)}")
     else:
-        episode = loaded
-        print(f"Episode : {os.path.basename(episode_path)}")
+        raise SystemExit("Provide either --kernel (fresh episode) or --episode (load from disk).")
 
     n_train = int(episode["n_train"].item())
     n_test = int(episode["n_test"].item())
