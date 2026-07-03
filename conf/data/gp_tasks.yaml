@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# GP task generation config — inter-instance Gaussian copula
+# ---------------------------------------------------------------------------
+
+d_features: 10          # total feature columns seen by the neural network
+
+# Kernel active-column selection (random per task)
+# k ~ Uniform[d_kernel_min, d_kernel_max] columns are passed to the kernel;
+# the remaining d_features - k columns are irrelevant noise the model must ignore.
+d_kernel_min: 1
+d_kernel_max: 4
+
+# Training/context set size range
+P_min: 32
+P_max: 32              # fewer train points → more residual posterior uncertainty
+
+# Test/query set size range (copula is over these N instances)
+N_min: 8
+N_max: 128
+
+# Number of tasks to generate
+n_tasks: 5000000
+
+# GP kernel hyperparameter ranges (shared across all stationary kernels)
+l_min: 1.0
+l_max: 10.0
+# Length-scale sampling mode (both default off — preserves existing behaviour).
+# l_scale_by_sqrt_k: multiply [l_min, l_max] by sqrt(k) (k = active kernel dims)
+#   before sampling. Squared distance grows ~linearly with k, so without this
+#   a shared l range mixes very different correlation regimes across k.
+# l_log_uniform: sample l ~ LogUniform instead of Uniform. exp(-.../l^2) decay
+#   means linear-uniform l rarely visits the high-correlation regime; log-uniform
+#   spreads mass evenly across decades of l. Needed to get e.g. RBF R_star
+#   roughly uniform on [0,1] instead of collapsing near 0 (see diag_kernels.py).
+l_log_uniform: true
+l_scale_by_sqrt_k: true
+alpha2_min: 0.5
+alpha2_max: 2.0
+
+# Nugget: single diagonal regulariser ~ U[nugget_min, nugget_max].
+# Guarantees PSD and controls posterior tightness (replaces separate noise param).
+nugget_min: 0.1
+nugget_max: 0.25
+
+# ---------------------------------------------------------------------------
+# Kernel selection
+# ---------------------------------------------------------------------------
+# Use a single fixed kernel:
+#   kernel: rbf
+# Or sample uniformly from a list each task:
+#   kernels: [rbf, matern32, cosine, periodic, rational_quadratic, dot_product, lsh_forest]
+#
+# Available kernels: rbf, matern32, cosine, periodic, rational_quadratic, dot_product, lsh_forest
+kernel: dot_product
+
+# Extra hyperparameter ranges (only used by the indicated kernels)
+period_min: 0.5      # periodic kernel
+period_max: 3.0
+rq_alpha_min: 0.1    # rational_quadratic kernel
+rq_alpha_max: 5.0
+# lsh_num_trees: 20   # lsh_forest kernel — number of random-hyperplane trees
+# lsh_depth: 4        # lsh_forest kernel — hyperplanes per tree (2**depth leaves/tree)
+
+# PIT epsilon for probit clamping (analytical pipeline)
+pit_eps: 1.0e-6
+
+# Episodes per shard file (D: reduces NFS metadata ops by this factor).
+# Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
+shard_size: 256
+
+# Output directory
+dataset_dir: ./data/pit_cosine_prior
+pit_dir: ${data.dataset_dir}/pit
+
+# Resume from existing files if present
+resume: false

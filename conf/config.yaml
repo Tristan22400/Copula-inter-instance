@@ -12,15 +12,23 @@ wandb:
 training:
   device: auto
   batch_size: 64
-  steps: 500000
+  # torch.compile adds real overhead (first-step + recompiles on shape changes);
+  # worth it for long runs, a drag while iterating quickly. Off by default.
+  compile: false
+  steps: 50000
   warmup_steps: 1000
   clip_grad_norm: 10.0
   log_every: 100
   val_every: 500
   save_every: 5000
-  ckpt_dir: ./checkpoints/test-full-model
+  ckpt_dir: ./checkpoints/dot-product-posterior-ckpts
   dataset_dir: ./data/dot-product-posterior/pit
   val_fraction: 0.05   # fraction of episodes held out for validation
+  # For sharded datasets: shuffle within blocks of this many shards at a time
+  # (all shuffled together, IO-cache resident) instead of one global shuffle
+  # across every shard — avoids thrashing the shard LRU cache on network
+  # storage. Still a true per-epoch permutation, just chunked randomization.
+  shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
   muon_lr: 8.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
