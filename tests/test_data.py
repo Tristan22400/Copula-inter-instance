@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import random
 
+import pytest
 import torch
+from omegaconf import OmegaConf
 
-from data_gen import generate_gp_task, gp_posterior, sigma_to_correlation
+from data_gen import ALL_KERNELS, generate_gp_task, gp_posterior, sigma_to_correlation
 from dataset import CopulaDataset, collate_fn
 
 # ---------------------------------------------------------------------------
@@ -106,6 +108,57 @@ def test_r_star_values_in_minus1_1(small_cfg):
     for _ in range(10):
         R = generate_gp_task(small_cfg)["R_star"]
         assert R.abs().max() <= 1.0 + 1e-5
+
+
+# Goldilocks band (mirrors src/diag_kernels.py's Stage-3 thresholds): R_star
+# must reflect real dependence — not collapsed toward independence (screening
+# effect) and not saturated near +-1 everywhere (trivial task).
+_COLLAPSE_THRESHOLD = 0.01
+_DEGENERATE_THRESHOLD = 0.95
+
+
+@pytest.mark.parametrize("kernel_name", ALL_KERNELS)
+def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
+    """Every registered kernel must produce a valid, non-trivial R_star.
+
+    One shared test parametrized over every entry in data_gen.ALL_KERNELS,
+    rather than a bespoke test per kernel, so newly registered kernels (e.g.
+    lsh_forest) are automatically held to the same PSD + Goldilocks bar as
+    the existing ones without needing a new test written by hand.
+    """
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.d_features = 6
+    cfg.data.d_kernel_min = 1
+    cfg.data.d_kernel_max = 4
+
+    torch.manual_seed(abs(hash(kernel_name)) % (2**31))
+    off_diag_abs = []
+    for _ in range(20):
+        task = generate_gp_task(cfg)
+        R = task["R_star"]
+        N = R.shape[0]
+
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4), (
+            f"{kernel_name}: diagonal not 1: {R.diagonal()}"
+        )
+        assert torch.allclose(R, R.T, atol=1e-5), f"{kernel_name}: not symmetric"
+        eigvals = torch.linalg.eigvalsh(R)
+        assert (eigvals >= -1e-4).all(), (
+            f"{kernel_name}: not PSD (min eig={eigvals.min():.6f})"
+        )
+        assert R.abs().max() <= 1.0 + 1e-5, f"{kernel_name}: value outside [-1, 1]"
+
+        mask = ~torch.eye(N, dtype=torch.bool)
+        off_diag_abs.append(R[mask].abs())
+
+    mean_abs_r = torch.cat(off_diag_abs).mean().item()
+    assert mean_abs_r > _COLLAPSE_THRESHOLD, (
+        f"{kernel_name}: screening effect, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+    assert mean_abs_r < _DEGENERATE_THRESHOLD, (
+        f"{kernel_name}: degenerate/trivial, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
 
 
 def test_gp_posterior_helper():

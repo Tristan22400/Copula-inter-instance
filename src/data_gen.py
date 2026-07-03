@@ -14,6 +14,10 @@ Supported kernels
   periodic            — Periodic: k(r) = alpha2 * exp(-2 sin²(π r / period) / l²)
   rational_quadratic  — Rational Quadratic: k(r) = alpha2 * (1 + r²/(2α l²))^{-α}
   dot_product         — Linear (dot product): k(x1,x2) = x1ᵀx2
+  lsh_forest          — LSH Forest: k(x1,x2) = alpha2 * (fraction of random-hyperplane
+                         trees where x1,x2 land in the same leaf). Ultrametric,
+                         block-diagonal structure (sharp regime changes, like a
+                         decision tree ensemble) instead of a smooth distance decay.
 
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
@@ -127,6 +131,45 @@ def dot_product_kernel(
     return X1 @ X2.T
 
 
+def _lsh_leaf_ids(X: Tensor, W: Tensor, b: Tensor) -> Tensor:
+    """Hash each row of X through every tree, return one leaf id per tree.
+
+    X: (n, k), W: (k, num_trees, depth), b: (num_trees, depth) -> (n, num_trees) int64.
+    Each of the `depth` random hyperplanes per tree contributes one bit; the
+    `depth` bits are packed into a single leaf id so a same-leaf test across a
+    tree is one integer comparison instead of `depth` boolean comparisons.
+    """
+    depth = W.shape[-1]
+    bits = torch.einsum("nk,ksd->nsd", X, W) + b > 0  # (n, num_trees, depth)
+    weights = (2 ** torch.arange(depth, device=X.device)).to(torch.int64)
+    return (bits.long() * weights).sum(-1)  # (n, num_trees)
+
+
+def lsh_forest_kernel(
+    X1: Tensor, X2: Tensor, *, alpha2: float, lsh_W: Tensor, lsh_b: Tensor, **_
+) -> Tensor:
+    """LSH Forest: alpha2 * (fraction of trees where x1, x2 land in the same leaf).
+
+    Each tree is a set of `depth` random hyperplanes that partitions the input
+    space into up to 2**depth cells (a random-hyperplane / SimHash forest).
+    Within one tree, the leaf-membership indicator matrix is a block-diagonal
+    0/1 matrix, which is PSD; a convex average (over trees) of PSD matrices is
+    PSD, so the kernel is valid for any alpha2 >= 0. This produces sharp,
+    ultrametric block structure (like a decision-tree ensemble) instead of the
+    smooth distance-based decay of the other stationary kernels.
+
+    lsh_W/lsh_b must be the SAME realization for every kernel_fn(X1, X2) call
+    within one episode — gp_posterior calls the kernel three times (K_ff, K_sf,
+    K_ss) with different point sets, so the hyperplanes are sampled once per
+    episode (see generate_gp_task/generate_gp_batch) and passed in here rather
+    than being resampled on every call.
+    """
+    ids1 = _lsh_leaf_ids(X1, lsh_W, lsh_b)  # (n1, num_trees)
+    ids2 = _lsh_leaf_ids(X2, lsh_W, lsh_b)  # (n2, num_trees)
+    matches = ids1.unsqueeze(1) == ids2.unsqueeze(0)  # (n1, n2, num_trees)
+    return alpha2 * matches.float().mean(-1)
+
+
 # ---------------------------------------------------------------------------
 # Kernel registry
 # ---------------------------------------------------------------------------
@@ -138,6 +181,7 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "periodic": periodic_kernel,
     "rational_quadratic": rational_quadratic_kernel,
     "dot_product": dot_product_kernel,
+    "lsh_forest": lsh_forest_kernel,
 }
 
 ALL_KERNELS: List[str] = list(KERNEL_REGISTRY.keys())
@@ -150,14 +194,24 @@ def build_kernel_fn(
     *,
     period: Optional[float] = None,
     rq_alpha: Optional[float] = None,
+    lsh_W: Optional[Tensor] = None,
+    lsh_b: Optional[Tensor] = None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
-    """Return a kernel(X1, X2) -> K callable with hyperparameters baked in."""
+    """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
+
+    lsh_W/lsh_b (lsh_forest only) must be one fixed realization sampled once
+    per episode by the caller — see lsh_forest_kernel's docstring for why.
+    """
     fn = KERNEL_REGISTRY[kernel_name]
     kwargs: Dict = dict(l=l, alpha2=alpha2)
     if period is not None:
         kwargs["period"] = period
     if rq_alpha is not None:
         kwargs["rq_alpha"] = rq_alpha
+    if lsh_W is not None:
+        kwargs["lsh_W"] = lsh_W
+    if lsh_b is not None:
+        kwargs["lsh_b"] = lsh_b
     return lambda X1, X2: fn(X1, X2, **kwargs)
 
 
@@ -391,6 +445,16 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
         rq_alpha = random.uniform(rq_min, rq_max)
 
+    lsh_W: Optional[Tensor] = None
+    lsh_b: Optional[Tensor] = None
+    if kernel_name == "lsh_forest":
+        num_trees = int(getattr(cfg.data, "lsh_num_trees", 20))
+        depth = int(getattr(cfg.data, "lsh_depth", 4))
+        # One fixed hyperplane forest for the whole episode — K_ff/K_sf/K_ss
+        # (computed by three separate kernel_fn calls below) must agree on it.
+        lsh_W = torch.randn(len(kernel_cols), num_trees, depth)
+        lsh_b = torch.randn(num_trees, depth)
+
     # 5. Sample features x ~ N(0, 1)^d, warp marginals (TabICLv2-style feature
     # heterogeneity), normalise over all P+N instances
     x_raw = torch.randn(P + N, d)
@@ -401,7 +465,9 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_k = x_norm[:, kernel_cols]                        # kernel sub-matrix (P+N, k)
 
     # 6. Build kernel function and sample y ~ GP(0, K + nugget·I) jointly
-    kernel_fn = build_kernel_fn(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
+    kernel_fn = build_kernel_fn(
+        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, lsh_W=lsh_W, lsh_b=lsh_b
+    )
     K_all = kernel_fn(x_k, x_k) + nugget * torch.eye(P + N)
 
     y_all = _safe_cholesky(K_all, max_attempts=12) @ torch.randn(P + N)
@@ -473,6 +539,18 @@ def _batched_cholesky(K: Tensor) -> Tensor:
     return L
 
 
+def _batched_lsh_leaf_ids(x_k: Tensor, W: Tensor, b: Tensor) -> Tensor:
+    """Batched version of _lsh_leaf_ids.
+
+    x_k: (B, T, k), W: (B, k, num_trees, depth), b: (B, num_trees, depth)
+    -> (B, T, num_trees) int64 leaf id per (episode, point, tree).
+    """
+    depth = W.shape[-1]
+    bits = torch.einsum("btk,bksd->btsd", x_k, W) + b.unsqueeze(1) > 0  # (B, T, num_trees, depth)
+    weights = (2 ** torch.arange(depth, device=x_k.device)).to(torch.int64)
+    return (bits.long() * weights).sum(-1)  # (B, T, num_trees)
+
+
 def _batched_kernel_matrix(
     kernel_name: str,
     x_k: Tensor,                        # (B, T, k)
@@ -480,6 +558,8 @@ def _batched_kernel_matrix(
     alpha2: Tensor,                     # (B,)
     period: Optional[Tensor] = None,    # (B,) — periodic kernel only
     rq_alpha: Optional[Tensor] = None,  # (B,) — rational_quadratic only
+    lsh_W: Optional[Tensor] = None,     # (B, k, num_trees, depth) — lsh_forest only
+    lsh_b: Optional[Tensor] = None,     # (B, num_trees, depth) — lsh_forest only
 ) -> Tensor:
     """Build B kernel matrices for T points in one vectorised call.
 
@@ -492,6 +572,11 @@ def _batched_kernel_matrix(
 
     if kernel_name == "dot_product":
         return x_k @ x_k.permute(0, 2, 1)  # (B, T, T)
+
+    if kernel_name == "lsh_forest":
+        ids = _batched_lsh_leaf_ids(x_k, lsh_W, lsh_b)         # (B, T, num_trees)
+        matches = ids.unsqueeze(2) == ids.unsqueeze(1)          # (B, T, T, num_trees)
+        return alpha3 * matches.float().mean(dim=-1)
 
     diff  = x_k.unsqueeze(2) - x_k.unsqueeze(1)  # (B, T, T, k)
     sq    = (diff ** 2).sum(-1)                    # (B, T, T)
@@ -629,7 +714,9 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
 
     if kernel_name in ("cosine", "periodic"):
         k = 1
-    elif kernel_name == "dot_product":
+    elif kernel_name in ("dot_product", "lsh_forest"):
+        # Every hyperplane split can draw on all d columns (no lengthscale to
+        # dilute with irrelevant dims, unlike rbf/matern32/rational_quadratic).
         k = d
     else:
         k = random.randint(
@@ -662,6 +749,15 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         rq_max  = float(getattr(cfg.data, "rq_alpha_max", 5.0))
         rq_alpha = torch.rand(B, device=device) * (rq_max - rq_min) + rq_min
 
+    lsh_W = lsh_b = None
+    if kernel_name == "lsh_forest":
+        num_trees = int(getattr(cfg.data, "lsh_num_trees", 20))
+        depth = int(getattr(cfg.data, "lsh_depth", 4))
+        # One fixed hyperplane forest per episode, shared by every submatrix
+        # of K_all — see lsh_forest_kernel's docstring for why this matters.
+        lsh_W = torch.randn(B, k, num_trees, depth, device=device)
+        lsh_b = torch.randn(B, num_trees, depth, device=device)
+
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw  = torch.randn(B, T, d, device=device)
     x_raw  = tabiclv2_warp_features(x_raw)
@@ -679,7 +775,7 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         x_k = x_norm.gather(2, col_idx.unsqueeze(1).expand(B, T, k))              # (B, T, k)
 
     # --- Build K_all (B, T, T) and sample y jointly ---
-    K_all = _batched_kernel_matrix(kernel_name, x_k, l, alpha2, period, rq_alpha)
+    K_all = _batched_kernel_matrix(kernel_name, x_k, l, alpha2, period, rq_alpha, lsh_W, lsh_b)
     K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
     K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
 

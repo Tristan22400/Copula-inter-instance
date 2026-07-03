@@ -211,8 +211,12 @@ def run_stage3(cfg: "Cfg", n_tasks: int) -> bool:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        ncols = 3
+        nrows = math.ceil(len(ALL_KERNELS) / ncols)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
         fig_axes = list(axes.flat)
+        for ax in fig_axes[len(ALL_KERNELS):]:
+            ax.set_visible(False)
     except ImportError:
         fig = None
 

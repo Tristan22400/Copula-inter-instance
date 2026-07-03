@@ -13,10 +13,10 @@ This script:
 Healthy run: copula_gap → 0 and ||R̂ - R*||_F → 0.
 
 Usage:
-    python src/overfit_single.py
-    python src/overfit_single.py --episode data/pit_episodes_cosine/task_000042.pt
-    python src/overfit_single.py --k-realizations 500 --steps 5000 --lr 1e-3
-    python src/overfit_single.py --freeze-backbone
+    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt
+    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --task-idx 3
+    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --k-realizations 500 --steps 5000 --lr 1e-3
+    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --freeze-backbone
 """
 
 from __future__ import annotations
@@ -47,8 +47,16 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--episode",
-        default=None,
-        help="Path to .pt episode file (default: task_000000.pt in pit_episodes_cosine)",
+        required=True,
+        help="Path to .pt episode file: either a single-episode task_*.pt, or a "
+        "sharded shard_*.pt (a list of episodes — one is picked via --task-idx).",
+    )
+    p.add_argument(
+        "--task-idx",
+        type=int,
+        default=0,
+        help="Which episode to select when --episode points at a shard_*.pt file "
+        "(list of episodes). Ignored for single-episode files. Default: 0.",
     )
     p.add_argument(
         "--k-realizations",
@@ -146,17 +154,20 @@ def main() -> None:
     print(f"Device: {device}")
 
     # Load episode.
-    if args.episode is None:
-        episode_path = os.path.join(
-            _ROOT, "data", "pit_episodes_cosine", "task_000000.pt"
-        )
+    episode_path = args.episode
+    loaded = torch.load(episode_path, map_location="cpu", weights_only=True)
+    if isinstance(loaded, list):
+        # Sharded layout (shard_XXXXXX.pt from generate_pit_dataset.py): a list
+        # of B episode dicts, same convention as CopulaDataset._get_sharded.
+        task_idx = min(args.task_idx, len(loaded) - 1)
+        episode = loaded[task_idx]
+        print(f"Episode : {os.path.basename(episode_path)}  (shard of {len(loaded)}, task_idx={task_idx})")
     else:
-        episode_path = args.episode
+        episode = loaded
+        print(f"Episode : {os.path.basename(episode_path)}")
 
-    episode = torch.load(episode_path, map_location="cpu", weights_only=True)
     n_train = int(episode["n_train"].item())
     n_test = int(episode["n_test"].item())
-    print(f"Episode : {os.path.basename(episode_path)}")
     print(f"  n_train={n_train}  n_test={n_test}  d_x={episode['x_norm_train'].shape[-1]}")
     print(f"  K realizations from N(0, R*): {args.k_realizations}")
 
