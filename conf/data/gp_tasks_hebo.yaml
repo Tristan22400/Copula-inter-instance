@@ -53,6 +53,16 @@ alpha2_max: 2.0
 nugget_min: 0.1
 nugget_max: 0.25
 
+# Test-side oracle for R_star/mu_star/sigma_star (and hence z_test) — see
+# gp_tasks.yaml for the posterior/prior explanation. Deliberately NOT mirroring
+# gp_tasks.yaml's "prior" default: hebo's ARD Matérn kernel (like every other
+# stationary kernel in this file) is non-negative by construction, so the raw
+# GP *prior* can never produce a negative R_star entry — only the *posterior*
+# (via Schur-complement conditioning on training data) can. Confirmed
+# empirically: oracle_mode=prior fails test_correlations_have_both_signs
+# (100% non-negative) and test_r_star_well_conditioned; posterior passes both.
+oracle_mode: posterior
+
 # ---------------------------------------------------------------------------
 # Kernel selection
 # ---------------------------------------------------------------------------

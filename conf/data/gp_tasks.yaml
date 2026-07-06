@@ -42,6 +42,14 @@ alpha2_max: 2.0
 nugget_min: 0.1
 nugget_max: 0.25
 
+# Test-side oracle for R_star/mu_star/sigma_star (and hence z_test):
+#   posterior: condition on the training context (K_ss − K_st K_ff⁻¹ K_ts) —
+#              off-diagonal correlations shrink with more/closer train points.
+#   prior:     raw kernel structure among test points only, ignoring the
+#              training context entirely.
+# z_train's LOO PIT is unaffected either way (always exact GP LOO on K_ff).
+oracle_mode: prior
+
 # ---------------------------------------------------------------------------
 # Kernel selection
 # ---------------------------------------------------------------------------

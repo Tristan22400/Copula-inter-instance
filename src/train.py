@@ -139,6 +139,25 @@ def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> 
     )
 
 
+def _fmt_run_value(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, (list, tuple)):
+        return "+".join(_fmt_run_value(v) for v in value)
+    return str(value).replace(" ", "")
+
+
+def _run_segments(cfg: DictConfig, prefix: str, keys: list[tuple[str, str]]) -> str:
+    parts = []
+    for cfg_key, label in keys:
+        value = cfg.get(cfg_key, None)
+        if value is not None:
+            parts.append(f"_{prefix}{label}={_fmt_run_value(value)}")
+    return "".join(parts)
+
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -375,10 +394,47 @@ def main(cfg: DictConfig) -> None:
     else:
         lora_str = "_nolora"
     unfreeze = bool(cfg.model.get("unfreeze_backbone", False))
+    model_hparams = _run_segments(
+        cfg.model,
+        "m_",
+        [
+            ("rank", "r"),
+            ("sigma_jitter", "jit"),
+            ("d_model", "dm"),
+            ("n_heads", "h"),
+            ("n_layers_s1", "s1"),
+            ("n_layers_s2", "s2"),
+            ("n_layers_s3", "s3"),
+            ("n_inducing", "ind"),
+            ("n_cls", "cls"),
+            ("p_max", "pmax"),
+            ("d_max", "dmax"),
+            ("dropout", "drop"),
+        ],
+    )
+    training_hparams = _run_segments(
+        t,
+        "tr_",
+        [
+            ("batch_size", "bs"),
+            ("steps", "steps"),
+            ("warmup_steps", "wu"),
+            ("muon_lr", "lr"),
+            ("muon_lr_min", "lrmin"),
+            ("muon_weight_decay", "wd"),
+            ("muon_momentum", "mom"),
+            ("muon_matched_adamw_rms", "rms"),
+            ("muon_ns_steps", "ns"),
+            ("clip_grad_norm", "clip"),
+            ("nll_weight", "nll"),
+            ("aux_mse_weight", "aux"),
+            ("compile", "compile"),
+        ],
+    )
     run_name = (
         f"{dataset_name}"
-        f"_r={cfg.model.rank}"
-        f"_lr={t.muon_lr}"
+        f"{model_hparams}"
+        f"{training_hparams}"
         f"_unfreeze={unfreeze}"
         f"{lora_str}"
     )
