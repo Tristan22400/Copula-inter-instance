@@ -19,15 +19,27 @@ Supported kernels
                          block-diagonal structure (sharp regime changes, like a
                          decision tree ensemble) instead of a smooth distance decay.
 
+Composite kernels ("A+B" / "A*B")
+---------------------------------
+  Sums and products of PSD kernels are PSD, so every pair drawn from
+  {rbf, matern32, cosine, periodic, rational_quadratic} is auto-registered
+  under both operators, e.g. "rbf+periodic" (locally periodic: smooth decay
+  times exact periodicity) or "matern32*cosine" (spectral windowing). See
+  COMPOSITE_KERNELS for the full list. dot_product and lsh_forest are not
+  composable (irregular hyperparameter signatures).
+
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
   cfg.data.kernel   : str          → use this single kernel for every task
+                                     (any entry in ALL_KERNELS, including composites)
   cfg.data.kernels  : list[str]    → sample uniformly at task generation time
   If both are absent the default is "rbf".
 """
 
 from __future__ import annotations
 
+import functools
+import itertools
 import math
 import random
 from typing import Callable, Dict, List, Optional
@@ -184,6 +196,91 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "lsh_forest": lsh_forest_kernel,
 }
 
+
+# ---------------------------------------------------------------------------
+# Composite kernels: sum / product of two base kernels
+# ---------------------------------------------------------------------------
+# Sums and products of PSD kernels are PSD, so "rbf+periodic" (locally
+# periodic — smooth decay times exact periodicity) or "matern32*cosine"
+# (spectral windowing) are valid kernels without any new math. Restricted to
+# the kernels below because they share one calling convention (l, alpha2,
+# plus an optional named extra); dot_product and lsh_forest have irregular
+# signatures (no lengthscale / a per-episode random forest) and are left out
+# of composites for now.
+_COMPOSABLE_KERNELS: List[str] = ["rbf", "matern32", "cosine", "periodic", "rational_quadratic"]
+
+# Kernels whose PSD guarantee only holds for scalar (1D) inputs — composites
+# that include one of these must also cap the active kernel dimensionality
+# to k=1 (see generate_gp_task / generate_gp_batch).
+_SCALAR_ONLY_KERNELS = {"cosine", "periodic"}
+
+
+def _parse_composite(name: str) -> Optional[tuple]:
+    """Split "A+B" / "A*B" into (name_a, op, name_b), or None if not composite."""
+    for op in ("+", "*"):
+        if op in name:
+            a, _, b = name.partition(op)
+            if a in _COMPOSABLE_KERNELS and b in _COMPOSABLE_KERNELS:
+                return a, op, b
+    return None
+
+
+def _kernel_needs_scalar_input(kernel_name: str) -> bool:
+    """True if this kernel (or either half of a composite) requires k=1 input dims."""
+    composite = _parse_composite(kernel_name)
+    if composite is not None:
+        name_a, _, name_b = composite
+        return name_a in _SCALAR_ONLY_KERNELS or name_b in _SCALAR_ONLY_KERNELS
+    return kernel_name in _SCALAR_ONLY_KERNELS
+
+
+def _composite_kernel(
+    X1: Tensor,
+    X2: Tensor,
+    *,
+    kernel_name: str,
+    l: float,
+    alpha2: float,
+    l_b: Optional[float] = None,
+    alpha2_b: Optional[float] = None,
+    period: Optional[float] = None,
+    period_b: Optional[float] = None,
+    rq_alpha: Optional[float] = None,
+    rq_alpha_b: Optional[float] = None,
+    **_,
+) -> Tensor:
+    """Evaluate a registered "A+B" / "A*B" composite kernel.
+
+    Component A uses (l, alpha2, period, rq_alpha); component B uses the
+    "_b"-suffixed counterparts — independent hyperparameters per component,
+    sampled once per episode by the caller (same convention as period/rq_alpha
+    for the simple kernels).
+    """
+    name_a, op, name_b = _parse_composite(kernel_name)
+    kwargs_a: Dict = dict(l=l, alpha2=alpha2)
+    if name_a == "periodic":
+        kwargs_a["period"] = period
+    if name_a == "rational_quadratic":
+        kwargs_a["rq_alpha"] = rq_alpha
+    kwargs_b: Dict = dict(l=l_b, alpha2=alpha2_b)
+    if name_b == "periodic":
+        kwargs_b["period"] = period_b
+    if name_b == "rational_quadratic":
+        kwargs_b["rq_alpha"] = rq_alpha_b
+
+    K_a = KERNEL_REGISTRY[name_a](X1, X2, **kwargs_a)
+    K_b = KERNEL_REGISTRY[name_b](X1, X2, **kwargs_b)
+    return K_a + K_b if op == "+" else K_a * K_b
+
+
+COMPOSITE_KERNELS: List[str] = []
+for _name_a, _name_b in itertools.combinations(_COMPOSABLE_KERNELS, 2):
+    for _op in ("+", "*"):
+        _combo_name = f"{_name_a}{_op}{_name_b}"
+        KERNEL_REGISTRY[_combo_name] = functools.partial(_composite_kernel, kernel_name=_combo_name)
+        COMPOSITE_KERNELS.append(_combo_name)
+del _name_a, _name_b, _op, _combo_name
+
 ALL_KERNELS: List[str] = list(KERNEL_REGISTRY.keys())
 
 
@@ -196,11 +293,17 @@ def build_kernel_fn(
     rq_alpha: Optional[float] = None,
     lsh_W: Optional[Tensor] = None,
     lsh_b: Optional[Tensor] = None,
+    l_b: Optional[float] = None,
+    alpha2_b: Optional[float] = None,
+    period_b: Optional[float] = None,
+    rq_alpha_b: Optional[float] = None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
     """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
 
     lsh_W/lsh_b (lsh_forest only) must be one fixed realization sampled once
     per episode by the caller — see lsh_forest_kernel's docstring for why.
+    l_b/alpha2_b/period_b/rq_alpha_b are the second component's hyperparameters
+    for composite ("A+B" / "A*B") kernels — see _composite_kernel.
     """
     fn = KERNEL_REGISTRY[kernel_name]
     kwargs: Dict = dict(l=l, alpha2=alpha2)
@@ -212,6 +315,14 @@ def build_kernel_fn(
         kwargs["lsh_W"] = lsh_W
     if lsh_b is not None:
         kwargs["lsh_b"] = lsh_b
+    if l_b is not None:
+        kwargs["l_b"] = l_b
+    if alpha2_b is not None:
+        kwargs["alpha2_b"] = alpha2_b
+    if period_b is not None:
+        kwargs["period_b"] = period_b
+    if rq_alpha_b is not None:
+        kwargs["rq_alpha_b"] = rq_alpha_b
     return lambda X1, X2: fn(X1, X2, **kwargs)
 
 
@@ -405,8 +516,9 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # 1. Choose kernel and active columns
     kernel_name = _resolve_kernel_name(cfg)
 
-    # cosine and periodic are PSD only for scalar (1D) inputs; cap to k=1
-    if kernel_name in ("cosine", "periodic"):
+    # cosine and periodic (and any composite containing one of them) are PSD
+    # only for scalar (1D) inputs; cap to k=1
+    if _kernel_needs_scalar_input(kernel_name):
         kernel_cols = [random.randint(0, d - 1)]
     else:
         kernel_cols = _sample_kernel_cols(d, cfg)
@@ -434,16 +546,33 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # 4. Extra hyperparameters for specific kernels
     period: Optional[float] = None
     rq_alpha: Optional[float] = None
+    l_b: Optional[float] = None
+    alpha2_b: Optional[float] = None
+    period_b: Optional[float] = None
+    rq_alpha_b: Optional[float] = None
 
-    if kernel_name == "periodic":
-        p_min = float(getattr(cfg.data, "period_min", 0.5))
-        p_max = float(getattr(cfg.data, "period_max", 3.0))
+    composite = _parse_composite(kernel_name)
+    component_a = composite[0] if composite is not None else kernel_name
+    component_b = composite[2] if composite is not None else None
+
+    p_min = float(getattr(cfg.data, "period_min", 0.5))
+    p_max = float(getattr(cfg.data, "period_max", 3.0))
+    rq_min = float(getattr(cfg.data, "rq_alpha_min", 0.1))
+    rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
+
+    if component_a == "periodic":
         period = random.uniform(p_min, p_max)
-
-    if kernel_name == "rational_quadratic":
-        rq_min = float(getattr(cfg.data, "rq_alpha_min", 0.1))
-        rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
+    if component_a == "rational_quadratic":
         rq_alpha = random.uniform(rq_min, rq_max)
+
+    if composite is not None:
+        # Component B: independent length-scale/variance draw, same ranges as A.
+        l_b = _sample_length_scale(cfg, len(kernel_cols), P)
+        alpha2_b = random.uniform(a2_min, a2_max)
+        if component_b == "periodic":
+            period_b = random.uniform(p_min, p_max)
+        if component_b == "rational_quadratic":
+            rq_alpha_b = random.uniform(rq_min, rq_max)
 
     lsh_W: Optional[Tensor] = None
     lsh_b: Optional[Tensor] = None
@@ -466,7 +595,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 
     # 6. Build kernel function and sample y ~ GP(0, K + nugget·I) jointly
     kernel_fn = build_kernel_fn(
-        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, lsh_W=lsh_W, lsh_b=lsh_b
+        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, lsh_W=lsh_W, lsh_b=lsh_b,
+        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
     )
     K_all = kernel_fn(x_k, x_k) + nugget * torch.eye(P + N)
 
@@ -506,6 +636,10 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "kernel": kernel_name,
         "period": torch.tensor(period if period is not None else 0.0),
         "rq_alpha": torch.tensor(rq_alpha if rq_alpha is not None else 0.0),
+        "l_b": torch.tensor(l_b if l_b is not None else 0.0),
+        "alpha2_b": torch.tensor(alpha2_b if alpha2_b is not None else 0.0),
+        "period_b": torch.tensor(period_b if period_b is not None else 0.0),
+        "rq_alpha_b": torch.tensor(rq_alpha_b if rq_alpha_b is not None else 0.0),
         "kernel_feature_indices": torch.tensor(kernel_cols, dtype=torch.long),
         # Ephemeral Cholesky factors — consumed by gp_analytical_pit, not saved to disk.
         "_L_ff": L_ff,    # (P, P) Cholesky of K_ff
@@ -551,7 +685,7 @@ def _batched_lsh_leaf_ids(x_k: Tensor, W: Tensor, b: Tensor) -> Tensor:
     return (bits.long() * weights).sum(-1)  # (B, T, num_trees)
 
 
-def _batched_kernel_matrix(
+def _batched_single_kernel_matrix(
     kernel_name: str,
     x_k: Tensor,                        # (B, T, k)
     l: Tensor,                          # (B,)
@@ -561,11 +695,7 @@ def _batched_kernel_matrix(
     lsh_W: Optional[Tensor] = None,     # (B, k, num_trees, depth) — lsh_forest only
     lsh_b: Optional[Tensor] = None,     # (B, num_trees, depth) — lsh_forest only
 ) -> Tensor:
-    """Build B kernel matrices for T points in one vectorised call.
-
-    Returns (B, T, T) WITHOUT nugget on the diagonal.
-    The caller is responsible for adding nugget * I.
-    """
+    """Build B matrices for one non-composite kernel (no nugget on the diagonal)."""
     B, T, _ = x_k.shape
     l3     = l.view(B, 1, 1)
     alpha3 = alpha2.view(B, 1, 1)
@@ -600,7 +730,38 @@ def _batched_kernel_matrix(
         r3 = rq_alpha.view(B, 1, 1)
         return alpha3 * (1.0 + sq / (2.0 * r3 * l3 ** 2)) ** (-r3)
 
-    raise ValueError(f"Unknown kernel '{kernel_name}' in _batched_kernel_matrix.")
+    raise ValueError(f"Unknown kernel '{kernel_name}' in _batched_single_kernel_matrix.")
+
+
+def _batched_kernel_matrix(
+    kernel_name: str,
+    x_k: Tensor,                        # (B, T, k)
+    l: Tensor,                          # (B,)
+    alpha2: Tensor,                     # (B,)
+    period: Optional[Tensor] = None,    # (B,) — periodic kernel/component only
+    rq_alpha: Optional[Tensor] = None,  # (B,) — rational_quadratic kernel/component only
+    lsh_W: Optional[Tensor] = None,     # (B, k, num_trees, depth) — lsh_forest only
+    lsh_b: Optional[Tensor] = None,     # (B, num_trees, depth) — lsh_forest only
+    l_b: Optional[Tensor] = None,       # (B,) — composite kernels only, component B
+    alpha2_b: Optional[Tensor] = None,  # (B,) — composite kernels only, component B
+    period_b: Optional[Tensor] = None,  # (B,) — composite kernels only, component B
+    rq_alpha_b: Optional[Tensor] = None,  # (B,) — composite kernels only, component B
+) -> Tensor:
+    """Build B kernel matrices for T points in one vectorised call.
+
+    Returns (B, T, T) WITHOUT nugget on the diagonal.
+    The caller is responsible for adding nugget * I.
+    """
+    composite = _parse_composite(kernel_name)
+    if composite is None:
+        return _batched_single_kernel_matrix(
+            kernel_name, x_k, l, alpha2, period=period, rq_alpha=rq_alpha, lsh_W=lsh_W, lsh_b=lsh_b
+        )
+
+    name_a, op, name_b = composite
+    K_a = _batched_single_kernel_matrix(name_a, x_k, l, alpha2, period=period, rq_alpha=rq_alpha)
+    K_b = _batched_single_kernel_matrix(name_b, x_k, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b)
+    return K_a + K_b if op == "+" else K_a * K_b
 
 
 def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
@@ -712,7 +873,11 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
 
-    if kernel_name in ("cosine", "periodic"):
+    composite = _parse_composite(kernel_name)
+    component_a = composite[0] if composite is not None else kernel_name
+    component_b = composite[2] if composite is not None else None
+
+    if _kernel_needs_scalar_input(kernel_name):
         k = 1
     elif kernel_name in ("dot_product", "lsh_forest"):
         # Every hyperplane split can draw on all d columns (no lengthscale to
@@ -739,15 +904,32 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         else torch.rand(B, device=device) * (cfg.data.alpha2_max - cfg.data.alpha2_min) + cfg.data.alpha2_min
     )
 
+    p_min  = float(getattr(cfg.data, "period_min",   0.5))
+    p_max  = float(getattr(cfg.data, "period_max",   3.0))
+    rq_min = float(getattr(cfg.data, "rq_alpha_min", 0.1))
+    rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
+
     period = rq_alpha = None
-    if kernel_name == "periodic":
-        p_min  = float(getattr(cfg.data, "period_min",   0.5))
-        p_max  = float(getattr(cfg.data, "period_max",   3.0))
+    if component_a == "periodic":
         period = torch.rand(B, device=device) * (p_max - p_min) + p_min
-    if kernel_name == "rational_quadratic":
-        rq_min  = float(getattr(cfg.data, "rq_alpha_min", 0.1))
-        rq_max  = float(getattr(cfg.data, "rq_alpha_max", 5.0))
+    if component_a == "rational_quadratic":
         rq_alpha = torch.rand(B, device=device) * (rq_max - rq_min) + rq_min
+
+    # --- Component B (composite kernels only): independent hyperparameters,
+    # same ranges as component A.
+    l_b = alpha2_b = period_b = rq_alpha_b = None
+    if composite is not None:
+        if getattr(cfg.data, "l_log_uniform", False):
+            l_b = torch.exp(
+                torch.rand(B, device=device) * (math.log(l_max) - math.log(l_min)) + math.log(l_min)
+            )
+        else:
+            l_b = torch.rand(B, device=device) * (l_max - l_min) + l_min
+        alpha2_b = torch.rand(B, device=device) * (cfg.data.alpha2_max - cfg.data.alpha2_min) + cfg.data.alpha2_min
+        if component_b == "periodic":
+            period_b = torch.rand(B, device=device) * (p_max - p_min) + p_min
+        if component_b == "rational_quadratic":
+            rq_alpha_b = torch.rand(B, device=device) * (rq_max - rq_min) + rq_min
 
     lsh_W = lsh_b = None
     if kernel_name == "lsh_forest":
@@ -766,7 +948,7 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     # --- Select kernel columns ---
     if kernel_name == "dot_product":
         x_k = x_norm                                                                # (B, T, d)
-    elif kernel_name in ("cosine", "periodic"):
+    elif _kernel_needs_scalar_input(kernel_name):
         col = torch.randint(0, d, (B,), device=device)                             # (B,)
         x_k = x_norm.gather(2, col.view(B, 1, 1).expand(B, T, 1))                 # (B, T, 1)
     else:
@@ -775,7 +957,10 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         x_k = x_norm.gather(2, col_idx.unsqueeze(1).expand(B, T, k))              # (B, T, k)
 
     # --- Build K_all (B, T, T) and sample y jointly ---
-    K_all = _batched_kernel_matrix(kernel_name, x_k, l, alpha2, period, rq_alpha, lsh_W, lsh_b)
+    K_all = _batched_kernel_matrix(
+        kernel_name, x_k, l, alpha2, period, rq_alpha, lsh_W, lsh_b,
+        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
+    )
     K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
     K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
 

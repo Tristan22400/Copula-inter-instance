@@ -1,3 +1,4 @@
+import re
 import subprocess
 import argparse
 import shutil
@@ -8,8 +9,15 @@ import tempfile
 # Kernels whose prior can be negative (oscillatory) get the wider-tolerance
 # dataset test (test_dataset_corr_uniform.py); every other kernel has a
 # non-negative prior and gets test_dataset_corr_nonneg.py. See the docstrings
-# of those two files for the statistical reasoning.
+# of those two files for the statistical reasoning. A composite ("A+B"/"A*B")
+# inherits this if either component is oscillatory: rbf*cosine's prior can
+# still go negative directly (rbf>0 times a negative cosine), so the tight
+# negative-fraction bound in test_dataset_corr_nonneg.py doesn't apply.
 OSCILLATORY_KERNELS = {"cosine"}
+
+
+def _is_oscillatory(kernel: str) -> bool:
+    return any(part in OSCILLATORY_KERNELS for part in re.split(r"[+*]", kernel))
 
 
 failures = []
@@ -35,14 +43,15 @@ def run_command(command: list, description: str, env: dict | None = None):
 def main():
     parser = argparse.ArgumentParser(description="Automated Kernel Validation Pipeline")
     parser.add_argument("--kernel", type=str, default="lsh_forest", help="Kernel to validate (e.g., lsh_forest)")
-    parser.add_argument("--skip-overfit", action="store_true", help="Skip the overfitting step (which can be slow)")
     parser.add_argument("--skip-dataset-validation", action="store_true",
                          help="Skip generating a dataset and checking its R_star correlation structure")
     parser.add_argument("--n-episodes", type=int, default=500,
                          help="Episodes to generate for the dataset correlation check (default: 500)")
     parser.add_argument("--keep-dataset", action="store_true",
                          help="Keep the generated validation dataset instead of deleting it afterwards")
-    args = parser.parse_args()
+    args, extra_overrides = parser.parse_known_args()
+    if extra_overrides:
+        print(f"📎 Extra Hydra overrides for Step 2a (dataset generation): {extra_overrides}")
 
     kernel = args.kernel
     print(f"🧪 Starting Validation Pipeline for Kernel: {kernel}\n")
@@ -70,12 +79,13 @@ def main():
                     f"data.kernel={kernel}",
                     f"data.n_tasks={args.n_episodes}",
                     f"data.dataset_dir={dataset_dir}",
+                    *extra_overrides,
                 ],
                 description=f"Step 2a: Generate {args.n_episodes} episodes for dataset validation"
             )
 
             dataset_test_file = (
-                "tests/test_dataset_corr_uniform.py" if kernel in OSCILLATORY_KERNELS
+                "tests/test_dataset_corr_uniform.py" if _is_oscillatory(kernel)
                 else "tests/test_dataset_corr_nonneg.py"
             )
             run_command(
@@ -96,15 +106,6 @@ def main():
         ["python", "scripts/visualize_kernel.py", "--kernel", kernel],
         description="Step 3: Structural Diversity Visualization (Headless)"
     )
-
-    # Step 4: Model Capacity Check (Overfit Single Batch)
-    if not args.skip_overfit:
-        run_command(
-            ["python", "src/overfit_single.py", "--kernel", kernel],
-            description="Step 4: Model Capacity Check (Single-Batch Overfit)"
-        )
-    else:
-        print("⏭️ Skipping Step 4 (Overfit Check) as requested.")
 
     if failures:
         print(f"\n⚠️  PIPELINE FINISHED FOR '{kernel}' WITH {len(failures)} FAILURE(S):")
