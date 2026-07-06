@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# GP task generation config — "hebo" kernel (PFNs4BO's tuned "HEBO+" prior)
+# ---------------------------------------------------------------------------
+# Hyperparameters (lengthscale/outputscale/noise) are NOT read from this file:
+# for kernel: hebo they are sampled by pfns4bo_upstream/pfns4bo/priors/
+# hebo_prior.py::get_model, using the tuned "HEBO+" config that trained
+# PFNs4BO's released hebo_plus_model checkpoint (see
+# src/data_gen.py::HEBO_PLUS_HYPERPARAMETERS for the exact constants and
+# their source). l_min/l_max/alpha2_min/alpha2_max/nugget_min/nugget_max
+# below are ignored for this kernel — kept only so this file stays a
+# drop-in override of gp_tasks.yaml.
+
+d_features: 10          # total feature columns seen by the neural network
+
+# Kernel active-column selection (random per task)
+# k ~ Uniform[d_kernel_min, d_kernel_max] columns are passed to the kernel;
+# the remaining d_features - k columns are irrelevant noise the model must ignore.
+d_kernel_min: 1
+d_kernel_max: 4
+
+# Training/context set size range.
+# Kept small: HEBO+'s per-dimension lengthscale ~ Gamma(mean~0.8) on a UNIT
+# CUBE input domain (see src/data_gen.py's ndtr mapping) conditions away
+# almost all test-side correlation once P grows past a handful of points —
+# diag_kernels.py showed a screening effect (46% of |R*_offdiag| < 0.01) at
+# this repo's default P range (32/5-30). Tuned empirically, same as the
+# composite kernels needed P_min=4,P_max=6 overrides (see project history).
+P_min: 4
+P_max: 8
+
+# Test/query set size range (copula is over these N instances).
+# Kept smaller than gp_tasks.yaml's default (128): HEBO+'s noise nugget is
+# LogNormal(-4.63, 0.5) — much smaller than every other kernel's deliberately
+# large nugget_min/max=[0.1,0.25] floor (chosen specifically to keep R_star
+# well-conditioned). With tiny noise, larger N raises the chance that two
+# test points land close together (near-duplicate under the sampled
+# lengthscale) and R_star's min eigenvalue dips under this repo's 0.001
+# well-conditioned floor. Empirically: N_max=128 gave 1/500 episodes just
+# under the floor (min_eig=9.2e-4); N_max=64 removes the failure.
+N_min: 8
+N_max: 64
+
+# Number of tasks to generate
+n_tasks: 5000000
+
+# Ignored for kernel: hebo — see header comment.
+l_min: 1.0
+l_max: 10.0
+l_log_uniform: true
+l_scale_by_sqrt_k: true
+alpha2_min: 0.5
+alpha2_max: 2.0
+nugget_min: 0.1
+nugget_max: 0.25
+
+# ---------------------------------------------------------------------------
+# Kernel selection
+# ---------------------------------------------------------------------------
+kernel: hebo
+
+# PIT epsilon for probit clamping (analytical pipeline)
+pit_eps: 1.0e-6
+
+# Episodes per shard file (reduces NFS metadata ops by this factor).
+shard_size: 256
+
+# Output directory
+dataset_dir: ./data/pit_hebo_prior
+pit_dir: ${data.dataset_dir}/pit
+
+# Resume from existing files if present
+resume: false

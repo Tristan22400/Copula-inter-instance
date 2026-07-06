@@ -18,6 +18,16 @@ Supported kernels
                          trees where x1,x2 land in the same leaf). Ultrametric,
                          block-diagonal structure (sharp regime changes, like a
                          decision tree ensemble) instead of a smooth distance decay.
+  hebo                — ARD Matérn ν=3/2 + outputscale, hyperparameters sampled via
+                         the "HEBO+" prior from pfns4bo_upstream (github.com/automl/
+                         PFNs4BO), the tuned config that trained their released
+                         `hebo_plus_model` checkpoint. Sampling itself calls
+                         pfns4bo_upstream's own pfns4bo.priors.hebo_prior.get_model
+                         (unmodified upstream code — see pfns4bo_compat.py for the
+                         load-time botorch-version compatibility shims this needs);
+                         see hebo_matern32_kernel / _sample_hebo_hyperparameters /
+                         HEBO_PLUS_HYPERPARAMETERS below for the exact tuned
+                         constants and their source.
 
 Composite kernels ("A+B" / "A*B")
 ---------------------------------
@@ -42,6 +52,7 @@ import functools
 import itertools
 import math
 import random
+import warnings
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -49,6 +60,7 @@ import torch
 from torch import Tensor
 
 from loss import _safe_cholesky
+from pfns4bo_compat import get_hebo_prior_module
 
 
 def _seed_everything(seed: int) -> None:
@@ -143,6 +155,26 @@ def dot_product_kernel(
     return X1 @ X2.T
 
 
+def hebo_matern32_kernel(X1: Tensor, X2: Tensor, *, l: Tensor, alpha2: float, **_) -> Tensor:
+    """ARD Matérn ν=3/2 + outputscale — pfns4bo_upstream's "HEBO+" kernel family.
+
+    Same formula as `gpytorch.kernels.ScaleKernel(MaternKernel(nu=1.5,
+    ard_num_dims=k))`; verified numerically against that (max abs diff ~2e-7,
+    float32). `l` is a per-dimension lengthscale *vector* (k,) here — unlike
+    every other kernel in this file, which uses one isotropic scalar l — but
+    broadcasts correctly since `diff` has a trailing k dimension. Registered
+    in KERNEL_REGISTRY like any other kernel so build_kernel_fn/pit.py's
+    reconstruction path works unchanged; the actual (l, alpha2) values for
+    "hebo" are sampled by _sample_hebo_hyperparameters via
+    pfns4bo_upstream's own hebo_prior.get_model, not by this function.
+    """
+    diff = X1.unsqueeze(1) - X2.unsqueeze(0)  # (n1, n2, k)
+    scaled = diff / l
+    r = scaled.pow(2).sum(-1).clamp(min=0.0).sqrt()
+    s = math.sqrt(3.0) * r
+    return alpha2 * (1.0 + s) * torch.exp(-s)
+
+
 def _lsh_leaf_ids(X: Tensor, W: Tensor, b: Tensor) -> Tensor:
     """Hash each row of X through every tree, return one leaf id per tree.
 
@@ -194,6 +226,7 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "rational_quadratic": rational_quadratic_kernel,
     "dot_product": dot_product_kernel,
     "lsh_forest": lsh_forest_kernel,
+    "hebo": hebo_matern32_kernel,
 }
 
 
@@ -324,6 +357,68 @@ def build_kernel_fn(
     if rq_alpha_b is not None:
         kwargs["rq_alpha_b"] = rq_alpha_b
     return lambda X1, X2: fn(X1, X2, **kwargs)
+
+
+HEBO_PLUS_HYPERPARAMETERS: Dict[str, object] = {
+    # Tuned "HEBO+" prior — the exact config that trained pfns4bo_upstream's
+    # released `hebo_plus_model` checkpoint. Source: pfns4bo_upstream/pfns4bo/
+    # priors/hebo_prior.py::get_model + Tutorial_Training_for_BO.ipynb (which
+    # trains that checkpoint) + PFN4BO.pdf Appendix B.1.
+    "lengthscale_concentration": 1.2106559584074301,
+    "lengthscale_rate": 1.5212245992840594,
+    "outputscale_concentration": 0.8452312502679863,
+    "outputscale_rate": 0.3993553245745406,
+    "hebo_noise_logmean": -4.63,
+    "hebo_noise_std": 0.5,
+    "add_linear_kernel": False,  # tuned HEBO+ drops the linear-kernel term
+    "hebo_warping": False,       # tuned HEBO+ drops input warping
+}
+
+
+def _sample_hebo_hyperparameters(x_unit: Tensor) -> tuple[Tensor, float, float]:
+    """Sample one independent HEBO+ GP hyperparameter draw.
+
+    Calls pfns4bo_upstream's own `hebo_prior.get_model` (unmodified upstream
+    code — pfns4bo_compat.py applies only load-time botorch-version
+    compatibility shims before import; see that module's docstring), which
+    internally builds a `ScaleKernel(MaternKernel(nu=1.5, ard_num_dims=k))`
+    with Gamma-distributed lengthscale/outputscale and LogNormal-distributed
+    noise, then calls gpytorch's `model.pyro_sample_from_prior()` to draw one
+    concrete realization.
+
+    x_unit: (T, k), already mapped to the unit hypercube — HEBO+'s prior is
+    calibrated for x in [0,1]^k (paper Appendix D), unlike this file's usual
+    ~N(0,1)-standardised features. Only used to fix the input shape/dtype for
+    `get_model`'s (unused) SingleTaskGP construction; the values themselves
+    don't affect which hyperparameters get sampled.
+
+    get_model registers its priors without a batch dimension, so calling it
+    once across many points still only produces ONE shared hyperparameter
+    draw for all of them (verified empirically) — call this once per episode
+    (T = one episode's train+test points) for an independent draw per
+    episode, matching how every other kernel in this file samples
+    independent per-episode hyperparameters.
+
+    Returns:
+        l      : (k,)  — ARD per-dimension lengthscale.
+        alpha2 : float — outputscale.
+        nugget : float — sampled Gaussian-likelihood noise; plays the same
+                 role as every other kernel's `nugget` (added to the K
+                 diagonal).
+    """
+    hebo_prior = get_hebo_prior_module()
+    T = x_unit.shape[0]
+    xb = x_unit.unsqueeze(0)
+    yb = torch.zeros(1, T, device=x_unit.device)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # botorch float32-precision notice
+        model, likelihood = hebo_prior.get_model(
+            xb, yb, HEBO_PLUS_HYPERPARAMETERS, sample=True
+        )
+    l = model.covar_module.base_kernel.lengthscale.detach().reshape(-1).clone()
+    alpha2 = model.covar_module.outputscale.detach().reshape(-1)[0].item()
+    nugget = likelihood.noise.detach().reshape(-1)[0].item()
+    return l, alpha2, nugget
 
 
 def _sample_kernel_cols(d_total: int, cfg) -> List[int]:
@@ -527,21 +622,28 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
 
-    # 3. Sample shared GP hyperparameters
-    l = _sample_length_scale(cfg, len(kernel_cols), P)
-    if kernel_name == "dot_product":
-        a2_min = float(0.0)
-        a2_max = float(0.0)
+    # 3. Sample shared GP hyperparameters.
+    # "hebo" defers l/alpha2/nugget sampling to step 6 below (after x_k is
+    # built) — pfns4bo_upstream's hebo_prior.get_model needs concrete input
+    # points to build its (unused) SingleTaskGP, unlike every other kernel's
+    # x-independent hyperparameter priors.
+    if kernel_name == "hebo":
+        l = alpha2 = nugget = None
     else:
-        a2_min = float(cfg.data.alpha2_min)
-        a2_max = float(cfg.data.alpha2_max)
-    alpha2 = random.uniform(a2_min, a2_max)
+        l = _sample_length_scale(cfg, len(kernel_cols), P)
+        if kernel_name == "dot_product":
+            a2_min = float(0.0)
+            a2_max = float(0.0)
+        else:
+            a2_min = float(cfg.data.alpha2_min)
+            a2_max = float(cfg.data.alpha2_max)
+        alpha2 = random.uniform(a2_min, a2_max)
 
-    # Nugget: single diagonal regulariser ~ U[nugget_min, nugget_max].
-    # Replaces the separate noise parameter (the two were always summed anyway).
-    nugget_min = float(getattr(cfg.data, "nugget_min", 0.1))
-    nugget_max = float(getattr(cfg.data, "nugget_max", 1.0))
-    nugget = random.uniform(nugget_min, nugget_max)
+        # Nugget: single diagonal regulariser ~ U[nugget_min, nugget_max].
+        # Replaces the separate noise parameter (the two were always summed anyway).
+        nugget_min = float(getattr(cfg.data, "nugget_min", 0.1))
+        nugget_max = float(getattr(cfg.data, "nugget_max", 1.0))
+        nugget = random.uniform(nugget_min, nugget_max)
 
     # 4. Extra hyperparameters for specific kernels
     period: Optional[float] = None
@@ -593,12 +695,22 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_norm = (x_raw - mu_x) / std_x                    # full (P+N, d_features)
     x_k = x_norm[:, kernel_cols]                        # kernel sub-matrix (P+N, k)
 
-    # 6. Build kernel function and sample y ~ GP(0, K + nugget·I) jointly
+    # 6. Build kernel function and sample y ~ GP(0, K + nugget·I) jointly.
+    # "hebo": sample l/alpha2/nugget now that x_k exists (see step 3), via
+    # pfns4bo_upstream's own hebo_prior.get_model — feed it x_k mapped to the
+    # unit hypercube, since that's what its prior is calibrated for (paper
+    # Appendix D), unlike this file's usual ~N(0,1)-standardised x_k. Every
+    # other kernel is unaffected: x_k_kernel == x_k.
+    x_k_kernel = x_k
+    if kernel_name == "hebo":
+        x_k_kernel = torch.special.ndtr(x_k)
+        l, alpha2, nugget = _sample_hebo_hyperparameters(x_k_kernel)
+
     kernel_fn = build_kernel_fn(
         kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, lsh_W=lsh_W, lsh_b=lsh_b,
         l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
     )
-    K_all = kernel_fn(x_k, x_k) + nugget * torch.eye(P + N)
+    K_all = kernel_fn(x_k_kernel, x_k_kernel) + nugget * torch.eye(P + N)
 
     y_all = _safe_cholesky(K_all, max_attempts=12) @ torch.randn(P + N)
 
@@ -613,8 +725,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # what the training context already explains.  Off-diagonal entries shrink
     # relative to the prior, giving the correct oracle for the copula the model
     # must learn: residual dependence after conditioning on training data.
-    x_k_train = x_k[:P]
-    x_k_test = x_k[P:]
+    x_k_train = x_k_kernel[:P]
+    x_k_test = x_k_kernel[P:]
     mu_star, Sigma_star, L_ff, alpha = gp_posterior(
         x_k_train, y_train, x_k_test, kernel_fn, nugget, return_factors=True
     )
@@ -630,7 +742,9 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "sigma_star": sigma_star,                                # (N,)
         "n_train": torch.tensor(P),
         "n_test": torch.tensor(N),
-        "l": torch.tensor(l),
+        # scalar for every kernel except "hebo", where l is an ARD
+        # per-dimension lengthscale vector (k,) — see hebo_matern32_kernel.
+        "l": l if torch.is_tensor(l) else torch.tensor(l),
         "alpha2": torch.tensor(alpha2),
         "nugget": torch.tensor(nugget),
         "kernel": kernel_name,
@@ -857,8 +971,6 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     Returns:
         list of B episode dicts ready for torch.save.
     """
-    import warnings
-
     seed = getattr(cfg, "seed", None)
     if seed is not None:
         _seed_everything(seed)
@@ -890,19 +1002,25 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         )
 
     # --- Per-episode hyperparameters ---
-    l_min, l_max = _length_scale_range(cfg, k, P)
-    if getattr(cfg.data, "l_log_uniform", False):
-        l = torch.exp(
-            torch.rand(B, device=device) * (math.log(l_max) - math.log(l_min)) + math.log(l_min)
-        )
+    # "hebo" samples l/alpha2/nugget per-episode further down (after x_k is
+    # built), via pfns4bo_upstream's own hebo_prior.get_model — see the
+    # "Build K_all" block below.
+    if kernel_name == "hebo":
+        l = alpha2 = nugget = None
     else:
-        l = torch.rand(B, device=device) * (l_max - l_min) + l_min
-    nugget = torch.rand(B, device=device) * (nugget_max           - nugget_min)           + nugget_min
-    alpha2 = (
-        torch.zeros(B, device=device)
-        if kernel_name == "dot_product"
-        else torch.rand(B, device=device) * (cfg.data.alpha2_max - cfg.data.alpha2_min) + cfg.data.alpha2_min
-    )
+        l_min, l_max = _length_scale_range(cfg, k, P)
+        if getattr(cfg.data, "l_log_uniform", False):
+            l = torch.exp(
+                torch.rand(B, device=device) * (math.log(l_max) - math.log(l_min)) + math.log(l_min)
+            )
+        else:
+            l = torch.rand(B, device=device) * (l_max - l_min) + l_min
+        nugget = torch.rand(B, device=device) * (nugget_max           - nugget_min)           + nugget_min
+        alpha2 = (
+            torch.zeros(B, device=device)
+            if kernel_name == "dot_product"
+            else torch.rand(B, device=device) * (cfg.data.alpha2_max - cfg.data.alpha2_min) + cfg.data.alpha2_min
+        )
 
     p_min  = float(getattr(cfg.data, "period_min",   0.5))
     p_max  = float(getattr(cfg.data, "period_max",   3.0))
@@ -957,10 +1075,25 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         x_k = x_norm.gather(2, col_idx.unsqueeze(1).expand(B, T, k))              # (B, T, k)
 
     # --- Build K_all (B, T, T) and sample y jointly ---
-    K_all = _batched_kernel_matrix(
-        kernel_name, x_k, l, alpha2, period, rq_alpha, lsh_W, lsh_b,
-        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
-    )
+    if kernel_name == "hebo":
+        # pfns4bo_upstream's hebo_prior.get_model samples one hyperparameter
+        # draw per call (its registered priors carry no batch dimension —
+        # verified empirically), so unlike every other kernel here this
+        # loops once per episode instead of one vectorised call, to give
+        # every episode an independent HEBO+ draw.
+        x_k_unit = torch.special.ndtr(x_k)  # HEBO+ prior assumes x in [0,1]^k (paper App. D)
+        K_parts, nugget_parts = [], []
+        for b in range(B):
+            l_b_, alpha2_b_, nugget_b_ = _sample_hebo_hyperparameters(x_k_unit[b])
+            K_parts.append(hebo_matern32_kernel(x_k_unit[b], x_k_unit[b], l=l_b_, alpha2=alpha2_b_))
+            nugget_parts.append(nugget_b_)
+        K_all = torch.stack(K_parts).to(device)
+        nugget = torch.tensor(nugget_parts, device=device)
+    else:
+        K_all = _batched_kernel_matrix(
+            kernel_name, x_k, l, alpha2, period, rq_alpha, lsh_W, lsh_b,
+            l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
+        )
     K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
     K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
 

@@ -1,3 +1,6 @@
 [submodule "tabicl_upstream"]
 	path = tabicl_upstream
 	url = https://github.com/soda-inria/tabicl.git
+[submodule "pfns4bo_upstream"]
+	path = pfns4bo_upstream
+	url = https://github.com/automl/PFNs4BO.git

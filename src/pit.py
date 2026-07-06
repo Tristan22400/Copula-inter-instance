@@ -201,7 +201,10 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_name = task["kernel"]
-    l      = task["l"].item()
+    # scalar for every kernel except "hebo", where l is an ARD per-dimension
+    # lengthscale vector (k,) — see data_gen.hebo_matern32_kernel.
+    l_tensor = task["l"]
+    l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
     alpha2 = task["alpha2"].item()
     nugget = task["nugget"].item()
     # 0.0 sentinel means the param is not applicable for this kernel
