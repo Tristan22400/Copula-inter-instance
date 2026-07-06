@@ -12,7 +12,10 @@ import tempfile
 OSCILLATORY_KERNELS = {"cosine"}
 
 
-def run_command(command: list, description: str, fail_fast: bool = True, env: dict | None = None):
+failures = []
+
+
+def run_command(command: list, description: str, env: dict | None = None):
     print(f"\n{'='*60}")
     print(f"🚀 RUNNING: {description}")
     print(f"💻 Command: {' '.join(command)}")
@@ -26,9 +29,7 @@ def run_command(command: list, description: str, fail_fast: bool = True, env: di
         return True
     except subprocess.CalledProcessError as e:
         print(f"\n❌ FAILED: {description} (Exit Code: {e.returncode})\n")
-        if fail_fast:
-            print("🛑 Pipeline aborted due to failure.")
-            sys.exit(1)
+        failures.append((description, e.returncode))
         return False
 
 def main():
@@ -105,7 +106,13 @@ def main():
     else:
         print("⏭️ Skipping Step 4 (Overfit Check) as requested.")
 
-    print(f"\n🎉 ALL PIPELINE STEPS COMPLETED SUCCESSFULLY FOR '{kernel}'!")
+    if failures:
+        print(f"\n⚠️  PIPELINE FINISHED FOR '{kernel}' WITH {len(failures)} FAILURE(S):")
+        for description, returncode in failures:
+            print(f"   ❌ {description} (Exit Code: {returncode})")
+        sys.exit(1)
+    else:
+        print(f"\n🎉 ALL PIPELINE STEPS COMPLETED SUCCESSFULLY FOR '{kernel}'!")
 
 if __name__ == "__main__":
     main()
