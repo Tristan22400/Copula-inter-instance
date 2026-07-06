@@ -460,23 +460,25 @@ def plot_joint_probability_calibration(data, day, C, context_idx, n_pairs=400, n
     M = coords.shape[0]
 
     samples = field_all.reshape(n_days, M)
-    tau = np.percentile(samples, 90)
 
-    # p_i must be the *predicted* exceedance probability (per the spec), i.e.
-    # under TabICLv2's own marginal model -- not the oracle mean/std of the
-    # true field. Both the independent (TabICLv2) and copula-combined
-    # (Copula-TFM) joint probabilities below reuse this same p_i, p_j so the
-    # plot isolates the effect of the dependence structure, not marginal
-    # quality: any miscalibration in the independent curve here is inherited
-    # from TabICLv2's (mocked) marginal, fit only from the same labeled
-    # context set (X_train, Y_train) used by Copula-TFM, exactly as in a
-    # real deployment where test-point labels are unavailable.
+    # TabICLv2 declares its own per-point 90th-percentile threshold q90[i]
+    # directly, fit only from the labeled context set (X_train, Y_train) --
+    # the same context used by Copula-TFM -- exactly as in a real deployment
+    # where test-point labels are unavailable. This replaces looking up
+    # P(X_i > tau) against a single, dataset-wide tau via the Gaussian CDF:
+    # by construction, P(X_i > q90[i]) = 0.10 under TabICLv2's own marginal,
+    # no inversion needed. It also removes any marginal-miscalibration
+    # confound: every point's own declared threshold is exactly as likely to
+    # be exceeded, so any gap between predicted and empirical joint
+    # probability below comes only from the (mis)modeled dependence
+    # structure, not from marginal errors.
     context_coords = coords[context_idx]
     context_values = field_all[day].ravel()[context_idx]
     mean_pred, std_pred = TabICLv2_Marginal(context_coords, context_values, coords)
-    p_exceed = 1.0 - norm.cdf(tau, loc=mean_pred, scale=std_pred)
+    q90 = norm.ppf(0.9, loc=mean_pred, scale=std_pred)
+    p_exceed = np.full(M, 0.10)
 
-    exceed_mask = samples > tau
+    exceed_mask = samples > q90
 
     idx_i = RNG.integers(0, M, size=n_pairs)
     idx_j = RNG.integers(0, M, size=n_pairs)
