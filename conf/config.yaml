@@ -11,7 +11,7 @@ wandb:
 
 training:
   device: auto
-  batch_size: 64
+  batch_size: 32
   # torch.compile adds real overhead (first-step + recompiles on shape changes);
   # worth it for long runs, a drag while iterating quickly. Off by default.
   compile: false
