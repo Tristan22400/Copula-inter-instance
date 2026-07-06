@@ -1,7 +1,9 @@
 """
 Generate the three NeurIPS figures comparing an independent tabular foundation
-model (TabICLv2, mocked) against a copula-based tabular foundation model
-(Copula-TFM, mocked) on a spatial temperature field.
+model (TabICLv2 -- the real, pretrained TabICL regressor for the joint-
+probability calibration plot; a Gaussian mock for the spatial-sample panel)
+against a copula-based tabular foundation model (Copula-TFM, mocked unless
+--ckpt is given) on a spatial temperature field.
 
 Everything this script needs lives in this directory:
   - plots/generate_neurips_plots.py   (this file)
@@ -178,17 +180,36 @@ def TabICLv2_Marginal(context_coords, context_values, coords_test):
     return mean, std
 
 
-def TabICLv2_Quantile(context_coords, context_values, coords_test, level=0.9):
+def TabICLv2_Regressor():
     """
-    TabICLv2's own quantile output: the model is queried for its `level`-th
-    percentile directly, per test location -- this is the number a real
-    quantile-output tabular model would hand back through its public API,
-    not something the caller derives after the fact from a mean/std pair.
-    Internally it still uses the same context-only marginal fit as
-    TabICLv2_Marginal; the point is that callers only ever see the quantile.
+    Construct the real, pretrained TabICL regressor -- default checkpoint
+    'tabicl-regressor-v2-20260212.ckpt', the actual "v2" this script's
+    TabICLv2 name refers to. Loading it once and reusing the instance across
+    repeated .fit() calls (e.g. once per day) avoids reloading the backbone
+    weights every time.
     """
-    mean, std = TabICLv2_Marginal(context_coords, context_values, coords_test)
-    return norm.ppf(level, loc=mean, scale=std)
+    from tabicl import TabICLRegressor
+
+    return TabICLRegressor()
+
+
+def TabICLv2_Quantile(context_coords, context_values, coords_test, level=0.9, regressor=None):
+    """
+    TabICLv2's own quantile output -- queried directly from the real
+    TabICL regressor (see TabICLv2_Regressor), not a Gaussian stand-in. It
+    is fit in-context on (context_coords, context_values) and asked
+    directly for its `level`-th percentile at coords_test via its own
+    non-parametric quantile-spline output
+    (tabicl._model.quantile_dist.QuantileDistribution) -- no mean/std, no
+    norm.ppf inversion.
+
+    Pass an existing `regressor` (from TabICLv2_Regressor) to reuse its
+    loaded backbone weights across repeated calls; otherwise a fresh one is
+    constructed, which reloads the checkpoint.
+    """
+    reg = regressor if regressor is not None else TabICLv2_Regressor()
+    reg.fit(context_coords, context_values)
+    return reg.predict(coords_test, output_type="quantiles", alphas=[level]).ravel()
 
 
 def Copula_TFM(coords_test, length_scale=8.0, nu=2.5):
@@ -475,21 +496,27 @@ def plot_joint_probability_calibration(data, C, context_idx, n_pairs=400, n_bins
     samples = field_all.reshape(n_days, M)
     context_coords = coords[context_idx]
 
-    # TabICLv2 is re-run as a fresh in-context episode for every day: its
-    # context LABELS (the true temperatures at the same 50 context
-    # locations) are taken from that specific day, so its declared q90[d, i]
-    # threshold is refit daily -- exactly as in a real deployment where the
-    # model is re-queried once per day rather than fit once (on a single
-    # day) and reused across days it never saw. The quantile itself is
-    # TabICLv2's own direct output (TabICLv2_Quantile), not something we
-    # derive after the fact from a mean/std pair. By construction,
-    # P(X_i > q90[d, i]) = 0.10 under TabICLv2's own marginal on every day,
-    # so no norm.cdf inversion against a shared tau is needed, and no
-    # marginal-miscalibration confound leaks into the comparison against
-    # Copula-TFM below -- only the (mis)modeled dependence structure does.
+    # TabICLv2 (the real, pretrained TabICLRegressor -- see TabICLv2_Quantile)
+    # is re-run as a fresh in-context episode for every day: its context
+    # LABELS (the true temperatures at the same 50 context locations) are
+    # taken from that specific day, so its declared q90[d, i] threshold is
+    # refit daily -- exactly as in a real deployment where the model is
+    # re-queried once per day rather than fit once (on a single day) and
+    # reused across days it never saw. The quantile is the model's own
+    # direct output (its non-parametric quantile spline), not derived from a
+    # mean/std pair via norm.cdf/norm.ppf: by definition TabICLv2 declares
+    # P(X_i > q90[d, i]) = 0.10 on every day. (The norm.ppf a few lines below
+    # is unrelated to TabICLv2 -- it's the standard-normal quantile transform
+    # that the Gaussian-copula combination formula itself requires to fold
+    # in Copula-TFM's correlation C[i,j].) No marginal-miscalibration
+    # confound leaks into the comparison against Copula-TFM below -- only
+    # the (mis)modeled dependence structure does.
+    tabiclv2 = TabICLv2_Regressor()
     q90 = np.stack(
         [
-            TabICLv2_Quantile(context_coords, field_all[d].ravel()[context_idx], coords, level=0.9)
+            TabICLv2_Quantile(
+                context_coords, field_all[d].ravel()[context_idx], coords, level=0.9, regressor=tabiclv2
+            )
             for d in range(n_days)
         ]
     )
