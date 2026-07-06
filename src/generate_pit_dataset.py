@@ -12,7 +12,7 @@ Each shard_XXXXXX.pt is a list of B episode dicts with the schema:
 
     x_norm_train, x_norm_test, y_train, y_test  — raw features / targets
     z_train, z_test, log_pdf_test               — standardised PIT + marginals
-    R_star, Sigma_star, mu_star, sigma_star     — posterior oracle
+    R_star, Sigma_star, mu_star, sigma_star     — oracle (posterior or prior, per cfg.data.oracle_mode)
     n_train, n_test                             — episode sizes
 
 A meta.pt file records {"n_total": int, "shard_size": int} so CopulaDataset

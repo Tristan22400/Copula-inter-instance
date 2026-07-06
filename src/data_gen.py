@@ -3,8 +3,9 @@ data_gen.py — Stage A: GP task generation for inter-instance copula.
 
 Each task samples a random GP with a configurable PSD kernel, draws P+N
 instances, normalises features over the full P+N set, samples targets jointly
-from the GP, computes the analytical posterior correlation matrix R*, and saves
-all required tensors.
+from the GP, computes the analytical correlation matrix R* at the test points
+(from either the GP posterior conditioned on training data or the raw GP
+prior, per cfg.data.oracle_mode), and saves all required tensors.
 
 Supported kernels
 -----------------
@@ -495,8 +496,9 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         x_norm_test           : (N, d_features)  normalised test features (full)
         y_test                : (N,)             test targets
         R_star                : (N, N)           ground-truth test correlation matrix
-        mu_star               : (N,)             GP posterior mean at test points
-        sigma_star            : (N,)             GP posterior marginal std at test points
+                                                  (posterior or prior, per cfg.data.oracle_mode)
+        mu_star               : (N,)             mean at test points (posterior mean, or 0 for prior)
+        sigma_star            : (N,)             marginal std at test points (posterior or prior)
         n_train               : int              P (as 0-dim tensor)
         n_test                : int              N (as 0-dim tensor)
         l                     : float            kernel length scale (scalar tensor)
@@ -608,16 +610,32 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_norm_test = x_norm[P:]
     y_test = y_all[P:]
 
-    # 8. Compute R_star from the GP posterior at test points.
-    # Sigma_star_posterior = K_ss + nugget·I − K_st K_ff⁻¹ K_ts  accounts for
-    # what the training context already explains.  Off-diagonal entries shrink
-    # relative to the prior, giving the correct oracle for the copula the model
-    # must learn: residual dependence after conditioning on training data.
+    # 8. Compute R_star at test points, from either the GP posterior or the
+    # GP prior, per cfg.data.oracle_mode (default "posterior" — unchanged
+    # behaviour).
+    # posterior: Sigma_star = K_ss + nugget·I − K_st K_ff⁻¹ K_ts accounts for
+    #   what the training context already explains — off-diagonal entries
+    #   shrink relative to the prior, giving the oracle for residual
+    #   dependence after conditioning on training data.
+    # prior: Sigma_star = K_ss + nugget·I, ignoring the training context —
+    #   the oracle is the raw kernel structure among test points.
     x_k_train = x_k[:P]
     x_k_test = x_k[P:]
-    mu_star, Sigma_star, L_ff, alpha = gp_posterior(
-        x_k_train, y_train, x_k_test, kernel_fn, nugget, return_factors=True
-    )
+    oracle_mode = getattr(cfg.data, "oracle_mode", "posterior")
+    if oracle_mode == "prior":
+        # z_train's LOO PIT still needs L_ff/alpha from K_ff regardless of
+        # which oracle is used for the test-side R_star/mu_star/sigma_star.
+        K_ff = kernel_fn(x_k_train, x_k_train) + nugget * torch.eye(P, device=x_k_train.device)
+        L_ff = _safe_cholesky(K_ff, max_attempts=12)
+        alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)
+        Sigma_star = kernel_fn(x_k_test, x_k_test) + nugget * torch.eye(N, device=x_k_test.device)
+        mu_star = torch.zeros(N, device=x_k_test.device)
+    elif oracle_mode == "posterior":
+        mu_star, Sigma_star, L_ff, alpha = gp_posterior(
+            x_k_train, y_train, x_k_test, kernel_fn, nugget, return_factors=True
+        )
+    else:
+        raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; expected 'prior' or 'posterior'.")
     R_star, sigma_star = sigma_to_correlation(Sigma_star)
 
     return {
@@ -977,13 +995,24 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     K_sf = K_all[:, P:, :P]   # (B, N, P)
     K_ss = K_all[:, P:, P:]   # (B, N, N)
 
-    # --- GP posterior (batched) ---
+    # --- GP posterior/prior (batched) ---
+    # z_train's LOO PIT always needs L_ff/alpha from K_ff, regardless of which
+    # oracle drives the test-side R_star/mu_star/sigma_star below.
     L_ff  = _batched_cholesky(K_ff)
     alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)          # (B, P)
-    mu_star  = (K_sf @ alpha.unsqueeze(-1)).squeeze(-1)                             # (B, N)
 
-    V          = torch.linalg.solve_triangular(L_ff, K_sf.permute(0, 2, 1), upper=False)  # (B, P, N)
-    Sigma_star = K_ss - V.permute(0, 2, 1) @ V                                     # (B, N, N)
+    oracle_mode = getattr(cfg.data, "oracle_mode", "posterior")
+    if oracle_mode == "prior":
+        # Prior oracle: ignore training conditioning — R_star reflects the raw
+        # kernel structure among test points; mu_star is the GP prior mean (0).
+        mu_star    = torch.zeros(B, N, device=device)
+        Sigma_star = K_ss
+    elif oracle_mode == "posterior":
+        mu_star    = (K_sf @ alpha.unsqueeze(-1)).squeeze(-1)                             # (B, N)
+        V          = torch.linalg.solve_triangular(L_ff, K_sf.permute(0, 2, 1), upper=False)  # (B, P, N)
+        Sigma_star = K_ss - V.permute(0, 2, 1) @ V                                     # (B, N, N)
+    else:
+        raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; expected 'prior' or 'posterior'.")
     Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
 
     # sigma_to_correlation (batched)
