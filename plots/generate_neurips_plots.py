@@ -158,14 +158,23 @@ def load_era5_data():
 # ---------------------------------------------------------------------------
 # Phase 2: Model mocking / interface
 # ---------------------------------------------------------------------------
-def TabICLv2_Marginal(coords_test, field_flat):
+def TabICLv2_Marginal(context_coords, context_values, coords_test):
     """
-    Mock of an independent tabular foundation model: returns a marginal
-    mean/std per test location, with no cross-location covariance information.
+    Mock of an independent tabular foundation model: fits a marginal mean/std
+    per test location from a labeled context set (X_train, Y_train) only --
+    the same context/test split the real Copula-TFM gets -- with no
+    cross-location covariance information. Test-point labels are never seen.
     """
-    lat = coords_test[:, 1]
-    mean = 25.0 - 0.35 * (lat - lat.min())
-    std = np.full(coords_test.shape[0], field_flat.std() * 0.6)
+    lat_train = context_coords[:, 1]
+    design = np.column_stack([np.ones_like(lat_train), lat_train])
+    coef, _, _, _ = np.linalg.lstsq(design, context_values, rcond=None)
+    a, b = coef
+
+    lat_test = coords_test[:, 1]
+    mean = a + b * lat_test
+
+    resid_std = max(float((context_values - (a + b * lat_train)).std()), 1e-6)
+    std = np.full(coords_test.shape[0], resid_std)
     return mean, std
 
 
@@ -301,8 +310,9 @@ def plot_spatial_map_comparison(data, day, context_idx, C):
     field_flat = field.ravel()
     M = coords.shape[0]
     context_coords = coords[context_idx]
+    context_values = field_flat[context_idx]
 
-    mean, std = TabICLv2_Marginal(coords, field_flat)
+    mean, std = TabICLv2_Marginal(context_coords, context_values, coords)
 
     # Both samples share the SAME underlying white noise draw z_shared -- the
     # only difference between the two panels is whether spatial correlation
@@ -441,7 +451,7 @@ def plot_correlation_matrix_comparison(C, C_true):
 # ---------------------------------------------------------------------------
 # Plot 4: Calibration of joint probabilities
 # ---------------------------------------------------------------------------
-def plot_joint_probability_calibration(data, day, C, n_pairs=400, n_bins=10):
+def plot_joint_probability_calibration(data, day, C, context_idx, n_pairs=400, n_bins=10):
     field_all = data["t2m"]
     n_days, grid_size, _ = field_all.shape
     lat, lon = data["latitude"], data["longitude"]
@@ -458,8 +468,12 @@ def plot_joint_probability_calibration(data, day, C, n_pairs=400, n_bins=10):
     # (Copula-TFM) joint probabilities below reuse this same p_i, p_j so the
     # plot isolates the effect of the dependence structure, not marginal
     # quality: any miscalibration in the independent curve here is inherited
-    # from TabICLv2's (mocked) marginal, exactly as in a real deployment.
-    mean_pred, std_pred = TabICLv2_Marginal(coords, field_all[day].ravel())
+    # from TabICLv2's (mocked) marginal, fit only from the same labeled
+    # context set (X_train, Y_train) used by Copula-TFM, exactly as in a
+    # real deployment where test-point labels are unavailable.
+    context_coords = coords[context_idx]
+    context_values = field_all[day].ravel()[context_idx]
+    mean_pred, std_pred = TabICLv2_Marginal(context_coords, context_values, coords)
     p_exceed = 1.0 - norm.cdf(tau, loc=mean_pred, scale=std_pred)
 
     exceed_mask = samples > tau
@@ -534,9 +548,9 @@ def main():
         type=int,
         default=0,
         help="Day index (0-based, into the n_days axis of era5_temperature.nc) to treat as the "
-        "'observed' field: it's the True Field panel, the source of context values (X_train, "
-        "Y_train) for the real Copula-TFM checkpoint, and the field TabICLv2_Marginal fits its "
-        "marginal to for the calibration plot. Default: 0.",
+        "'observed' field: it's the True Field panel, and the source of context values "
+        "(X_train, Y_train) both for the real Copula-TFM checkpoint and for the "
+        "TabICLv2_Marginal fit used in the calibration plot. Default: 0.",
     )
     args = parser.parse_args()
 
@@ -565,7 +579,7 @@ def main():
     plot_spatial_map_comparison(data, day, context_idx, C)
     plot_correlation_vs_distance(data, C)
     plot_correlation_matrix_comparison(C, C_true)
-    plot_joint_probability_calibration(data, day, C)
+    plot_joint_probability_calibration(data, day, C, context_idx)
     print(f"All four NeurIPS figures saved to {PLOTS_DIR}")
 
 
