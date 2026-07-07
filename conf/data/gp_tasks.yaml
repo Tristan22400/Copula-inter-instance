@@ -12,7 +12,7 @@ d_kernel_max: 4
 
 # Training/context set size range
 P_min: 32
-P_max: 32              # fewer train points → more residual posterior uncertainty
+P_max: 1024             # fewer train points → more residual posterior uncertainty
 
 # Test/query set size range (copula is over these N instances)
 N_min: 8

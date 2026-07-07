@@ -19,6 +19,7 @@ import argparse
 import os
 import shutil
 import sys
+from typing import Sequence, Tuple
 
 import numpy as np
 import matplotlib
@@ -570,6 +571,148 @@ def plot_joint_probability_calibration(data, C, context_idx, n_pairs=400, n_bins
     print(f"Saved {out_path}")
 
 
+# ---------------------------------------------------------------------------
+# Plot 5: Quantile calibration (reliability diagram)
+# ---------------------------------------------------------------------------
+def compute_quantile_ece(
+    y_true: np.ndarray,
+    y_pred_quantiles: np.ndarray,
+    quantiles: Sequence[float],
+) -> Tuple[float, np.ndarray]:
+    """
+    Compute the quantile-regression Expected Calibration Error (ECE).
+
+    For each nominal quantile level, the empirical coverage is the fraction
+    of instances where the true value falls at or below the predicted
+    quantile value. The ECE is the mean absolute gap between the nominal
+    levels and their empirical coverages (0 for perfect calibration).
+
+    Args:
+        y_true: 1D array/Series of shape (n_samples,) with observed targets.
+        y_pred_quantiles: 2D array/DataFrame of shape (n_samples, n_quantiles);
+            column k holds the predicted value for quantiles[k].
+        quantiles: Nominal quantile levels in (0, 1), e.g. [0.1, ..., 0.9].
+
+    Returns:
+        Tuple (ece, empirical_coverage), where empirical_coverage has shape
+        (n_quantiles,) and aligns positionally with `quantiles`.
+    """
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred_quantiles = np.asarray(y_pred_quantiles)
+    quantiles = np.asarray(quantiles, dtype=float)
+
+    if y_pred_quantiles.ndim != 2:
+        raise ValueError("y_pred_quantiles must be 2D (n_samples, n_quantiles).")
+    if y_pred_quantiles.shape[0] != y_true.shape[0]:
+        raise ValueError(
+            f"y_true has {y_true.shape[0]} samples but y_pred_quantiles has "
+            f"{y_pred_quantiles.shape[0]}."
+        )
+    if y_pred_quantiles.shape[1] != quantiles.shape[0]:
+        raise ValueError(
+            f"y_pred_quantiles has {y_pred_quantiles.shape[1]} quantile columns "
+            f"but {quantiles.shape[0]} nominal quantiles were given."
+        )
+
+    empirical_coverage = np.mean(y_true[:, None] <= y_pred_quantiles, axis=0)
+    ece = float(np.mean(np.abs(quantiles - empirical_coverage)))
+    return ece, empirical_coverage
+
+
+def generate_era5_reliability_diagram(
+    y_true: np.ndarray,
+    y_pred_quantiles: np.ndarray,
+    quantiles: Sequence[float],
+    output_path: str,
+) -> float:
+    """
+    Build and save a reliability diagram for TabICLv2's ERA5 quantile
+    predictions, with nominal quantile on the x-axis and empirical coverage
+    on the y-axis.
+
+    Args:
+        y_true: 1D array/Series of observed ERA5 targets.
+        y_pred_quantiles: 2D array/DataFrame (n_samples, n_quantiles) of
+            predicted quantile values.
+        quantiles: Nominal quantile levels matching the columns above.
+        output_path: Destination file path for the saved figure.
+
+    Returns:
+        The scalar ECE score (also annotated on the figure).
+    """
+    ece, empirical_coverage = compute_quantile_ece(y_true, y_pred_quantiles, quantiles)
+    quantiles = np.asarray(quantiles, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Perfect calibration")
+    ax.plot(quantiles, empirical_coverage, "o-", color="tab:blue", label="TabICLv2")
+    ax.fill_between(
+        quantiles,
+        quantiles,
+        empirical_coverage,
+        color="tab:blue",
+        alpha=0.2,
+        label="Calibration gap",
+    )
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Nominal quantile")
+    ax.set_ylabel("Empirical coverage")
+    ax.set_title("Reliability Diagram: TabICLv2 on ERA5 Dataset")
+    ax.text(
+        0.05,
+        0.95,
+        f"ECE = {ece:.4f}",
+        transform=ax.transAxes,
+        fontsize=11,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.85),
+    )
+    ax.legend(loc="lower right")
+    plt.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {output_path} (ECE={ece:.4f})")
+    return ece
+
+
+def plot_era5_quantile_reliability(data, context_idx, quantiles=np.arange(0.1, 1.0, 0.1)):
+    """
+    Real-data driver for the reliability diagram: context locations
+    (`context_idx`) are fixed once, but -- exactly as in
+    `plot_joint_probability_calibration` -- the context LABELS are re-drawn
+    from that day's field and TabICLv2 is re-queried per day, so we iterate
+    over every timestamp in the dataset to build up (y_true, y_pred_quantiles)
+    across all days x grid points before scoring calibration.
+    """
+    field_all = data["t2m"]
+    n_days = field_all.shape[0]
+    lat, lon = data["latitude"], data["longitude"]
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
+    context_coords = coords[context_idx]
+
+    tabiclv2 = TabICLv2_Regressor()
+    y_true_chunks, y_pred_chunks = [], []
+    for d in range(n_days):
+        context_values = field_all[d].ravel()[context_idx]
+        preds = np.stack(
+            [
+                TabICLv2_Quantile(context_coords, context_values, coords, level=q, regressor=tabiclv2)
+                for q in quantiles
+            ],
+            axis=1,
+        )  # (M, n_quantiles)
+        y_true_chunks.append(field_all[d].ravel())
+        y_pred_chunks.append(preds)
+
+    y_true = np.concatenate(y_true_chunks)
+    y_pred_quantiles = np.concatenate(y_pred_chunks, axis=0)
+
+    out_path = os.path.join(PLOTS_DIR, "era5_reliability_diagram.pdf")
+    generate_era5_reliability_diagram(y_true, y_pred_quantiles, quantiles, out_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -624,7 +767,8 @@ def main():
     plot_correlation_vs_distance(data, C)
     plot_correlation_matrix_comparison(C, C_true)
     plot_joint_probability_calibration(data, C, context_idx)
-    print(f"All four NeurIPS figures saved to {PLOTS_DIR}")
+    plot_era5_quantile_reliability(data, context_idx)
+    print(f"All figures saved to {PLOTS_DIR}")
 
 
 if __name__ == "__main__":

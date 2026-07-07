@@ -25,8 +25,8 @@ d_kernel_max: 4
 # diag_kernels.py showed a screening effect (46% of |R*_offdiag| < 0.01) at
 # this repo's default P range (32/5-30). Tuned empirically, same as the
 # composite kernels needed P_min=4,P_max=6 overrides (see project history).
-P_min: 4
-P_max: 8
+P_min: 512
+P_max: 512
 
 # Test/query set size range (copula is over these N instances).
 # Kept smaller than gp_tasks.yaml's default (128): HEBO+'s noise nugget is
@@ -61,7 +61,7 @@ nugget_max: 0.25
 # (via Schur-complement conditioning on training data) can. Confirmed
 # empirically: oracle_mode=prior fails test_correlations_have_both_signs
 # (100% non-negative) and test_r_star_well_conditioned; posterior passes both.
-oracle_mode: posterior
+oracle_mode: prior
 
 # ---------------------------------------------------------------------------
 # Kernel selection
@@ -75,8 +75,8 @@ pit_eps: 1.0e-6
 shard_size: 256
 
 # Output directory
-dataset_dir: ./data/pit_hebo_prior
+dataset_dir: ./data/pit_hebo_prior-true
 pit_dir: ${data.dataset_dir}/pit
 
 # Resume from existing files if present
-resume: false
+resume: true

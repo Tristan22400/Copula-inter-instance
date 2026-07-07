@@ -10,3 +10,5 @@ src/models/__pycache__/
 *.pyc
 *.stderr
 *.stdout
+*.pdf
+*.png
