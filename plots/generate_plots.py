@@ -27,7 +27,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.io import netcdf_file
-from scipy.stats import multivariate_normal, norm
+from scipy.special import gammaln, logsumexp
+from scipy.stats import chi2, multivariate_normal, norm
 from sklearn.gaussian_process.kernels import Matern
 
 # ---------------------------------------------------------------------------
@@ -749,6 +750,245 @@ def plot_era5_quantile_reliability(
 
     out_path = os.path.join(PLOTS_DIR, "era5_reliability_diagram.pdf")
     generate_era5_reliability_diagram(y_true, y_pred_quantiles, quantiles, out_path)
+
+
+# ---------------------------------------------------------------------------
+# Plot 6: Multivariate (joint) spatial calibration
+#
+# TabICLv2 emits independent marginal quantiles per row, so its declared
+# joint predictive distribution over a D-dimensional target patch is the
+# Independence Copula: H_i(y_i) = prod_d F_{i,d}(y_{i,d}). The four
+# diagnostics below all probe whether that independence assumption (and the
+# marginals feeding it) are jointly well-calibrated against the true,
+# spatially-correlated field -- not just marginally calibrated per grid cell
+# (which `compute_quantile_ece` above already checks).
+# ---------------------------------------------------------------------------
+
+
+def calc_kendall_pit(cdf_values: np.ndarray) -> np.ndarray:
+    """
+    Copula PIT (Kendall's transform) for the independence copula.
+
+    Under H_i(y_i) = prod_d F_{i,d}(y_{i,d}), the copula-level "witness"
+    w_i = prod_d F_{i,d}(y_{i,d}) is Uniform(0, 1)-distributed at every
+    dimension only if the joint model is exactly correct; W = prod of D iid
+    U(0,1) is NOT itself uniform (it concentrates near 0), so w_i must be
+    passed through W's own CDF -- the Kendall distribution function -- to
+    recover a Uniform(0, 1) PIT value:
+
+        z_i = w_i * sum_{k=0}^{D-1} (-ln w_i)^k / k!
+
+    (equivalently, -ln(w_i) ~ Gamma(D, 1) under H0, and z_i is its survival
+    function evaluated at -ln(w_i)). z_i ~ Uniform(0, 1) iff the independence
+    copula is correctly calibrated.
+
+    Args:
+        cdf_values: (n_samples, D) array of F_{i,d}(y_{i,d}) marginal CDF
+            values, one row per instance and one column per spatial
+            dimension.
+
+    Returns:
+        (n_samples,) array of Kendall PIT values z_i in [0, 1].
+    """
+    cdf_values = np.clip(np.asarray(cdf_values, dtype=np.float64), 1e-300, 1.0)
+    n, D = cdf_values.shape
+
+    log_w = np.log(cdf_values).sum(axis=1)  # log(w_i) = sum_d log F_{i,d}(y_{i,d})
+    x = np.clip(-log_w, 0.0, None)  # x_i = -ln(w_i) >= 0
+
+    # log of the k-th series term x^k / k!, summed via logsumexp for numerical
+    # stability (naive summation can overflow/underflow for large D or x).
+    k = np.arange(D, dtype=np.float64)
+    with np.errstate(divide="ignore"):
+        log_terms = k[None, :] * np.log(x)[:, None] - gammaln(k + 1.0)[None, :]
+    # x_i == 0 (w_i == 1) means k*log(0) is -inf for k>0 and the 0**0
+    # convention gives 1 for k=0 -- set that row explicitly rather than rely
+    # on IEEE 0*-inf/log(0) arithmetic.
+    zero_mask = x == 0.0
+    log_terms[zero_mask, :] = -np.inf
+    log_terms[zero_mask, 0] = 0.0
+
+    log_series = logsumexp(log_terms, axis=1)  # log sum_k x^k / k!
+    z = np.exp(log_w + log_series)  # z_i = w_i * series
+    return np.clip(z, 0.0, 1.0)
+
+
+def plot_kendall_pit(z_values: np.ndarray, ax, n_bins: int = 20):
+    """Histogram of Kendall PIT values against the theoretical Uniform(0, 1) density."""
+    z_values = np.asarray(z_values, dtype=np.float64)
+    ax.hist(
+        z_values,
+        bins=n_bins,
+        range=(0.0, 1.0),
+        density=True,
+        color="tab:blue",
+        alpha=0.75,
+        edgecolor="white",
+        label="Empirical",
+    )
+    ax.axhline(1.0, color="k", linestyle="--", linewidth=1, label="Uniform(0, 1)")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("Kendall PIT value $z$")
+    ax.set_ylabel("Density")
+    ax.set_title("Kendall PIT Histogram (Independence Copula)")
+    ax.legend()
+    return ax
+
+
+def calc_mahalanobis_distances(
+    y_true: np.ndarray, means: np.ndarray, variances: np.ndarray
+) -> np.ndarray:
+    """
+    Mahalanobis distance under a diagonal covariance (Gaussian marginals,
+    independence copula): d_i^2 = sum_d (y_{i,d} - mu_{i,d})^2 / sigma^2_{i,d}.
+    Under perfect calibration, d_i^2 ~ chi^2_D.
+
+    Args:
+        y_true, means, variances: (n_samples, D) arrays.
+
+    Returns:
+        (n_samples,) array of squared Mahalanobis distances.
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    means = np.asarray(means, dtype=np.float64)
+    variances = np.asarray(variances, dtype=np.float64)
+    if not (y_true.shape == means.shape == variances.shape):
+        raise ValueError(
+            f"y_true, means, variances must share shape (n_samples, D); got "
+            f"{y_true.shape}, {means.shape}, {variances.shape}."
+        )
+    return np.sum((y_true - means) ** 2 / variances, axis=1)
+
+
+def plot_mahalanobis_pp(distances: np.ndarray, dim_d: int, ax):
+    """
+    PP-plot (probability-probability plot) of squared Mahalanobis distances
+    against the theoretical chi^2_D CDF: for the i-th order statistic
+    d^2_(i), plot F_{chi^2_D}(d^2_(i)) against the empirical percentile
+    (i - 0.5) / n. Points on the y = x diagonal indicate correct calibration.
+    """
+    distances = np.sort(np.asarray(distances, dtype=np.float64))
+    n = distances.shape[0]
+    empirical_p = (np.arange(1, n + 1) - 0.5) / n
+    theoretical_p = chi2.cdf(distances, df=dim_d)
+
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Ideal calibration")
+    ax.plot(theoretical_p, empirical_p, color="tab:blue", linewidth=1.5, label=f"$\\chi^2_{{{dim_d}}}$ PP-plot")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel(r"Theoretical $\chi^2_D$ CDF")
+    ax.set_ylabel("Empirical CDF")
+    ax.set_title(f"Mahalanobis $\\chi^2$ PP-Plot ($D={dim_d}$)")
+    ax.legend()
+    return ax
+
+
+def calc_exceedance_probs(y_true: np.ndarray, cdf_func, thresholds: np.ndarray):
+    """
+    Spatial exceedance events and their independence-copula predicted
+    probabilities, for a set of thresholds tau_m:
+
+        e_{i,m} = 1[max_d y_{i,d} > tau_m]                (true event)
+        pi_{i,m} = 1 - prod_d F_{i,d}(tau_m)              (predicted prob)
+
+    Args:
+        y_true: (n_samples, D) array of observed targets.
+        cdf_func: callable, cdf_func(tau) -> (n_samples, D) array of marginal
+            CDF values F_{i,d}(tau) at threshold tau, for every instance i
+            and dimension d.
+        thresholds: (n_thresholds,) array of thresholds tau_m.
+
+    Returns:
+        Tuple (predicted_probs, true_events), both (n_samples, n_thresholds).
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    thresholds = np.asarray(thresholds, dtype=np.float64)
+    max_y = y_true.max(axis=1)  # (n_samples,)
+    true_events = (max_y[:, None] > thresholds[None, :]).astype(np.float64)
+
+    predicted_probs = np.empty((y_true.shape[0], thresholds.shape[0]), dtype=np.float64)
+    for m, tau in enumerate(thresholds):
+        F = np.clip(np.asarray(cdf_func(tau), dtype=np.float64), 0.0, 1.0)
+        predicted_probs[:, m] = 1.0 - np.prod(F, axis=1)
+    return predicted_probs, true_events
+
+
+def plot_spatial_reliability(predicted_probs: np.ndarray, true_events: np.ndarray, num_bins: int, ax):
+    """Binned reliability diagram of predicted vs. empirical spatial exceedance probability."""
+    pred_flat = np.asarray(predicted_probs, dtype=np.float64).ravel()
+    true_flat = np.asarray(true_events, dtype=np.float64).ravel()
+
+    bins = np.linspace(0.0, 1.0, num_bins + 1)
+    bin_idx = np.clip(np.digitize(pred_flat, bins) - 1, 0, num_bins - 1)
+    bin_pred, bin_true = [], []
+    for b in range(num_bins):
+        mask = bin_idx == b
+        if mask.any():
+            bin_pred.append(pred_flat[mask].mean())
+            bin_true.append(true_flat[mask].mean())
+
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Ideal calibration")
+    ax.plot(bin_pred, bin_true, "o-", color="tab:green", label="Spatial exceedance")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel(r"Predicted exceedance probability $\pi_{i,m}$")
+    ax.set_ylabel("Empirical exceedance frequency")
+    ax.set_title("Spatial Exceedance Reliability Diagram")
+    ax.legend()
+    return ax
+
+
+def calc_spatial_coverage(y_true: np.ndarray, q_lower: np.ndarray, q_upper: np.ndarray) -> float:
+    """
+    Empirical spatial (joint) central coverage: the fraction of instances
+    where EVERY spatial dimension falls within its own central interval,
+    P_hat_c = (1/N) sum_i 1[forall d, y_{i,d} in [q_lower_{i,d}, q_upper_{i,d}]].
+
+    Args:
+        y_true, q_lower, q_upper: (n_samples, D) arrays.
+
+    Returns:
+        Scalar empirical coverage in [0, 1].
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    q_lower = np.asarray(q_lower, dtype=np.float64)
+    q_upper = np.asarray(q_upper, dtype=np.float64)
+    inside = (y_true >= q_lower) & (y_true <= q_upper)  # (n_samples, D)
+    return float(inside.all(axis=1).mean())
+
+
+def plot_spatial_coverage_curve(y_true: np.ndarray, quantile_func, nominal_coverages: np.ndarray, ax):
+    """
+    Spatial central coverage curve: for each nominal coverage c = 1 - alpha,
+    query `quantile_func(alpha)` for the per-dimension central interval
+    [Q(alpha/2), Q(1 - alpha/2)] and plot the empirical joint coverage
+    (`calc_spatial_coverage`) against c. Points below the y = x diagonal mean
+    the joint intervals are too narrow (overconfident independence copula).
+
+    Args:
+        y_true: (n_samples, D) array of observed targets.
+        quantile_func: callable, quantile_func(alpha) -> (q_lower, q_upper),
+            each (n_samples, D), the per-dimension alpha/2 and 1 - alpha/2
+            predictive quantiles.
+        nominal_coverages: (n_levels,) array of nominal coverages c in (0, 1).
+        ax: matplotlib axis to draw on.
+    """
+    nominal_coverages = np.asarray(nominal_coverages, dtype=np.float64)
+    empirical = np.empty_like(nominal_coverages)
+    for i, c in enumerate(nominal_coverages):
+        alpha = 1.0 - c
+        q_lower, q_upper = quantile_func(alpha)
+        empirical[i] = calc_spatial_coverage(y_true, q_lower, q_upper)
+
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Ideal calibration")
+    ax.plot(nominal_coverages, empirical, "o-", color="tab:purple", label="Spatial coverage")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel(r"Nominal joint coverage $c = 1 - \alpha$")
+    ax.set_ylabel(r"Empirical spatial coverage $\hat{P}_c$")
+    ax.set_title("Spatial Central Coverage Curve")
+    ax.legend()
+    return ax
 
 
 def main():
