@@ -697,7 +697,11 @@ def generate_era5_reliability_diagram(
     return ece
 
 
-def plot_era5_quantile_reliability(data, context_idx, quantiles=np.arange(0.1, 1.0, 0.1)):
+def plot_era5_quantile_reliability(
+    data,
+    context_idx,
+    quantiles=np.array([0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]),
+):
     """
     Real-data driver for the reliability diagram: context locations
     (`context_idx`) are fixed once, but -- exactly as in
@@ -705,6 +709,10 @@ def plot_era5_quantile_reliability(data, context_idx, quantiles=np.arange(0.1, 1
     from that day's field and TabICLv2 is re-queried per day, so we iterate
     over every timestamp in the dataset to build up (y_true, y_pred_quantiles)
     across all days x grid points before scoring calibration.
+
+    The tail levels 0.01/0.05/0.95/0.99 are included alongside the 0.1-step
+    grid so the diagram also reports calibration in the extreme tails, not
+    just the bulk of the distribution.
     """
     field_all = data["t2m"]
     n_days = field_all.shape[0]
