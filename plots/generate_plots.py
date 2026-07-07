@@ -713,6 +713,14 @@ def plot_era5_quantile_reliability(
     The tail levels 0.01/0.05/0.95/0.99 are included alongside the 0.1-step
     grid so the diagram also reports calibration in the extreme tails, not
     just the bulk of the distribution.
+
+    Evaluation is restricted to grid points OUTSIDE `context_idx`: querying
+    the model at its own context locations would hand it the true label as a
+    training example and then score it against that same label, inflating
+    the apparent coverage. All quantile levels for a given day are requested
+    from a single fit()+predict() call -- TabICL's quantile spline comes from
+    one backbone forward pass regardless of how many `alphas` are requested,
+    so refitting/re-forwarding once per quantile level would be redundant.
     """
     field_all = data["t2m"]
     n_days = field_all.shape[0]
@@ -721,18 +729,19 @@ def plot_era5_quantile_reliability(
     coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
     context_coords = coords[context_idx]
 
+    target_idx = np.setdiff1d(np.arange(coords.shape[0]), context_idx)
+    target_coords = coords[target_idx]
+
+    quantiles = np.asarray(quantiles, dtype=float)
     tabiclv2 = TabICLv2_Regressor()
     y_true_chunks, y_pred_chunks = [], []
     for d in range(n_days):
         context_values = field_all[d].ravel()[context_idx]
-        preds = np.stack(
-            [
-                TabICLv2_Quantile(context_coords, context_values, coords, level=q, regressor=tabiclv2)
-                for q in quantiles
-            ],
-            axis=1,
-        )  # (M, n_quantiles)
-        y_true_chunks.append(field_all[d].ravel())
+        tabiclv2.fit(context_coords, context_values)
+        preds = tabiclv2.predict(
+            target_coords, output_type="quantiles", alphas=list(quantiles)
+        )  # (n_target, n_quantiles)
+        y_true_chunks.append(field_all[d].ravel()[target_idx])
         y_pred_chunks.append(preds)
 
     y_true = np.concatenate(y_true_chunks)
