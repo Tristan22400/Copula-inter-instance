@@ -42,7 +42,7 @@ def run_command(command: list, description: str, env: dict | None = None):
 
 def main():
     parser = argparse.ArgumentParser(description="Automated Kernel Validation Pipeline")
-    parser.add_argument("--kernel", type=str, default="lsh_forest", help="Kernel to validate (e.g., lsh_forest)")
+    parser.add_argument("--kernel", type=str, default="rbf", help="Kernel to validate (e.g., rbf)")
     parser.add_argument("--skip-dataset-validation", action="store_true",
                          help="Skip generating a dataset and checking its R_star correlation structure")
     parser.add_argument("--n-episodes", type=int, default=500,

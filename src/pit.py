@@ -173,6 +173,7 @@ def run_pit(
 # ---------------------------------------------------------------------------
 
 
+@torch.no_grad()
 def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     """Exact PIT from GP LOO (train) and posterior (test) marginals.
 
@@ -193,16 +194,16 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
 
     Args:
         task: raw task dict returned by generate_gp_task (must contain
-              kernel, l, alpha2, nugget, period, rq_alpha,
-              kernel_feature_indices, x_norm_train, y_train, y_test,
-              mu_star, sigma_star).
+              kernel, l, alpha2, nugget, period, rq_alpha, l_b, alpha2_b,
+              period_b, rq_alpha_b, kernel_feature_indices, x_norm_train,
+              y_train, y_test, mu_star, sigma_star).
         eps:  unused (kept for API symmetry with run_pit).
 
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_name = task["kernel"]
     # scalar for every kernel except "hebo", where l is an ARD per-dimension
-    # lengthscale vector (k,) — see data_gen.hebo_matern32_kernel.
+    # lengthscale vector (k,) — see data_gen._build_scaled_kernel.
     l_tensor = task["l"]
     l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
     alpha2 = task["alpha2"].item()
@@ -210,10 +211,31 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     # 0.0 sentinel means the param is not applicable for this kernel
     period   = task["period"].item()   if task["period"].item()   != 0.0 else None
     rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
+    # Composite ("A+B"/"A*B") kernels' second component — same 0.0 sentinel
+    # convention. Omitting these previously made build_kernel_fn silently
+    # reconstruct composites with l_b/alpha2_b=None, crashing with a
+    # TypeError as soon as component B's kernel function tried to use them.
+    # l_b (unlike l) is never an ARD vector — composite components are
+    # always base kernels (hebo, the only ARD one, isn't composable).
+    l_b        = task["l_b"].item() if task["l_b"].item() != 0.0 else None
+    alpha2_b   = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
+    period_b   = task["period_b"].item() if task["period_b"].item() != 0.0 else None
+    rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
 
-    kernel_fn  = build_kernel_fn(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
+    kernel_fn  = build_kernel_fn(
+        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha,
+        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
+    )
     cols       = task["kernel_feature_indices"]
     x_k_train  = task["x_norm_train"][:, cols]   # (P, k)
+    if kernel_name == "hebo":
+        # HEBO+'s Gamma-distributed lengthscale is calibrated for x in
+        # [0,1]^k (paper Appendix D) — see data_gen.generate_gp_task's same
+        # mapping. Skipping this previously left gp_analytical_pit
+        # reconstructing HEBO's kernel over the wrong input domain, silently
+        # producing a different z_train than the one generate_gp_task itself
+        # computed via _L_ff/_alpha.
+        x_k_train = torch.special.ndtr(x_k_train)
     y_train    = task["y_train"]                  # (P,)
     y_test     = task["y_test"]                   # (N,)
     mu_star    = task["mu_star"]                  # (N,) posterior mean

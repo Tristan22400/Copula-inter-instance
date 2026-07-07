@@ -19,7 +19,7 @@ Never opens a GUI window — safe to run over SSH on a host with no DISPLAY
 (matplotlib's Agg backend is forced before pyplot is imported).
 
 Usage:
-    python scripts/visualize_kernel.py --kernel lsh_forest
+    python scripts/visualize_kernel.py --kernel rbf
 """
 import argparse
 import os

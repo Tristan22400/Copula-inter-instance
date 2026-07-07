@@ -21,26 +21,23 @@ N_max: 128
 # Number of tasks to generate
 n_tasks: 5000000
 
-# GP kernel hyperparameter ranges (shared across all stationary kernels)
-l_min: 1.0
-l_max: 10.0
-# Length-scale sampling mode (both default off — preserves existing behaviour).
-# l_scale_by_sqrt_k: multiply [l_min, l_max] by sqrt(k) (k = active kernel dims)
-#   before sampling. Squared distance grows ~linearly with k, so without this
-#   a shared l range mixes very different correlation regimes across k.
-# l_log_uniform: sample l ~ LogUniform instead of Uniform. exp(-.../l^2) decay
-#   means linear-uniform l rarely visits the high-correlation regime; log-uniform
-#   spreads mass evenly across decades of l. Needed to get e.g. RBF R_star
-#   roughly uniform on [0,1] instead of collapsing near 0 (see diag_kernels.py).
-l_log_uniform: true
+# GP kernel hyperparameter priors (shared across all stationary kernels,
+# except "hebo" — its Gamma/LogNormal constants are fixed, tuned "HEBO+"
+# values from the PFN4BO paper; see data_gen.py::HEBO_PLUS_HYPERPARAMETERS).
+# lengthscale ~ LogNormal(l_lognormal_loc, l_lognormal_scale), with loc
+# shifted by +0.5*log(k) when l_scale_by_sqrt_k (k = active kernel dims) —
+# squared distance grows ~linearly with k, so without this shift a shared
+# lengthscale distribution mixes very different correlation regimes across k.
+l_lognormal_loc: 1.0986    # log(3.0)
+l_lognormal_scale: 0.7
 l_scale_by_sqrt_k: true
-alpha2_min: 0.5
-alpha2_max: 2.0
+alpha2_gamma_concentration: 4.0   # outputscale ~ Gamma(concentration, rate)
+alpha2_gamma_rate: 3.0
 
-# Nugget: single diagonal regulariser ~ U[nugget_min, nugget_max].
+# Nugget: single diagonal regulariser ~ LogNormal(nugget_lognormal_loc, nugget_lognormal_scale).
 # Guarantees PSD and controls posterior tightness (replaces separate noise param).
-nugget_min: 0.1
-nugget_max: 0.25
+nugget_lognormal_loc: -1.897    # log(0.15)
+nugget_lognormal_scale: 0.4
 
 # Test-side oracle for R_star/mu_star/sigma_star (and hence z_test):
 #   posterior: condition on the training context (K_ss − K_st K_ff⁻¹ K_ts) —
@@ -56,18 +53,17 @@ oracle_mode: prior
 # Use a single fixed kernel:
 #   kernel: rbf
 # Or sample uniformly from a list each task:
-#   kernels: [rbf, matern32, cosine, periodic, rational_quadratic, dot_product, lsh_forest]
+#   kernels: [rbf, matern32, cosine, periodic, rational_quadratic, dot_product, hebo]
 #
-# Available kernels: rbf, matern32, cosine, periodic, rational_quadratic, dot_product, lsh_forest
+# Available kernels: rbf, matern32, cosine, periodic, rational_quadratic, dot_product, hebo
+# (plus 20 "A+B"/"A*B" composites of {rbf, matern32, cosine, periodic, rational_quadratic} — see data_gen.COMPOSITE_KERNELS)
 kernel: dot_product
 
-# Extra hyperparameter ranges (only used by the indicated kernels)
-period_min: 0.5      # periodic kernel
-period_max: 3.0
-rq_alpha_min: 0.1    # rational_quadratic kernel
-rq_alpha_max: 5.0
-# lsh_num_trees: 20   # lsh_forest kernel — number of random-hyperplane trees
-# lsh_depth: 4        # lsh_forest kernel — hyperplanes per tree (2**depth leaves/tree)
+# Extra hyperparameter priors (only used by the indicated kernels)
+period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
+period_lognormal_scale: 0.4
+rq_alpha_gamma_concentration: 2.0    # rational_quadratic kernel's `rq_alpha`
+rq_alpha_gamma_rate: 1.0
 
 # PIT epsilon for probit clamping (analytical pipeline)
 pit_eps: 1.0e-6

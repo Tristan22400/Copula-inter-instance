@@ -17,7 +17,7 @@ Usage:
     python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --task-idx 3
     python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --k-realizations 500 --steps 5000 --lr 1e-3
     python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --freeze-backbone
-    python src/overfit_single.py --kernel lsh_forest   # fresh episode, no dataset needed
+    python src/overfit_single.py --kernel rbf   # fresh episode, no dataset needed
 """
 
 from __future__ import annotations

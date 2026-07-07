@@ -2,13 +2,13 @@
 # GP task generation config — "hebo" kernel (PFNs4BO's tuned "HEBO+" prior)
 # ---------------------------------------------------------------------------
 # Hyperparameters (lengthscale/outputscale/noise) are NOT read from this file:
-# for kernel: hebo they are sampled by pfns4bo_upstream/pfns4bo/priors/
-# hebo_prior.py::get_model, using the tuned "HEBO+" config that trained
-# PFNs4BO's released hebo_plus_model checkpoint (see
-# src/data_gen.py::HEBO_PLUS_HYPERPARAMETERS for the exact constants and
-# their source). l_min/l_max/alpha2_min/alpha2_max/nugget_min/nugget_max
-# below are ignored for this kernel — kept only so this file stays a
-# drop-in override of gp_tasks.yaml.
+# for kernel: hebo they are sampled directly from gpytorch.priors.GammaPrior/
+# LogNormalPrior objects built in data_gen.py::_kernel_prior_spec /
+# _nugget_prior, using the tuned "HEBO+" constants in
+# src/data_gen.py::HEBO_PLUS_HYPERPARAMETERS (this repo no longer calls
+# pfns4bo_upstream at runtime — see data_gen.py's module docstring). The
+# l_*/alpha2_*/nugget_* keys below are ignored for this kernel — kept only
+# so this file stays a drop-in override of gp_tasks.yaml.
 
 d_features: 10          # total feature columns seen by the neural network
 
@@ -44,14 +44,13 @@ N_max: 64
 n_tasks: 5000000
 
 # Ignored for kernel: hebo — see header comment.
-l_min: 1.0
-l_max: 10.0
-l_log_uniform: true
+l_lognormal_loc: 1.0986
+l_lognormal_scale: 0.7
 l_scale_by_sqrt_k: true
-alpha2_min: 0.5
-alpha2_max: 2.0
-nugget_min: 0.1
-nugget_max: 0.25
+alpha2_gamma_concentration: 4.0
+alpha2_gamma_rate: 3.0
+nugget_lognormal_loc: -1.897
+nugget_lognormal_scale: 0.4
 
 # Test-side oracle for R_star/mu_star/sigma_star (and hence z_test) — see
 # gp_tasks.yaml for the posterior/prior explanation. Deliberately NOT mirroring

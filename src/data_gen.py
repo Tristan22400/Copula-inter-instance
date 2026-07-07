@@ -7,6 +7,15 @@ from the GP, computes the analytical correlation matrix R* at the test points
 (from either the GP posterior conditioned on training data or the raw GP
 prior, per cfg.data.oracle_mode), and saves all required tensors.
 
+Kernels are built from gpytorch.kernels (RBFKernel, MaternKernel,
+PeriodicKernel, RQKernel, CosineKernel) wrapped in ScaleKernel; hyperparameters
+(lengthscale, outputscale, nugget, period, rq_alpha) are sampled from
+gpytorch.priors (LogNormalPrior / GammaPrior) rather than the uniform ranges
+an earlier version of this file used — see _kernel_prior_spec / _nugget_prior
+for the exact distributions (all cfg-overridable, same getattr-with-default
+convention as before). Kernel composition (sums/products of two base kernels)
+uses gpytorch's native `+`/`*` operator overloading on Kernel objects.
+
 Supported kernels
 -----------------
   rbf                 — Squared Exponential / RBF
@@ -14,30 +23,31 @@ Supported kernels
   cosine              — Cosine (spectral): k(r) = alpha2 * cos(2π r / l)
   periodic            — Periodic: k(r) = alpha2 * exp(-2 sin²(π r / period) / l²)
   rational_quadratic  — Rational Quadratic: k(r) = alpha2 * (1 + r²/(2α l²))^{-α}
-  dot_product         — Linear (dot product): k(x1,x2) = x1ᵀx2
-  lsh_forest          — LSH Forest: k(x1,x2) = alpha2 * (fraction of random-hyperplane
-                         trees where x1,x2 land in the same leaf). Ultrametric,
-                         block-diagonal structure (sharp regime changes, like a
-                         decision tree ensemble) instead of a smooth distance decay.
-  hebo                — ARD Matérn ν=3/2 + outputscale, hyperparameters sampled via
-                         the "HEBO+" prior from pfns4bo_upstream (github.com/automl/
-                         PFNs4BO), the tuned config that trained their released
-                         `hebo_plus_model` checkpoint. Sampling itself calls
-                         pfns4bo_upstream's own pfns4bo.priors.hebo_prior.get_model
-                         (unmodified upstream code — see pfns4bo_compat.py for the
-                         load-time botorch-version compatibility shims this needs);
-                         see hebo_matern32_kernel / _sample_hebo_hyperparameters /
-                         HEBO_PLUS_HYPERPARAMETERS below for the exact tuned
-                         constants and their source.
+  dot_product         — Linear (dot product): k(x1,x2) = x1ᵀx2. Unscaled, no
+                         hyperparameters — kept as a plain torch op rather
+                         than a gpytorch LinearKernel so its exact original
+                         behaviour (no offset, no variance term) is preserved.
+  hebo                — ARD Matérn ν=3/2 + outputscale, the tuned "HEBO+"
+                         prior from the PFN4BO paper (github.com/automl/
+                         PFNs4BO), Appendix B.1: lengthscale/outputscale ~
+                         Gamma, noise ~ LogNormal — see
+                         HEBO_PLUS_HYPERPARAMETERS for the exact tuned
+                         constants and their source. Sampled with the same
+                         gpytorch.priors machinery as every other kernel here
+                         — no runtime dependency on pfns4bo_upstream any more
+                         (its Gamma/LogNormal hyperpriors don't depend on the
+                         input points, unlike upstream's SingleTaskGP-based
+                         `hebo_prior.get_model` scaffolding).
 
 Composite kernels ("A+B" / "A*B")
 ---------------------------------
   Sums and products of PSD kernels are PSD, so every pair drawn from
   {rbf, matern32, cosine, periodic, rational_quadratic} is auto-registered
-  under both operators, e.g. "rbf+periodic" (locally periodic: smooth decay
-  times exact periodicity) or "matern32*cosine" (spectral windowing). See
-  COMPOSITE_KERNELS for the full list. dot_product and lsh_forest are not
-  composable (irregular hyperparameter signatures).
+  under both operators via gpytorch's `+`/`*` kernel composition, e.g.
+  "rbf+periodic" (locally periodic: smooth decay times exact periodicity) or
+  "matern32*cosine" (spectral windowing). See COMPOSITE_KERNELS for the full
+  list. dot_product and hebo are not composable (irregular hyperparameter
+  signatures — no lengthscale, or ARD-only).
 
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
@@ -54,14 +64,16 @@ import itertools
 import math
 import random
 import warnings
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import gpytorch
 import numpy as np
 import torch
+from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
 from torch import Tensor
 
 from loss import _safe_cholesky
-from pfns4bo_compat import get_hebo_prior_module
 
 
 def _seed_everything(seed: int) -> None:
@@ -91,6 +103,12 @@ def _dist(X1: Tensor, X2: Tensor) -> Tensor:
 
 # ---------------------------------------------------------------------------
 # PSD kernel functions  k(X1, X2) -> (n1, n2) matrix
+#
+# Kept as plain torch (not gpytorch objects) because src/evaluate_baselines.py
+# imports these directly for a from-scratch gradient-based GP MLE fit against
+# real (UCI) data — a different code path from episode generation below,
+# independently tested and numerically unaffected by the kernel-construction
+# rewrite in this file.
 # ---------------------------------------------------------------------------
 
 
@@ -145,9 +163,7 @@ def rational_quadratic_kernel(
     return alpha2 * (1.0 + sq / (2.0 * rq_alpha * l**2)) ** (-rq_alpha)
 
 
-def dot_product_kernel(
-    X1: Tensor, X2: Tensor, **_
-) -> Tensor:
+def dot_product_kernel(X1: Tensor, X2: Tensor, **_) -> Tensor:
     """Linear (dot product): X1 @ X2ᵀ.
 
     PSD because K = XᵀX is PSD. Has no lengthscale or variance hyperparameter;
@@ -156,68 +172,289 @@ def dot_product_kernel(
     return X1 @ X2.T
 
 
-def hebo_matern32_kernel(X1: Tensor, X2: Tensor, *, l: Tensor, alpha2: float, **_) -> Tensor:
-    """ARD Matérn ν=3/2 + outputscale — pfns4bo_upstream's "HEBO+" kernel family.
+# ---------------------------------------------------------------------------
+# gpytorch-backed kernel construction (sampling + reconstruction)
+# ---------------------------------------------------------------------------
+# Two entry points share the machinery below:
+#   - _sample_episode_kernel: draws fresh hyperparameters from gpytorch
+#     LogNormal/Gamma priors for B episodes at once (used by
+#     generate_gp_task / generate_gp_batch to generate new data).
+#   - build_kernel_fn: builds a kernel(X1, X2) -> K callable from CONCRETE,
+#     already-known hyperparameter values (used by pit.py::gp_analytical_pit
+#     and tests to reconstruct the kernel a saved episode was drawn from).
+#
+# Both always materialise the Gram matrix immediately via `.to_dense()` and
+# hand off to this file's own torch.linalg-based Cholesky/solve code
+# (_safe_cholesky / _batched_cholesky) rather than gpytorch's own
+# ExactGP/lazy-tensor solve machinery — gpytorch silently switches to an
+# approximate CG solve for matrices larger than
+# gpytorch.settings.max_cholesky_size (default 800), which would silently
+# diverge from the exact-Cholesky-based invariants this repo's test suite
+# checks (well-conditioned floor, unit-diagonal tolerance).
 
-    Same formula as `gpytorch.kernels.ScaleKernel(MaternKernel(nu=1.5,
-    ard_num_dims=k))`; verified numerically against that (max abs diff ~2e-7,
-    float32). `l` is a per-dimension lengthscale *vector* (k,) here — unlike
-    every other kernel in this file, which uses one isotropic scalar l — but
-    broadcasts correctly since `diff` has a trailing k dimension. Registered
-    in KERNEL_REGISTRY like any other kernel so build_kernel_fn/pit.py's
-    reconstruction path works unchanged; the actual (l, alpha2) values for
-    "hebo" are sampled by _sample_hebo_hyperparameters via
-    pfns4bo_upstream's own hebo_prior.get_model, not by this function.
+_BASE_GPYTORCH_KERNEL_CLS: Dict[str, Callable[..., gpytorch.kernels.Kernel]] = {
+    "rbf": gpytorch.kernels.RBFKernel,
+    "matern32": functools.partial(gpytorch.kernels.MaternKernel, nu=1.5),
+    "cosine": gpytorch.kernels.CosineKernel,
+    "periodic": gpytorch.kernels.PeriodicKernel,
+    "rational_quadratic": gpytorch.kernels.RQKernel,
+    "hebo": functools.partial(gpytorch.kernels.MaternKernel, nu=1.5),
+}
+
+# Maps an output-dict/schema parameter name to the gpytorch attribute that
+# holds it, for the "extra" (non-lengthscale, non-outputscale) parameters.
+_EXTRA_PARAM_TO_ATTR: Dict[str, str] = {"period": "period_length", "rq_alpha": "alpha"}
+
+
+@dataclass
+class KernelPriorSpec:
+    """Hyperprior distributions for one base kernel family.
+
+    lengthscale_prior(k) returns the Prior over the kernel's shape parameter
+    (its `.lengthscale`, or `.period_length` for cosine — see
+    lengthscale_attr) given k active input dimensions; ard=True (currently
+    only "hebo") samples one independent value per dimension instead of one
+    isotropic scalar shared across all k dims.
     """
-    diff = X1.unsqueeze(1) - X2.unsqueeze(0)  # (n1, n2, k)
-    scaled = diff / l
-    r = scaled.pow(2).sum(-1).clamp(min=0.0).sqrt()
-    s = math.sqrt(3.0) * r
-    return alpha2 * (1.0 + s) * torch.exp(-s)
+
+    lengthscale_prior: Callable[[int], Prior]
+    outputscale_prior: Prior
+    lengthscale_attr: str = "lengthscale"
+    extra_priors: Dict[str, Prior] = field(default_factory=dict)
+    ard: bool = False
 
 
-def _lsh_leaf_ids(X: Tensor, W: Tensor, b: Tensor) -> Tensor:
-    """Hash each row of X through every tree, return one leaf id per tree.
+HEBO_PLUS_HYPERPARAMETERS: Dict[str, object] = {
+    # Tuned "HEBO+" prior constants — the exact config that trained
+    # pfns4bo_upstream's released `hebo_plus_model` checkpoint. Source:
+    # pfns4bo_upstream/pfns4bo/priors/hebo_prior.py::get_model +
+    # Tutorial_Training_for_BO.ipynb + PFN4BO.pdf Appendix B.1. Used directly
+    # by _kernel_prior_spec / _nugget_prior's "hebo" branches below — this
+    # file reproduces the exact sampled distributions via
+    # gpytorch.priors.GammaPrior/LogNormalPrior instead of calling upstream
+    # at runtime (see module docstring).
+    "lengthscale_concentration": 1.2106559584074301,
+    "lengthscale_rate": 1.5212245992840594,
+    "outputscale_concentration": 0.8452312502679863,
+    "outputscale_rate": 0.3993553245745406,
+    "hebo_noise_logmean": -4.63,
+    "hebo_noise_std": 0.5,
+    "add_linear_kernel": False,  # tuned HEBO+ drops the linear-kernel term — not implemented here
+    "hebo_warping": False,  # tuned HEBO+ drops input warping — not implemented here
+}
 
-    X: (n, k), W: (k, num_trees, depth), b: (num_trees, depth) -> (n, num_trees) int64.
-    Each of the `depth` random hyperplanes per tree contributes one bit; the
-    `depth` bits are packed into a single leaf id so a same-leaf test across a
-    tree is one integer comparison instead of `depth` boolean comparisons.
+
+def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
+    """Build the LogNormal/Gamma hyperprior spec for one base kernel family.
+
+    Every numeric constant is overridable via cfg.data (getattr-defaulted,
+    same convention the old l_min/l_max/alpha2_min/alpha2_max ranges used),
+    except "hebo"'s, which are the fixed tuned HEBO+ constants above.
     """
-    depth = W.shape[-1]
-    bits = torch.einsum("nk,ksd->nsd", X, W) + b > 0  # (n, num_trees, depth)
-    weights = (2 ** torch.arange(depth, device=X.device)).to(torch.int64)
-    return (bits.long() * weights).sum(-1)  # (n, num_trees)
+    if kernel_name == "hebo":
+        return KernelPriorSpec(
+            lengthscale_prior=lambda k: GammaPrior(
+                HEBO_PLUS_HYPERPARAMETERS["lengthscale_concentration"],
+                HEBO_PLUS_HYPERPARAMETERS["lengthscale_rate"],
+            ),
+            outputscale_prior=GammaPrior(
+                HEBO_PLUS_HYPERPARAMETERS["outputscale_concentration"],
+                HEBO_PLUS_HYPERPARAMETERS["outputscale_rate"],
+            ),
+            ard=True,
+        )
+
+    l_loc = float(getattr(cfg.data, "l_lognormal_loc", math.log(3.0)))
+    l_scale = float(getattr(cfg.data, "l_lognormal_scale", 0.7))
+    scale_by_sqrt_k = bool(getattr(cfg.data, "l_scale_by_sqrt_k", True))
+    a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
+    a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
+
+    def lengthscale_prior(k: int) -> LogNormalPrior:
+        # Squared distance sum_{i=1}^k (x1_i - x2_i)^2 grows ~linearly with k
+        # (active kernel dims), so without this shift, k=1 and k=4 tasks
+        # sample from very different effective-correlation regimes even
+        # though l comes from the same distribution — this is the LogNormal
+        # equivalent of the old l_scale_by_sqrt_k range-multiplier (if
+        # l ~ LogNormal(loc, scale) then c*l ~ LogNormal(loc + log(c), scale)).
+        loc = l_loc + (0.5 * math.log(max(k, 1)) if scale_by_sqrt_k else 0.0)
+        return LogNormalPrior(loc, l_scale)
+
+    # cosine has no `.lengthscale` attribute — its one shape parameter is
+    # `.period_length`, playing the same role "l" does in cosine_kernel's
+    # formula (NOT the same as periodic's separate `period` parameter below).
+    lengthscale_attr = "period_length" if kernel_name == "cosine" else "lengthscale"
+
+    extra_priors: Dict[str, Prior] = {}
+    if kernel_name == "periodic":
+        p_loc = float(getattr(cfg.data, "period_lognormal_loc", math.log(1.2)))
+        p_scale = float(getattr(cfg.data, "period_lognormal_scale", 0.4))
+        extra_priors["period"] = LogNormalPrior(p_loc, p_scale)
+    elif kernel_name == "rational_quadratic":
+        rq_conc = float(getattr(cfg.data, "rq_alpha_gamma_concentration", 2.0))
+        rq_rate = float(getattr(cfg.data, "rq_alpha_gamma_rate", 1.0))
+        extra_priors["rq_alpha"] = GammaPrior(rq_conc, rq_rate)
+
+    return KernelPriorSpec(
+        lengthscale_prior=lengthscale_prior,
+        outputscale_prior=GammaPrior(a_conc, a_rate),
+        lengthscale_attr=lengthscale_attr,
+        extra_priors=extra_priors,
+    )
 
 
-def lsh_forest_kernel(
-    X1: Tensor, X2: Tensor, *, alpha2: float, lsh_W: Tensor, lsh_b: Tensor, **_
-) -> Tensor:
-    """LSH Forest: alpha2 * (fraction of trees where x1, x2 land in the same leaf).
+def _nugget_prior(cfg, kernel_name: str) -> LogNormalPrior:
+    """Diagonal regulariser prior — same role the old nugget_min/max range played."""
+    if kernel_name == "hebo":
+        return LogNormalPrior(
+            HEBO_PLUS_HYPERPARAMETERS["hebo_noise_logmean"],
+            HEBO_PLUS_HYPERPARAMETERS["hebo_noise_std"],
+        )
+    loc = float(getattr(cfg.data, "nugget_lognormal_loc", math.log(0.15)))
+    scale = float(getattr(cfg.data, "nugget_lognormal_scale", 0.4))
+    return LogNormalPrior(loc, scale)
 
-    Each tree is a set of `depth` random hyperplanes that partitions the input
-    space into up to 2**depth cells (a random-hyperplane / SimHash forest).
-    Within one tree, the leaf-membership indicator matrix is a block-diagonal
-    0/1 matrix, which is PSD; a convex average (over trees) of PSD matrices is
-    PSD, so the kernel is valid for any alpha2 >= 0. This produces sharp,
-    ultrametric block structure (like a decision-tree ensemble) instead of the
-    smooth distance-based decay of the other stationary kernels.
 
-    lsh_W/lsh_b must be the SAME realization for every kernel_fn(X1, X2) call
-    within one episode — gp_posterior calls the kernel three times (K_ff, K_sf,
-    K_ss) with different point sets, so the hyperplanes are sampled once per
-    episode (see generate_gp_task/generate_gp_batch) and passed in here rather
-    than being resampled on every call.
+def _build_scaled_kernel(
+    name: str, spec: KernelPriorSpec, k: int, B: int, device
+) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
+    """Sample B episodes' hyperparameters for one base kernel and return the
+    resulting ScaleKernel(base)(batch_shape=[B]) object plus a dict of the
+    sampled values (keyed by the output-dict schema names: l, alpha2, and
+    any of spec.extra_priors' keys)."""
+    batch_shape = torch.Size([B])
+    kernel_kwargs: Dict = {"batch_shape": batch_shape}
+    if spec.ard:
+        kernel_kwargs["ard_num_dims"] = k
+    # gpytorch kernel modules default to CPU-resident parameters regardless
+    # of `device`; move before assigning sampled values so the in-place
+    # `self.initialize(...)` used by the `.lengthscale =` / `.outputscale =`
+    # setters below copies into device-resident storage, not CPU storage.
+    base = _BASE_GPYTORCH_KERNEL_CLS[name](**kernel_kwargs).to(device)
+
+    l_attr = getattr(base, spec.lengthscale_attr)
+    l_sample = spec.lengthscale_prior(k).sample(l_attr.shape).to(device)
+    setattr(base, spec.lengthscale_attr, l_sample)
+
+    scaled = gpytorch.kernels.ScaleKernel(base, batch_shape=batch_shape).to(device)
+    a_sample = spec.outputscale_prior.sample(scaled.outputscale.shape).to(device)
+    scaled.outputscale = a_sample
+
+    l_flat = l_sample.reshape(B, -1)
+    params: Dict[str, Tensor] = {
+        "l": l_flat.squeeze(-1) if l_flat.shape[-1] == 1 else l_flat,
+        "alpha2": a_sample.reshape(B),
+    }
+    for schema_name, prior in spec.extra_priors.items():
+        attr_name = _EXTRA_PARAM_TO_ATTR[schema_name]
+        attr = getattr(base, attr_name)
+        sample = prior.sample(attr.shape).to(device)
+        setattr(base, attr_name, sample)
+        params[schema_name] = sample.reshape(B)
+
+    return scaled, params
+
+
+def _sample_episode_kernel(
+    cfg, kernel_name: str, k: int, B: int, device
+) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
+    """Sample B episodes' hyperparameters for kernel_name (base or "A+B"/"A*B"
+    composite) and return (gpytorch Kernel with batch_shape=[B], params dict).
+
+    Not valid for "dot_product" (no kernel object / hyperparameters — handled
+    directly by the caller). params keys match the output-dict schema (l,
+    alpha2, period, rq_alpha, l_b, alpha2_b, period_b, rq_alpha_b);
+    not-applicable entries are filled with a 0.0 sentinel (the convention
+    pit.py::gp_analytical_pit relies on).
     """
-    ids1 = _lsh_leaf_ids(X1, lsh_W, lsh_b)  # (n1, num_trees)
-    ids2 = _lsh_leaf_ids(X2, lsh_W, lsh_b)  # (n2, num_trees)
-    matches = ids1.unsqueeze(1) == ids2.unsqueeze(0)  # (n1, n2, num_trees)
-    return alpha2 * matches.float().mean(-1)
+    composite = _parse_composite(kernel_name)
+    if composite is None:
+        spec = _kernel_prior_spec(cfg, kernel_name)
+        kernel, params = _build_scaled_kernel(kernel_name, spec, k, B, device)
+    else:
+        name_a, op, name_b = composite
+        kernel_a, params_a = _build_scaled_kernel(name_a, _kernel_prior_spec(cfg, name_a), k, B, device)
+        kernel_b, params_b = _build_scaled_kernel(name_b, _kernel_prior_spec(cfg, name_b), k, B, device)
+        kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
+        params = dict(params_a)
+        for key, val in params_b.items():
+            params[f"{key}_b"] = val
+
+    for key in ("period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b"):
+        params.setdefault(key, torch.zeros(B, device=device))
+
+    return kernel, params
+
+
+def _build_concrete_kernel(
+    name: str, l, alpha2, *, period=None, rq_alpha=None
+) -> gpytorch.kernels.Kernel:
+    """Construct a non-batched gpytorch Kernel with CONCRETE hyperparameter
+    values assigned — reconstruction (given known values), not sampling.
+    Used by build_kernel_fn."""
+    if name == "hebo":
+        l_t = l if torch.is_tensor(l) else torch.tensor([float(l)])
+        base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=l_t.numel())
+        base.lengthscale = l_t.reshape(base.lengthscale.shape)
+    else:
+        base = _BASE_GPYTORCH_KERNEL_CLS[name]()
+        attr = "period_length" if name == "cosine" else "lengthscale"
+        l_t = torch.as_tensor(l, dtype=torch.get_default_dtype())
+        setattr(base, attr, l_t.reshape(getattr(base, attr).shape))
+        if name == "periodic" and period is not None:
+            base.period_length = torch.as_tensor(float(period)).reshape(base.period_length.shape)
+        if name == "rational_quadratic" and rq_alpha is not None:
+            base.alpha = torch.as_tensor(float(rq_alpha)).reshape(base.alpha.shape)
+
+    scale = gpytorch.kernels.ScaleKernel(base)
+    scale.outputscale = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(scale.outputscale.shape)
+    return scale
+
+
+def build_kernel_fn(
+    kernel_name: str,
+    l,
+    alpha2,
+    *,
+    period: Optional[float] = None,
+    rq_alpha: Optional[float] = None,
+    l_b=None,
+    alpha2_b=None,
+    period_b: Optional[float] = None,
+    rq_alpha_b: Optional[float] = None,
+) -> Callable[[Tensor, Tensor], Tensor]:
+    """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
+
+    l_b/alpha2_b/period_b/rq_alpha_b are the second component's hyperparameters
+    for composite ("A+B" / "A*B") kernels.
+    """
+    if kernel_name == "dot_product":
+        return dot_product_kernel
+
+    composite = _parse_composite(kernel_name)
+    if composite is None:
+        kernel = _build_concrete_kernel(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
+    else:
+        name_a, op, name_b = composite
+        kernel_a = _build_concrete_kernel(name_a, l, alpha2, period=period, rq_alpha=rq_alpha)
+        kernel_b = _build_concrete_kernel(name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b)
+        kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
+
+    # kernel's parameters are CPU-resident regardless of the device l/alpha2
+    # were on (see _build_scaled_kernel's docstring note) — move lazily to
+    # X1's device at call time, since X1 isn't known yet at construction time.
+    return lambda X1, X2: kernel.to(X1.device)(X1, X2).to_dense()
 
 
 # ---------------------------------------------------------------------------
-# Kernel registry
+# Kernel registry (names + free-function dispatch, e.g. for
+# scripts/visualize_kernel.py's membership checks and ALL_KERNELS)
 # ---------------------------------------------------------------------------
+
+
+def _hebo_kernel_dispatch(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+    return build_kernel_fn("hebo", l, alpha2)(X1, X2)
+
 
 KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "rbf": rbf_kernel,
@@ -226,8 +463,7 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "periodic": periodic_kernel,
     "rational_quadratic": rational_quadratic_kernel,
     "dot_product": dot_product_kernel,
-    "lsh_forest": lsh_forest_kernel,
-    "hebo": hebo_matern32_kernel,
+    "hebo": _hebo_kernel_dispatch,
 }
 
 
@@ -238,14 +474,17 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
 # periodic — smooth decay times exact periodicity) or "matern32*cosine"
 # (spectral windowing) are valid kernels without any new math. Restricted to
 # the kernels below because they share one calling convention (l, alpha2,
-# plus an optional named extra); dot_product and lsh_forest have irregular
-# signatures (no lengthscale / a per-episode random forest) and are left out
-# of composites for now.
+# plus an optional named extra); dot_product and hebo have irregular
+# signatures (no lengthscale / ARD-only) and are left out of composites.
 _COMPOSABLE_KERNELS: List[str] = ["rbf", "matern32", "cosine", "periodic", "rational_quadratic"]
 
 # Kernels whose PSD guarantee only holds for scalar (1D) inputs — composites
 # that include one of these must also cap the active kernel dimensionality
-# to k=1 (see generate_gp_task / generate_gp_batch).
+# to k=1 (see generate_gp_task / generate_gp_batch). Verified empirically:
+# CosineKernel used isotropically is not PSD for k>=2 (Bochner/Schoenberg —
+# an isotropic cos(||x||) is not a valid Mercer kernel for d>1); periodic is
+# conservatively capped the same way for behavioural parity even though
+# gpytorch's ARD PeriodicKernel is independently PSD for k>1.
 _SCALAR_ONLY_KERNELS = {"cosine", "periodic"}
 
 
@@ -283,28 +522,13 @@ def _composite_kernel(
     rq_alpha_b: Optional[float] = None,
     **_,
 ) -> Tensor:
-    """Evaluate a registered "A+B" / "A*B" composite kernel.
-
-    Component A uses (l, alpha2, period, rq_alpha); component B uses the
-    "_b"-suffixed counterparts — independent hyperparameters per component,
-    sampled once per episode by the caller (same convention as period/rq_alpha
-    for the simple kernels).
-    """
-    name_a, op, name_b = _parse_composite(kernel_name)
-    kwargs_a: Dict = dict(l=l, alpha2=alpha2)
-    if name_a == "periodic":
-        kwargs_a["period"] = period
-    if name_a == "rational_quadratic":
-        kwargs_a["rq_alpha"] = rq_alpha
-    kwargs_b: Dict = dict(l=l_b, alpha2=alpha2_b)
-    if name_b == "periodic":
-        kwargs_b["period"] = period_b
-    if name_b == "rational_quadratic":
-        kwargs_b["rq_alpha"] = rq_alpha_b
-
-    K_a = KERNEL_REGISTRY[name_a](X1, X2, **kwargs_a)
-    K_b = KERNEL_REGISTRY[name_b](X1, X2, **kwargs_b)
-    return K_a + K_b if op == "+" else K_a * K_b
+    """Evaluate a registered "A+B" / "A*B" composite kernel (KERNEL_REGISTRY
+    dispatch convention) by delegating to build_kernel_fn."""
+    fn = build_kernel_fn(
+        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha,
+        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
+    )
+    return fn(X1, X2)
 
 
 COMPOSITE_KERNELS: List[str] = []
@@ -316,110 +540,6 @@ for _name_a, _name_b in itertools.combinations(_COMPOSABLE_KERNELS, 2):
 del _name_a, _name_b, _op, _combo_name
 
 ALL_KERNELS: List[str] = list(KERNEL_REGISTRY.keys())
-
-
-def build_kernel_fn(
-    kernel_name: str,
-    l: float,
-    alpha2: float,
-    *,
-    period: Optional[float] = None,
-    rq_alpha: Optional[float] = None,
-    lsh_W: Optional[Tensor] = None,
-    lsh_b: Optional[Tensor] = None,
-    l_b: Optional[float] = None,
-    alpha2_b: Optional[float] = None,
-    period_b: Optional[float] = None,
-    rq_alpha_b: Optional[float] = None,
-) -> Callable[[Tensor, Tensor], Tensor]:
-    """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
-
-    lsh_W/lsh_b (lsh_forest only) must be one fixed realization sampled once
-    per episode by the caller — see lsh_forest_kernel's docstring for why.
-    l_b/alpha2_b/period_b/rq_alpha_b are the second component's hyperparameters
-    for composite ("A+B" / "A*B") kernels — see _composite_kernel.
-    """
-    fn = KERNEL_REGISTRY[kernel_name]
-    kwargs: Dict = dict(l=l, alpha2=alpha2)
-    if period is not None:
-        kwargs["period"] = period
-    if rq_alpha is not None:
-        kwargs["rq_alpha"] = rq_alpha
-    if lsh_W is not None:
-        kwargs["lsh_W"] = lsh_W
-    if lsh_b is not None:
-        kwargs["lsh_b"] = lsh_b
-    if l_b is not None:
-        kwargs["l_b"] = l_b
-    if alpha2_b is not None:
-        kwargs["alpha2_b"] = alpha2_b
-    if period_b is not None:
-        kwargs["period_b"] = period_b
-    if rq_alpha_b is not None:
-        kwargs["rq_alpha_b"] = rq_alpha_b
-    return lambda X1, X2: fn(X1, X2, **kwargs)
-
-
-HEBO_PLUS_HYPERPARAMETERS: Dict[str, object] = {
-    # Tuned "HEBO+" prior — the exact config that trained pfns4bo_upstream's
-    # released `hebo_plus_model` checkpoint. Source: pfns4bo_upstream/pfns4bo/
-    # priors/hebo_prior.py::get_model + Tutorial_Training_for_BO.ipynb (which
-    # trains that checkpoint) + PFN4BO.pdf Appendix B.1.
-    "lengthscale_concentration": 1.2106559584074301,
-    "lengthscale_rate": 1.5212245992840594,
-    "outputscale_concentration": 0.8452312502679863,
-    "outputscale_rate": 0.3993553245745406,
-    "hebo_noise_logmean": -4.63,
-    "hebo_noise_std": 0.5,
-    "add_linear_kernel": False,  # tuned HEBO+ drops the linear-kernel term
-    "hebo_warping": False,       # tuned HEBO+ drops input warping
-}
-
-
-def _sample_hebo_hyperparameters(x_unit: Tensor) -> tuple[Tensor, float, float]:
-    """Sample one independent HEBO+ GP hyperparameter draw.
-
-    Calls pfns4bo_upstream's own `hebo_prior.get_model` (unmodified upstream
-    code — pfns4bo_compat.py applies only load-time botorch-version
-    compatibility shims before import; see that module's docstring), which
-    internally builds a `ScaleKernel(MaternKernel(nu=1.5, ard_num_dims=k))`
-    with Gamma-distributed lengthscale/outputscale and LogNormal-distributed
-    noise, then calls gpytorch's `model.pyro_sample_from_prior()` to draw one
-    concrete realization.
-
-    x_unit: (T, k), already mapped to the unit hypercube — HEBO+'s prior is
-    calibrated for x in [0,1]^k (paper Appendix D), unlike this file's usual
-    ~N(0,1)-standardised features. Only used to fix the input shape/dtype for
-    `get_model`'s (unused) SingleTaskGP construction; the values themselves
-    don't affect which hyperparameters get sampled.
-
-    get_model registers its priors without a batch dimension, so calling it
-    once across many points still only produces ONE shared hyperparameter
-    draw for all of them (verified empirically) — call this once per episode
-    (T = one episode's train+test points) for an independent draw per
-    episode, matching how every other kernel in this file samples
-    independent per-episode hyperparameters.
-
-    Returns:
-        l      : (k,)  — ARD per-dimension lengthscale.
-        alpha2 : float — outputscale.
-        nugget : float — sampled Gaussian-likelihood noise; plays the same
-                 role as every other kernel's `nugget` (added to the K
-                 diagonal).
-    """
-    hebo_prior = get_hebo_prior_module()
-    T = x_unit.shape[0]
-    xb = x_unit.unsqueeze(0)
-    yb = torch.zeros(1, T, device=x_unit.device)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # botorch float32-precision notice
-        model, likelihood = hebo_prior.get_model(
-            xb, yb, HEBO_PLUS_HYPERPARAMETERS, sample=True
-        )
-    l = model.covar_module.base_kernel.lengthscale.detach().reshape(-1).clone()
-    alpha2 = model.covar_module.outputscale.detach().reshape(-1)[0].item()
-    nugget = likelihood.noise.detach().reshape(-1)[0].item()
-    return l, alpha2, nugget
 
 
 def _sample_kernel_cols(d_total: int, cfg) -> List[int]:
@@ -434,51 +554,6 @@ def _sample_kernel_cols(d_total: int, cfg) -> List[int]:
     d_max = min(d_max, d_total)
     k = random.randint(d_min, d_max)
     return sorted(random.sample(range(d_total), k))
-
-
-def _length_scale_range(cfg, k: int, P: int) -> tuple[float, float]:
-    """(l_min, l_max), optionally scaled by sqrt(k) and/or P-density — see _sample_length_scale."""
-    l_min = float(cfg.data.l_min)
-    l_max = float(cfg.data.l_max)
-    if getattr(cfg.data, "l_scale_by_sqrt_k", False):
-        scale = math.sqrt(max(k, 1))
-        l_min *= scale
-        l_max *= scale
-    if getattr(cfg.data, "l_scale_by_P", False):
-        P_ref = float(getattr(cfg.data, "l_P_ref", 32.0))
-        density_scale = (P_ref / max(P, 1)) ** (1.0 / max(k, 1))
-        l_min *= density_scale
-        l_max *= density_scale
-    return l_min, l_max
-
-
-def _sample_length_scale(cfg, k: int, P: int) -> float:
-    """Sample the GP length-scale l, honouring three optional cfg flags.
-
-    l_scale_by_sqrt_k: multiplies [l_min, l_max] by sqrt(k) before sampling.
-        Squared distance sum_{i=1}^k (x1_i - x2_i)^2 grows ~linearly with k
-        (active kernel dims), so without this correction, k=1 and k=4 tasks
-        sample from very different effective-correlation regimes even though
-        l is drawn from the same range — this is what produces a bimodal
-        (collapsed-to-0 vs. spread-out) mixture in R_star.
-    l_scale_by_P: multiplies [l_min, l_max] by (l_P_ref / P)^(1/k) before
-        sampling. Train/test points are drawn i.i.d. from the same fixed
-        domain, so larger P packs training points more densely — any test
-        point ends up with a training neighbour within one length-scale,
-        and GP conditioning shrinks R_star towards 0 regardless of the
-        kernel hyperparameters. Shrinking l with P keeps the *local*
-        neighbour count (and hence how much conditioning explains away)
-        roughly constant across the whole P range, so R_star stays
-        meaningful even at large, realistic P (e.g. 32-512).
-    l_log_uniform: samples l ~ LogUniform instead of Uniform. RBF correlation
-        decays as exp(-k / l^2), so a linear-uniform l barely visits the
-        high-correlation regime; log-uniform spreads mass evenly across
-        decades of l and gives a much more uniform R_star.
-    """
-    l_min, l_max = _length_scale_range(cfg, k, P)
-    if getattr(cfg.data, "l_log_uniform", False):
-        return math.exp(random.uniform(math.log(l_min), math.log(l_max)))
-    return random.uniform(l_min, l_max)
 
 
 def _resolve_kernel_name(cfg) -> str:
@@ -567,6 +642,7 @@ def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
 # ---------------------------------------------------------------------------
 
 
+@torch.no_grad()
 def generate_gp_task(cfg) -> Dict[str, Tensor]:
     """Sample one GP task and return a dict of tensors.
 
@@ -576,8 +652,9 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 
     cosine and periodic kernels are capped to k=1 (they are PSD only for scalar inputs).
 
-    A nugget ~ U[nugget_min, nugget_max] is added to the diagonal for guaranteed PSD
-    and controls posterior tightness (replaces the former separate noise parameter).
+    A nugget ~ LogNormal(...) (see _nugget_prior) is added to the diagonal for
+    guaranteed PSD and controls posterior tightness (replaces the former
+    separate noise parameter).
 
     If cfg.seed is set (same field train.py uses via `torch.manual_seed(cfg.seed)`),
     it seeds python/numpy/torch RNGs, making the kernel/hyperparameter choice
@@ -598,7 +675,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         n_test                : int              N (as 0-dim tensor)
         l                     : float            kernel length scale (scalar tensor)
         alpha2                : float            kernel variance / bias (scalar tensor)
-        nugget                : float            diagonal regulariser ~ U[nugget_min, nugget_max]
+        nugget                : float            diagonal regulariser (LogNormal-sampled)
         kernel                : str              name of the kernel used
         period                : float            period param (periodic kernel only, else 0.0)
         rq_alpha              : float            alpha param (rational_quadratic only, else 0.0)
@@ -610,85 +687,42 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 
     d = cfg.data.d_features
 
-    # 1. Choose kernel and active columns
-    kernel_name = _resolve_kernel_name(cfg)
-
+    # 1. Choose kernel and active columns.
     # cosine and periodic (and any composite containing one of them) are PSD
     # only for scalar (1D) inputs; cap to k=1
+    kernel_name = _resolve_kernel_name(cfg)
     if _kernel_needs_scalar_input(kernel_name):
         kernel_cols = [random.randint(0, d - 1)]
     else:
         kernel_cols = _sample_kernel_cols(d, cfg)
+    k = len(kernel_cols)
 
-    # 2. Sample dataset sizes (needed before l — see l_scale_by_P)
+    # 2. Sample dataset sizes
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
 
-    # 3. Sample shared GP hyperparameters.
-    # "hebo" defers l/alpha2/nugget sampling to step 6 below (after x_k is
-    # built) — pfns4bo_upstream's hebo_prior.get_model needs concrete input
-    # points to build its (unused) SingleTaskGP, unlike every other kernel's
-    # x-independent hyperparameter priors.
-    if kernel_name == "hebo":
-        l = alpha2 = nugget = None
+    # 3. Sample GP hyperparameters via gpytorch LogNormal/Gamma hyperpriors
+    # (see _kernel_prior_spec / _nugget_prior). Unlike the pre-gpytorch
+    # implementation, "hebo" no longer needs to defer sampling until x_k
+    # exists — its Gamma priors don't depend on the input points.
+    nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([1])).item()
+    if kernel_name == "dot_product":
+        kernel_obj = None
+        l = alpha2 = period = rq_alpha = torch.tensor(0.0)
+        l_b = alpha2_b = period_b = rq_alpha_b = torch.tensor(0.0)
     else:
-        l = _sample_length_scale(cfg, len(kernel_cols), P)
+        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, 1, "cpu")
+        l, alpha2, period, rq_alpha = (params[key][0] for key in ("l", "alpha2", "period", "rq_alpha"))
+        l_b, alpha2_b, period_b, rq_alpha_b = (
+            params[key][0] for key in ("l_b", "alpha2_b", "period_b", "rq_alpha_b")
+        )
+
+    def kernel_fn(X1: Tensor, X2: Tensor) -> Tensor:
         if kernel_name == "dot_product":
-            a2_min = float(0.0)
-            a2_max = float(0.0)
-        else:
-            a2_min = float(cfg.data.alpha2_min)
-            a2_max = float(cfg.data.alpha2_max)
-        alpha2 = random.uniform(a2_min, a2_max)
+            return dot_product_kernel(X1, X2)
+        return kernel_obj(X1.unsqueeze(0), X2.unsqueeze(0)).to_dense()[0]
 
-        # Nugget: single diagonal regulariser ~ U[nugget_min, nugget_max].
-        # Replaces the separate noise parameter (the two were always summed anyway).
-        nugget_min = float(getattr(cfg.data, "nugget_min", 0.1))
-        nugget_max = float(getattr(cfg.data, "nugget_max", 1.0))
-        nugget = random.uniform(nugget_min, nugget_max)
-
-    # 4. Extra hyperparameters for specific kernels
-    period: Optional[float] = None
-    rq_alpha: Optional[float] = None
-    l_b: Optional[float] = None
-    alpha2_b: Optional[float] = None
-    period_b: Optional[float] = None
-    rq_alpha_b: Optional[float] = None
-
-    composite = _parse_composite(kernel_name)
-    component_a = composite[0] if composite is not None else kernel_name
-    component_b = composite[2] if composite is not None else None
-
-    p_min = float(getattr(cfg.data, "period_min", 0.5))
-    p_max = float(getattr(cfg.data, "period_max", 3.0))
-    rq_min = float(getattr(cfg.data, "rq_alpha_min", 0.1))
-    rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
-
-    if component_a == "periodic":
-        period = random.uniform(p_min, p_max)
-    if component_a == "rational_quadratic":
-        rq_alpha = random.uniform(rq_min, rq_max)
-
-    if composite is not None:
-        # Component B: independent length-scale/variance draw, same ranges as A.
-        l_b = _sample_length_scale(cfg, len(kernel_cols), P)
-        alpha2_b = random.uniform(a2_min, a2_max)
-        if component_b == "periodic":
-            period_b = random.uniform(p_min, p_max)
-        if component_b == "rational_quadratic":
-            rq_alpha_b = random.uniform(rq_min, rq_max)
-
-    lsh_W: Optional[Tensor] = None
-    lsh_b: Optional[Tensor] = None
-    if kernel_name == "lsh_forest":
-        num_trees = int(getattr(cfg.data, "lsh_num_trees", 20))
-        depth = int(getattr(cfg.data, "lsh_depth", 4))
-        # One fixed hyperplane forest for the whole episode — K_ff/K_sf/K_ss
-        # (computed by three separate kernel_fn calls below) must agree on it.
-        lsh_W = torch.randn(len(kernel_cols), num_trees, depth)
-        lsh_b = torch.randn(num_trees, depth)
-
-    # 5. Sample features x ~ N(0, 1)^d, warp marginals (TabICLv2-style feature
+    # 4. Sample features x ~ N(0, 1)^d, warp marginals (TabICLv2-style feature
     # heterogeneity), normalise over all P+N instances
     x_raw = torch.randn(P + N, d)
     x_raw = tabiclv2_warp_features(x_raw)
@@ -697,35 +731,23 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     x_norm = (x_raw - mu_x) / std_x                    # full (P+N, d_features)
     x_k = x_norm[:, kernel_cols]                        # kernel sub-matrix (P+N, k)
 
-    # 6. Build kernel function and sample y ~ GP(0, K + nugget·I) jointly.
-    # "hebo": sample l/alpha2/nugget now that x_k exists (see step 3), via
-    # pfns4bo_upstream's own hebo_prior.get_model — feed it x_k mapped to the
-    # unit hypercube, since that's what its prior is calibrated for (paper
-    # Appendix D), unlike this file's usual ~N(0,1)-standardised x_k. Every
-    # other kernel is unaffected: x_k_kernel == x_k.
-    x_k_kernel = x_k
-    if kernel_name == "hebo":
-        x_k_kernel = torch.special.ndtr(x_k)
-        l, alpha2, nugget = _sample_hebo_hyperparameters(x_k_kernel)
+    # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k
+    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_k.
+    x_k_kernel = torch.special.ndtr(x_k) if kernel_name == "hebo" else x_k
 
-    kernel_fn = build_kernel_fn(
-        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, lsh_W=lsh_W, lsh_b=lsh_b,
-        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
-    )
+    # 5. Sample y ~ GP(0, K + nugget·I) jointly.
     K_all = kernel_fn(x_k_kernel, x_k_kernel) + nugget * torch.eye(P + N)
-
     y_all = _safe_cholesky(K_all, max_attempts=12) @ torch.randn(P + N)
 
-    # 7. Split into train / test (full features returned to model)
+    # 6. Split into train / test (full features returned to model)
     x_norm_train = x_norm[:P]
     y_train = y_all[:P]
     x_norm_test = x_norm[P:]
     y_test = y_all[P:]
 
-    # 8. Compute R_star at test points, from either the GP posterior or the
+    # 7. Compute R_star at test points, from either the GP posterior or the
     # GP prior, per cfg.data.oracle_mode (default "posterior" — unchanged
-    # behaviour). Uses x_k_kernel (== x_k for every kernel except "hebo",
-    # which needs its ndtr-mapped unit-hypercube representation — see step 6).
+    # behaviour).
     # posterior: Sigma_star = K_ss + nugget·I − K_st K_ff⁻¹ K_ts accounts for
     #   what the training context already explains — off-diagonal entries
     #   shrink relative to the prior, giving the oracle for residual
@@ -762,17 +784,17 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "n_train": torch.tensor(P),
         "n_test": torch.tensor(N),
         # scalar for every kernel except "hebo", where l is an ARD
-        # per-dimension lengthscale vector (k,) — see hebo_matern32_kernel.
+        # per-dimension lengthscale vector (k,) — see _build_scaled_kernel.
         "l": l if torch.is_tensor(l) else torch.tensor(l),
-        "alpha2": torch.tensor(alpha2),
+        "alpha2": torch.as_tensor(alpha2),
         "nugget": torch.tensor(nugget),
         "kernel": kernel_name,
-        "period": torch.tensor(period if period is not None else 0.0),
-        "rq_alpha": torch.tensor(rq_alpha if rq_alpha is not None else 0.0),
-        "l_b": torch.tensor(l_b if l_b is not None else 0.0),
-        "alpha2_b": torch.tensor(alpha2_b if alpha2_b is not None else 0.0),
-        "period_b": torch.tensor(period_b if period_b is not None else 0.0),
-        "rq_alpha_b": torch.tensor(rq_alpha_b if rq_alpha_b is not None else 0.0),
+        "period": torch.as_tensor(period),
+        "rq_alpha": torch.as_tensor(rq_alpha),
+        "l_b": torch.as_tensor(l_b),
+        "alpha2_b": torch.as_tensor(alpha2_b),
+        "period_b": torch.as_tensor(period_b),
+        "rq_alpha_b": torch.as_tensor(rq_alpha_b),
         "kernel_feature_indices": torch.tensor(kernel_cols, dtype=torch.long),
         # Ephemeral Cholesky factors — consumed by gp_analytical_pit, not saved to disk.
         "_L_ff": L_ff,    # (P, P) Cholesky of K_ff
@@ -804,97 +826,6 @@ def _batched_cholesky(K: Tensor) -> Tensor:
         # Last resort: replace with identity so the episode is invalid but non-crashing.
         L[failed] = eye.unsqueeze(0).expand_as(L[failed])
     return L
-
-
-def _batched_lsh_leaf_ids(x_k: Tensor, W: Tensor, b: Tensor) -> Tensor:
-    """Batched version of _lsh_leaf_ids.
-
-    x_k: (B, T, k), W: (B, k, num_trees, depth), b: (B, num_trees, depth)
-    -> (B, T, num_trees) int64 leaf id per (episode, point, tree).
-    """
-    depth = W.shape[-1]
-    bits = torch.einsum("btk,bksd->btsd", x_k, W) + b.unsqueeze(1) > 0  # (B, T, num_trees, depth)
-    weights = (2 ** torch.arange(depth, device=x_k.device)).to(torch.int64)
-    return (bits.long() * weights).sum(-1)  # (B, T, num_trees)
-
-
-def _batched_single_kernel_matrix(
-    kernel_name: str,
-    x_k: Tensor,                        # (B, T, k)
-    l: Tensor,                          # (B,)
-    alpha2: Tensor,                     # (B,)
-    period: Optional[Tensor] = None,    # (B,) — periodic kernel only
-    rq_alpha: Optional[Tensor] = None,  # (B,) — rational_quadratic only
-    lsh_W: Optional[Tensor] = None,     # (B, k, num_trees, depth) — lsh_forest only
-    lsh_b: Optional[Tensor] = None,     # (B, num_trees, depth) — lsh_forest only
-) -> Tensor:
-    """Build B matrices for one non-composite kernel (no nugget on the diagonal)."""
-    B, T, _ = x_k.shape
-    l3     = l.view(B, 1, 1)
-    alpha3 = alpha2.view(B, 1, 1)
-
-    if kernel_name == "dot_product":
-        return x_k @ x_k.permute(0, 2, 1)  # (B, T, T)
-
-    if kernel_name == "lsh_forest":
-        ids = _batched_lsh_leaf_ids(x_k, lsh_W, lsh_b)         # (B, T, num_trees)
-        matches = ids.unsqueeze(2) == ids.unsqueeze(1)          # (B, T, T, num_trees)
-        return alpha3 * matches.float().mean(dim=-1)
-
-    diff  = x_k.unsqueeze(2) - x_k.unsqueeze(1)  # (B, T, T, k)
-    sq    = (diff ** 2).sum(-1)                    # (B, T, T)
-    r     = sq.clamp(min=0.0).sqrt()
-
-    if kernel_name == "rbf":
-        return alpha3 * torch.exp(-sq / (2.0 * l3 ** 2))
-
-    if kernel_name == "matern32":
-        s = math.sqrt(3.0) * r / l3
-        return alpha3 * (1.0 + s) * torch.exp(-s)
-
-    if kernel_name == "cosine":
-        return alpha3 * torch.cos(2.0 * math.pi * r / l3)
-
-    if kernel_name == "periodic":
-        p3 = period.view(B, 1, 1)
-        return alpha3 * torch.exp(-2.0 * torch.sin(math.pi * r / p3) ** 2 / l3 ** 2)
-
-    if kernel_name == "rational_quadratic":
-        r3 = rq_alpha.view(B, 1, 1)
-        return alpha3 * (1.0 + sq / (2.0 * r3 * l3 ** 2)) ** (-r3)
-
-    raise ValueError(f"Unknown kernel '{kernel_name}' in _batched_single_kernel_matrix.")
-
-
-def _batched_kernel_matrix(
-    kernel_name: str,
-    x_k: Tensor,                        # (B, T, k)
-    l: Tensor,                          # (B,)
-    alpha2: Tensor,                     # (B,)
-    period: Optional[Tensor] = None,    # (B,) — periodic kernel/component only
-    rq_alpha: Optional[Tensor] = None,  # (B,) — rational_quadratic kernel/component only
-    lsh_W: Optional[Tensor] = None,     # (B, k, num_trees, depth) — lsh_forest only
-    lsh_b: Optional[Tensor] = None,     # (B, num_trees, depth) — lsh_forest only
-    l_b: Optional[Tensor] = None,       # (B,) — composite kernels only, component B
-    alpha2_b: Optional[Tensor] = None,  # (B,) — composite kernels only, component B
-    period_b: Optional[Tensor] = None,  # (B,) — composite kernels only, component B
-    rq_alpha_b: Optional[Tensor] = None,  # (B,) — composite kernels only, component B
-) -> Tensor:
-    """Build B kernel matrices for T points in one vectorised call.
-
-    Returns (B, T, T) WITHOUT nugget on the diagonal.
-    The caller is responsible for adding nugget * I.
-    """
-    composite = _parse_composite(kernel_name)
-    if composite is None:
-        return _batched_single_kernel_matrix(
-            kernel_name, x_k, l, alpha2, period=period, rq_alpha=rq_alpha, lsh_W=lsh_W, lsh_b=lsh_b
-        )
-
-    name_a, op, name_b = composite
-    K_a = _batched_single_kernel_matrix(name_a, x_k, l, alpha2, period=period, rq_alpha=rq_alpha)
-    K_b = _batched_single_kernel_matrix(name_b, x_k, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b)
-    return K_a + K_b if op == "+" else K_a * K_b
 
 
 def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
@@ -963,13 +894,17 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
     return warped_x
 
 
+@torch.no_grad()
 def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor]]:
     """Generate B GP episodes in a single vectorised call.
 
     All B episodes share one kernel type and one (P, N) size (both sampled
-    once per call) but have independent hyperparameters and feature draws.
-    This removes the Python-loop overhead of B separate generate_gp_task calls
-    and enables GPU or CPU-SIMD acceleration for the linear-algebra steps.
+    once per call) but have independent hyperparameters and feature draws —
+    gpytorch's `batch_shape=[B]` kernels draw B independent hyperparameter
+    sets in one call (see _sample_episode_kernel), and evaluate all B Gram
+    matrices in one vectorised call to the kernel object. This removes the
+    Python-loop overhead of B separate generate_gp_task calls and enables GPU
+    or CPU-SIMD acceleration for the linear-algebra steps.
 
     The returned dicts have the same schema as the episodes saved by
     generate_pit_dataset.py (no kernel metadata).
@@ -994,9 +929,7 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     if seed is not None:
         _seed_everything(seed)
 
-    d          = cfg.data.d_features
-    nugget_min = float(getattr(cfg.data, "nugget_min", 0.1))
-    nugget_max = float(getattr(cfg.data, "nugget_max", 1.0))
+    d = cfg.data.d_features
 
     # --- Shared settings for this batch ---
     kernel_name = _resolve_kernel_name(cfg)
@@ -1004,14 +937,10 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
 
-    composite = _parse_composite(kernel_name)
-    component_a = composite[0] if composite is not None else kernel_name
-    component_b = composite[2] if composite is not None else None
-
     if _kernel_needs_scalar_input(kernel_name):
         k = 1
-    elif kernel_name in ("dot_product", "lsh_forest"):
-        # Every hyperplane split can draw on all d columns (no lengthscale to
+    elif kernel_name == "dot_product":
+        # Every dot product can draw on all d columns (no lengthscale to
         # dilute with irrelevant dims, unlike rbf/matern32/rational_quadratic).
         k = d
     else:
@@ -1020,66 +949,20 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
             min(int(getattr(cfg.data, "d_kernel_max", 4)), d),
         )
 
-    # --- Per-episode hyperparameters ---
-    # "hebo" samples l/alpha2/nugget per-episode further down (after x_k is
-    # built), via pfns4bo_upstream's own hebo_prior.get_model — see the
-    # "Build K_all" block below.
-    if kernel_name == "hebo":
-        l = alpha2 = nugget = None
+    # --- Per-episode hyperparameters (B independent draws in one call) ---
+    nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([B])).to(device)
+    if kernel_name == "dot_product":
+        kernel_obj = None
+        params = {
+            key: torch.zeros(B, device=device)
+            for key in ("l", "alpha2", "period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b")
+        }
     else:
-        l_min, l_max = _length_scale_range(cfg, k, P)
-        if getattr(cfg.data, "l_log_uniform", False):
-            l = torch.exp(
-                torch.rand(B, device=device) * (math.log(l_max) - math.log(l_min)) + math.log(l_min)
-            )
-        else:
-            l = torch.rand(B, device=device) * (l_max - l_min) + l_min
-        nugget = torch.rand(B, device=device) * (nugget_max           - nugget_min)           + nugget_min
-        alpha2 = (
-            torch.zeros(B, device=device)
-            if kernel_name == "dot_product"
-            else torch.rand(B, device=device) * (cfg.data.alpha2_max - cfg.data.alpha2_min) + cfg.data.alpha2_min
-        )
-
-    p_min  = float(getattr(cfg.data, "period_min",   0.5))
-    p_max  = float(getattr(cfg.data, "period_max",   3.0))
-    rq_min = float(getattr(cfg.data, "rq_alpha_min", 0.1))
-    rq_max = float(getattr(cfg.data, "rq_alpha_max", 5.0))
-
-    period = rq_alpha = None
-    if component_a == "periodic":
-        period = torch.rand(B, device=device) * (p_max - p_min) + p_min
-    if component_a == "rational_quadratic":
-        rq_alpha = torch.rand(B, device=device) * (rq_max - rq_min) + rq_min
-
-    # --- Component B (composite kernels only): independent hyperparameters,
-    # same ranges as component A.
-    l_b = alpha2_b = period_b = rq_alpha_b = None
-    if composite is not None:
-        if getattr(cfg.data, "l_log_uniform", False):
-            l_b = torch.exp(
-                torch.rand(B, device=device) * (math.log(l_max) - math.log(l_min)) + math.log(l_min)
-            )
-        else:
-            l_b = torch.rand(B, device=device) * (l_max - l_min) + l_min
-        alpha2_b = torch.rand(B, device=device) * (cfg.data.alpha2_max - cfg.data.alpha2_min) + cfg.data.alpha2_min
-        if component_b == "periodic":
-            period_b = torch.rand(B, device=device) * (p_max - p_min) + p_min
-        if component_b == "rational_quadratic":
-            rq_alpha_b = torch.rand(B, device=device) * (rq_max - rq_min) + rq_min
-
-    lsh_W = lsh_b = None
-    if kernel_name == "lsh_forest":
-        num_trees = int(getattr(cfg.data, "lsh_num_trees", 20))
-        depth = int(getattr(cfg.data, "lsh_depth", 4))
-        # One fixed hyperplane forest per episode, shared by every submatrix
-        # of K_all — see lsh_forest_kernel's docstring for why this matters.
-        lsh_W = torch.randn(B, k, num_trees, depth, device=device)
-        lsh_b = torch.randn(B, num_trees, depth, device=device)
+        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device)
 
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
-    x_raw  = torch.randn(B, T, d, device=device)
-    x_raw  = tabiclv2_warp_features(x_raw)
+    x_raw = torch.randn(B, T, d, device=device)
+    x_raw = tabiclv2_warp_features(x_raw)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
     # --- Select kernel columns ---
@@ -1093,26 +976,15 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         col_idx = torch.rand(B, d, device=device).argsort(dim=1)[:, :k]           # (B, k)
         x_k = x_norm.gather(2, col_idx.unsqueeze(1).expand(B, T, k))              # (B, T, k)
 
+    # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k
+    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_k.
+    x_k_kernel = torch.special.ndtr(x_k) if kernel_name == "hebo" else x_k
+
     # --- Build K_all (B, T, T) and sample y jointly ---
-    if kernel_name == "hebo":
-        # pfns4bo_upstream's hebo_prior.get_model samples one hyperparameter
-        # draw per call (its registered priors carry no batch dimension —
-        # verified empirically), so unlike every other kernel here this
-        # loops once per episode instead of one vectorised call, to give
-        # every episode an independent HEBO+ draw.
-        x_k_unit = torch.special.ndtr(x_k)  # HEBO+ prior assumes x in [0,1]^k (paper App. D)
-        K_parts, nugget_parts = [], []
-        for b in range(B):
-            l_b_, alpha2_b_, nugget_b_ = _sample_hebo_hyperparameters(x_k_unit[b])
-            K_parts.append(hebo_matern32_kernel(x_k_unit[b], x_k_unit[b], l=l_b_, alpha2=alpha2_b_))
-            nugget_parts.append(nugget_b_)
-        K_all = torch.stack(K_parts).to(device)
-        nugget = torch.tensor(nugget_parts, device=device)
+    if kernel_name == "dot_product":
+        K_all = x_k_kernel @ x_k_kernel.permute(0, 2, 1)
     else:
-        K_all = _batched_kernel_matrix(
-            kernel_name, x_k, l, alpha2, period, rq_alpha, lsh_W, lsh_b,
-            l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
-        )
+        K_all = kernel_obj(x_k_kernel).to_dense()
     K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
     K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
 

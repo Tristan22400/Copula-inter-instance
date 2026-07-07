@@ -122,9 +122,9 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     """Every registered kernel must produce a valid, non-trivial R_star.
 
     One shared test parametrized over every entry in data_gen.ALL_KERNELS,
-    rather than a bespoke test per kernel, so newly registered kernels (e.g.
-    lsh_forest) are automatically held to the same PSD + Goldilocks bar as
-    the existing ones without needing a new test written by hand.
+    rather than a bespoke test per kernel, so newly registered kernels are
+    automatically held to the same PSD + Goldilocks bar as the existing
+    ones without needing a new test written by hand.
     """
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
