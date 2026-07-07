@@ -27,7 +27,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.io import netcdf_file
-from scipy.spatial.distance import pdist, squareform
 from scipy.stats import multivariate_normal, norm
 from sklearn.gaussian_process.kernels import Matern
 
@@ -393,6 +392,28 @@ def plot_spatial_map_comparison(data, day, context_idx, C):
 # ---------------------------------------------------------------------------
 # Plot 2: Correlation vs. distance (implicit variogram)
 # ---------------------------------------------------------------------------
+EARTH_RADIUS_KM = 6371.0
+
+
+def haversine_distance_km(coords):
+    """
+    Great-circle distance (km) between every pair of (lon, lat) points in
+    `coords` (degrees). `coords` here -- and everywhere else in this script --
+    is plain Euclidean (lon, lat) in degrees, which is what the Matern kernel
+    mock (`Copula_TFM`) and the real model both actually condition on; this
+    haversine version is only for turning that into a physically meaningful
+    x-axis (km) on the correlation-vs-distance plot.
+    """
+    lon_rad, lat_rad = np.radians(coords[:, 0]), np.radians(coords[:, 1])
+    dlat = lat_rad[:, None] - lat_rad[None, :]
+    dlon = lon_rad[:, None] - lon_rad[None, :]
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(lat_rad[:, None]) * np.cos(lat_rad[None, :]) * np.sin(dlon / 2) ** 2
+    )
+    return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
 def plot_correlation_vs_distance(data, C):
     lat, lon = data["latitude"], data["longitude"]
     lon_grid, lat_grid = np.meshgrid(lon, lat)
@@ -400,7 +421,7 @@ def plot_correlation_vs_distance(data, C):
 
     iu = np.triu_indices_from(C, k=1)
     corr = C[iu]
-    dist = squareform(pdist(coords))[iu]
+    dist = haversine_distance_km(coords)[iu]
 
     n_pairs = len(dist)
     max_scatter_points = 4000
@@ -420,7 +441,7 @@ def plot_correlation_vs_distance(data, C):
     fig, ax = plt.subplots(figsize=(6, 4.5))
     ax.scatter(dist_plot, corr_plot, s=4, alpha=0.15, color="steelblue", label="Predicted pairs")
     ax.plot(dist_avg, moving_avg, color="crimson", linewidth=2, label="Moving average")
-    ax.set_xlabel("Spatial distance")
+    ax.set_xlabel("Spatial distance (km)")
     ax.set_ylabel(r"Predicted correlation $\rho_{ij}$")
     ax.legend()
     plt.tight_layout()
