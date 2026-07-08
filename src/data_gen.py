@@ -484,10 +484,12 @@ _COMPOSABLE_KERNELS: List[str] = ["rbf", "matern32", "cosine", "periodic", "rati
 # that include one of these must also cap the active kernel dimensionality
 # to k=1 (see generate_gp_task / generate_gp_batch). Verified empirically:
 # CosineKernel used isotropically is not PSD for k>=2 (Bochner/Schoenberg —
-# an isotropic cos(||x||) is not a valid Mercer kernel for d>1); periodic is
-# conservatively capped the same way for behavioural parity even though
-# gpytorch's ARD PeriodicKernel is independently PSD for k>1.
-_SCALAR_ONLY_KERNELS = {"cosine", "periodic"}
+# an isotropic cos(||x||) is not a valid Mercer kernel for d>1). "periodic" is
+# NOT in this set: gpytorch.kernels.PeriodicKernel sums per-dimension sin²
+# terms inside a single exp() (a product of per-dimension periodic kernels),
+# which is PSD for any k — with or without ard_num_dims (non-ARD just ties
+# the lengthscale/period across dims instead of fitting one per dimension).
+_SCALAR_ONLY_KERNELS = {"cosine"}
 
 
 def _parse_composite(name: str) -> Optional[tuple]:
@@ -652,7 +654,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     d_kernel_max]); the full d_features columns are returned so the model must
     identify which features drive the correlations.
 
-    cosine and periodic kernels are capped to k=1 (they are PSD only for scalar inputs).
+    cosine is capped to k=1 (its PSD guarantee only holds for scalar inputs;
+    see _SCALAR_ONLY_KERNELS).
 
     A nugget ~ LogNormal(...) (see _nugget_prior) is added to the diagonal for
     guaranteed PSD and controls posterior tightness (replaces the former
@@ -690,8 +693,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     d = cfg.data.d_features
 
     # 1. Choose kernel and active columns.
-    # cosine and periodic (and any composite containing one of them) are PSD
-    # only for scalar (1D) inputs; cap to k=1
+    # cosine (and any composite containing it) is PSD only for scalar (1D)
+    # inputs; cap to k=1 — see _SCALAR_ONLY_KERNELS.
     kernel_name = _resolve_kernel_name(cfg)
     if _kernel_needs_scalar_input(kernel_name):
         kernel_cols = [random.randint(0, d - 1)]
