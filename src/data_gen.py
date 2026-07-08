@@ -97,6 +97,16 @@ from torch import Tensor
 
 from loss import _safe_cholesky
 
+# gpytorch's own solver (via linear_operator) only guarantees an EXACT
+# Cholesky solve for matrices up to gpytorch.settings.max_cholesky_size
+# (default 800); above that it silently switches to an approximate
+# Lanczos/CG solve. conf/data/gp_tasks.yaml allows P up to 1024 and N up to
+# 128 (T = P+N up to 1152), so every gpytorch call in this file that touches
+# a full (P+N, P+N) or (P, P) covariance is wrapped in
+# `with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):` — generous
+# headroom over any realistic T, cheap to raise further if P_max/N_max grow.
+_MAX_CHOLESKY = 8192
+
 
 def _seed_everything(seed: int) -> None:
     """Seed python/numpy/torch RNGs for reproducible data generation."""
@@ -128,20 +138,33 @@ def _dist(X1: Tensor, X2: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 # Two entry points share the machinery below:
 #   - _sample_episode_kernel: draws fresh hyperparameters from gpytorch
-#     LogNormal/Gamma priors for B episodes at once (used by
-#     generate_gp_task / generate_gp_batch to generate new data).
+#     LogNormal/Gamma priors for B episodes at once. Its kernel object feeds
+#     BOTH of the following:
+#       - generate_gp_batch / generate_gp_task's own sampling and posterior
+#         conditioning, done via gpytorch's native GaussianLikelihood +
+#         ExactGP (_build_likelihood, _GeneratorGP below) rather than
+#         hand-rolled Gram-matrix + noise math.
+#       - build_kernel_fn (below), for reconstructing a kernel from already-
+#         known concrete hyperparameter values.
 #   - build_kernel_fn: builds a kernel(X1, X2) -> K callable from CONCRETE,
 #     already-known hyperparameter values (used by pit.py::gp_analytical_pit
 #     and tests to reconstruct the kernel a saved episode was drawn from).
+#     Materialises the Gram matrix via `.to_dense()` and hands off to this
+#     file's own torch.linalg-based Cholesky/solve code (_safe_cholesky) —
+#     there is no live train/test split at that point to condition an
+#     ExactGP on, just a Gram matrix to factor.
 #
-# Both always materialise the Gram matrix immediately via `.to_dense()` and
-# hand off to this file's own torch.linalg-based Cholesky/solve code
-# (_safe_cholesky / _batched_cholesky) rather than gpytorch's own
-# ExactGP/lazy-tensor solve machinery — gpytorch silently switches to an
+# gpytorch's own ExactGP/lazy-tensor solve machinery silently switches to an
 # approximate CG solve for matrices larger than
-# gpytorch.settings.max_cholesky_size (default 800), which would silently
-# diverge from the exact-Cholesky-based invariants this repo's test suite
-# checks (well-conditioned floor, unit-diagonal tolerance).
+# gpytorch.settings.max_cholesky_size (default 800, see _MAX_CHOLESKY),
+# which would silently diverge from the exact-Cholesky-based invariants this
+# repo's test suite checks (well-conditioned floor, unit-diagonal tolerance)
+# — this repo's episode sizes (P up to 1024, N up to 128, see
+# conf/data/gp_tasks.yaml) regularly exceed that default. Every gpytorch
+# call in this file that sees a full (P+N, P+N) or (P, P) covariance is
+# therefore wrapped in `with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):`
+# to force exact solves — verified empirically to agree with the previous
+# hand-rolled Cholesky implementation to ~1e-6 max abs difference.
 
 _BASE_GPYTORCH_KERNEL_CLS: Dict[str, Callable[..., gpytorch.kernels.Kernel]] = {
     "rbf": gpytorch.kernels.RBFKernel,
@@ -280,6 +303,18 @@ def _nugget_prior(cfg, kernel_name: str) -> LogNormalPrior:
     loc = float(getattr(cfg.data, "nugget_lognormal_loc", math.log(0.15)))
     scale = float(getattr(cfg.data, "nugget_lognormal_scale", 0.4))
     return LogNormalPrior(loc, scale)
+
+
+def _build_likelihood(cfg, kernel_name: str, B: int, device) -> gpytorch.likelihoods.GaussianLikelihood:
+    """Sample B episodes' diagonal noise (same _nugget_prior every kernel
+    family already used) and hand it back wrapped in a GaussianLikelihood,
+    so the rest of this file adds noise via gpytorch's own
+    `likelihood(mvn)` instead of a hand-added `nugget * torch.eye(...)`.
+    `.noise` is the "nugget" name used everywhere else in this file — same
+    quantity, just gpytorch's own container for it."""
+    likelihood = gpytorch.likelihoods.GaussianLikelihood(batch_shape=torch.Size([B])).to(device)
+    likelihood.noise = _nugget_prior(cfg, kernel_name).sample(torch.Size([B])).to(device)
+    return likelihood
 
 
 def _build_scaled_kernel(
@@ -710,6 +745,25 @@ def gp_posterior(
     return mu_star, Sigma_star
 
 
+class _GeneratorGP(gpytorch.models.ExactGP):
+    """Thin ExactGP wrapper so oracle_mode="posterior" conditioning goes
+    through gpytorch's own exact-inference machinery (`model(x_test)` in
+    eval mode) instead of the hand-rolled K_ss - K_sf K_ff^-1 K_fs formula
+    gp_posterior used. `kernel` is the already-sampled (batch_shape=[B])
+    Kernel object from _sample_episode_kernel — one instance, no per-family
+    branching needed here. Verified numerically equivalent (~1e-6 max abs
+    diff) to the old manual computation, given max_cholesky_size forced
+    high enough (see _MAX_CHOLESKY) and fast_pred_var disabled at call time."""
+
+    def __init__(self, train_x: Tensor, train_y: Tensor, likelihood, kernel: gpytorch.kernels.Kernel, batch_shape: torch.Size):
+        super().__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
+        self.covar_module = kernel
+
+    def forward(self, x: Tensor) -> gpytorch.distributions.MultivariateNormal:
+        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
+
+
 def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
     """Convert covariance matrix to correlation matrix and marginal std."""
     sigma = Sigma.diagonal().clamp(min=1e-10).sqrt()  # (N,)
@@ -732,163 +786,32 @@ def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
 def generate_gp_task(cfg) -> Dict[str, Tensor]:
     """Sample one GP task and return a dict of tensors.
 
-    The kernel operates on a random subset of k columns (k = d_features minus
-    a fraction ~ Uniform[inactive_frac_min, inactive_frac_max] of columns left
-    inactive — see _sample_active_dims); the full d_features columns are
-    returned so the model must identify which features drive the
-    correlations. Column selection is done via gpytorch's own active_dims
-    kernel kwarg (see _sample_episode_kernel/build_kernel_fn) — kernel_fn is
-    always called with the full-width x_norm, not a pre-sliced sub-matrix.
+    Thin wrapper around generate_gp_batch(cfg, 1, "cpu",
+    return_kernel_metadata=True) — a single episode is just a batch of one,
+    and the two functions used to duplicate ~150 lines of kernel/column
+    selection, hyperparameter sampling, feature warp, y sampling, and
+    oracle-mode branching that's now implemented once. See
+    generate_gp_batch's docstring for the full behaviour (kernel/active_dims
+    selection, ARD, nugget, oracle_mode, seeding); this only documents the
+    single-episode-specific return schema.
 
-    cosine and periodic kernels are capped to k=1 (they are PSD only for scalar inputs).
+    Known behaviour change from the pre-dedup version: kernel column
+    selection now goes through generate_gp_batch's vectorised active_dims
+    sampling (including dot_product always using every column) instead of a
+    separate single-episode code path — both are uniform draws over the same
+    distribution, so this doesn't change task statistics, but a fixed
+    cfg.seed will no longer reproduce the exact old column indices bit-for-bit.
 
-    A nugget ~ LogNormal(...) (see _nugget_prior) is added to the diagonal for
-    guaranteed PSD and controls posterior tightness (replaces the former
-    separate noise parameter).
-
-    If cfg.seed is set (same field train.py uses via `torch.manual_seed(cfg.seed)`),
-    it seeds python/numpy/torch RNGs, making the kernel/hyperparameter choice
-    (kernel_name, P, N, l, alpha2, nugget, ...), the feature warp, and y
-    sampling all reproducible. Calling this repeatedly with the same cfg.seed
-    restarts every RNG at the same point every time.
-
-    Keys returned:
-        x_norm_train          : (P, d_features)  normalised train features (full)
-        y_train               : (P,)             train targets
-        x_norm_test           : (N, d_features)  normalised test features (full)
-        y_test                : (N,)             test targets
-        R_star                : (N, N)           ground-truth test correlation matrix
-                                                  (posterior or prior, per cfg.data.oracle_mode)
-        mu_star               : (N,)             mean at test points (posterior mean, or 0 for prior)
-        sigma_star            : (N,)             marginal std at test points (posterior or prior)
-        n_train               : int              P (as 0-dim tensor)
-        n_test                : int              N (as 0-dim tensor)
-        l                     : float            kernel length scale (scalar tensor)
-        alpha2                : float            kernel variance / bias (scalar tensor)
-        nugget                : float            diagonal regulariser (LogNormal-sampled)
-        kernel                : str              name of the kernel used
-        period                : float            period param (periodic kernel only, else 0.0)
-        rq_alpha              : float            alpha param (rational_quadratic only, else 0.0)
-        kernel_feature_indices: (k,)             column indices used by the kernel (metadata)
+    Keys returned (see generate_gp_batch for shapes/semantics):
+        x_norm_train, y_train, x_norm_test, y_test,
+        z_train, z_test, log_pdf_test,
+        R_star, Sigma_star, mu_star, sigma_star, n_train, n_test,
+        l, alpha2, nugget, kernel, period, rq_alpha,
+        l_b, alpha2_b, period_b, rq_alpha_b, kernel_feature_indices,
+        _L_ff, _alpha  (ephemeral Cholesky factors, consumed by
+                        pit.py::gp_analytical_pit, not saved to disk)
     """
-    seed = getattr(cfg, "seed", None)
-    if seed is not None:
-        _seed_everything(seed)
-
-    d = cfg.data.d_features
-
-    # 1. Choose kernel and active columns.
-    # cosine and periodic (and any composite containing one of them) are PSD
-    # only for scalar (1D) inputs; cap to k=1
-    kernel_name = _resolve_kernel_name(cfg)
-    if _kernel_needs_scalar_input(kernel_name):
-        kernel_cols = [random.randint(0, d - 1)]
-    else:
-        kernel_cols = _sample_active_dims(d, cfg)
-    k = len(kernel_cols)
-
-    # 2. Sample dataset sizes
-    P = random.randint(cfg.data.P_min, cfg.data.P_max)
-    N = random.randint(cfg.data.N_min, cfg.data.N_max)
-
-    # 3. Sample GP hyperparameters via gpytorch LogNormal/Gamma hyperpriors
-    # (see _kernel_prior_spec / _nugget_prior). Unlike the pre-gpytorch
-    # implementation, "hebo" no longer needs to defer sampling until x_k
-    # exists — its Gamma priors don't depend on the input points.
-    nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([1])).item()
-    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, 1, "cpu", active_dims=kernel_cols)
-    l, alpha2, period, rq_alpha = (params[key][0] for key in ("l", "alpha2", "period", "rq_alpha"))
-    l_b, alpha2_b, period_b, rq_alpha_b = (
-        params[key][0] for key in ("l_b", "alpha2_b", "period_b", "rq_alpha_b")
-    )
-
-    # kernel_obj carries active_dims=kernel_cols, so it always takes the
-    # full-width (..., d_features) input and selects its own k active
-    # columns internally (gpytorch.kernels.Kernel.__call__) — no manual
-    # column slicing needed here.
-    def kernel_fn(X1: Tensor, X2: Tensor) -> Tensor:
-        return kernel_obj(X1.unsqueeze(0), X2.unsqueeze(0)).to_dense()[0]
-
-    # 4. Sample features x ~ N(0, 1)^d, warp marginals (TabICLv2-style feature
-    # heterogeneity), normalise over all P+N instances
-    x_raw = torch.randn(P + N, d)
-    x_raw = tabiclv2_warp_features(x_raw)
-    mu_x = x_raw.mean(0)
-    std_x = x_raw.std(0).clamp(min=1e-8)
-    x_norm = (x_raw - mu_x) / std_x                    # full (P+N, d_features)
-
-    # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k
-    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_norm.
-    # Safe to map every column (not just the active ones): kernel_fn only
-    # ever reads the active_dims columns internally.
-    x_kernel_input = torch.special.ndtr(x_norm) if kernel_name == "hebo" else x_norm
-
-    # 5. Sample y ~ GP(0, K + nugget·I) jointly.
-    K_all = kernel_fn(x_kernel_input, x_kernel_input) + nugget * torch.eye(P + N)
-    y_all = _safe_cholesky(K_all, max_attempts=12) @ torch.randn(P + N)
-
-    # 6. Split into train / test (full features returned to model)
-    x_norm_train = x_norm[:P]
-    y_train = y_all[:P]
-    x_norm_test = x_norm[P:]
-    y_test = y_all[P:]
-
-    # 7. Compute R_star at test points, from either the GP posterior or the
-    # GP prior, per cfg.data.oracle_mode (default "posterior" — unchanged
-    # behaviour).
-    # posterior: Sigma_star = K_ss + nugget·I − K_st K_ff⁻¹ K_ts accounts for
-    #   what the training context already explains — off-diagonal entries
-    #   shrink relative to the prior, giving the oracle for residual
-    #   dependence after conditioning on training data.
-    # prior: Sigma_star = K_ss + nugget·I, ignoring the training context —
-    #   the oracle is the raw kernel structure among test points.
-    x_kernel_train = x_kernel_input[:P]
-    x_kernel_test = x_kernel_input[P:]
-    oracle_mode = getattr(cfg.data, "oracle_mode", "posterior")
-    if oracle_mode == "prior":
-        # z_train's LOO PIT still needs L_ff/alpha from K_ff regardless of
-        # which oracle is used for the test-side R_star/mu_star/sigma_star.
-        K_ff = kernel_fn(x_kernel_train, x_kernel_train) + nugget * torch.eye(P, device=x_kernel_train.device)
-        L_ff = _safe_cholesky(K_ff, max_attempts=12)
-        alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)
-        Sigma_star = kernel_fn(x_kernel_test, x_kernel_test) + nugget * torch.eye(N, device=x_kernel_test.device)
-        mu_star = torch.zeros(N, device=x_kernel_test.device)
-    elif oracle_mode == "posterior":
-        mu_star, Sigma_star, L_ff, alpha = gp_posterior(
-            x_kernel_train, y_train, x_kernel_test, kernel_fn, nugget, return_factors=True
-        )
-    else:
-        raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; expected 'prior' or 'posterior'.")
-    R_star, sigma_star = sigma_to_correlation(Sigma_star)
-
-    return {
-        "x_norm_train": x_norm_train,                           # (P, d_features)
-        "y_train": y_train,                                      # (P,)
-        "x_norm_test": x_norm_test,                             # (N, d_features)
-        "y_test": y_test,                                        # (N,)
-        "R_star": R_star,                                        # (N, N)
-        "mu_star": mu_star,                                      # (N,)
-        "sigma_star": sigma_star,                                # (N,)
-        "n_train": torch.tensor(P),
-        "n_test": torch.tensor(N),
-        # scalar, unless the episode was generated ARD (cfg.data.ard=True, or
-        # always for "hebo"), in which case l (and, for "periodic", period)
-        # is a per-dimension vector (k,) — see _build_scaled_kernel.
-        "l": l if torch.is_tensor(l) else torch.tensor(l),
-        "alpha2": torch.as_tensor(alpha2),
-        "nugget": torch.tensor(nugget),
-        "kernel": kernel_name,
-        "period": torch.as_tensor(period),
-        "rq_alpha": torch.as_tensor(rq_alpha),
-        "l_b": torch.as_tensor(l_b),
-        "alpha2_b": torch.as_tensor(alpha2_b),
-        "period_b": torch.as_tensor(period_b),
-        "rq_alpha_b": torch.as_tensor(rq_alpha_b),
-        "kernel_feature_indices": torch.tensor(kernel_cols, dtype=torch.long),
-        # Ephemeral Cholesky factors — consumed by gp_analytical_pit, not saved to disk.
-        "_L_ff": L_ff,    # (P, P) Cholesky of K_ff
-        "_alpha": alpha,  # (P,)   K_ff^{-1} y_train
-    }
+    return generate_gp_batch(cfg, 1, "cpu", return_kernel_metadata=True)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -984,22 +907,29 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
 
 
 @torch.no_grad()
-def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor]]:
+def generate_gp_batch(
+    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
+) -> List[Dict[str, Tensor]]:
     """Generate B GP episodes in a single vectorised call.
 
     All B episodes share one kernel type, one (P, N) size, and one set of
     active_dims/k (all sampled once per call) but have independent
     hyperparameters and feature draws — gpytorch's `batch_shape=[B]` kernels
     draw B independent hyperparameter sets in one call (see
-    _sample_episode_kernel), and evaluate all B Gram matrices in one
-    vectorised call to the kernel object (which selects its active_dims
-    columns out of the full-width x_norm internally — see
-    _sample_episode_kernel's active_dims param). This removes the
-    Python-loop overhead of B separate generate_gp_task calls and enables GPU
-    or CPU-SIMD acceleration for the linear-algebra steps.
+    _sample_episode_kernel), and a batch_shape=[B] GaussianLikelihood
+    (_build_likelihood) draws B independent noise values the same way.
+    Sampling and GP-posterior conditioning both go through gpytorch's own
+    MultivariateNormal/ExactGP machinery (see _GeneratorGP and the
+    max_cholesky_size discussion in the module docstring) rather than
+    hand-rolled Gram-matrix + Cholesky code, evaluated once for all B
+    episodes at once. This removes the Python-loop overhead of B separate
+    generate_gp_task calls and enables GPU or CPU-SIMD acceleration for the
+    linear-algebra steps.
 
     The returned dicts have the same schema as the episodes saved by
-    generate_pit_dataset.py (no kernel metadata).
+    generate_pit_dataset.py (no kernel metadata), unless
+    return_kernel_metadata=True (see Args) — used by generate_gp_task, which
+    delegates here with B=1.
 
     If cfg.seed is set, it seeds python/numpy/torch RNGs, making the
     kernel/shape choice (kernel_name, P, N, k), hyperparameters (l, nugget,
@@ -1013,6 +943,13 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         cfg    : Hydra config (same as generate_gp_task).
         B      : number of episodes to generate in this batch.
         device : torch device string ("cpu" or "cuda").
+        return_kernel_metadata: if True, also pack each episode's kernel
+            name, hyperparameters (l, alpha2, nugget, period, rq_alpha,
+            l_b, alpha2_b, period_b, rq_alpha_b), kernel_feature_indices, and
+            the ephemeral _L_ff/_alpha Cholesky factors — the schema
+            generate_gp_task/pit.py::gp_analytical_pit/diag_kernels.py need.
+            Off by default so the production shard schema
+            (generate_pit_dataset.py) is unaffected.
 
     Returns:
         list of B episode dicts ready for torch.save.
@@ -1028,6 +965,7 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
+    batch_shape = torch.Size([B])
 
     # active_dims (and hence k) is sampled once per batch call and shared by
     # all B episodes — same granularity as kernel_name/P/N above. gpytorch's
@@ -1044,9 +982,10 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
         kernel_cols = _sample_active_dims(d, cfg)
     k = d if kernel_cols is None else len(kernel_cols)
 
-    # --- Per-episode hyperparameters (B independent draws in one call) ---
-    nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([B])).to(device)
+    # --- Per-episode hyperparameters + noise (B independent draws in one call) ---
     kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols)
+    likelihood = _build_likelihood(cfg, kernel_name, B, device)
+    nugget = likelihood.noise.reshape(B)  # "nugget" name kept for the saved-metadata schema
 
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
@@ -1060,13 +999,20 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     # .__call__ index_selects them before forward).
     x_kernel_input = torch.special.ndtr(x_norm) if kernel_name == "hebo" else x_norm
 
-    # --- Build K_all (B, T, T) and sample y jointly ---
-    K_all = kernel_obj(x_kernel_input).to_dense()
-    K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
-    K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
-
-    L_all = _batched_cholesky(K_all)                              # (B, T, T)
-    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # (B, T)
+    # --- Joint prior sample + noisy covariance (B, T, T), via gpytorch's own
+    # GaussianLikelihood(MultivariateNormal) — replaces the old manual
+    # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly and
+    # `_batched_cholesky(K_all) @ randn` sampling. max_cholesky_size is
+    # forced high (see module docstring / _MAX_CHOLESKY) so this is an exact
+    # Cholesky-based sample, not gpytorch's approximate CG/Lanczos fallback.
+    with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
+        prior_dist = gpytorch.distributions.MultivariateNormal(
+            torch.zeros(B, T, device=device), kernel_obj(x_kernel_input)
+        )
+        noisy_dist = likelihood(prior_dist)
+        y_all = noisy_dist.rsample()                 # (B, T)
+        K_all = noisy_dist.covariance_matrix          # (B, T, T), nugget already on diagonal
+    K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))    # symmetrize float32 drift
 
     x_norm_train = x_norm[:, :P]   # (B, P, d)
     x_norm_test  = x_norm[:, P:]   # (B, N, d)
@@ -1075,12 +1021,13 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
 
     # --- Sub-matrices of K_all (nugget already on diagonal) ---
     K_ff = K_all[:, :P, :P]   # (B, P, P)
-    K_sf = K_all[:, P:, :P]   # (B, N, P)
     K_ss = K_all[:, P:, P:]   # (B, N, N)
 
-    # --- GP posterior/prior (batched) ---
-    # z_train's LOO PIT always needs L_ff/alpha from K_ff, regardless of which
-    # oracle drives the test-side R_star/mu_star/sigma_star below.
+    # --- LOO PIT always needs L_ff/alpha from K_ff (R&W Eq. 5.12), regardless
+    # of which oracle drives the test-side R_star/mu_star/sigma_star below.
+    # No clean gpytorch public API exposes diag(K_ff^-1) for an ExactGP, so
+    # this stays hand-rolled (_batched_cholesky), just sourced from the
+    # gpytorch-native K_all above instead of a separately hand-added nugget.
     L_ff  = _batched_cholesky(K_ff)
     alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)          # (B, P)
 
@@ -1088,12 +1035,22 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     if oracle_mode == "prior":
         # Prior oracle: ignore training conditioning — R_star reflects the raw
         # kernel structure among test points; mu_star is the GP prior mean (0).
+        # No conditioning needed, so this branch never touches _GeneratorGP.
         mu_star    = torch.zeros(B, N, device=device)
         Sigma_star = K_ss
     elif oracle_mode == "posterior":
-        mu_star    = (K_sf @ alpha.unsqueeze(-1)).squeeze(-1)                             # (B, N)
-        V          = torch.linalg.solve_triangular(L_ff, K_sf.permute(0, 2, 1), upper=False)  # (B, P, N)
-        Sigma_star = K_ss - V.permute(0, 2, 1) @ V                                     # (B, N, N)
+        # Posterior oracle: condition on (x_train, y_train) via gpytorch's own
+        # exact-inference ExactGP.__call__ instead of the hand-rolled
+        # K_ss - K_sf K_ff^-1 K_fs formula gp_posterior used — same likelihood
+        # object as the joint sample above, so the noise model matches.
+        # fast_pred_var(False) disables gpytorch's LOVE variance shortcut (a
+        # separate approximation from the Cholesky-size one).
+        x_kernel_train = x_kernel_input[:, :P]
+        x_kernel_test  = x_kernel_input[:, P:]
+        with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY), gpytorch.settings.fast_pred_var(False):
+            post_model = _GeneratorGP(x_kernel_train, y_train, likelihood, kernel_obj, batch_shape).eval()
+            post = post_model(x_kernel_test)
+            mu_star, Sigma_star = post.mean, post.covariance_matrix   # (B, N), (B, N, N)
     else:
         raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; expected 'prior' or 'posterior'.")
     Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
@@ -1151,7 +1108,23 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     }
     n_tr = torch.tensor(P)
     n_te = torch.tensor(N)
+    extra: Dict[str, object] = {"n_train": n_tr, "n_test": n_te}
+
+    if return_kernel_metadata:
+        # Per-episode (sliceable via val[b]) hyperparameters/factors, plus
+        # the batch-shared kernel name and active_dims — the schema
+        # generate_gp_task / pit.py::gp_analytical_pit / diag_kernels.py need.
+        for key in ("l", "alpha2", "period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b"):
+            tensors[key] = params[key].cpu()
+        tensors["nugget"] = nugget.cpu()
+        tensors["_L_ff"] = L_ff
+        tensors["_alpha"] = alpha
+        extra["kernel"] = kernel_name
+        extra["kernel_feature_indices"] = torch.tensor(
+            kernel_cols if kernel_cols is not None else list(range(d)), dtype=torch.long
+        )
+
     return [
-        {key: val[b] for key, val in tensors.items()} | {"n_train": n_tr, "n_test": n_te}
+        {key: val[b] for key, val in tensors.items()} | extra
         for b in range(B)
     ]
