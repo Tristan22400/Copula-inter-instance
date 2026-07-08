@@ -1045,12 +1045,31 @@ def generate_gp_batch(
         # object as the joint sample above, so the noise model matches.
         # fast_pred_var(False) disables gpytorch's LOVE variance shortcut (a
         # separate approximation from the Cholesky-size one).
+        #
+        # Done in float64: the Schur-complement subtraction K_ss - V^T V that
+        # ExactGP performs internally is a cancellation between two close
+        # quantities, and in float32 this measurably breaks PSD-ness for
+        # composite kernels combining a heavy-tailed component (e.g.
+        # rational_quadratic, whose small-alpha tail makes K_ff ill-
+        # conditioned) with an oscillatory one (cosine/periodic) — observed
+        # min eigenvalues down to -1.1e-3 across repeated sampling. float64
+        # brings the worst case to ~5e-13 (machine-epsilon noise), confirming
+        # this is precision, not a genuine non-PSD kernel. kernel_obj/
+        # likelihood are mutated in place by .double() (nn.Module convention)
+        # but are not read again after this branch, so that's safe; casting
+        # back to float32 keeps the returned schema consistent with every
+        # other tensor in this function.
         x_kernel_train = x_kernel_input[:, :P]
         x_kernel_test  = x_kernel_input[:, P:]
+        out_dtype = x_kernel_input.dtype
         with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY), gpytorch.settings.fast_pred_var(False):
-            post_model = _GeneratorGP(x_kernel_train, y_train, likelihood, kernel_obj, batch_shape).eval()
-            post = post_model(x_kernel_test)
-            mu_star, Sigma_star = post.mean, post.covariance_matrix   # (B, N), (B, N, N)
+            post_model = _GeneratorGP(
+                x_kernel_train.double(), y_train.double(),
+                likelihood.double(), kernel_obj.double(), batch_shape,
+            ).eval()
+            post = post_model(x_kernel_test.double())
+            mu_star    = post.mean.to(out_dtype)               # (B, N)
+            Sigma_star = post.covariance_matrix.to(out_dtype)  # (B, N, N)
     else:
         raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; expected 'prior' or 'posterior'.")
     Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
