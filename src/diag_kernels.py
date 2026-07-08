@@ -9,6 +9,14 @@ Run from the project root:
     python src/diag_kernels.py
     python src/diag_kernels.py --n-stage3 200   # smaller/faster batch
     python src/diag_kernels.py --skip-stage3    # per-task checks only
+
+DataCfg/Cfg/check_task/batch_off_diagonal_stats below are also imported
+directly by tests/test_diag_kernels.py, which turns this same per-task/
+Stage-3 health check into real pytest assertions (parametrized over
+ALL_KERNELS) so a regression like a kernel family losing PSD-ness is caught
+by the test suite instead of only a manually-run script. Everything below
+this module's "Main" section only runs under `if __name__ == "__main__":`,
+so importing this module (e.g. from a test) has no side effects.
 """
 from __future__ import annotations
 
@@ -274,64 +282,74 @@ def run_stage3(cfg: "Cfg", n_tasks: int) -> bool:
 # Main
 # ---------------------------------------------------------------------------
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--n-stage3", type=int, default=1000,
-                     help="Tasks per kernel for the Stage 3 batch distribution check (default: 1000)")
-parser.add_argument("--skip-stage3", action="store_true",
-                     help="Skip the Stage 3 batch distribution check")
-args = parser.parse_args()
-
 N_PER_KERNEL = 5
 SEED = 42
-random.seed(SEED)
-torch.manual_seed(SEED)
 
-cfg = Cfg()
-# disable list-based selection
-cfg.data.kernels = []
 
-SEP = "─" * 70
-all_ok = True
+def main() -> bool:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--n-stage3", type=int, default=1000,
+                         help="Tasks per kernel for the Stage 3 batch distribution check (default: 1000)")
+    parser.add_argument("--skip-stage3", action="store_true",
+                         help="Skip the Stage 3 batch distribution check")
+    args = parser.parse_args()
 
-for kernel_name in ALL_KERNELS:
-    cfg.data.kernel = kernel_name
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    cfg = Cfg()
+    # disable list-based selection
+    cfg.data.kernels = []
+
+    all_ok = True
+
+    for kernel_name in ALL_KERNELS:
+        cfg.data.kernel = kernel_name
+        print(f"\n{SEP}")
+        print(f"  KERNEL: {kernel_name.upper()}")
+        print(SEP)
+
+        kernel_ok = True
+        for i in range(N_PER_KERNEL):
+            task = generate_gp_task(cfg)
+            result = check_task(task, kernel_name, i)
+
+            status = "OK " if result["ok"] else "FAIL"
+            if not result["ok"]:
+                kernel_ok = False
+                all_ok = False
+
+            if result["ok"]:
+                print(
+                    f"  [{status}] task {i+1}  "
+                    f"P={result['P']:2d} N={result['N']:2d}  "
+                    f"l={result['l']:.2f} a2={result['alpha2']:.2f} nug={result['nugget']:.2f}  "
+                    f"r:[{result['r_min']:+.3f},{result['r_max']:+.3f}]  "
+                    f"od_mean={result['od_mean']:+.3f}  od_std={result['od_std']:.3f}  "
+                    f"|r|_mean={result['od_abs_mean']:.3f}  "
+                    f"min_eig={result['min_eig']:.4f}"
+                )
+            else:
+                print(f"  [{status}] task {i+1}  ISSUES: {result['issues']}")
+                # also print any numeric stats if they were computed
+                for key in ("r_min", "r_max", "od_mean", "od_std", "od_abs_mean", "min_eig"):
+                    if key in result:
+                        print(f"           {key}={result[key]:.4f}")
+
+        print(f"  {'ALL PASSED' if kernel_ok else '*** FAILURES DETECTED ***'}")
+
     print(f"\n{SEP}")
-    print(f"  KERNEL: {kernel_name.upper()}")
+    print(f"  OVERALL: {'ALL KERNELS OK' if all_ok else 'SOME FAILURES — see above'}")
     print(SEP)
 
-    kernel_ok = True
-    for i in range(N_PER_KERNEL):
-        task = generate_gp_task(cfg)
-        result = check_task(task, kernel_name, i)
+    if not args.skip_stage3:
+        stage3_ok = run_stage3(cfg, args.n_stage3)
+        all_ok = all_ok and stage3_ok
 
-        status = "OK " if result["ok"] else "FAIL"
-        if not result["ok"]:
-            kernel_ok = False
-            all_ok = False
+    return all_ok
 
-        if result["ok"]:
-            print(
-                f"  [{status}] task {i+1}  "
-                f"P={result['P']:2d} N={result['N']:2d}  "
-                f"l={result['l']:.2f} a2={result['alpha2']:.2f} nug={result['nugget']:.2f}  "
-                f"r:[{result['r_min']:+.3f},{result['r_max']:+.3f}]  "
-                f"od_mean={result['od_mean']:+.3f}  od_std={result['od_std']:.3f}  "
-                f"|r|_mean={result['od_abs_mean']:.3f}  "
-                f"min_eig={result['min_eig']:.4f}"
-            )
-        else:
-            print(f"  [{status}] task {i+1}  ISSUES: {result['issues']}")
-            # also print any numeric stats if they were computed
-            for key in ("r_min", "r_max", "od_mean", "od_std", "od_abs_mean", "min_eig"):
-                if key in result:
-                    print(f"           {key}={result[key]:.4f}")
 
-    print(f"  {'ALL PASSED' if kernel_ok else '*** FAILURES DETECTED ***'}")
+SEP = "─" * 70
 
-print(f"\n{SEP}")
-print(f"  OVERALL: {'ALL KERNELS OK' if all_ok else 'SOME FAILURES — see above'}")
-print(SEP)
-
-if not args.skip_stage3:
-    stage3_ok = run_stage3(cfg, args.n_stage3)
-    all_ok = all_ok and stage3_ok
+if __name__ == "__main__":
+    sys.exit(0 if main() else 1)
