@@ -31,7 +31,7 @@ n_tasks: 5000000
 # lengthscale ~ LogNormal(l_lognormal_loc, l_lognormal_scale), loc constant
 # in k (active kernel dims) — no k-dependent shift.
 l_lognormal_loc: 0.0    # log(1.0)
-l_lognormal_scale: 0.7
+l_lognormal_scale: 0.4
 alpha2_gamma_concentration: 4.0   # outputscale ~ Gamma(concentration, rate)
 alpha2_gamma_rate: 3.0
 
@@ -68,7 +68,7 @@ oracle_mode: prior
 #
 # Available kernels: rbf, matern32, cosine, periodic, rational_quadratic, dot_product, hebo
 # (plus 20 "A+B"/"A*B" composites of {rbf, matern32, cosine, periodic, rational_quadratic} — see data_gen.COMPOSITE_KERNELS)
-kernel: dot_product
+kernel: rbf
 
 # "hebo" (PFNs4BO's tuned "HEBO+" prior) needs different P/N ranges than the
 # defaults above — see data_gen.py::HEBO_PLUS_HYPERPARAMETERS and the module
