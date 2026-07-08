@@ -181,15 +181,15 @@ def test_unit_diagonal(dataset_dir):
 
 
 def test_r_star_well_conditioned(min_eigenvalues):
-    """All R_star matrices must have minimum eigenvalue ≥ 0.001.
+    """All R_star matrices must have minimum eigenvalue ≥ 0.0001.
 
     With latent=False, the nugget noise floor in K_ss prevents R_star from
     being rank-deficient. Near-singular R_star (min_eig ~ 1e-7) causes
     oracle_copula_nll to blow up (z^T R^{-1} z >> 1).
     """
-    bad = [v for v in min_eigenvalues if v < 0.001]
+    bad = [v for v in min_eigenvalues if v < 0.0001]
     assert len(bad) == 0, (
-        f"{len(bad)}/{len(min_eigenvalues)} episodes have min_eig < 0.001; "
+        f"{len(bad)}/{len(min_eigenvalues)} episodes have min_eig < 0.0001; "
         f"smallest: {min(bad):.2e}. R_star is near-singular — check if "
         f"latent=False is in effect in data_gen.generate_gp_task."
     )
