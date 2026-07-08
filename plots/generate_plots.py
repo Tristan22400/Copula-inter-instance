@@ -8,7 +8,7 @@ against a copula-based tabular foundation model (Copula-TFM, mocked unless
 Everything this script needs lives in this directory:
   - plots/generate_neurips_plots.py   (this file)
   - plots/era5_temperature.nc         (downloaded or synthetic input data)
-  - plots/*.pdf                       (the four output figures)
+  - plots/all_figures.pdf             (single combined output, one page per figure)
 
 Usage:
     python plots/generate_neurips_plots.py
@@ -26,6 +26,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from scipy.io import netcdf_file
 from scipy.special import gammaln, logsumexp
 from scipy.stats import chi2, multivariate_normal, norm
@@ -54,6 +55,7 @@ if not _USE_TEX:
 
 PLOTS_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(PLOTS_DIR, "era5_temperature.nc")
+ALL_FIGURES_PATH = os.path.join(PLOTS_DIR, "all_figures.pdf")
 
 RNG = np.random.default_rng(42)
 
@@ -333,10 +335,27 @@ def build_copula_correlation_fn(ckpt_path, device, context_coords, context_value
     return corr_fn
 
 
+def _save_fig(fig, filename, pdf, **savefig_kwargs):
+    """
+    Save `fig` as one page of the combined `pdf` (a PdfPages) if given,
+    otherwise fall back to writing it as its own standalone file under
+    PLOTS_DIR -- keeps each plot function usable/testable on its own.
+    """
+    if pdf is not None:
+        pdf.savefig(fig, **savefig_kwargs)
+        plt.close(fig)
+        print(f"Saved {filename} page to {ALL_FIGURES_PATH}")
+    else:
+        out_path = os.path.join(PLOTS_DIR, filename)
+        fig.savefig(out_path, **savefig_kwargs)
+        plt.close(fig)
+        print(f"Saved {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Plot 1: Static vs. Smooth spatial map
 # ---------------------------------------------------------------------------
-def plot_spatial_map_comparison(data, day, context_idx, C):
+def plot_spatial_map_comparison(data, day, context_idx, C, pdf=None):
     field = data["t2m"][day]
     lat, lon = data["latitude"], data["longitude"]
     grid_size = field.shape[0]
@@ -384,10 +403,7 @@ def plot_spatial_map_comparison(data, day, context_idx, C):
     axes[0].set_ylabel("Latitude")
     plt.tight_layout()
     fig.colorbar(mesh, ax=axes.tolist(), shrink=0.85, label="Temperature (deg C)")
-    out_path = os.path.join(PLOTS_DIR, "spatial_map_comparison.pdf")
-    fig.savefig(out_path)
-    plt.close(fig)
-    print(f"Saved {out_path}")
+    _save_fig(fig, "spatial_map_comparison.pdf", pdf)
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +431,7 @@ def haversine_distance_km(coords):
     return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
-def plot_correlation_vs_distance(data, C):
+def plot_correlation_vs_distance(data, C, pdf=None):
     lat, lon = data["latitude"], data["longitude"]
     lon_grid, lat_grid = np.meshgrid(lon, lat)
     coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
@@ -446,16 +462,13 @@ def plot_correlation_vs_distance(data, C):
     ax.set_ylabel(r"Predicted correlation $\rho_{ij}$")
     ax.legend()
     plt.tight_layout()
-    out_path = os.path.join(PLOTS_DIR, "correlation_vs_distance.pdf")
-    fig.savefig(out_path)
-    plt.close(fig)
-    print(f"Saved {out_path}")
+    _save_fig(fig, "correlation_vs_distance.pdf", pdf)
 
 
 # ---------------------------------------------------------------------------
 # Plot 3: Predicted vs. ground-truth correlation matrix
 # ---------------------------------------------------------------------------
-def plot_correlation_matrix_comparison(C, C_true):
+def plot_correlation_matrix_comparison(C, C_true, pdf=None):
     """
     Directly visualize the model's predicted MxM correlation matrix next to
     the ground-truth reference (see `ground_truth_correlation_matrix`), plus
@@ -499,16 +512,13 @@ def plot_correlation_matrix_comparison(C, C_true):
 
     plt.tight_layout()
     fig.colorbar(im1, ax=axes[:2].tolist(), shrink=0.85, label="Correlation")
-    out_path = os.path.join(PLOTS_DIR, "correlation_matrix_comparison.pdf")
-    fig.savefig(out_path)
-    plt.close(fig)
-    print(f"Saved {out_path}")
+    _save_fig(fig, "correlation_matrix_comparison.pdf", pdf)
 
 
 # ---------------------------------------------------------------------------
 # Plot 4: Calibration of joint probabilities
 # ---------------------------------------------------------------------------
-def plot_joint_probability_calibration(data, C, context_idx, n_pairs=400, n_bins=10):
+def plot_joint_probability_calibration(data, C, context_idx, n_pairs=400, n_bins=10, pdf=None):
     field_all = data["t2m"]
     n_days, grid_size, _ = field_all.shape
     lat, lon = data["latitude"], data["longitude"]
@@ -587,10 +597,7 @@ def plot_joint_probability_calibration(data, C, context_idx, n_pairs=400, n_bins
     ax.set_ylabel("Empirical joint exceedance frequency")
     ax.legend()
     plt.tight_layout()
-    out_path = os.path.join(PLOTS_DIR, "joint_probability_calibration.pdf")
-    fig.savefig(out_path)
-    plt.close(fig)
-    print(f"Saved {out_path}")
+    _save_fig(fig, "joint_probability_calibration.pdf", pdf)
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +652,7 @@ def generate_era5_reliability_diagram(
     y_true: np.ndarray,
     y_pred_quantiles: np.ndarray,
     quantiles: Sequence[float],
-    output_path: str,
+    pdf: "PdfPages | None" = None,
 ) -> float:
     """
     Build and save a reliability diagram for TabICLv2's ERA5 quantile
@@ -657,7 +664,8 @@ def generate_era5_reliability_diagram(
         y_pred_quantiles: 2D array/DataFrame (n_samples, n_quantiles) of
             predicted quantile values.
         quantiles: Nominal quantile levels matching the columns above.
-        output_path: Destination file path for the saved figure.
+        pdf: Combined PdfPages to append this figure to as a page; if None,
+            the figure is saved as its own standalone file instead.
 
     Returns:
         The scalar ECE score (also annotated on the figure).
@@ -692,9 +700,8 @@ def generate_era5_reliability_diagram(
     )
     ax.legend(loc="lower right")
     plt.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {output_path} (ECE={ece:.4f})")
+    _save_fig(fig, "era5_reliability_diagram.pdf", pdf, bbox_inches="tight")
+    print(f"ECE={ece:.4f}")
     return ece
 
 
@@ -702,6 +709,7 @@ def plot_era5_quantile_reliability(
     data,
     context_idx,
     quantiles=np.array([0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]),
+    pdf=None,
 ):
     """
     Real-data driver for the reliability diagram: context locations
@@ -748,8 +756,7 @@ def plot_era5_quantile_reliability(
     y_true = np.concatenate(y_true_chunks)
     y_pred_quantiles = np.concatenate(y_pred_chunks, axis=0)
 
-    out_path = os.path.join(PLOTS_DIR, "era5_reliability_diagram.pdf")
-    generate_era5_reliability_diagram(y_true, y_pred_quantiles, quantiles, out_path)
+    generate_era5_reliability_diagram(y_true, y_pred_quantiles, quantiles, pdf)
 
 
 # ---------------------------------------------------------------------------
@@ -1041,12 +1048,13 @@ def main():
     C = corr_fn(coords)
     C_true = ground_truth_correlation_matrix(data, coords)
 
-    plot_spatial_map_comparison(data, day, context_idx, C)
-    plot_correlation_vs_distance(data, C)
-    plot_correlation_matrix_comparison(C, C_true)
-    plot_joint_probability_calibration(data, C, context_idx)
-    plot_era5_quantile_reliability(data, context_idx)
-    print(f"All figures saved to {PLOTS_DIR}")
+    with PdfPages(ALL_FIGURES_PATH) as pdf:
+        plot_spatial_map_comparison(data, day, context_idx, C, pdf=pdf)
+        plot_correlation_vs_distance(data, C, pdf=pdf)
+        plot_correlation_matrix_comparison(C, C_true, pdf=pdf)
+        plot_joint_probability_calibration(data, C, context_idx, pdf=pdf)
+        plot_era5_quantile_reliability(data, context_idx, pdf=pdf)
+    print(f"All figures saved to {ALL_FIGURES_PATH}")
 
 
 if __name__ == "__main__":
