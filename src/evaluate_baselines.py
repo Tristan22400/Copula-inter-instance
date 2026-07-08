@@ -951,6 +951,9 @@ def main() -> None:
     )
     parser.add_argument("--config",       default="conf/config.yaml")
     parser.add_argument("--ckpt",         required=True)
+    parser.add_argument("--dataset_dir",  default=None,
+                        help="Episode directory to evaluate on (overrides "
+                             "training.dataset_dir from --config)")
     parser.add_argument("--n_episodes",   type=int,   default=50)
     parser.add_argument("--episode_idx",  type=int,   default=0)
     parser.add_argument("--n_steps_mle",  type=int,   default=1000,
@@ -996,7 +999,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in icl_model.parameters())
     print(f"ICL model parameters: {n_params:,}  rank={icl_rank}")
 
-    dataset_dir = cfg.training.dataset_dir
+    dataset_dir = args.dataset_dir or cfg.training.dataset_dir
     n_ep = args.n_episodes
 
     dataset = CopulaDataset(episode_dir=dataset_dir)
