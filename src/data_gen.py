@@ -8,7 +8,8 @@ from the GP, computes the analytical correlation matrix R* at the test points
 prior, per cfg.data.oracle_mode), and saves all required tensors.
 
 Kernels are built from gpytorch.kernels (RBFKernel, MaternKernel,
-PeriodicKernel, RQKernel, CosineKernel) wrapped in ScaleKernel; hyperparameters
+PeriodicKernel, RQKernel, CosineKernel, LinearKernel) wrapped in ScaleKernel
+(LinearKernel is the one exception — see "dot_product" below); hyperparameters
 (lengthscale, outputscale, nugget, period, rq_alpha) are sampled from
 gpytorch.priors (LogNormalPrior / GammaPrior) rather than the uniform ranges
 an earlier version of this file used — see _kernel_prior_spec / _nugget_prior
@@ -23,10 +24,16 @@ Supported kernels
   cosine              — Cosine (spectral): k(r) = alpha2 * cos(2π r / l)
   periodic            — Periodic: k(r) = alpha2 * exp(-2 sin²(π r / period) / l²)
   rational_quadratic  — Rational Quadratic: k(r) = alpha2 * (1 + r²/(2α l²))^{-α}
-  dot_product         — Linear (dot product): k(x1,x2) = x1ᵀx2. Unscaled, no
-                         hyperparameters — kept as a plain torch op rather
-                         than a gpytorch LinearKernel so its exact original
-                         behaviour (no offset, no variance term) is preserved.
+  dot_product         — Linear (dot product): k(x1,x2) = alpha2 * x1ᵀx2, via
+                         gpytorch.kernels.LinearKernel. Its `variance` plays
+                         exactly the role `alpha2` (outputscale) plays for
+                         every other kernel here — sampled from the same
+                         alpha2 ~ Gamma(alpha2_gamma_concentration,
+                         alpha2_gamma_rate) prior directly (see
+                         _sample_episode_kernel), not wrapped in a separate
+                         outer ScaleKernel (that would just be a second,
+                         redundant alpha2). No lengthscale — geometry is
+                         determined entirely by the feature space.
   hebo                — ARD Matérn ν=3/2 + outputscale, the tuned "HEBO+"
                          prior from the PFN4BO paper (github.com/automl/
                          PFNs4BO), Appendix B.1: lengthscale/outputscale ~
@@ -99,77 +106,6 @@ def _sq_dist(X1: Tensor, X2: Tensor) -> Tensor:
 def _dist(X1: Tensor, X2: Tensor) -> Tensor:
     """Euclidean distance matrix (n1, n2)."""
     return _sq_dist(X1, X2).clamp(min=0.0).sqrt()
-
-
-# ---------------------------------------------------------------------------
-# PSD kernel functions  k(X1, X2) -> (n1, n2) matrix
-#
-# Kept as plain torch (not gpytorch objects) because src/evaluate_baselines.py
-# imports these directly for a from-scratch gradient-based GP MLE fit against
-# real (UCI) data — a different code path from episode generation below,
-# independently tested and numerically unaffected by the kernel-construction
-# rewrite in this file.
-# ---------------------------------------------------------------------------
-
-
-def rbf_kernel(X1: Tensor, X2: Tensor, *, l: float, alpha2: float, **_) -> Tensor:
-    """Squared Exponential (RBF): alpha2 * exp(-r² / (2 l²))."""
-    return alpha2 * torch.exp(-_sq_dist(X1, X2) / (2.0 * l**2))
-
-
-def matern32_kernel(X1: Tensor, X2: Tensor, *, l: float, alpha2: float, **_) -> Tensor:
-    """Matérn ν=3/2: alpha2 * (1 + √3 r/l) * exp(-√3 r/l)."""
-    r = _dist(X1, X2)
-    s = math.sqrt(3.0) * r / l
-    return alpha2 * (1.0 + s) * torch.exp(-s)
-
-
-def cosine_kernel(X1: Tensor, X2: Tensor, *, l: float, alpha2: float, **_) -> Tensor:
-    """Cosine (spectral): alpha2 * cos(2π r / l).
-
-    Stationary PSD kernel whose spectral density is a pair of Dirac deltas at
-    ±1/l.  Small negative eigenvalues from floating-point rounding are handled
-    by the jitter already applied in generate_gp_task.
-    """
-    r = _dist(X1, X2)
-    return alpha2 * torch.cos(2.0 * math.pi * r / l)
-
-
-def periodic_kernel(
-    X1: Tensor,
-    X2: Tensor,
-    *,
-    l: float,
-    alpha2: float,
-    period: float = 1.0,
-    **_,
-) -> Tensor:
-    """Periodic: alpha2 * exp(-2 sin²(π r / period) / l²)."""
-    r = _dist(X1, X2)
-    return alpha2 * torch.exp(-2.0 * torch.sin(math.pi * r / period) ** 2 / l**2)
-
-
-def rational_quadratic_kernel(
-    X1: Tensor,
-    X2: Tensor,
-    *,
-    l: float,
-    alpha2: float,
-    rq_alpha: float = 1.0,
-    **_,
-) -> Tensor:
-    """Rational Quadratic: alpha2 * (1 + r² / (2 α l²))^{-α}."""
-    sq = _sq_dist(X1, X2)
-    return alpha2 * (1.0 + sq / (2.0 * rq_alpha * l**2)) ** (-rq_alpha)
-
-
-def dot_product_kernel(X1: Tensor, X2: Tensor, **_) -> Tensor:
-    """Linear (dot product): X1 @ X2ᵀ.
-
-    PSD because K = XᵀX is PSD. Has no lengthscale or variance hyperparameter;
-    geometry is determined entirely by the feature space.
-    """
-    return X1 @ X2.T
 
 
 # ---------------------------------------------------------------------------
@@ -361,14 +297,27 @@ def _sample_episode_kernel(
     """Sample B episodes' hyperparameters for kernel_name (base or "A+B"/"A*B"
     composite) and return (gpytorch Kernel with batch_shape=[B], params dict).
 
-    Not valid for "dot_product" (no kernel object / hyperparameters — handled
-    directly by the caller). params keys match the output-dict schema (l,
-    alpha2, period, rq_alpha, l_b, alpha2_b, period_b, rq_alpha_b);
+    "dot_product" has no lengthscale, but its LinearKernel `variance` is
+    sampled from the same alpha2 ~ Gamma(alpha2_gamma_concentration,
+    alpha2_gamma_rate) prior every other kernel's outputscale uses (see
+    dot_product_kernel's docstring). params keys match the output-dict schema
+    (l, alpha2, period, rq_alpha, l_b, alpha2_b, period_b, rq_alpha_b);
     not-applicable entries are filled with a 0.0 sentinel (the convention
     pit.py::gp_analytical_pit relies on).
     """
     composite = _parse_composite(kernel_name)
-    if composite is None:
+    if kernel_name == "dot_product":
+        batch_shape = torch.Size([B])
+        kernel = gpytorch.kernels.LinearKernel(batch_shape=batch_shape).to(device)
+        a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
+        a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
+        a_sample = GammaPrior(a_conc, a_rate).sample(kernel.variance.shape).to(device)
+        kernel.variance = a_sample
+        params: Dict[str, Tensor] = {
+            "l": torch.zeros(B, device=device),
+            "alpha2": a_sample.reshape(B),
+        }
+    elif composite is None:
         spec = _kernel_prior_spec(cfg, kernel_name)
         kernel, params = _build_scaled_kernel(kernel_name, spec, k, B, device)
     else:
@@ -391,7 +340,17 @@ def _build_concrete_kernel(
 ) -> gpytorch.kernels.Kernel:
     """Construct a non-batched gpytorch Kernel with CONCRETE hyperparameter
     values assigned — reconstruction (given known values), not sampling.
-    Used by build_kernel_fn."""
+    Used by build_kernel_fn.
+
+    "dot_product" returns the bare LinearKernel (no ScaleKernel wrapper):
+    its `variance` already plays the role `alpha2` plays for every other
+    kernel, so wrapping it would just be a second, redundant alpha2. "l" is
+    ignored — no lengthscale, geometry comes entirely from the feature space.
+    """
+    if name == "dot_product":
+        kernel = gpytorch.kernels.LinearKernel()
+        kernel.variance = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(kernel.variance.shape)
+        return kernel
     if name == "hebo":
         l_t = l if torch.is_tensor(l) else torch.tensor([float(l)])
         base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=l_t.numel())
@@ -428,9 +387,6 @@ def build_kernel_fn(
     l_b/alpha2_b/period_b/rq_alpha_b are the second component's hyperparameters
     for composite ("A+B" / "A*B") kernels.
     """
-    if kernel_name == "dot_product":
-        return dot_product_kernel
-
     composite = _parse_composite(kernel_name)
     if composite is None:
         kernel = _build_concrete_kernel(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
@@ -449,7 +405,53 @@ def build_kernel_fn(
 # ---------------------------------------------------------------------------
 # Kernel registry (names + free-function dispatch, e.g. for
 # scripts/visualize_kernel.py's membership checks and ALL_KERNELS)
+#
+# Every base kernel below evaluates the real gpytorch kernel object via
+# build_kernel_fn — single source of truth for the math, no hand-rolled
+# formula to drift out of sync with the gpytorch-backed episode-generation
+# path above. NOT usable for backprop into l/alpha2/period/rq_alpha:
+# build_kernel_fn assigns hyperparameters through gpytorch's `.lengthscale =`
+# / `.outputscale =` setters, which do an in-place `.initialize()` copy that
+# breaks autograd back to those inputs (the forward pass on X1/X2 itself is
+# still differentiable). src/evaluate_baselines.py's from-scratch GP-MLE fit
+# needs exactly that backprop, so it keeps its own local plain-torch copies of
+# rbf_kernel/periodic_kernel/rational_quadratic_kernel instead of importing
+# these — see its module comment.
 # ---------------------------------------------------------------------------
+
+
+def rbf_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+    """Squared Exponential (RBF), via gpytorch.kernels.RBFKernel."""
+    return build_kernel_fn("rbf", l, alpha2)(X1, X2)
+
+
+def matern32_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+    """Matérn ν=3/2, via gpytorch.kernels.MaternKernel(nu=1.5)."""
+    return build_kernel_fn("matern32", l, alpha2)(X1, X2)
+
+
+def cosine_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+    """Cosine (spectral), via gpytorch.kernels.CosineKernel."""
+    return build_kernel_fn("cosine", l, alpha2)(X1, X2)
+
+
+def periodic_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, period: float = 1.0, **_) -> Tensor:
+    """Periodic, via gpytorch.kernels.PeriodicKernel."""
+    return build_kernel_fn("periodic", l, alpha2, period=period)(X1, X2)
+
+
+def rational_quadratic_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, rq_alpha: float = 1.0, **_) -> Tensor:
+    """Rational Quadratic, via gpytorch.kernels.RQKernel."""
+    return build_kernel_fn("rational_quadratic", l, alpha2, rq_alpha=rq_alpha)(X1, X2)
+
+
+def dot_product_kernel(X1: Tensor, X2: Tensor, *, alpha2: float = 1.0, **_) -> Tensor:
+    """Linear (dot product): alpha2 * X1 @ X2ᵀ, via gpytorch.kernels.LinearKernel.
+
+    PSD because K = XᵀX is PSD. No lengthscale hyperparameter — "l" is
+    ignored (build_kernel_fn's dot_product branch doesn't use it).
+    """
+    return build_kernel_fn("dot_product", 0.0, alpha2)(X1, X2)
 
 
 def _hebo_kernel_dispatch(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
@@ -706,20 +708,13 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # implementation, "hebo" no longer needs to defer sampling until x_k
     # exists — its Gamma priors don't depend on the input points.
     nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([1])).item()
-    if kernel_name == "dot_product":
-        kernel_obj = None
-        l = alpha2 = period = rq_alpha = torch.tensor(0.0)
-        l_b = alpha2_b = period_b = rq_alpha_b = torch.tensor(0.0)
-    else:
-        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, 1, "cpu")
-        l, alpha2, period, rq_alpha = (params[key][0] for key in ("l", "alpha2", "period", "rq_alpha"))
-        l_b, alpha2_b, period_b, rq_alpha_b = (
-            params[key][0] for key in ("l_b", "alpha2_b", "period_b", "rq_alpha_b")
-        )
+    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, 1, "cpu")
+    l, alpha2, period, rq_alpha = (params[key][0] for key in ("l", "alpha2", "period", "rq_alpha"))
+    l_b, alpha2_b, period_b, rq_alpha_b = (
+        params[key][0] for key in ("l_b", "alpha2_b", "period_b", "rq_alpha_b")
+    )
 
     def kernel_fn(X1: Tensor, X2: Tensor) -> Tensor:
-        if kernel_name == "dot_product":
-            return dot_product_kernel(X1, X2)
         return kernel_obj(X1.unsqueeze(0), X2.unsqueeze(0)).to_dense()[0]
 
     # 4. Sample features x ~ N(0, 1)^d, warp marginals (TabICLv2-style feature
@@ -951,14 +946,7 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
 
     # --- Per-episode hyperparameters (B independent draws in one call) ---
     nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([B])).to(device)
-    if kernel_name == "dot_product":
-        kernel_obj = None
-        params = {
-            key: torch.zeros(B, device=device)
-            for key in ("l", "alpha2", "period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b")
-        }
-    else:
-        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device)
+    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device)
 
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
@@ -981,10 +969,7 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     x_k_kernel = torch.special.ndtr(x_k) if kernel_name == "hebo" else x_k
 
     # --- Build K_all (B, T, T) and sample y jointly ---
-    if kernel_name == "dot_product":
-        K_all = x_k_kernel @ x_k_kernel.permute(0, 2, 1)
-    else:
-        K_all = kernel_obj(x_k_kernel).to_dense()
+    K_all = kernel_obj(x_k_kernel).to_dense()
     K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
     K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
 

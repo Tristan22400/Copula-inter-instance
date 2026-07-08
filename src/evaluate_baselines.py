@@ -70,9 +70,6 @@ from data_gen import (
     _dist,
     dot_product_kernel,
     matern32_kernel,
-    periodic_kernel,
-    rational_quadratic_kernel,
-    rbf_kernel,
     sigma_to_correlation,
 )
 from dataset import CopulaDataset
@@ -91,6 +88,39 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ---------------------------------------------------------------------------
+# Differentiable kernel formulas for GP-MLE fitting
+# ---------------------------------------------------------------------------
+# data_gen.py's rbf_kernel/periodic_kernel/rational_quadratic_kernel now
+# delegate to gpytorch kernel objects (single source of truth for episode
+# generation), but gpytorch's `.lengthscale =` / `.outputscale =` setters do
+# an in-place `.initialize()` copy that is not differentiable — unusable for
+# gp_mle_fit/eval_dkl_mle below, which backprop through l/alpha2/period/
+# rq_alpha (nn.Parameters, or an MLP output for DKL). Kept here as plain torch
+# formulas, identical to data_gen.py's pre-gpytorch math. matern32_kernel has
+# no local copy: it's only ever called under torch.no_grad() below (its own
+# differentiable use sites go through the NaN-safe _safe_dist helper instead,
+# never through matern32_kernel itself), so importing the gpytorch-backed
+# version straight from data_gen is safe.
+
+
+def rbf_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+    """Squared Exponential (RBF): alpha2 * exp(-r² / (2 l²))."""
+    return alpha2 * torch.exp(-_sq_dist(X1, X2) / (2.0 * l**2))
+
+
+def periodic_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, period=1.0, **_) -> Tensor:
+    """Periodic: alpha2 * exp(-2 sin²(π r / period) / l²)."""
+    r = _dist(X1, X2)
+    return alpha2 * torch.exp(-2.0 * torch.sin(math.pi * r / period) ** 2 / l**2)
+
+
+def rational_quadratic_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, rq_alpha=1.0, **_) -> Tensor:
+    """Rational Quadratic: alpha2 * (1 + r² / (2 α l²))^{-α}."""
+    sq = _sq_dist(X1, X2)
+    return alpha2 * (1.0 + sq / (2.0 * rq_alpha * l**2)) ** (-rq_alpha)
 
 
 # ---------------------------------------------------------------------------
