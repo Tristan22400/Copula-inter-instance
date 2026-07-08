@@ -161,6 +161,70 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     )
 
 
+_ARD_ELIGIBLE_KERNELS = ["rbf", "matern32", "rational_quadratic"]  # "periodic" is capped to k=1 (see below)
+
+
+@pytest.mark.parametrize("kernel_name", _ARD_ELIGIBLE_KERNELS)
+def test_ard_samples_per_dimension_lengthscale(small_cfg, kernel_name):
+    """cfg.data.ard=True gives an ARD lengthscale vector (k,) instead of a
+    shared isotropic scalar, and the analytical-PIT kernel reconstruction
+    (pit.gp_analytical_pit -> data_gen.build_kernel_fn) round-trips it
+    correctly (matches the cached _L_ff/_alpha result from generation)."""
+    from pit import gp_analytical_pit
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.d_features = 6
+    cfg.data.d_kernel_min = 3
+    cfg.data.d_kernel_max = 3
+    cfg.data.ard = True
+
+    torch.manual_seed(abs(hash("ard_" + kernel_name)) % (2**31))
+    task = generate_gp_task(cfg)
+    assert task["l"].shape == (3,), f"{kernel_name}: expected ARD vector (3,), got {tuple(task['l'].shape)}"
+
+    cached = gp_analytical_pit(task)
+    reconstructed_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}
+    reconstructed = gp_analytical_pit(reconstructed_task)
+    assert torch.allclose(cached["z_train"], reconstructed["z_train"], atol=1e-3)
+    assert torch.allclose(cached["z_test"], reconstructed["z_test"], atol=1e-3)
+
+
+def test_ard_default_false_keeps_isotropic_lengthscale(small_cfg):
+    """Without cfg.data.ard, lengthscale stays a shared scalar even for k>1
+    (unchanged pre-ARD behaviour)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features = 6
+    cfg.data.d_kernel_min = 3
+    cfg.data.d_kernel_max = 3
+
+    torch.manual_seed(0)
+    task = generate_gp_task(cfg)
+    assert task["l"].shape == (), f"expected isotropic scalar, got shape {tuple(task['l'].shape)}"
+
+
+def test_ard_not_applied_to_cosine_or_dot_product(small_cfg):
+    """cfg.data.ard=True is a silent no-op for kernels where ARD isn't
+    structurally possible ("cosine": gpytorch hardcodes period_length to a
+    scalar) or not applicable ("dot_product": no lengthscale)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.d_kernel_min = 3
+    cfg.data.d_kernel_max = 3
+    cfg.data.ard = True
+
+    torch.manual_seed(0)
+    cfg.data.kernel = "cosine"
+    task = generate_gp_task(cfg)
+    assert task["l"].shape == (), "cosine's period_length must stay scalar under ard=True"
+
+    torch.manual_seed(0)
+    cfg.data.kernel = "dot_product"
+    task = generate_gp_task(cfg)  # must not raise
+    assert task["alpha2"].numel() == 1
+
+
 def test_gp_posterior_helper():
     """gp_posterior should return correct shapes and PSD Sigma_star."""
     from data_gen import build_kernel_fn

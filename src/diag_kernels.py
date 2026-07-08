@@ -124,8 +124,9 @@ def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
         "od_abs_mean": od_abs,
         "N": N,
         "P": task["n_train"].item(),
-        # scalar for every kernel except "hebo", whose l is an ARD
-        # per-dimension lengthscale vector (k,) — report its mean here.
+        # scalar, unless the episode was generated ARD (cfg.data.ard=True, or
+        # always for "hebo"), in which case l is a per-dimension lengthscale
+        # vector (k,) — report its mean here.
         "l": task["l"].mean().item() if task["l"].numel() > 1 else task["l"].item(),
         "alpha2": task["alpha2"].item(),
         "nugget": task["nugget"].item(),

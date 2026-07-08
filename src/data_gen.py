@@ -46,6 +46,20 @@ Supported kernels
                          input points, unlike upstream's SingleTaskGP-based
                          `hebo_prior.get_model` scaffolding).
 
+ARD (cfg.data.ard)
+-------------------
+  When cfg.data.ard is True, rbf/matern32/periodic/rational_quadratic sample
+  one independent lengthscale per active kernel dimension (ard_num_dims=k)
+  instead of one isotropic scalar shared across all k dims — same mechanism
+  "hebo" already always uses. periodic's period also becomes per-dimension
+  (gpytorch.kernels.PeriodicKernel ties period_length's ard_num_dims to the
+  same kwarg as lengthscale). Default False (isotropic), preserving prior
+  dataset-generation behaviour. Not possible for "cosine": gpytorch's
+  CosineKernel hardcodes period_length to a single scalar regardless of
+  ard_num_dims — no per-dimension formula exists. Not applicable to
+  "dot_product" (no lengthscale) or "hebo" (already unconditionally ARD via
+  its own tuned prior, independent of this flag). See _ARD_ELIGIBLE_KERNELS.
+
 Composite kernels ("A+B" / "A*B")
 ---------------------------------
   Sums and products of PSD kernels are PSD, so every pair drawn from
@@ -54,7 +68,8 @@ Composite kernels ("A+B" / "A*B")
   "rbf+periodic" (locally periodic: smooth decay times exact periodicity) or
   "matern32*cosine" (spectral windowing). See COMPOSITE_KERNELS for the full
   list. dot_product and hebo are not composable (irregular hyperparameter
-  signatures — no lengthscale, or ARD-only).
+  signatures — no lengthscale, or ARD-only). cfg.data.ard applies
+  independently to each ARD-eligible component of a composite.
 
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
@@ -148,9 +163,14 @@ class KernelPriorSpec:
 
     lengthscale_prior(k) returns the Prior over the kernel's shape parameter
     (its `.lengthscale`, or `.period_length` for cosine — see
-    lengthscale_attr) given k active input dimensions; ard=True (currently
-    only "hebo") samples one independent value per dimension instead of one
-    isotropic scalar shared across all k dims.
+    lengthscale_attr) given k active input dimensions; ard=True samples one
+    independent value per dimension instead of one isotropic scalar shared
+    across all k dims. Always True for "hebo" (the tuned HEBO+ prior is
+    ARD by definition); for rbf/matern32/periodic/rational_quadratic it
+    follows cfg.data.ard (see _kernel_prior_spec / _ARD_ELIGIBLE_KERNELS).
+    "cosine" is never ARD — gpytorch.kernels.CosineKernel's period_length is
+    a single scalar regardless of ard_num_dims (no per-dimension formula
+    exists to opt into).
     """
 
     lengthscale_prior: Callable[[int], Prior]
@@ -158,6 +178,15 @@ class KernelPriorSpec:
     lengthscale_attr: str = "lengthscale"
     extra_priors: Dict[str, Prior] = field(default_factory=dict)
     ard: bool = False
+
+
+# Base kernel families whose lengthscale can be made ARD (one value per active
+# input dimension) via cfg.data.ard. "cosine" is excluded: gpytorch's
+# CosineKernel hardcodes period_length to shape (*batch_shape, 1, 1) — it
+# ignores ard_num_dims entirely, so there's no per-dimension formula to opt
+# into. "dot_product" has no lengthscale at all (see its docstring) and
+# "hebo" is unconditionally ARD already (its tuned prior, not this flag).
+_ARD_ELIGIBLE_KERNELS = frozenset({"rbf", "matern32", "periodic", "rational_quadratic"})
 
 
 HEBO_PLUS_HYPERPARAMETERS: Dict[str, object] = {
@@ -205,6 +234,7 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
     scale_by_sqrt_k = bool(getattr(cfg.data, "l_scale_by_sqrt_k", True))
     a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
     a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
+    ard = bool(getattr(cfg.data, "ard", False)) and kernel_name in _ARD_ELIGIBLE_KERNELS
 
     def lengthscale_prior(k: int) -> LogNormalPrior:
         # Squared distance sum_{i=1}^k (x1_i - x2_i)^2 grows ~linearly with k
@@ -236,6 +266,7 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
         outputscale_prior=GammaPrior(a_conc, a_rate),
         lengthscale_attr=lengthscale_attr,
         extra_priors=extra_priors,
+        ard=ard,
     )
 
 
@@ -286,7 +317,13 @@ def _build_scaled_kernel(
         attr = getattr(base, attr_name)
         sample = prior.sample(attr.shape).to(device)
         setattr(base, attr_name, sample)
-        params[schema_name] = sample.reshape(B)
+        # "period" is ARD-vector-shaped too when spec.ard (gpytorch's
+        # PeriodicKernel ties period_length's ard_num_dims to the same
+        # kwarg as lengthscale) — same squeeze convention as l_flat above.
+        # "rq_alpha" is never ARD (RQKernel.alpha has no ard_num_dims), so
+        # this is a no-op reshape/squeeze for it.
+        sample_flat = sample.reshape(B, -1)
+        params[schema_name] = sample_flat.squeeze(-1) if sample_flat.shape[-1] == 1 else sample_flat
 
     return scaled, params
 
@@ -351,19 +388,22 @@ def _build_concrete_kernel(
         kernel = gpytorch.kernels.LinearKernel()
         kernel.variance = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(kernel.variance.shape)
         return kernel
-    if name == "hebo":
-        l_t = l if torch.is_tensor(l) else torch.tensor([float(l)])
-        base = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=l_t.numel())
-        base.lengthscale = l_t.reshape(base.lengthscale.shape)
-    else:
-        base = _BASE_GPYTORCH_KERNEL_CLS[name]()
-        attr = "period_length" if name == "cosine" else "lengthscale"
-        l_t = torch.as_tensor(l, dtype=torch.get_default_dtype())
-        setattr(base, attr, l_t.reshape(getattr(base, attr).shape))
-        if name == "periodic" and period is not None:
-            base.period_length = torch.as_tensor(float(period)).reshape(base.period_length.shape)
-        if name == "rational_quadratic" and rq_alpha is not None:
-            base.alpha = torch.as_tensor(float(rq_alpha)).reshape(base.alpha.shape)
+
+    l_t = l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.get_default_dtype())
+    # l having more than one element means this episode was generated ARD
+    # (cfg.data.ard=True for rbf/matern32/periodic/rational_quadratic, or
+    # always for "hebo") — gpytorch needs ard_num_dims at construction time
+    # to size .lengthscale (and, for "periodic", .period_length — see the
+    # reshape below) correctly before values can be assigned into it.
+    kernel_kwargs = {"ard_num_dims": l_t.numel()} if l_t.numel() > 1 else {}
+    base = _BASE_GPYTORCH_KERNEL_CLS[name](**kernel_kwargs)
+    attr = "period_length" if name == "cosine" else "lengthscale"
+    setattr(base, attr, l_t.reshape(getattr(base, attr).shape))
+    if name == "periodic" and period is not None:
+        period_t = period if torch.is_tensor(period) else torch.as_tensor(float(period))
+        base.period_length = period_t.reshape(base.period_length.shape)
+    if name == "rational_quadratic" and rq_alpha is not None:
+        base.alpha = torch.as_tensor(float(rq_alpha)).reshape(base.alpha.shape)
 
     scale = gpytorch.kernels.ScaleKernel(base)
     scale.outputscale = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(scale.outputscale.shape)
@@ -375,17 +415,19 @@ def build_kernel_fn(
     l,
     alpha2,
     *,
-    period: Optional[float] = None,
+    period: Optional[float | Tensor] = None,
     rq_alpha: Optional[float] = None,
     l_b=None,
     alpha2_b=None,
-    period_b: Optional[float] = None,
+    period_b: Optional[float | Tensor] = None,
     rq_alpha_b: Optional[float] = None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
     """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
 
     l_b/alpha2_b/period_b/rq_alpha_b are the second component's hyperparameters
-    for composite ("A+B" / "A*B") kernels.
+    for composite ("A+B" / "A*B") kernels. l/l_b/period/period_b may be an
+    ARD per-dimension vector (Tensor) instead of a scalar when the episode
+    was generated with cfg.data.ard=True (or "hebo", always ARD).
     """
     composite = _parse_composite(kernel_name)
     if composite is None:
@@ -484,12 +526,10 @@ _COMPOSABLE_KERNELS: List[str] = ["rbf", "matern32", "cosine", "periodic", "rati
 # that include one of these must also cap the active kernel dimensionality
 # to k=1 (see generate_gp_task / generate_gp_batch). Verified empirically:
 # CosineKernel used isotropically is not PSD for k>=2 (Bochner/Schoenberg —
-# an isotropic cos(||x||) is not a valid Mercer kernel for d>1). "periodic" is
-# NOT in this set: gpytorch.kernels.PeriodicKernel sums per-dimension sin²
-# terms inside a single exp() (a product of per-dimension periodic kernels),
-# which is PSD for any k — with or without ard_num_dims (non-ARD just ties
-# the lengthscale/period across dims instead of fitting one per dimension).
-_SCALAR_ONLY_KERNELS = {"cosine"}
+# an isotropic cos(||x||) is not a valid Mercer kernel for d>1); periodic is
+# conservatively capped the same way for behavioural parity even though
+# gpytorch's ARD PeriodicKernel is independently PSD for k>1.
+_SCALAR_ONLY_KERNELS = {"cosine", "periodic"}
 
 
 def _parse_composite(name: str) -> Optional[tuple]:
@@ -589,7 +629,7 @@ def gp_posterior(
     kernel_fn: Callable[[Tensor, Tensor], Tensor],
     noise: float,
     *,
-    latent: bool = False,
+    latent: bool = True,
     return_factors: bool = False,
 ) -> tuple:
     """Analytical GP posterior for an arbitrary stationary kernel.
@@ -654,8 +694,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     d_kernel_max]); the full d_features columns are returned so the model must
     identify which features drive the correlations.
 
-    cosine is capped to k=1 (its PSD guarantee only holds for scalar inputs;
-    see _SCALAR_ONLY_KERNELS).
+    cosine and periodic kernels are capped to k=1 (they are PSD only for scalar inputs).
 
     A nugget ~ LogNormal(...) (see _nugget_prior) is added to the diagonal for
     guaranteed PSD and controls posterior tightness (replaces the former
@@ -693,8 +732,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     d = cfg.data.d_features
 
     # 1. Choose kernel and active columns.
-    # cosine (and any composite containing it) is PSD only for scalar (1D)
-    # inputs; cap to k=1 — see _SCALAR_ONLY_KERNELS.
+    # cosine and periodic (and any composite containing one of them) are PSD
+    # only for scalar (1D) inputs; cap to k=1
     kernel_name = _resolve_kernel_name(cfg)
     if _kernel_needs_scalar_input(kernel_name):
         kernel_cols = [random.randint(0, d - 1)]
@@ -781,8 +820,9 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         "sigma_star": sigma_star,                                # (N,)
         "n_train": torch.tensor(P),
         "n_test": torch.tensor(N),
-        # scalar for every kernel except "hebo", where l is an ARD
-        # per-dimension lengthscale vector (k,) — see _build_scaled_kernel.
+        # scalar, unless the episode was generated ARD (cfg.data.ard=True, or
+        # always for "hebo"), in which case l (and, for "periodic", period)
+        # is a per-dimension vector (k,) — see _build_scaled_kernel.
         "l": l if torch.is_tensor(l) else torch.tensor(l),
         "alpha2": torch.as_tensor(alpha2),
         "nugget": torch.tensor(nugget),

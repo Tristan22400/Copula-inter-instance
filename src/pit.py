@@ -43,6 +43,15 @@ from data_gen import build_kernel_fn, _safe_cholesky  # noqa: E402
 DEFAULT_K_FOLDS = 10
 
 
+def _optional_param(t: torch.Tensor):
+    """Unpack a possibly-ARD-vector task hyperparameter (see data_gen's 0.0
+    "not applicable" sentinel convention): None if every entry is the
+    sentinel, else a python float (scalar) or the raw tensor (ARD vector)."""
+    if torch.all(t == 0.0):
+        return None
+    return t.item() if t.numel() == 1 else t
+
+
 # ---------------------------------------------------------------------------
 # TabICL loader
 # ---------------------------------------------------------------------------
@@ -202,24 +211,28 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_name = task["kernel"]
-    # scalar for every kernel except "hebo", where l is an ARD per-dimension
-    # lengthscale vector (k,) — see data_gen._build_scaled_kernel.
+    # scalar, unless the episode was generated ARD (cfg.data.ard=True for
+    # rbf/matern32/periodic/rational_quadratic, or always for "hebo"), in
+    # which case l is a per-dimension lengthscale vector (k,) — see
+    # data_gen._build_scaled_kernel.
     l_tensor = task["l"]
     l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
     alpha2 = task["alpha2"].item()
     nugget = task["nugget"].item()
-    # 0.0 sentinel means the param is not applicable for this kernel
-    period   = task["period"].item()   if task["period"].item()   != 0.0 else None
+    # 0.0 sentinel means the param is not applicable for this kernel. period
+    # is likewise a per-dimension vector under periodic+ARD (gpytorch's
+    # PeriodicKernel ties period_length's ard_num_dims to lengthscale's).
+    period   = _optional_param(task["period"])
     rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
     # Composite ("A+B"/"A*B") kernels' second component — same 0.0 sentinel
     # convention. Omitting these previously made build_kernel_fn silently
     # reconstruct composites with l_b/alpha2_b=None, crashing with a
     # TypeError as soon as component B's kernel function tried to use them.
-    # l_b (unlike l) is never an ARD vector — composite components are
-    # always base kernels (hebo, the only ARD one, isn't composable).
-    l_b        = task["l_b"].item() if task["l_b"].item() != 0.0 else None
+    # l_b/period_b can be ARD vectors too, same as l/period above, whenever
+    # component B is one of the ARD-eligible base kernels under cfg.data.ard.
+    l_b        = _optional_param(task["l_b"])
     alpha2_b   = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
-    period_b   = task["period_b"].item() if task["period_b"].item() != 0.0 else None
+    period_b   = _optional_param(task["period_b"])
     rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
 
     kernel_fn  = build_kernel_fn(
