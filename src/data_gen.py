@@ -590,10 +590,12 @@ _COMPOSABLE_KERNELS: List[str] = ["rbf", "matern32", "cosine", "periodic", "rati
 # that include one of these must also cap the active kernel dimensionality
 # to k=1 (see generate_gp_task / generate_gp_batch). Verified empirically:
 # CosineKernel used isotropically is not PSD for k>=2 (Bochner/Schoenberg —
-# an isotropic cos(||x||) is not a valid Mercer kernel for d>1); periodic is
-# conservatively capped the same way for behavioural parity even though
-# gpytorch's ARD PeriodicKernel is independently PSD for k>1.
-_SCALAR_ONLY_KERNELS = {"cosine", "periodic"}
+# an isotropic cos(||x||) is not a valid Mercer kernel for d>1). "periodic"
+# is NOT in this set: gpytorch's ARD PeriodicKernel (ard_num_dims=k) is
+# independently PSD for k>1 (per-dimension lengthscale/period, product-
+# combined), so it uses the same _sample_active_dims / ARD path as
+# rbf/matern32/rational_quadratic — see _ARD_ELIGIBLE_KERNELS.
+_SCALAR_ONLY_KERNELS = {"cosine"}
 
 
 def _parse_composite(name: str) -> Optional[tuple]:

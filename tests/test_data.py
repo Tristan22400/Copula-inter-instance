@@ -161,7 +161,7 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     )
 
 
-_ARD_ELIGIBLE_KERNELS = ["rbf", "matern32", "rational_quadratic"]  # "periodic" is capped to k=1 (see below)
+_ARD_ELIGIBLE_KERNELS = ["rbf", "matern32", "rational_quadratic", "periodic"]
 
 
 @pytest.mark.parametrize("kernel_name", _ARD_ELIGIBLE_KERNELS)
