@@ -42,7 +42,7 @@ alpha2_gamma_rate: 3.0
 # Applies to rbf/matern32/periodic/rational_quadratic ("hebo" is always ARD
 # regardless of this flag; "cosine"/"dot_product" can't be — see
 # data_gen.py's module docstring). Default false preserves prior behaviour.
-ard: false
+ard: true
 
 # Nugget: single diagonal regulariser ~ LogNormal(nugget_lognormal_loc, nugget_lognormal_scale).
 # Guarantees PSD and controls posterior tightness (replaces separate noise param).
