@@ -252,22 +252,15 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
             ard=True,
         )
 
-    l_loc = float(getattr(cfg.data, "l_lognormal_loc", math.log(3.0)))
+    l_loc = float(getattr(cfg.data, "l_lognormal_loc", 0.0))
     l_scale = float(getattr(cfg.data, "l_lognormal_scale", 0.7))
-    scale_by_sqrt_k = bool(getattr(cfg.data, "l_scale_by_sqrt_k", True))
     a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
     a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
     ard = bool(getattr(cfg.data, "ard", False)) and kernel_name in _ARD_ELIGIBLE_KERNELS
 
     def lengthscale_prior(k: int) -> LogNormalPrior:
-        # Squared distance sum_{i=1}^k (x1_i - x2_i)^2 grows ~linearly with k
-        # (active kernel dims), so without this shift, k=1 and k=4 tasks
-        # sample from very different effective-correlation regimes even
-        # though l comes from the same distribution — this is the LogNormal
-        # equivalent of the old l_scale_by_sqrt_k range-multiplier (if
-        # l ~ LogNormal(loc, scale) then c*l ~ LogNormal(loc + log(c), scale)).
-        loc = l_loc + (0.5 * math.log(max(k, 1)) if scale_by_sqrt_k else 0.0)
-        return LogNormalPrior(loc, l_scale)
+        # loc is constant in k (active kernel dims) — no sqrt(k)/log(k) shift.
+        return LogNormalPrior(l_loc, l_scale)
 
     # cosine has no `.lengthscale` attribute — its one shape parameter is
     # `.period_length`, playing the same role "l" does in cosine_kernel's
@@ -294,14 +287,11 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
 
 
 def _nugget_prior(cfg, kernel_name: str) -> LogNormalPrior:
-    """Diagonal regulariser prior — same role the old nugget_min/max range played."""
-    if kernel_name == "hebo":
-        return LogNormalPrior(
-            HEBO_PLUS_HYPERPARAMETERS["hebo_noise_logmean"],
-            HEBO_PLUS_HYPERPARAMETERS["hebo_noise_std"],
-        )
-    loc = float(getattr(cfg.data, "nugget_lognormal_loc", math.log(0.15)))
-    scale = float(getattr(cfg.data, "nugget_lognormal_scale", 0.4))
+    """Diagonal regulariser prior, shared by every kernel (including "hebo" — this
+    is HEBO+'s tuned noise prior, LogNormal(-4.63, 0.5), now the default noise
+    floor for all kernels; see HEBO_PLUS_HYPERPARAMETERS for provenance)."""
+    loc = float(getattr(cfg.data, "nugget_lognormal_loc", -4.63))
+    scale = float(getattr(cfg.data, "nugget_lognormal_scale", 0.5))
     return LogNormalPrior(loc, scale)
 
 
