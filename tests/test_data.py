@@ -129,8 +129,8 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.d_features = 6
-    cfg.data.d_kernel_min = 1
-    cfg.data.d_kernel_max = 4
+    cfg.data.inactive_frac_min = 1 / 3     # (6-4)/6 -> k up to 4
+    cfg.data.inactive_frac_max = 5 / 6     # (6-1)/6 -> k down to 1
 
     torch.manual_seed(abs(hash(kernel_name)) % (2**31))
     off_diag_abs = []
@@ -175,8 +175,8 @@ def test_ard_samples_per_dimension_lengthscale(small_cfg, kernel_name):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.d_features = 6
-    cfg.data.d_kernel_min = 3
-    cfg.data.d_kernel_max = 3
+    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_max = 0.5
     cfg.data.ard = True
 
     torch.manual_seed(abs(hash("ard_" + kernel_name)) % (2**31))
@@ -196,8 +196,8 @@ def test_ard_default_false_keeps_isotropic_lengthscale(small_cfg):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.d_features = 6
-    cfg.data.d_kernel_min = 3
-    cfg.data.d_kernel_max = 3
+    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_max = 0.5
 
     torch.manual_seed(0)
     task = generate_gp_task(cfg)
@@ -210,8 +210,8 @@ def test_ard_not_applied_to_cosine_or_dot_product(small_cfg):
     scalar) or not applicable ("dot_product": no lengthscale)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
-    cfg.data.d_kernel_min = 3
-    cfg.data.d_kernel_max = 3
+    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_max = 0.5
     cfg.data.ard = True
 
     torch.manual_seed(0)

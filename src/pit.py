@@ -235,19 +235,25 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     period_b   = _optional_param(task["period_b"])
     rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
 
-    kernel_fn  = build_kernel_fn(
+    # active_dims (gpytorch's own kernel kwarg) lets kernel_fn take the
+    # full-width x_norm_train straight through and select its k active
+    # columns internally — same mechanism data_gen.generate_gp_task uses,
+    # so no manual column slicing is needed here either.
+    cols = task["kernel_feature_indices"].tolist()
+    kernel_fn = build_kernel_fn(
         kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha,
         l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
+        active_dims=cols,
     )
-    cols       = task["kernel_feature_indices"]
-    x_k_train  = task["x_norm_train"][:, cols]   # (P, k)
+    x_k_train = task["x_norm_train"]   # (P, d_features)
     if kernel_name == "hebo":
         # HEBO+'s Gamma-distributed lengthscale is calibrated for x in
         # [0,1]^k (paper Appendix D) — see data_gen.generate_gp_task's same
         # mapping. Skipping this previously left gp_analytical_pit
         # reconstructing HEBO's kernel over the wrong input domain, silently
         # producing a different z_train than the one generate_gp_task itself
-        # computed via _L_ff/_alpha.
+        # computed via _L_ff/_alpha. Safe to map every column: kernel_fn
+        # only ever reads the active_dims columns internally.
         x_k_train = torch.special.ndtr(x_k_train)
     y_train    = task["y_train"]                  # (P,)
     y_test     = task["y_test"]                   # (N,)

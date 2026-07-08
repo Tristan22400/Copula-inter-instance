@@ -31,8 +31,8 @@ from data_gen import generate_gp_task, ALL_KERNELS  # noqa: E402
 @dataclass
 class DataCfg:
     d_features: int = 10
-    d_kernel_min: int = 1
-    d_kernel_max: int = 4
+    inactive_frac_min: float = 0.6
+    inactive_frac_max: float = 0.9
     P_min: int = 5
     P_max: int = 30
     N_min: int = 10

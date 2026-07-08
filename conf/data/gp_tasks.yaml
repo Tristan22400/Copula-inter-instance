@@ -4,11 +4,14 @@
 
 d_features: 10          # total feature columns seen by the neural network
 
-# Kernel active-column selection (random per task)
-# k ~ Uniform[d_kernel_min, d_kernel_max] columns are passed to the kernel;
-# the remaining d_features - k columns are irrelevant noise the model must ignore.
-d_kernel_min: 1
-d_kernel_max: 4
+# Kernel active-column selection (random per task, via gpytorch's own
+# active_dims kernel kwarg — see data_gen.py::_sample_active_dims).
+# A fraction ~ Uniform[inactive_frac_min, inactive_frac_max] of the
+# d_features columns is left inactive (irrelevant noise the model must
+# learn to ignore); the rest are the kernel's active_dims. Defaults below
+# give k = d_features - round(frac*d_features) ~ {1,2,3,4} for d_features=10.
+inactive_frac_min: 0.6
+inactive_frac_max: 0.9
 
 # Training/context set size range
 P_min: 32
@@ -65,6 +68,28 @@ oracle_mode: prior
 # Available kernels: rbf, matern32, cosine, periodic, rational_quadratic, dot_product, hebo
 # (plus 20 "A+B"/"A*B" composites of {rbf, matern32, cosine, periodic, rational_quadratic} — see data_gen.COMPOSITE_KERNELS)
 kernel: dot_product
+
+# "hebo" (PFNs4BO's tuned "HEBO+" prior) needs different P/N ranges than the
+# defaults above — see data_gen.py::HEBO_PLUS_HYPERPARAMETERS and the module
+# docstring for why. l_*/alpha2_*/nugget_* keys above are ignored for this
+# kernel (its Gamma/LogNormal constants are fixed). Override at the CLI
+# rather than switching config files, e.g.:
+#   python src/generate_pit_dataset.py data.kernel=hebo \
+#     data.P_min=512 data.P_max=512 data.N_min=8 data.N_max=64 \
+#     data.dataset_dir=./data/pit_hebo_prior-true data.resume=true
+# P_min=P_max=512: HEBO+'s per-dimension lengthscale ~ Gamma(mean~0.8) on a
+#   UNIT CUBE input domain (see the ndtr mapping in data_gen.py) conditions
+#   away almost all test-side correlation once P grows past a handful of
+#   points — diag_kernels.py showed a screening effect (46% of
+#   |R*_offdiag| < 0.01) at this file's default P range. Tuned empirically,
+#   same as the composite kernels needing P_min=4,P_max=6 overrides.
+# N_max=64 (vs. this file's default 128): HEBO+'s noise nugget is
+#   LogNormal(-4.63, 0.5) — much smaller than every other kernel's
+#   deliberately large nugget floor here. With tiny noise, larger N raises
+#   the chance two test points land close together (near-duplicate under the
+#   sampled lengthscale) and R_star's min eigenvalue dips under this repo's
+#   0.001 well-conditioned floor. Empirically: N_max=128 gave 1/500 episodes
+#   just under the floor (min_eig=9.2e-4); N_max=64 removes the failure.
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter

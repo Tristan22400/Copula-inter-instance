@@ -283,14 +283,22 @@ def _nugget_prior(cfg, kernel_name: str) -> LogNormalPrior:
 
 
 def _build_scaled_kernel(
-    name: str, spec: KernelPriorSpec, k: int, B: int, device
+    name: str, spec: KernelPriorSpec, k: int, B: int, device, active_dims: Optional[List[int]] = None
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
     """Sample B episodes' hyperparameters for one base kernel and return the
     resulting ScaleKernel(base)(batch_shape=[B]) object plus a dict of the
     sampled values (keyed by the output-dict schema names: l, alpha2, and
-    any of spec.extra_priors' keys)."""
+    any of spec.extra_priors' keys).
+
+    active_dims (gpytorch.kernels.Kernel's own constructor kwarg) makes the
+    base kernel select its k active columns out of the caller's full-width
+    input at call time (Kernel.__call__ index_selects them internally) —
+    callers pass the full d_features tensor straight through instead of
+    pre-slicing a (..., k) sub-matrix themselves."""
     batch_shape = torch.Size([B])
     kernel_kwargs: Dict = {"batch_shape": batch_shape}
+    if active_dims is not None:
+        kernel_kwargs["active_dims"] = active_dims
     if spec.ard:
         kernel_kwargs["ard_num_dims"] = k
     # gpytorch kernel modules default to CPU-resident parameters regardless
@@ -329,7 +337,7 @@ def _build_scaled_kernel(
 
 
 def _sample_episode_kernel(
-    cfg, kernel_name: str, k: int, B: int, device
+    cfg, kernel_name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
     """Sample B episodes' hyperparameters for kernel_name (base or "A+B"/"A*B"
     composite) and return (gpytorch Kernel with batch_shape=[B], params dict).
@@ -341,11 +349,19 @@ def _sample_episode_kernel(
     (l, alpha2, period, rq_alpha, l_b, alpha2_b, period_b, rq_alpha_b);
     not-applicable entries are filled with a 0.0 sentinel (the convention
     pit.py::gp_analytical_pit relies on).
+
+    active_dims: column indices (out of the caller's full d_features input)
+    this kernel is active on — None means every column. Forwarded to
+    gpytorch's own active_dims kwarg (see _build_scaled_kernel), so callers
+    pass the full-width input straight through instead of pre-slicing it.
     """
     composite = _parse_composite(kernel_name)
     if kernel_name == "dot_product":
         batch_shape = torch.Size([B])
-        kernel = gpytorch.kernels.LinearKernel(batch_shape=batch_shape).to(device)
+        kernel_kwargs: Dict = {"batch_shape": batch_shape}
+        if active_dims is not None:
+            kernel_kwargs["active_dims"] = active_dims
+        kernel = gpytorch.kernels.LinearKernel(**kernel_kwargs).to(device)
         a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
         a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
         a_sample = GammaPrior(a_conc, a_rate).sample(kernel.variance.shape).to(device)
@@ -356,11 +372,15 @@ def _sample_episode_kernel(
         }
     elif composite is None:
         spec = _kernel_prior_spec(cfg, kernel_name)
-        kernel, params = _build_scaled_kernel(kernel_name, spec, k, B, device)
+        kernel, params = _build_scaled_kernel(kernel_name, spec, k, B, device, active_dims=active_dims)
     else:
         name_a, op, name_b = composite
-        kernel_a, params_a = _build_scaled_kernel(name_a, _kernel_prior_spec(cfg, name_a), k, B, device)
-        kernel_b, params_b = _build_scaled_kernel(name_b, _kernel_prior_spec(cfg, name_b), k, B, device)
+        kernel_a, params_a = _build_scaled_kernel(
+            name_a, _kernel_prior_spec(cfg, name_a), k, B, device, active_dims=active_dims
+        )
+        kernel_b, params_b = _build_scaled_kernel(
+            name_b, _kernel_prior_spec(cfg, name_b), k, B, device, active_dims=active_dims
+        )
         kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
         params = dict(params_a)
         for key, val in params_b.items():
@@ -373,7 +393,7 @@ def _sample_episode_kernel(
 
 
 def _build_concrete_kernel(
-    name: str, l, alpha2, *, period=None, rq_alpha=None
+    name: str, l, alpha2, *, period=None, rq_alpha=None, active_dims: Optional[List[int]] = None
 ) -> gpytorch.kernels.Kernel:
     """Construct a non-batched gpytorch Kernel with CONCRETE hyperparameter
     values assigned — reconstruction (given known values), not sampling.
@@ -383,9 +403,16 @@ def _build_concrete_kernel(
     its `variance` already plays the role `alpha2` plays for every other
     kernel, so wrapping it would just be a second, redundant alpha2. "l" is
     ignored — no lengthscale, geometry comes entirely from the feature space.
+
+    active_dims: column indices this kernel reads out of the caller's
+    full-width input (gpytorch's own kwarg — see _build_scaled_kernel);
+    None means every column.
     """
     if name == "dot_product":
-        kernel = gpytorch.kernels.LinearKernel()
+        kernel_kwargs: Dict = {}
+        if active_dims is not None:
+            kernel_kwargs["active_dims"] = active_dims
+        kernel = gpytorch.kernels.LinearKernel(**kernel_kwargs)
         kernel.variance = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(kernel.variance.shape)
         return kernel
 
@@ -396,6 +423,8 @@ def _build_concrete_kernel(
     # to size .lengthscale (and, for "periodic", .period_length — see the
     # reshape below) correctly before values can be assigned into it.
     kernel_kwargs = {"ard_num_dims": l_t.numel()} if l_t.numel() > 1 else {}
+    if active_dims is not None:
+        kernel_kwargs["active_dims"] = active_dims
     base = _BASE_GPYTORCH_KERNEL_CLS[name](**kernel_kwargs)
     attr = "period_length" if name == "cosine" else "lengthscale"
     setattr(base, attr, l_t.reshape(getattr(base, attr).shape))
@@ -421,6 +450,7 @@ def build_kernel_fn(
     alpha2_b=None,
     period_b: Optional[float | Tensor] = None,
     rq_alpha_b: Optional[float] = None,
+    active_dims: Optional[List[int]] = None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
     """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
 
@@ -428,14 +458,23 @@ def build_kernel_fn(
     for composite ("A+B" / "A*B") kernels. l/l_b/period/period_b may be an
     ARD per-dimension vector (Tensor) instead of a scalar when the episode
     was generated with cfg.data.ard=True (or "hebo", always ARD).
+
+    active_dims: column indices this kernel is active on (both components of
+    a composite share the same active columns — see generate_gp_task/
+    generate_gp_batch, which sample one column subset per task/batch). The
+    caller passes its full-width X1/X2 straight through; gpytorch's own
+    active_dims kwarg selects the columns internally. None means every
+    column (e.g. "dot_product" tasks that draw on all d_features).
     """
     composite = _parse_composite(kernel_name)
     if composite is None:
-        kernel = _build_concrete_kernel(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha)
+        kernel = _build_concrete_kernel(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, active_dims=active_dims)
     else:
         name_a, op, name_b = composite
-        kernel_a = _build_concrete_kernel(name_a, l, alpha2, period=period, rq_alpha=rq_alpha)
-        kernel_b = _build_concrete_kernel(name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b)
+        kernel_a = _build_concrete_kernel(name_a, l, alpha2, period=period, rq_alpha=rq_alpha, active_dims=active_dims)
+        kernel_b = _build_concrete_kernel(
+            name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, active_dims=active_dims
+        )
         kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
 
     # kernel's parameters are CPU-resident regardless of the device l/alpha2
@@ -586,17 +625,20 @@ del _name_a, _name_b, _op, _combo_name
 ALL_KERNELS: List[str] = list(KERNEL_REGISTRY.keys())
 
 
-def _sample_kernel_cols(d_total: int, cfg) -> List[int]:
+def _sample_active_dims(d_total: int, cfg) -> List[int]:
     """Return a sorted list of column indices that the kernel will use.
 
-    k ~ Uniform[d_kernel_min, d_kernel_max]; falls back to all columns when
-    the config keys are absent (backward compat with old episode files).
+    A fraction of the d_total feature columns ~ Uniform[inactive_frac_min,
+    inactive_frac_max] is left inactive (irrelevant noise the model must
+    learn to ignore); the remaining columns are the kernel's active_dims.
+    Falls back to using every column when the config keys are absent
+    (backward compat with old episode files / configs).
     """
-    d_min = int(getattr(cfg.data, "d_kernel_min", d_total))
-    d_max = int(getattr(cfg.data, "d_kernel_max", d_total))
-    d_min = min(d_min, d_total)
-    d_max = min(d_max, d_total)
-    k = random.randint(d_min, d_max)
+    frac_min = float(getattr(cfg.data, "inactive_frac_min", 0.0))
+    frac_max = float(getattr(cfg.data, "inactive_frac_max", 0.0))
+    frac = random.uniform(frac_min, frac_max)
+    k = d_total - round(frac * d_total)
+    k = max(1, min(k, d_total))
     return sorted(random.sample(range(d_total), k))
 
 
@@ -690,9 +732,13 @@ def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
 def generate_gp_task(cfg) -> Dict[str, Tensor]:
     """Sample one GP task and return a dict of tensors.
 
-    The kernel operates on a random subset of k columns (k ~ Uniform[d_kernel_min,
-    d_kernel_max]); the full d_features columns are returned so the model must
-    identify which features drive the correlations.
+    The kernel operates on a random subset of k columns (k = d_features minus
+    a fraction ~ Uniform[inactive_frac_min, inactive_frac_max] of columns left
+    inactive — see _sample_active_dims); the full d_features columns are
+    returned so the model must identify which features drive the
+    correlations. Column selection is done via gpytorch's own active_dims
+    kernel kwarg (see _sample_episode_kernel/build_kernel_fn) — kernel_fn is
+    always called with the full-width x_norm, not a pre-sliced sub-matrix.
 
     cosine and periodic kernels are capped to k=1 (they are PSD only for scalar inputs).
 
@@ -738,7 +784,7 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     if _kernel_needs_scalar_input(kernel_name):
         kernel_cols = [random.randint(0, d - 1)]
     else:
-        kernel_cols = _sample_kernel_cols(d, cfg)
+        kernel_cols = _sample_active_dims(d, cfg)
     k = len(kernel_cols)
 
     # 2. Sample dataset sizes
@@ -750,12 +796,16 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     # implementation, "hebo" no longer needs to defer sampling until x_k
     # exists — its Gamma priors don't depend on the input points.
     nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([1])).item()
-    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, 1, "cpu")
+    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, 1, "cpu", active_dims=kernel_cols)
     l, alpha2, period, rq_alpha = (params[key][0] for key in ("l", "alpha2", "period", "rq_alpha"))
     l_b, alpha2_b, period_b, rq_alpha_b = (
         params[key][0] for key in ("l_b", "alpha2_b", "period_b", "rq_alpha_b")
     )
 
+    # kernel_obj carries active_dims=kernel_cols, so it always takes the
+    # full-width (..., d_features) input and selects its own k active
+    # columns internally (gpytorch.kernels.Kernel.__call__) — no manual
+    # column slicing needed here.
     def kernel_fn(X1: Tensor, X2: Tensor) -> Tensor:
         return kernel_obj(X1.unsqueeze(0), X2.unsqueeze(0)).to_dense()[0]
 
@@ -766,14 +816,15 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     mu_x = x_raw.mean(0)
     std_x = x_raw.std(0).clamp(min=1e-8)
     x_norm = (x_raw - mu_x) / std_x                    # full (P+N, d_features)
-    x_k = x_norm[:, kernel_cols]                        # kernel sub-matrix (P+N, k)
 
     # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k
-    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_k.
-    x_k_kernel = torch.special.ndtr(x_k) if kernel_name == "hebo" else x_k
+    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_norm.
+    # Safe to map every column (not just the active ones): kernel_fn only
+    # ever reads the active_dims columns internally.
+    x_kernel_input = torch.special.ndtr(x_norm) if kernel_name == "hebo" else x_norm
 
     # 5. Sample y ~ GP(0, K + nugget·I) jointly.
-    K_all = kernel_fn(x_k_kernel, x_k_kernel) + nugget * torch.eye(P + N)
+    K_all = kernel_fn(x_kernel_input, x_kernel_input) + nugget * torch.eye(P + N)
     y_all = _safe_cholesky(K_all, max_attempts=12) @ torch.randn(P + N)
 
     # 6. Split into train / test (full features returned to model)
@@ -791,20 +842,20 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
     #   dependence after conditioning on training data.
     # prior: Sigma_star = K_ss + nugget·I, ignoring the training context —
     #   the oracle is the raw kernel structure among test points.
-    x_k_train = x_k_kernel[:P]
-    x_k_test = x_k_kernel[P:]
+    x_kernel_train = x_kernel_input[:P]
+    x_kernel_test = x_kernel_input[P:]
     oracle_mode = getattr(cfg.data, "oracle_mode", "posterior")
     if oracle_mode == "prior":
         # z_train's LOO PIT still needs L_ff/alpha from K_ff regardless of
         # which oracle is used for the test-side R_star/mu_star/sigma_star.
-        K_ff = kernel_fn(x_k_train, x_k_train) + nugget * torch.eye(P, device=x_k_train.device)
+        K_ff = kernel_fn(x_kernel_train, x_kernel_train) + nugget * torch.eye(P, device=x_kernel_train.device)
         L_ff = _safe_cholesky(K_ff, max_attempts=12)
         alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)
-        Sigma_star = kernel_fn(x_k_test, x_k_test) + nugget * torch.eye(N, device=x_k_test.device)
-        mu_star = torch.zeros(N, device=x_k_test.device)
+        Sigma_star = kernel_fn(x_kernel_test, x_kernel_test) + nugget * torch.eye(N, device=x_kernel_test.device)
+        mu_star = torch.zeros(N, device=x_kernel_test.device)
     elif oracle_mode == "posterior":
         mu_star, Sigma_star, L_ff, alpha = gp_posterior(
-            x_k_train, y_train, x_k_test, kernel_fn, nugget, return_factors=True
+            x_kernel_train, y_train, x_kernel_test, kernel_fn, nugget, return_factors=True
         )
     else:
         raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; expected 'prior' or 'posterior'.")
@@ -936,11 +987,14 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
 def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor]]:
     """Generate B GP episodes in a single vectorised call.
 
-    All B episodes share one kernel type and one (P, N) size (both sampled
-    once per call) but have independent hyperparameters and feature draws —
-    gpytorch's `batch_shape=[B]` kernels draw B independent hyperparameter
-    sets in one call (see _sample_episode_kernel), and evaluate all B Gram
-    matrices in one vectorised call to the kernel object. This removes the
+    All B episodes share one kernel type, one (P, N) size, and one set of
+    active_dims/k (all sampled once per call) but have independent
+    hyperparameters and feature draws — gpytorch's `batch_shape=[B]` kernels
+    draw B independent hyperparameter sets in one call (see
+    _sample_episode_kernel), and evaluate all B Gram matrices in one
+    vectorised call to the kernel object (which selects its active_dims
+    columns out of the full-width x_norm internally — see
+    _sample_episode_kernel's active_dims param). This removes the
     Python-loop overhead of B separate generate_gp_task calls and enables GPU
     or CPU-SIMD acceleration for the linear-algebra steps.
 
@@ -975,44 +1029,39 @@ def generate_gp_batch(cfg, B: int, device: str = "cpu") -> List[Dict[str, Tensor
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
 
+    # active_dims (and hence k) is sampled once per batch call and shared by
+    # all B episodes — same granularity as kernel_name/P/N above. gpytorch's
+    # active_dims kernel kwarg is a single fixed column spec per Kernel
+    # instance, so it can't vary per-episode within one batched kernel call
+    # the way the old per-row torch.gather selection did.
     if _kernel_needs_scalar_input(kernel_name):
-        k = 1
+        kernel_cols = [random.randint(0, d - 1)]
     elif kernel_name == "dot_product":
         # Every dot product can draw on all d columns (no lengthscale to
         # dilute with irrelevant dims, unlike rbf/matern32/rational_quadratic).
-        k = d
+        kernel_cols = None
     else:
-        k = random.randint(
-            int(getattr(cfg.data, "d_kernel_min", 1)),
-            min(int(getattr(cfg.data, "d_kernel_max", 4)), d),
-        )
+        kernel_cols = _sample_active_dims(d, cfg)
+    k = d if kernel_cols is None else len(kernel_cols)
 
     # --- Per-episode hyperparameters (B independent draws in one call) ---
     nugget = _nugget_prior(cfg, kernel_name).sample(torch.Size([B])).to(device)
-    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device)
+    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols)
 
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
     x_raw = tabiclv2_warp_features(x_raw)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
-    # --- Select kernel columns ---
-    if kernel_name == "dot_product":
-        x_k = x_norm                                                                # (B, T, d)
-    elif _kernel_needs_scalar_input(kernel_name):
-        col = torch.randint(0, d, (B,), device=device)                             # (B,)
-        x_k = x_norm.gather(2, col.view(B, 1, 1).expand(B, T, 1))                 # (B, T, 1)
-    else:
-        # Vectorised random column selection: argsort of uniform noise picks k cols
-        col_idx = torch.rand(B, d, device=device).argsort(dim=1)[:, :k]           # (B, k)
-        x_k = x_norm.gather(2, col_idx.unsqueeze(1).expand(B, T, k))              # (B, T, k)
-
     # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k
-    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_k.
-    x_k_kernel = torch.special.ndtr(x_k) if kernel_name == "hebo" else x_k
+    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_norm.
+    # Safe to map every column (not just the active ones): kernel_obj only
+    # ever reads its active_dims columns internally (gpytorch.kernels.Kernel
+    # .__call__ index_selects them before forward).
+    x_kernel_input = torch.special.ndtr(x_norm) if kernel_name == "hebo" else x_norm
 
     # --- Build K_all (B, T, T) and sample y jointly ---
-    K_all = kernel_obj(x_k_kernel).to_dense()
+    K_all = kernel_obj(x_kernel_input).to_dense()
     K_all = K_all + nugget.view(B, 1, 1) * torch.eye(T, device=device)
     K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))               # symmetrize float32 drift
 
