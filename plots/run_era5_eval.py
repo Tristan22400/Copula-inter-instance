@@ -29,6 +29,11 @@ real model is available.
 Usage:
     python plots/run_era5_eval.py --nc-path /path/to/era5_temperature.nc \\
         --target-lat-bounds 45 50 --target-lon-bounds 0 5
+
+If --nc-path is omitted, a small real ERA5 sample (Western Europe, 10 daily
+snapshots from Jan 2023) is auto-downloaded from the public no-auth
+ARCO-ERA5 Zarr archive on GCS and cached to `plots/era5_real_default.nc`, so
+the script produces real results out of the box with no arguments.
 """
 
 from __future__ import annotations
@@ -53,7 +58,49 @@ import generate_plots as gp  # noqa: E402
 
 _G = 9.80665  # m/s^2, for geopotential (m^2/s^2) -> elevation (m)
 _TEMP_VAR_CANDIDATES = ("t2m", "2m_temperature", "temperature", "temp")
-_ELEV_VAR_CANDIDATES = ("z", "geopotential", "surface_geopotential", "orography", "elevation", "altitude")
+_ELEV_VAR_CANDIDATES = (
+    "z",
+    "geopotential",
+    "geopotential_at_surface",
+    "surface_geopotential",
+    "orography",
+    "elevation",
+    "altitude",
+)
+
+# Public, no-auth ARCO-ERA5 archive used to auto-fetch a default real-data
+# sample when --nc-path is omitted (see reference memory: no CDS API key
+# needed, unlike plots/generate_plots.py's download_era5).
+_ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
+_DEFAULT_CACHE_NC = os.path.join(_HERE, "era5_real_default.nc")
+_DEFAULT_TARGET_LAT_BOUNDS = (45.0, 50.0)  # Northern France / Belgium
+_DEFAULT_TARGET_LON_BOUNDS = (0.0, 5.0)
+_DEFAULT_FETCH_LAT_BOUNDS = (25.0, 72.0)  # Europe-ish context box
+_DEFAULT_FETCH_LON_BOUNDS = (0.0, 40.0)  # kept in [0, 360) to match ARCO-ERA5's longitude convention
+_DEFAULT_FETCH_TIME_RANGE = ("2023-01-01", "2023-01-10")  # 10 daily (00:00 UTC) snapshots
+
+
+def _fetch_default_era5_subset(cache_path: str = _DEFAULT_CACHE_NC) -> str:
+    """Download a small real ERA5 sample (2m temperature + surface
+    geopotential, Europe box, 10 daily snapshots from Jan 2023) from the
+    public no-auth ARCO-ERA5 Zarr archive and cache it as a local NetCDF
+    file, so this only runs once. Returns `cache_path`."""
+    if os.path.exists(cache_path):
+        return cache_path
+    print(f"No --nc-path given; downloading a small real ERA5 sample to {cache_path} ...")
+    ds = xr.open_zarr(_ARCO_ERA5_URL, chunks={"time": 24}, storage_options={"token": "anon"}, consolidated=True)
+    lat_lo, lat_hi = _DEFAULT_FETCH_LAT_BOUNDS
+    lon_lo, lon_hi = _DEFAULT_FETCH_LON_BOUNDS
+    start, end = _DEFAULT_FETCH_TIME_RANGE
+    sub = ds[["2m_temperature", "geopotential_at_surface"]].sel(
+        latitude=slice(lat_hi, lat_lo),  # ARCO-ERA5 latitude is descending (90 -> -90)
+        longitude=slice(lon_lo, lon_hi),
+        time=slice(start, end),
+    )
+    sub = sub.isel(time=slice(0, None, 24))  # hourly -> daily (00:00 UTC)
+    sub.load().to_netcdf(cache_path)
+    print(f"Saved {cache_path}")
+    return cache_path
 
 # Quantile levels TabICLv2 (real or mock) is queried at for every ICL
 # episode. Dense enough to (a) fit a Gaussian mean/std per target cell via
@@ -83,7 +130,7 @@ def _elevation_field(ds: xr.Dataset, time_idx: int, shape: Tuple[int, int]) -> n
     if "time" in da.dims:
         da = da.isel(time=time_idx)
     field = da.values.astype(np.float64)
-    if elev_var in ("z", "geopotential", "surface_geopotential"):
+    if elev_var in ("z", "geopotential", "geopotential_at_surface", "surface_geopotential"):
         field = field / _G
     return field
 
@@ -345,9 +392,27 @@ def build_calibration_figure(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--nc-path", type=str, required=True, help="Path to a real ERA5 temperature NetCDF file.")
-    parser.add_argument("--target-lat-bounds", type=float, nargs=2, required=True, metavar=("LAT_MIN", "LAT_MAX"))
-    parser.add_argument("--target-lon-bounds", type=float, nargs=2, required=True, metavar=("LON_MIN", "LON_MAX"))
+    parser.add_argument(
+        "--nc-path",
+        type=str,
+        default=None,
+        help="Path to a real ERA5 temperature NetCDF file. If omitted, a small real "
+        f"sample is auto-downloaded and cached to {_DEFAULT_CACHE_NC}.",
+    )
+    parser.add_argument(
+        "--target-lat-bounds",
+        type=float,
+        nargs=2,
+        default=list(_DEFAULT_TARGET_LAT_BOUNDS),
+        metavar=("LAT_MIN", "LAT_MAX"),
+    )
+    parser.add_argument(
+        "--target-lon-bounds",
+        type=float,
+        nargs=2,
+        default=list(_DEFAULT_TARGET_LON_BOUNDS),
+        metavar=("LON_MIN", "LON_MAX"),
+    )
     parser.add_argument("--n-ctx", type=int, default=1000, help="Global context points sampled per timestamp.")
     parser.add_argument(
         "--n-timestamps", type=int, default=None, help="Number of timestamps to evaluate (default: all)."
@@ -360,8 +425,10 @@ def main():
     )
     args = parser.parse_args()
 
+    nc_path = args.nc_path if args.nc_path is not None else _fetch_default_era5_subset()
+
     y_true, all_quantiles = run_era5_eval(
-        args.nc_path,
+        nc_path,
         tuple(args.target_lat_bounds),
         tuple(args.target_lon_bounds),
         n_ctx=args.n_ctx,

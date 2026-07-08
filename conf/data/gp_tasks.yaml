@@ -15,7 +15,7 @@ inactive_frac_max: 0.9
 
 # Training/context set size range
 P_min: 32
-P_max: 1024             # fewer train points → more residual posterior uncertainty
+P_max: 512             # fewer train points → more residual posterior uncertainty
 
 # Test/query set size range (copula is over these N instances)
 N_min: 8
