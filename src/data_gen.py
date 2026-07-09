@@ -966,6 +966,109 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
     return warped_x
 
 
+# Activation bank for DAG feature mixing (adapted from CauKer's SCM activation
+# set, applied here to GP *input coordinates* rather than sampled *outputs* —
+# see apply_dag_feature_mixing's docstring for why this preserves exact
+# analytic Gaussianity while CauKer's approach would not).
+_DAG_MIX_ACTIVATIONS: List[str] = ["linear", "relu", "sigmoid", "sin", "mod", "leaky_relu"]
+
+
+def _apply_dag_activation(x: Tensor, name: str) -> Tensor:
+    """Elementwise nonlinearity for one DAG-mixing layer. `x` is any shape."""
+    if name == "linear":
+        return x
+    if name == "relu":
+        return torch.relu(x)
+    if name == "sigmoid":
+        return torch.sigmoid(x)
+    if name == "sin":
+        return torch.sin(x)
+    if name == "mod":
+        # Remainder by a fixed period (not data-dependent) keeps this a pure
+        # deterministic function of x alone -> still a valid PSD-preserving
+        # feature map; 2*pi period avoids introducing a new magic-number
+        # scale unrelated to the 'sin' branch above.
+        return torch.remainder(x, 2 * math.pi)
+    if name == "leaky_relu":
+        return torch.nn.functional.leaky_relu(x, negative_slope=0.1)
+    raise ValueError(f"Unknown DAG-mixing activation '{name}'")
+
+
+def apply_dag_feature_mixing(x: Tensor, cfg, device) -> Tensor:
+    """Randomly mix the GP's input feature columns through a small stack of
+    dense affine + nonlinearity layers, applied to input coordinates x (never
+    to sampled outputs y) so k(f(x_i), f(x_j)) remains a valid PSD kernel for
+    the fixed deterministic map f = this mixing stack composed with
+    tabiclv2_warp_features -- preserving EXACT analytic Gaussianity (closed-
+    form GP posterior/Cholesky oracle), unlike CauKer's SCM approach of mixing
+    sampled *outputs* through a random DAG (which would force Monte Carlo).
+
+    Structure mirrors the rest of this file's "shared structure across the
+    batch, independent per-episode parameters" convention (kernel_name,
+    active_dims, tabiclv2_warp_features's per-(episode,column) transform
+    choice): the number of layers L and each layer's activation name are
+    sampled ONCE per batch call (shared across all B episodes); each layer's
+    weight matrix and bias are sampled independently PER EPISODE and applied
+    via a batched einsum (no Python loop over B).
+
+    Note on active_dims/ARD semantics: this is a DENSE mix (every output
+    column is a combination of every input column), so it partially subverts
+    the "inactive_frac_min/max leaves some columns as pure noise" contract
+    downstream in _sample_active_dims -- post-mixing, no column is purely
+    irrelevant anymore. This is an accepted trade-off for increased task
+    diversity, not a bug.
+
+    Args:
+        x: (B, T, d) tensor, already warped by tabiclv2_warp_features, NOT
+            yet z-normalised (this runs before the existing per-episode
+            mean/std normalisation step).
+        cfg: Hydra config; reads cfg.data.dag_mixing_* keys (see
+            conf/data/gp_tasks.yaml), all optional/backward-compatible via
+            getattr defaults (dag_mixing_enabled defaults False -> exact
+            no-op, byte-for-byte, for every existing config/dataset).
+        device: torch device string, threaded through for the new W_l/b_l
+            parameter tensors (same convention as the rest of this file).
+
+    Returns:
+        (B, T, d) tensor, same shape/dtype as x. Episodes not selected by the
+        per-episode Bernoulli gate (dag_mixing_prob) are returned unchanged.
+    """
+    if not bool(getattr(cfg.data, "dag_mixing_enabled", False)):
+        return x
+
+    mixing_prob = float(getattr(cfg.data, "dag_mixing_prob", 0.3))
+    if mixing_prob <= 0.0:
+        return x
+
+    L_min = int(getattr(cfg.data, "dag_num_layers_min", 1))
+    L_max = int(getattr(cfg.data, "dag_num_layers_max", 2))
+    w_std = float(getattr(cfg.data, "dag_mix_weight_std", 1.0))
+
+    B, T, d = x.shape
+    L = random.randint(L_min, L_max)
+    # Activation sequence shared across the whole batch call (same granularity
+    # as kernel_name/P/N/active_dims above) -- NOT per-episode, so every mixed
+    # episode in this batch call shares one topology, differing only in the
+    # sampled W_l/b_l weight values.
+    activations = [random.choice(_DAG_MIX_ACTIVATIONS) for _ in range(L)]
+
+    x_mixed = x
+    for act_name in activations:
+        # 1/sqrt(d) fan-in scaling keeps the pre-activation roughly variance-
+        # preserving (same purpose as Xavier/He init) -- an empirically-tuned
+        # default rather than an analytically-guaranteed bound; validated by
+        # test_dag_mixing_goldilocks_and_psd in tests/test_data.py.
+        W_l = torch.randn(B, d, d, device=device) * (w_std / math.sqrt(d))
+        b_l = torch.randn(B, 1, d, device=device) * w_std
+        x_mixed = torch.einsum("btd,bde->bte", x_mixed, W_l) + b_l
+        x_mixed = _apply_dag_activation(x_mixed, act_name)
+
+    gate = (torch.rand(B, device=device) < mixing_prob)[:, None, None]  # (B,1,1)
+    # (B,1,1) is required for correct broadcast against (B,T,d); a bare (B,)
+    # shape misaligns on the trailing (T, d) dims instead of the batch dim.
+    return torch.where(gate, x_mixed, x)
+
+
 @torch.no_grad()
 def generate_gp_batch(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
@@ -1041,7 +1144,10 @@ def generate_gp_batch(
     # all B episodes — same granularity as kernel_name/P/N above. gpytorch's
     # active_dims kernel kwarg is a single fixed column spec per Kernel
     # instance, so it can't vary per-episode within one batched kernel call
-    # the way the old per-row torch.gather selection did.
+    # the way the old per-row torch.gather selection did. Note: when
+    # apply_dag_feature_mixing is enabled, every output column is a dense mix
+    # of all d input columns, so "inactive" columns selected here are no
+    # longer purely irrelevant noise — see apply_dag_feature_mixing's docstring.
     if _kernel_needs_scalar_input(kernel_name):
         kernel_cols = [random.randint(0, d - 1)]
     elif kernel_name == "dot_product":
@@ -1074,6 +1180,7 @@ def generate_gp_batch(
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
     x_raw = tabiclv2_warp_features(x_raw)
+    x_raw = apply_dag_feature_mixing(x_raw, cfg, device)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
     # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k

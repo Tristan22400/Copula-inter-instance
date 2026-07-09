@@ -42,6 +42,28 @@ alpha2_gamma_rate: 3.0
 # data_gen.py's module docstring). Default false preserves prior behaviour.
 ard: true
 
+# DAG feature mixing: optionally entangle the d_features input columns
+# through a small stack of random dense affine + nonlinearity layers,
+# applied to the GP's INPUT coordinates x (never to sampled outputs y)
+# before the existing per-episode z-normalisation -- preserves the EXACT
+# analytic oracle. See data_gen.py::apply_dag_feature_mixing.
+# Default off: byte-for-byte no-op for every existing config/dataset.
+dag_mixing_enabled: false
+# Fraction of episodes per generate_gp_batch call that get mixed at all
+# (Bernoulli gate); the rest pass through unmixed, mirroring
+# tabiclv2_warp_features's identity-transform choice.
+dag_mixing_prob: 0.3
+# Number of mixing layers, sampled once per batch call (shared by every
+# episode in that call). Kept small (1-2): each layer risks collapsing
+# R_star toward independence or saturating an activation -- validate any
+# change against tests/test_dataset_corr_uniform.py on a pilot dataset
+# before a full generation run.
+dag_num_layers_min: 1
+dag_num_layers_max: 2
+# Std of each layer's random weight matrix before 1/sqrt(d_features)
+# fan-in scaling -- keeps the pre-activation roughly variance-preserving.
+dag_mix_weight_std: 1.0
+
 # Nugget/noise: single diagonal regulariser ~ LogNormal(nugget_lognormal_loc,
 # nugget_lognormal_scale), shared by ALL kernels including "hebo" (this is
 # now literally HEBO+'s tuned noise prior — see
