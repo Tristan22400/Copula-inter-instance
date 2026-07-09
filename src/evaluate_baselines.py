@@ -203,9 +203,14 @@ def _randomize_init(
     every time.
     """
     base = model.covar_module if kernel_name == "dot_product" else model.covar_module.base_kernel
-    device = base.lengthscale.device if hasattr(base, "lengthscale") else next(model.parameters()).device
+    # gpytorch's Kernel base class defines a `lengthscale` property on every
+    # kernel (returning None for kernels with has_lengthscale=False, e.g.
+    # LinearKernel) rather than raising AttributeError, so hasattr() alone
+    # can't distinguish "no lengthscale" from "has one" — check the value too.
+    has_lengthscale = getattr(base, "lengthscale", None) is not None
+    device = base.lengthscale.device if has_lengthscale else next(model.parameters()).device
     ls_prior = kernel_priors.get("lengthscale_prior", lengthscale_init_prior)
-    if ls_prior is not None and hasattr(base, "lengthscale"):
+    if ls_prior is not None and has_lengthscale:
         base.lengthscale = ls_prior.sample(base.lengthscale.shape).to(device)
     if "period_length_prior" in kernel_priors:
         base.period_length = kernel_priors["period_length_prior"].sample(base.period_length.shape).to(device)
