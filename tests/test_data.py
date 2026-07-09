@@ -18,7 +18,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import ALL_KERNELS, generate_gp_task, gp_posterior, sigma_to_correlation
+from data_gen import ALL_KERNELS, _kernel_needs_scalar_input, generate_gp_task, gp_posterior, sigma_to_correlation
 from dataset import CopulaDataset, collate_fn
 
 # ---------------------------------------------------------------------------
@@ -158,6 +158,66 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     )
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
         f"{kernel_name}: degenerate/trivial, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+
+
+def test_kernel_needs_scalar_input_handles_n_way_chains():
+    """Regression test: _kernel_needs_scalar_input used to route through
+    _parse_composite, which only handles exactly 2 parts via .partition() —
+    for a 3-way systematic-composition chain like "rbf+cosine*periodic",
+    that mis-parsed as non-composite and silently returned False even though
+    cosine (scalar-only) is present. The generic re.split-based
+    implementation must catch cosine anywhere in the chain, regardless of
+    position or chain length."""
+    assert _kernel_needs_scalar_input("rbf+cosine*periodic") is True
+    assert _kernel_needs_scalar_input("periodic*matern32+cosine") is True
+    assert _kernel_needs_scalar_input("rbf+periodic*matern32") is False
+    # Existing base-kernel / 2-way-composite behaviour must be unchanged.
+    assert _kernel_needs_scalar_input("cosine") is True
+    assert _kernel_needs_scalar_input("rbf") is False
+    assert _kernel_needs_scalar_input("rbf+cosine") is True
+    assert _kernel_needs_scalar_input("rbf+periodic") is False
+
+
+def test_systematic_composition_goldilocks_and_psd(small_cfg):
+    """cfg.data.systematic_composition=True (CauKer-style chain sampling)
+    must produce a valid R_star on every draw, same hard invariants as
+    test_kernel_goldilocks_and_psd. Not ALL_KERNELS-parametrized (chain
+    names are sampled at runtime, unbounded cardinality) and only keeps the
+    _COLLAPSE_THRESHOLD lower-bound Goldilocks check — the upper
+    (_DEGENERATE_THRESHOLD) bound is expected to trip legitimately for
+    short/product-heavy chains and would be flaky here."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.systematic_composition = True
+    cfg.data.composite_num_kernels_min = 1
+    cfg.data.composite_num_kernels_max = 3
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 1 / 3
+    cfg.data.inactive_frac_max = 5 / 6
+
+    torch.manual_seed(123)
+    off_diag_abs = []
+    for _ in range(20):
+        task = generate_gp_task(cfg)
+        R = task["R_star"]
+        N = R.shape[0]
+
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4), (
+            f"{task['kernel']}: diagonal not 1: {R.diagonal()}"
+        )
+        assert torch.allclose(R, R.T, atol=1e-5), f"{task['kernel']}: not symmetric"
+        eigvals = torch.linalg.eigvalsh(R)
+        assert (eigvals >= -1e-4).all(), (
+            f"{task['kernel']}: not PSD (min eig={eigvals.min():.6f})"
+        )
+        assert R.abs().max() <= 1.0 + 1e-5, f"{task['kernel']}: value outside [-1, 1]"
+
+        mask = ~torch.eye(N, dtype=torch.bool)
+        off_diag_abs.append(R[mask].abs())
+
+    mean_abs_r = torch.cat(off_diag_abs).mean().item()
+    assert mean_abs_r > _COLLAPSE_THRESHOLD, (
+        f"systematic_composition: screening effect, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
 
 

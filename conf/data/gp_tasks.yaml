@@ -70,6 +70,22 @@ oracle_mode: prior
 # (plus 20 "A+B"/"A*B" composites of {rbf, matern32, cosine, periodic, rational_quadratic} — see data_gen.COMPOSITE_KERNELS)
 kernel: rbf
 
+# Systematic composition (CauKer-style, github.com/ShifengXIE/CauKer): if
+# true, ignores kernel/kernels above entirely and instead samples a random
+# chain length M ~ Uniform[composite_num_kernels_min, composite_num_kernels_max],
+# draws M elementary kernels with replacement from {rbf, matern32, cosine,
+# periodic, rational_quadratic}, and combines them left-to-right with
+# independently-sampled +/* operators — see data_gen.py::
+# _sample_kernel_chain_structure / _build_kernel_chain. Produces chain names
+# like "rbf+cosine*periodic" that are NOT in ALL_KERNELS/KERNEL_REGISTRY
+# (unbounded cardinality) and are not reconstructible via build_kernel_fn.
+systematic_composition: false
+composite_num_kernels_min: 1
+composite_num_kernels_max: 4    # smaller than CauKer's up-to-8 — avoids
+                                 # over-multiplied R_star collapsing under
+                                 # this repo's well-conditioned/Goldilocks
+                                 # floor checks
+
 # "hebo" (PFNs4BO's tuned "HEBO+" prior) needs different P/N ranges than the
 # defaults above — see data_gen.py::HEBO_PLUS_HYPERPARAMETERS and the module
 # docstring for why. l_*/alpha2_*/nugget_* keys above are ignored for this
