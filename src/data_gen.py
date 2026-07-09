@@ -71,12 +71,33 @@ Composite kernels ("A+B" / "A*B")
   signatures — no lengthscale, or ARD-only). cfg.data.ard applies
   independently to each ARD-eligible component of a composite.
 
+  Systematic composition (cfg.data.systematic_composition, CauKer-style —
+  github.com/ShifengXIE/CauKer): an alternative, opt-in generative mode that
+  samples a random chain length M ~ Uniform[composite_num_kernels_min,
+  composite_num_kernels_max], draws M elementary kernels with replacement
+  from {rbf, matern32, cosine, periodic, rational_quadratic}, and combines
+  them left-to-right with independently-sampled +/* operators (see
+  _sample_kernel_chain_structure / _build_kernel_chain), instead of the
+  static enumerated 2-way COMPOSITE_KERNELS list. Produces chain names like
+  "rbf+cosine*periodic" that are NOT registered in ALL_KERNELS/
+  KERNEL_REGISTRY (unbounded cardinality) and are not reconstructible via
+  build_kernel_fn — see generate_gp_batch's return_kernel_metadata handling
+  for the separate kernel_components/kernel_ops/kernel_component_params
+  schema this mode uses instead of the flat l/alpha2/l_b/alpha2_b keys.
+
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
   cfg.data.kernel   : str          → use this single kernel for every task
                                      (any entry in ALL_KERNELS, including composites)
   cfg.data.kernels  : list[str]    → sample uniformly at task generation time
-  If both are absent the default is "rbf".
+  cfg.data.systematic_composition : bool → if True, ignore cfg.data.kernel/
+                                     kernels entirely and sample a fresh
+                                     random-length kernel chain per
+                                     batch/task call instead (see
+                                     "Systematic composition" above).
+                                     Default False.
+  If both kernel/kernels are absent (and systematic_composition is False)
+  the default is "rbf".
 """
 
 from __future__ import annotations
@@ -85,6 +106,7 @@ import functools
 import itertools
 import math
 import random
+import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -609,12 +631,15 @@ def _parse_composite(name: str) -> Optional[tuple]:
 
 
 def _kernel_needs_scalar_input(kernel_name: str) -> bool:
-    """True if this kernel (or either half of a composite) requires k=1 input dims."""
-    composite = _parse_composite(kernel_name)
-    if composite is not None:
-        name_a, _, name_b = composite
-        return name_a in _SCALAR_ONLY_KERNELS or name_b in _SCALAR_ONLY_KERNELS
-    return kernel_name in _SCALAR_ONLY_KERNELS
+    """True if this kernel (or any component of a composite/chain) requires
+    k=1 input dims. Uses a generic re.split rather than _parse_composite
+    (which only handles exactly 2 parts via .partition) so this is correct
+    for both the legacy 2-way composites and arbitrary-length systematic
+    chains (cfg.data.systematic_composition) alike — e.g. a 3-way chain like
+    "rbf+cosine*periodic" must still be detected as scalar-only because of
+    the cosine component, even though it isn't a name _parse_composite
+    recognizes."""
+    return any(part in _SCALAR_ONLY_KERNELS for part in re.split(r"[+*]", kernel_name))
 
 
 def _composite_kernel(
@@ -684,6 +709,49 @@ def _resolve_kernel_name(cfg) -> str:
                 raise ValueError(f"Unknown kernel '{k}'. Choose from {ALL_KERNELS}.")
         return random.choice(pool)
     return "rbf"
+
+
+def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
+    """CauKer-style composition (github.com/ShifengXIE/CauKer): sample a
+    random component COUNT m ~ Uniform[composite_num_kernels_min,
+    composite_num_kernels_max], then a length-m list of elementary kernels
+    (with replacement) from _COMPOSABLE_KERNELS, then m-1 independently
+    sampled +/* operators to combine them left-to-right (functools.reduce,
+    see _build_kernel_chain) — instead of picking from the fixed 20-entry
+    COMPOSITE_KERNELS pool. Active only when cfg.data.systematic_composition
+    is True (see _resolve_kernel_name's docstring for the non-systematic
+    path). Returns (names, ops, chain_name) where chain_name is the same
+    "A+B*C"-style left-to-right string the static composites already use
+    (m=1 degenerates to a bare base-kernel name, no ops)."""
+    lo = int(getattr(cfg.data, "composite_num_kernels_min", 1))
+    hi = int(getattr(cfg.data, "composite_num_kernels_max", 4))
+    m = random.randint(lo, hi)
+    names = random.choices(_COMPOSABLE_KERNELS, k=m)
+    ops = [random.choice(("+", "*")) for _ in range(m - 1)]
+    chain_name = names[0] + "".join(f"{op}{name}" for op, name in zip(ops, names[1:]))
+    return names, ops, chain_name
+
+
+def _build_kernel_chain(
+    cfg, names: List[str], ops: List[str], k: int, B: int, device, active_dims: Optional[List[int]] = None
+) -> tuple[gpytorch.kernels.Kernel, List[Dict[str, Tensor]]]:
+    """Sample B episodes' hyperparameters for each component in `names` (via
+    the same _build_scaled_kernel/_kernel_prior_spec machinery
+    _sample_episode_kernel's composite branch already uses — no new
+    hyperparameter-sampling logic) and combine the resulting kernel objects
+    left-to-right per `ops`. Returns the combined Kernel plus one params
+    dict per component (in `names` order), UNFLATTENED — not coerced into
+    the legacy l_b/alpha2_b-style schema, since component count is variable
+    here (see generate_gp_batch's return_kernel_metadata handling)."""
+    built = [
+        _build_scaled_kernel(name, _kernel_prior_spec(cfg, name), k, B, device, active_dims=active_dims)
+        for name in names
+    ]
+    kernel = built[0][0]
+    for op, (comp_kernel, _) in zip(ops, built[1:]):
+        kernel = kernel + comp_kernel if op == "+" else kernel * comp_kernel
+    component_params = [params for _, params in built]
+    return kernel, component_params
 
 
 # ---------------------------------------------------------------------------
@@ -953,7 +1021,17 @@ def generate_gp_batch(
     d = cfg.data.d_features
 
     # --- Shared settings for this batch ---
-    kernel_name = _resolve_kernel_name(cfg)
+    # systematic_composition (CauKer-style, see _sample_kernel_chain_structure)
+    # bypasses cfg.data.kernel/kernels entirely and samples a fresh
+    # variable-length kernel chain instead — resolved here (before the
+    # kernel_cols/k decision below) since chain components are always drawn
+    # from _COMPOSABLE_KERNELS, so _kernel_needs_scalar_input still applies
+    # and the "dot_product" branch below is simply never taken.
+    systematic = bool(getattr(cfg.data, "systematic_composition", False))
+    if systematic:
+        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg)
+    else:
+        kernel_name = _resolve_kernel_name(cfg)
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
@@ -975,7 +1053,21 @@ def generate_gp_batch(
     k = d if kernel_cols is None else len(kernel_cols)
 
     # --- Per-episode hyperparameters + noise (B independent draws in one call) ---
-    kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols)
+    if systematic:
+        kernel_obj, component_params = _build_kernel_chain(
+            cfg, chain_names, chain_ops, k, B, device, active_dims=kernel_cols
+        )
+        # Legacy zero-sentinel schema (see _sample_episode_kernel's docstring)
+        # is kept populated so the rest of this function — nugget sampling,
+        # GP prior/posterior machinery, metadata packing loop below — is
+        # untouched regardless of mode; the real per-component values live in
+        # component_params instead (see the return_kernel_metadata block).
+        params = {
+            key: torch.zeros(B, device=device)
+            for key in ("l", "alpha2", "period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b")
+        }
+    else:
+        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols)
     likelihood = _build_likelihood(cfg, kernel_name, B, device)
     nugget = likelihood.noise.reshape(B)  # "nugget" name kept for the saved-metadata schema
 
@@ -1135,7 +1227,26 @@ def generate_gp_batch(
             kernel_cols if kernel_cols is not None else list(range(d)), dtype=torch.long
         )
 
-    return [
+    episodes = [
         {key: val[b] for key, val in tensors.items()} | extra
         for b in range(B)
     ]
+
+    if return_kernel_metadata and systematic:
+        # Systematic-composition chains have a variable component count, so
+        # their per-component hyperparameters don't fit the legacy flat
+        # l/alpha2/l_b/alpha2_b schema populated with zero-sentinels above.
+        # kernel_components/kernel_ops are shared across the batch (like
+        # extra["kernel"] already is); kernel_component_params is a plain
+        # per-episode Python list (not a stacked tensor) so heterogeneous
+        # ARD-vector-vs-scalar "l" shapes across components don't need
+        # padding. Not reconstructible via build_kernel_fn — see module
+        # docstring's "Systematic composition" section.
+        for b in range(B):
+            episodes[b]["kernel_components"] = chain_names
+            episodes[b]["kernel_ops"] = chain_ops
+            episodes[b]["kernel_component_params"] = [
+                {pk: pv[b].cpu() for pk, pv in comp.items()} for comp in component_params
+            ]
+
+    return episodes
