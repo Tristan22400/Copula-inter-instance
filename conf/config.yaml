@@ -22,7 +22,7 @@ training:
   val_every: 500
   save_every: 5000
   ckpt_dir: null
-  dataset_dir: ./data/dot-product-posterior/pit
+  dataset_dir: ./data/rbf-prior-2/pit
   val_fraction: 0.05   # fraction of episodes held out for validation
   # For sharded datasets: shuffle within blocks of this many shards at a time
   # (all shuffled together, IO-cache resident) instead of one global shuffle
@@ -31,7 +31,7 @@ training:
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
-  muon_lr: 8.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
+  muon_lr: 1.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
   muon_lr_min: 1.0e-6         # cosine decay floor
   muon_momentum: 0.95
   muon_weight_decay: 0.01     # cautious weight decay (Chen et al. 2025a)
@@ -45,7 +45,7 @@ training:
   nll_weight: 1.0
   # Auxiliary MSE loss on off-diagonal correlations vs oracle R_star.
   # Provides a direct gradient signal; 0.0 disables it entirely.
-  aux_mse_weight: 1.0
+  aux_mse_weight: 0.0
 
 tabicl:
   pretrained: true   # false → randomly-initialised backbone (uses arch section below)

@@ -459,8 +459,17 @@ def main(cfg: DictConfig) -> None:
         )
         n = len(full_dataset)
         n_val = min(49, max(1, int(n * t.val_fraction)))
-        train_dataset = Subset(full_dataset, range(n_val, n))
-        val_dataset   = Subset(full_dataset, range(n_val))
+        # generate_gp_batch (data_gen.py) samples kernel_name/P/N/active_dims
+        # once per shard call, shared by every episode in that shard — a
+        # contiguous index block smaller than shard_size (as a plain
+        # range(n_val) would be) pins validation to a single task shape
+        # instead of sampling the full config distribution train sees. Stride
+        # evenly across the whole dataset so val spans many shards/configs.
+        val_indices = sorted(set(int(i) for i in torch.linspace(0, n - 1, n_val)))
+        val_set = set(val_indices)
+        train_indices = [i for i in range(n) if i not in val_set]
+        train_dataset = Subset(full_dataset, train_indices)
+        val_dataset   = Subset(full_dataset, val_indices)
         # Sharded datasets can span thousands of shards; a global shuffle
         # scatters each batch across dozens of them, thrashing the shard LRU
         # cache (dataset.py) with repeated full-shard reloads from disk/NFS.

@@ -23,7 +23,7 @@
 #                      col → col_embedder   (3 induced-SA blocks, 2 MHAs each)
 
 enabled: false
-rank: 8
+rank: 16
 alpha: 16.0
 target: "qkvo"
 stages:
