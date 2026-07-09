@@ -60,6 +60,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
 from omegaconf import OmegaConf
 from torch import Tensor
 from torch.optim import Adam
@@ -110,6 +111,111 @@ _ARD_ELIGIBLE = {
     "dot_product": False,
 }
 
+# Default hyperprior constants, mirroring data_gen.py's _kernel_prior_spec /
+# _nugget_prior fallback defaults (the actual per-dataset values live in the
+# checkpoint's own saved cfg.data and are threaded in via prior_cfg — these
+# are only the fallback if a key happens to be missing there).
+_DEFAULT_PRIOR_CFG: dict[str, float] = {
+    "l_lognormal_loc": 0.0,
+    "l_lognormal_scale": 0.7,
+    "alpha2_gamma_concentration": 4.0,
+    "alpha2_gamma_rate": 3.0,
+    "period_lognormal_loc": math.log(1.2),
+    "period_lognormal_scale": 0.4,
+    "rq_alpha_gamma_concentration": 2.0,
+    "rq_alpha_gamma_rate": 1.0,
+    "nugget_lognormal_loc": -4.63,
+    "nugget_lognormal_scale": 0.5,
+}
+
+
+def _kernel_priors(prior_cfg: dict, kernel_name: str, ard: bool = False) -> dict[str, Prior]:
+    """Build the same LogNormal/Gamma hyperpriors data_gen.py's generative
+    process samples ground-truth hyperparameters from (see
+    data_gen._kernel_prior_spec / _nugget_prior), for MAP — instead of plain
+    MLE — fitting of the GP baselines here.
+
+    Plain MLE over an ARD lengthscale vector has no reason to prefer "large
+    lengthscale" (irrelevant dimension) over "small lengthscale" (active
+    dimension, poorly identified from limited context) when both explain the
+    P training points similarly well — the marginal-likelihood surface is
+    flat/multimodal in that direction. Registering these priors on the
+    kernel/likelihood makes ExactMarginalLogLikelihood add their log-density
+    automatically (gpytorch sums every registered prior's log_prob via
+    Module.named_priors() — no separate loss-term plumbing needed), pulling
+    the fit toward the same hyperparameter regime the episodes were actually
+    generated from.
+
+    ard=True omits the lengthscale prior specifically: LogNormal(l_loc, l_scale)
+    describes the lengthscale of a dimension already known to be active — its
+    median-1 pull actively discourages the "grow arbitrarily large" behaviour
+    an ARD lengthscale needs to correctly flag a dimension as irrelevant.
+    Measured on one rbf-prior-2 episode (10 dims, ~60-90% inactive):
+    registering it homogenised all 10 fitted lengthscales into a narrow
+    0.4-1.0 band (vs. a plain-MLE run that let 2 of them grow to ~4, correctly
+    flagging those as inactive) and *reduced* recovered off-diagonal
+    correlation (max |corr| 0.60 -> 0.40) despite restarts making the fit
+    reliable/reproducible across inits. Outputscale/noise priors showed no
+    such conflict (they aren't asked to do variable selection) and stay on
+    unconditionally.
+    """
+    cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
+    if kernel_name == "dot_product":
+        return {"variance_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"])}
+    priors: dict[str, Prior] = {
+        "outputscale_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"]),
+    }
+    if not ard:
+        priors["lengthscale_prior"] = LogNormalPrior(cfg["l_lognormal_loc"], cfg["l_lognormal_scale"])
+    if kernel_name == "periodic":
+        priors["period_length_prior"] = LogNormalPrior(cfg["period_lognormal_loc"], cfg["period_lognormal_scale"])
+    elif kernel_name == "rational_quadratic":
+        priors["alpha_prior"] = GammaPrior(cfg["rq_alpha_gamma_concentration"], cfg["rq_alpha_gamma_rate"])
+    return priors
+
+
+def _noise_prior(prior_cfg: dict) -> LogNormalPrior:
+    cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
+    return LogNormalPrior(cfg["nugget_lognormal_loc"], cfg["nugget_lognormal_scale"])
+
+
+def _lengthscale_init_prior(prior_cfg: dict) -> LogNormalPrior:
+    """Same LogNormal distribution _kernel_priors would've used for the
+    lengthscale prior — used here only to sample a fresh *initial* value per
+    restart when ard=True omits it as a registered MAP prior (see
+    _kernel_priors' ard docs), so ARD restarts still diversify their starting
+    point instead of all beginning from gpytorch's identical default init."""
+    cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
+    return LogNormalPrior(cfg["l_lognormal_loc"], cfg["l_lognormal_scale"])
+
+
+def _randomize_init(
+    model: "_ExactGPModel",
+    kernel_priors: dict[str, Prior],
+    kernel_name: str,
+    lengthscale_init_prior: Prior | None = None,
+) -> None:
+    """Sample a fresh initial value for every registered prior's parameter —
+    called once per restart (before .train()/optimizer construction, so the
+    in-place `.initialize()` copy these setters do is safe; see the module
+    note above about not using them mid-training) to diversify restarts
+    instead of re-running Adam from the same fixed gpytorch default init
+    every time.
+    """
+    base = model.covar_module if kernel_name == "dot_product" else model.covar_module.base_kernel
+    device = base.lengthscale.device if hasattr(base, "lengthscale") else next(model.parameters()).device
+    ls_prior = kernel_priors.get("lengthscale_prior", lengthscale_init_prior)
+    if ls_prior is not None and hasattr(base, "lengthscale"):
+        base.lengthscale = ls_prior.sample(base.lengthscale.shape).to(device)
+    if "period_length_prior" in kernel_priors:
+        base.period_length = kernel_priors["period_length_prior"].sample(base.period_length.shape).to(device)
+    if "alpha_prior" in kernel_priors:
+        base.alpha = kernel_priors["alpha_prior"].sample(base.alpha.shape).to(device)
+    if "variance_prior" in kernel_priors:
+        model.covar_module.variance = kernel_priors["variance_prior"].sample(model.covar_module.variance.shape).to(device)
+    if "outputscale_prior" in kernel_priors:
+        model.covar_module.outputscale = kernel_priors["outputscale_prior"].sample(model.covar_module.outputscale.shape).to(device)
+
 
 class _ExactGPModel(gpytorch.models.ExactGP):
     """ExactGP wrapper over one of the five baseline kernels, optionally
@@ -123,10 +229,12 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         kernel_name: str,
         ard_num_dims: int | None = None,
         feature_extractor: nn.Module | None = None,
+        kernel_priors: dict[str, Prior] | None = None,
     ) -> None:
         super().__init__(X_train, z_train, likelihood)
         self.feature_extractor = feature_extractor
         self.mean_module = gpytorch.means.ZeroMean()
+        kp = kernel_priors or {}
 
         # PeriodicKernel reads `kwargs.get("ard_num_dims", 1)` directly rather
         # than through the base Kernel class's None-handling, so passing
@@ -135,15 +243,19 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         ard_kw = {} if ard_num_dims is None else {"ard_num_dims": ard_num_dims}
 
         if kernel_name == "rbf":
-            base = gpytorch.kernels.RBFKernel(**ard_kw)
+            base = gpytorch.kernels.RBFKernel(lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
         elif kernel_name == "matern32":
-            base = gpytorch.kernels.MaternKernel(nu=1.5, **ard_kw)
+            base = gpytorch.kernels.MaternKernel(nu=1.5, lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
         elif kernel_name == "periodic":
-            base = gpytorch.kernels.PeriodicKernel(**ard_kw)
+            base = gpytorch.kernels.PeriodicKernel(
+                lengthscale_prior=kp.get("lengthscale_prior"),
+                period_length_prior=kp.get("period_length_prior"),
+                **ard_kw,
+            )
         elif kernel_name == "rational_quadratic":
-            base = gpytorch.kernels.RQKernel(**ard_kw)
+            base = gpytorch.kernels.RQKernel(lengthscale_prior=kp.get("lengthscale_prior"), alpha_prior=kp.get("alpha_prior"), **ard_kw)
         elif kernel_name == "dot_product":
-            base = gpytorch.kernels.LinearKernel()
+            base = gpytorch.kernels.LinearKernel(variance_prior=kp.get("variance_prior"))
         else:
             raise ValueError(f"Unknown kernel: {kernel_name}")
 
@@ -151,7 +263,8 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         # wrapping it in ScaleKernel on top would just be a redundant,
         # unidentifiable second scale factor.
         self.covar_module = (
-            base if kernel_name == "dot_product" else gpytorch.kernels.ScaleKernel(base)
+            base if kernel_name == "dot_product"
+            else gpytorch.kernels.ScaleKernel(base, outputscale_prior=kp.get("outputscale_prior"))
         )
 
     def forward(self, x: Tensor) -> gpytorch.distributions.MultivariateNormal:
@@ -170,49 +283,126 @@ def fit_and_eval_gpytorch(
     ard: bool = False,
     feature_extractor: nn.Module | None = None,
     jitter: float = 1e-6,
+    oracle_mode: str = "prior",
+    prior_cfg: dict | None = None,
+    n_restarts: int = 1,
 ) -> Tensor:
     """Fit a GP (optionally over a learned feature extractor, i.e. DKL) by
-    maximising the exact marginal log-likelihood, and return the posterior
-    correlation matrix at X_test.
+    maximising the exact marginal log-likelihood, and return the correlation
+    matrix at X_test to compare against the episode's oracle R_star.
 
-    likelihood(model(X_test)) already folds observation noise into the
-    returned covariance matrix, mirroring data_gen.gp_posterior's latent=False
-    convention used to build the oracle R_star (needed so dot_product's
-    rank-deficient K_ss — rank <= d_x, often < N — doesn't come out singular).
+    oracle_mode must match how the episode's own R_star was built (see
+    data_gen.py's oracle_mode branch):
+      - "posterior": R_star conditions on (X_train, z_train), so we score the
+        fitted kernel's true GP posterior at X_test — likelihood(model(X_test))
+        folds observation noise into the returned covariance matrix, mirroring
+        data_gen.gp_posterior's latent=False convention (needed so
+        dot_product's rank-deficient K_ss — rank <= d_x, often < N — doesn't
+        come out singular).
+      - "prior": R_star ignores training conditioning entirely (raw kernel
+        structure among test points only). Scoring the conditioned posterior
+        here would answer a different question than what R_star asks — with P
+        up to several hundred context points and a small nugget, the posterior
+        shrinks off-diagonal correlation toward ~0 regardless of how well the
+        kernel hyperparameters were identified, a systematic bias specific to
+        GP-MLE/DKL (per_ep_transformer and the ICL model are trained
+        end-to-end against this same R_star target, so they don't have this
+        mismatch). Instead, evaluate the *fitted* kernel's own prior
+        covariance at X_test — model.forward(X_test) bypasses
+        ExactGP.__call__'s posterior conditioning and returns
+        mean_module/covar_module evaluated directly at X_test, then
+        likelihood(...) adds the fitted noise, exactly mirroring data_gen.py's
+        Sigma_star = K_ss (kernel + nugget, no conditioning).
+
+    prior_cfg / n_restarts: registers the same LogNormal/Gamma hyperpriors
+    data_gen.py's generative process uses (see _kernel_priors), turning plain
+    MLE into MAP, and repeats the fit from n_restarts independent random
+    inits (each sampled from those same priors — see _randomize_init),
+    keeping whichever restart reaches the best final training loss. Plain MLE
+    over an ARD lengthscale vector has no reason to prefer "large lengthscale
+    = irrelevant dimension" over "small lengthscale = active dimension,
+    poorly identified from limited context" when both explain the P training
+    points similarly well (the marginal-likelihood surface is flat/multimodal
+    along that direction) — regularising toward the true generative
+    hyperparameter regime, and giving the optimiser several independent shots
+    at escaping a bad local optimum, both target that failure mode directly.
     """
     if kernel_name == "periodic" and feature_extractor is not None:
         raise ValueError("kernel_name='periodic' is not PD in a >1D DKL latent space")
+    if ard and feature_extractor is not None:
+        # ard_num_dims below is derived from d_x (X_train's raw column count),
+        # but the base kernel actually sees feature_extractor(x) — a
+        # differently-shaped latent tensor. Silently using d_x here would
+        # either crash with a lengthscale/tensor shape mismatch, or (if d_x
+        # happens to equal the extractor's out_dim) silently "work" while
+        # tying each lengthscale to the wrong axis. Neither call site combines
+        # ard=True with a feature_extractor today; fail loudly instead of
+        # leaving this as a landmine for a future caller.
+        raise ValueError(
+            "ard=True is not supported together with a feature_extractor: "
+            "ARD lengthscale count must match the extractor's output "
+            "dimension, not X_train's raw column count (d_x)."
+        )
 
     d_x = X_train.shape[1]
     ard_num_dims = d_x if (ard and kernel_name != "dot_product") else None
+    kernel_priors = _kernel_priors(prior_cfg or {}, kernel_name, ard=ard)
+    noise_prior = _noise_prior(prior_cfg or {})
+    lengthscale_init_prior = _lengthscale_init_prior(prior_cfg or {})
 
-    # Mirrors the previous hand-rolled code's log_noise clamp range
-    # (exp(-8)..exp(2)) — keeps optimisation stable / prevents noise
-    # collapsing to (near-)zero.
-    noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
-    likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_constraint=noise_constraint)
-    likelihood.noise = 0.1
+    best_loss: float | None = None
+    best_model: _ExactGPModel | None = None
+    best_likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
 
-    model = _ExactGPModel(
-        X_train, z_train, likelihood, kernel_name,
-        ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
-    ).to(X_train.device)
+    for _ in range(max(1, n_restarts)):
+        # Mirrors the previous hand-rolled code's log_noise clamp range
+        # (exp(-8)..exp(2)) — keeps optimisation stable / prevents noise
+        # collapsing to (near-)zero. Built fresh every restart: gpytorch's
+        # Interval holds its bounds as plain (non-parameter) tensors, so
+        # reusing one Interval instance across multiple GaussianLikelihoods
+        # in this loop means the *next* likelihood constructed from it
+        # inherits whatever device the *previous* iteration's `.to(device)`
+        # left those bounds on, in-place — a shared-mutable-state footgun
+        # that surfaces as a CPU/CUDA device-mismatch on restart 2+.
+        noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
+        likelihood = gpytorch.likelihoods.GaussianLikelihood(
+            noise_constraint=noise_constraint, noise_prior=noise_prior,
+        )
+        # Sampled (not fixed at 0.1) so restarts are actually independent —
+        # clamped strictly inside noise_constraint's open interval.
+        likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(X_train.device).clamp(
+            min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
+        )
 
-    model.train()
-    likelihood.train()
-    opt = Adam(model.parameters(), lr=lr)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+        model = _ExactGPModel(
+            X_train, z_train, likelihood, kernel_name,
+            ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
+            kernel_priors=kernel_priors,
+        ).to(X_train.device)
+        _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
 
-    for _ in range(n_steps):
-        opt.zero_grad()
-        loss = -mll(model(X_train), z_train)
-        loss.backward()
-        opt.step()
+        model.train()
+        likelihood.train()
+        opt = Adam(model.parameters(), lr=lr)
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
+        loss = None
+        for _step in range(n_steps):
+            opt.zero_grad()
+            loss = -mll(model(X_train), z_train)
+            loss.backward()
+            opt.step()
+
+        final_loss = loss.item()
+        if best_loss is None or final_loss < best_loss:
+            best_loss, best_model, best_likelihood = final_loss, model, likelihood
+
+    model, likelihood = best_model, best_likelihood
     model.eval()
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        Sigma_post = likelihood(model(X_test)).covariance_matrix
+        pred = likelihood(model.forward(X_test)) if oracle_mode == "prior" else likelihood(model(X_test))
+        Sigma_post = pred.covariance_matrix
         N = X_test.shape[0]
         Sigma_post = 0.5 * (Sigma_post + Sigma_post.T) + jitter * torch.eye(
             N, dtype=Sigma_post.dtype, device=Sigma_post.device
@@ -528,6 +718,9 @@ def _eval_episode(
     n_steps_per_ep: int,
     patience_per_ep: int,
     device: torch.device,
+    oracle_mode: str = "prior",
+    prior_cfg: dict | None = None,
+    n_restarts_mle: int = 1,
 ) -> tuple[dict[str, float], dict[str, Tensor], Tensor]:
     """Evaluate all methods on one episode.
 
@@ -575,7 +768,9 @@ def _eval_episode(
             label = _LABEL_MAP[(kname, ard)]
             try:
                 R_gp = fit_and_eval_gpytorch(X_train, z_train, X_test, kname,
-                                             n_steps=n_steps_mle, lr=lr_mle, ard=ard)
+                                             n_steps=n_steps_mle, lr=lr_mle, ard=ard,
+                                             oracle_mode=oracle_mode, prior_cfg=prior_cfg,
+                                             n_restarts=n_restarts_mle)
                 nlls[label]  = _corr_nll_single(R_gp, z_test)
                 R_dict[label] = R_gp
             except Exception as exc:
@@ -598,7 +793,8 @@ def _eval_episode(
             mlp = DKLFeatureExtractor(d_x, hidden=32, out_dim=16, dropout=0.0).to(device)
             R_dkl = fit_and_eval_gpytorch(X_train, z_train, X_test, kname,
                                           n_steps=n_steps_dkl, lr=lr_dkl,
-                                          ard=False, feature_extractor=mlp)
+                                          ard=False, feature_extractor=mlp,
+                                          oracle_mode=oracle_mode, prior_cfg=prior_cfg)
             nlls[label]  = _corr_nll_single(R_dkl, z_test)
             R_dict[label] = R_dkl
         except Exception as exc:
@@ -721,6 +917,14 @@ def main() -> None:
                         help="Adam steps for GP kernel MLE fitting (also used for ARD variants)")
     parser.add_argument("--lr_mle",       type=float, default=0.05,
                         help="Learning rate for GP MLE Adam")
+    parser.add_argument("--n_restarts_mle", type=int, default=5,
+                        help="Independent random restarts per GP-MLE kernel fit (each "
+                             "initialised by sampling from the same LogNormal/Gamma "
+                             "hyperpriors data_gen.py's generative process uses — see "
+                             "fit_and_eval_gpytorch's prior_cfg/n_restarts docs); keeps "
+                             "whichever restart reaches the best final training loss. "
+                             "GP-ARD's marginal-likelihood surface is multimodal enough "
+                             "that a single Adam run from a fixed init is unreliable.")
     parser.add_argument("--n_steps_dkl",  type=int,   default=5000,
                         help="Adam steps for Deep Kernel Learning (MLP+GP) fitting")
     parser.add_argument("--lr_dkl",       type=float, default=0.01,
@@ -735,6 +939,14 @@ def main() -> None:
                         help="Directory for saved corr_grid figure")
     parser.add_argument("--device",       default="auto")
     parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--oracle_mode",  default=None, choices=["prior", "posterior"],
+                        help="How R_star was built for this dataset (see data_gen.py's "
+                             "oracle_mode). Determines whether GP-MLE/DKL score the fitted "
+                             "kernel's posterior (conditioned on X_train) or its raw prior "
+                             "covariance at X_test. Default: read from the checkpoint's own "
+                             "saved training config (cfg.data.oracle_mode), falling back to "
+                             "'prior' if that's absent (this repo's current datasets all use "
+                             "oracle_mode=prior).")
     args = parser.parse_args()
 
     _set_seed(args.seed)
@@ -759,6 +971,25 @@ def main() -> None:
     icl_rank = int(icl_cfg.model.rank)
     n_params = sum(p.numel() for p in icl_model.parameters())
     print(f"ICL model parameters: {n_params:,}  rank={icl_rank}")
+
+    # GP-MLE/DKL must score against the same convention used to build this
+    # dataset's R_star ("prior" ignores training conditioning entirely,
+    # "posterior" conditions on X_train) — see fit_and_eval_gpytorch's
+    # docstring. Read from the checkpoint's own saved training cfg by
+    # default, since that's the actual generation config for this run's
+    # dataset; falls back to "prior" (this repo's current datasets all use
+    # oracle_mode=prior, unlike data_gen.py's own historical "posterior"
+    # default for dataset *generation*).
+    oracle_mode = args.oracle_mode or OmegaConf.select(icl_cfg, "data.oracle_mode", default="prior")
+    print(f"Oracle mode: {oracle_mode}")
+
+    # GP-MLE/DKL hyperpriors (see _kernel_priors/_noise_prior): read the exact
+    # LogNormal/Gamma constants this checkpoint's dataset was generated with,
+    # falling back to _DEFAULT_PRIOR_CFG (data_gen.py's own defaults) for any
+    # missing key (e.g. an older checkpoint saved before a given key existed).
+    data_cfg = OmegaConf.select(icl_cfg, "data", default=None)
+    prior_cfg = OmegaConf.to_container(data_cfg) if data_cfg is not None else {}
+    print(f"GP-MLE restarts: {args.n_restarts_mle}")
 
     dataset_dir = args.dataset_dir or cfg.training.dataset_dir
     n_ep = args.n_episodes
@@ -793,6 +1024,9 @@ def main() -> None:
             n_steps_per_ep=args.n_steps_per_ep,
             patience_per_ep=args.patience_per_ep,
             device=device,
+            oracle_mode=oracle_mode,
+            prior_cfg=prior_cfg,
+            n_restarts_mle=args.n_restarts_mle,
         )
         all_nlls.append(nlls)
 
