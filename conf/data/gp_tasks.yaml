@@ -81,10 +81,13 @@ kernel: rbf
 # (unbounded cardinality) and are not reconstructible via build_kernel_fn.
 systematic_composition: false
 composite_num_kernels_min: 1
-composite_num_kernels_max: 4    # smaller than CauKer's up-to-8 — avoids
-                                 # over-multiplied R_star collapsing under
-                                 # this repo's well-conditioned/Goldilocks
-                                 # floor checks
+composite_num_kernels_max: 8
+# Optional: drop elementary kernels from the systematic_composition sampling
+# pool (data_gen._COMPOSABLE_KERNELS) without affecting the static 20-entry
+# COMPOSITE_KERNELS pool used by the non-systematic path. e.g. [periodic] to
+# exclude periodic chains entirely. Empty = sample from all of
+# {rbf, matern32, cosine, periodic, rational_quadratic} as before.
+composite_exclude_kernels: []
 
 # "hebo" (PFNs4BO's tuned "HEBO+" prior) needs different P/N ranges than the
 # defaults above — see data_gen.py::HEBO_PLUS_HYPERPARAMETERS and the module

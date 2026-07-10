@@ -720,13 +720,25 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
     see _build_kernel_chain) — instead of picking from the fixed 20-entry
     COMPOSITE_KERNELS pool. Active only when cfg.data.systematic_composition
     is True (see _resolve_kernel_name's docstring for the non-systematic
-    path). Returns (names, ops, chain_name) where chain_name is the same
-    "A+B*C"-style left-to-right string the static composites already use
-    (m=1 degenerates to a bare base-kernel name, no ops)."""
+    path). cfg.data.composite_exclude_kernels (optional list, default empty)
+    drops named elementary kernels from the sampling pool without touching
+    _COMPOSABLE_KERNELS itself — that constant also seeds the static 20-entry
+    COMPOSITE_KERNELS/KERNEL_REGISTRY at import time (module-level loop
+    above), which must stay unfiltered for the non-systematic path. Returns
+    (names, ops, chain_name) where chain_name is the same "A+B*C"-style
+    left-to-right string the static composites already use (m=1 degenerates
+    to a bare base-kernel name, no ops)."""
+    exclude = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
+    pool = [k for k in _COMPOSABLE_KERNELS if k not in exclude]
+    if not pool:
+        raise ValueError(
+            f"composite_exclude_kernels={sorted(exclude)} excludes every kernel "
+            f"in _COMPOSABLE_KERNELS={_COMPOSABLE_KERNELS}"
+        )
     lo = int(getattr(cfg.data, "composite_num_kernels_min", 1))
     hi = int(getattr(cfg.data, "composite_num_kernels_max", 4))
     m = random.randint(lo, hi)
-    names = random.choices(_COMPOSABLE_KERNELS, k=m)
+    names = random.choices(pool, k=m)
     ops = [random.choice(("+", "*")) for _ in range(m - 1)]
     chain_name = names[0] + "".join(f"{op}{name}" for op, name in zip(ops, names[1:]))
     return names, ops, chain_name
