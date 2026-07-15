@@ -98,6 +98,21 @@ Kernel selection (cfg.data.kernel / cfg.data.kernels)
                                      Default False.
   If both kernel/kernels are absent (and systematic_composition is False)
   the default is "rbf".
+
+Total feature count (cfg.data.d_features / d_features_lognormal_loc/scale)
+----------------------------------------------------------------------------
+  d (total feature columns, of which _sample_active_dims picks a subset as
+  the kernel's active_dims) is normally the fixed cfg.data.d_features. If
+  cfg.data.d_features_lognormal_loc/scale are both set instead, d ~
+  round(LogNormal(...)) clipped to a minimum of 2, sampled once per
+  generate_gp_batch call (i.e. once per shard in generate_pit_dataset.py —
+  see _sample_d_features). Every episode within one shard shares the same
+  d; different shards can differ. Since dataset.py's collate_fn stacks a
+  training minibatch's x_train/x_test into one (B, *, d) tensor using the
+  first sample's d, a minibatch that spans shards with different d will
+  crash — when this mode is enabled, set data.shard_block_shards=1 and
+  choose training.batch_size to evenly divide data.shard_size so every
+  minibatch stays within a single shard (see conf/data/gp_tasks.yaml).
 """
 
 from __future__ import annotations
@@ -677,6 +692,27 @@ del _name_a, _name_b, _op, _combo_name
 ALL_KERNELS: List[str] = list(KERNEL_REGISTRY.keys())
 
 
+def _sample_d_features(cfg) -> int:
+    """Return the total feature-column count d for this batch/shard.
+
+    If cfg.data.d_features_lognormal_loc/scale are both set, d ~
+    round(LogNormal(d_features_lognormal_loc, d_features_lognormal_scale)),
+    clipped to a minimum of 2 (a single-feature task is degenerate — see
+    _sample_active_dims, which already enforces the same floor on the
+    *active* subset of d). Sampled once per generate_gp_batch call, i.e.
+    once per shard in generate_pit_dataset.py, matching the granularity
+    kernel_name/P/N/active_dims already use — every episode within one
+    shard shares the same d. Falls back to the fixed cfg.data.d_features
+    when the lognormal keys are absent (backward compat with old configs;
+    also what every unit test that pins an exact d relies on).
+    """
+    loc = getattr(cfg.data, "d_features_lognormal_loc", None)
+    scale = getattr(cfg.data, "d_features_lognormal_scale", None)
+    if loc is None or scale is None:
+        return int(cfg.data.d_features)
+    return max(2, round(random.lognormvariate(float(loc), float(scale))))
+
+
 def _sample_active_dims(d_total: int, cfg) -> List[int]:
     """Return a sorted list of column indices that the kernel will use.
 
@@ -1030,7 +1066,7 @@ def generate_gp_batch(
     if seed is not None:
         _seed_everything(seed)
 
-    d = cfg.data.d_features
+    d = _sample_d_features(cfg)
 
     # --- Shared settings for this batch ---
     # systematic_composition (CauKer-style, see _sample_kernel_chain_structure)

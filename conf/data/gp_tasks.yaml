@@ -2,14 +2,30 @@
 # GP task generation config — inter-instance Gaussian copula
 # ---------------------------------------------------------------------------
 
-d_features: 10          # total feature columns seen by the neural network
+d_features: 10          # total feature columns; fallback used only when
+                        # d_features_lognormal_loc/scale below are unset.
+
+# Total feature count d ~ round(LogNormal(d_features_lognormal_loc,
+# d_features_lognormal_scale)), clipped to a minimum of 2, sampled once per
+# shard (every episode within one shard shares the same d — see
+# data_gen.py::_sample_d_features). Defaults below (loc=log(10), scale=0.4)
+# give d mostly in [5, 19], median 10 (matches the old fixed default).
+# Comment out both keys to fall back to the fixed d_features above.
+#
+# IMPORTANT: since different shards can have different d, a training
+# minibatch that spans shards would mix mismatched feature widths and crash
+# dataset.py's collate_fn. When training on a dataset generated with this
+# enabled, override training.shard_block_shards=1 (see conf/config.yaml —
+# the default 16 shuffles across shards) and pick training.batch_size to
+# evenly divide shard_size below, so every minibatch stays within one shard.
+d_features_lognormal_loc: 2.302585    # log(10)
+d_features_lognormal_scale: 0.4
 
 # Kernel active-column selection (random per task, via gpytorch's own
 # active_dims kernel kwarg — see data_gen.py::_sample_active_dims).
 # A fraction ~ Uniform[inactive_frac_min, inactive_frac_max] of the
-# d_features columns is left inactive (irrelevant noise the model must
-# learn to ignore); the rest are the kernel's active_dims. Defaults below
-# give k = d_features - round(frac*d_features) ~ {1,2,3,4} for d_features=10.
+# (per-shard) d_features columns is left inactive (irrelevant noise the
+# model must learn to ignore); the rest are the kernel's active_dims.
 inactive_frac_min: 0.6
 inactive_frac_max: 0.9
 
