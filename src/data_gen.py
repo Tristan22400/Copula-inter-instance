@@ -110,7 +110,7 @@ Total feature count (cfg.data.d_features / d_features_lognormal_loc/scale)
   d; different shards can differ. Since dataset.py's collate_fn stacks a
   training minibatch's x_train/x_test into one (B, *, d) tensor using the
   first sample's d, a minibatch that spans shards with different d will
-  crash — when this mode is enabled, set data.shard_block_shards=1 and
+  crash — when this mode is enabled, set training.shard_block_shards=1 and
   choose training.batch_size to evenly divide data.shard_size so every
   minibatch stays within a single shard (see conf/data/gp_tasks.yaml).
 """
@@ -721,12 +721,17 @@ def _sample_active_dims(d_total: int, cfg) -> List[int]:
     learn to ignore); the remaining columns are the kernel's active_dims.
     Falls back to using every column when the config keys are absent
     (backward compat with old episode files / configs).
+
+    The active count k is floored at 2 (a single active feature is
+    degenerate) whenever d_total allows it; if d_total itself is 1, k=1 is
+    unavoidable and used instead.
     """
     frac_min = float(getattr(cfg.data, "inactive_frac_min", 0.0))
     frac_max = float(getattr(cfg.data, "inactive_frac_max", 0.0))
     frac = random.uniform(frac_min, frac_max)
     k = d_total - round(frac * d_total)
-    k = max(1, min(k, d_total))
+    k = min(k, d_total)
+    k = max(min(2, d_total), k)
     return sorted(random.sample(range(d_total), k))
 
 
