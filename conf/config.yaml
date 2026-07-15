@@ -28,6 +28,10 @@ training:
   # (all shuffled together, IO-cache resident) instead of one global shuffle
   # across every shard — avoids thrashing the shard LRU cache on network
   # storage. Still a true per-epoch permutation, just chunked randomization.
+  # NOTE: if the dataset was generated with data.d_features_lognormal_loc/
+  # scale set (variable feature count per shard, see conf/data/gp_tasks.yaml),
+  # this must be 1 and batch_size must evenly divide data.shard_size — a
+  # minibatch spanning shards with different d crashes dataset.py's collate_fn.
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
