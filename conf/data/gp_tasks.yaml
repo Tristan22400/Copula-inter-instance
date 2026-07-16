@@ -10,8 +10,8 @@ d_features: 10          # total feature columns seen by the neural network
 # d_features columns is left inactive (irrelevant noise the model must
 # learn to ignore); the rest are the kernel's active_dims. Defaults below
 # give k = d_features - round(frac*d_features) ~ {1,2,3,4} for d_features=10.
-inactive_frac_min: 0.6
-inactive_frac_max: 0.9
+inactive_frac_min: 0.1
+inactive_frac_max: 0.8
 
 # Training/context set size range
 P_min: 32
@@ -22,7 +22,7 @@ N_min: 8
 N_max: 128
 
 # Number of tasks to generate
-n_tasks: 5000000
+n_tasks: 20000000
 
 # GP kernel hyperparameter priors (shared across all stationary kernels,
 # except "hebo"'s lengthscale/outputscale — its Gamma constants are fixed,
@@ -48,18 +48,18 @@ ard: true
 # before the existing per-episode z-normalisation -- preserves the EXACT
 # analytic oracle. See data_gen.py::apply_dag_feature_mixing.
 # Default off: byte-for-byte no-op for every existing config/dataset.
-dag_mixing_enabled: false
+dag_mixing_enabled: true
 # Fraction of episodes per generate_gp_batch call that get mixed at all
 # (Bernoulli gate); the rest pass through unmixed, mirroring
 # tabiclv2_warp_features's identity-transform choice.
-dag_mixing_prob: 0.3
+dag_mixing_prob: 0.9
 # Number of mixing layers, sampled once per batch call (shared by every
 # episode in that call). Kept small (1-2): each layer risks collapsing
 # R_star toward independence or saturating an activation -- validate any
 # change against tests/test_dataset_corr_uniform.py on a pilot dataset
 # before a full generation run.
 dag_num_layers_min: 1
-dag_num_layers_max: 2
+dag_num_layers_max: 4
 # Std of each layer's random weight matrix before 1/sqrt(d_features)
 # fan-in scaling -- keeps the pre-activation roughly variance-preserving.
 dag_mix_weight_std: 1.0
