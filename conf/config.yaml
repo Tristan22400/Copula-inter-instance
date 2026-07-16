@@ -17,25 +17,27 @@ training:
   compile: false
   steps: 500000
   warmup_steps: 1000
-  clip_grad_norm: 10.0
+  clip_grad_norm: 1.0
   log_every: 100
   val_every: 500
   save_every: 5000
   ckpt_dir: null
-  dataset_dir: ./data/rbf-prior-2/pit
+  # Path to a checkpoint saved by save_checkpoint() (model + optimizer +
+  # scheduler + step). When set, training resumes from step+1 instead of 0.
+  # Everything else (steps, LR schedule, dataset, etc.) follows this run's
+  # config, not the one baked into the checkpoint.
+  # Usage: python src/train.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
+  resume_ckpt: null
+  dataset_dir: ./data/systematic_composition-8/pit
   val_fraction: 0.05   # fraction of episodes held out for validation
   # For sharded datasets: shuffle within blocks of this many shards at a time
   # (all shuffled together, IO-cache resident) instead of one global shuffle
   # across every shard — avoids thrashing the shard LRU cache on network
   # storage. Still a true per-epoch permutation, just chunked randomization.
-  # NOTE: if the dataset was generated with data.d_features_lognormal_loc/
-  # scale set (variable feature count per shard, see conf/data/gp_tasks.yaml),
-  # this must be 1 and batch_size must evenly divide data.shard_size — a
-  # minibatch spanning shards with different d crashes dataset.py's collate_fn.
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
-  muon_lr: 1.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
+  muon_lr: 2.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
   muon_lr_min: 1.0e-6         # cosine decay floor
   muon_momentum: 0.95
   muon_weight_decay: 0.01     # cautious weight decay (Chen et al. 2025a)

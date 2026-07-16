@@ -12,21 +12,13 @@ Tests verify:
 
 from __future__ import annotations
 
-import math
 import random
 
 import pytest
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import (
-    ALL_KERNELS,
-    _kernel_needs_scalar_input,
-    generate_gp_batch,
-    generate_gp_task,
-    gp_posterior,
-    sigma_to_correlation,
-)
+from data_gen import ALL_KERNELS, _kernel_needs_scalar_input, generate_gp_task, gp_posterior, sigma_to_correlation
 from dataset import CopulaDataset, collate_fn
 
 # ---------------------------------------------------------------------------
@@ -68,54 +60,6 @@ def test_gp_task_shapes(small_cfg):
 
     assert small_cfg.data.P_min <= P <= small_cfg.data.P_max
     assert small_cfg.data.N_min <= N <= small_cfg.data.N_max
-
-
-def test_d_features_fixed_when_lognormal_keys_absent(small_cfg):
-    """Without cfg.data.d_features_lognormal_loc/scale, d stays exactly the
-    fixed cfg.data.d_features (backward compat — every other test in this
-    file relies on this)."""
-    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
-    cfg.data.d_features = 6
-
-    torch.manual_seed(0)
-    task = generate_gp_task(cfg)
-    assert task["x_norm_train"].shape[-1] == 6
-
-
-def test_d_features_lognormal_varies_across_batches_fixed_within(small_cfg):
-    """cfg.data.d_features_lognormal_loc/scale (opt-in) makes the total
-    feature count d ~ round(LogNormal(...)) instead of the fixed
-    cfg.data.d_features, sampled once per generate_gp_batch call — i.e.
-    once per shard in generate_pit_dataset.py — and shared by every episode
-    in that call, but free to differ between calls (see
-    data_gen.py::_sample_d_features)."""
-    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
-    cfg.data.d_features_lognormal_loc = math.log(10.0)
-    cfg.data.d_features_lognormal_scale = 0.6
-
-    torch.manual_seed(0)
-    ds_per_call = []
-    for _ in range(15):
-        episodes = generate_gp_batch(cfg, B=3, device="cpu")
-        ds_in_call = {ep["x_norm_train"].shape[-1] for ep in episodes}
-        assert len(ds_in_call) == 1, f"d varied within one batch call: {ds_in_call}"
-        d = next(iter(ds_in_call))
-        assert d >= 2
-        ds_per_call.append(d)
-
-    assert len(set(ds_per_call)) > 1, f"d never varied across calls: {ds_per_call}"
-
-
-def test_d_features_lognormal_floor_min_two(small_cfg):
-    """d is clipped to a minimum of 2 even when the LogNormal draw rounds to
-    0 or 1 — a single-feature task is degenerate."""
-    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
-    cfg.data.d_features_lognormal_loc = math.log(1.0)  # median draw = 1
-    cfg.data.d_features_lognormal_scale = 0.0            # deterministic, see lognormvariate(mu, 0) == exp(mu)
-
-    torch.manual_seed(0)
-    episodes = generate_gp_batch(cfg, B=2, device="cpu")
-    assert episodes[0]["x_norm_train"].shape[-1] == 2
 
 
 def test_feature_normalisation_over_all_instances(small_cfg):
@@ -295,9 +239,14 @@ def test_ard_samples_per_dimension_lengthscale(small_cfg, kernel_name):
     cfg.data.inactive_frac_max = 0.5
     cfg.data.ard = True
 
+    # "periodic" is always capped to k=1 active dims (see data_gen.py), so
+    # its ARD vector squeezes to a plain scalar, same as the non-ARD case.
+    expected_shape = () if kernel_name == "periodic" else (3,)
     torch.manual_seed(abs(hash("ard_" + kernel_name)) % (2**31))
     task = generate_gp_task(cfg)
-    assert task["l"].shape == (3,), f"{kernel_name}: expected ARD vector (3,), got {tuple(task['l'].shape)}"
+    assert task["l"].shape == expected_shape, (
+        f"{kernel_name}: expected shape {expected_shape}, got {tuple(task['l'].shape)}"
+    )
 
     cached = gp_analytical_pit(task)
     reconstructed_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}

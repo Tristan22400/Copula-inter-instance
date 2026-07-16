@@ -356,7 +356,7 @@ def validate(
     return metrics, plot_figs
 
 
-def save_checkpoint(model, optimizer, scheduler, cfg, step: int) -> None:
+def save_checkpoint(model, optimizer, scheduler, cfg, step: int, scaler=None) -> None:
     if cfg.training.ckpt_dir is None:
         return
     os.makedirs(cfg.training.ckpt_dir, exist_ok=True)
@@ -368,10 +368,28 @@ def save_checkpoint(model, optimizer, scheduler, cfg, step: int) -> None:
             "state_dict": raw.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "cfg": OmegaConf.to_container(cfg),
         },
         path,
     )
+
+
+def load_checkpoint(ckpt_path: str, model: nn.Module, optimizer, scheduler, device: str, scaler=None) -> int:
+    """Restore model/optimizer/scheduler(/scaler) state from a checkpoint saved by save_checkpoint().
+
+    Returns the step to resume from (checkpoint step + 1).
+    """
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    raw = getattr(model, "_orig_mod", model)
+    raw.load_state_dict(ckpt["state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
+    return int(ckpt["step"]) + 1
 
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
@@ -431,12 +449,15 @@ def main(cfg: DictConfig) -> None:
             ("compile", "compile"),
         ],
     )
+    resume_ckpt = t.get("resume_ckpt", None)
+    resume_str = "_resumed" if resume_ckpt else ""
     run_name = (
         f"{dataset_name}"
         f"{model_hparams}"
         f"{training_hparams}"
         f"_unfreeze={unfreeze}"
         f"{lora_str}"
+        f"{resume_str}"
     )
     wandb.init(
         project=cfg.wandb.project,
@@ -562,6 +583,11 @@ def main(cfg: DictConfig) -> None:
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
 
+    start_step = 0
+    if resume_ckpt:
+        start_step = load_checkpoint(resume_ckpt, model, optimizer, scheduler, device, scaler=scaler)
+        print(f"Resumed from {resume_ckpt} — continuing at step {start_step}")
+
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     nll_weight = float(t.get("nll_weight", 1.0))
     aux_mse_weight = float(t.get("aux_mse_weight", 0.0))
@@ -608,7 +634,7 @@ def main(cfg: DictConfig) -> None:
         else:
             _prof_ms[name] += (time.perf_counter() - start) * 1000.0
 
-    for step in range(t.steps + 1):
+    for step in range(start_step, t.steps + 1):
         _t_data0 = time.perf_counter()
         try:
             batch = next(train_iter)
@@ -788,9 +814,9 @@ def main(cfg: DictConfig) -> None:
             )
 
         if step % t.save_every == 0 and step > 0:
-            save_checkpoint(model, optimizer, scheduler, cfg, step)
+            save_checkpoint(model, optimizer, scheduler, cfg, step, scaler=scaler)
 
-    save_checkpoint(model, optimizer, scheduler, cfg, t.steps)
+    save_checkpoint(model, optimizer, scheduler, cfg, t.steps, scaler=scaler)
     wandb.finish()
 
 
