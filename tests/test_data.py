@@ -293,6 +293,84 @@ def test_ard_not_applied_to_cosine_or_dot_product(small_cfg):
     assert task["alpha2"].numel() == 1
 
 
+@pytest.mark.parametrize("kernel_name", _ARD_ELIGIBLE_KERNELS)
+def test_isotropic_ratio_one_collapses_every_episode(small_cfg, kernel_name):
+    """cfg.data.isotropic_ratio=1.0 forces every episode's ARD lengthscale
+    (and periodic's period) to a single value repeated across dims, even
+    though cfg.data.ard=True keeps the tensor ARD-shaped (k,)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_max = 0.5
+    cfg.data.ard = True
+    cfg.data.isotropic_ratio = 1.0
+
+    torch.manual_seed(abs(hash("iso_" + kernel_name)) % (2**31))
+    episodes = generate_gp_batch(cfg, B=8, device="cpu", return_kernel_metadata=True)
+    for task in episodes:
+        assert task["l"].shape == (3,), f"{kernel_name}: expected ARD-shaped (3,), got {tuple(task['l'].shape)}"
+        assert torch.allclose(task["l"], task["l"][0].expand_as(task["l"]), atol=1e-6), (
+            f"{kernel_name}: isotropic_ratio=1.0 should collapse lengthscale to one shared value"
+        )
+        if kernel_name == "periodic":
+            assert torch.allclose(task["period"], task["period"][0].expand_as(task["period"]), atol=1e-6)
+
+
+def test_isotropic_ratio_zero_is_default_ard_behaviour(small_cfg):
+    """cfg.data.isotropic_ratio defaults to 0.0 — a no-op, so ARD episodes
+    keep independent per-dim lengthscales (not all collapsed to one value)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 0.5
+    cfg.data.inactive_frac_max = 0.5
+    cfg.data.ard = True
+
+    torch.manual_seed(0)
+    episodes = generate_gp_batch(cfg, B=20, device="cpu", return_kernel_metadata=True)
+    n_collapsed = sum(
+        torch.allclose(task["l"], task["l"][0].expand_as(task["l"]), atol=1e-6) for task in episodes
+    )
+    assert n_collapsed == 0, "isotropic_ratio default (0.0) should never force-collapse an ARD lengthscale"
+
+
+def test_isotropic_ratio_no_op_when_ard_false(small_cfg):
+    """cfg.data.isotropic_ratio is a no-op when cfg.data.ard=False (nothing
+    ARD-shaped to collapse); lengthscale stays a plain isotropic scalar."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 0.5
+    cfg.data.inactive_frac_max = 0.5
+    cfg.data.ard = False
+    cfg.data.isotropic_ratio = 1.0
+
+    torch.manual_seed(0)
+    task = generate_gp_task(cfg)
+    assert task["l"].shape == (), f"expected isotropic scalar, got shape {tuple(task['l'].shape)}"
+
+
+def test_isotropic_ratio_partial_mixes_isotropic_and_ard_episodes(small_cfg):
+    """A ratio strictly between 0 and 1 produces a mix of isotropic and ARD
+    episodes within the same generate_gp_batch call, in roughly the
+    requested proportion."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 0.5
+    cfg.data.inactive_frac_max = 0.5
+    cfg.data.ard = True
+    cfg.data.isotropic_ratio = 0.5
+
+    torch.manual_seed(1)
+    episodes = generate_gp_batch(cfg, B=400, device="cpu", return_kernel_metadata=True)
+    n_collapsed = sum(
+        torch.allclose(task["l"], task["l"][0].expand_as(task["l"]), atol=1e-6) for task in episodes
+    )
+    assert 150 < n_collapsed < 250, f"expected ~200/400 isotropic episodes, got {n_collapsed}"
+
+
 # ---------------------------------------------------------------------------
 # DAG feature mixing tests
 # ---------------------------------------------------------------------------

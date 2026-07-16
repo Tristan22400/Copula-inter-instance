@@ -42,6 +42,15 @@ alpha2_gamma_rate: 3.0
 # data_gen.py's module docstring). Default false preserves prior behaviour.
 ard: true
 
+# Even when a kernel is ARD (via `ard: true` above, or "hebo" which is
+# always ARD), each episode independently has this probability of having
+# its lengthscale (and periodic's period) collapsed to one shared value
+# across active dims instead of one independent value per dim — i.e. an
+# isotropic kernel in effect, mixed in among the ARD episodes. Default 0.0
+# (no isotropic override) preserves prior behaviour. See
+# data_gen.py::_build_scaled_kernel / _collapse_isotropic.
+isotropic_ratio: 0.0
+
 # DAG feature mixing: optionally entangle the d_features input columns
 # through a small stack of random dense affine + nonlinearity layers,
 # applied to the GP's INPUT coordinates x (never to sampled outputs y)
