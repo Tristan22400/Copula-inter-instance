@@ -11,7 +11,7 @@ d_features: 10          # total feature columns seen by the neural network
 # learn to ignore); the rest are the kernel's active_dims. Defaults below
 # give k = d_features - round(frac*d_features) ~ {1,2,3,4} for d_features=10.
 inactive_frac_min: 0.1
-inactive_frac_max: 0.9
+inactive_frac_max: 0.8
 
 # Training/context set size range
 P_min: 32
@@ -42,6 +42,37 @@ alpha2_gamma_rate: 3.0
 # data_gen.py's module docstring). Default false preserves prior behaviour.
 # "periodic" is always capped to k=1 active dims regardless (see data_gen.py).
 ard: true
+
+# Even when a kernel is ARD (via `ard: true` above, or "hebo" which is
+# always ARD), each episode independently has this probability of having
+# its lengthscale (and periodic's period) collapsed to one shared value
+# across active dims instead of one independent value per dim — i.e. an
+# isotropic kernel in effect, mixed in among the ARD episodes. Default 0.0
+# (no isotropic override) preserves prior behaviour. See
+# data_gen.py::_build_scaled_kernel / _collapse_isotropic.
+isotropic_ratio: 0.0
+
+# DAG feature mixing: optionally entangle the d_features input columns
+# through a small stack of random dense affine + nonlinearity layers,
+# applied to the GP's INPUT coordinates x (never to sampled outputs y)
+# before the existing per-episode z-normalisation -- preserves the EXACT
+# analytic oracle. See data_gen.py::apply_dag_feature_mixing.
+# Default off: byte-for-byte no-op for every existing config/dataset.
+dag_mixing_enabled: true
+# Fraction of episodes per generate_gp_batch call that get mixed at all
+# (Bernoulli gate); the rest pass through unmixed, mirroring
+# tabiclv2_warp_features's identity-transform choice.
+dag_mixing_prob: 0.9
+# Number of mixing layers, sampled once per batch call (shared by every
+# episode in that call). Kept small (1-2): each layer risks collapsing
+# R_star toward independence or saturating an activation -- validate any
+# change against tests/test_dataset_corr_uniform.py on a pilot dataset
+# before a full generation run.
+dag_num_layers_min: 1
+dag_num_layers_max: 4
+# Std of each layer's random weight matrix before 1/sqrt(d_features)
+# fan-in scaling -- keeps the pre-activation roughly variance-preserving.
+dag_mix_weight_std: 1.0
 
 # Nugget/noise: single diagonal regulariser ~ LogNormal(nugget_lognormal_loc,
 # nugget_lognormal_scale), shared by ALL kernels including "hebo" (this is

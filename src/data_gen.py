@@ -62,6 +62,16 @@ ARD (cfg.data.ard)
   "periodic" is additionally always capped to k=1 active dims (independent
   of this flag) — see generate_gp_batch's kernel_cols selection.
 
+  cfg.data.isotropic_ratio (default 0.0): even when a kernel would otherwise
+  be ARD (cfg.data.ard=True for an ARD-eligible kernel, or "hebo" which is
+  always ARD), each episode independently has probability isotropic_ratio of
+  having its lengthscale (and periodic's period) collapsed to one shared
+  value across all active dims instead of one independent value per dim —
+  i.e. an isotropic kernel in effect, still stored in the ARD-shaped (k,)
+  tensor (so "l"/"period" numel doesn't change, only whether the k values
+  are equal). A no-op when the kernel isn't ARD in the first place. See
+  _build_scaled_kernel.
+
 Composite kernels ("A+B" / "A*B")
 ---------------------------------
   Sums and products of PSD kernels are PSD, so every pair drawn from
@@ -225,6 +235,11 @@ class KernelPriorSpec:
     lengthscale_attr: str = "lengthscale"
     extra_priors: Dict[str, Prior] = field(default_factory=dict)
     ard: bool = False
+    # Per-episode probability of collapsing an otherwise-ARD lengthscale/
+    # period to a single shared value across dims (cfg.data.isotropic_ratio,
+    # see the module docstring's ARD section and _build_scaled_kernel).
+    # No-op when ard=False.
+    isotropic_ratio: float = 0.0
 
 
 # Base kernel families whose lengthscale can be made ARD (one value per active
@@ -263,6 +278,8 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
     same convention the old l_min/l_max/alpha2_min/alpha2_max ranges used),
     except "hebo"'s, which are the fixed tuned HEBO+ constants above.
     """
+    isotropic_ratio = float(getattr(cfg.data, "isotropic_ratio", 0.0))
+
     if kernel_name == "hebo":
         return KernelPriorSpec(
             lengthscale_prior=lambda k: GammaPrior(
@@ -274,6 +291,7 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
                 HEBO_PLUS_HYPERPARAMETERS["outputscale_rate"],
             ),
             ard=True,
+            isotropic_ratio=isotropic_ratio,
         )
 
     l_loc = float(getattr(cfg.data, "l_lognormal_loc", 0.0))
@@ -307,6 +325,7 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
         lengthscale_attr=lengthscale_attr,
         extra_priors=extra_priors,
         ard=ard,
+        isotropic_ratio=isotropic_ratio,
     )
 
 
@@ -329,6 +348,25 @@ def _build_likelihood(cfg, kernel_name: str, B: int, device) -> gpytorch.likelih
     likelihood = gpytorch.likelihoods.GaussianLikelihood(batch_shape=torch.Size([B])).to(device)
     likelihood.noise = _nugget_prior(cfg, kernel_name).sample(torch.Size([B])).to(device)
     return likelihood
+
+
+def _collapse_isotropic(sample: Tensor, iso_mask: Optional[Tensor]) -> Tensor:
+    """Force the last (ard_num_dims) axis of an ARD-shaped `sample` to a
+    single shared value, per episode, for every episode flagged True in
+    iso_mask (B,) — i.e. that episode's kernel is isotropic in effect even
+    though its lengthscale/period tensor keeps the ARD (k,)-per-episode
+    shape. The shared value is simply the first of the already-sampled k
+    values (still a valid draw from the same per-dim prior — see
+    _kernel_prior_spec's lengthscale_prior, whose distribution doesn't
+    depend on k), so this needs no extra sampling call.
+
+    No-op when iso_mask is None (isotropic_ratio<=0 or spec.ard=False) or
+    `sample`'s last axis already has size 1 (nothing to collapse)."""
+    if iso_mask is None or sample.shape[-1] == 1:
+        return sample
+    collapsed = sample[..., :1].expand_as(sample)
+    mask = iso_mask.view(-1, *([1] * (sample.dim() - 1)))
+    return torch.where(mask, collapsed, sample)
 
 
 def _build_scaled_kernel(
@@ -356,8 +394,18 @@ def _build_scaled_kernel(
     # setters below copies into device-resident storage, not CPU storage.
     base = _BASE_GPYTORCH_KERNEL_CLS[name](**kernel_kwargs).to(device)
 
+    # One shared per-episode isotropic-override coin flip, reused below for
+    # both the lengthscale and (for "periodic") period — see
+    # _collapse_isotropic / cfg.data.isotropic_ratio in the module docstring.
+    iso_mask = (
+        torch.rand(B, device=device) < spec.isotropic_ratio
+        if spec.ard and spec.isotropic_ratio > 0.0
+        else None
+    )
+
     l_attr = getattr(base, spec.lengthscale_attr)
     l_sample = spec.lengthscale_prior(k).sample(l_attr.shape).to(device)
+    l_sample = _collapse_isotropic(l_sample, iso_mask)
     setattr(base, spec.lengthscale_attr, l_sample)
 
     scaled = gpytorch.kernels.ScaleKernel(base, batch_shape=batch_shape).to(device)
@@ -373,12 +421,14 @@ def _build_scaled_kernel(
         attr_name = _EXTRA_PARAM_TO_ATTR[schema_name]
         attr = getattr(base, attr_name)
         sample = prior.sample(attr.shape).to(device)
-        setattr(base, attr_name, sample)
         # "period" is ARD-vector-shaped too when spec.ard (gpytorch's
         # PeriodicKernel ties period_length's ard_num_dims to the same
-        # kwarg as lengthscale) — same squeeze convention as l_flat above.
+        # kwarg as lengthscale), so it collapses under the same iso_mask
+        # used for "l" above (keeps both isotropic together, per episode).
         # "rq_alpha" is never ARD (RQKernel.alpha has no ard_num_dims), so
-        # this is a no-op reshape/squeeze for it.
+        # this is a no-op collapse/reshape/squeeze for it.
+        sample = _collapse_isotropic(sample, iso_mask)
+        setattr(base, attr_name, sample)
         sample_flat = sample.reshape(B, -1)
         params[schema_name] = sample_flat.squeeze(-1) if sample_flat.shape[-1] == 1 else sample_flat
 
@@ -982,6 +1032,109 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
     return warped_x
 
 
+# Activation bank for DAG feature mixing (adapted from CauKer's SCM activation
+# set, applied here to GP *input coordinates* rather than sampled *outputs* —
+# see apply_dag_feature_mixing's docstring for why this preserves exact
+# analytic Gaussianity while CauKer's approach would not).
+_DAG_MIX_ACTIVATIONS: List[str] = ["linear", "relu", "sigmoid", "sin", "mod", "leaky_relu"]
+
+
+def _apply_dag_activation(x: Tensor, name: str) -> Tensor:
+    """Elementwise nonlinearity for one DAG-mixing layer. `x` is any shape."""
+    if name == "linear":
+        return x
+    if name == "relu":
+        return torch.relu(x)
+    if name == "sigmoid":
+        return torch.sigmoid(x)
+    if name == "sin":
+        return torch.sin(x)
+    if name == "mod":
+        # Remainder by a fixed period (not data-dependent) keeps this a pure
+        # deterministic function of x alone -> still a valid PSD-preserving
+        # feature map; 2*pi period avoids introducing a new magic-number
+        # scale unrelated to the 'sin' branch above.
+        return torch.remainder(x, 2 * math.pi)
+    if name == "leaky_relu":
+        return torch.nn.functional.leaky_relu(x, negative_slope=0.1)
+    raise ValueError(f"Unknown DAG-mixing activation '{name}'")
+
+
+def apply_dag_feature_mixing(x: Tensor, cfg, device) -> Tensor:
+    """Randomly mix the GP's input feature columns through a small stack of
+    dense affine + nonlinearity layers, applied to input coordinates x (never
+    to sampled outputs y) so k(f(x_i), f(x_j)) remains a valid PSD kernel for
+    the fixed deterministic map f = this mixing stack composed with
+    tabiclv2_warp_features -- preserving EXACT analytic Gaussianity (closed-
+    form GP posterior/Cholesky oracle), unlike CauKer's SCM approach of mixing
+    sampled *outputs* through a random DAG (which would force Monte Carlo).
+
+    Structure mirrors the rest of this file's "shared structure across the
+    batch, independent per-episode parameters" convention (kernel_name,
+    active_dims, tabiclv2_warp_features's per-(episode,column) transform
+    choice): the number of layers L and each layer's activation name are
+    sampled ONCE per batch call (shared across all B episodes); each layer's
+    weight matrix and bias are sampled independently PER EPISODE and applied
+    via a batched einsum (no Python loop over B).
+
+    Note on active_dims/ARD semantics: this is a DENSE mix (every output
+    column is a combination of every input column), so it partially subverts
+    the "inactive_frac_min/max leaves some columns as pure noise" contract
+    downstream in _sample_active_dims -- post-mixing, no column is purely
+    irrelevant anymore. This is an accepted trade-off for increased task
+    diversity, not a bug.
+
+    Args:
+        x: (B, T, d) tensor, already warped by tabiclv2_warp_features, NOT
+            yet z-normalised (this runs before the existing per-episode
+            mean/std normalisation step).
+        cfg: Hydra config; reads cfg.data.dag_mixing_* keys (see
+            conf/data/gp_tasks.yaml), all optional/backward-compatible via
+            getattr defaults (dag_mixing_enabled defaults False -> exact
+            no-op, byte-for-byte, for every existing config/dataset).
+        device: torch device string, threaded through for the new W_l/b_l
+            parameter tensors (same convention as the rest of this file).
+
+    Returns:
+        (B, T, d) tensor, same shape/dtype as x. Episodes not selected by the
+        per-episode Bernoulli gate (dag_mixing_prob) are returned unchanged.
+    """
+    if not bool(getattr(cfg.data, "dag_mixing_enabled", False)):
+        return x
+
+    mixing_prob = float(getattr(cfg.data, "dag_mixing_prob", 0.3))
+    if mixing_prob <= 0.0:
+        return x
+
+    L_min = int(getattr(cfg.data, "dag_num_layers_min", 1))
+    L_max = int(getattr(cfg.data, "dag_num_layers_max", 2))
+    w_std = float(getattr(cfg.data, "dag_mix_weight_std", 1.0))
+
+    B, T, d = x.shape
+    L = random.randint(L_min, L_max)
+    # Activation sequence shared across the whole batch call (same granularity
+    # as kernel_name/P/N/active_dims above) -- NOT per-episode, so every mixed
+    # episode in this batch call shares one topology, differing only in the
+    # sampled W_l/b_l weight values.
+    activations = [random.choice(_DAG_MIX_ACTIVATIONS) for _ in range(L)]
+
+    x_mixed = x
+    for act_name in activations:
+        # 1/sqrt(d) fan-in scaling keeps the pre-activation roughly variance-
+        # preserving (same purpose as Xavier/He init) -- an empirically-tuned
+        # default rather than an analytically-guaranteed bound; validated by
+        # test_dag_mixing_goldilocks_and_psd in tests/test_data.py.
+        W_l = torch.randn(B, d, d, device=device) * (w_std / math.sqrt(d))
+        b_l = torch.randn(B, 1, d, device=device) * w_std
+        x_mixed = torch.einsum("btd,bde->bte", x_mixed, W_l) + b_l
+        x_mixed = _apply_dag_activation(x_mixed, act_name)
+
+    gate = (torch.rand(B, device=device) < mixing_prob)[:, None, None]  # (B,1,1)
+    # (B,1,1) is required for correct broadcast against (B,T,d); a bare (B,)
+    # shape misaligns on the trailing (T, d) dims instead of the batch dim.
+    return torch.where(gate, x_mixed, x)
+
+
 @torch.no_grad()
 def generate_gp_batch(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
@@ -1057,7 +1210,10 @@ def generate_gp_batch(
     # all B episodes — same granularity as kernel_name/P/N above. gpytorch's
     # active_dims kernel kwarg is a single fixed column spec per Kernel
     # instance, so it can't vary per-episode within one batched kernel call
-    # the way the old per-row torch.gather selection did.
+    # the way the old per-row torch.gather selection did. Note: when
+    # apply_dag_feature_mixing is enabled, every output column is a dense mix
+    # of all d input columns, so "inactive" columns selected here are no
+    # longer purely irrelevant noise — see apply_dag_feature_mixing's docstring.
     # "periodic" (bare or as a composite/chain component) is also capped to
     # k=1: it never decays with r, so at k>1 the period becomes unrecoverable
     # from a finite point cloud (aliasing) well before k=3-4.
@@ -1093,6 +1249,7 @@ def generate_gp_batch(
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
     x_raw = tabiclv2_warp_features(x_raw)
+    x_raw = apply_dag_feature_mixing(x_raw, cfg, device)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
     # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k
