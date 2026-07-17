@@ -71,6 +71,19 @@ tabicl:
   #   ff_factor: 2
   #   dropout: 0.0
 
+# Classical-kernel baselines evaluated each validation loop: fixed kernels on the
+# test features x_test, scored against the oracle (corr metrics) and via the copula
+# NLL, and drawn as extra rows in the val/corr_grid plot. Lengthscales are fixed per
+# episode via the median heuristic (isotropic = global; ARD = per-dimension).
+# Metrics are logged as val/baseline/<kernel>/{copula_nll,corr_mse,corr_mae,corr_pearson}.
+baselines:
+  enabled: true
+  # Kernel families; each is built both isotropic and ARD (see `ard`).
+  kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic]
+  ard: [false, true]        # build without ARD (isotropic) and with ARD
+  rq_alpha: 1.0             # α of the Rational Quadratic kernel
+  lengthscale_scale: 1.0    # multiplier on the median-heuristic lengthscales
+
 # LoRA fine-tuning of the TabICL backbone.
 # Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]
 lora:

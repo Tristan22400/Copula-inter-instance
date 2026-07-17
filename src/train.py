@@ -35,6 +35,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from classical_kernels import compute_kernel_bank, default_kernel_names
 from dataset import CopulaDataset, ShardBlockSampler, collate_fn
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
@@ -89,30 +90,54 @@ def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
     return {"mse": mse, "mae": mae, "pearson": pearson, "bias": bias}
 
 
-def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
-    """2-row × n_ep subplot grid showing oracle (top) vs predicted (bottom) correlation matrices."""
+def _corr_grid_fig(
+    plot_episodes: list[dict], step: int, baseline_names: list[str] | None = None
+) -> plt.Figure:
+    """Correlation-matrix grid: one column per episode, one row per estimator.
+
+    Rows are Oracle, model Pred, then one row per classical-kernel baseline (in
+    ``baseline_names`` order). Every predicted row is annotated with its
+    per-episode upper-triangle MSE against the oracle.
+    """
+    baseline_names = baseline_names or []
     n_ep = len(plot_episodes)
-    fig, axes = plt.subplots(2, n_ep, figsize=(max(n_ep * 1.8, 4), 4),
-                             squeeze=False)
+
+    # (row_label, key-in-episode-dict-or-None). Oracle/Pred are top-level keys;
+    # baselines live under ep["baselines"][name].
+    rows: list[tuple[str, str | None]] = [("Oracle", "R_ora"), ("Pred", "R_pred")]
+    rows += [(name, name) for name in baseline_names]
+    n_row = len(rows)
+
+    fig, axes = plt.subplots(
+        n_row, n_ep, figsize=(max(n_ep * 1.8, 4), max(n_row * 1.6, 4)),
+        squeeze=False, constrained_layout=True,
+    )
     cmap = plt.get_cmap("RdBu_r").copy()
     cmap.set_bad(color="lightgrey")
 
+    im = None
     for col, ep in enumerate(plot_episodes):
-        R_pred = ep["R_pred"].copy()
-        R_ora = ep["R_ora"].copy()
-        n = R_pred.shape[0]
+        R_ora = ep["R_ora"]
+        n = R_ora.shape[0]
         diag = np.arange(n)
-
-        # Compute per-episode upper-triangle MSE
         ri, ci = np.triu_indices(n, k=1)
-        mse = float(np.mean((R_pred[ri, ci] - R_ora[ri, ci]) ** 2))
 
-        # Blank diagonal so it doesn't dominate the colour scale
-        R_pred[diag, diag] = np.nan
-        R_ora[diag, diag] = np.nan
-
-        for row, (mat, row_label) in enumerate([(R_ora, "Oracle"), (R_pred, "Pred")]):
+        for row, (row_label, key) in enumerate(rows):
+            if key == "R_ora":
+                mat = R_ora
+            elif key == "R_pred":
+                mat = ep["R_pred"]
+            else:
+                mat = ep["baselines"].get(key)
             ax = axes[row, col]
+            if mat is None:
+                ax.axis("off")
+                continue
+
+            mse = None if row == 0 else float(np.mean((mat[ri, ci] - R_ora[ri, ci]) ** 2))
+            mat = mat.copy()
+            mat[diag, diag] = np.nan  # blank diagonal so it doesn't dominate the scale
+
             im = ax.imshow(mat, cmap=cmap, vmin=-1, vmax=1,
                            interpolation="nearest", aspect="auto")
             ax.set_xticks([])
@@ -121,13 +146,27 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
                 ax.set_ylabel(row_label, fontsize=7)
             if row == 0:
                 ax.set_title(ep["label"], fontsize=6)
-            if row == 1:
+            if mse is not None:
                 ax.set_xlabel(f"MSE={mse:.3f}", fontsize=6)
 
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.5, pad=0.02)
-    fig.suptitle(f"step {step} — oracle vs predicted correlations", fontsize=8)
-    fig.tight_layout()
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.4, aspect=40, pad=0.02)
+    fig.suptitle(f"step {step} — oracle vs predicted vs classical kernels", fontsize=8)
     return fig
+
+
+def _baseline_settings(cfg: DictConfig) -> tuple[bool, dict]:
+    """Read the classical-kernel baseline config into (enabled, compute_kernel_bank kwargs)."""
+    bcfg = cfg.get("baselines", {}) or {}
+    enabled = bool(bcfg.get("enabled", True))
+    kwargs: dict = {}
+    if bcfg.get("kernels") is not None:
+        kwargs["families"] = list(bcfg["kernels"])
+    if bcfg.get("ard") is not None:
+        kwargs["ard_flags"] = list(bcfg["ard"])
+    kwargs["rq_alpha"] = float(bcfg.get("rq_alpha", 1.0))
+    kwargs["lengthscale_scale"] = float(bcfg.get("lengthscale_scale", 1.0))
+    return enabled, kwargs
 
 
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
@@ -185,6 +224,13 @@ def validate(
     all_off_ora: list[np.ndarray] = []
     plot_episodes: list[dict] = []
 
+    # Classical-kernel baselines: fixed kernels on x_test features, scored each
+    # validation against the oracle (corr metrics) and via the copula NLL.
+    baselines_on, baseline_kwargs = _baseline_settings(cfg)
+    base_off_pred: dict[str, list[np.ndarray]] = {}
+    base_cop: dict[str, list[float]] = {}
+    baseline_names: list[str] = []
+
     for batch_idx, batch in enumerate(val_loader):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
@@ -192,6 +238,16 @@ def validate(
         Sigma = low_rank_correlation(
             out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
         )
+
+        bank = (
+            compute_kernel_bank(batch["x_test"].float(), batch["test_mask"], **baseline_kwargs)
+            if baselines_on
+            else {}
+        )
+        if bank and not baseline_names:
+            baseline_names = list(bank.keys())
+            base_off_pred = {n: [] for n in baseline_names}
+            base_cop = {n: [] for n in baseline_names}
         parts = y_space_nll(
             Sigma,
             batch["z_test"].float(),
@@ -209,6 +265,10 @@ def validate(
             batch["z_test"].float(),
             batch["test_mask"],
         )
+        for name, C in bank.items():
+            base_cop[name].append(
+                oracle_copula_nll(C, batch["z_test"].float(), batch["test_mask"]).item()
+            )
         tot.append(parts["total"].item())
         cop.append(parts["copula"].item())
         mar.append(parts["marginal"].item())
@@ -258,6 +318,10 @@ def validate(
             all_off_pred_flat.append(off_vals_cur.cpu().numpy())
             all_off_ora_flat.append(R_star_off_cur.cpu().numpy())
 
+            # Baseline off-diagonals over the same valid pairs (aligned with R_star_off_cur)
+            for name, C in bank.items():
+                base_off_pred[name].append(C[:, ri_cur, ci_cur][valid_off_cur].cpu().numpy())
+
         # ---- Collect data for plots ----
         if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
             B = Sigma.shape[0]
@@ -275,6 +339,10 @@ def validate(
                         "R_pred": R_pred_b,
                         "R_ora": R_ora_b,
                         "label": f"ep{batch_idx * B + b}\nN={n}",
+                        "baselines": {
+                            name: C[b, :n, :n].float().cpu().numpy()
+                            for name, C in bank.items()
+                        },
                     })
 
     mean_cop       = sum(cop)     / len(cop)
@@ -328,6 +396,17 @@ def validate(
         metrics["corr_mse"] = metrics["corr_mae"] = float("nan")
         metrics["corr_pearson"] = metrics["corr_bias"] = float("nan")
 
+    # Classical-kernel baseline metrics (one group per kernel).
+    off_o_all = np.concatenate(all_off_ora_flat) if all_off_ora_flat else None
+    for name in baseline_names:
+        if base_cop[name]:
+            metrics[f"baseline/{name}/copula_nll"] = float(np.mean(base_cop[name]))
+        if off_o_all is not None and base_off_pred[name]:
+            cqb = _corr_quality(np.concatenate(base_off_pred[name]), off_o_all)
+            metrics[f"baseline/{name}/corr_mse"]     = cqb["mse"]
+            metrics[f"baseline/{name}/corr_mae"]     = cqb["mae"]
+            metrics[f"baseline/{name}/corr_pearson"] = cqb["pearson"]
+
     model.train()
 
     plot_figs: list = []
@@ -349,9 +428,9 @@ def validate(
             fig_den.tight_layout()
             plot_figs.append(fig_den)
 
-        # — Oracle vs predicted correlation matrix grid —
+        # — Oracle vs predicted vs classical-kernel correlation matrix grid —
         if plot_episodes:
-            plot_figs.append(_corr_grid_fig(plot_episodes, step))
+            plot_figs.append(_corr_grid_fig(plot_episodes, step, baseline_names))
 
     return metrics, plot_figs
 
