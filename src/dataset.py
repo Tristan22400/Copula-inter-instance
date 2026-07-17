@@ -165,6 +165,9 @@ def collate_fn(samples: List[dict]) -> dict:
         train_mask   : BoolTensor (B, P_max)
         test_mask    : BoolTensor (B, N_max)
         R_star       : (B, N_max, N_max)
+        R_prior      : (B, N_max, N_max)  (only if episodes carry it — the
+                       sampling-prior correlation corr(K_ss); absent for older
+                       datasets generated before it was added)
         Sigma_star   : (B, N_max, N_max)
         mu_star      : (B, N_max)
         sigma_star   : (B, N_max)
@@ -208,6 +211,11 @@ def collate_fn(samples: List[dict]) -> dict:
     Sigma_star   = torch.zeros(B, N_max, N_max)
     mu_star      = torch.zeros(B, N_max)
     sigma_star   = torch.zeros(B, N_max)
+    # R_prior (sampling-prior correlation) is optional — only datasets generated
+    # after it was added carry it (data_gen.py). Emit it only when present so
+    # older shards still collate.
+    has_prior    = "R_prior" in samples[0]
+    R_prior      = torch.zeros(B, N_max, N_max) if has_prior else None
 
     for b, s in enumerate(samples):
         P = P_list[b]
@@ -226,8 +234,10 @@ def collate_fn(samples: List[dict]) -> dict:
         Sigma_star[b, :N, :N] = s["Sigma_star"]
         mu_star[b,   :N]    = s["mu_star"]
         sigma_star[b, :N]   = s["sigma_star"]
+        if has_prior:
+            R_prior[b, :N, :N] = s["R_prior"]
 
-    return {
+    out = {
         "x_train":      x_train,
         "x_test":       x_test,
         "y_train":      y_train,
@@ -244,6 +254,9 @@ def collate_fn(samples: List[dict]) -> dict:
         "n_train":      torch.tensor(P_list, dtype=torch.long),
         "n_test":       torch.tensor(N_list, dtype=torch.long),
     }
+    if has_prior:
+        out["R_prior"] = R_prior
+    return out
 
 
 class ShardBlockSampler(Sampler[int]):

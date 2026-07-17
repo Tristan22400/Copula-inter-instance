@@ -1378,6 +1378,20 @@ def generate_gp_batch(
     d_diag     = R_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
     R_star     = R_star / (d_diag.unsqueeze(1) * d_diag.unsqueeze(2))
 
+    # --- Prior correlation among the test points -------------------------------
+    # K_ss is the joint-prior test block (nugget already on the diagonal) that
+    # y_test was actually drawn from (noisy_dist above). Its correlation is the
+    # "sampling prior": identical to R_star when oracle_mode="prior", but a
+    # distinct, informative reference under oracle_mode="posterior" — it shows the
+    # raw kernel structure before conditioning on the training points. Stored per
+    # episode so downstream plots can compare prior vs oracle vs prediction.
+    # Same batched D^{-1/2} K D^{-1/2} normalization used for R_star just above.
+    prior_var  = K_ss.diagonal(dim1=1, dim2=2).clamp(min=1e-10)                   # (B, N)
+    prior_inv  = prior_var.rsqrt()
+    R_prior    = K_ss * prior_inv.unsqueeze(1) * prior_inv.unsqueeze(2)           # (B, N, N)
+    pd_diag    = R_prior.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
+    R_prior    = R_prior / (pd_diag.unsqueeze(1) * pd_diag.unsqueeze(2))
+
     # --- LOO PIT for z_train (R&W Eq. 5.12, batched) ---
     # diag(K_ff^{-1}) = column-squared-norm of L_ff^{-1}
     eye_P      = torch.eye(P, device=device)
@@ -1417,6 +1431,7 @@ def generate_gp_batch(
         "z_test":       z_test.cpu(),
         "log_pdf_test": log_pdf_test.cpu(),
         "R_star":       R_star.cpu(),
+        "R_prior":      R_prior.cpu(),
         "Sigma_star":   Sigma_full.cpu(),
         "mu_star":      mu_star.cpu(),
         "sigma_star":   sigma_star.cpu(),

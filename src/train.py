@@ -100,17 +100,23 @@ def _corr_grid_fig(
 ) -> plt.Figure:
     """Correlation-matrix grid: one column per episode, one row per estimator.
 
-    Rows are Oracle, model Pred, then one row per classical-kernel baseline (in
-    ``baseline_names`` order). Every predicted row is annotated with its
-    per-episode upper-triangle MSE against the oracle.
+    Rows are (optionally) the sampling Prior, the Oracle, the model Pred, then one
+    row per classical-kernel baseline (in ``baseline_names`` order). The Prior row
+    (corr(K_ss), the raw kernel correlation the samples were drawn from) is shown
+    only when episodes carry ``R_prior`` (datasets generated after it was added).
+    Every non-oracle row is annotated with its per-episode upper-triangle MSE
+    against the oracle.
     """
     baseline_names = baseline_names or []
     n_ep = len(plot_episodes)
 
-    # (row_label, key-in-episode-dict-or-None). Oracle/Pred are top-level keys;
-    # baselines live under ep["baselines"][name].
-    rows: list[tuple[str, str | None]] = [("Oracle", "R_ora"), ("Pred", "R_pred")]
-    rows += [(name, name) for name in baseline_names]
+    # (row_label, lookup). Prior/Oracle/Pred are top-level episode keys; baselines
+    # live under ep["baselines"][name], flagged with a ("baseline", name) tuple.
+    rows: list[tuple[str, object]] = []
+    if any("R_prior" in ep for ep in plot_episodes):
+        rows.append(("Prior", "R_prior"))
+    rows += [("Oracle", "R_ora"), ("Pred", "R_pred")]
+    rows += [(name, ("baseline", name)) for name in baseline_names]
     n_row = len(rows)
 
     fig, axes = plt.subplots(
@@ -128,18 +134,19 @@ def _corr_grid_fig(
         ri, ci = np.triu_indices(n, k=1)
 
         for row, (row_label, key) in enumerate(rows):
-            if key == "R_ora":
-                mat = R_ora
-            elif key == "R_pred":
-                mat = ep["R_pred"]
-            else:
-                mat = ep["baselines"].get(key)
+            is_oracle = key == "R_ora"
+            if isinstance(key, tuple):          # ("baseline", name)
+                mat = ep["baselines"].get(key[1])
+            else:                                # top-level key: R_prior/R_ora/R_pred
+                mat = ep.get(key)
             ax = axes[row, col]
             if mat is None:
                 ax.axis("off")
                 continue
 
-            mse = None if row == 0 else float(np.mean((mat[ri, ci] - R_ora[ri, ci]) ** 2))
+            # Annotate every row except the oracle itself with its MSE vs oracle
+            # (for Prior this quantifies how much conditioning changed the corr).
+            mse = None if is_oracle else float(np.mean((mat[ri, ci] - R_ora[ri, ci]) ** 2))
             mat = mat.copy()
             mat[diag, diag] = np.nan  # blank diagonal so it doesn't dominate the scale
 
@@ -156,7 +163,9 @@ def _corr_grid_fig(
 
     if im is not None:
         fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.4, aspect=40, pad=0.02)
-    fig.suptitle(f"step {step} — oracle vs predicted vs classical kernels", fontsize=8)
+    row_desc = " vs ".join(label for label, _ in rows[: max(1, n_row - len(baseline_names))])
+    tail = " vs classical kernels" if baseline_names else ""
+    fig.suptitle(f"step {step} — {row_desc}{tail}", fontsize=8)
     return fig
 
 
@@ -340,7 +349,7 @@ def validate(
                 all_off_pred.append(R_pred_b[ri, ci])
                 all_off_ora.append(R_ora_b[ri, ci])
                 if len(plot_episodes) < _MAX_PLOT_EPISODES:
-                    plot_episodes.append({
+                    ep_plot = {
                         "R_pred": R_pred_b,
                         "R_ora": R_ora_b,
                         "label": f"ep{batch_idx * B + b}\nN={n}",
@@ -348,7 +357,12 @@ def validate(
                             name: C[b, :n, :n].float().cpu().numpy()
                             for name, C in bank.items()
                         },
-                    })
+                    }
+                    # Sampling-prior correlation corr(K_ss): only present for
+                    # datasets generated after R_prior was added (data_gen.py).
+                    if "R_prior" in batch:
+                        ep_plot["R_prior"] = batch["R_prior"][b, :n, :n].float().cpu().numpy()
+                    plot_episodes.append(ep_plot)
 
     mean_cop       = sum(cop)     / len(cop)
     mean_ora_cop_z = sum(ora_cop_z) / len(ora_cop_z)
