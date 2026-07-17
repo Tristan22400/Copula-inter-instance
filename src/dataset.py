@@ -174,6 +174,22 @@ def collate_fn(samples: List[dict]) -> dict:
     B   = len(samples)
     d_x = samples[0]["x_norm_train"].shape[-1]
 
+    # Variable-d_features datasets store a different feature count per shard
+    # (data_gen.py::_sample_d_features), and every column feeds TabICL as one
+    # (B, T, d_x) tensor — the row masks do not cover the feature axis. A batch
+    # that straddles shards of different d cannot be stacked; fail loudly here
+    # instead of the opaque "expanded size ... must match" from the assignment
+    # below. Use ShardHomogeneousBatchSampler (see train.py) to keep every batch
+    # within a single shard.
+    if any(s["x_norm_train"].shape[-1] != d_x for s in samples):
+        d_set = sorted({int(s["x_norm_train"].shape[-1]) for s in samples})
+        raise RuntimeError(
+            f"collate_fn received a batch with mixed feature counts {d_set}. "
+            "This dataset has per-shard-varying d_features; batches must stay "
+            "within one shard. Ensure train.py uses ShardHomogeneousBatchSampler "
+            "(auto-enabled for variable-d datasets)."
+        )
+
     P_list = [int(s["n_train"].item()) for s in samples]
     N_list = [int(s["n_test"].item())  for s in samples]
     P_max  = max(P_list)
@@ -269,3 +285,71 @@ class ShardBlockSampler(Sampler[int]):
                 block_positions.extend(groups[sid])
             for i in torch.randperm(len(block_positions)).tolist():
                 yield block_positions[i]
+
+
+class ShardHomogeneousBatchSampler(Sampler[List[int]]):
+    """Batch sampler that keeps every minibatch within a single shard.
+
+    Variable-``d_features`` datasets store a different feature count per shard
+    (data_gen.py::_sample_d_features), so ``collate_fn`` can only stack episodes
+    that share a shard — a batch straddling two shards has mismatched feature
+    columns and cannot be padded (the row masks do not cover the feature axis,
+    and TabICL consumes one (B, T, d) tensor). This sampler groups positions by
+    shard and emits chunks of ``batch_size`` *within* each shard, so batches are
+    always feature-homogeneous regardless of whether ``batch_size`` divides
+    ``shard_size``. Because a shard's episodes also share kernel/P/N/active_dims
+    (see generate_gp_batch), each batch is single-task — the price of variable-d.
+
+    Keeping a shard's batches contiguous also means at most one shard is resident
+    at a time (cache-friendly on network storage).
+
+    Yields lists of *local* positions (indices into a wrapping ``Subset``), so
+    pass ``subset.indices`` — same convention as ShardBlockSampler. Covers every
+    position exactly once per epoch. With ``shuffle=True`` the shard order and
+    the within-shard order are re-randomised each epoch; the final batch of each
+    shard may be smaller than ``batch_size`` unless ``drop_last``.
+    """
+
+    def __init__(
+        self,
+        subset_indices: Sequence[int],
+        shard_size: int,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        self.subset_indices = list(subset_indices)
+        self.shard_size = shard_size
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+    def _groups(self) -> dict[int, list[int]]:
+        groups: dict[int, list[int]] = {}
+        for local_pos, global_idx in enumerate(self.subset_indices):
+            groups.setdefault(global_idx // self.shard_size, []).append(local_pos)
+        return groups
+
+    def __len__(self) -> int:
+        total = 0
+        for members in self._groups().values():
+            if self.drop_last:
+                total += len(members) // self.batch_size
+            else:
+                total += (len(members) + self.batch_size - 1) // self.batch_size
+        return total
+
+    def __iter__(self):
+        groups = self._groups()
+        shard_ids = list(groups.keys())
+        if self.shuffle:
+            shard_ids = [shard_ids[i] for i in torch.randperm(len(shard_ids)).tolist()]
+        for sid in shard_ids:
+            members = groups[sid]
+            if self.shuffle:
+                members = [members[i] for i in torch.randperm(len(members)).tolist()]
+            for start in range(0, len(members), self.batch_size):
+                batch = members[start : start + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                yield batch
