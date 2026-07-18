@@ -50,6 +50,7 @@ from muon import Muon
 
 _MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
+_CORR_GRID_N_WRAP = 3  # stack corr_grid episodes across this many bands
 
 
 def _sigma_stats(Sigma: torch.Tensor, mask: torch.Tensor) -> dict:
@@ -100,27 +101,26 @@ def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
 def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     """Correlation-matrix grid: each estimator paired side-by-side with the oracle.
 
-    One row per estimator — (optionally) the sampling Prior, then the model Pred.
-    Each episode occupies *two adjacent columns*: the oracle ``R_star`` on the left
-    and that row's prediction on the right, so every estimate sits right next to
-    the ground truth it is compared against (no scanning to a distant oracle row).
-    The Prior row (corr(K_ss), the raw kernel correlation the samples were drawn
-    from) is shown only when episodes carry ``R_prior`` (datasets generated after
-    it was added). Each prediction cell is annotated with its per-episode
-    upper-triangle MSE against the oracle.
+    One row per estimator — the model Pred. Each episode occupies *two adjacent
+    columns*: the oracle ``R_star`` on the left and that row's prediction on the
+    right, so every estimate sits right next to the ground truth it is compared
+    against (no scanning to a distant oracle row). Each prediction cell is
+    annotated with its per-episode upper-triangle MSE against the oracle.
+    Episodes are wrapped across ``_CORR_GRID_N_WRAP`` stacked bands instead of
+    one very wide row, so the figure stays a reasonable aspect ratio on screen.
     """
     n_ep = len(plot_episodes)
 
-    # (row_label, lookup) for each *estimator*: Prior/Pred are top-level episode
-    # keys. The oracle is no longer a row — it is the left cell of every episode pair.
-    rows: list[tuple[str, str]] = []
-    if any("R_prior" in ep for ep in plot_episodes):
-        rows.append(("Prior", "R_prior"))
-    rows.append(("Pred", "R_pred"))
-    n_row = len(rows)
+    # (row_label, lookup) for each *estimator*: Pred is a top-level episode key.
+    # The oracle is no longer a row — it is the left cell of every episode pair.
+    rows: list[tuple[str, str]] = [("Pred", "R_pred")]
+    n_est = len(rows)
 
-    # Two columns per episode: [oracle | prediction].
-    n_col = 2 * n_ep
+    n_wrap = max(1, min(_CORR_GRID_N_WRAP, n_ep))
+    per_line = math.ceil(n_ep / n_wrap)
+    n_col = 2 * per_line
+    n_row = n_est * n_wrap
+
     fig, axes = plt.subplots(
         n_row, n_col, figsize=(max(n_col * 1.1, 4), max(n_row * 1.5, 4)),
         squeeze=False, constrained_layout=True,
@@ -136,13 +136,15 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
                          interpolation="nearest", aspect="auto")
 
     im = None
-    for col, ep in enumerate(plot_episodes):
+    for idx, ep in enumerate(plot_episodes):
+        line, col = divmod(idx, per_line)
         R_ora = ep["R_ora"]
         ri, ci = np.triu_indices(R_ora.shape[0], k=1)
         c_ora, c_est = 2 * col, 2 * col + 1
 
-        for row, (row_label, key) in enumerate(rows):
-            mat = ep.get(key)  # top-level key: R_prior/R_pred
+        for row_idx, (row_label, key) in enumerate(rows):
+            row = line * n_est + row_idx
+            mat = ep.get(key)  # top-level key: R_pred
 
             # Left cell: the oracle, redrawn beside every estimator as its reference.
             ax_o = axes[row, c_ora]
@@ -151,14 +153,14 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
             ax_o.set_yticks([])
             if col == 0:
                 ax_o.set_ylabel(row_label, fontsize=7)
-            if row == 0:
+            if row_idx == 0:
                 ax_o.set_title(f"{ep['label']}\noracle", fontsize=6)
 
             # Right cell: this row's prediction, annotated with its MSE vs oracle.
             ax_e = axes[row, c_est]
             ax_e.set_xticks([])
             ax_e.set_yticks([])
-            if row == 0:
+            if row_idx == 0:
                 ax_e.set_title("\nest", fontsize=6)
             if mat is None:
                 ax_e.axis("off")
@@ -166,6 +168,14 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
             im = _draw(ax_e, mat)
             mse = float(np.mean((mat[ri, ci] - R_ora[ri, ci]) ** 2))
             ax_e.set_xlabel(f"MSE={mse:.3f}", fontsize=6)
+
+    # Blank out the trailing unused slots in the last (possibly partial) band.
+    for idx in range(n_ep, per_line * n_wrap):
+        line, col = divmod(idx, per_line)
+        for row_idx in range(n_est):
+            row = line * n_est + row_idx
+            axes[row, 2 * col].axis("off")
+            axes[row, 2 * col + 1].axis("off")
 
     if im is not None:
         fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.4, aspect=40, pad=0.02)
@@ -352,16 +362,11 @@ def validate(
                 all_off_pred.append(R_pred_b[ri, ci])
                 all_off_ora.append(R_ora_b[ri, ci])
                 if len(plot_episodes) < _MAX_PLOT_EPISODES:
-                    ep_plot = {
+                    plot_episodes.append({
                         "R_pred": R_pred_b,
                         "R_ora": R_ora_b,
                         "label": f"ep{batch_idx * B + b}\nN={n}",
-                    }
-                    # Sampling-prior correlation corr(K_ss): only present for
-                    # datasets generated after R_prior was added (data_gen.py).
-                    if "R_prior" in batch:
-                        ep_plot["R_prior"] = batch["R_prior"][b, :n, :n].float().cpu().numpy()
-                    plot_episodes.append(ep_plot)
+                    })
 
     mean_cop       = sum(cop)     / len(cop)
     mean_ora_cop_z = sum(ora_cop_z) / len(ora_cop_z)
@@ -444,14 +449,11 @@ def validate(
         if do_plot:
             n_s = int(sbatch["test_mask"][0].sum())
             if n_s >= 2:
-                ep_plot_s = {
+                plot_episodes.append({
                     "R_pred": Sigma_s[0, :n_s, :n_s].float().cpu().numpy(),
                     "R_ora":  sbatch["R_star"][0, :n_s, :n_s].float().cpu().numpy(),
                     "label":  f"kfit:{family}\nN={n_s}",
-                }
-                if "R_prior" in sbatch:
-                    ep_plot_s["R_prior"] = sbatch["R_prior"][0, :n_s, :n_s].float().cpu().numpy()
-                plot_episodes.append(ep_plot_s)
+                })
 
     model.train()
 
