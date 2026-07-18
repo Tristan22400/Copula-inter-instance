@@ -98,74 +98,87 @@ def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
 def _corr_grid_fig(
     plot_episodes: list[dict], step: int, baseline_names: list[str] | None = None
 ) -> plt.Figure:
-    """Correlation-matrix grid: one column per episode, one row per estimator.
+    """Correlation-matrix grid: each estimator paired side-by-side with the oracle.
 
-    Rows are (optionally) the sampling Prior, the Oracle, the model Pred, then one
-    row per classical-kernel baseline (in ``baseline_names`` order). The Prior row
+    One row per estimator — (optionally) the sampling Prior, the model Pred, then one
+    row per classical-kernel baseline (in ``baseline_names`` order). Each episode
+    occupies *two adjacent columns*: the oracle ``R_star`` on the left and that row's
+    prediction on the right, so every estimate sits right next to the ground truth it
+    is compared against (no scanning to a distant oracle row). The Prior row
     (corr(K_ss), the raw kernel correlation the samples were drawn from) is shown
     only when episodes carry ``R_prior`` (datasets generated after it was added).
-    Every non-oracle row is annotated with its per-episode upper-triangle MSE
+    Each prediction cell is annotated with its per-episode upper-triangle MSE
     against the oracle.
     """
     baseline_names = baseline_names or []
     n_ep = len(plot_episodes)
 
-    # (row_label, lookup). Prior/Oracle/Pred are top-level episode keys; baselines
-    # live under ep["baselines"][name], flagged with a ("baseline", name) tuple.
+    # (row_label, lookup) for each *estimator*. Prior/Pred are top-level episode
+    # keys; baselines live under ep["baselines"][name], flagged ("baseline", name).
+    # The oracle is no longer a row — it is the left cell of every episode pair.
     rows: list[tuple[str, object]] = []
     if any("R_prior" in ep for ep in plot_episodes):
         rows.append(("Prior", "R_prior"))
-    rows += [("Oracle", "R_ora"), ("Pred", "R_pred")]
+    rows.append(("Pred", "R_pred"))
     rows += [(name, ("baseline", name)) for name in baseline_names]
     n_row = len(rows)
 
+    # Two columns per episode: [oracle | prediction].
+    n_col = 2 * n_ep
     fig, axes = plt.subplots(
-        n_row, n_ep, figsize=(max(n_ep * 1.8, 4), max(n_row * 1.6, 4)),
+        n_row, n_col, figsize=(max(n_col * 1.1, 4), max(n_row * 1.5, 4)),
         squeeze=False, constrained_layout=True,
     )
     cmap = plt.get_cmap("RdBu_r").copy()
     cmap.set_bad(color="lightgrey")
 
+    def _draw(ax, mat):
+        m = mat.copy()
+        d = np.arange(m.shape[0])
+        m[d, d] = np.nan  # blank diagonal so it doesn't dominate the colour scale
+        return ax.imshow(m, cmap=cmap, vmin=-1, vmax=1,
+                         interpolation="nearest", aspect="auto")
+
     im = None
     for col, ep in enumerate(plot_episodes):
         R_ora = ep["R_ora"]
-        n = R_ora.shape[0]
-        diag = np.arange(n)
-        ri, ci = np.triu_indices(n, k=1)
+        ri, ci = np.triu_indices(R_ora.shape[0], k=1)
+        c_ora, c_est = 2 * col, 2 * col + 1
 
         for row, (row_label, key) in enumerate(rows):
-            is_oracle = key == "R_ora"
             if isinstance(key, tuple):          # ("baseline", name)
                 mat = ep["baselines"].get(key[1])
-            else:                                # top-level key: R_prior/R_ora/R_pred
+            else:                                # top-level key: R_prior/R_pred
                 mat = ep.get(key)
-            ax = axes[row, col]
-            if mat is None:
-                ax.axis("off")
-                continue
 
-            # Annotate every row except the oracle itself with its MSE vs oracle
-            # (for Prior this quantifies how much conditioning changed the corr).
-            mse = None if is_oracle else float(np.mean((mat[ri, ci] - R_ora[ri, ci]) ** 2))
-            mat = mat.copy()
-            mat[diag, diag] = np.nan  # blank diagonal so it doesn't dominate the scale
-
-            im = ax.imshow(mat, cmap=cmap, vmin=-1, vmax=1,
-                           interpolation="nearest", aspect="auto")
-            ax.set_xticks([])
-            ax.set_yticks([])
+            # Left cell: the oracle, redrawn beside every estimator as its reference.
+            ax_o = axes[row, c_ora]
+            im = _draw(ax_o, R_ora)
+            ax_o.set_xticks([])
+            ax_o.set_yticks([])
             if col == 0:
-                ax.set_ylabel(row_label, fontsize=7)
+                ax_o.set_ylabel(row_label, fontsize=7)
             if row == 0:
-                ax.set_title(ep["label"], fontsize=6)
-            if mse is not None:
-                ax.set_xlabel(f"MSE={mse:.3f}", fontsize=6)
+                ax_o.set_title(f"{ep['label']}\noracle", fontsize=6)
+
+            # Right cell: this row's prediction, annotated with its MSE vs oracle.
+            ax_e = axes[row, c_est]
+            ax_e.set_xticks([])
+            ax_e.set_yticks([])
+            if row == 0:
+                ax_e.set_title("\nest", fontsize=6)
+            if mat is None:
+                ax_e.axis("off")
+                continue
+            im = _draw(ax_e, mat)
+            mse = float(np.mean((mat[ri, ci] - R_ora[ri, ci]) ** 2))
+            ax_e.set_xlabel(f"MSE={mse:.3f}", fontsize=6)
 
     if im is not None:
         fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.4, aspect=40, pad=0.02)
-    row_desc = " vs ".join(label for label, _ in rows[: max(1, n_row - len(baseline_names))])
-    tail = " vs classical kernels" if baseline_names else ""
-    fig.suptitle(f"step {step} — {row_desc}{tail}", fontsize=8)
+    fig.suptitle(
+        f"step {step} — oracle (left) vs prediction (right), per episode", fontsize=8
+    )
     return fig
 
 
