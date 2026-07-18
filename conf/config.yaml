@@ -71,18 +71,20 @@ tabicl:
   #   ff_factor: 2
   #   dropout: 0.0
 
-# Classical-kernel baselines evaluated each validation loop: fixed kernels on the
-# test features x_test, scored against the oracle (corr metrics) and via the copula
-# NLL, and drawn as extra rows in the val/corr_grid plot. Lengthscales are fixed per
-# episode via the median heuristic (isotropic = global; ARD = per-dimension).
-# Metrics are logged as val/baseline/<kernel>/{copula_nll,corr_mse,corr_mae,corr_pearson}.
+# Model-fit-to-classical-kernel diagnostic, evaluated each validation loop:
+#   val/kernel_fit/<kernel>/{copula_nll,corr_mse,corr_mae,corr_pearson}
+# For each kernel family below, a fixed batch of synthetic episodes is
+# generated once (at startup) via data_gen.generate_gp_batch — the same
+# (x_train, z_train, x_test, R_star, ...) construction as real training data,
+# but with the generative kernel forced to that single family instead of this
+# run's usual composite/systematic mixture. Every validation call then runs
+# the CURRENT model on this frozen probe set, so kernel_fit/<kernel> moves
+# with training progress (unlike a fixed, data-only baseline would).
 baselines:
   enabled: true
-  # Kernel families; each is built both isotropic and ARD (see `ard`).
   kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic]
-  ard: [false, true]        # build without ARD (isotropic) and with ARD
-  rq_alpha: 1.0             # α of the Rational Quadratic kernel
-  lengthscale_scale: 1.0    # multiplier on the median-heuristic lengthscales
+  synth_n_episodes: 64      # fixed episodes generated once per kernel family
+  synth_seed: 20260718      # fixed seed -> same probe episodes every run
 
 # LoRA fine-tuning of the TabICL backbone.
 # Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]

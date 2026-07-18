@@ -217,7 +217,9 @@ def _dist(X1: Tensor, X2: Tensor) -> Tensor:
 
 _BASE_GPYTORCH_KERNEL_CLS: Dict[str, Callable[..., gpytorch.kernels.Kernel]] = {
     "rbf": gpytorch.kernels.RBFKernel,
+    "matern12": functools.partial(gpytorch.kernels.MaternKernel, nu=0.5),
     "matern32": functools.partial(gpytorch.kernels.MaternKernel, nu=1.5),
+    "matern52": functools.partial(gpytorch.kernels.MaternKernel, nu=2.5),
     "cosine": gpytorch.kernels.CosineKernel,
     "periodic": gpytorch.kernels.PeriodicKernel,
     "rational_quadratic": gpytorch.kernels.RQKernel,
@@ -263,7 +265,9 @@ class KernelPriorSpec:
 # ignores ard_num_dims entirely, so there's no per-dimension formula to opt
 # into. "dot_product" has no lengthscale at all (see its docstring) and
 # "hebo" is unconditionally ARD already (its tuned prior, not this flag).
-_ARD_ELIGIBLE_KERNELS = frozenset({"rbf", "matern32", "periodic", "rational_quadratic"})
+_ARD_ELIGIBLE_KERNELS = frozenset(
+    {"rbf", "matern12", "matern32", "matern52", "periodic", "rational_quadratic"}
+)
 
 
 HEBO_PLUS_HYPERPARAMETERS: Dict[str, object] = {
@@ -620,9 +624,19 @@ def rbf_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
     return build_kernel_fn("rbf", l, alpha2)(X1, X2)
 
 
+def matern12_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+    """Matérn ν=1/2, via gpytorch.kernels.MaternKernel(nu=0.5)."""
+    return build_kernel_fn("matern12", l, alpha2)(X1, X2)
+
+
 def matern32_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
     """Matérn ν=3/2, via gpytorch.kernels.MaternKernel(nu=1.5)."""
     return build_kernel_fn("matern32", l, alpha2)(X1, X2)
+
+
+def matern52_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+    """Matérn ν=5/2, via gpytorch.kernels.MaternKernel(nu=2.5)."""
+    return build_kernel_fn("matern52", l, alpha2)(X1, X2)
 
 
 def cosine_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
@@ -655,7 +669,9 @@ def _hebo_kernel_dispatch(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
 
 KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "rbf": rbf_kernel,
+    "matern12": matern12_kernel,
     "matern32": matern32_kernel,
+    "matern52": matern52_kernel,
     "cosine": cosine_kernel,
     "periodic": periodic_kernel,
     "rational_quadratic": rational_quadratic_kernel,

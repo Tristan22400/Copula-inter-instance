@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import time
+import zlib
 from glob import glob
 
 import hydra
@@ -35,7 +36,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from classical_kernels import compute_kernel_bank, default_kernel_names
+from classical_kernels import DEFAULT_FAMILIES
+from data_gen import KERNEL_REGISTRY, generate_gp_batch
 from dataset import (
     CopulaDataset,
     ShardBlockSampler,
@@ -95,32 +97,26 @@ def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
     return {"mse": mse, "mae": mae, "pearson": pearson, "bias": bias}
 
 
-def _corr_grid_fig(
-    plot_episodes: list[dict], step: int, baseline_names: list[str] | None = None
-) -> plt.Figure:
+def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     """Correlation-matrix grid: each estimator paired side-by-side with the oracle.
 
-    One row per estimator — (optionally) the sampling Prior, the model Pred, then one
-    row per classical-kernel baseline (in ``baseline_names`` order). Each episode
-    occupies *two adjacent columns*: the oracle ``R_star`` on the left and that row's
-    prediction on the right, so every estimate sits right next to the ground truth it
-    is compared against (no scanning to a distant oracle row). The Prior row
-    (corr(K_ss), the raw kernel correlation the samples were drawn from) is shown
-    only when episodes carry ``R_prior`` (datasets generated after it was added).
-    Each prediction cell is annotated with its per-episode upper-triangle MSE
-    against the oracle.
+    One row per estimator — (optionally) the sampling Prior, then the model Pred.
+    Each episode occupies *two adjacent columns*: the oracle ``R_star`` on the left
+    and that row's prediction on the right, so every estimate sits right next to
+    the ground truth it is compared against (no scanning to a distant oracle row).
+    The Prior row (corr(K_ss), the raw kernel correlation the samples were drawn
+    from) is shown only when episodes carry ``R_prior`` (datasets generated after
+    it was added). Each prediction cell is annotated with its per-episode
+    upper-triangle MSE against the oracle.
     """
-    baseline_names = baseline_names or []
     n_ep = len(plot_episodes)
 
-    # (row_label, lookup) for each *estimator*. Prior/Pred are top-level episode
-    # keys; baselines live under ep["baselines"][name], flagged ("baseline", name).
-    # The oracle is no longer a row — it is the left cell of every episode pair.
-    rows: list[tuple[str, object]] = []
+    # (row_label, lookup) for each *estimator*: Prior/Pred are top-level episode
+    # keys. The oracle is no longer a row — it is the left cell of every episode pair.
+    rows: list[tuple[str, str]] = []
     if any("R_prior" in ep for ep in plot_episodes):
         rows.append(("Prior", "R_prior"))
     rows.append(("Pred", "R_pred"))
-    rows += [(name, ("baseline", name)) for name in baseline_names]
     n_row = len(rows)
 
     # Two columns per episode: [oracle | prediction].
@@ -146,10 +142,7 @@ def _corr_grid_fig(
         c_ora, c_est = 2 * col, 2 * col + 1
 
         for row, (row_label, key) in enumerate(rows):
-            if isinstance(key, tuple):          # ("baseline", name)
-                mat = ep["baselines"].get(key[1])
-            else:                                # top-level key: R_prior/R_pred
-                mat = ep.get(key)
+            mat = ep.get(key)  # top-level key: R_prior/R_pred
 
             # Left cell: the oracle, redrawn beside every estimator as its reference.
             ax_o = axes[row, c_ora]
@@ -182,18 +175,38 @@ def _corr_grid_fig(
     return fig
 
 
-def _baseline_settings(cfg: DictConfig) -> tuple[bool, dict]:
-    """Read the classical-kernel baseline config into (enabled, compute_kernel_bank kwargs)."""
+def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, dict]:
+    """Fixed per-kernel-family synthetic probe episodes for the
+    ``kernel_fit/<family>`` validation metrics (see validate()).
+
+    Generates B episodes per family via data_gen.generate_gp_batch — the same
+    (x_train, z_train, x_test, R_star, ...) construction used for real
+    training/val data, but with the generative kernel forced to one classical
+    family instead of this run's usual composite/systematic mixture. Built
+    once, with a fixed per-family seed, and reused every validation call, so
+    kernel_fit/<family> only reflects the model's changing predictions on a
+    frozen probe set — not resampling noise.
+    """
     bcfg = cfg.get("baselines", {}) or {}
-    enabled = bool(bcfg.get("enabled", True))
-    kwargs: dict = {}
-    if bcfg.get("kernels") is not None:
-        kwargs["families"] = list(bcfg["kernels"])
-    if bcfg.get("ard") is not None:
-        kwargs["ard_flags"] = list(bcfg["ard"])
-    kwargs["rq_alpha"] = float(bcfg.get("rq_alpha", 1.0))
-    kwargs["lengthscale_scale"] = float(bcfg.get("lengthscale_scale", 1.0))
-    return enabled, kwargs
+    families = list(bcfg.get("kernels") or DEFAULT_FAMILIES)
+    n_episodes = int(bcfg.get("synth_n_episodes", 64))
+    base_seed = int(bcfg.get("synth_seed", 20260718))
+
+    batches: dict[str, dict] = {}
+    for family in families:
+        if family not in KERNEL_REGISTRY:
+            continue  # not standalone-generatable (e.g. an unregistered composite)
+        family_seed = base_seed + (zlib.crc32(family.encode()) % 10_000)
+        synth_cfg = OmegaConf.merge(
+            cfg,
+            OmegaConf.create(
+                {"seed": family_seed, "data": {"kernel": family, "systematic_composition": False}}
+            ),
+        )
+        episodes = generate_gp_batch(synth_cfg, n_episodes, device="cpu")
+        batch = collate_fn(episodes)
+        batches[family] = {k: v.to(device) for k, v in batch.items()}
+    return batches
 
 
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
@@ -232,6 +245,7 @@ def validate(
     device: str,
     step: int = 0,
     do_plot: bool = False,
+    synth_kernel_batches: dict | None = None,
 ) -> tuple[dict, list]:
     # Do NOT call model.eval() here: TabICL's eval mode triggers _inference_forward
     # which uses InferenceManager with its own float16 autocast on CUDA, producing
@@ -251,13 +265,6 @@ def validate(
     all_off_ora: list[np.ndarray] = []
     plot_episodes: list[dict] = []
 
-    # Classical-kernel baselines: fixed kernels on x_test features, scored each
-    # validation against the oracle (corr metrics) and via the copula NLL.
-    baselines_on, baseline_kwargs = _baseline_settings(cfg)
-    base_off_pred: dict[str, list[np.ndarray]] = {}
-    base_cop: dict[str, list[float]] = {}
-    baseline_names: list[str] = []
-
     for batch_idx, batch in enumerate(val_loader):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
@@ -266,15 +273,6 @@ def validate(
             out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
         )
 
-        bank = (
-            compute_kernel_bank(batch["x_test"].float(), batch["test_mask"], **baseline_kwargs)
-            if baselines_on
-            else {}
-        )
-        if bank and not baseline_names:
-            baseline_names = list(bank.keys())
-            base_off_pred = {n: [] for n in baseline_names}
-            base_cop = {n: [] for n in baseline_names}
         parts = y_space_nll(
             Sigma,
             batch["z_test"].float(),
@@ -292,10 +290,6 @@ def validate(
             batch["z_test"].float(),
             batch["test_mask"],
         )
-        for name, C in bank.items():
-            base_cop[name].append(
-                oracle_copula_nll(C, batch["z_test"].float(), batch["test_mask"]).item()
-            )
         tot.append(parts["total"].item())
         cop.append(parts["copula"].item())
         mar.append(parts["marginal"].item())
@@ -345,10 +339,6 @@ def validate(
             all_off_pred_flat.append(off_vals_cur.cpu().numpy())
             all_off_ora_flat.append(R_star_off_cur.cpu().numpy())
 
-            # Baseline off-diagonals over the same valid pairs (aligned with R_star_off_cur)
-            for name, C in bank.items():
-                base_off_pred[name].append(C[:, ri_cur, ci_cur][valid_off_cur].cpu().numpy())
-
         # ---- Collect data for plots ----
         if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
             B = Sigma.shape[0]
@@ -366,10 +356,6 @@ def validate(
                         "R_pred": R_pred_b,
                         "R_ora": R_ora_b,
                         "label": f"ep{batch_idx * B + b}\nN={n}",
-                        "baselines": {
-                            name: C[b, :n, :n].float().cpu().numpy()
-                            for name, C in bank.items()
-                        },
                     }
                     # Sampling-prior correlation corr(K_ss): only present for
                     # datasets generated after R_prior was added (data_gen.py).
@@ -428,16 +414,44 @@ def validate(
         metrics["corr_mse"] = metrics["corr_mae"] = float("nan")
         metrics["corr_pearson"] = metrics["corr_bias"] = float("nan")
 
-    # Classical-kernel baseline metrics (one group per kernel).
-    off_o_all = np.concatenate(all_off_ora_flat) if all_off_ora_flat else None
-    for name in baseline_names:
-        if base_cop[name]:
-            metrics[f"baseline/{name}/copula_nll"] = float(np.mean(base_cop[name]))
-        if off_o_all is not None and base_off_pred[name]:
-            cqb = _corr_quality(np.concatenate(base_off_pred[name]), off_o_all)
-            metrics[f"baseline/{name}/corr_mse"]     = cqb["mse"]
-            metrics[f"baseline/{name}/corr_mae"]     = cqb["mae"]
-            metrics[f"baseline/{name}/corr_pearson"] = cqb["pearson"]
+    # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
+    # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
+    # so these move with training progress (unlike a fixed data-only baseline).
+    for family, sbatch in (synth_kernel_batches or {}).items():
+        out_s = model(sbatch)
+        Sigma_s = low_rank_correlation(
+            out_s["W"].float(), out_s["s"].float(), sbatch["test_mask"], jitter=jitter
+        )
+        parts_s = y_space_nll(
+            Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
+        )
+        N_s = Sigma_s.shape[1]
+        ri_s, ci_s = torch.triu_indices(N_s, N_s, offset=1, device=Sigma_s.device)
+        mask2d_s = sbatch["test_mask"].unsqueeze(-1) & sbatch["test_mask"].unsqueeze(-2)
+        valid_s = mask2d_s[:, ri_s, ci_s]
+        off_p_s = Sigma_s[:, ri_s, ci_s][valid_s].cpu().numpy()
+        off_o_s = sbatch["R_star"].float()[:, ri_s, ci_s][valid_s].cpu().numpy()
+        cq_s = _corr_quality(off_p_s, off_o_s)
+        metrics[f"kernel_fit/{family}/copula_nll"]  = parts_s["copula"].item()
+        metrics[f"kernel_fit/{family}/corr_mse"]     = cq_s["mse"]
+        metrics[f"kernel_fit/{family}/corr_mae"]     = cq_s["mae"]
+        metrics[f"kernel_fit/{family}/corr_pearson"] = cq_s["pearson"]
+
+        # One extra corr_grid column per kernel family: its own synthetic
+        # episode's oracle beside the model's prediction on it — replaces the
+        # old classical-kernel baseline rows (which used the real episodes'
+        # oracle instead of a kernel-specific one).
+        if do_plot:
+            n_s = int(sbatch["test_mask"][0].sum())
+            if n_s >= 2:
+                ep_plot_s = {
+                    "R_pred": Sigma_s[0, :n_s, :n_s].float().cpu().numpy(),
+                    "R_ora":  sbatch["R_star"][0, :n_s, :n_s].float().cpu().numpy(),
+                    "label":  f"kfit:{family}\nN={n_s}",
+                }
+                if "R_prior" in sbatch:
+                    ep_plot_s["R_prior"] = sbatch["R_prior"][0, :n_s, :n_s].float().cpu().numpy()
+                plot_episodes.append(ep_plot_s)
 
     model.train()
 
@@ -460,9 +474,9 @@ def validate(
             fig_den.tight_layout()
             plot_figs.append(fig_den)
 
-        # — Oracle vs predicted vs classical-kernel correlation matrix grid —
+        # — Oracle vs predicted correlation matrix grid —
         if plot_episodes:
-            plot_figs.append(_corr_grid_fig(plot_episodes, step, baseline_names))
+            plot_figs.append(_corr_grid_fig(plot_episodes, step))
 
     return metrics, plot_figs
 
@@ -698,6 +712,9 @@ def main(cfg: DictConfig) -> None:
             else {"batch_size": t.batch_size, "shuffle": False}
         ),
     )
+
+    baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
+    synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
 
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
@@ -952,7 +969,8 @@ def main(cfg: DictConfig) -> None:
             plot_val_every = int(t.get("plot_val_every", 5000))
             do_plot = plot_val_every > 0 and step % plot_val_every == 0
             metrics, plot_figs = validate(
-                model, val_loader, cfg, device, step=step, do_plot=do_plot
+                model, val_loader, cfg, device, step=step, do_plot=do_plot,
+                synth_kernel_batches=synth_kernel_batches,
             )
             log_dict = {f"val/{k}": v for k, v in metrics.items()}
             if plot_figs:
