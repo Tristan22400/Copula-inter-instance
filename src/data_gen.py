@@ -63,20 +63,25 @@ ARD (cfg.data.ard)
 Composite kernels ("A+B" / "A*B")
 ---------------------------------
   Sums and products of PSD kernels are PSD, so every pair drawn from
-  {rbf, matern32, cosine, periodic, rational_quadratic} is auto-registered
-  under both operators via gpytorch's `+`/`*` kernel composition, e.g.
-  "rbf+periodic" (locally periodic: smooth decay times exact periodicity) or
-  "matern32*cosine" (spectral windowing). See COMPOSITE_KERNELS for the full
-  list. dot_product is not composable (no lengthscale — irregular
-  hyperparameter signature). cfg.data.ard applies independently to each
-  ARD-eligible component of a composite.
+  _COMPOSABLE_KERNELS (every base kernel, including dot_product) is
+  auto-registered under both operators via gpytorch's `+`/`*` kernel
+  composition, e.g. "rbf+periodic" (locally periodic: smooth decay times
+  exact periodicity), "matern32*cosine" (spectral windowing), or
+  "dot_product+rbf" (linear trend plus smooth deviation — dot_product has no
+  lengthscale, so it contributes only its LinearKernel term, and always over
+  every feature column regardless of the other component's active_dims
+  subset — see _build_kernel_component's docstring for why that matters).
+  See COMPOSITE_KERNELS for the full list. cfg.data.ard applies independently
+  to each ARD-eligible component of a composite. cfg.data.composite_exclude_kernels
+  prunes elementary kernels from the systematic-composition sampling pool at
+  run time (see below) without touching _COMPOSABLE_KERNELS itself.
 
   Systematic composition (cfg.data.systematic_composition, CauKer-style —
   github.com/ShifengXIE/CauKer): an alternative, opt-in generative mode that
   samples a random chain length M ~ Uniform[composite_num_kernels_min,
   composite_num_kernels_max], draws M elementary kernels with replacement
-  from {rbf, matern32, cosine, periodic, rational_quadratic}, and combines
-  them left-to-right with independently-sampled +/* operators (see
+  from _COMPOSABLE_KERNELS (minus cfg.data.composite_exclude_kernels), and
+  combines them left-to-right with independently-sampled +/* operators (see
   _sample_kernel_chain_structure / _build_kernel_chain), instead of the
   static enumerated 2-way COMPOSITE_KERNELS list. Produces chain names like
   "rbf+cosine*periodic" that are NOT registered in ALL_KERNELS/
@@ -425,32 +430,40 @@ def _build_scaled_kernel(
     return scaled, params
 
 
-def _sample_episode_kernel(
-    cfg, kernel_name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None
+def _build_kernel_component(
+    cfg, name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
-    """Sample B episodes' hyperparameters for kernel_name (base or "A+B"/"A*B"
-    composite) and return (gpytorch Kernel with batch_shape=[B], params dict).
+    """Build one elementary (non-composite) kernel + its sampled hyperparameter
+    dict — the unit _sample_episode_kernel calls once for a bare kernel or
+    twice (component A, component B) for a composite.
 
-    "dot_product" has no lengthscale, but its LinearKernel `variance` is
-    sampled from the same alpha2 ~ Gamma(alpha2_gamma_concentration,
-    alpha2_gamma_rate) prior every other kernel's outputscale uses (see
-    dot_product_kernel's docstring). params keys match the output-dict schema
-    (l, alpha2, period, rq_alpha, l_b, alpha2_b, period_b, rq_alpha_b);
-    not-applicable entries are filled with a 0.0 sentinel (the convention
-    pit.py::gp_analytical_pit relies on).
+    "dot_product" has no lengthscale, so it bypasses _kernel_prior_spec/
+    _build_scaled_kernel entirely: a bare LinearKernel (no ScaleKernel
+    wrapper — its `variance` already plays the alpha2 role, see
+    dot_product_kernel's docstring) whose variance is sampled from the same
+    alpha2 ~ Gamma(alpha2_gamma_concentration, alpha2_gamma_rate) prior every
+    other kernel's outputscale uses. Every other kernel goes through
+    _build_scaled_kernel (ScaleKernel-wrapped, real lengthscale prior).
 
-    active_dims: column indices (out of the caller's full d_features input)
-    this kernel is active on — None means every column. Forwarded to
-    gpytorch's own active_dims kwarg (see _build_scaled_kernel), so callers
-    pass the full-width input straight through instead of pre-slicing it.
+    `active_dims` is deliberately IGNORED for "dot_product": unlike every
+    stationary kernel here, its diagonal k(x,x) = alpha2 * x@x depends on the
+    actual point (not just alpha2), so restricting it to a small column
+    subset (e.g. k=1, forced when its composite partner is cosine/periodic)
+    makes k(x,x)==0 a real, non-negligible event whenever that one column's
+    per-episode-standardized value lands on ~0 for some point — which zeroes
+    the WHOLE diagonal for a "*" (product) composite, breaking R_star's
+    unit-diagonal invariant (empirically ~1% of episodes under forced MLP
+    mixing for e.g. "matern32*dot_product" before this override). Always
+    using every column (same as the bare "dot_product" kernel already did —
+    see generate_gp_batch's kernel_cols selection) makes that coordinate-wise
+    coincidence require ALL d columns to vanish simultaneously instead of
+    just one, which the standalone kernel already relies on (0/3000 in an
+    empirical sweep) and composites now share. gpytorch kernel `+`/`*`
+    composition evaluates each side on the full-width input independently, so
+    this doesn't require the other component to match active_dims.
     """
-    composite = _parse_composite(kernel_name)
-    if kernel_name == "dot_product":
-        batch_shape = torch.Size([B])
-        kernel_kwargs: Dict = {"batch_shape": batch_shape}
-        if active_dims is not None:
-            kernel_kwargs["active_dims"] = active_dims
-        kernel = gpytorch.kernels.LinearKernel(**kernel_kwargs).to(device)
+    if name == "dot_product":
+        kernel = gpytorch.kernels.LinearKernel(batch_shape=torch.Size([B])).to(device)
         a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
         a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
         a_sample = GammaPrior(a_conc, a_rate).sample(kernel.variance.shape).to(device)
@@ -459,17 +472,36 @@ def _sample_episode_kernel(
             "l": torch.zeros(B, device=device),
             "alpha2": a_sample.reshape(B),
         }
-    elif composite is None:
-        spec = _kernel_prior_spec(cfg, kernel_name)
-        kernel, params = _build_scaled_kernel(kernel_name, spec, k, B, device, active_dims=active_dims)
+        return kernel, params
+    spec = _kernel_prior_spec(cfg, name)
+    return _build_scaled_kernel(name, spec, k, B, device, active_dims=active_dims)
+
+
+def _sample_episode_kernel(
+    cfg, kernel_name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None
+) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
+    """Sample B episodes' hyperparameters for kernel_name (base or "A+B"/"A*B"
+    composite, either component of which may be "dot_product" — see
+    _build_kernel_component) and return (gpytorch Kernel with
+    batch_shape=[B], params dict).
+
+    params keys match the output-dict schema (l, alpha2, period, rq_alpha,
+    l_b, alpha2_b, period_b, rq_alpha_b); not-applicable entries (including
+    "dot_product"'s "l"/"l_b") are filled with a 0.0 sentinel (the convention
+    pit.py::gp_analytical_pit relies on).
+
+    active_dims: column indices (out of the caller's full d_features input)
+    this kernel is active on — None means every column. Forwarded to
+    gpytorch's own active_dims kwarg (see _build_scaled_kernel), so callers
+    pass the full-width input straight through instead of pre-slicing it.
+    """
+    composite = _parse_composite(kernel_name)
+    if composite is None:
+        kernel, params = _build_kernel_component(cfg, kernel_name, k, B, device, active_dims=active_dims)
     else:
         name_a, op, name_b = composite
-        kernel_a, params_a = _build_scaled_kernel(
-            name_a, _kernel_prior_spec(cfg, name_a), k, B, device, active_dims=active_dims
-        )
-        kernel_b, params_b = _build_scaled_kernel(
-            name_b, _kernel_prior_spec(cfg, name_b), k, B, device, active_dims=active_dims
-        )
+        kernel_a, params_a = _build_kernel_component(cfg, name_a, k, B, device, active_dims=active_dims)
+        kernel_b, params_b = _build_kernel_component(cfg, name_b, k, B, device, active_dims=active_dims)
         kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
         params = dict(params_a)
         for key, val in params_b.items():
@@ -492,16 +524,17 @@ def _build_concrete_kernel(
     its `variance` already plays the role `alpha2` plays for every other
     kernel, so wrapping it would just be a second, redundant alpha2. "l" is
     ignored — no lengthscale, geometry comes entirely from the feature space.
+    `active_dims` is likewise ignored for "dot_product" — see
+    _build_kernel_component's docstring for why (always full columns,
+    matching how it was actually sampled, including as a composite
+    component).
 
     active_dims: column indices this kernel reads out of the caller's
     full-width input (gpytorch's own kwarg — see _build_scaled_kernel);
     None means every column.
     """
     if name == "dot_product":
-        kernel_kwargs: Dict = {}
-        if active_dims is not None:
-            kernel_kwargs["active_dims"] = active_dims
-        kernel = gpytorch.kernels.LinearKernel(**kernel_kwargs)
+        kernel = gpytorch.kernels.LinearKernel()
         kernel.variance = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(kernel.variance.shape)
         return kernel
 
@@ -651,11 +684,17 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
 # ---------------------------------------------------------------------------
 # Sums and products of PSD kernels are PSD, so "rbf+periodic" (locally
 # periodic — smooth decay times exact periodicity) or "matern32*cosine"
-# (spectral windowing) are valid kernels without any new math. Restricted to
-# the kernels below because they share one calling convention (l, alpha2,
-# plus an optional named extra); dot_product has an irregular signature
-# (no lengthscale) and is left out of composites.
-_COMPOSABLE_KERNELS: List[str] = ["rbf", "matern32", "cosine", "periodic", "rational_quadratic"]
+# (spectral windowing) are valid kernels without any new math. Includes every
+# base kernel in KERNEL_REGISTRY — "dot_product" has no lengthscale (see its
+# docstring) but _build_kernel_component/_build_concrete_kernel both special-
+# case it (bare LinearKernel, `l`/`l_b` ignored) so it composes fine, e.g.
+# "dot_product+rbf" (linear trend plus smooth deviation). Per-run pruning
+# (e.g. dropping periodic/cosine) goes through cfg.data.composite_exclude_kernels
+# instead of hardcoding a subset here — see _sample_kernel_chain_structure.
+_COMPOSABLE_KERNELS: List[str] = [
+    "rbf", "matern12", "matern32", "matern52", "cosine", "periodic",
+    "rational_quadratic", "dot_product",
+]
 
 # Kernels whose PSD guarantee only holds for scalar (1D) inputs — composites
 # that include one of these must also cap the active kernel dimensionality
@@ -789,12 +828,12 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
     composite_num_kernels_max], then a length-m list of elementary kernels
     (with replacement) from _COMPOSABLE_KERNELS, then m-1 independently
     sampled +/* operators to combine them left-to-right (functools.reduce,
-    see _build_kernel_chain) — instead of picking from the fixed 20-entry
+    see _build_kernel_chain) — instead of picking from the fixed 56-entry
     COMPOSITE_KERNELS pool. Active only when cfg.data.systematic_composition
     is True (see _resolve_kernel_name's docstring for the non-systematic
     path). cfg.data.composite_exclude_kernels (optional list, default empty)
     drops named elementary kernels from the sampling pool without touching
-    _COMPOSABLE_KERNELS itself — that constant also seeds the static 20-entry
+    _COMPOSABLE_KERNELS itself — that constant also seeds the static 56-entry
     COMPOSITE_KERNELS/KERNEL_REGISTRY at import time (module-level loop
     above), which must stay unfiltered for the non-systematic path. Returns
     (names, ops, chain_name) where chain_name is the same "A+B*C"-style
@@ -820,17 +859,16 @@ def _build_kernel_chain(
     cfg, names: List[str], ops: List[str], k: int, B: int, device, active_dims: Optional[List[int]] = None
 ) -> tuple[gpytorch.kernels.Kernel, List[Dict[str, Tensor]]]:
     """Sample B episodes' hyperparameters for each component in `names` (via
-    the same _build_scaled_kernel/_kernel_prior_spec machinery
-    _sample_episode_kernel's composite branch already uses — no new
-    hyperparameter-sampling logic) and combine the resulting kernel objects
-    left-to-right per `ops`. Returns the combined Kernel plus one params
-    dict per component (in `names` order), UNFLATTENED — not coerced into
-    the legacy l_b/alpha2_b-style schema, since component count is variable
-    here (see generate_gp_batch's return_kernel_metadata handling)."""
-    built = [
-        _build_scaled_kernel(name, _kernel_prior_spec(cfg, name), k, B, device, active_dims=active_dims)
-        for name in names
-    ]
+    the same _build_kernel_component machinery _sample_episode_kernel's
+    composite branch already uses — no new hyperparameter-sampling logic,
+    and "dot_product" components dispatch to the bare-LinearKernel path
+    just like the static composite path does) and combine the resulting
+    kernel objects left-to-right per `ops`. Returns the combined Kernel plus
+    one params dict per component (in `names` order), UNFLATTENED — not
+    coerced into the legacy l_b/alpha2_b-style schema, since component count
+    is variable here (see generate_gp_batch's return_kernel_metadata
+    handling)."""
+    built = [_build_kernel_component(cfg, name, k, B, device, active_dims=active_dims) for name in names]
     kernel = built[0][0]
     for op, (comp_kernel, _) in zip(ops, built[1:]):
         kernel = kernel + comp_kernel if op == "+" else kernel * comp_kernel
@@ -1212,8 +1250,12 @@ def generate_gp_batch(
     # bypasses cfg.data.kernel/kernels entirely and samples a fresh
     # variable-length kernel chain instead — resolved here (before the
     # kernel_cols/k decision below) since chain components are always drawn
-    # from _COMPOSABLE_KERNELS, so _kernel_needs_scalar_input still applies
-    # and the "dot_product" branch below is simply never taken.
+    # from _COMPOSABLE_KERNELS, so _kernel_needs_scalar_input still applies.
+    # The "dot_product" branch below still only fires for the degenerate
+    # m=1 chain (kernel_name == "dot_product" exactly, no operator) — a
+    # multi-component chain that merely includes dot_product falls through
+    # to _sample_active_dims like any other composite, since its components
+    # must share one active_dims subset (see _build_kernel_chain).
     systematic = bool(getattr(cfg.data, "systematic_composition", False))
     if systematic:
         chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg)

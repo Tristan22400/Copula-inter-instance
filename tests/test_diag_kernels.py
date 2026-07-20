@@ -17,6 +17,8 @@ reliably reproduce that.
 
 from __future__ import annotations
 
+import random
+
 import pytest
 import torch
 
@@ -44,6 +46,7 @@ def test_kernel_produces_valid_r_star(cfg, kernel_name):
     """Every kernel family must produce NaN/Inf-free, unit-diagonal, PSD,
     non-trivial R_star across repeated sampling."""
     torch.manual_seed(SEED)
+    random.seed(SEED)
     cfg.data.kernel = kernel_name
 
     failures = []
@@ -73,6 +76,7 @@ N_TASKS_STAGE3 = 100
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
 def test_kernel_off_diagonal_not_degenerate(cfg, kernel_name):
     torch.manual_seed(SEED)
+    random.seed(SEED)
     cfg.data.kernel = kernel_name
 
     stats = batch_off_diagonal_stats(kernel_name, cfg, N_TASKS_STAGE3)
