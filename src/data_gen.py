@@ -34,37 +34,25 @@ Supported kernels
                          outer ScaleKernel (that would just be a second,
                          redundant alpha2). No lengthscale — geometry is
                          determined entirely by the feature space.
-  hebo                — ARD Matérn ν=3/2 + outputscale, the tuned "HEBO+"
-                         prior from the PFN4BO paper (github.com/automl/
-                         PFNs4BO), Appendix B.1: lengthscale/outputscale ~
-                         Gamma, noise ~ LogNormal — see
-                         HEBO_PLUS_HYPERPARAMETERS for the exact tuned
-                         constants and their source. Sampled with the same
-                         gpytorch.priors machinery as every other kernel here
-                         — no runtime dependency on pfns4bo_upstream any more
-                         (its Gamma/LogNormal hyperpriors don't depend on the
-                         input points, unlike upstream's SingleTaskGP-based
-                         `hebo_prior.get_model` scaffolding).
 
 ARD (cfg.data.ard)
 -------------------
   When cfg.data.ard is True, rbf/matern32/periodic/rational_quadratic sample
   one independent lengthscale per active kernel dimension (ard_num_dims=k)
-  instead of one isotropic scalar shared across all k dims — same mechanism
-  "hebo" already always uses. periodic's period also becomes per-dimension
-  (gpytorch.kernels.PeriodicKernel ties period_length's ard_num_dims to the
-  same kwarg as lengthscale). Default False (isotropic), preserving prior
-  dataset-generation behaviour. Not possible for "cosine": gpytorch's
-  CosineKernel hardcodes period_length to a single scalar regardless of
-  ard_num_dims — no per-dimension formula exists. Not applicable to
-  "dot_product" (no lengthscale) or "hebo" (already unconditionally ARD via
-  its own tuned prior, independent of this flag). See _ARD_ELIGIBLE_KERNELS.
-  "periodic" is additionally always capped to k=1 active dims (independent
-  of this flag) — see generate_gp_batch's kernel_cols selection.
+  instead of one isotropic scalar shared across all k dims. periodic's
+  period also becomes per-dimension (gpytorch.kernels.PeriodicKernel ties
+  period_length's ard_num_dims to the same kwarg as lengthscale). Default
+  False (isotropic), preserving prior dataset-generation behaviour. Not
+  possible for "cosine": gpytorch's CosineKernel hardcodes period_length to
+  a single scalar regardless of ard_num_dims — no per-dimension formula
+  exists. Not applicable to "dot_product" (no lengthscale). See
+  _ARD_ELIGIBLE_KERNELS. "periodic" is additionally always capped to k=1
+  active dims (independent of this flag) — see generate_gp_batch's
+  kernel_cols selection.
 
   cfg.data.isotropic_ratio (default 0.0): even when a kernel would otherwise
-  be ARD (cfg.data.ard=True for an ARD-eligible kernel, or "hebo" which is
-  always ARD), each episode independently has probability isotropic_ratio of
+  be ARD (cfg.data.ard=True for an ARD-eligible kernel), each episode
+  independently has probability isotropic_ratio of
   having its lengthscale (and periodic's period) collapsed to one shared
   value across all active dims instead of one independent value per dim —
   i.e. an isotropic kernel in effect, still stored in the ARD-shaped (k,)
@@ -79,9 +67,9 @@ Composite kernels ("A+B" / "A*B")
   under both operators via gpytorch's `+`/`*` kernel composition, e.g.
   "rbf+periodic" (locally periodic: smooth decay times exact periodicity) or
   "matern32*cosine" (spectral windowing). See COMPOSITE_KERNELS for the full
-  list. dot_product and hebo are not composable (irregular hyperparameter
-  signatures — no lengthscale, or ARD-only). cfg.data.ard applies
-  independently to each ARD-eligible component of a composite.
+  list. dot_product is not composable (no lengthscale — irregular
+  hyperparameter signature). cfg.data.ard applies independently to each
+  ARD-eligible component of a composite.
 
   Systematic composition (cfg.data.systematic_composition, CauKer-style —
   github.com/ShifengXIE/CauKer): an alternative, opt-in generative mode that
@@ -223,7 +211,6 @@ _BASE_GPYTORCH_KERNEL_CLS: Dict[str, Callable[..., gpytorch.kernels.Kernel]] = {
     "cosine": gpytorch.kernels.CosineKernel,
     "periodic": gpytorch.kernels.PeriodicKernel,
     "rational_quadratic": gpytorch.kernels.RQKernel,
-    "hebo": functools.partial(gpytorch.kernels.MaternKernel, nu=1.5),
 }
 
 # Maps an output-dict/schema parameter name to the gpytorch attribute that
@@ -239,12 +226,11 @@ class KernelPriorSpec:
     (its `.lengthscale`, or `.period_length` for cosine — see
     lengthscale_attr) given k active input dimensions; ard=True samples one
     independent value per dimension instead of one isotropic scalar shared
-    across all k dims. Always True for "hebo" (the tuned HEBO+ prior is
-    ARD by definition); for rbf/matern32/periodic/rational_quadratic it
-    follows cfg.data.ard (see _kernel_prior_spec / _ARD_ELIGIBLE_KERNELS).
-    "cosine" is never ARD — gpytorch.kernels.CosineKernel's period_length is
-    a single scalar regardless of ard_num_dims (no per-dimension formula
-    exists to opt into).
+    across all k dims, following cfg.data.ard for
+    rbf/matern32/periodic/rational_quadratic (see _kernel_prior_spec /
+    _ARD_ELIGIBLE_KERNELS). "cosine" is never ARD — gpytorch.kernels.
+    CosineKernel's period_length is a single scalar regardless of
+    ard_num_dims (no per-dimension formula exists to opt into).
     """
 
     lengthscale_prior: Callable[[int], Prior]
@@ -263,55 +249,19 @@ class KernelPriorSpec:
 # input dimension) via cfg.data.ard. "cosine" is excluded: gpytorch's
 # CosineKernel hardcodes period_length to shape (*batch_shape, 1, 1) — it
 # ignores ard_num_dims entirely, so there's no per-dimension formula to opt
-# into. "dot_product" has no lengthscale at all (see its docstring) and
-# "hebo" is unconditionally ARD already (its tuned prior, not this flag).
+# into. "dot_product" has no lengthscale at all (see its docstring).
 _ARD_ELIGIBLE_KERNELS = frozenset(
     {"rbf", "matern12", "matern32", "matern52", "periodic", "rational_quadratic"}
 )
-
-
-HEBO_PLUS_HYPERPARAMETERS: Dict[str, object] = {
-    # Tuned "HEBO+" prior constants — the exact config that trained
-    # pfns4bo_upstream's released `hebo_plus_model` checkpoint. Source:
-    # pfns4bo_upstream/pfns4bo/priors/hebo_prior.py::get_model +
-    # Tutorial_Training_for_BO.ipynb + PFN4BO.pdf Appendix B.1. Used directly
-    # by _kernel_prior_spec / _nugget_prior's "hebo" branches below — this
-    # file reproduces the exact sampled distributions via
-    # gpytorch.priors.GammaPrior/LogNormalPrior instead of calling upstream
-    # at runtime (see module docstring).
-    "lengthscale_concentration": 1.2106559584074301,
-    "lengthscale_rate": 1.5212245992840594,
-    "outputscale_concentration": 0.8452312502679863,
-    "outputscale_rate": 0.3993553245745406,
-    "hebo_noise_logmean": -4.63,
-    "hebo_noise_std": 0.5,
-    "add_linear_kernel": False,  # tuned HEBO+ drops the linear-kernel term — not implemented here
-    "hebo_warping": False,  # tuned HEBO+ drops input warping — not implemented here
-}
 
 
 def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
     """Build the LogNormal/Gamma hyperprior spec for one base kernel family.
 
     Every numeric constant is overridable via cfg.data (getattr-defaulted,
-    same convention the old l_min/l_max/alpha2_min/alpha2_max ranges used),
-    except "hebo"'s, which are the fixed tuned HEBO+ constants above.
+    same convention the old l_min/l_max/alpha2_min/alpha2_max ranges used).
     """
     isotropic_ratio = float(getattr(cfg.data, "isotropic_ratio", 0.0))
-
-    if kernel_name == "hebo":
-        return KernelPriorSpec(
-            lengthscale_prior=lambda k: GammaPrior(
-                HEBO_PLUS_HYPERPARAMETERS["lengthscale_concentration"],
-                HEBO_PLUS_HYPERPARAMETERS["lengthscale_rate"],
-            ),
-            outputscale_prior=GammaPrior(
-                HEBO_PLUS_HYPERPARAMETERS["outputscale_concentration"],
-                HEBO_PLUS_HYPERPARAMETERS["outputscale_rate"],
-            ),
-            ard=True,
-            isotropic_ratio=isotropic_ratio,
-        )
 
     l_loc = float(getattr(cfg.data, "l_lognormal_loc", 0.0))
     l_scale = float(getattr(cfg.data, "l_lognormal_scale", 0.7))
@@ -349,9 +299,11 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
 
 
 def _nugget_prior(cfg, kernel_name: str) -> LogNormalPrior:
-    """Diagonal regulariser prior, shared by every kernel (including "hebo" — this
-    is HEBO+'s tuned noise prior, LogNormal(-4.63, 0.5), now the default noise
-    floor for all kernels; see HEBO_PLUS_HYPERPARAMETERS for provenance)."""
+    """Diagonal regulariser prior, shared by every kernel — defaults to the
+    tuned "HEBO+" noise prior from the PFN4BO paper (github.com/automl/
+    PFNs4BO, Appendix B.1), LogNormal(-4.63, 0.5), used as the default noise
+    floor for all kernels here (not specific to any particular kernel
+    family)."""
     loc = float(getattr(cfg.data, "nugget_lognormal_loc", -4.63))
     scale = float(getattr(cfg.data, "nugget_lognormal_scale", 0.5))
     return LogNormalPrior(loc, scale)
@@ -536,10 +488,10 @@ def _build_concrete_kernel(
 
     l_t = l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.get_default_dtype())
     # l having more than one element means this episode was generated ARD
-    # (cfg.data.ard=True for rbf/matern32/periodic/rational_quadratic, or
-    # always for "hebo") — gpytorch needs ard_num_dims at construction time
-    # to size .lengthscale (and, for "periodic", .period_length — see the
-    # reshape below) correctly before values can be assigned into it.
+    # (cfg.data.ard=True for rbf/matern32/periodic/rational_quadratic) —
+    # gpytorch needs ard_num_dims at construction time to size .lengthscale
+    # (and, for "periodic", .period_length — see the reshape below)
+    # correctly before values can be assigned into it.
     kernel_kwargs = {"ard_num_dims": l_t.numel()} if l_t.numel() > 1 else {}
     if active_dims is not None:
         kernel_kwargs["active_dims"] = active_dims
@@ -575,7 +527,7 @@ def build_kernel_fn(
     l_b/alpha2_b/period_b/rq_alpha_b are the second component's hyperparameters
     for composite ("A+B" / "A*B") kernels. l/l_b/period/period_b may be an
     ARD per-dimension vector (Tensor) instead of a scalar when the episode
-    was generated with cfg.data.ard=True (or "hebo", always ARD).
+    was generated with cfg.data.ard=True.
 
     active_dims: column indices this kernel is active on (both components of
     a composite share the same active columns — see generate_gp_task/
@@ -663,10 +615,6 @@ def dot_product_kernel(X1: Tensor, X2: Tensor, *, alpha2: float = 1.0, **_) -> T
     return build_kernel_fn("dot_product", 0.0, alpha2)(X1, X2)
 
 
-def _hebo_kernel_dispatch(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
-    return build_kernel_fn("hebo", l, alpha2)(X1, X2)
-
-
 KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "rbf": rbf_kernel,
     "matern12": matern12_kernel,
@@ -676,7 +624,6 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "periodic": periodic_kernel,
     "rational_quadratic": rational_quadratic_kernel,
     "dot_product": dot_product_kernel,
-    "hebo": _hebo_kernel_dispatch,
 }
 
 
@@ -687,8 +634,8 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
 # periodic — smooth decay times exact periodicity) or "matern32*cosine"
 # (spectral windowing) are valid kernels without any new math. Restricted to
 # the kernels below because they share one calling convention (l, alpha2,
-# plus an optional named extra); dot_product and hebo have irregular
-# signatures (no lengthscale / ARD-only) and are left out of composites.
+# plus an optional named extra); dot_product has an irregular signature
+# (no lengthscale) and is left out of composites.
 _COMPOSABLE_KERNELS: List[str] = ["rbf", "matern32", "cosine", "periodic", "rational_quadratic"]
 
 # Kernels whose PSD guarantee only holds for scalar (1D) inputs — composites
@@ -1304,13 +1251,6 @@ def generate_gp_batch(
     x_raw = apply_dag_feature_mixing(x_raw, cfg, device)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
-    # HEBO+'s Gamma-distributed lengthscale is calibrated for x in [0,1]^k
-    # (paper Appendix D), unlike this file's usual ~N(0,1)-standardised x_norm.
-    # Safe to map every column (not just the active ones): kernel_obj only
-    # ever reads its active_dims columns internally (gpytorch.kernels.Kernel
-    # .__call__ index_selects them before forward).
-    x_kernel_input = torch.special.ndtr(x_norm) if kernel_name == "hebo" else x_norm
-
     # --- Joint prior sample + noisy covariance (B, T, T), via gpytorch's own
     # GaussianLikelihood(MultivariateNormal) — replaces the old manual
     # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly and
@@ -1319,7 +1259,7 @@ def generate_gp_batch(
     # Cholesky-based sample, not gpytorch's approximate CG/Lanczos fallback.
     with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
         prior_dist = gpytorch.distributions.MultivariateNormal(
-            torch.zeros(B, T, device=device), kernel_obj(x_kernel_input)
+            torch.zeros(B, T, device=device), kernel_obj(x_norm)
         )
         noisy_dist = likelihood(prior_dist)
         y_all = noisy_dist.rsample()                 # (B, T)
@@ -1371,9 +1311,9 @@ def generate_gp_batch(
         # but are not read again after this branch, so that's safe; casting
         # back to float32 keeps the returned schema consistent with every
         # other tensor in this function.
-        x_kernel_train = x_kernel_input[:, :P]
-        x_kernel_test  = x_kernel_input[:, P:]
-        out_dtype = x_kernel_input.dtype
+        x_kernel_train = x_norm[:, :P]
+        x_kernel_test  = x_norm[:, P:]
+        out_dtype = x_norm.dtype
         with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY), gpytorch.settings.fast_pred_var(False):
             post_model = _GeneratorGP(
                 x_kernel_train.double(), y_train.double(),
