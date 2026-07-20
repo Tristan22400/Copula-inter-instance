@@ -21,7 +21,7 @@ from omegaconf import OmegaConf
 from data_gen import (
     ALL_KERNELS,
     _kernel_needs_scalar_input,
-    apply_dag_feature_mixing,
+    apply_mlp_feature_mixing,
     generate_gp_batch,
     generate_gp_task,
     gp_posterior,
@@ -382,41 +382,41 @@ def test_isotropic_ratio_partial_mixes_isotropic_and_ard_episodes(small_cfg):
 
 
 # ---------------------------------------------------------------------------
-# DAG feature mixing tests
+# MLP feature mixing tests
 # ---------------------------------------------------------------------------
 
 
-def test_dag_mixing_default_off_is_noop(small_cfg):
-    """dag_mixing_enabled defaults False: apply_dag_feature_mixing must be a
+def test_mlp_mixing_default_off_is_noop(small_cfg):
+    """mlp_mixing_enabled defaults False: apply_mlp_feature_mixing must be a
     byte-for-byte identity, so every existing config/dataset is unaffected."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     x = torch.randn(4, 10, cfg.data.d_features)
-    out = apply_dag_feature_mixing(x, cfg, "cpu")
+    out = apply_mlp_feature_mixing(x, cfg, "cpu")
     assert torch.equal(out, x)
 
 
-def test_dag_mixing_prob_zero_is_noop(small_cfg):
-    """dag_mixing_enabled=True but dag_mixing_prob=0.0 must still be a no-op
+def test_mlp_mixing_prob_zero_is_noop(small_cfg):
+    """mlp_mixing_enabled=True but mlp_mixing_prob=0.0 must still be a no-op
     (regression safety: the gate must genuinely gate, not just decorate)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
-    cfg.data.dag_mixing_enabled = True
-    cfg.data.dag_mixing_prob = 0.0
+    cfg.data.mlp_mixing_enabled = True
+    cfg.data.mlp_mixing_prob = 0.0
     x = torch.randn(4, 10, cfg.data.d_features)
-    out = apply_dag_feature_mixing(x, cfg, "cpu")
+    out = apply_mlp_feature_mixing(x, cfg, "cpu")
     assert torch.equal(out, x)
 
 
-def test_dag_mixing_shapes_preserved(small_cfg):
+def test_mlp_mixing_shapes_preserved(small_cfg):
     """Mixing (when enabled) must preserve tensor shape/dtype exactly, and
     generate_gp_batch's full output schema must still round-trip correctly."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
-    cfg.data.dag_mixing_enabled = True
-    cfg.data.dag_mixing_prob = 1.0  # force mixing on every episode
+    cfg.data.mlp_mixing_enabled = True
+    cfg.data.mlp_mixing_prob = 1.0  # force mixing on every episode
 
     torch.manual_seed(0)
     x = torch.randn(4, 10, cfg.data.d_features)
-    out = apply_dag_feature_mixing(x, cfg, "cpu")
+    out = apply_mlp_feature_mixing(x, cfg, "cpu")
     assert out.shape == x.shape
     assert out.dtype == x.dtype
 
@@ -428,55 +428,55 @@ def test_dag_mixing_shapes_preserved(small_cfg):
         assert ep["x_norm_test"].shape[-1] == d
 
 
-def test_dag_mixing_prob_one_changes_output(small_cfg):
+def test_mlp_mixing_prob_one_changes_output(small_cfg):
     """Sanity check the mixing actually does something when forced on for
     every episode (guards against a silently-inert implementation)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
-    cfg.data.dag_mixing_enabled = True
-    cfg.data.dag_mixing_prob = 1.0
+    cfg.data.mlp_mixing_enabled = True
+    cfg.data.mlp_mixing_prob = 1.0
 
     torch.manual_seed(0)
     x = torch.randn(4, 10, cfg.data.d_features)
-    out = apply_dag_feature_mixing(x.clone(), cfg, "cpu")
+    out = apply_mlp_feature_mixing(x.clone(), cfg, "cpu")
     assert not torch.equal(out, x)
 
 
-def test_dag_mixing_partial_gate_leaves_some_episodes_unmixed(small_cfg):
-    """0 < dag_mixing_prob < 1 over a large-enough B should leave at least one
+def test_mlp_mixing_partial_gate_leaves_some_episodes_unmixed(small_cfg):
+    """0 < mlp_mixing_prob < 1 over a large-enough B should leave at least one
     episode identical to its pre-mixing input and at least one changed —
     verifies the per-episode Bernoulli gate (not an all-or-nothing switch)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
-    cfg.data.dag_mixing_enabled = True
-    cfg.data.dag_mixing_prob = 0.5
+    cfg.data.mlp_mixing_enabled = True
+    cfg.data.mlp_mixing_prob = 0.5
 
     torch.manual_seed(0)
     B = 64
     x = torch.randn(B, 10, cfg.data.d_features)
-    out = apply_dag_feature_mixing(x.clone(), cfg, "cpu")
+    out = apply_mlp_feature_mixing(x.clone(), cfg, "cpu")
     n_unchanged = sum(torch.equal(out[b], x[b]) for b in range(B))
     n_changed = B - n_unchanged
     assert n_unchanged > 0, "expected some episodes left unmixed at prob=0.5"
     assert n_changed > 0, "expected some episodes mixed at prob=0.5"
 
 
-def test_feature_normalisation_holds_with_dag_mixing(small_cfg):
+def test_feature_normalisation_holds_with_mlp_mixing(small_cfg):
     """x_norm_train/x_norm_test combined should still be ~zero mean, ~unit
     std post-mixing -- the existing normalisation step runs AFTER mixing and
     must still bound its output the same way it bounds tabiclv2_warp_features's
     output today (mirrors test_feature_normalisation_over_all_instances)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
-    cfg.data.dag_mixing_enabled = True
-    cfg.data.dag_mixing_prob = 1.0
+    cfg.data.mlp_mixing_enabled = True
+    cfg.data.mlp_mixing_prob = 1.0
     # NOTE: capped at 1 layer here (production default allows up to 2, see
-    # conf/data/gp_tasks.yaml's dag_num_layers_max). With 2 layers, relu/
+    # conf/data/gp_tasks.yaml's mlp_num_layers_max). With 2 layers, relu/
     # leaky_relu/sigmoid can legitimately zero out an entire feature column
     # for a small fraction of episodes at these small T (P+N ~ 8-16) — a
     # real, expected statistical property of ReLU-family activations on
     # short sequences (measured ~7% of episodes at layers_max=2, ~3% even at
-    # layers_max=1 over a larger sample), not a bug in apply_dag_feature_mixing.
+    # layers_max=1 over a larger sample), not a bug in apply_mlp_feature_mixing.
     # The subsequent z-normalisation's clamp(min=1e-8) floor then silently
     # divides a nonzero numerator by ~0, or 0/~0 -> 0, so a collapsed column
     # reads back as all-zero rather than raising. This is pre-existing
@@ -484,11 +484,11 @@ def test_feature_normalisation_holds_with_dag_mixing(small_cfg):
     # constant column, mixing-unrelated) that this test isn't trying to
     # regression-guard; capping at 1 layer here keeps this test's seed/loop
     # deterministic and clear of that (separate, pre-existing) edge case
-    # while test_dag_mixing_goldilocks_and_psd below -- the real regression
+    # while test_mlp_mixing_goldilocks_and_psd below -- the real regression
     # guard for correlation collapse/PSD-ness -- still runs with the full
-    # production dag_num_layers_max=2 range and passes for every kernel.
-    cfg.data.dag_num_layers_min = 1
-    cfg.data.dag_num_layers_max = 1
+    # production mlp_num_layers_max=2 range and passes for every kernel.
+    cfg.data.mlp_num_layers_min = 1
+    cfg.data.mlp_num_layers_max = 1
 
     torch.manual_seed(1)
     for _ in range(10):
@@ -502,9 +502,9 @@ def test_feature_normalisation_holds_with_dag_mixing(small_cfg):
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_dag_mixing_goldilocks_and_psd(small_cfg, kernel_name):
+def test_mlp_mixing_goldilocks_and_psd(small_cfg, kernel_name):
     """Every registered kernel must still produce a valid, PSD, non-trivial
-    R_star with DAG mixing forced on for every episode -- same band as
+    R_star with MLP mixing forced on for every episode -- same band as
     test_kernel_goldilocks_and_psd, this is the key regression guard against
     correlation collapse (sigmoid/mod saturation) or degeneracy introduced by
     the mixing stack."""
@@ -513,10 +513,10 @@ def test_dag_mixing_goldilocks_and_psd(small_cfg, kernel_name):
     cfg.data.d_features = 6
     cfg.data.inactive_frac_min = 1 / 3
     cfg.data.inactive_frac_max = 5 / 6
-    cfg.data.dag_mixing_enabled = True
-    cfg.data.dag_mixing_prob = 1.0
+    cfg.data.mlp_mixing_enabled = True
+    cfg.data.mlp_mixing_prob = 1.0
 
-    torch.manual_seed(abs(hash("dag_mix_" + kernel_name)) % (2**31))
+    torch.manual_seed(abs(hash("mlp_mix_" + kernel_name)) % (2**31))
     off_diag_abs = []
     for _ in range(20):
         task = generate_gp_task(cfg)
@@ -527,7 +527,7 @@ def test_dag_mixing_goldilocks_and_psd(small_cfg, kernel_name):
         assert torch.allclose(R, R.T, atol=1e-5)
         eigvals = torch.linalg.eigvalsh(R)
         assert (eigvals >= -1e-4).all(), (
-            f"{kernel_name}: not PSD with DAG mixing (min eig={eigvals.min():.6f})"
+            f"{kernel_name}: not PSD with MLP mixing (min eig={eigvals.min():.6f})"
         )
         assert R.abs().max() <= 1.0 + 1e-5
 
@@ -536,10 +536,10 @@ def test_dag_mixing_goldilocks_and_psd(small_cfg, kernel_name):
 
     mean_abs_r = torch.cat(off_diag_abs).mean().item()
     assert mean_abs_r > _COLLAPSE_THRESHOLD, (
-        f"{kernel_name}: DAG mixing collapsed correlation, mean|r*_offdiag|={mean_abs_r:.4f}"
+        f"{kernel_name}: MLP mixing collapsed correlation, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
-        f"{kernel_name}: DAG mixing degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
+        f"{kernel_name}: MLP mixing degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
 
 
