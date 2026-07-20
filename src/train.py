@@ -437,7 +437,11 @@ def validate(
         off_p_s = Sigma_s[:, ri_s, ci_s][valid_s].cpu().numpy()
         off_o_s = sbatch["R_star"].float()[:, ri_s, ci_s][valid_s].cpu().numpy()
         cq_s = _corr_quality(off_p_s, off_o_s)
-        metrics[f"kernel_fit/{family}/copula_nll"]  = parts_s["copula"].item()
+        oracle_cop_s = oracle_copula_nll(
+            sbatch["R_star"].float(), sbatch["z_test"].float(), sbatch["test_mask"]
+        ).item()
+        metrics[f"kernel_fit/{family}/copula_nll"]        = parts_s["copula"].item()
+        metrics[f"kernel_fit/{family}/oracle_copula_nll"] = oracle_cop_s
         metrics[f"kernel_fit/{family}/corr_mse"]     = cq_s["mse"]
         metrics[f"kernel_fit/{family}/corr_mae"]     = cq_s["mae"]
         metrics[f"kernel_fit/{family}/corr_pearson"] = cq_s["pearson"]
