@@ -269,9 +269,28 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
     a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
     ard = bool(getattr(cfg.data, "ard", False)) and kernel_name in _ARD_ELIGIBLE_KERNELS
 
+    # Without a k-dependent shift, a k-dims-summed stationary kernel's squared
+    # distance grows ~linearly in k (active kernel dims) for standardized iid
+    # inputs, so a fixed-in-k lengthscale collapses R_star toward the identity
+    # as k grows -- k=16-19 (reachable via this file's d_features/inactive_frac
+    # priors) gives near-zero correlation regardless of the "interesting"
+    # lengthscale draw, independent of ard (a single shared isotropic
+    # lengthscale summed over k dims collapses the same way an ARD one does).
+    # A prior version of this file had a full sqrt(k) shift (0.5*log(k)) here
+    # and dropped it in f72a3d2 ("remove sqrt(k) lengthscale shift") because,
+    # combined with this file's now much tighter HEBO+-derived nugget floor,
+    # it pushed correlations toward a uniform/degenerate regime. 0.25*log(k)
+    # (capped before the log so the rare d_features tail doesn't drag the
+    # shift past what was validated) was tuned against the CURRENT nugget
+    # floor and tests/test_dataset_corr_uniform.py's abs(mean)<0.30 bound:
+    # full sqrt(k) still overshoots that bound (measured mean ~0.35 on the
+    # systematic_composition mix), 0.25*log(k) does not (~0.24).
+    k_exponent = float(getattr(cfg.data, "l_lognormal_k_exponent", 0.25))
+    k_cap = float(getattr(cfg.data, "l_lognormal_k_cap", 15))
+
     def lengthscale_prior(k: int) -> LogNormalPrior:
-        # loc is constant in k (active kernel dims) — no sqrt(k)/log(k) shift.
-        return LogNormalPrior(l_loc, l_scale)
+        shift = k_exponent * math.log(max(min(k, k_cap), 1))
+        return LogNormalPrior(l_loc + shift, l_scale)
 
     # cosine has no `.lengthscale` attribute — its one shape parameter is
     # `.period_length`, playing the same role "l" does in cosine_kernel's

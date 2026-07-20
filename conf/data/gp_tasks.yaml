@@ -42,10 +42,22 @@ N_max: 128
 n_tasks: 20000000
 
 # GP kernel hyperparameter priors (shared across all stationary kernels).
-# lengthscale ~ LogNormal(l_lognormal_loc, l_lognormal_scale), loc constant
-# in k (active kernel dims) — no k-dependent shift.
+# lengthscale ~ LogNormal(l_lognormal_loc + l_lognormal_k_exponent *
+# log(min(k, l_lognormal_k_cap)), l_lognormal_scale), where k = number of
+# active kernel dims. Without the k-dependent shift, the k-dims-summed
+# squared distance grows ~linearly in k for standardized iid inputs, so a
+# fixed-in-k lengthscale collapses R_star toward the identity as k grows
+# (see data_gen.py::_kernel_prior_spec). 0.25 was tuned against
+# tests/test_dataset_corr_uniform.py's abs(mean)<0.30 bound for this file's
+# systematic_composition mix and the current HEBO+-derived nugget floor
+# below -- a prior, fuller (0.5=sqrt(k)) version of this shift was tried and
+# reverted (see f72a3d2) because it pushed correlations toward a
+# uniform/degenerate regime once the nugget floor was tightened; re-tune if
+# composite_exclude_kernels or the nugget prior change again.
 l_lognormal_loc: 0.0    # log(1.0)
 l_lognormal_scale: 0.5
+l_lognormal_k_exponent: 0.25
+l_lognormal_k_cap: 15
 alpha2_gamma_concentration: 4.0   # outputscale ~ Gamma(concentration, rate)
 alpha2_gamma_rate: 3.0
 
