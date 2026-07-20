@@ -41,10 +41,7 @@ N_max: 128
 # Number of tasks to generate
 n_tasks: 20000000
 
-# GP kernel hyperparameter priors (shared across all stationary kernels,
-# except "hebo"'s lengthscale/outputscale — its Gamma constants are fixed,
-# tuned "HEBO+" values from the PFN4BO paper; see
-# data_gen.py::HEBO_PLUS_HYPERPARAMETERS).
+# GP kernel hyperparameter priors (shared across all stationary kernels).
 # lengthscale ~ LogNormal(l_lognormal_loc, l_lognormal_scale), loc constant
 # in k (active kernel dims) — no k-dependent shift.
 l_lognormal_loc: 0.0    # log(1.0)
@@ -54,15 +51,15 @@ alpha2_gamma_rate: 3.0
 
 # ARD: sample one independent lengthscale per active kernel dimension
 # (ard_num_dims=k) instead of one isotropic scalar shared across all k dims.
-# Applies to rbf/matern32/periodic/rational_quadratic ("hebo" is always ARD
-# regardless of this flag; "cosine"/"dot_product" can't be — see
-# data_gen.py's module docstring). Default false preserves prior behaviour.
-# "periodic" is always capped to k=1 active dims regardless (see data_gen.py).
+# Applies to rbf/matern32/periodic/rational_quadratic ("cosine"/"dot_product"
+# can't be — see data_gen.py's module docstring). Default false preserves
+# prior behaviour. "periodic" is always capped to k=1 active dims regardless
+# (see data_gen.py).
 ard: true
 
-# Even when a kernel is ARD (via `ard: true` above, or "hebo" which is
-# always ARD), each episode independently has this probability of having
-# its lengthscale (and periodic's period) collapsed to one shared value
+# Even when a kernel is ARD (via `ard: true` above), each episode
+# independently has this probability of having its lengthscale (and
+# periodic's period) collapsed to one shared value
 # across active dims instead of one independent value per dim — i.e. an
 # isotropic kernel in effect, mixed in among the ARD episodes. Default 0.0
 # (no isotropic override) preserves prior behaviour. See
@@ -92,10 +89,9 @@ dag_num_layers_max: 4
 dag_mix_weight_std: 1.0
 
 # Nugget/noise: single diagonal regulariser ~ LogNormal(nugget_lognormal_loc,
-# nugget_lognormal_scale), shared by ALL kernels including "hebo" (this is
-# now literally HEBO+'s tuned noise prior — see
-# data_gen.py::HEBO_PLUS_HYPERPARAMETERS's hebo_noise_logmean/hebo_noise_std).
-# Guarantees PSD and controls posterior tightness.
+# nugget_lognormal_scale), shared by ALL kernels — defaults to the tuned
+# "HEBO+" noise prior from the PFN4BO paper (github.com/automl/PFNs4BO,
+# Appendix B.1). Guarantees PSD and controls posterior tightness.
 nugget_lognormal_loc: -4.63
 nugget_lognormal_scale: 0.5
 
@@ -113,9 +109,9 @@ oracle_mode: prior
 # Use a single fixed kernel:
 #   kernel: rbf
 # Or sample uniformly from a list each task:
-#   kernels: [rbf, matern32, cosine, periodic, rational_quadratic, dot_product, hebo]
+#   kernels: [rbf, matern32, cosine, periodic, rational_quadratic, dot_product]
 #
-# Available kernels: rbf, matern32, cosine, periodic, rational_quadratic, dot_product, hebo
+# Available kernels: rbf, matern32, cosine, periodic, rational_quadratic, dot_product
 # (plus 20 "A+B"/"A*B" composites of {rbf, matern32, cosine, periodic, rational_quadratic} — see data_gen.COMPOSITE_KERNELS)
 kernel: rbf
 
@@ -137,28 +133,6 @@ composite_num_kernels_max: 8
 # exclude periodic chains entirely. Empty = sample from all of
 # {rbf, matern32, cosine, periodic, rational_quadratic} as before.
 composite_exclude_kernels: [periodic, cosine]
-
-# "hebo" (PFNs4BO's tuned "HEBO+" prior) needs different P/N ranges than the
-# defaults above — see data_gen.py::HEBO_PLUS_HYPERPARAMETERS and the module
-# docstring for why. l_*/alpha2_*/nugget_* keys above are ignored for this
-# kernel (its Gamma/LogNormal constants are fixed). Override at the CLI
-# rather than switching config files, e.g.:
-#   python src/generate_pit_dataset.py data.kernel=hebo \
-#     data.P_min=512 data.P_max=512 data.N_min=8 data.N_max=64 \
-#     data.dataset_dir=./data/pit_hebo_prior-true data.resume=true
-# P_min=P_max=512: HEBO+'s per-dimension lengthscale ~ Gamma(mean~0.8) on a
-#   UNIT CUBE input domain (see the ndtr mapping in data_gen.py) conditions
-#   away almost all test-side correlation once P grows past a handful of
-#   points — diag_kernels.py showed a screening effect (46% of
-#   |R*_offdiag| < 0.01) at this file's default P range. Tuned empirically,
-#   same as the composite kernels needing P_min=4,P_max=6 overrides.
-# N_max=64 (vs. this file's default 128): HEBO+'s noise nugget is
-#   LogNormal(-4.63, 0.5) — much smaller than every other kernel's
-#   deliberately large nugget floor here. With tiny noise, larger N raises
-#   the chance two test points land close together (near-duplicate under the
-#   sampled lengthscale) and R_star's min eigenvalue dips under this repo's
-#   0.001 well-conditioned floor. Empirically: N_max=128 gave 1/500 episodes
-#   just under the floor (min_eig=9.2e-4); N_max=64 removes the failure.
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter

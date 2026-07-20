@@ -212,9 +212,8 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     """
     kernel_name = task["kernel"]
     # scalar, unless the episode was generated ARD (cfg.data.ard=True for
-    # rbf/matern32/periodic/rational_quadratic, or always for "hebo"), in
-    # which case l is a per-dimension lengthscale vector (k,) — see
-    # data_gen._build_scaled_kernel.
+    # rbf/matern32/periodic/rational_quadratic), in which case l is a
+    # per-dimension lengthscale vector (k,) — see data_gen._build_scaled_kernel.
     l_tensor = task["l"]
     l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
     alpha2 = task["alpha2"].item()
@@ -246,15 +245,6 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         active_dims=cols,
     )
     x_k_train = task["x_norm_train"]   # (P, d_features)
-    if kernel_name == "hebo":
-        # HEBO+'s Gamma-distributed lengthscale is calibrated for x in
-        # [0,1]^k (paper Appendix D) — see data_gen.generate_gp_task's same
-        # mapping. Skipping this previously left gp_analytical_pit
-        # reconstructing HEBO's kernel over the wrong input domain, silently
-        # producing a different z_train than the one generate_gp_task itself
-        # computed via _L_ff/_alpha. Safe to map every column: kernel_fn
-        # only ever reads the active_dims columns internally.
-        x_k_train = torch.special.ndtr(x_k_train)
     y_train    = task["y_train"]                  # (P,)
     y_test     = task["y_test"]                   # (N,)
     mu_star    = task["mu_star"]                  # (N,) posterior mean

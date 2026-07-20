@@ -20,9 +20,8 @@ Two marginal backends are supported, with genuinely different conventions:
   PFN4BO   — ``get_marginal_quantiles_pfn4bo`` — a bucketed (bar) distribution
              over a fixed y-support; quantiles at arbitrary probability levels
              come from inverting the bucket CDF. PFN4BO expects x in [0,1]^d
-             (mapped here via the Gaussian CDF, matching this repo's own
-             "hebo" kernel domain convention in ``src/pit.py::gp_analytical_pit``)
-             and y power-transformed (Yeo-Johnson, fit on context y only);
+             (mapped here via the Gaussian CDF) and y power-transformed
+             (Yeo-Johnson, fit on context y only);
              the returned quantile grid is inverse-transformed back to
              original y-units before returning.
 
@@ -401,10 +400,9 @@ def get_marginal_quantiles_pfn4bo(
     Handles PFN4BO's own input/output conventions, none of which match
     TabICL's:
       - x must lie in [0,1]^d — mapped here via the Gaussian CDF
-        (``torch.special.ndtr``), matching this repo's own domain convention
-        for the "hebo" kernel (``src/pit.py::gp_analytical_pit``). Feature
-        padding up to the model's fixed input width is handled automatically
-        by its own ``VariableNumFeaturesEncoder`` — no manual padding needed.
+        (``torch.special.ndtr``). Feature padding up to the model's fixed
+        input width is handled automatically by its own
+        ``VariableNumFeaturesEncoder`` — no manual padding needed.
       - y is power-transformed (Yeo-Johnson, fit on ``y_context`` only) before
         being fed to the model; the returned quantile *values* are inverse-
         transformed back to original y-units before returning (valid since
