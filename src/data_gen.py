@@ -1116,7 +1116,9 @@ def _apply_mlp_activation(x: Tensor, name: str) -> Tensor:
     raise ValueError(f"Unknown MLP-mixing activation '{name}'")
 
 
-def apply_mlp_feature_mixing(x: Tensor, cfg, device) -> Tensor:
+def apply_mlp_feature_mixing(
+    x: Tensor, cfg, device, *, return_gate: bool = False
+) -> Tensor | tuple[Tensor, Tensor]:
     """Randomly mix the GP's input feature columns through a small stack of
     dense affine + nonlinearity layers, applied to input coordinates x (never
     to sampled outputs y) so k(f(x_i), f(x_j)) remains a valid PSD kernel for
@@ -1150,16 +1152,27 @@ def apply_mlp_feature_mixing(x: Tensor, cfg, device) -> Tensor:
             no-op, byte-for-byte, for every existing config/dataset).
         device: torch device string, threaded through for the new W_l/b_l
             parameter tensors (same convention as the rest of this file).
+        return_gate: if True, also return the (B,) bool tensor recording
+            which episodes were actually mixed (used by generate_gp_batch's
+            return_kernel_metadata=True path to report mlp-mixing usage per
+            episode). Default False preserves the original single-tensor
+            return type/behavior for every existing call site.
 
     Returns:
         (B, T, d) tensor, same shape/dtype as x. Episodes not selected by the
         per-episode Bernoulli gate (mlp_mixing_prob) are returned unchanged.
+        If return_gate=True, returns (x, gate) instead, where gate is a (B,)
+        bool tensor (all False when mixing is disabled/no-op).
     """
     if not bool(getattr(cfg.data, "mlp_mixing_enabled", False)):
+        if return_gate:
+            return x, torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
         return x
 
     mixing_prob = float(getattr(cfg.data, "mlp_mixing_prob", 0.3))
     if mixing_prob <= 0.0:
+        if return_gate:
+            return x, torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
         return x
 
     L_min = int(getattr(cfg.data, "mlp_num_layers_min", 1))
@@ -1185,10 +1198,14 @@ def apply_mlp_feature_mixing(x: Tensor, cfg, device) -> Tensor:
         x_mixed = torch.einsum("btd,bde->bte", x_mixed, W_l) + b_l
         x_mixed = _apply_mlp_activation(x_mixed, act_name)
 
-    gate = (torch.rand(B, device=device) < mixing_prob)[:, None, None]  # (B,1,1)
+    gate_1d = torch.rand(B, device=device) < mixing_prob  # (B,)
+    gate = gate_1d[:, None, None]  # (B,1,1)
     # (B,1,1) is required for correct broadcast against (B,T,d); a bare (B,)
     # shape misaligns on the trailing (T, d) dims instead of the batch dim.
-    return torch.where(gate, x_mixed, x)
+    x_out = torch.where(gate, x_mixed, x)
+    if return_gate:
+        return x_out, gate_1d
+    return x_out
 
 
 @torch.no_grad()
@@ -1230,8 +1247,10 @@ def generate_gp_batch(
         device : torch device string ("cpu" or "cuda").
         return_kernel_metadata: if True, also pack each episode's kernel
             name, hyperparameters (l, alpha2, nugget, period, rq_alpha,
-            l_b, alpha2_b, period_b, rq_alpha_b), kernel_feature_indices, and
-            the ephemeral _L_ff/_alpha Cholesky factors — the schema
+            l_b, alpha2_b, period_b, rq_alpha_b), kernel_feature_indices,
+            mlp_mixed (bool — whether the mlp-mixing gate fired for that
+            episode; see apply_mlp_feature_mixing), and the ephemeral
+            _L_ff/_alpha Cholesky factors — the schema
             generate_gp_task/pit.py::gp_analytical_pit/diag_kernels.py need.
             Off by default so the production shard schema
             (generate_pit_dataset.py) is unaffected.
@@ -1309,7 +1328,10 @@ def generate_gp_batch(
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
     x_raw = tabiclv2_warp_features(x_raw)
-    x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
+    if return_kernel_metadata:
+        x_raw, mlp_mixed = apply_mlp_feature_mixing(x_raw, cfg, device, return_gate=True)
+    else:
+        x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
     # --- Joint prior sample + noisy covariance (B, T, T), via gpytorch's own
@@ -1464,6 +1486,7 @@ def generate_gp_batch(
         for key in ("l", "alpha2", "period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b"):
             tensors[key] = params[key].cpu()
         tensors["nugget"] = nugget.cpu()
+        tensors["mlp_mixed"] = mlp_mixed.cpu()
         tensors["_L_ff"] = L_ff
         tensors["_alpha"] = alpha
         extra["kernel"] = kernel_name
