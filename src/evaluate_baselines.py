@@ -349,6 +349,23 @@ def fit_and_eval_gpytorch(
     along that direction) — regularising toward the true generative
     hyperparameter regime, and giving the optimiser several independent shots
     at escaping a bad local optimum, both target that failure mode directly.
+
+    When feature_extractor is given (DKL), training instead holds out a 20%
+    validation split of X_train/y_train and keeps whichever training step's
+    weights reached the best held-out predictive NLL, instead of just running
+    to n_steps and keeping the final weights. The plain (no feature_extractor)
+    GP-MLE fit above has only 2-3 free hyperparameters, already regularised by
+    kernel_priors/noise_prior — but DKL's MLP is unregularised and free to
+    rescale its own output to defeat those priors (they constrain the kernel's
+    hyperparameters, not the network feeding it). Empirically this drives the
+    fitted noise toward the noise_constraint floor, near-interpolating y_train
+    while collapsing every X_test feature into a near-constant direction
+    (off-diagonal correlation -> ~1) — training loss keeps improving long
+    after held-out NLL has turned catastrophically worse than independence,
+    so a fixed step count with no validation signal silently picks the worst
+    point on that curve. Skipped for P < 8 (too few points for a meaningful
+    split); falls back to training on the full set with no early stopping,
+    same as the no-feature-extractor path.
     """
     if kernel_name == "periodic" and feature_extractor is not None:
         raise ValueError("kernel_name='periodic' is not PD in a >1D DKL latent space")
@@ -372,6 +389,18 @@ def fit_and_eval_gpytorch(
     kernel_priors = _kernel_priors(prior_cfg or {}, kernel_name, ard=ard)
     noise_prior = _noise_prior(prior_cfg or {})
     lengthscale_init_prior = _lengthscale_init_prior(prior_cfg or {})
+
+    P = X_train.shape[0]
+    use_val = feature_extractor is not None and P >= 8
+    if use_val:
+        n_val = max(2, int(round(0.2 * P)))
+        perm = torch.randperm(P, device=X_train.device)
+        val_idx, fit_idx = perm[:n_val], perm[n_val:]
+        X_fit, y_fit = X_train[fit_idx], y_train[fit_idx]
+        X_val, y_val = X_train[val_idx], y_train[val_idx]
+        val_every = max(1, n_steps // 100)
+    else:
+        X_fit, y_fit = X_train, y_train
 
     best_loss: float | None = None
     best_model: _ExactGPModel | None = None
@@ -398,7 +427,7 @@ def fit_and_eval_gpytorch(
         )
 
         model = _ExactGPModel(
-            X_train, y_train, likelihood, kernel_name,
+            X_fit, y_fit, likelihood, kernel_name,
             ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
             kernel_priors=kernel_priors,
         ).to(X_train.device)
@@ -409,18 +438,49 @@ def fit_and_eval_gpytorch(
         opt = Adam(model.parameters(), lr=lr)
         mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
+        best_step_val: float = float("inf")
+        best_step_state: tuple[dict, dict] | None = None
         loss = None
-        for _step in range(n_steps):
+        for step in range(n_steps):
             opt.zero_grad()
-            loss = -mll(model(X_train), y_train)
+            loss = -mll(model(X_fit), y_fit)
             loss.backward()
             opt.step()
 
-        final_loss = loss.item()
+            if use_val and (step % val_every == 0 or step == n_steps - 1):
+                model.eval()
+                likelihood.eval()
+                with torch.no_grad():
+                    val_nll = -likelihood(model(X_val)).log_prob(y_val).item() / X_val.shape[0]
+                model.train()
+                likelihood.train()
+                if val_nll < best_step_val:
+                    best_step_val = val_nll
+                    best_step_state = (
+                        copy.deepcopy(model.state_dict()),
+                        copy.deepcopy(likelihood.state_dict()),
+                    )
+
+        if use_val:
+            model.load_state_dict(best_step_state[0])
+            likelihood.load_state_dict(best_step_state[1])
+            final_loss = best_step_val
+        else:
+            final_loss = loss.item()
+
         if best_loss is None or final_loss < best_loss:
             best_loss, best_model, best_likelihood = final_loss, model, likelihood
 
     model, likelihood = best_model, best_likelihood
+    if use_val:
+        # The val split only mattered for picking which training step's
+        # weights to keep; restore full-context conditioning for the final
+        # posterior/prior evaluation below (oracle_mode="posterior" needs the
+        # model literally conditioned on all of X_train — oracle_mode="prior"
+        # ignores stored train data entirely via model.forward(), so this is
+        # a no-op for that path). strict=False since the point count changes
+        # from len(fit_idx) to P.
+        model.set_train_data(inputs=X_train, targets=y_train, strict=False)
     model.eval()
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
