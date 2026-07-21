@@ -627,7 +627,7 @@ def main(cfg: DictConfig) -> None:
             episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4
         )
         n = len(full_dataset)
-        n_val = min(1000, max(1, int(n * t.val_fraction)))
+        n_val = min(500, max(1, int(n * t.val_fraction)))
         # generate_gp_batch (data_gen.py) samples kernel_name/P/N/active_dims
         # once per shard call, shared by every episode in that shard — a
         # contiguous index block smaller than shard_size (as a plain
@@ -695,7 +695,7 @@ def main(cfg: DictConfig) -> None:
             raise RuntimeError(
                 f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first."
             )
-        n_val = min(1000, max(1, int(len(all_files) * t.val_fraction)))
+        n_val = min(500, max(1, int(len(all_files) * t.val_fraction)))
         train_dataset = CopulaDataset(file_list=all_files[n_val:])
         val_dataset   = CopulaDataset(file_list=all_files[:n_val])
 
