@@ -49,9 +49,11 @@ training:
   muon_adamw_eps: 1.0e-8
   # Scalar weight on the Y-space NLL (copula + marginal); 1.0 = standard.
   nll_weight: 1.0
-  # Auxiliary MSE loss on off-diagonal correlations vs oracle R_star.
-  # Provides a direct gradient signal; 0.0 disables it entirely.
-  aux_mse_weight: 0.0
+  # Auxiliary MAE (L1) loss on off-diagonal correlations vs oracle R_star.
+  # Provides a direct gradient signal and, unlike MSE, pushes near-zero
+  # correlations to exact zero — encourages sparsity in the predicted
+  # covariance structure. 0.0 disables it entirely.
+  aux_mae_weight: 0.0
 
 tabicl:
   pretrained: true   # false → randomly-initialised backbone (uses arch section below)
