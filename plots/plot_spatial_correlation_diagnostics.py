@@ -11,22 +11,25 @@ Four curves, all binned by great-circle distance and plotted together:
   2. Independent TabICLv2: a model with no inter-instance copula assumes
      conditional independence across the grid, so its implied correlation
      matrix IS the identity by construction — no forward pass needed.
-  3. TabICLv2 learned PRIOR copula: an (as-near-as-architecturally-possible)
-     unconditional forward pass of the trained CopulaTabICL checkpoint,
-     matching how it's trained (cfg.data.oracle_mode="prior", see
-     src/data_gen.py) to output R_star ignoring in-context conditioning.
-  4. TabICLv2 + Copula POSTERIOR: a real joint forward pass over all D grid
-     points at once, conditioned on a historical in-context sample of the
-     SAME 24h persistence residual field as (1) — not the raw absolute
-     temperatures — so the posterior is conditioned on the same physical
-     quantity whose spatial decay it's being compared against. Context
-     labels z_train are NOT a naive (y - mean) / std standardization: they
-     are the K-fold leave-one-out Probability Integral Transform of each
-     context point's true residual under TabICLv2's own learned marginal
-     (see src/pit.py::run_pit) — i.e. u_i = F_hat(y_i | other context
-     points), z_i = Phi^-1(u_i) — matching how z_train is actually defined
-     during training (data_gen.py's GP-oracle LOO PIT) instead of assuming
-     a Gaussian marginal by fiat.
+  3. Copula model with dummy context: an (as-near-as-architecturally-possible)
+     unconditional forward pass of the trained CopulaTabICL checkpoint. This
+     is NOT a Bayesian posterior extraction, just a forward pass with a
+     content-free dummy context row, matching how the model is trained
+     (cfg.data.oracle_mode="prior", see src/data_gen.py) to output R_star
+     ignoring in-context conditioning.
+  4. Copula model with N context points: a real joint forward pass over all
+     D grid points at once, conditioned on a historical in-context sample of
+     the SAME 24h persistence residual field as (1) — not the raw absolute
+     temperatures — so it's conditioned on the same physical quantity whose
+     spatial decay it's being compared against. This is likewise NOT a
+     Bayesian posterior — it's the same forward pass as (3), just with real
+     context instead of a dummy one. Context labels z_train are NOT a naive
+     (y - mean) / std standardization: they are the K-fold leave-one-out
+     Probability Integral Transform of each context point's true residual
+     under TabICLv2's own learned marginal (see src/pit.py::run_pit) — i.e.
+     u_i = F_hat(y_i | other context points), z_i = Phi^-1(u_i) — matching
+     how z_train is actually defined during training (data_gen.py's
+     GP-oracle LOO PIT) instead of assuming a Gaussian marginal by fiat.
 
 Reuses:
   - plots/generate_plots.py: load_era5_data (+ synthetic-GP fallback) and
@@ -35,8 +38,8 @@ Reuses:
   - src/model.py: build_copula_transformer + low_rank_correlation, the same
     (W, s) -> Sigma projection used by generate_plots.py's
     build_copula_correlation_fn — this script loads the checkpoint once and
-    reuses it for both the prior (3) and posterior (4) extractions instead
-    of loading it twice.
+    reuses it for both the dummy-context (3) and real-context (4)
+    extractions instead of loading it twice.
   - src/pit.py: load_tabicl + run_pit, the same frozen-TabICL-quantile-head
     K-fold LOO PIT used to build z_train for real (non-GP-oracle) data —
     reused as-is rather than reimplemented with a naive standardization.
@@ -103,7 +106,7 @@ def empirical_spatial_correlation(data: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# TabICLv2 / CopulaTabICL: shared checkpoint loading + prior/posterior extraction
+# TabICLv2 / CopulaTabICL: shared checkpoint loading + dummy/real-context extraction
 # ---------------------------------------------------------------------------
 def load_copula_model(ckpt_path: str, device: "str | None" = None):
     """Load a CopulaTabICL checkpoint, mirroring
@@ -131,7 +134,7 @@ def load_copula_model(ckpt_path: str, device: "str | None" = None):
 def load_marginal_tabicl(cfg, device: str):
     """Load the frozen, pretrained TabICL quantile regressor used ONLY as a
     marginal-CDF oracle for the PIT transform in
-    extract_model_posterior_correlation — NOT the same object as the
+    extract_model_context_correlation — NOT the same object as the
     CopulaTabICL backbone in load_copula_model, whose quantile decoder has
     been stripped and replaced by the copula head (see src/model.py). This
     is the same checkpoint (cfg.tabicl.ckpt) CopulaTabICL's backbone was
@@ -144,7 +147,7 @@ def load_marginal_tabicl(cfg, device: str):
     """
     if not bool(cfg.tabicl.get("pretrained", True)):
         print("Warning: cfg.tabicl.pretrained=False — no pretrained quantile "
-              "head available for PIT; posterior z_train will fall back to "
+              "head available for PIT; context z_train will fall back to "
               "naive standardization.")
         return None
 
@@ -155,8 +158,8 @@ def load_marginal_tabicl(cfg, device: str):
 
 def _forward_correlation(model, device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray) -> np.ndarray:
     """Shared (x_train, z_train, x_test) -> Sigma forward pass, used by both
-    the prior and posterior extractions below (see src/model.py:CopulaTabICL
-    and low_rank_correlation)."""
+    the dummy-context and real-context extractions below (see
+    src/model.py:CopulaTabICL and low_rank_correlation)."""
     import torch
 
     from src.model import low_rank_correlation
@@ -172,25 +175,28 @@ def _forward_correlation(model, device, x_train_norm: np.ndarray, z_train: np.nd
     return Sigma[0].cpu().numpy()
 
 
-def extract_model_prior_correlation(model, device, coords_test: np.ndarray) -> np.ndarray:
-    """Extract the model's PRIOR correlation matrix via an unconditional
-    forward pass — i.e. with no informative historical in-context examples,
-    so the output cannot depend on any specific test-time context, only on
-    the learned prior.
+def extract_model_dummy_context_correlation(model, device, coords_test: np.ndarray) -> np.ndarray:
+    """Extract the model's correlation matrix via an unconditional forward
+    pass — i.e. with no informative historical in-context examples, so the
+    output cannot depend on any specific test-time context, only on what
+    the model learned as its context-free behavior. This is NOT a Bayesian
+    prior extraction in any closed-form sense — just a forward pass fed a
+    dummy context (see below).
 
-    CopulaTabICL has no separate closed-form "prior head": (W, s) are always
-    produced from a forward pass over (x_train, z_train, x_test). A literal
-    zero-row x_train/z_train (P=0) is not supported by the underlying TabICL
-    backbone — its target-aware column embedding unconditionally computes
-    `y_train.max()` (see tabicl_upstream/src/tabicl/_model/embedding.py),
-    which raises on an empty tensor regardless of oracle mode. The closest
-    architecturally-valid stand-in for "no historical context" is therefore
-    a single dummy context row at x_train=0, z_train=0 (P=1) — a constant,
-    content-free input carrying no information about any real historical
-    series. Under cfg.data.oracle_mode="prior" training (the current
-    default, see conf/data/gp_tasks.yaml), R_star is defined to ignore
-    training-context conditioning entirely, so a well-trained model's output
-    here should not be sensitive to which dummy value is fed in.
+    CopulaTabICL has no separate closed-form "no-context head": (W, s) are
+    always produced from a forward pass over (x_train, z_train, x_test). A
+    literal zero-row x_train/z_train (P=0) is not supported by the
+    underlying TabICL backbone — its target-aware column embedding
+    unconditionally computes `y_train.max()` (see
+    tabicl_upstream/src/tabicl/_model/embedding.py), which raises on an
+    empty tensor regardless of oracle mode. The closest architecturally-valid
+    stand-in for "no historical context" is therefore a single dummy context
+    row at x_train=0, z_train=0 (P=1) — a constant, content-free input
+    carrying no information about any real historical series. Under
+    cfg.data.oracle_mode="prior" training (the current default, see
+    conf/data/gp_tasks.yaml), R_star is defined to ignore training-context
+    conditioning entirely, so a well-trained model's output here should not
+    be sensitive to which dummy value is fed in.
     """
     coords_test = np.asarray(coords_test, dtype=np.float64)
     x_mean = coords_test.mean(axis=0, keepdims=True)
@@ -202,14 +208,16 @@ def extract_model_prior_correlation(model, device, coords_test: np.ndarray) -> n
     return _forward_correlation(model, device, x_train_norm, z_train, x_test_norm)
 
 
-def extract_model_posterior_correlation(
+def extract_model_context_correlation(
     model, device, tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
     coords_test: np.ndarray, k_folds: int = 10,
 ) -> np.ndarray:
-    """Extract the model's POSTERIOR correlation matrix via a single joint
-    forward pass over all of `coords_test` at once, conditioned on a real
-    historical in-context sample (context_coords, context_values) — the
-    actual model-in-the-loop copula posterior.
+    """Extract the model's correlation matrix via a single joint forward
+    pass over all of `coords_test` at once, conditioned on a real historical
+    in-context sample (context_coords, context_values). This is NOT a
+    Bayesian posterior extraction — it's the same forward pass as
+    extract_model_dummy_context_correlation, just with real context points
+    instead of a dummy one.
 
     z_train is the K-fold leave-one-out PIT of each context point's true
     value under `tabicl_marginal`'s own predicted marginal distribution
@@ -281,12 +289,13 @@ def main():
         type=int,
         nargs="+",
         default=None,
-        help="Day indices t providing the historical in-context sample: for each t, the posterior "
+        help="Day indices t providing the historical in-context sample: for each t, the model "
         "conditions on the 24h persistence residual field[t] - field[t-1] (same quantity as the "
-        "ground-truth curve), sampled at --n-context grid points. Each must be >= 1. One posterior "
-        "curve is computed per day and shown faint, plus their mean shown bold, so you can see "
-        "whether the posterior's shape is a systematic model behavior or single-day noise. "
-        "Default: an evenly spaced spread of up to 8 days across the whole dataset.",
+        "ground-truth curve), sampled at --n-context grid points. Each must be >= 1. One "
+        "context-conditioned curve is computed per day and shown faint, plus their mean shown "
+        "bold, so you can see whether the curve's shape is a systematic model behavior or "
+        "single-day noise. Default: an evenly spaced spread of up to 8 days across the whole "
+        "dataset.",
     )
     parser.add_argument("--n-context", type=int, default=50, help="Number of historical context points sampled per day.")
     parser.add_argument(
@@ -323,11 +332,11 @@ def main():
     print(f"Loading TabICLv2 checkpoint '{args.ckpt}'...")
     model, cfg, device = load_copula_model(args.ckpt, device=args.device)
 
-    print("Loading frozen pretrained TabICL quantile head for posterior context PIT...")
+    print("Loading frozen pretrained TabICL quantile head for context PIT...")
     tabicl_marginal = load_marginal_tabicl(cfg, device)
 
-    print("Extracting the model's unconditional PRIOR correlation matrix (no real context)...")
-    R_prior = extract_model_prior_correlation(model, device, coords)
+    print("Extracting the model's unconditional correlation matrix (dummy context)...")
+    R_dummy_context = extract_model_dummy_context_correlation(model, device, coords)
 
     dist = haversine_distance_km(coords)
     bin_edges = np.linspace(0.0, dist.max(), args.n_bins + 1)
@@ -337,22 +346,22 @@ def main():
     context_idx = rng.choice(D, size=n_context, replace=False)  # same context locations every day, only values change
     context_coords = coords[context_idx]
 
-    rho_posterior_per_day = []
+    rho_context_per_day = []
     for d in args.days:
-        print(f"Extracting the joint copula POSTERIOR correlation matrix (context day={d}, "
+        print(f"Extracting the joint copula correlation matrix with real context (context day={d}, "
               f"conditioned on the 24h persistence residual field[{d}] - field[{d - 1}])...")
         residual_day = data["t2m"][d].ravel() - data["t2m"][d - 1].ravel()
         context_values = residual_day[context_idx]
-        R_posterior = extract_model_posterior_correlation(
+        R_context = extract_model_context_correlation(
             model, device, tabicl_marginal, context_coords, context_values, coords, k_folds=args.pit_k_folds,
         )
-        rho_posterior_per_day.append(bin_correlation_by_distance(R_posterior, dist, bin_edges))
-    rho_posterior_per_day = np.array(rho_posterior_per_day)  # (n_days, n_bins)
-    rho_posterior_mean = np.nanmean(rho_posterior_per_day, axis=0)
+        rho_context_per_day.append(bin_correlation_by_distance(R_context, dist, bin_edges))
+    rho_context_per_day = np.array(rho_context_per_day)  # (n_days, n_bins)
+    rho_context_mean = np.nanmean(rho_context_per_day, axis=0)
 
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_indep = bin_correlation_by_distance(R_indep, dist, bin_edges)
-    rho_prior = bin_correlation_by_distance(R_prior, dist, bin_edges)
+    rho_dummy_context = bin_correlation_by_distance(R_dummy_context, dist, bin_edges)
 
     fig, ax = plt.subplots(figsize=(10.5, 5.8))
     ax.plot(dist_centers, rho_emp, "--", color="black", marker="o",
@@ -360,12 +369,12 @@ def main():
                   "$E_t = Z_t - Z_{t-24}$, averaged over all days")
     ax.plot(dist_centers, rho_indep, "-", color="red", marker="^",
             label="Independent TabICLv2: no copula, so $\\rho \\equiv 0$ by construction")
-    ax.plot(dist_centers, rho_prior, "-", color="tab:orange", marker="D",
+    ax.plot(dist_centers, rho_dummy_context, "-", color="tab:orange", marker="D",
             label="Copula model with dummy context")
-    for i, (d, rho_d) in enumerate(zip(args.days, rho_posterior_per_day)):
+    for i, (d, rho_d) in enumerate(zip(args.days, rho_context_per_day)):
         ax.plot(dist_centers, rho_d, "-", color="blue", alpha=0.18, linewidth=1,
                 label=f"Copula model with {n_context} context points: individual days\n({len(args.days)} days shown faint)" if i == 0 else None)
-    ax.plot(dist_centers, rho_posterior_mean, "-", color="blue", marker="s", linewidth=2.2,
+    ax.plot(dist_centers, rho_context_mean, "-", color="blue", marker="s", linewidth=2.2,
             label=f"Copula model with {n_context} context points: mean over {len(args.days)} days")
     ax.axhline(0.0, color="gray", linewidth=0.8, linestyle=":")
     ax.set_xlabel("Spatial distance (km)")
