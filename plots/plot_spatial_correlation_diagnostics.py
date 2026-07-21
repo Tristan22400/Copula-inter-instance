@@ -389,6 +389,26 @@ THEORY_STYLE = {
     "matern": ("magenta", "-", 2.4, "Matérn (free $\\nu$)"),
 }
 
+# Published reference decorrelation lengths L (km), independent of the fits
+# above -- a literature sanity check, not derived from this dataset. Only
+# 'exponential' and 'whittle' have a single reported number to compare
+# against; 'gaussian' is used here only as an idealized, infinitely-smooth
+# upper bound never fit to real temperature data in the literature, and free-
+# nu 'matern' has no canonical L since nu itself varies by fit.
+#   - exponential: North, Wang & Genton (2011, J. Climate 24), Fig. 1 -- their
+#     own exponential refit of extratropical annual-mean surface-temperature
+#     correlation ("modified from HL87"). Hansen & Lebedeff (1987) themselves
+#     used a more conservative L~1000 km as a practical station-spacing
+#     design choice, not a curve-fit estimate.
+#   - whittle: North, Wang & Genton (2011), Fig. 2 -- their Whittle/EBCM fit
+#     rK1(r) to annual-mean eastern-Siberia (land) data, reported as "about
+#     50% larger than in HL87" (2800 / 1800 = 1.56, consistent with the
+#     exponential number above).
+LITERATURE_L = {
+    "exponential": (1800.0, "North, Wang & Genton 2011, Fig. 1 (extratropical, exponential fit)"),
+    "whittle": (2800.0, "North, Wang & Genton 2011, Fig. 2 (eastern Siberia, Whittle/EBCM fit)"),
+}
+
 
 def _correlation_length_guess(dist_centers: np.ndarray, rho: np.ndarray) -> float:
     """Initial L guess for curve_fit: distance at which the empirical curve
@@ -584,6 +604,10 @@ def main():
             param_str = ", ".join(f"{k}={v:.0f} km" if k == "L" else f"{k}={v:.2f}"
                                    for k, v in fit["params"].items())
             print(f"  Fitted {theory_model}: {param_str}, weighted R^2={fit['r_squared']:.3f}")
+            lit = LITERATURE_L.get(theory_model)
+            if lit is not None:
+                L_lit, citation = lit
+                print(f"    Literature reference: L={L_lit:.0f} km ({citation})")
             theory_fits.append(fit)
 
     fig, (ax, ax_count) = plt.subplots(
@@ -599,10 +623,17 @@ def main():
         rho_theory = fit["law_fn"](r_dense, *fit["params"].values())
         L_fit = fit["params"]["L"]
         nu_str = f", $\\nu$={fit['params']['nu']:.2f}" if "nu" in fit["params"] else ""
+        lit = LITERATURE_L.get(fit["model"])
+        lit_str = f", lit. $L$={lit[0]:.0f} km" if lit is not None else ""
         ax.plot(r_dense, rho_theory, linestyle, color=color, linewidth=linewidth,
                 label=f"{display_name} fit to ground truth:\n"
-                      f"$L$={L_fit:.0f} km{nu_str}, weighted $R^2$={fit['r_squared']:.3f}")
+                      f"$L$={L_fit:.0f} km{nu_str}{lit_str}, weighted $R^2$={fit['r_squared']:.3f}")
         ax.axvline(L_fit, color=color, linewidth=0.8, linestyle=linestyle, alpha=0.4)
+        if lit is not None:
+            # Densely-dotted vertical line (same color, no separate legend entry --
+            # the literature L is already stated in the fit's own label above) marking
+            # the published reference L, for a direct visual fit-vs-literature check.
+            ax.axvline(lit[0], color=color, linewidth=1.4, linestyle=(0, (1, 1)), alpha=0.75)
     ax.plot(dist_centers, rho_indep, "-", color="red", marker="^",
             label="Independent TabICLv2: no copula, so $\\rho \\equiv 0$ by construction")
     ax.plot(dist_centers, rho_dummy_context, "-", color="tab:orange", marker="D",
