@@ -260,18 +260,51 @@ def extract_model_context_correlation(
 # ---------------------------------------------------------------------------
 # Distance binning shared by every curve
 # ---------------------------------------------------------------------------
+def _bin_indices(d: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    """Bin index per distance, or -1 for out-of-[bin_edges[0], bin_edges[-1]] values.
+
+    Pairs beyond bin_edges[-1] are DROPPED (index -1), not clipped into the last
+    bin: bin_edges may be capped below dist.max() (see --max-dist-percentile) to
+    exclude the corner-only, high-variance tail of a bounded non-periodic
+    lat/lon domain, and clipping would silently pull that excluded tail back
+    into the last visible bin under a misleadingly low distance label.
+    """
+    n_bins = len(bin_edges) - 1
+    bin_idx = np.digitize(d, bin_edges) - 1
+    bin_idx[(d < bin_edges[0]) | (d > bin_edges[-1])] = -1
+    bin_idx[bin_idx == n_bins] = n_bins - 1  # d == bin_edges[-1] exactly
+    return bin_idx
+
+
 def bin_correlation_by_distance(R: np.ndarray, dist: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
     """Mean correlation per distance bin, over the upper-triangle pairwise entries."""
     iu = np.triu_indices_from(R, k=1)
     corr, d = R[iu], dist[iu]
     n_bins = len(bin_edges) - 1
-    bin_idx = np.clip(np.digitize(d, bin_edges) - 1, 0, n_bins - 1)
+    bin_idx = _bin_indices(d, bin_edges)
     means = np.full(n_bins, np.nan)
     for b in range(n_bins):
         mask = bin_idx == b
         if mask.any():
             means[b] = corr[mask].mean()
     return means
+
+
+def pair_counts_by_distance(dist: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    """Number of upper-triangle (i, j) pairs falling in each distance bin.
+
+    On a bounded, non-periodic lat/lon rectangle (see AREA in generate_plots.py),
+    the pair population thins out sharply near the max distance -- only the
+    handful of pairs straddling opposite corners of the box reach it -- so a
+    bin's mean correlation is only as trustworthy as its count here. This is a
+    diagnostic for exactly that: low counts in the tail flag bins whose mean is
+    a small-sample, corner-biased estimate rather than a real isotropic decay.
+    """
+    iu_dist = dist[np.triu_indices_from(dist, k=1)]
+    n_bins = len(bin_edges) - 1
+    bin_idx = _bin_indices(iu_dist, bin_edges)
+    counts = np.bincount(bin_idx[bin_idx >= 0], minlength=n_bins)
+    return counts[:n_bins]
 
 
 def main():
@@ -306,6 +339,14 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-bins", type=int, default=15, help="Number of spatial-distance bins.")
+    parser.add_argument(
+        "--max-dist-percentile", type=float, default=90.0,
+        help="Cap the binned distance range at this percentile of all pairwise distances instead "
+        "of the raw max. On a bounded, non-periodic lat/lon rectangle the pairs near the raw max "
+        "distance are almost exclusively opposite-corner pairs -- a tiny, geometrically special, "
+        "non-isotropic subset -- so their bin mean is a high-variance, corner-biased estimate, not "
+        "a real feature of the spatial decay. Set to 100 to restore the old raw-max behavior.",
+    )
     parser.add_argument("--output", type=str, default=OUT_PATH)
     args = parser.parse_args()
 
@@ -339,8 +380,17 @@ def main():
     R_dummy_context = extract_model_dummy_context_correlation(model, device, coords)
 
     dist = haversine_distance_km(coords)
-    bin_edges = np.linspace(0.0, dist.max(), args.n_bins + 1)
+    dist_iu = dist[np.triu_indices_from(dist, k=1)]
+    max_dist = np.percentile(dist_iu, args.max_dist_percentile)
+    bin_edges = np.linspace(0.0, max_dist, args.n_bins + 1)
     dist_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    pair_counts = pair_counts_by_distance(dist, bin_edges)
+    print(f"Pairwise distances range [0, {dist_iu.max():.0f}] km; binning out to the "
+          f"{args.max_dist_percentile:.0f}th percentile ({max_dist:.0f} km) to avoid the "
+          f"corner-only, high-variance tail of the raw max. Pairs per bin:")
+    for lo, hi, n in zip(bin_edges[:-1], bin_edges[1:], pair_counts):
+        print(f"  [{lo:7.0f}, {hi:7.0f}) km: {n:8d} pairs")
 
     n_context = min(args.n_context, D)
     context_idx = rng.choice(D, size=n_context, replace=False)  # same context locations every day, only values change
@@ -363,7 +413,10 @@ def main():
     rho_indep = bin_correlation_by_distance(R_indep, dist, bin_edges)
     rho_dummy_context = bin_correlation_by_distance(R_dummy_context, dist, bin_edges)
 
-    fig, ax = plt.subplots(figsize=(10.5, 5.8))
+    fig, (ax, ax_count) = plt.subplots(
+        2, 1, figsize=(10.5, 7.3), sharex=True, height_ratios=[3.2, 1],
+        gridspec_kw={"hspace": 0.08},
+    )
     ax.plot(dist_centers, rho_emp, "--", color="black", marker="o",
             label="Ground Truth: empirical corr. of real 24h residuals\n"
                   "$E_t = Z_t - Z_{t-24}$, averaged over all days")
@@ -377,12 +430,18 @@ def main():
     ax.plot(dist_centers, rho_context_mean, "-", color="blue", marker="s", linewidth=2.2,
             label=f"Copula model with {n_context} context points: mean over {len(args.days)} days")
     ax.axhline(0.0, color="gray", linewidth=0.8, linestyle=":")
-    ax.set_xlabel("Spatial distance (km)")
     ax.set_ylabel("Correlation")
     ax.set_ylim(-1.0, 1.0)
     ax.set_title("Spatial Correlation Decay: Ground Truth vs. Copula Model (Independent / Dummy Context / With Context)")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
+
+    bin_width = bin_edges[1] - bin_edges[0]
+    ax_count.bar(dist_centers, pair_counts, width=bin_width * 0.9, color="steelblue", alpha=0.8)
+    ax_count.set_yscale("log")
+    ax_count.set_xlabel("Spatial distance (km)")
+    ax_count.set_ylabel("Pairs per bin\n(log scale)", fontsize=8)
+    ax_count.grid(True, alpha=0.3)
     plt.tight_layout()
     fig.savefig(args.output, dpi=150, bbox_inches="tight")
     plt.close(fig)

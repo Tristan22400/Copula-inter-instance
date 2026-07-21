@@ -14,6 +14,21 @@ from __future__ import annotations
 
 import math
 import os
+
+# P/N (hence attention sequence length T=P+N) are sampled per-shard from a wide
+# range (see conf/data/gp_tasks.yaml P_min/P_max, N_min/N_max), so batches vary
+# a lot in size while batch_size stays fixed — some shards get much closer to
+# the VRAM ceiling than others. When that happens, PyTorch's caching allocator
+# can fail a small allocation despite reserved-but-unallocated memory being
+# nominally sufficient, because it's fragmented into pieces too small to
+# satisfy the request (see the OOM message's "reserved but unallocated"
+# figure). expandable_segments avoids this by growing/shrinking allocations
+# in-place instead of requiring a fresh contiguous chunk. Must be set before
+# the CUDA caching allocator initializes (i.e. before any CUDA call), so this
+# goes at the top of the file, before `import torch`. setdefault so an
+# explicit environment override still wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import sys
 import time
 import zlib
@@ -832,56 +847,72 @@ def main(cfg: DictConfig) -> None:
         _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
 
         optimizer.zero_grad(set_to_none=True)
-        _ev_fwd0 = _phase_start()
-        with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            out = model(batch)
-        _phase_end("forward", _ev_fwd0)
+        try:
+            _ev_fwd0 = _phase_start()
+            with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                out = model(batch)
+            _phase_end("forward", _ev_fwd0)
 
-        # Loss in float32 — Cholesky / log-det want full precision.
-        _ev_loss0 = _phase_start()
-        Sigma = low_rank_correlation(
-            out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
-        )
-        parts = y_space_nll(
-            Sigma,
-            batch["z_test"].float(),
-            batch["log_pdf_test"].float(),
-            batch["test_mask"],
-        )
-        loss = nll_weight * parts["total"]
+            # Loss in float32 — Cholesky / log-det want full precision.
+            _ev_loss0 = _phase_start()
+            Sigma = low_rank_correlation(
+                out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
+            )
+            parts = y_space_nll(
+                Sigma,
+                batch["z_test"].float(),
+                batch["log_pdf_test"].float(),
+                batch["test_mask"],
+            )
+            loss = nll_weight * parts["total"]
 
-        # Auxiliary MSE on off-diagonal correlations vs oracle R_star.
-        # Gives a direct gradient toward the oracle structure; weight=0 disables.
-        aux_mse = Sigma.new_tensor(0.0)
-        if aux_mse_weight > 0.0:
-            N_t = Sigma.shape[1]
-            mask_2d_t = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
-            if N_t not in _triu_cache:
-                _triu_cache[N_t] = torch.triu_indices(N_t, N_t, offset=1, device=Sigma.device)
-            ri_t, ci_t = _triu_cache[N_t]
-            valid_off_t = mask_2d_t[:, ri_t, ci_t]  # (B, n_pairs)
-            if valid_off_t.any():
-                pred_off = Sigma[:, ri_t, ci_t][valid_off_t]
-                ora_off = batch["R_star"].float()[:, ri_t, ci_t][valid_off_t]
-                aux_mse = ((pred_off - ora_off) ** 2).mean()
-            loss = loss + aux_mse_weight * aux_mse
-        _phase_end("loss", _ev_loss0)
+            # Auxiliary MSE on off-diagonal correlations vs oracle R_star.
+            # Gives a direct gradient toward the oracle structure; weight=0 disables.
+            aux_mse = Sigma.new_tensor(0.0)
+            if aux_mse_weight > 0.0:
+                N_t = Sigma.shape[1]
+                mask_2d_t = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
+                if N_t not in _triu_cache:
+                    _triu_cache[N_t] = torch.triu_indices(N_t, N_t, offset=1, device=Sigma.device)
+                ri_t, ci_t = _triu_cache[N_t]
+                valid_off_t = mask_2d_t[:, ri_t, ci_t]  # (B, n_pairs)
+                if valid_off_t.any():
+                    pred_off = Sigma[:, ri_t, ci_t][valid_off_t]
+                    ora_off = batch["R_star"].float()[:, ri_t, ci_t][valid_off_t]
+                    aux_mse = ((pred_off - ora_off) ** 2).mean()
+                loss = loss + aux_mse_weight * aux_mse
+            _phase_end("loss", _ev_loss0)
 
-        _ev_bwd0 = _phase_start()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
-            optimizer.step()
+            _ev_bwd0 = _phase_start()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
+                optimizer.step()
 
-        scheduler.step()
-        _phase_end("backward_step", _ev_bwd0)
-        _prof_n += 1
+            scheduler.step()
+            _phase_end("backward_step", _ev_bwd0)
+            _prof_n += 1
+        except torch.cuda.OutOfMemoryError:
+            # P/N (attention length T=P+N) vary a lot per shard (see comment at
+            # top of file) while batch_size is fixed, so an occasional
+            # oversized shard can exceed VRAM even though most batches fit
+            # comfortably. Rather than let one bad shard kill a 500k-step run,
+            # drop it and move on — one skipped step is noise at this scale.
+            P_b, N_b = batch["x_train"].shape[1], batch["x_test"].shape[1]
+            print(
+                f"[{step:6d}] CUDA OOM on batch (B={batch['x_train'].shape[0]}, "
+                f"P={P_b}, N={N_b}, T={P_b + N_b}) — skipping step."
+            )
+            optimizer.zero_grad(set_to_none=True)
+            del batch
+            torch.cuda.empty_cache()
+            continue
 
         # Defer .item() / float() GPU syncs to logging steps — saves 2+ syncs/step
         if step % t.log_every == 0:
@@ -928,7 +959,14 @@ def main(cfg: DictConfig) -> None:
                 _free_b, _total_b = torch.cuda.mem_get_info()
                 mem_alloc_pct = 100.0 * torch.cuda.memory_allocated() / _total_b
                 mem_reserved_pct = 100.0 * torch.cuda.memory_reserved() / _total_b
+                # max_memory_allocated() is a lifetime high-water mark, not a
+                # per-step reading — left un-reset it stays pinned near its
+                # first spike and hides real step-to-step variance (this is
+                # part of why the OOM at a data-dependent large-T shard came
+                # as a surprise from the logs). Reset after each read so the
+                # printed value is "peak since last log line".
                 mem_peak_pct = 100.0 * torch.cuda.max_memory_allocated() / _total_b
+                torch.cuda.reset_peak_memory_stats()
             else:
                 mem_alloc_pct = mem_reserved_pct = mem_peak_pct = 0.0
 

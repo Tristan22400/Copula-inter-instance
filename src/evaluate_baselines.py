@@ -9,21 +9,27 @@ Methods
   independence       : R = I_N (copula NLL = 0.0 always, reference point)
   gp_prior_rbf       : RBF prior correlation at test points (median bandwidth,
                        no conditioning on z_train)
-  gp_mle_rbf         : GP posterior with MLE-fitted RBF {l, α², σ²_n}
+  gp_mle_rbf         : GP posterior with MLE-fitted RBF {l, α², σ²_n}, fit in
+                       raw y-space
   gp_mle_ard_rbf     : Same, with one lengthscale per input dimension (ARD)
-  gp_mle_matern32    : GP posterior with MLE-fitted Matérn-3/2 kernel
+  gp_mle_matern32    : GP posterior with MLE-fitted Matérn-3/2 kernel, fit in
+                       raw y-space
   gp_mle_ard_matern32: Matérn-3/2 with ARD lengthscales
-  gp_mle_periodic    : GP posterior with MLE-fitted Periodic kernel (+ period)
+  gp_mle_periodic    : GP posterior with MLE-fitted Periodic kernel (+ period),
+                       fit in raw y-space
   gp_mle_ard_periodic: Periodic with one lengthscale + period per input dimension (ARD)
-  gp_mle_rq          : GP posterior with MLE-fitted Rational Quadratic (+ rq_α)
+  gp_mle_rq          : GP posterior with MLE-fitted Rational Quadratic (+ rq_α),
+                       fit in raw y-space
   gp_mle_ard_rq      : Rational Quadratic with ARD lengthscales
   gp_mle_dot_product : GP posterior with MLE-fitted linear/dot-product kernel
-                       (variance + noise term fitted)
+                       (variance + noise term fitted), fit in raw y-space
   dkl_rbf/matern32/rq/dot_product :
                        Deep Kernel Learning — MLP(d_x→32→16) feature extractor
-                       feeding a GP layer (chosen kernel), trained jointly by
-                       maximising the marginal log-likelihood
-  per_ep_transformer : Small set-transformer trained from scratch on this episode
+                       feeding a GP layer (chosen kernel), fit in raw y-space,
+                       trained jointly by maximising the marginal log-likelihood
+  per_ep_transformer : Small set-transformer trained from scratch on this episode,
+                       fit against a z-scored (no oracle kernel) transform of
+                       y_train, analogous to gp_mle/dkl's y-space fit
   icl                : Pretrained CopulaTabICL checkpoint (in-context learning)
   oracle             : Ground-truth R_star from episode file (lower bound)
 
@@ -229,14 +235,14 @@ class _ExactGPModel(gpytorch.models.ExactGP):
     def __init__(
         self,
         X_train: Tensor,
-        z_train: Tensor,
+        y_train: Tensor,
         likelihood: gpytorch.likelihoods.GaussianLikelihood,
         kernel_name: str,
         ard_num_dims: int | None = None,
         feature_extractor: nn.Module | None = None,
         kernel_priors: dict[str, Prior] | None = None,
     ) -> None:
-        super().__init__(X_train, z_train, likelihood)
+        super().__init__(X_train, y_train, likelihood)
         self.feature_extractor = feature_extractor
         self.mean_module = gpytorch.means.ZeroMean()
         kp = kernel_priors or {}
@@ -280,7 +286,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
 
 def fit_and_eval_gpytorch(
     X_train: Tensor,
-    z_train: Tensor,
+    y_train: Tensor,
     X_test: Tensor,
     kernel_name: str,
     n_steps: int,
@@ -292,13 +298,25 @@ def fit_and_eval_gpytorch(
     prior_cfg: dict | None = None,
     n_restarts: int = 1,
 ) -> Tensor:
-    """Fit a GP (optionally over a learned feature extractor, i.e. DKL) by
-    maximising the exact marginal log-likelihood, and return the correlation
-    matrix at X_test to compare against the episode's oracle R_star.
+    """Fit a GP (optionally over a learned feature extractor, i.e. DKL) on the
+    raw y-space target by maximising the exact marginal log-likelihood, and
+    return the correlation matrix at X_test to compare against the episode's
+    oracle R_star.
+
+    Fits against y_train (not the PIT-transformed z_train) because z_train is
+    itself derived from the true generating kernel's own Cholesky factor (see
+    data_gen.py's LOO-PIT, R&W Eq. 5.12) — feeding that into an independently
+    fit "baseline" GP would leak oracle kernel information a real baseline
+    never has access to, and would fit against a variable already whitened to
+    unit variance, at odds with the alpha2/nugget hyperpriors below (which
+    mirror data_gen.py's own *y-space* generative kernel-hyperparameter
+    priors). The resulting covariance is converted to a correlation matrix
+    (sigma_to_correlation), which is coordinate-free, so scoring against
+    z_test downstream is unaffected by y_train's absolute scale/mean.
 
     oracle_mode must match how the episode's own R_star was built (see
     data_gen.py's oracle_mode branch):
-      - "posterior": R_star conditions on (X_train, z_train), so we score the
+      - "posterior": R_star conditions on (X_train, y_train), so we score the
         fitted kernel's true GP posterior at X_test — likelihood(model(X_test))
         folds observation noise into the returned covariance matrix, mirroring
         data_gen.gp_posterior's latent=False convention (needed so
@@ -380,7 +398,7 @@ def fit_and_eval_gpytorch(
         )
 
         model = _ExactGPModel(
-            X_train, z_train, likelihood, kernel_name,
+            X_train, y_train, likelihood, kernel_name,
             ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
             kernel_priors=kernel_priors,
         ).to(X_train.device)
@@ -394,7 +412,7 @@ def fit_and_eval_gpytorch(
         loss = None
         for _step in range(n_steps):
             opt.zero_grad()
-            loss = -mll(model(X_train), z_train)
+            loss = -mll(model(X_train), y_train)
             loss.backward()
             opt.step()
 
@@ -556,6 +574,26 @@ def _corr_nll_single(R: Tensor, z: Tensor) -> float:
     N = z.shape[0]
     mask = torch.ones(1, N, dtype=torch.bool, device=z.device)
     return oracle_copula_nll(R.unsqueeze(0), z.unsqueeze(0), mask).item()
+
+
+def _standardize_y(y: Tensor) -> Tensor:
+    """Z-score y using only its own sample mean/std — no oracle kernel.
+
+    Unlike arbitrary real-world targets, data_gen.py's y_all is a direct
+    MultivariateNormal(0, K) + Gaussian-noise sample (see generate_gp_batch:
+    `noisy_dist.rsample()`); tabiclv2_warp_features only warps X, never y. So
+    y's marginal is exactly Gaussian by construction, and plain affine
+    standardization already gives ~N(0,1) margins — the exact PIT for a
+    known-Gaussian family, unlike a rank-based transform (which is only
+    needed when the marginal shape is unknown, and would discard magnitude
+    information down to order statistics for no benefit here). This never
+    touches the true generating kernel K_ff, so it carries none of the
+    oracle-kernel leakage fit_and_eval_gpytorch's docstring warns about.
+    Gives per_ep_transformer standard-normal-margin inputs (required by
+    oracle_copula_nll's Gaussian-copula density) without the oracle shortcut,
+    matching how gp_mle/dkl are fit against raw y_train instead of z_train.
+    """
+    return (y - y.mean()) / y.std(unbiased=True).clamp(min=1e-6)
 
 
 def train_per_episode(
@@ -735,7 +773,9 @@ def _eval_episode(
         R_oracle  : (N, N) oracle correlation tensor
     """
     X_train    = ep["x_norm_train"].to(device)   # (P, d_x)
-    z_train    = ep["z_train"].to(device)         # (P,)
+    y_train    = ep["y_train"].to(device)         # (P,)  raw target, used to fit the GP-MLE/DKL baselines
+    z_train    = ep["z_train"].to(device)         # (P,)  oracle LOO-PIT residual, used to train icl only
+    z_train_self = _standardize_y(y_train)         # (P,) z-scored y_train, used to train per_ep_transformer
     X_test     = ep["x_norm_test"].to(device)     # (N, d_x)
     z_test     = ep["z_test"].to(device)          # (N,)
     R_oracle   = ep["R_star"].to(device)          # (N, N)
@@ -772,7 +812,7 @@ def _eval_episode(
         for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
             label = _LABEL_MAP[(kname, ard)]
             try:
-                R_gp = fit_and_eval_gpytorch(X_train, z_train, X_test, kname,
+                R_gp = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                              n_steps=n_steps_mle, lr=lr_mle, ard=ard,
                                              oracle_mode=oracle_mode, prior_cfg=prior_cfg,
                                              n_restarts=n_restarts_mle)
@@ -796,7 +836,7 @@ def _eval_episode(
         label = _DKL_LABEL_MAP[kname]
         try:
             mlp = DKLFeatureExtractor(d_x, hidden=32, out_dim=16, dropout=0.0).to(device)
-            R_dkl = fit_and_eval_gpytorch(X_train, z_train, X_test, kname,
+            R_dkl = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                           n_steps=n_steps_dkl, lr=lr_dkl,
                                           ard=False, feature_extractor=mlp,
                                           oracle_mode=oracle_mode, prior_cfg=prior_cfg)
@@ -808,14 +848,17 @@ def _eval_episode(
             R_dict[label] = R_I.clone()
 
     # --- per-episode transformer ---
+    # Trained/queried against z_train_self (z-scored from y_train), not the
+    # oracle z_train — see _standardize_y's docstring. Scored against z_test
+    # (oracle) below, same as every other baseline.
     try:
         per_ep_model = train_per_episode(
-            X_train, z_train, r=icl_rank,
+            X_train, z_train_self, r=icl_rank,
             n_steps=n_steps_per_ep, patience=patience_per_ep,
             device=device,
         )
         with torch.no_grad():
-            W_te, s_te = per_ep_model(X_train, z_train, X_test)
+            W_te, s_te = per_ep_model(X_train, z_train_self, X_test)
             Sigma_te   = low_rank_correlation(W_te.unsqueeze(0), s_te.unsqueeze(0)).squeeze(0)
         nlls["per_ep_transformer"]  = _corr_nll_single(Sigma_te, z_test)
         R_dict["per_ep_transformer"] = Sigma_te
@@ -916,7 +959,7 @@ def main() -> None:
     parser.add_argument("--dataset_dir",  default=None,
                         help="Episode directory to evaluate on (overrides "
                              "training.dataset_dir from --config)")
-    parser.add_argument("--n_episodes",   type=int,   default=50)
+    parser.add_argument("--n_episodes",   type=int,   default=5)
     parser.add_argument("--episode_idx",  type=int,   default=0)
     parser.add_argument("--n_steps_mle",  type=int,   default=1000,
                         help="Adam steps for GP kernel MLE fitting (also used for ARD variants)")
