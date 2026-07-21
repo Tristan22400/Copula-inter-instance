@@ -361,19 +361,17 @@ def main():
     ax.plot(dist_centers, rho_indep, "-", color="red", marker="^",
             label="Independent TabICLv2: no copula, so $\\rho \\equiv 0$ by construction")
     ax.plot(dist_centers, rho_prior, "-", color="tab:orange", marker="D",
-            label="TabICLv2 Prior Copula: unconditional forward pass\n"
-                  "(dummy zero context — this is the model's trained target)")
+            label="Copula model with dummy context")
     for i, (d, rho_d) in enumerate(zip(args.days, rho_posterior_per_day)):
         ax.plot(dist_centers, rho_d, "-", color="blue", alpha=0.18, linewidth=1,
-                label=f"TabICLv2 Posterior Copula: individual context days\n({len(args.days)} days shown faint)" if i == 0 else None)
+                label=f"Copula model with {n_context} context points: individual days\n({len(args.days)} days shown faint)" if i == 0 else None)
     ax.plot(dist_centers, rho_posterior_mean, "-", color="blue", marker="s", linewidth=2.2,
-            label=f"TabICLv2 Posterior Copula: mean over {len(args.days)} context days\n"
-                  "(context z_train = LOO-PIT of real 24h-residuals, 50 grid pts)")
+            label=f"Copula model with {n_context} context points: mean over {len(args.days)} days")
     ax.axhline(0.0, color="gray", linewidth=0.8, linestyle=":")
     ax.set_xlabel("Spatial distance (km)")
     ax.set_ylabel("Correlation")
     ax.set_ylim(-1.0, 1.0)
-    ax.set_title("Spatial Correlation Decay: Ground Truth vs. TabICLv2 (Independent / Prior / Posterior)")
+    ax.set_title("Spatial Correlation Decay: Ground Truth vs. Copula Model (Independent / Dummy Context / With Context)")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
     plt.tight_layout()
