@@ -591,7 +591,7 @@ def main(cfg: DictConfig) -> None:
             ("muon_ns_steps", "ns"),
             ("clip_grad_norm", "clip"),
             ("nll_weight", "nll"),
-            ("aux_mse_weight", "aux"),
+            ("aux_mae_weight", "aux"),
             ("compile", "compile"),
         ],
     )
@@ -791,7 +791,7 @@ def main(cfg: DictConfig) -> None:
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     nll_weight = float(t.get("nll_weight", 1.0))
-    aux_mse_weight = float(t.get("aux_mse_weight", 0.0))
+    aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
 
     model.train()
     # NOT itertools.cycle(train_loader): cycle() caches every yielded batch
@@ -866,10 +866,12 @@ def main(cfg: DictConfig) -> None:
             )
             loss = nll_weight * parts["total"]
 
-            # Auxiliary MSE on off-diagonal correlations vs oracle R_star.
+            # Auxiliary MAE (L1) on off-diagonal correlations vs oracle R_star.
             # Gives a direct gradient toward the oracle structure; weight=0 disables.
-            aux_mse = Sigma.new_tensor(0.0)
-            if aux_mse_weight > 0.0:
+            # L1 (vs L2/MSE) has constant-magnitude gradient near zero, which pushes
+            # near-zero predicted correlations to exactly zero — sparsity in Sigma.
+            aux_mae = Sigma.new_tensor(0.0)
+            if aux_mae_weight > 0.0:
                 N_t = Sigma.shape[1]
                 mask_2d_t = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
                 if N_t not in _triu_cache:
@@ -879,8 +881,8 @@ def main(cfg: DictConfig) -> None:
                 if valid_off_t.any():
                     pred_off = Sigma[:, ri_t, ci_t][valid_off_t]
                     ora_off = batch["R_star"].float()[:, ri_t, ci_t][valid_off_t]
-                    aux_mse = ((pred_off - ora_off) ** 2).mean()
-                loss = loss + aux_mse_weight * aux_mse
+                    aux_mae = (pred_off - ora_off).abs().mean()
+                loss = loss + aux_mae_weight * aux_mae
             _phase_end("loss", _ev_loss0)
 
             _ev_bwd0 = _phase_start()
@@ -923,7 +925,7 @@ def main(cfg: DictConfig) -> None:
             amp_scale = scaler.get_scale() if scaler is not None else 1.0
             cop_val = parts["copula"].item()
             mar_val = parts["marginal"].item()
-            aux_mse_val = aux_mse.item()
+            aux_mae_val = aux_mae.item()
             with torch.no_grad():
                 w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
                 sig_stats = _sigma_stats(Sigma, batch["test_mask"])
@@ -975,7 +977,7 @@ def main(cfg: DictConfig) -> None:
                     "train/y_nll_total":          loss_val,
                     "train/y_nll_copula":         cop_val,
                     "train/y_nll_marginal":       mar_val,
-                    "train/aux_mse":              aux_mse_val,
+                    "train/aux_mae":              aux_mae_val,
                     "train/lr":                   lr_now,
                     "train/grad_norm":            grad_norm_val,
                     "train/amp_scale":            amp_scale,
@@ -995,7 +997,7 @@ def main(cfg: DictConfig) -> None:
                 },
                 step=step,
             )
-            aux_str = f" aux_mse={aux_mse_val:.4f}" if aux_mse_weight > 0.0 else ""
+            aux_str = f" aux_mae={aux_mae_val:.4f}" if aux_mae_weight > 0.0 else ""
             nonfinite_str = f" | sigma_nonfinite={sigma_nonfinite}" if sigma_nonfinite else ""
             print(
                 f"[{step:6d}] loss={loss_val:.4f} "
