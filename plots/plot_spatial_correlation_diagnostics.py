@@ -4,7 +4,9 @@ for TabICLv2 (CopulaTabICL): does the model's learned inter-instance
 dependence structure reproduce the physical spatial correlation decay of the
 real ERA5 field?
 
-Four curves, all binned by great-circle distance and plotted together:
+Four empirical/model curves plus theoretical-law overlays, all binned (or,
+for the theory curves, evaluated) by great-circle distance and plotted
+together:
 
   1. Ground truth: empirical correlation of 24h persistence residuals
      E_t = Z_true_t - Z_true_{t-24} across the spatial grid.
@@ -30,6 +32,21 @@ Four curves, all binned by great-circle distance and plotted together:
      u_i = F_hat(y_i | other context points), z_i = Phi^-1(u_i) — matching
      how z_train is actually defined during training (data_gen.py's
      GP-oracle LOO PIT) instead of assuming a Gaussian marginal by fiat.
+  5. Theoretical decay laws (--theory-models, default: ALL FOUR at once):
+     every isotropic correlation law in the reference literature --
+     exponential (Hansen & Lebedeff 1987, nu=1/2), Gaussian (nu->infinity),
+     Whittle (Matern nu=1, the closed-form omega->0 limit of North, Wang &
+     Genton 2011's energy-balance/damped-diffusion model), and the general
+     Matern (free smoothness nu, fit directly rather than assumed) -- each
+     independently fit by weighted nonlinear least squares to curve (1)
+     ONLY (never to the model curves, and never to the synthetic-GP
+     fallback's own generating kernel), so the fit is an independent
+     physical sanity check: if the ground truth doesn't track a known decay
+     law reasonably well (see the printed weighted R^2 per law), something
+     is off with the empirical curve itself before comparing it to the
+     model at all. Plotting all four together also shows which shape family
+     the data actually prefers (e.g. Matern's fitted nu should land close
+     to whichever of exponential/Gaussian/Whittle fits best).
 
 Reuses:
   - plots/generate_plots.py: load_era5_data (+ synthetic-GP fallback) and
@@ -56,6 +73,8 @@ import sys
 
 import numpy as np
 import matplotlib
+from scipy.optimize import curve_fit
+from scipy.special import gamma as gamma_fn, kv as bessel_k
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -307,6 +326,137 @@ def pair_counts_by_distance(dist: np.ndarray, bin_edges: np.ndarray) -> np.ndarr
     return counts[:n_bins]
 
 
+# ---------------------------------------------------------------------------
+# Theoretical spatial-correlation decay laws (North, Wang & Genton 2011;
+# Whittle 1954; Matern 1960) -- an independent physical sanity check, fit
+# ONLY to the ground-truth empirical curve and NOT derived from the model
+# or (for the synthetic fallback) the GP's own generating kernel, so a good
+# fit is informative rather than circular.
+# ---------------------------------------------------------------------------
+def exponential_law(r: np.ndarray, L: float) -> np.ndarray:
+    """rho(r) = exp(-r / L) -- Hansen & Lebedeff (1987); Matern nu=1/2. Cusped
+    (non-smooth) at r=0; the classic empirical baseline, fit this first."""
+    return np.exp(-np.asarray(r, dtype=np.float64) / L)
+
+
+def gaussian_law(r: np.ndarray, L: float) -> np.ndarray:
+    """rho(r) = exp(-r^2 / (2 L^2)) -- Matern nu -> infinity, i.e. an
+    infinitely smooth field. Usually too smooth for real temperature data."""
+    r = np.asarray(r, dtype=np.float64)
+    return np.exp(-(r ** 2) / (2.0 * L ** 2))
+
+
+def matern_law(r: np.ndarray, L: float, nu: float) -> np.ndarray:
+    """General Matern correlation: rho(r) = 2^(1-nu)/Gamma(nu) (r/L)^nu K_nu(r/L),
+    rho(0)=1 by the x K_nu(x) -> ... limit (handled explicitly below since
+    K_nu(0) itself diverges for nu>0). nu=1/2 reduces to exponential_law,
+    nu=1 is whittle_law, nu->inf approaches gaussian_law. Free-nu Matern is
+    usually the best unconstrained empirical fit (nu~1 typical for real
+    temperature fields)."""
+    r = np.asarray(r, dtype=np.float64)
+    out = np.ones_like(r)
+    nz = r > 0
+    x = r[nz] / L
+    out[nz] = (2.0 ** (1.0 - nu) / gamma_fn(nu)) * (x ** nu) * bessel_k(nu, x)
+    return out
+
+
+def whittle_law(r: np.ndarray, L: float) -> np.ndarray:
+    """rho(r) = (r/L) K_1(r/L) -- Matern nu=1, AND the omega->0 (long-time-
+    averaging) closed-form limit of the North, Wang & Genton (2011)
+    energy-balance / damped-diffusion model (their Eq. 6). This is the one
+    law here with an actual physical derivation behind its shape, not just
+    a good empirical fit -- see the reference doc section 2.3."""
+    return matern_law(r, L, nu=1.0)
+
+
+# name -> (callable(r, *params), ordered param names); param order must match
+# each callable's positional signature for curve_fit's p0/bounds below.
+THEORY_LAWS = {
+    "exponential": (exponential_law, ["L"]),
+    "gaussian": (gaussian_law, ["L"]),
+    "whittle": (whittle_law, ["L"]),
+    "matern": (matern_law, ["L", "nu"]),
+}
+
+# name -> (color, linestyle, linewidth, display label) for the overlay plot.
+# matern is drawn bolder/opaque since it's the general (free-nu) parent model
+# every other law here is a special case of (see THEORY_LAWS docstrings).
+THEORY_STYLE = {
+    "exponential": ("purple", "-.", 1.6, "Exponential (Hansen & Lebedeff 1987, $\\nu$=1/2)"),
+    "gaussian": ("saddlebrown", "--", 1.6, "Gaussian ($\\nu\\to\\infty$)"),
+    "whittle": ("darkgreen", ":", 1.8, "Whittle / EBCM $\\omega\\to0$ limit (North et al. 2011, $\\nu$=1)"),
+    "matern": ("magenta", "-", 2.4, "Matérn (free $\\nu$)"),
+}
+
+
+def _correlation_length_guess(dist_centers: np.ndarray, rho: np.ndarray) -> float:
+    """Initial L guess for curve_fit: distance at which the empirical curve
+    crosses 1/e (the correlation-length definition used throughout the
+    reference doc), by linear interpolation between the bracketing bin
+    centers. Falls back to half the plotted distance range if the curve
+    never crosses 1/e (e.g. too noisy or too short a distance range)."""
+    valid = np.isfinite(rho)
+    d, r = dist_centers[valid], rho[valid]
+    below = np.where(r <= 1.0 / np.e)[0]
+    if len(below) == 0 or below[0] == 0:
+        return float(d[-1] / 2.0) if len(d) else 1000.0
+    i = below[0]
+    d0, d1, r0, r1 = d[i - 1], d[i], r[i - 1], r[i]
+    if r0 == r1:
+        return float(d0)
+    frac = (1.0 / np.e - r0) / (r1 - r0)
+    return float(d0 + frac * (d1 - d0))
+
+
+def fit_theoretical_law(
+    dist_centers: np.ndarray, rho_emp: np.ndarray, pair_counts: np.ndarray, model: str,
+) -> "dict | None":
+    """Nonlinear least-squares fit of `model` (see THEORY_LAWS) to the binned
+    ground-truth empirical curve, weighted by sqrt(pair_counts) per bin: a
+    bin's mean-correlation estimate is lower-variance the more pairs back it
+    (see pair_counts_by_distance's docstring on the corner-biased tail), so
+    high-count bins should pull the fit harder than sparse tail bins.
+
+    Returns None (with a printed warning) instead of raising if curve_fit
+    fails to converge or too few bins are populated, so the caller can just
+    skip drawing the theory curve rather than crash the whole diagnostic
+    plot over an unfittable curve.
+    """
+    if model not in THEORY_LAWS:
+        raise ValueError(f"Unknown --theory-model '{model}', choose from {sorted(THEORY_LAWS)}.")
+    law_fn, param_names = THEORY_LAWS[model]
+
+    mask = np.isfinite(rho_emp) & (pair_counts > 0)
+    if mask.sum() < len(param_names) + 1:
+        print(f"Warning: too few valid distance bins ({mask.sum()}) to fit '{model}'; skipping theory curve.")
+        return None
+    d, r, n = dist_centers[mask], rho_emp[mask], pair_counts[mask]
+    sigma = 1.0 / np.sqrt(n)  # SEM of a Pearson-r bin mean scales ~ 1/sqrt(n pairs)
+
+    L0 = _correlation_length_guess(dist_centers, rho_emp)
+    L_hi = max(50.0 * L0, 10.0 * float(dist_centers[-1]))
+    if param_names == ["L"]:
+        p0, bounds = [L0], ([1.0], [L_hi])
+    else:  # ["L", "nu"]
+        p0, bounds = [L0, 1.0], ([1.0, 0.05], [L_hi, 8.0])
+
+    try:
+        popt, _ = curve_fit(law_fn, d, r, p0=p0, sigma=sigma, bounds=bounds, maxfev=20000)
+    except RuntimeError as exc:
+        print(f"Warning: curve_fit failed to converge for '{model}' ({exc}); skipping theory curve.")
+        return None
+
+    pred = law_fn(d, *popt)
+    resid = r - pred
+    weighted_ss_res = float(np.sum((resid / sigma) ** 2))
+    r_bar = np.average(r, weights=1.0 / sigma ** 2)
+    weighted_ss_tot = float(np.sum(((r - r_bar) / sigma) ** 2))
+    r_squared = 1.0 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot > 0 else float("nan")
+
+    return {"model": model, "law_fn": law_fn, "params": dict(zip(param_names, popt)), "r_squared": r_squared}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -346,6 +496,18 @@ def main():
         "distance are almost exclusively opposite-corner pairs -- a tiny, geometrically special, "
         "non-isotropic subset -- so their bin mean is a high-variance, corner-biased estimate, not "
         "a real feature of the spatial decay. Set to 100 to restore the old raw-max behavior.",
+    )
+    parser.add_argument(
+        "--theory-models", type=str, nargs="+", default=["exponential", "gaussian", "whittle", "matern"],
+        choices=["exponential", "gaussian", "whittle", "matern", "none"],
+        help="Theoretical spatial-correlation decay law(s) to fit (weighted nonlinear least squares, each "
+        "independently) to the ground-truth empirical curve and overlay, as a physical sanity check "
+        "independent of the model (North, Wang & Genton 2011 / Whittle 1954 / Matern 1960). Default plots "
+        "every law from the reference literature at once so their shapes can be compared directly: "
+        "'exponential' (nu=1/2, Hansen & Lebedeff 1987 baseline), 'gaussian' (nu->inf, infinitely-smooth "
+        "upper bound), 'whittle' (nu=1, the physically-derived long-averaging-limit EBCM law), 'matern' "
+        "(free smoothness nu, the most flexible fit -- nu is estimated directly by the fit, not assumed). "
+        "Pass 'none' alone to disable the overlay entirely.",
     )
     parser.add_argument("--output", type=str, default=OUT_PATH)
     args = parser.parse_args()
@@ -413,6 +575,17 @@ def main():
     rho_indep = bin_correlation_by_distance(R_indep, dist, bin_edges)
     rho_dummy_context = bin_correlation_by_distance(R_dummy_context, dist, bin_edges)
 
+    theory_models = [] if args.theory_models == ["none"] else args.theory_models
+    theory_fits = []
+    for theory_model in theory_models:
+        print(f"Fitting theoretical decay law '{theory_model}' to the ground-truth empirical curve...")
+        fit = fit_theoretical_law(dist_centers, rho_emp, pair_counts, theory_model)
+        if fit is not None:
+            param_str = ", ".join(f"{k}={v:.0f} km" if k == "L" else f"{k}={v:.2f}"
+                                   for k, v in fit["params"].items())
+            print(f"  Fitted {theory_model}: {param_str}, weighted R^2={fit['r_squared']:.3f}")
+            theory_fits.append(fit)
+
     fig, (ax, ax_count) = plt.subplots(
         2, 1, figsize=(10.5, 7.3), sharex=True, height_ratios=[3.2, 1],
         gridspec_kw={"hspace": 0.08},
@@ -420,6 +593,16 @@ def main():
     ax.plot(dist_centers, rho_emp, "--", color="black", marker="o",
             label="Ground Truth: empirical corr. of real 24h residuals\n"
                   "$E_t = Z_t - Z_{t-24}$, averaged over all days")
+    r_dense = np.linspace(0.0, bin_edges[-1], 300)
+    for fit in theory_fits:
+        color, linestyle, linewidth, display_name = THEORY_STYLE[fit["model"]]
+        rho_theory = fit["law_fn"](r_dense, *fit["params"].values())
+        L_fit = fit["params"]["L"]
+        nu_str = f", $\\nu$={fit['params']['nu']:.2f}" if "nu" in fit["params"] else ""
+        ax.plot(r_dense, rho_theory, linestyle, color=color, linewidth=linewidth,
+                label=f"{display_name} fit to ground truth:\n"
+                      f"$L$={L_fit:.0f} km{nu_str}, weighted $R^2$={fit['r_squared']:.3f}")
+        ax.axvline(L_fit, color=color, linewidth=0.8, linestyle=linestyle, alpha=0.4)
     ax.plot(dist_centers, rho_indep, "-", color="red", marker="^",
             label="Independent TabICLv2: no copula, so $\\rho \\equiv 0$ by construction")
     ax.plot(dist_centers, rho_dummy_context, "-", color="tab:orange", marker="D",
