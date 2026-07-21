@@ -970,6 +970,52 @@ def _kernel_composition_label(ep: dict) -> str:
     return label
 
 
+def _live_generate_alternating(icl_cfg, n_ep: int, device, seed: int) -> list[dict]:
+    """Live-generate n_ep episodes, forcing every even local index (0, 2, 4,
+    ...) to a single elementary kernel (no composition) so each consecutive
+    pair of evaluated episodes includes one non-composite draw — otherwise
+    non-composite episodes are rare (e.g. only a 1/8 chance per episode under
+    this repo's default composite_num_kernels_max=8, and even that 1/8 would
+    apply to the WHOLE eval run at once, not per episode; see below).
+
+    generate_gp_batch samples its kernel structure once per call and shares
+    it across the whole batch (see its docstring), so getting per-episode
+    composition variety at all — regardless of the alternating scheme here —
+    requires B=1 calls rather than the single B=n_ep batched call this
+    replaces. Each call gets its own seed (seed + local_i): generate_gp_batch
+    reseeds every RNG from cfg.seed at the start of each call, so reusing one
+    seed across calls would otherwise resample the identical episode n_ep
+    times.
+    """
+    episodes: list[dict] = []
+    for local_i in range(n_ep):
+        ep_cfg = copy.deepcopy(icl_cfg)
+        ep_cfg.seed = seed + local_i
+        if local_i % 2 == 0:
+            # Force non-composite for both kernel-selection modes
+            # _resolve_kernel_name / _sample_kernel_chain_structure support.
+            if bool(getattr(ep_cfg.data, "systematic_composition", False)):
+                ep_cfg.data.composite_num_kernels_min = 1
+                ep_cfg.data.composite_num_kernels_max = 1
+            else:
+                fixed = getattr(ep_cfg.data, "kernel", None)
+                if fixed:
+                    composite = _parse_composite(str(fixed))
+                    if composite is not None:
+                        ep_cfg.data.kernel = composite[0]
+                elif getattr(ep_cfg.data, "kernels", None):
+                    pool = [k for k in ep_cfg.data.kernels if _parse_composite(k) is None]
+                    if not pool:
+                        raise ValueError(
+                            f"cfg.data.kernels={list(ep_cfg.data.kernels)} contains only "
+                            "composite kernels; cannot force a non-composite episode."
+                        )
+                    ep_cfg.data.kernels = pool
+                # else: _resolve_kernel_name's own "rbf" default, already non-composite.
+        episodes.extend(generate_gp_batch(ep_cfg, 1, device, return_kernel_metadata=True))
+    return episodes
+
+
 def _print_table(all_nlls: list[dict[str, float]]) -> None:
     means = {k: float(np.nanmean([m.get(k, float("nan")) for m in all_nlls]))
              for k, _ in _METHOD_ORDER}
@@ -1116,10 +1162,10 @@ def main() -> None:
         # episode's kernel composition available for the per-episode print
         # below, without ever touching generate_pit_dataset.py's on-disk
         # shard schema.
-        icl_cfg.seed = args.seed
         print(f"\nLive-generating {n_ep} episodes via generate_gp_batch "
-              f"(return_kernel_metadata=True), seed={args.seed}")
-        live_episodes = generate_gp_batch(icl_cfg, n_ep, device, return_kernel_metadata=True)
+              f"(return_kernel_metadata=True), seed={args.seed}, "
+              "alternating every-other episode to a non-composite kernel")
+        live_episodes = _live_generate_alternating(icl_cfg, n_ep, device, args.seed)
     else:
         dataset_dir = args.dataset_dir or cfg.training.dataset_dir
         dataset = CopulaDataset(episode_dir=dataset_dir)
