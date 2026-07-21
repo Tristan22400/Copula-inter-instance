@@ -74,7 +74,7 @@ from torch.optim import Adam
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-from data_gen import _sq_dist, sigma_to_correlation
+from data_gen import _parse_composite, _sq_dist, generate_gp_batch, sigma_to_correlation
 from dataset import CopulaDataset
 from loss import oracle_copula_nll
 from model import build_copula_transformer, low_rank_correlation
@@ -921,6 +921,55 @@ _METHOD_ORDER = [
 ]
 
 
+# Excluded from the "5 best baselines" ranking: independence/gp_prior_rbf
+# are trivial, no-fit reference points rather than baselines, and icl/oracle
+# aren't baselines at all (icl is our model, oracle is the lower bound).
+_NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle"}
+
+_METHOD_LABELS = dict(_METHOD_ORDER)
+
+
+def _kernel_composition_label(ep: dict) -> str:
+    """Human-readable kernel-composition string for one episode (e.g.
+    "rbf(ARD)+periodic, mlp-mixing"), built from the return_kernel_metadata
+    fields generate_gp_batch attaches (see its docstring) — absent entirely
+    for episodes loaded from a pre-built dataset that didn't request that
+    metadata (the common case for existing PIT datasets on disk today)."""
+    if "kernel" not in ep:
+        return "unavailable (pass --dataset_dir with pre-generated metadata, or use --live_generate)"
+
+    if "kernel_components" in ep:
+        parts = [ep["kernel_components"][0]]
+        for op, comp_name in zip(ep["kernel_ops"], ep["kernel_components"][1:]):
+            parts.append(op)
+            parts.append(comp_name)
+        label = " ".join(parts)
+        ard_tags = [
+            comp_name + "(ARD)"
+            for comp_name, comp_params in zip(ep["kernel_components"], ep["kernel_component_params"])
+            if torch.is_tensor(comp_params.get("l")) and comp_params["l"].numel() > 1
+        ]
+    else:
+        label = ep["kernel"]
+        composite = _parse_composite(ep["kernel"])
+        ard_tags = []
+        if composite is None:
+            if torch.is_tensor(ep.get("l")) and ep["l"].numel() > 1:
+                ard_tags.append(f"{ep['kernel']}(ARD)")
+        else:
+            name_a, _op, name_b = composite
+            if torch.is_tensor(ep.get("l")) and ep["l"].numel() > 1:
+                ard_tags.append(f"{name_a}(ARD)")
+            if torch.is_tensor(ep.get("l_b")) and ep["l_b"].numel() > 1:
+                ard_tags.append(f"{name_b}(ARD)")
+
+    if ard_tags:
+        label = f"{label}  [{', '.join(ard_tags)}]"
+    if bool(ep.get("mlp_mixed", False)):
+        label = f"{label}, mlp-mixing"
+    return label
+
+
 def _print_table(all_nlls: list[dict[str, float]]) -> None:
     means = {k: float(np.nanmean([m.get(k, float("nan")) for m in all_nlls]))
              for k, _ in _METHOD_ORDER}
@@ -958,7 +1007,18 @@ def main() -> None:
     parser.add_argument("--ckpt",         required=True)
     parser.add_argument("--dataset_dir",  default=None,
                         help="Episode directory to evaluate on (overrides "
-                             "training.dataset_dir from --config)")
+                             "training.dataset_dir from --config). Passing "
+                             "this disables --live_generate by default.")
+    parser.add_argument("--live_generate", action=argparse.BooleanOptionalAction, default=None,
+                        help="Generate evaluation episodes on the fly via "
+                             "data_gen.generate_gp_batch(..., return_kernel_metadata=True) "
+                             "instead of loading a pre-built PIT dataset directory. Gives "
+                             "the printed per-episode summary access to the kernel "
+                             "composition (rbf/rational_quadratic/.../ARD/mlp-mixing) that "
+                             "actually generated each scored episode, without needing to "
+                             "regenerate an on-disk dataset with that metadata. Default: "
+                             "True unless --dataset_dir is given. --episode_idx is ignored "
+                             "in this mode (episodes are freshly sampled, not indexed).")
     parser.add_argument("--n_episodes",   type=int,   default=5)
     parser.add_argument("--episode_idx",  type=int,   default=0)
     parser.add_argument("--n_steps_mle",  type=int,   default=1000,
@@ -1039,28 +1099,48 @@ def main() -> None:
     prior_cfg = OmegaConf.to_container(data_cfg) if data_cfg is not None else {}
     print(f"GP-MLE restarts: {args.n_restarts_mle}")
 
-    dataset_dir = args.dataset_dir or cfg.training.dataset_dir
+    # Live-generate by default, unless the user points at a fixed dataset
+    # with --dataset_dir (see --live_generate's help text).
+    live_generate = args.live_generate if args.live_generate is not None else (args.dataset_dir is None)
+
     n_ep = args.n_episodes
-
-    dataset = CopulaDataset(episode_dir=dataset_dir)
-    n_available = len(dataset)
-
     all_nlls: list[dict[str, float]] = []
     plot_R_dict: dict[str, Tensor] | None = None
     plot_R_oracle: Tensor | None = None
 
-    print(f"\nEvaluating {n_ep} episodes from {dataset_dir} (start={args.episode_idx})")
-    print(f"  Dataset size: {n_available} episodes")
+    if live_generate:
+        # icl_cfg is the checkpoint's own saved training config (same source
+        # already used for prior_cfg above), so live-generated episodes match
+        # the kernel family/hyperprior distribution the ICL model was
+        # actually trained on. return_kernel_metadata=True makes each
+        # episode's kernel composition available for the per-episode print
+        # below, without ever touching generate_pit_dataset.py's on-disk
+        # shard schema.
+        icl_cfg.seed = args.seed
+        print(f"\nLive-generating {n_ep} episodes via generate_gp_batch "
+              f"(return_kernel_metadata=True), seed={args.seed}")
+        live_episodes = generate_gp_batch(icl_cfg, n_ep, device, return_kernel_metadata=True)
+    else:
+        dataset_dir = args.dataset_dir or cfg.training.dataset_dir
+        dataset = CopulaDataset(episode_dir=dataset_dir)
+        n_available = len(dataset)
+        print(f"\nEvaluating {n_ep} episodes from {dataset_dir} (start={args.episode_idx})")
+        print(f"  Dataset size: {n_available} episodes")
+
     print(f"  GP MLE: {args.n_steps_mle} steps | DKL: {args.n_steps_dkl} steps | "
           f"PerEp: {args.n_steps_per_ep} steps (patience={args.patience_per_ep})")
 
     for local_i in range(n_ep):
-        ep_i = args.episode_idx + local_i
-        if ep_i >= n_available:
-            print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")
-            continue
+        if live_generate:
+            ep_i = local_i
+            ep = live_episodes[local_i]
+        else:
+            ep_i = args.episode_idx + local_i
+            if ep_i >= n_available:
+                print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")
+                continue
+            ep = dataset[ep_i]
 
-        ep = dataset[ep_i]
         nlls, R_dict, R_oracle = _eval_episode(
             ep=ep,
             icl_model=icl_model,
@@ -1084,7 +1164,15 @@ def main() -> None:
 
         icl_nll = nlls.get("icl", float("nan"))
         ora_nll = nlls.get("oracle", float("nan"))
-        print(f"  ep {ep_i:04d}: icl={icl_nll:.4f}  oracle={ora_nll:.4f}")
+        top5 = sorted(
+            ((k, v) for k, v in nlls.items() if k not in _NON_FITTED_EXCLUDED),
+            key=lambda kv: kv[1],
+        )[:5]
+        print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
+        print(f"    icl={icl_nll:.4f}  oracle={ora_nll:.4f}")
+        print("    top-5 baselines (lowest NLL, fitted only):")
+        for key, val in top5:
+            print(f"      {_METHOD_LABELS.get(key, key):<28}{val:.4f}")
 
     if not all_nlls:
         print("No episodes evaluated successfully.")
