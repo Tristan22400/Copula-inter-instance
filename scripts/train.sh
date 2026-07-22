@@ -1,6 +1,7 @@
 #!/bin/bash
 #OAR -n TabICL_Train
 #OAR -l gpu=1,walltime=36:00:00
+#OAR -p "gpu_model != 'TITAN RTX'"
 
 
 set -e
