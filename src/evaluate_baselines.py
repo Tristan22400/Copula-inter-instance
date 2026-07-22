@@ -86,12 +86,16 @@ from torch import Tensor
 from torch.optim import Adam
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
+_REPO_ROOT = os.path.dirname(_HERE)
+for _p in (_HERE, _REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from data_gen import _parse_composite, _sq_dist, generate_gp_batch, sigma_to_correlation
 from dataset import CopulaDataset
+from inference.copula_inference import load_copula_model
 from loss import oracle_copula_nll
-from model import build_copula_transformer, low_rank_correlation
+from model import low_rank_correlation
 
 
 # ---------------------------------------------------------------------------
@@ -1331,13 +1335,7 @@ def main() -> None:
 
     # ---- Load ICL model ----
     print(f"\nLoading ICL checkpoint: {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    icl_cfg = ckpt.get("cfg", cfg)
-    if isinstance(icl_cfg, dict):
-        icl_cfg = OmegaConf.create(icl_cfg)
-    icl_model = build_copula_transformer(icl_cfg).to(device)
-    icl_model.load_state_dict(ckpt.get("model_state", ckpt.get("state_dict")))
-    icl_model.eval()
+    icl_model, icl_cfg = load_copula_model(args.ckpt, config_path=args.config, device=str(device))
     icl_rank = int(icl_cfg.model.rank)
     n_params = sum(p.numel() for p in icl_model.parameters())
     print(f"ICL model parameters: {n_params:,}  rank={icl_rank}")
