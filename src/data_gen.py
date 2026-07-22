@@ -193,6 +193,8 @@ import gpytorch
 import numpy as np
 import torch
 from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
+from gpytorch.utils.cholesky import psd_safe_cholesky
+from gpytorch.utils.errors import NotPSDError
 from torch import Tensor
 
 from loss import _safe_cholesky
@@ -1404,12 +1406,16 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 # ---------------------------------------------------------------------------
 
 
-def _batched_cholesky(K: Tensor) -> Tensor:
-    """Batched Cholesky (B, N, N) → (B, N, N) with automatic jitter for failures."""
+def _batched_cholesky(K: Tensor) -> tuple[Tensor, Tensor]:
+    """Batched Cholesky (B, N, N) → (L, failed): L is (B, N, N) with automatic
+    jitter for failures; failed (B,) bool marks episodes where even the
+    maximum jitter (0.1) couldn't recover a PSD matrix — L is an identity
+    placeholder for those, and the caller (generate_gp_batch) is expected to
+    drop them rather than save a degenerate episode."""
     L, info = torch.linalg.cholesky_ex(K)
     failed = info.ne(0)
     if not failed.any():
-        return L
+        return L, failed
     eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
     for jitter in (1e-5, 1e-4, 1e-3, 1e-2, 0.1):
         if not failed.any():
@@ -1420,9 +1426,66 @@ def _batched_cholesky(K: Tensor) -> Tensor:
         L[failed] = L_new[failed]
         failed = info_new.ne(0)
     if failed.any():
-        # Last resort: replace with identity so the episode is invalid but non-crashing.
+        # Last resort: replace with identity so this call doesn't crash.
+        # Logged (not silent) so a run-wide rate can be monitored — this
+        # means K_ff/LOO PIT (z_train) is degenerate for these episodes even
+        # after the maximum jitter escalation above. The caller discards
+        # these episodes entirely (see generate_gp_batch) rather than saving
+        # this identity placeholder.
+        warnings.warn(
+            f"_batched_cholesky: {int(failed.sum())}/{K.shape[0]} episodes fell back "
+            f"to an identity K_ff Cholesky factor (unrecoverable even at jitter=0.1) "
+            f"and will be discarded.",
+            RuntimeWarning,
+        )
         L[failed] = eye.unsqueeze(0).expand_as(L[failed])
-    return L
+    return L, failed
+
+
+def _psd_safe_batch(K: Tensor, max_tries: int = 6) -> tuple[Tensor, Tensor]:
+    """Batched (B, N, N) -> (L, failed) Cholesky factor via gpytorch's own
+    psd_safe_cholesky, instead of a hand-rolled retry loop (see
+    _batched_cholesky above, kept as-is for K_ff/LOO PIT — this is the
+    equivalent tool for K_all, used to GUARANTEE Sigma_star/R_star are PSD
+    rather than just symmetric, see generate_gp_batch's joint-sample block).
+    failed (B,) bool marks episodes where even the maximum jitter couldn't
+    recover a PSD matrix; the caller is expected to drop them.
+
+    psd_safe_cholesky adds escalating diagonal jitter (starting at
+    gpytorch.settings.cholesky_jitter, x10 per retry — the exact same
+    mechanism gpytorch itself falls back to internally, e.g. the "added
+    jitter... Using symeig method" warning this pipeline already emits for
+    marginal episodes) ONLY to the batch elements that actually fail a
+    Cholesky attempt, leaving every well-conditioned episode's matrix
+    untouched. max_tries=6 reaches a jitter ceiling of ~1e-6*10^5=0.1,
+    matching _batched_cholesky's own escalation ceiling above.
+
+    psd_safe_cholesky raises (rather than returning a partial result) if
+    ANY batch element is still not PSD after max_tries — so on that
+    exception we re-derive exactly which elements are still bad at the same
+    maximum jitter (rather than discarding the whole batch's progress) and
+    fall back to identity (same "mark the episode invalid, don't crash
+    generation" convention _batched_cholesky uses) for only those, in the
+    astronomically unlikely case max_tries isn't enough. Logged (not
+    silent) so a run-wide rate can be monitored.
+    """
+    try:
+        L = psd_safe_cholesky(K, max_tries=max_tries)
+        return L, torch.zeros(K.shape[0], dtype=torch.bool, device=K.device)
+    except NotPSDError:
+        jitter0 = gpytorch.settings.cholesky_jitter.value(K.dtype)
+        max_jitter = jitter0 * (10 ** (max_tries - 1))
+        eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
+        L, info = torch.linalg.cholesky_ex(K + max_jitter * eye)
+        failed = info.ne(0)
+        warnings.warn(
+            f"_psd_safe_batch: {int(failed.sum())}/{K.shape[0]} episodes fell back "
+            f"to an identity K_all (unrecoverable even at jitter={max_jitter:.1e}) "
+            f"and will be discarded.",
+            RuntimeWarning,
+        )
+        L[failed] = eye.unsqueeze(0).expand_as(L[failed])
+        return L, failed
 
 
 def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
@@ -1612,10 +1675,23 @@ def apply_mlp_feature_mixing(
 
 
 @torch.no_grad()
-def generate_gp_batch(
+def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
 ) -> List[Dict[str, Tensor]]:
-    """Generate B GP episodes in a single vectorised call.
+    """Generate up to B GP episodes in a single vectorised call — the
+    "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
+    episodes, since any episode whose K_all/K_ff Cholesky repair bottomed
+    out at an identity placeholder (see _psd_safe_batch/_batched_cholesky's
+    `discard` above) is dropped before returning, rather than saved as a
+    degenerate placeholder. Call generate_gp_batch instead of this function
+    directly unless you specifically want the possibly-short, unpadded
+    result.
+
+    All B episodes share one kernel type, one (P, N) size, and one set of
+    active_dims/k (all sampled once per call) but have independent
+    hyperparameters and feature draws — gpytorch's `batch_shape=[B]` kernels
+    draw B independent hyperparameter sets in one call (see
+    _sample_episode_kernel), and a batch_shape=[B] GaussianLikelihood
 
     All B episodes share one kernel type, one (P, N) size, and one set of
     active_dims/k (all sampled once per call) but have independent
@@ -1748,18 +1824,40 @@ def generate_gp_batch(
 
     # --- Joint prior sample + noisy covariance (B, T, T), via gpytorch's own
     # GaussianLikelihood(MultivariateNormal) — replaces the old manual
-    # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly and
-    # `_batched_cholesky(K_all) @ randn` sampling. max_cholesky_size is
-    # forced high (see module docstring / _MAX_CHOLESKY) so this is an exact
-    # Cholesky-based sample, not gpytorch's approximate CG/Lanczos fallback.
+    # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly.
+    # max_cholesky_size is forced high (see module docstring / _MAX_CHOLESKY)
+    # so the covariance_matrix materialization below is exact, not gpytorch's
+    # approximate CG/Lanczos fallback.
     with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
         prior_dist = gpytorch.distributions.MultivariateNormal(
             torch.zeros(B, T, device=device), kernel_obj(x_norm)
         )
         noisy_dist = likelihood(prior_dist)
-        y_all = noisy_dist.rsample()                 # (B, T)
-        K_all = noisy_dist.covariance_matrix          # (B, T, T), nugget already on diagonal
-    K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))    # symmetrize float32 drift
+        K_all_raw = noisy_dist.covariance_matrix      # (B, T, T), nugget already on diagonal
+
+    # No explicit symmetrization needed here: torch.linalg.cholesky_ex (used
+    # by psd_safe_cholesky below) only ever reads the lower triangle of its
+    # input and ignores the upper triangle entirely (verified — corrupting
+    # the upper triangle changes nothing about the result), and the K_all we
+    # actually use downstream is reconstructed as L_all @ L_all.mT, which is
+    # exactly symmetric by construction regardless of what K_all_raw's upper
+    # triangle looked like. K_all_raw is NOT guaranteed PSD though: gpytorch's
+    # own float32 kernel evaluation accumulates enough rounding error across
+    # a long composite/systematic chain (worse once SignModulatedKernel's
+    # elementwise +-1 factor is in the mix) to occasionally leave a slightly
+    # negative eigenvalue. psd_safe_cholesky is gpytorch/linear_operator's
+    # own canonical PSD-repair tool — the same escalating-jitter mechanism
+    # gpytorch falls back to internally (see the "added jitter... Using
+    # symeig method" warning this pipeline already emits for marginal
+    # episodes), applied here explicitly, ONCE, so that y_all (the actual
+    # sample) and K_all/K_ss/K_ff/R_star (the reported covariance/oracle)
+    # are both derived from the exact same, provably-PSD matrix rather than
+    # two independently-reconstructed quantities that could disagree at the
+    # float32 rounding level. Replaces the old `noisy_dist.rsample()`, which
+    # offered no such guarantee for the *reported* K_all.
+    L_all, failed_all = _psd_safe_batch(K_all_raw)
+    K_all = L_all @ L_all.mT                          # (B, T, T), PSD by construction
+    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero prior mean
 
     x_norm_train = x_norm[:, :P]   # (B, P, d)
     x_norm_test  = x_norm[:, P:]   # (B, N, d)
@@ -1775,38 +1873,31 @@ def generate_gp_batch(
     # No clean gpytorch public API exposes diag(K_ff^-1) for an ExactGP, so
     # this stays hand-rolled (_batched_cholesky), just sourced from the
     # gpytorch-native K_all above instead of a separately hand-added nugget.
-    L_ff  = _batched_cholesky(K_ff)
+    L_ff, failed_ff = _batched_cholesky(K_ff)
     alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)          # (B, P)
+
+    # Episodes where either Cholesky repair above bottomed out at an
+    # identity placeholder are not valid GP episodes (K_all/K_ff no longer
+    # reflect the sampled kernel at all) — dropped entirely at the end of
+    # this function (see the "Discard degenerate episodes" block below)
+    # rather than saved with a degenerate placeholder. generate_gp_batch
+    # (the public wrapper) tops up the shortfall so callers still get
+    # exactly B valid episodes.
+    discard = failed_all | failed_ff
 
     oracle_mode = getattr(cfg.data, "oracle_mode", "posterior")
     if oracle_mode == "prior":
         # Prior oracle: ignore training conditioning — R_star reflects the raw
         # kernel structure among test points; mu_star is the GP prior mean (0).
         # No conditioning needed, so this branch never touches _GeneratorGP.
-        #
-        # Sigma_star is recomputed directly from kernel_obj(x_norm_test) in
-        # float64 rather than reused as K_ss (the float32 joint K_all's test
-        # block): K_ss is only made exactly SYMMETRIC by line 1441's fix, not
-        # necessarily PSD. gpytorch's own kernel evaluation accumulates
-        # enough float32 rounding error across a composite/systematic chain
-        # (worse once SignModulatedKernel's elementwise +-1 multiplication is
-        # in the mix — observed min eigenvalues down to -3.8e-4 across a
-        # 5000-episode sweep with sign modulation on, vs. 0 violations with
-        # it off) to occasionally push this test-only principal submatrix's
-        # eigenvalues slightly negative. Same class of precision issue the
-        # posterior branch below already documents and fixes with float64 —
-        # see its comment. kernel_obj/likelihood are mutated in place by
-        # .double() (nn.Module convention) but, same as the posterior
-        # branch, are not read again after this branch, so that's safe; only
-        # Sigma_star's own PSD-relevant computation is redone in double
-        # precision, not the (already-drawn, float32) y_test sample.
-        mu_star = torch.zeros(B, N, device=device)
-        with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
-            prior_dist_ss = gpytorch.distributions.MultivariateNormal(
-                torch.zeros(B, N, dtype=torch.float64, device=device),
-                kernel_obj.double()(x_norm_test.double()),
-            )
-            Sigma_star = likelihood.double()(prior_dist_ss).covariance_matrix.to(x_norm.dtype)  # (B, N, N)
+        # Sigma_star = K_ss is already guaranteed PSD here: K_ss is a
+        # principal submatrix of K_all, which is constructed above as
+        # L_all @ L_all.mT (PSD by construction, via psd_safe_cholesky) —
+        # not a slice of an unprotected raw materialization. A principal
+        # submatrix of a PSD matrix is itself PSD, so no further repair is
+        # needed at this point.
+        mu_star    = torch.zeros(B, N, device=device)
+        Sigma_star = K_ss
     elif oracle_mode == "posterior":
         # Posterior oracle: condition on (x_train, y_train) via gpytorch's own
         # exact-inference ExactGP.__call__ instead of the hand-rolled
@@ -1945,9 +2036,27 @@ def generate_gp_batch(
             kernel_cols if kernel_cols is not None else list(range(d)), dtype=torch.long
         )
 
+    # --- Discard degenerate episodes (see `discard` above) rather than
+    # saving an identity-placeholder K_all/K_ff/R_star. n_train/n_test/
+    # kernel/kernel_feature_indices in `extra` are batch-shared (same P, N,
+    # kernel_name, active_dims for every episode in this call — see the top
+    # of this function), so they need no filtering; only the per-episode
+    # `tensors` (and, for systematic chains, `component_params`) do.
+    keep = ~discard
+    B_kept = int(keep.sum())
+    # tensors dict mixes CPU (most fields, .cpu()'d above) and device-resident
+    # (_L_ff/_alpha, kept on `device` for reuse elsewhere) tensors, so index
+    # each with a copy of `keep`/`discard`'s boolean mask moved to its own
+    # device rather than a single fixed-device index tensor.
+    tensors = {key: val[keep.to(val.device)] for key, val in tensors.items()}
+    if return_kernel_metadata and systematic:
+        component_params = [
+            {pk: pv[keep.to(pv.device)] for pk, pv in comp.items()} for comp in component_params
+        ]
+
     episodes = [
         {key: val[b] for key, val in tensors.items()} | extra
-        for b in range(B)
+        for b in range(B_kept)
     ]
 
     if return_kernel_metadata and systematic:
@@ -1960,7 +2069,7 @@ def generate_gp_batch(
         # ARD-vector-vs-scalar "l" shapes across components don't need
         # padding. Not reconstructible via build_kernel_fn — see module
         # docstring's "Systematic composition" section.
-        for b in range(B):
+        for b in range(B_kept):
             episodes[b]["kernel_components"] = chain_names
             episodes[b]["kernel_ops"] = chain_ops
             episodes[b]["kernel_component_params"] = [
@@ -1968,3 +2077,45 @@ def generate_gp_batch(
             ]
 
     return episodes
+
+
+def generate_gp_batch(
+    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
+) -> List[Dict[str, Tensor]]:
+    """Generate exactly B GP episodes, discarding and regenerating any that
+    turn out degenerate (see _generate_gp_batch_raw's `discard` — an
+    unrecoverable K_all/K_ff Cholesky, i.e. even psd_safe_cholesky/
+    _batched_cholesky's escalating jitter bottomed out at an identity
+    placeholder) instead of saving a placeholder episode.
+
+    Every caller (generate_pit_dataset.py, train.py, tests, ...) relies on
+    getting exactly B episodes back: dataset.py's CopulaDataset._get_sharded
+    indexes shards with a fixed stride (idx // shard_size), so a shard
+    silently written with fewer than shard_size episodes would corrupt
+    indexing for every shard after it. This wrapper preserves that
+    invariant by topping up the shortfall with fresh top-up calls (which
+    resample their own kernel/P/N/active_dims independently, same as any
+    other call) until exactly B valid episodes are assembled.
+
+    In practice this loop almost never repeats more than once: the discard
+    rate is astronomically rare (an episode has to defeat escalating jitter
+    up to ~0.1 — see _psd_safe_batch/_batched_cholesky). max_rounds bounds
+    the retries so a pathological config (e.g. one that's non-PSD by
+    construction regardless of jitter) fails loudly instead of hanging.
+    """
+    episodes = _generate_gp_batch_raw(cfg, B, device, return_kernel_metadata=return_kernel_metadata)
+    max_rounds = 20
+    for _ in range(max_rounds):
+        if len(episodes) >= B:
+            break
+        shortfall = B - len(episodes)
+        episodes += _generate_gp_batch_raw(
+            cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata
+        )
+    if len(episodes) < B:
+        raise RuntimeError(
+            f"generate_gp_batch: could not assemble {B} valid episodes after "
+            f"{max_rounds} top-up rounds ({len(episodes)} obtained) — the kernel/config "
+            f"combination in this call appears to be persistently non-PSD."
+        )
+    return episodes[:B]
