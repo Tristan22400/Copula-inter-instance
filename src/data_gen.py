@@ -1783,8 +1783,30 @@ def generate_gp_batch(
         # Prior oracle: ignore training conditioning — R_star reflects the raw
         # kernel structure among test points; mu_star is the GP prior mean (0).
         # No conditioning needed, so this branch never touches _GeneratorGP.
-        mu_star    = torch.zeros(B, N, device=device)
-        Sigma_star = K_ss
+        #
+        # Sigma_star is recomputed directly from kernel_obj(x_norm_test) in
+        # float64 rather than reused as K_ss (the float32 joint K_all's test
+        # block): K_ss is only made exactly SYMMETRIC by line 1441's fix, not
+        # necessarily PSD. gpytorch's own kernel evaluation accumulates
+        # enough float32 rounding error across a composite/systematic chain
+        # (worse once SignModulatedKernel's elementwise +-1 multiplication is
+        # in the mix — observed min eigenvalues down to -3.8e-4 across a
+        # 5000-episode sweep with sign modulation on, vs. 0 violations with
+        # it off) to occasionally push this test-only principal submatrix's
+        # eigenvalues slightly negative. Same class of precision issue the
+        # posterior branch below already documents and fixes with float64 —
+        # see its comment. kernel_obj/likelihood are mutated in place by
+        # .double() (nn.Module convention) but, same as the posterior
+        # branch, are not read again after this branch, so that's safe; only
+        # Sigma_star's own PSD-relevant computation is redone in double
+        # precision, not the (already-drawn, float32) y_test sample.
+        mu_star = torch.zeros(B, N, device=device)
+        with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
+            prior_dist_ss = gpytorch.distributions.MultivariateNormal(
+                torch.zeros(B, N, dtype=torch.float64, device=device),
+                kernel_obj.double()(x_norm_test.double()),
+            )
+            Sigma_star = likelihood.double()(prior_dist_ss).covariance_matrix.to(x_norm.dtype)  # (B, N, N)
     elif oracle_mode == "posterior":
         # Posterior oracle: condition on (x_train, y_train) via gpytorch's own
         # exact-inference ExactGP.__call__ instead of the hand-rolled
