@@ -1833,7 +1833,29 @@ def _generate_gp_batch_raw(
             torch.zeros(B, T, device=device), kernel_obj(x_norm)
         )
         noisy_dist = likelihood(prior_dist)
-        K_all_raw = noisy_dist.covariance_matrix      # (B, T, T), nugget already on diagonal
+        try:
+            K_all_raw = noisy_dist.covariance_matrix  # (B, T, T), nugget already on diagonal
+        except NotPSDError:
+            # Some composite/systematic kernel chains (esp. under sign
+            # modulation — see _build_kernel_chain) leave an intermediate
+            # partial-sum LinearOperator that gpytorch's own low-rank
+            # __add__ path (add_low_rank -> root_inv_decomposition) can't
+            # Cholesky-factor, even before _psd_safe_batch below gets a
+            # chance to repair the final K_all. This raises straight out of
+            # gpytorch's kernel evaluation, for the whole batch at once, so
+            # the individual bad episode(s) can't be isolated the way
+            # _psd_safe_batch/_batched_cholesky isolate per-row failures
+            # below. Discard the whole B-episode batch (this call's kernel/
+            # hyperparameter draw) and let generate_gp_batch's top-up loop
+            # resample a fresh one, rather than crashing the whole run.
+            warnings.warn(
+                f"_generate_gp_batch_raw: kernel evaluation for this "
+                f"{B}-episode batch (kernel={kernel_name!r}) raised NotPSDError "
+                f"before psd_safe_cholesky repair could run; discarding the "
+                f"whole batch and resampling.",
+                RuntimeWarning,
+            )
+            return []
 
     # No explicit symmetrization needed here: torch.linalg.cholesky_ex (used
     # by psd_safe_cholesky below) only ever reads the lower triangle of its
