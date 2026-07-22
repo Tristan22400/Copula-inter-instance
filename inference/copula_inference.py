@@ -258,6 +258,7 @@ def load_copula_model(
     raw = getattr(model, "_orig_mod", model)
     raw.load_state_dict(state)
     model.eval()
+    print(f"Loaded CopulaTabICL checkpoint '{ckpt_path}' (step {ckpt.get('step')}) on {device}.")
     return model, cfg
 
 

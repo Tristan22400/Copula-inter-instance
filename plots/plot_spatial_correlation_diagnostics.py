@@ -128,25 +128,20 @@ def empirical_spatial_correlation(data: dict) -> np.ndarray:
 # TabICLv2 / CopulaTabICL: shared checkpoint loading + dummy/real-context extraction
 # ---------------------------------------------------------------------------
 def load_copula_model(ckpt_path: str, device: "str | None" = None):
-    """Load a CopulaTabICL checkpoint, mirroring
-    generate_plots.build_copula_correlation_fn's loading path exactly (same
-    build_copula_transformer factory + state_dict load) so this script stays
-    consistent with every other real-checkpoint entry point in this repo.
+    """Load a CopulaTabICL checkpoint via the repo's single canonical loader
+    (inference/copula_inference.py::load_copula_model) rather than
+    reimplementing torch.load + build_copula_transformer + state_dict here;
+    this wrapper only resolves the auto ("cuda" if available else "cpu")
+    device default this script's --device flag relies on.
     """
     import torch
-    from omegaconf import OmegaConf
 
-    from src.model import build_copula_transformer
+    from inference.copula_inference import load_copula_model as _load_copula_model
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = OmegaConf.create(ckpt["cfg"])
-    model = build_copula_transformer(cfg)
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval().to(device)
-    print(f"Loaded CopulaTabICL checkpoint '{ckpt_path}' (step {ckpt.get('step')}) on {device}.")
+    model, cfg = _load_copula_model(ckpt_path, device=device)
     return model, cfg, device
 
 
