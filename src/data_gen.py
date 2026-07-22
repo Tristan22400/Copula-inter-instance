@@ -109,6 +109,45 @@ Composite kernels ("A+B" / "A*B")
   for the separate kernel_components/kernel_ops/kernel_component_params
   schema this mode uses instead of the flat l/alpha2/l_b/alpha2_b keys.
 
+Sign modulation (cfg.data.sign_modulation_component_prob / _outer_prob)
+-------------------------------------------------------------------------
+  An optional Schur-product wrapper (SignModulatedKernel) that injects
+  negative pairwise correlation into R_star without any new positivity
+  argument: K'(x1, x2) = K(x1, x2) * sign(w.x1[active]+b) *
+  sign(w.x2[active]+b), where (w, b) is a random affine hyperplane over the
+  wrapped kernel's own active-column subspace, one independent draw per
+  episode (w ~ N(0, I_k), b ~ N(0, 1)). PSD holds via the Schur product
+  theorem: the sign vector's outer product s s^T is rank-1 PSD, and an
+  elementwise product of two PSD matrices is PSD.
+
+  Two independently Bernoulli-per-batch-call-gated injection points (same
+  granularity as mlp_mixing_enabled/mlp_mixing_prob — if the coin flip
+  fires for a given generate_gp_batch call, every episode in that call gets
+  its own independent (w, b), same "shared gate, independent draw"
+  convention used throughout this file):
+    - cfg.data.sign_modulation_component_prob: per elementary component,
+      wired into the shared _build_kernel_component choke point — covers
+      bare kernels, both sides of a static "A+B"/"A*B" composite (via
+      _sample_episode_kernel), and every link of a systematic_composition
+      chain (via _build_kernel_chain), independently per component, with no
+      extra plumbing needed at any of those three call sites.
+    - cfg.data.sign_modulation_outer_prob: applied once more, independently,
+      to the fully composed kernel (whichever of the three modes above
+      produced it) — see the end of _sample_episode_kernel / the end of
+      _build_kernel_chain.
+  Both default to 0.0 (off), so existing datasets/behaviour are unaffected
+  until explicitly turned on.
+
+  Saved/reconstructed via new sign_applied[_b|_outer] (0.0/1.0 float
+  sentinel — same "0 means N/A" convention dot_product's l=0 already uses)
+  and sign_w[_b|_outer]/sign_b[_b|_outer] schema keys (see
+  generate_gp_batch's return_kernel_metadata handling and build_kernel_fn's
+  signature), following the same flat-schema/zero-sentinel pattern as
+  l/alpha2/period/rq_alpha/power. Systematic-composition chains instead
+  carry their per-component sign fields inside each entry of
+  kernel_component_params (same non-reconstructible-via-build_kernel_fn
+  caveat as every other systematic-composition hyperparameter — see above).
+
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
   cfg.data.kernel   : str          → use this single kernel for every task
@@ -154,6 +193,8 @@ import gpytorch
 import numpy as np
 import torch
 from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
+from gpytorch.utils.cholesky import psd_safe_cholesky
+from gpytorch.utils.errors import NotPSDError
 from torch import Tensor
 
 from loss import _safe_cholesky
@@ -468,12 +509,162 @@ def _build_scaled_kernel(
     return scaled, params
 
 
+class SignModulatedKernel(gpytorch.kernels.Kernel):
+    """Schur-product sign modulation: K'(x1, x2) = K(x1, x2) * s(x1) * s(x2),
+    where s(x) = sign(w . x[active_cols] + b) in {-1, +1} is a random affine
+    hyperplane split of the (active-column subspace of the) input space, one
+    independent (w, b) draw per episode (batch_shape=[B], mirroring
+    ScaleKernel/_build_scaled_kernel above).
+
+    PSD rationale: s(x1)*s(x2) is the outer product of a +-1 vector with
+    itself, i.e. a rank-1 PSD matrix (s s^T), and the elementwise (Schur/
+    Hadamard) product of two PSD matrices is PSD (Schur product theorem), so
+    K' is PSD whenever K is -- no new positivity argument needed beyond what
+    every existing kernel in this file already relies on.
+
+    `active_cols` intentionally reuses whatever column subset the wrapped
+    base_kernel itself was built with (the caller passes the same
+    `active_dims` list used for the kernel being wrapped -- see
+    generate_gp_batch's `kernel_cols` and _build_kernel_component/
+    _sample_episode_kernel/_build_kernel_chain below) rather than drawing a
+    second, independent active-dims subset: the hyperplane should live in the
+    same feature subspace the kernel actually sees, not an unrelated one.
+    None means every column (matching gpytorch's own active_dims convention
+    elsewhere in this file).
+
+    sign(0) edge case: torch.sign(0) == 0, which would zero out (not flip)
+    the covariance for any point that lands exactly on the hyperplane -- a
+    measure-zero event for continuous inputs (the z-normalised features this
+    file generates are effectively continuous), so it is accepted as-is
+    rather than nudged to +-1; it costs nothing in practice and keeps the
+    formula identical to the textbook sign() function.
+    """
+
+    def __init__(
+        self,
+        base_kernel: gpytorch.kernels.Kernel,
+        w: Tensor,
+        b: Tensor,
+        active_dims: Optional[List[int]] = None,
+        **kwargs,
+    ):
+        # batch_shape is inferred from w's leading dim (B,), matching how
+        # ScaleKernel infers it from outputscale's shape.
+        super().__init__(batch_shape=torch.Size([w.shape[0]]), **kwargs)
+        self.base_kernel = base_kernel
+        self.register_buffer("w", w)   # (B, k)
+        self.register_buffer("b", b)   # (B,)
+        self.active_cols = list(active_dims) if active_dims is not None else None
+
+    def _signs(self, x: Tensor) -> Tensor:
+        """sign(w . x[..., active_cols] + b), shape (..., n) for x of shape
+        (..., n, d) -- same batch/broadcast convention gpytorch kernels use
+        for their own forward() (x's leading dims are batch dims, its last
+        two are (n, d)).
+
+        w has shape (B, k), b has shape (B,) -- both are unsqueezed with one
+        extra axis right before their last dim (giving (B, 1, k) / (B, 1))
+        so they broadcast against x_active's (..., n, k) / (..., n) from the
+        right, the same way e.g. gpytorch's own outputscale (B,) broadcasts
+        against a (B, n1, n2) covariance elsewhere in this file. Any further
+        leading dims gpytorch's own kernel machinery adds (e.g. an extra
+        singleton batch dim for some composition paths) broadcast for free
+        via ordinary right-aligned torch broadcasting -- no manual padding
+        needed for those.
+        """
+        cols = self.active_cols
+        x_active = x[..., cols] if cols is not None else x
+        w = self.w.unsqueeze(-2)   # (B, 1, k)
+        b = self.b.unsqueeze(-1)   # (B, 1)
+        return torch.sign((x_active * w).sum(-1) + b)
+
+    def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params) -> Tensor:
+        K = self.base_kernel(x1, x2, diag=diag, **params)
+        K = K.to_dense() if hasattr(K, "to_dense") else K
+        s1 = self._signs(x1)
+        s2 = self._signs(x2)
+        if diag:
+            return K * s1 * s2
+        return K * s1.unsqueeze(-1) * s2.unsqueeze(-2)
+
+
+def _sample_sign_modulation(
+    k: int, B: int, device
+) -> tuple[Tensor, Tensor]:
+    """Sample one (w, b) hyperplane per episode: w ~ N(0, I_k), b ~ N(0, 1),
+    i.i.d. standard normal -- a roughly balanced (not degenerate) random
+    split of the active-column subspace, reused for both the per-component
+    and post-composition SignModulatedKernel injection points (see the
+    module docstring's "Sign modulation" section)."""
+    w = torch.randn(B, k, device=device)
+    b = torch.randn(B, device=device)
+    return w, b
+
+
+def _maybe_wrap_sign_modulated(
+    kernel: gpytorch.kernels.Kernel,
+    prob: float,
+    k: int,
+    B: int,
+    device,
+    active_dims: Optional[List[int]],
+    param_suffix: str = "",
+) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
+    """Bernoulli(prob)-per-call gate (same per-batch-call granularity as
+    mlp_mixing_enabled/mlp_mixing_prob's own gate -- see
+    apply_mlp_feature_mixing) deciding whether to wrap `kernel` in a
+    SignModulatedKernel at all for this generate_gp_batch call. When gated
+    on, EVERY episode in the batch gets its own independent (w, b) draw (the
+    B-batched SignModulatedKernel itself), matching how every other batched
+    hyperparameter in this file (l, alpha2, ...) is drawn once per call but
+    independently per episode within it.
+
+    Returns (possibly-wrapped kernel, params) where params has
+    "sign_applied{suffix}" (0.0/1.0 float sentinel, same "0 means N/A"
+    convention dot_product's l=0 already uses), "sign_w{suffix}" (B, k) and
+    "sign_b{suffix}" (B,) -- zero-filled/no-op when not applied, so the
+    output schema always has these keys regardless of the coin flip.
+    """
+    if prob > 0.0 and random.random() < prob:
+        w, b = _sample_sign_modulation(k, B, device)
+        wrapped = SignModulatedKernel(kernel, w, b, active_dims=active_dims)
+        params = {
+            f"sign_applied{param_suffix}": torch.ones(B, device=device),
+            f"sign_w{param_suffix}": w,
+            f"sign_b{param_suffix}": b,
+        }
+        return wrapped, params
+    params = {
+        f"sign_applied{param_suffix}": torch.zeros(B, device=device),
+        f"sign_w{param_suffix}": torch.zeros(B, max(k, 1), device=device),
+        f"sign_b{param_suffix}": torch.zeros(B, device=device),
+    }
+    return kernel, params
+
+
 def _build_kernel_component(
-    cfg, name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None
+    cfg, name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None,
+    d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
     """Build one elementary (non-composite) kernel + its sampled hyperparameter
     dict — the unit _sample_episode_kernel calls once for a bare kernel or
     twice (component A, component B) for a composite.
+
+    Also the shared choke point for the PER-COMPONENT sign-modulation
+    injection point (cfg.data.sign_modulation_component_prob — see the
+    module docstring's "Sign modulation" section and SignModulatedKernel):
+    every branch below sits behind one `_maybe_wrap_sign_modulated` call
+    right before it returns, so bare kernels, both components of a static
+    "A+B"/"A*B" composite (called from _sample_episode_kernel), and every
+    link of a systematic chain (called from _build_kernel_chain) are all
+    covered with no extra plumbing at those call sites.
+
+    d_total: total feature-column count d (generate_gp_batch's `d`), used
+    ONLY to size the sign-modulation hyperplane for "dot_product" components,
+    which ignore `active_dims`/`k` for the base kernel itself (see the
+    active_dims paragraph below) but must still size `w` correctly — reusing
+    `k` there would draw a hyperplane over the wrong (smaller) subspace.
+    Defaults to `k` when omitted (every other kernel name uses `k` as-is).
 
     "dot_product" has no lengthscale, so it bypasses _kernel_prior_spec/
     _build_scaled_kernel entirely: a bare LinearKernel (no ScaleKernel
@@ -500,6 +691,8 @@ def _build_kernel_component(
     composition evaluates each side on the full-width input independently, so
     this doesn't require the other component to match active_dims.
     """
+    sign_prob = float(getattr(cfg.data, "sign_modulation_component_prob", 0.0))
+
     if name == "dot_product":
         kernel = gpytorch.kernels.LinearKernel(batch_shape=torch.Size([B])).to(device)
         a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
@@ -510,6 +703,14 @@ def _build_kernel_component(
             "l": torch.zeros(B, device=device),
             "alpha2": a_sample.reshape(B),
         }
+        # dot_product ignores active_dims/k for the base kernel itself (see
+        # this function's docstring) — its sign hyperplane must match, i.e.
+        # span every column (d_total, defaulting to k), not the caller's
+        # (possibly smaller) active_dims subset.
+        kernel, sign_params = _maybe_wrap_sign_modulated(
+            kernel, sign_prob, d_total if d_total is not None else k, B, device, active_dims=None
+        )
+        params.update(sign_params)
         return kernel, params
     if name == "polynomial":
         # power is a single Python int shared by every episode in this
@@ -542,13 +743,23 @@ def _build_kernel_component(
             "alpha2": a_sample.reshape(B),
             "power": torch.full((B,), float(power), device=device),
         }
+        scaled, sign_params = _maybe_wrap_sign_modulated(
+            scaled, sign_prob, k, B, device, active_dims=active_dims
+        )
+        params.update(sign_params)
         return scaled, params
     spec = _kernel_prior_spec(cfg, name)
-    return _build_scaled_kernel(name, spec, k, B, device, active_dims=active_dims)
+    scaled, params = _build_scaled_kernel(name, spec, k, B, device, active_dims=active_dims)
+    scaled, sign_params = _maybe_wrap_sign_modulated(
+        scaled, sign_prob, k, B, device, active_dims=active_dims
+    )
+    params.update(sign_params)
+    return scaled, params
 
 
 def _sample_episode_kernel(
-    cfg, kernel_name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None
+    cfg, kernel_name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None,
+    d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
     """Sample B episodes' hyperparameters for kernel_name (base or "A+B"/"A*B"
     composite, either component of which may be "dot_product" — see
@@ -556,22 +767,37 @@ def _sample_episode_kernel(
     batch_shape=[B], params dict).
 
     params keys match the output-dict schema (l, alpha2, period, rq_alpha,
-    power, l_b, alpha2_b, period_b, rq_alpha_b, power_b); not-applicable
-    entries (including "dot_product"'s "l"/"l_b") are filled with a 0.0
-    sentinel (the convention pit.py::gp_analytical_pit relies on).
+    power, l_b, alpha2_b, period_b, rq_alpha_b, power_b, sign_applied,
+    sign_w, sign_b, sign_applied_b, sign_w_b, sign_b_b, sign_applied_outer,
+    sign_w_outer, sign_b_outer); not-applicable entries (including
+    "dot_product"'s "l"/"l_b") are filled with a 0.0 sentinel (the
+    convention pit.py::gp_analytical_pit relies on).
 
     active_dims: column indices (out of the caller's full d_features input)
     this kernel is active on — None means every column. Forwarded to
     gpytorch's own active_dims kwarg (see _build_scaled_kernel), so callers
     pass the full-width input straight through instead of pre-slicing it.
+
+    Also the POST-COMPOSITION sign-modulation injection point
+    (cfg.data.sign_modulation_outer_prob — see the module docstring's "Sign
+    modulation" section): applied once more, independently of the
+    per-component gate inside _build_kernel_component, to the fully composed
+    kernel object (or the bare kernel, for a non-composite kernel_name).
     """
+    d_total = d_total if d_total is not None else k
     composite = _parse_composite(kernel_name)
     if composite is None:
-        kernel, params = _build_kernel_component(cfg, kernel_name, k, B, device, active_dims=active_dims)
+        kernel, params = _build_kernel_component(
+            cfg, kernel_name, k, B, device, active_dims=active_dims, d_total=d_total
+        )
     else:
         name_a, op, name_b = composite
-        kernel_a, params_a = _build_kernel_component(cfg, name_a, k, B, device, active_dims=active_dims)
-        kernel_b, params_b = _build_kernel_component(cfg, name_b, k, B, device, active_dims=active_dims)
+        kernel_a, params_a = _build_kernel_component(
+            cfg, name_a, k, B, device, active_dims=active_dims, d_total=d_total
+        )
+        kernel_b, params_b = _build_kernel_component(
+            cfg, name_b, k, B, device, active_dims=active_dims, d_total=d_total
+        )
         kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
         params = dict(params_a)
         for key, val in params_b.items():
@@ -580,11 +806,46 @@ def _sample_episode_kernel(
     for key in ("period", "rq_alpha", "power", "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b"):
         params.setdefault(key, torch.zeros(B, device=device))
 
+    outer_prob = float(getattr(cfg.data, "sign_modulation_outer_prob", 0.0))
+    kernel, outer_params = _maybe_wrap_sign_modulated(
+        kernel, outer_prob, k, B, device, active_dims=active_dims, param_suffix="_outer"
+    )
+    params.update(outer_params)
+
     return kernel, params
 
 
+def _wrap_concrete_sign_modulated(
+    kernel: gpytorch.kernels.Kernel, sign_w, sign_b, active_dims: Optional[List[int]]
+) -> gpytorch.kernels.Kernel:
+    """Wrap a non-batched, already-built concrete `kernel` in
+    SignModulatedKernel using CONCRETE (already-known) sign_w/sign_b values
+    — the _build_concrete_kernel-side counterpart of _maybe_wrap_sign_modulated
+    (which samples fresh w/b; this reconstructs from saved ones). No-op
+    (returns `kernel` unchanged) when sign_w/sign_b are None (the "not
+    applied" case — callers check the sign_applied* 0.0/1.0 sentinel before
+    calling this, same convention _optional_param callers use for period/
+    rq_alpha/power elsewhere in this file).
+
+    sign_w/sign_b are reshaped to a (1, k)/(1,) leading "batch" axis:
+    SignModulatedKernel is written batched (mirroring ScaleKernel), and
+    gpytorch kernels with batch_shape=[1] broadcast fine against the
+    non-batched (n, d) X1/X2 build_kernel_fn's callers pass in — consistent
+    with how every other concrete kernel built here has no explicit
+    batch_shape either.
+    """
+    if sign_w is None or sign_b is None:
+        return kernel
+    w_t = sign_w if torch.is_tensor(sign_w) else torch.as_tensor(sign_w, dtype=torch.get_default_dtype())
+    b_t = sign_b if torch.is_tensor(sign_b) else torch.as_tensor(sign_b, dtype=torch.get_default_dtype())
+    w_t = w_t.reshape(1, -1)
+    b_t = b_t.reshape(1)
+    return SignModulatedKernel(kernel, w_t, b_t, active_dims=active_dims)
+
+
 def _build_concrete_kernel(
-    name: str, l, alpha2, *, period=None, rq_alpha=None, power=None, active_dims: Optional[List[int]] = None
+    name: str, l, alpha2, *, period=None, rq_alpha=None, power=None, active_dims: Optional[List[int]] = None,
+    sign_w=None, sign_b=None,
 ) -> gpytorch.kernels.Kernel:
     """Construct a non-batched gpytorch Kernel with CONCRETE hyperparameter
     values assigned — reconstruction (given known values), not sampling.
@@ -607,11 +868,20 @@ def _build_concrete_kernel(
     active_dims: column indices this kernel reads out of the caller's
     full-width input (gpytorch's own kwarg — see _build_scaled_kernel);
     None means every column.
+
+    sign_w/sign_b: CONCRETE per-component sign-modulation hyperplane values
+    (see SignModulatedKernel / _maybe_wrap_sign_modulated), applied via
+    _wrap_concrete_sign_modulated right before returning. None (the default)
+    means "not applied" -- a no-op, matching the sign_applied 0.0 sentinel
+    convention build_kernel_fn's caller checks. Ignored (forced to
+    active_dims=None) for "dot_product", same override the sampling-time
+    _build_kernel_component uses -- the hyperplane must span every column,
+    matching how it was actually sampled.
     """
     if name == "dot_product":
         kernel = gpytorch.kernels.LinearKernel()
         kernel.variance = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(kernel.variance.shape)
-        return kernel
+        return _wrap_concrete_sign_modulated(kernel, sign_w, sign_b, active_dims=None)
 
     if name == "polynomial":
         power_int = int(round(float(power))) if power is not None else 2
@@ -623,7 +893,7 @@ def _build_concrete_kernel(
         base.offset = offset_t.reshape(base.offset.shape)
         scale = gpytorch.kernels.ScaleKernel(base)
         scale.outputscale = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(scale.outputscale.shape)
-        return scale
+        return _wrap_concrete_sign_modulated(scale, sign_w, sign_b, active_dims=active_dims)
 
     l_t = l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.get_default_dtype())
     # l having more than one element means this episode was generated ARD
@@ -645,7 +915,7 @@ def _build_concrete_kernel(
 
     scale = gpytorch.kernels.ScaleKernel(base)
     scale.outputscale = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(scale.outputscale.shape)
-    return scale
+    return _wrap_concrete_sign_modulated(scale, sign_w, sign_b, active_dims=active_dims)
 
 
 def build_kernel_fn(
@@ -662,6 +932,12 @@ def build_kernel_fn(
     rq_alpha_b: Optional[float] = None,
     power_b: Optional[float | int] = None,
     active_dims: Optional[List[int]] = None,
+    sign_w=None,
+    sign_b=None,
+    sign_w_b=None,
+    sign_b_b=None,
+    sign_w_outer=None,
+    sign_b_outer=None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
     """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
 
@@ -678,21 +954,40 @@ def build_kernel_fn(
     caller passes its full-width X1/X2 straight through; gpytorch's own
     active_dims kwarg selects the columns internally. None means every
     column (e.g. "dot_product" tasks that draw on all d_features).
+
+    sign_w/sign_b (component A) and sign_w_b/sign_b_b (component B, composite
+    only) are the PER-COMPONENT sign-modulation hyperplanes (see
+    SignModulatedKernel / cfg.data.sign_modulation_component_prob); None
+    (the default) means "not applied" for that component -- callers should
+    pass None (not the saved 0.0-filled tensor) whenever that episode's
+    sign_applied[_b] sentinel is 0.0, same pattern _optional_param already
+    uses for period/rq_alpha/power/l_b (see pit.py::gp_analytical_pit).
+    sign_w_outer/sign_b_outer is the POST-COMPOSITION hyperplane (cfg.data.
+    sign_modulation_outer_prob), applied LAST -- after A/B are built and
+    combined -- wrapping the whole (possibly composite) kernel, mirroring
+    the order _sample_episode_kernel/_build_kernel_chain apply it at
+    generation time (per-component first, then once more on the composed
+    result).
     """
     composite = _parse_composite(kernel_name)
     if composite is None:
         kernel = _build_concrete_kernel(
-            kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims
+            kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims,
+            sign_w=sign_w, sign_b=sign_b,
         )
     else:
         name_a, op, name_b = composite
         kernel_a = _build_concrete_kernel(
-            name_a, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims
+            name_a, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims,
+            sign_w=sign_w, sign_b=sign_b,
         )
         kernel_b = _build_concrete_kernel(
-            name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, power=power_b, active_dims=active_dims
+            name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, power=power_b, active_dims=active_dims,
+            sign_w=sign_w_b, sign_b=sign_b_b,
         )
         kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
+
+    kernel = _wrap_concrete_sign_modulated(kernel, sign_w_outer, sign_b_outer, active_dims=active_dims)
 
     # kernel's parameters are CPU-resident regardless of the device l/alpha2
     # were on (see _build_scaled_kernel's docstring note) — move lazily to
@@ -963,24 +1258,46 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
 
 
 def _build_kernel_chain(
-    cfg, names: List[str], ops: List[str], k: int, B: int, device, active_dims: Optional[List[int]] = None
-) -> tuple[gpytorch.kernels.Kernel, List[Dict[str, Tensor]]]:
+    cfg, names: List[str], ops: List[str], k: int, B: int, device, active_dims: Optional[List[int]] = None,
+    d_total: Optional[int] = None,
+) -> tuple[gpytorch.kernels.Kernel, List[Dict[str, Tensor]], Dict[str, Tensor]]:
     """Sample B episodes' hyperparameters for each component in `names` (via
     the same _build_kernel_component machinery _sample_episode_kernel's
     composite branch already uses — no new hyperparameter-sampling logic,
     and "dot_product" components dispatch to the bare-LinearKernel path
     just like the static composite path does) and combine the resulting
-    kernel objects left-to-right per `ops`. Returns the combined Kernel plus
-    one params dict per component (in `names` order), UNFLATTENED — not
-    coerced into the legacy l_b/alpha2_b-style schema, since component count
-    is variable here (see generate_gp_batch's return_kernel_metadata
-    handling)."""
-    built = [_build_kernel_component(cfg, name, k, B, device, active_dims=active_dims) for name in names]
+    kernel objects left-to-right per `ops`. Returns (combined Kernel,
+    per-component params list, outer sign-modulation params dict).
+
+    component_params is one dict per component (in `names` order),
+    UNFLATTENED — not coerced into the legacy l_b/alpha2_b-style schema,
+    since component count is variable here (see generate_gp_batch's
+    return_kernel_metadata handling). Each component dict already carries
+    its own sign_applied/sign_w/sign_b (per-component injection point, via
+    _build_kernel_component — cfg.data.sign_modulation_component_prob,
+    independently gated per link in the chain).
+
+    The returned outer_params dict (sign_applied_outer/sign_w_outer/
+    sign_b_outer) is the POST-FOLD injection point (cfg.data.
+    sign_modulation_outer_prob) applied once to the fully-combined chain
+    kernel, mirroring _sample_episode_kernel's own post-composition wrap —
+    kept separate from component_params (rather than a synthetic extra
+    "component") since it isn't a component, it wraps the whole chain."""
+    built = [
+        _build_kernel_component(cfg, name, k, B, device, active_dims=active_dims, d_total=d_total)
+        for name in names
+    ]
     kernel = built[0][0]
     for op, (comp_kernel, _) in zip(ops, built[1:]):
         kernel = kernel + comp_kernel if op == "+" else kernel * comp_kernel
     component_params = [params for _, params in built]
-    return kernel, component_params
+
+    outer_prob = float(getattr(cfg.data, "sign_modulation_outer_prob", 0.0))
+    kernel, outer_params = _maybe_wrap_sign_modulated(
+        kernel, outer_prob, k, B, device, active_dims=active_dims, param_suffix="_outer"
+    )
+
+    return kernel, component_params, outer_params
 
 
 # ---------------------------------------------------------------------------
@@ -1108,12 +1425,16 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 # ---------------------------------------------------------------------------
 
 
-def _batched_cholesky(K: Tensor) -> Tensor:
-    """Batched Cholesky (B, N, N) → (B, N, N) with automatic jitter for failures."""
+def _batched_cholesky(K: Tensor) -> tuple[Tensor, Tensor]:
+    """Batched Cholesky (B, N, N) → (L, failed): L is (B, N, N) with automatic
+    jitter for failures; failed (B,) bool marks episodes where even the
+    maximum jitter (0.1) couldn't recover a PSD matrix — L is an identity
+    placeholder for those, and the caller (generate_gp_batch) is expected to
+    drop them rather than save a degenerate episode."""
     L, info = torch.linalg.cholesky_ex(K)
     failed = info.ne(0)
     if not failed.any():
-        return L
+        return L, failed
     eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
     for jitter in (1e-5, 1e-4, 1e-3, 1e-2, 0.1):
         if not failed.any():
@@ -1124,9 +1445,66 @@ def _batched_cholesky(K: Tensor) -> Tensor:
         L[failed] = L_new[failed]
         failed = info_new.ne(0)
     if failed.any():
-        # Last resort: replace with identity so the episode is invalid but non-crashing.
+        # Last resort: replace with identity so this call doesn't crash.
+        # Logged (not silent) so a run-wide rate can be monitored — this
+        # means K_ff/LOO PIT (z_train) is degenerate for these episodes even
+        # after the maximum jitter escalation above. The caller discards
+        # these episodes entirely (see generate_gp_batch) rather than saving
+        # this identity placeholder.
+        warnings.warn(
+            f"_batched_cholesky: {int(failed.sum())}/{K.shape[0]} episodes fell back "
+            f"to an identity K_ff Cholesky factor (unrecoverable even at jitter=0.1) "
+            f"and will be discarded.",
+            RuntimeWarning,
+        )
         L[failed] = eye.unsqueeze(0).expand_as(L[failed])
-    return L
+    return L, failed
+
+
+def _psd_safe_batch(K: Tensor, max_tries: int = 6) -> tuple[Tensor, Tensor]:
+    """Batched (B, N, N) -> (L, failed) Cholesky factor via gpytorch's own
+    psd_safe_cholesky, instead of a hand-rolled retry loop (see
+    _batched_cholesky above, kept as-is for K_ff/LOO PIT — this is the
+    equivalent tool for K_all, used to GUARANTEE Sigma_star/R_star are PSD
+    rather than just symmetric, see generate_gp_batch's joint-sample block).
+    failed (B,) bool marks episodes where even the maximum jitter couldn't
+    recover a PSD matrix; the caller is expected to drop them.
+
+    psd_safe_cholesky adds escalating diagonal jitter (starting at
+    gpytorch.settings.cholesky_jitter, x10 per retry — the exact same
+    mechanism gpytorch itself falls back to internally, e.g. the "added
+    jitter... Using symeig method" warning this pipeline already emits for
+    marginal episodes) ONLY to the batch elements that actually fail a
+    Cholesky attempt, leaving every well-conditioned episode's matrix
+    untouched. max_tries=6 reaches a jitter ceiling of ~1e-6*10^5=0.1,
+    matching _batched_cholesky's own escalation ceiling above.
+
+    psd_safe_cholesky raises (rather than returning a partial result) if
+    ANY batch element is still not PSD after max_tries — so on that
+    exception we re-derive exactly which elements are still bad at the same
+    maximum jitter (rather than discarding the whole batch's progress) and
+    fall back to identity (same "mark the episode invalid, don't crash
+    generation" convention _batched_cholesky uses) for only those, in the
+    astronomically unlikely case max_tries isn't enough. Logged (not
+    silent) so a run-wide rate can be monitored.
+    """
+    try:
+        L = psd_safe_cholesky(K, max_tries=max_tries)
+        return L, torch.zeros(K.shape[0], dtype=torch.bool, device=K.device)
+    except NotPSDError:
+        jitter0 = gpytorch.settings.cholesky_jitter.value(K.dtype)
+        max_jitter = jitter0 * (10 ** (max_tries - 1))
+        eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
+        L, info = torch.linalg.cholesky_ex(K + max_jitter * eye)
+        failed = info.ne(0)
+        warnings.warn(
+            f"_psd_safe_batch: {int(failed.sum())}/{K.shape[0]} episodes fell back "
+            f"to an identity K_all (unrecoverable even at jitter={max_jitter:.1e}) "
+            f"and will be discarded.",
+            RuntimeWarning,
+        )
+        L[failed] = eye.unsqueeze(0).expand_as(L[failed])
+        return L, failed
 
 
 def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
@@ -1316,10 +1694,23 @@ def apply_mlp_feature_mixing(
 
 
 @torch.no_grad()
-def generate_gp_batch(
+def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
 ) -> List[Dict[str, Tensor]]:
-    """Generate B GP episodes in a single vectorised call.
+    """Generate up to B GP episodes in a single vectorised call — the
+    "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
+    episodes, since any episode whose K_all/K_ff Cholesky repair bottomed
+    out at an identity placeholder (see _psd_safe_batch/_batched_cholesky's
+    `discard` above) is dropped before returning, rather than saved as a
+    degenerate placeholder. Call generate_gp_batch instead of this function
+    directly unless you specifically want the possibly-short, unpadded
+    result.
+
+    All B episodes share one kernel type, one (P, N) size, and one set of
+    active_dims/k (all sampled once per call) but have independent
+    hyperparameters and feature draws — gpytorch's `batch_shape=[B]` kernels
+    draw B independent hyperparameter sets in one call (see
+    _sample_episode_kernel), and a batch_shape=[B] GaussianLikelihood
 
     All B episodes share one kernel type, one (P, N) size, and one set of
     active_dims/k (all sampled once per call) but have independent
@@ -1415,14 +1806,17 @@ def generate_gp_batch(
 
     # --- Per-episode hyperparameters + noise (B independent draws in one call) ---
     if systematic:
-        kernel_obj, component_params = _build_kernel_chain(
-            cfg, chain_names, chain_ops, k, B, device, active_dims=kernel_cols
+        kernel_obj, component_params, outer_sign_params = _build_kernel_chain(
+            cfg, chain_names, chain_ops, k, B, device, active_dims=kernel_cols, d_total=d
         )
         # Legacy zero-sentinel schema (see _sample_episode_kernel's docstring)
         # is kept populated so the rest of this function — nugget sampling,
         # GP prior/posterior machinery, metadata packing loop below — is
         # untouched regardless of mode; the real per-component values live in
         # component_params instead (see the return_kernel_metadata block).
+        # The post-fold (outer) sign-modulation params DO belong in this flat
+        # schema, same as the non-systematic branch below — they wrap the
+        # whole chain, not any one component.
         params = {
             key: torch.zeros(B, device=device)
             for key in (
@@ -1430,8 +1824,11 @@ def generate_gp_batch(
                 "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b",
             )
         }
+        params.update(outer_sign_params)
     else:
-        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols)
+        kernel_obj, params = _sample_episode_kernel(
+            cfg, kernel_name, k, B, device, active_dims=kernel_cols, d_total=d
+        )
     likelihood = _build_likelihood(cfg, kernel_name, B, device)
     nugget = likelihood.noise.reshape(B)  # "nugget" name kept for the saved-metadata schema
 
@@ -1446,18 +1843,40 @@ def generate_gp_batch(
 
     # --- Joint prior sample + noisy covariance (B, T, T), via gpytorch's own
     # GaussianLikelihood(MultivariateNormal) — replaces the old manual
-    # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly and
-    # `_batched_cholesky(K_all) @ randn` sampling. max_cholesky_size is
-    # forced high (see module docstring / _MAX_CHOLESKY) so this is an exact
-    # Cholesky-based sample, not gpytorch's approximate CG/Lanczos fallback.
+    # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly.
+    # max_cholesky_size is forced high (see module docstring / _MAX_CHOLESKY)
+    # so the covariance_matrix materialization below is exact, not gpytorch's
+    # approximate CG/Lanczos fallback.
     with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
         prior_dist = gpytorch.distributions.MultivariateNormal(
             torch.zeros(B, T, device=device), kernel_obj(x_norm)
         )
         noisy_dist = likelihood(prior_dist)
-        y_all = noisy_dist.rsample()                 # (B, T)
-        K_all = noisy_dist.covariance_matrix          # (B, T, T), nugget already on diagonal
-    K_all = 0.5 * (K_all + K_all.permute(0, 2, 1))    # symmetrize float32 drift
+        K_all_raw = noisy_dist.covariance_matrix      # (B, T, T), nugget already on diagonal
+
+    # No explicit symmetrization needed here: torch.linalg.cholesky_ex (used
+    # by psd_safe_cholesky below) only ever reads the lower triangle of its
+    # input and ignores the upper triangle entirely (verified — corrupting
+    # the upper triangle changes nothing about the result), and the K_all we
+    # actually use downstream is reconstructed as L_all @ L_all.mT, which is
+    # exactly symmetric by construction regardless of what K_all_raw's upper
+    # triangle looked like. K_all_raw is NOT guaranteed PSD though: gpytorch's
+    # own float32 kernel evaluation accumulates enough rounding error across
+    # a long composite/systematic chain (worse once SignModulatedKernel's
+    # elementwise +-1 factor is in the mix) to occasionally leave a slightly
+    # negative eigenvalue. psd_safe_cholesky is gpytorch/linear_operator's
+    # own canonical PSD-repair tool — the same escalating-jitter mechanism
+    # gpytorch falls back to internally (see the "added jitter... Using
+    # symeig method" warning this pipeline already emits for marginal
+    # episodes), applied here explicitly, ONCE, so that y_all (the actual
+    # sample) and K_all/K_ss/K_ff/R_star (the reported covariance/oracle)
+    # are both derived from the exact same, provably-PSD matrix rather than
+    # two independently-reconstructed quantities that could disagree at the
+    # float32 rounding level. Replaces the old `noisy_dist.rsample()`, which
+    # offered no such guarantee for the *reported* K_all.
+    L_all, failed_all = _psd_safe_batch(K_all_raw)
+    K_all = L_all @ L_all.mT                          # (B, T, T), PSD by construction
+    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero prior mean
 
     x_norm_train = x_norm[:, :P]   # (B, P, d)
     x_norm_test  = x_norm[:, P:]   # (B, N, d)
@@ -1473,14 +1892,29 @@ def generate_gp_batch(
     # No clean gpytorch public API exposes diag(K_ff^-1) for an ExactGP, so
     # this stays hand-rolled (_batched_cholesky), just sourced from the
     # gpytorch-native K_all above instead of a separately hand-added nugget.
-    L_ff  = _batched_cholesky(K_ff)
+    L_ff, failed_ff = _batched_cholesky(K_ff)
     alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)          # (B, P)
+
+    # Episodes where either Cholesky repair above bottomed out at an
+    # identity placeholder are not valid GP episodes (K_all/K_ff no longer
+    # reflect the sampled kernel at all) — dropped entirely at the end of
+    # this function (see the "Discard degenerate episodes" block below)
+    # rather than saved with a degenerate placeholder. generate_gp_batch
+    # (the public wrapper) tops up the shortfall so callers still get
+    # exactly B valid episodes.
+    discard = failed_all | failed_ff
 
     oracle_mode = getattr(cfg.data, "oracle_mode", "posterior")
     if oracle_mode == "prior":
         # Prior oracle: ignore training conditioning — R_star reflects the raw
         # kernel structure among test points; mu_star is the GP prior mean (0).
         # No conditioning needed, so this branch never touches _GeneratorGP.
+        # Sigma_star = K_ss is already guaranteed PSD here: K_ss is a
+        # principal submatrix of K_all, which is constructed above as
+        # L_all @ L_all.mT (PSD by construction, via psd_safe_cholesky) —
+        # not a slice of an unprotected raw materialization. A principal
+        # submatrix of a PSD matrix is itself PSD, so no further repair is
+        # needed at this point.
         mu_star    = torch.zeros(B, N, device=device)
         Sigma_star = K_ss
     elif oracle_mode == "posterior":
@@ -1593,10 +2027,24 @@ def generate_gp_batch(
         # Per-episode (sliceable via val[b]) hyperparameters/factors, plus
         # the batch-shared kernel name and active_dims — the schema
         # generate_gp_task / pit.py::gp_analytical_pit / diag_kernels.py need.
-        for key in (
+        # sign_applied_outer/sign_w_outer/sign_b_outer (post-composition sign
+        # modulation — see _sample_episode_kernel/_build_kernel_chain) are
+        # always present in `params` (zero-filled when not applied), same
+        # 0.0-sentinel convention as period/rq_alpha/power above. The
+        # per-component sign_applied/sign_w/sign_b (bare or non-systematic
+        # composite kernel_name) are likewise always in `params` for the
+        # non-systematic path -- systematic chains instead carry their
+        # per-component sign fields inside kernel_component_params below.
+        flat_keys = [
             "l", "alpha2", "period", "rq_alpha", "power",
             "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b",
-        ):
+            "sign_applied_outer", "sign_w_outer", "sign_b_outer",
+        ]
+        if not systematic:
+            flat_keys += ["sign_applied", "sign_w", "sign_b"]
+            if _parse_composite(kernel_name) is not None:
+                flat_keys += ["sign_applied_b", "sign_w_b", "sign_b_b"]
+        for key in flat_keys:
             tensors[key] = params[key].cpu()
         tensors["nugget"] = nugget.cpu()
         tensors["mlp_mixed"] = mlp_mixed.cpu()
@@ -1607,9 +2055,27 @@ def generate_gp_batch(
             kernel_cols if kernel_cols is not None else list(range(d)), dtype=torch.long
         )
 
+    # --- Discard degenerate episodes (see `discard` above) rather than
+    # saving an identity-placeholder K_all/K_ff/R_star. n_train/n_test/
+    # kernel/kernel_feature_indices in `extra` are batch-shared (same P, N,
+    # kernel_name, active_dims for every episode in this call — see the top
+    # of this function), so they need no filtering; only the per-episode
+    # `tensors` (and, for systematic chains, `component_params`) do.
+    keep = ~discard
+    B_kept = int(keep.sum())
+    # tensors dict mixes CPU (most fields, .cpu()'d above) and device-resident
+    # (_L_ff/_alpha, kept on `device` for reuse elsewhere) tensors, so index
+    # each with a copy of `keep`/`discard`'s boolean mask moved to its own
+    # device rather than a single fixed-device index tensor.
+    tensors = {key: val[keep.to(val.device)] for key, val in tensors.items()}
+    if return_kernel_metadata and systematic:
+        component_params = [
+            {pk: pv[keep.to(pv.device)] for pk, pv in comp.items()} for comp in component_params
+        ]
+
     episodes = [
         {key: val[b] for key, val in tensors.items()} | extra
-        for b in range(B)
+        for b in range(B_kept)
     ]
 
     if return_kernel_metadata and systematic:
@@ -1622,7 +2088,7 @@ def generate_gp_batch(
         # ARD-vector-vs-scalar "l" shapes across components don't need
         # padding. Not reconstructible via build_kernel_fn — see module
         # docstring's "Systematic composition" section.
-        for b in range(B):
+        for b in range(B_kept):
             episodes[b]["kernel_components"] = chain_names
             episodes[b]["kernel_ops"] = chain_ops
             episodes[b]["kernel_component_params"] = [
@@ -1630,3 +2096,45 @@ def generate_gp_batch(
             ]
 
     return episodes
+
+
+def generate_gp_batch(
+    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
+) -> List[Dict[str, Tensor]]:
+    """Generate exactly B GP episodes, discarding and regenerating any that
+    turn out degenerate (see _generate_gp_batch_raw's `discard` — an
+    unrecoverable K_all/K_ff Cholesky, i.e. even psd_safe_cholesky/
+    _batched_cholesky's escalating jitter bottomed out at an identity
+    placeholder) instead of saving a placeholder episode.
+
+    Every caller (generate_pit_dataset.py, train.py, tests, ...) relies on
+    getting exactly B episodes back: dataset.py's CopulaDataset._get_sharded
+    indexes shards with a fixed stride (idx // shard_size), so a shard
+    silently written with fewer than shard_size episodes would corrupt
+    indexing for every shard after it. This wrapper preserves that
+    invariant by topping up the shortfall with fresh top-up calls (which
+    resample their own kernel/P/N/active_dims independently, same as any
+    other call) until exactly B valid episodes are assembled.
+
+    In practice this loop almost never repeats more than once: the discard
+    rate is astronomically rare (an episode has to defeat escalating jitter
+    up to ~0.1 — see _psd_safe_batch/_batched_cholesky). max_rounds bounds
+    the retries so a pathological config (e.g. one that's non-PSD by
+    construction regardless of jitter) fails loudly instead of hanging.
+    """
+    episodes = _generate_gp_batch_raw(cfg, B, device, return_kernel_metadata=return_kernel_metadata)
+    max_rounds = 20
+    for _ in range(max_rounds):
+        if len(episodes) >= B:
+            break
+        shortfall = B - len(episodes)
+        episodes += _generate_gp_batch_raw(
+            cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata
+        )
+    if len(episodes) < B:
+        raise RuntimeError(
+            f"generate_gp_batch: could not assemble {B} valid episodes after "
+            f"{max_rounds} top-up rounds ({len(episodes)} obtained) — the kernel/config "
+            f"combination in this call appears to be persistently non-PSD."
+        )
+    return episodes[:B]

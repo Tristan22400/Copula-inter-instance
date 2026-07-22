@@ -238,6 +238,24 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
     power_b    = task["power_b"].item() if task["power_b"].item() != 0.0 else None
 
+    # Sign-modulation hyperplanes (see data_gen.SignModulatedKernel /
+    # cfg.data.sign_modulation_component_prob / sign_modulation_outer_prob):
+    # gated on the explicit sign_applied*/1.0 sentinel rather than
+    # _optional_param's "all entries are 0.0" check, since sign_w is a
+    # random N(0, I_k) draw that isn't guaranteed nonzero even when applied
+    # (unlike l/period/etc., whose priors never actually produce exactly 0).
+    # Absent entirely for episodes saved before this feature existed (older
+    # datasets on disk) -- task.get(..., 0.0) defaults to "not applied".
+    def _sign_pair(applied_key: str, w_key: str, b_key: str):
+        applied = task.get(applied_key)
+        if applied is None or applied.item() == 0.0:
+            return None, None
+        return task[w_key], task[b_key]
+
+    sign_w, sign_b = _sign_pair("sign_applied", "sign_w", "sign_b")
+    sign_w_b, sign_b_b = _sign_pair("sign_applied_b", "sign_w_b", "sign_b_b")
+    sign_w_outer, sign_b_outer = _sign_pair("sign_applied_outer", "sign_w_outer", "sign_b_outer")
+
     # active_dims (gpytorch's own kernel kwarg) lets kernel_fn take the
     # full-width x_norm_train straight through and select its k active
     # columns internally — same mechanism data_gen.generate_gp_task uses,
@@ -247,6 +265,8 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
         l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
         active_dims=cols,
+        sign_w=sign_w, sign_b=sign_b, sign_w_b=sign_w_b, sign_b_b=sign_b_b,
+        sign_w_outer=sign_w_outer, sign_b_outer=sign_b_outer,
     )
     x_k_train = task["x_norm_train"]   # (P, d_features)
     y_train    = task["y_train"]                  # (P,)
