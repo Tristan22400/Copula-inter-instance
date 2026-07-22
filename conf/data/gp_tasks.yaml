@@ -121,10 +121,10 @@ oracle_mode: prior
 # Use a single fixed kernel:
 #   kernel: rbf
 # Or sample uniformly from a list each task:
-#   kernels: [rbf, matern12, matern32, matern52, cosine, periodic, rational_quadratic, dot_product]
+#   kernels: [rbf, matern12, matern32, matern52, cosine, periodic, rational_quadratic, dot_product, polynomial]
 #
-# Available kernels: rbf, matern12, matern32, matern52, cosine, periodic, rational_quadratic, dot_product
-# (plus 56 "A+B"/"A*B" composites of all 8 of those — see data_gen.COMPOSITE_KERNELS / data_gen._COMPOSABLE_KERNELS)
+# Available kernels: rbf, matern12, matern32, matern52, cosine, periodic, rational_quadratic, dot_product, polynomial
+# (plus "A+B"/"A*B" composites of all 9 of those — see data_gen.COMPOSITE_KERNELS / data_gen._COMPOSABLE_KERNELS)
 kernel: rbf
 
 # Systematic composition (CauKer-style, github.com/ShifengXIE/CauKer): if
@@ -140,18 +140,25 @@ systematic_composition: true
 composite_num_kernels_min: 1
 composite_num_kernels_max: 8
 # Optional: drop elementary kernels from the systematic_composition sampling
-# pool (data_gen._COMPOSABLE_KERNELS) without affecting the static 56-entry
+# pool (data_gen._COMPOSABLE_KERNELS) without affecting the static
 # COMPOSITE_KERNELS pool used by the non-systematic path. e.g. [periodic] to
 # exclude periodic chains entirely. Empty = sample from all of
 # data_gen._COMPOSABLE_KERNELS (rbf, matern12, matern32, matern52, cosine,
-# periodic, rational_quadratic, dot_product).
-composite_exclude_kernels: [periodic, cosine, dot_product]
+# periodic, rational_quadratic, dot_product, polynomial).
+# "polynomial" is excluded here for now (like periodic/cosine/dot_product):
+# new addition, not yet validated against tests/test_dataset_corr_uniform.py
+# in long chains — remove it from this list once validated.
+composite_exclude_kernels: [periodic, cosine, dot_product, polynomial]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
 period_lognormal_scale: 0.4
 rq_alpha_gamma_concentration: 2.0    # rational_quadratic kernel's `rq_alpha`
 rq_alpha_gamma_rate: 1.0
+poly_power_min: 2     # polynomial kernel's integer degree d, sampled once per
+poly_power_max: 4     # generate_gp_batch call (shared by the whole batch — see data_gen.py)
+poly_offset_gamma_concentration: 2.0    # polynomial kernel's offset c
+poly_offset_gamma_rate: 1.0
 
 # PIT epsilon for probit clamping (analytical pipeline)
 pit_eps: 1.0e-6

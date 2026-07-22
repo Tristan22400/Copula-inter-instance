@@ -382,6 +382,80 @@ def test_isotropic_ratio_partial_mixes_isotropic_and_ard_episodes(small_cfg):
 
 
 # ---------------------------------------------------------------------------
+# Polynomial kernel tests
+# ---------------------------------------------------------------------------
+# "polynomial" is exercised generically by test_kernel_goldilocks_and_psd and
+# test_mlp_mixing_goldilocks_and_psd (both ALL_KERNELS-parametrized), same as
+# every other registered kernel. These tests cover what's actually novel about
+# it: `power` is sampled once per generate_gp_batch call and shared by every
+# episode (unlike l/alpha2/period/rq_alpha, which are per-episode), and it
+# must still round-trip correctly through the l/alpha2/period/rq_alpha/power
+# save-and-reconstruct schema build_kernel_fn/pit.gp_analytical_pit rely on.
+
+
+def test_polynomial_power_shared_across_batch(small_cfg):
+    """power (the integer degree) is drawn ONCE per generate_gp_batch call
+    (gpytorch.kernels.PolynomialKernel forbids more than one distinct power
+    value per kernel instance), so every episode in one batch call must
+    report the same power, within [poly_power_min, poly_power_max]."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "polynomial"
+    cfg.data.poly_power_min = 2
+    cfg.data.poly_power_max = 5
+
+    torch.manual_seed(0)
+    episodes = generate_gp_batch(cfg, B=16, device="cpu", return_kernel_metadata=True)
+    powers = {task["power"].item() for task in episodes}
+    assert len(powers) == 1, f"expected one shared power across the batch, got {powers}"
+    power = powers.pop()
+    assert 2 <= power <= 5, f"power {power} outside configured [poly_power_min, poly_power_max]"
+
+
+def test_polynomial_power_varies_across_batches(small_cfg):
+    """Different generate_gp_batch calls (different global RNG state) may
+    draw different powers — the sharing in
+    test_polynomial_power_shared_across_batch is per-call, not a global
+    constant."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "polynomial"
+    cfg.data.poly_power_min = 2
+    cfg.data.poly_power_max = 8
+
+    torch.manual_seed(0)
+    random.seed(0)
+    seen_powers = set()
+    for _ in range(20):
+        episodes = generate_gp_batch(cfg, B=1, device="cpu", return_kernel_metadata=True)
+        seen_powers.add(episodes[0]["power"].item())
+    assert len(seen_powers) > 1, f"power never varied across 20 batches: {seen_powers}"
+
+
+@pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
+def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name):
+    """The saved l (offset)/alpha2/power schema must round-trip through
+    build_kernel_fn (via pit.gp_analytical_pit) to the same z_train/z_test
+    the real batched kernel produced at generation time — same pattern as
+    test_ard_samples_per_dimension_lengthscale, but for polynomial's offset
+    and (batch-shared) power instead of an ARD lengthscale vector."""
+    from pit import gp_analytical_pit
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_max = 0.5
+
+    torch.manual_seed(abs(hash("poly_recon_" + kernel_name)) % (2**31))
+    task = generate_gp_task(cfg)
+
+    cached = gp_analytical_pit(task)
+    reconstructed_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}
+    reconstructed = gp_analytical_pit(reconstructed_task)
+    assert torch.allclose(cached["z_train"], reconstructed["z_train"], atol=1e-3)
+    assert torch.allclose(cached["z_test"], reconstructed["z_test"], atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
 # MLP feature mixing tests
 # ---------------------------------------------------------------------------
 

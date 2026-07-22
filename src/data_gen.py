@@ -34,6 +34,25 @@ Supported kernels
                          outer ScaleKernel (that would just be a second,
                          redundant alpha2). No lengthscale — geometry is
                          determined entirely by the feature space.
+  polynomial          — Polynomial: k(x1,x2) = alpha2 * (x1ᵀx2 + c)^d, via
+                         gpytorch.kernels.PolynomialKernel wrapped in
+                         ScaleKernel. c (the offset) ~
+                         Gamma(poly_offset_gamma_concentration,
+                         poly_offset_gamma_rate) and is stored in the "l"
+                         schema slot — the same reuse convention cosine's
+                         period_length already relies on (see
+                         _kernel_prior_spec), since polynomial has no
+                         lengthscale either. d (the integer power/degree) ~
+                         Uniform{poly_power_min, ..., poly_power_max}
+                         (default 2..4), sampled ONCE per generate_gp_batch
+                         call — same granularity as kernel_name/P/N/
+                         active_dims below, NOT per-episode like l/alpha2:
+                         gpytorch.kernels.PolynomialKernel raises if given
+                         more than one distinct power value, so every
+                         episode in one batch call shares the same degree.
+                         Saved/reconstructed via the new "power"/"power_b"
+                         schema keys (same 0.0-sentinel convention as
+                         period/rq_alpha — see build_kernel_fn).
 
 ARD (cfg.data.ard)
 -------------------
@@ -473,6 +492,38 @@ def _build_kernel_component(
             "alpha2": a_sample.reshape(B),
         }
         return kernel, params
+    if name == "polynomial":
+        # power is a single Python int shared by every episode in this
+        # batch/task call (gpytorch.kernels.PolynomialKernel raises if given
+        # more than one distinct value) — sampled at the same granularity as
+        # kernel_name/P/N/active_dims in generate_gp_batch, not per-episode
+        # like l/alpha2 below. See the module docstring's "polynomial" entry.
+        power_min = int(getattr(cfg.data, "poly_power_min", 2))
+        power_max = int(getattr(cfg.data, "poly_power_max", 4))
+        power = random.randint(power_min, power_max)
+        kernel_kwargs: Dict = {"power": power, "batch_shape": torch.Size([B])}
+        if active_dims is not None:
+            kernel_kwargs["active_dims"] = active_dims
+        base = gpytorch.kernels.PolynomialKernel(**kernel_kwargs).to(device)
+        o_conc = float(getattr(cfg.data, "poly_offset_gamma_concentration", 2.0))
+        o_rate = float(getattr(cfg.data, "poly_offset_gamma_rate", 1.0))
+        o_sample = GammaPrior(o_conc, o_rate).sample(base.offset.shape).to(device)
+        base.offset = o_sample
+
+        scaled = gpytorch.kernels.ScaleKernel(base, batch_shape=torch.Size([B])).to(device)
+        a_conc = float(getattr(cfg.data, "alpha2_gamma_concentration", 4.0))
+        a_rate = float(getattr(cfg.data, "alpha2_gamma_rate", 3.0))
+        a_sample = GammaPrior(a_conc, a_rate).sample(scaled.outputscale.shape).to(device)
+        scaled.outputscale = a_sample
+
+        params = {
+            # Offset reuses the "l" schema slot (cosine's period_length
+            # already does the same — see _kernel_prior_spec).
+            "l": o_sample.reshape(B),
+            "alpha2": a_sample.reshape(B),
+            "power": torch.full((B,), float(power), device=device),
+        }
+        return scaled, params
     spec = _kernel_prior_spec(cfg, name)
     return _build_scaled_kernel(name, spec, k, B, device, active_dims=active_dims)
 
@@ -486,9 +537,9 @@ def _sample_episode_kernel(
     batch_shape=[B], params dict).
 
     params keys match the output-dict schema (l, alpha2, period, rq_alpha,
-    l_b, alpha2_b, period_b, rq_alpha_b); not-applicable entries (including
-    "dot_product"'s "l"/"l_b") are filled with a 0.0 sentinel (the convention
-    pit.py::gp_analytical_pit relies on).
+    power, l_b, alpha2_b, period_b, rq_alpha_b, power_b); not-applicable
+    entries (including "dot_product"'s "l"/"l_b") are filled with a 0.0
+    sentinel (the convention pit.py::gp_analytical_pit relies on).
 
     active_dims: column indices (out of the caller's full d_features input)
     this kernel is active on — None means every column. Forwarded to
@@ -507,14 +558,14 @@ def _sample_episode_kernel(
         for key, val in params_b.items():
             params[f"{key}_b"] = val
 
-    for key in ("period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b"):
+    for key in ("period", "rq_alpha", "power", "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b"):
         params.setdefault(key, torch.zeros(B, device=device))
 
     return kernel, params
 
 
 def _build_concrete_kernel(
-    name: str, l, alpha2, *, period=None, rq_alpha=None, active_dims: Optional[List[int]] = None
+    name: str, l, alpha2, *, period=None, rq_alpha=None, power=None, active_dims: Optional[List[int]] = None
 ) -> gpytorch.kernels.Kernel:
     """Construct a non-batched gpytorch Kernel with CONCRETE hyperparameter
     values assigned — reconstruction (given known values), not sampling.
@@ -529,6 +580,11 @@ def _build_concrete_kernel(
     matching how it was actually sampled, including as a composite
     component).
 
+    "polynomial" reads its offset out of "l" (same reuse convention cosine's
+    period_length uses — see _build_kernel_component) and its integer
+    power/degree out of `power` (defaults to 2 if not given, matching
+    gpytorch.kernels.PolynomialKernel's own default).
+
     active_dims: column indices this kernel reads out of the caller's
     full-width input (gpytorch's own kwarg — see _build_scaled_kernel);
     None means every column.
@@ -537,6 +593,18 @@ def _build_concrete_kernel(
         kernel = gpytorch.kernels.LinearKernel()
         kernel.variance = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(kernel.variance.shape)
         return kernel
+
+    if name == "polynomial":
+        power_int = int(round(float(power))) if power is not None else 2
+        kernel_kwargs = {"power": power_int}
+        if active_dims is not None:
+            kernel_kwargs["active_dims"] = active_dims
+        base = gpytorch.kernels.PolynomialKernel(**kernel_kwargs)
+        offset_t = l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.get_default_dtype())
+        base.offset = offset_t.reshape(base.offset.shape)
+        scale = gpytorch.kernels.ScaleKernel(base)
+        scale.outputscale = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(scale.outputscale.shape)
+        return scale
 
     l_t = l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.get_default_dtype())
     # l having more than one element means this episode was generated ARD
@@ -568,18 +636,22 @@ def build_kernel_fn(
     *,
     period: Optional[float | Tensor] = None,
     rq_alpha: Optional[float] = None,
+    power: Optional[float | int] = None,
     l_b=None,
     alpha2_b=None,
     period_b: Optional[float | Tensor] = None,
     rq_alpha_b: Optional[float] = None,
+    power_b: Optional[float | int] = None,
     active_dims: Optional[List[int]] = None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
     """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
 
-    l_b/alpha2_b/period_b/rq_alpha_b are the second component's hyperparameters
-    for composite ("A+B" / "A*B") kernels. l/l_b/period/period_b may be an
-    ARD per-dimension vector (Tensor) instead of a scalar when the episode
-    was generated with cfg.data.ard=True.
+    l_b/alpha2_b/period_b/rq_alpha_b/power_b are the second component's
+    hyperparameters for composite ("A+B" / "A*B") kernels. l/l_b/period/
+    period_b may be an ARD per-dimension vector (Tensor) instead of a scalar
+    when the episode was generated with cfg.data.ard=True. power/power_b is
+    "polynomial"'s integer degree (see _build_concrete_kernel); ignored for
+    every other kernel name.
 
     active_dims: column indices this kernel is active on (both components of
     a composite share the same active columns — see generate_gp_task/
@@ -590,12 +662,16 @@ def build_kernel_fn(
     """
     composite = _parse_composite(kernel_name)
     if composite is None:
-        kernel = _build_concrete_kernel(kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, active_dims=active_dims)
+        kernel = _build_concrete_kernel(
+            kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims
+        )
     else:
         name_a, op, name_b = composite
-        kernel_a = _build_concrete_kernel(name_a, l, alpha2, period=period, rq_alpha=rq_alpha, active_dims=active_dims)
+        kernel_a = _build_concrete_kernel(
+            name_a, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims
+        )
         kernel_b = _build_concrete_kernel(
-            name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, active_dims=active_dims
+            name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, power=power_b, active_dims=active_dims
         )
         kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
 
@@ -667,6 +743,15 @@ def dot_product_kernel(X1: Tensor, X2: Tensor, *, alpha2: float = 1.0, **_) -> T
     return build_kernel_fn("dot_product", 0.0, alpha2)(X1, X2)
 
 
+def polynomial_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, power: float = 2.0, **_) -> Tensor:
+    """Polynomial: alpha2 * (x1ᵀx2 + c)^d, via gpytorch.kernels.PolynomialKernel.
+
+    "l" holds the offset c (same schema-slot reuse cosine's period_length
+    already uses); `power` is the integer degree d.
+    """
+    return build_kernel_fn("polynomial", l, alpha2, power=power)(X1, X2)
+
+
 KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "rbf": rbf_kernel,
     "matern12": matern12_kernel,
@@ -676,6 +761,7 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
     "periodic": periodic_kernel,
     "rational_quadratic": rational_quadratic_kernel,
     "dot_product": dot_product_kernel,
+    "polynomial": polynomial_kernel,
 }
 
 
@@ -693,7 +779,7 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
 # instead of hardcoding a subset here — see _sample_kernel_chain_structure.
 _COMPOSABLE_KERNELS: List[str] = [
     "rbf", "matern12", "matern32", "matern52", "cosine", "periodic",
-    "rational_quadratic", "dot_product",
+    "rational_quadratic", "dot_product", "polynomial",
 ]
 
 # Kernels whose PSD guarantee only holds for scalar (1D) inputs — composites
@@ -745,13 +831,15 @@ def _composite_kernel(
     period_b: Optional[float] = None,
     rq_alpha: Optional[float] = None,
     rq_alpha_b: Optional[float] = None,
+    power: Optional[float] = None,
+    power_b: Optional[float] = None,
     **_,
 ) -> Tensor:
     """Evaluate a registered "A+B" / "A*B" composite kernel (KERNEL_REGISTRY
     dispatch convention) by delegating to build_kernel_fn."""
     fn = build_kernel_fn(
-        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha,
-        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
+        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
+        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
     )
     return fn(X1, X2)
 
@@ -988,8 +1076,8 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
         x_norm_train, y_train, x_norm_test, y_test,
         z_train, z_test, log_pdf_test,
         R_star, Sigma_star, mu_star, sigma_star, n_train, n_test,
-        l, alpha2, nugget, kernel, period, rq_alpha,
-        l_b, alpha2_b, period_b, rq_alpha_b, kernel_feature_indices,
+        l, alpha2, nugget, kernel, period, rq_alpha, power,
+        l_b, alpha2_b, period_b, rq_alpha_b, power_b, kernel_feature_indices,
         _L_ff, _alpha  (ephemeral Cholesky factors, consumed by
                         pit.py::gp_analytical_pit, not saved to disk)
     """
@@ -1246,8 +1334,8 @@ def generate_gp_batch(
         B      : number of episodes to generate in this batch.
         device : torch device string ("cpu" or "cuda").
         return_kernel_metadata: if True, also pack each episode's kernel
-            name, hyperparameters (l, alpha2, nugget, period, rq_alpha,
-            l_b, alpha2_b, period_b, rq_alpha_b), kernel_feature_indices,
+            name, hyperparameters (l, alpha2, nugget, period, rq_alpha, power,
+            l_b, alpha2_b, period_b, rq_alpha_b, power_b), kernel_feature_indices,
             mlp_mixed (bool — whether the mlp-mixing gate fired for that
             episode; see apply_mlp_feature_mixing), and the ephemeral
             _L_ff/_alpha Cholesky factors — the schema
@@ -1318,7 +1406,10 @@ def generate_gp_batch(
         # component_params instead (see the return_kernel_metadata block).
         params = {
             key: torch.zeros(B, device=device)
-            for key in ("l", "alpha2", "period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b")
+            for key in (
+                "l", "alpha2", "period", "rq_alpha", "power",
+                "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b",
+            )
         }
     else:
         kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols)
@@ -1483,7 +1574,10 @@ def generate_gp_batch(
         # Per-episode (sliceable via val[b]) hyperparameters/factors, plus
         # the batch-shared kernel name and active_dims — the schema
         # generate_gp_task / pit.py::gp_analytical_pit / diag_kernels.py need.
-        for key in ("l", "alpha2", "period", "rq_alpha", "l_b", "alpha2_b", "period_b", "rq_alpha_b"):
+        for key in (
+            "l", "alpha2", "period", "rq_alpha", "power",
+            "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b",
+        ):
             tensors[key] = params[key].cpu()
         tensors["nugget"] = nugget.cpu()
         tensors["mlp_mixed"] = mlp_mixed.cpu()
