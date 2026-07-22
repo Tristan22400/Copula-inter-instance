@@ -160,6 +160,45 @@ poly_power_max: 4     # generate_gp_batch call (shared by the whole batch — se
 poly_offset_gamma_concentration: 2.0    # polynomial kernel's offset c
 poly_offset_gamma_rate: 1.0
 
+# Sign-modulated (Schur product) kernel wrapper: K'(x1,x2) = K(x1,x2) *
+# sign(w.x1+b) * sign(w.x2+b), a random hyperplane split of the kernel's own
+# active-column subspace, PSD via the Schur product theorem (rank-1 PSD s s^T
+# times PSD K stays PSD) — see data_gen.py::SignModulatedKernel. w ~ N(0, I_k),
+# b ~ N(0, 1), one independent draw per episode. Injects negative pairwise
+# correlation into R_star without touching oracle_mode or gp_posterior.
+# Two independently-gated injection points, each a Bernoulli-per-batch-call
+# coin flip (same granularity as mlp_mixing_prob — if it fires, EVERY episode
+# in that generate_gp_batch call gets its own independent (w, b) draw):
+#   sign_modulation_component_prob: applied per elementary kernel component,
+#     inside data_gen.py::_build_kernel_component -- covers bare kernels,
+#     both sides of a static "A+B"/"A*B" composite, and every link of a
+#     systematic_composition chain, independently per component.
+#   sign_modulation_outer_prob: applied once more to the fully composed
+#     kernel (whole bare/composite/chain result), independently of the
+#     per-component gate above.
+# Both default to 0.0 (off) so existing datasets/behaviour are unaffected
+# until explicitly turned on. See tests/test_dataset_corr_uniform.py's
+# test_correlations_negative_fraction (25-75% band) before raising these on
+# a production run.
+#
+# Tuning note (validated against the current systematic_composition mix,
+# composite_num_kernels_max=8, composite_exclude_kernels below): counter-
+# intuitively, a HIGH per-component prob is needed, not a low one. A single
+# sign flip only inverts a "*"-multiplied sub-chain's contribution; on a
+# "+"-summed term it just flips that one summand's sign within a sum still
+# dominated by the other (unflipped) terms, so a naive-seeming 0.3-0.4
+# barely moves the negative-fraction needle on long (up to 8-component)
+# chains (measured neg_frac ~0.07-0.22 at prob 0.15-0.4, averaged over many
+# independent batch-call draws). ~0.5+ was needed to reliably land in the
+# 25-75% band (measured neg_frac ~0.27-0.41 at prob 0.5-0.7, mean ~0.09-0.16,
+# std ~0.27-0.30). If composite_num_kernels_max/composite_exclude_kernels
+# change, or systematic_composition is turned off (shorter/no chains), re-
+# validate -- a fixed prob that works for 8-component chains will likely be
+# too aggressive for bare/2-component kernels (e.g. prob=1.0 on a bare
+# kernel already gives neg_frac ~0.36, see SignModulatedKernel's docstring).
+sign_modulation_component_prob: 0.0
+sign_modulation_outer_prob: 0.0
+
 # PIT epsilon for probit clamping (analytical pipeline)
 pit_eps: 1.0e-6
 
