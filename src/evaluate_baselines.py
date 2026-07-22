@@ -50,6 +50,20 @@ Usage
         [--out_dir ./plots]       # directory to save corr_grid figure
         [--device auto]
         [--seed 42]
+        [--baseline_cache ./baseline_cache.pt]  # cache fitted baseline results across runs
+        [--no_baseline_cache]      # disable the cache entirely
+        [--refresh_baselines]      # ignore cached entries, refit and overwrite them
+
+Baseline caching
+----------------
+GP-MLE (with restarts)/DKL/per_ep_transformer fitting dominates runtime and,
+unlike the ICL model under test, only depends on the episode-generating
+config and the fitting hyperparameters above — not on which checkpoint is
+being evaluated. Results are cached to --baseline_cache per episode; repeated
+runs against a new checkpoint (same --config/--dataset_dir/--seed/etc.) load
+the cached baseline NLLs/correlations and only re-run the cheap ICL forward
+pass + oracle NLL. Any change to a fitting hyperparameter or the episode
+config invalidates the cache automatically (see _baseline_fingerprint).
 """
 
 from __future__ import annotations
@@ -810,9 +824,8 @@ def plot_corr_grid(
 # ---------------------------------------------------------------------------
 
 
-def _eval_episode(
+def _eval_baselines_episode(
     ep: dict,
-    icl_model: nn.Module,
     icl_rank: int,
     n_steps_mle: int,
     lr_mle: float,
@@ -824,21 +837,25 @@ def _eval_episode(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
-) -> tuple[dict[str, float], dict[str, Tensor], Tensor]:
-    """Evaluate all methods on one episode.
+) -> tuple[dict[str, float], dict[str, Tensor]]:
+    """Evaluate every classical/fitted baseline (everything except the ICL
+    model and the oracle) on one episode.
+
+    Split out from the ICL/oracle evaluation so the (expensive: many Adam
+    restarts per GP-MLE kernel, DKL training, per-episode-transformer
+    training) results here can be cached across repeated evaluate_baselines.py
+    runs that only change the checkpoint under test — see main()'s
+    baseline-cache logic.
 
     Returns:
         nlls      : {method_name: copula_nll_float}
         R_dict    : {method_name: (N, N) correlation tensor} — for plotting
-        R_oracle  : (N, N) oracle correlation tensor
     """
     X_train    = ep["x_norm_train"].to(device)   # (P, d_x)
     y_train    = ep["y_train"].to(device)         # (P,)  raw target, used to fit the GP-MLE/DKL baselines
-    z_train    = ep["z_train"].to(device)         # (P,)  oracle LOO-PIT residual, used to train icl only
     z_train_self = _standardize_y(y_train)         # (P,) z-scored y_train, used to train per_ep_transformer
     X_test     = ep["x_norm_test"].to(device)     # (N, d_x)
     z_test     = ep["z_test"].to(device)          # (N,)
-    R_oracle   = ep["R_star"].to(device)          # (N, N)
 
     P, d_x = X_train.shape
     N      = X_test.shape[0]
@@ -926,6 +943,29 @@ def _eval_episode(
         print(f"  [per_ep_transformer] failed: {exc}")
         nlls["per_ep_transformer"]  = float("nan")
         R_dict["per_ep_transformer"] = R_I.clone()
+
+    return nlls, R_dict
+
+
+def _eval_icl_episode(
+    ep: dict,
+    icl_model: nn.Module,
+    device: torch.device,
+) -> tuple[dict[str, float], dict[str, Tensor], Tensor]:
+    """Evaluate just the ICL model + oracle lower bound on one episode — the
+    cheap, per-checkpoint part of the comparison (no fitting/training loop),
+    always recomputed even when the baseline results are served from cache.
+    """
+    X_train    = ep["x_norm_train"].to(device)   # (P, d_x)
+    z_train    = ep["z_train"].to(device)         # (P,)  oracle LOO-PIT residual, used to train icl only
+    X_test     = ep["x_norm_test"].to(device)     # (N, d_x)
+    z_test     = ep["z_test"].to(device)          # (N,)
+    R_oracle   = ep["R_star"].to(device)          # (N, N)
+
+    P, N = X_train.shape[0], X_test.shape[0]
+    nlls: dict[str, float]    = {}
+    R_dict: dict[str, Tensor] = {}
+    R_I = torch.eye(N, dtype=X_train.dtype, device=device)
 
     # --- ICL model ---
     try:
@@ -1101,6 +1141,103 @@ def _print_table(all_nlls: list[dict[str, float]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Baseline cache
+# ---------------------------------------------------------------------------
+#
+# GP-MLE (with restarts)/DKL/per_ep_transformer fitting dominates this
+# script's runtime and, unlike the ICL model under test, is unaffected by
+# which checkpoint we're evaluating — only by the episode-generating config
+# and the fitting hyperparameters below. Caching those results to disk lets
+# repeated "just check the new checkpoint" runs skip straight to the ICL
+# forward pass + oracle NLL for every episode, instead of re-fitting ~15
+# baselines per episode from scratch.
+
+def _baseline_fingerprint(
+    icl_cfg,
+    live_generate: bool,
+    dataset_dir: str | None,
+    seed: int,
+    icl_rank: int,
+    oracle_mode: str,
+    n_steps_mle: int,
+    lr_mle: float,
+    n_restarts_mle: int,
+    n_steps_dkl: int,
+    lr_dkl: float,
+    n_steps_per_ep: int,
+    patience_per_ep: int,
+) -> dict:
+    """Everything that determines the *baseline* fit results for an episode,
+    other than which episode it is (see _episode_cache_key for that half).
+
+    Includes cfg.data (the generating distribution episodes are drawn from,
+    and the source of prior_cfg's hyperpriors) and icl_rank (sizes
+    per_ep_transformer's low-rank factor — see train_per_episode's docstring)
+    since both change what a "correct" baseline fit looks like, even though
+    neither is a baseline-fitting hyperparameter in the argparse sense.
+    Deliberately excludes the rest of icl_cfg (e.g. model architecture,
+    optimizer settings) — those affect the ICL model, not the baselines being
+    cached here, and including them would invalidate the cache every time an
+    unrelated training run tweaks something baselines never see.
+    """
+    data_cfg = OmegaConf.select(icl_cfg, "data", default=None)
+    return {
+        "data_cfg": OmegaConf.to_container(data_cfg) if data_cfg is not None else {},
+        "icl_rank": icl_rank,
+        "live_generate": live_generate,
+        "dataset_dir": os.path.abspath(dataset_dir) if (dataset_dir and not live_generate) else None,
+        "seed": seed,
+        "oracle_mode": oracle_mode,
+        "n_steps_mle": n_steps_mle,
+        "lr_mle": lr_mle,
+        "n_restarts_mle": n_restarts_mle,
+        "n_steps_dkl": n_steps_dkl,
+        "lr_dkl": lr_dkl,
+        "n_steps_per_ep": n_steps_per_ep,
+        "patience_per_ep": patience_per_ep,
+    }
+
+
+def _episode_cache_key(live_generate: bool, dataset_dir: str | None, seed: int, local_i: int, ep_i: int) -> str:
+    """Identifies which episode a cached baseline result belongs to.
+
+    Live episodes are fully determined by (seed, local_i) — see
+    generate_gp_batch's per-call reseeding and _live_generate_alternating's
+    docstring; dataset episodes by (dataset_dir, ep_i)."""
+    if live_generate:
+        return f"live:seed{seed}:idx{local_i}"
+    return f"dataset:{os.path.abspath(dataset_dir)}:idx{ep_i}"
+
+
+def _load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
+    """Load {episode_key: {"nlls": ..., "R_dict": ...}} from path if its
+    stored fingerprint matches; otherwise (missing file, or a fingerprint
+    mismatch meaning the cache was built under different generation/fitting
+    settings) start from an empty cache rather than serving stale results."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"  [baseline_cache] failed to load {path}: {exc} — starting fresh")
+        return {}
+    if blob.get("fingerprint") != fingerprint:
+        print(f"  [baseline_cache] {path} was built with different generation/fitting "
+              "settings — ignoring it and refitting all baselines")
+        return {}
+    entries = blob.get("entries", {})
+    print(f"  [baseline_cache] loaded {len(entries)} cached episode(s) from {path}")
+    return entries
+
+
+def _save_baseline_cache(path: str, fingerprint: dict, entries: dict[str, dict]) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    torch.save({"fingerprint": fingerprint, "entries": entries}, path)
+    print(f"  [baseline_cache] saved {len(entries)} episode(s) to {path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1161,6 +1298,25 @@ def main() -> None:
                              "saved training config (cfg.data.oracle_mode), falling back to "
                              "'prior' if that's absent (this repo's current datasets all use "
                              "oracle_mode=prior).")
+    parser.add_argument("--baseline_cache", default="./baseline_cache.pt",
+                        help="Path to a cache file storing every classical baseline's fitted "
+                             "NLL/correlation results (independence/gp_prior_rbf/gp_mle_*/"
+                             "dkl_*/per_ep_transformer), keyed per-episode. These are the "
+                             "expensive, checkpoint-independent part of the comparison (many "
+                             "Adam restarts per GP-MLE kernel, DKL training, per-episode-"
+                             "transformer training); the ICL model + oracle are always "
+                             "recomputed fresh since they're what actually changes between "
+                             "runs. A cache entry is only reused when the episode-generating "
+                             "config and every baseline-fitting hyperparameter below match "
+                             "exactly what produced it (see _baseline_fingerprint) — "
+                             "otherwise it's recomputed and the cache updated in place.")
+    parser.add_argument("--no_baseline_cache", action="store_true",
+                        help="Disable baseline caching entirely: always recompute, never "
+                             "read or write --baseline_cache.")
+    parser.add_argument("--refresh_baselines", action="store_true",
+                        help="Recompute every baseline even if a matching cache entry "
+                             "exists, overwriting it (still writes --baseline_cache unless "
+                             "--no_baseline_cache is also given).")
     args = parser.parse_args()
 
     _set_seed(args.seed)
@@ -1236,6 +1392,17 @@ def main() -> None:
     print(f"  GP MLE: {args.n_steps_mle} steps | DKL: {args.n_steps_dkl} steps | "
           f"PerEp: {args.n_steps_per_ep} steps (patience={args.patience_per_ep})")
 
+    # ---- Baseline cache: skip re-fitting GP-MLE/DKL/per_ep_transformer for
+    # episodes already scored under an identical generation/fitting config ----
+    use_cache = not args.no_baseline_cache
+    fingerprint = _baseline_fingerprint(
+        icl_cfg, live_generate, args.dataset_dir, args.seed, icl_rank, oracle_mode,
+        args.n_steps_mle, args.lr_mle, args.n_restarts_mle,
+        args.n_steps_dkl, args.lr_dkl, args.n_steps_per_ep, args.patience_per_ep,
+    )
+    cache_entries = _load_baseline_cache(args.baseline_cache, fingerprint) if use_cache else {}
+    cache_dirty = False
+
     for local_i in range(n_ep):
         if live_generate:
             ep_i = local_i
@@ -1247,21 +1414,37 @@ def main() -> None:
                 continue
             ep = dataset[ep_i]
 
-        nlls, R_dict, R_oracle = _eval_episode(
-            ep=ep,
-            icl_model=icl_model,
-            icl_rank=icl_rank,
-            n_steps_mle=args.n_steps_mle,
-            lr_mle=args.lr_mle,
-            n_steps_dkl=args.n_steps_dkl,
-            lr_dkl=args.lr_dkl,
-            n_steps_per_ep=args.n_steps_per_ep,
-            patience_per_ep=args.patience_per_ep,
-            device=device,
-            oracle_mode=oracle_mode,
-            prior_cfg=prior_cfg,
-            n_restarts_mle=args.n_restarts_mle,
-        )
+        cache_key = _episode_cache_key(live_generate, args.dataset_dir, args.seed, local_i, ep_i)
+        cached = cache_entries.get(cache_key) if (use_cache and not args.refresh_baselines) else None
+        if cached is not None:
+            baseline_nlls = cached["nlls"]
+            baseline_R    = {k: v.to(device) for k, v in cached["R_dict"].items()}
+        else:
+            baseline_nlls, baseline_R = _eval_baselines_episode(
+                ep=ep,
+                icl_rank=icl_rank,
+                n_steps_mle=args.n_steps_mle,
+                lr_mle=args.lr_mle,
+                n_steps_dkl=args.n_steps_dkl,
+                lr_dkl=args.lr_dkl,
+                n_steps_per_ep=args.n_steps_per_ep,
+                patience_per_ep=args.patience_per_ep,
+                device=device,
+                oracle_mode=oracle_mode,
+                prior_cfg=prior_cfg,
+                n_restarts_mle=args.n_restarts_mle,
+            )
+            if use_cache:
+                cache_entries[cache_key] = {
+                    "nlls": baseline_nlls,
+                    "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
+                }
+                cache_dirty = True
+
+        icl_nlls, icl_R, R_oracle = _eval_icl_episode(ep=ep, icl_model=icl_model, device=device)
+
+        nlls   = {**baseline_nlls, **icl_nlls}
+        R_dict = {**baseline_R, **icl_R}
         all_nlls.append(nlls)
 
         if local_i == args.plot_episode:
@@ -1279,6 +1462,9 @@ def main() -> None:
         print("    top-5 baselines (lowest NLL, fitted only):")
         for key, val in top5:
             print(f"      {_METHOD_LABELS.get(key, key):<28}{val:.4f}")
+
+    if use_cache and cache_dirty:
+        _save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
 
     if not all_nlls:
         print("No episodes evaluated successfully.")
