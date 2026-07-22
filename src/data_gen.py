@@ -298,7 +298,7 @@ class KernelPriorSpec:
     ard_num_dims (no per-dimension formula exists to opt into).
     """
 
-    lengthscale_prior: Callable[[int], torch.distributions.Distribution]
+    lengthscale_prior: Callable[[int], Prior]
     outputscale_prior: Prior
     lengthscale_attr: str = "lengthscale"
     extra_priors: Dict[str, Prior] = field(default_factory=dict)
@@ -353,28 +353,9 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
     k_exponent = float(getattr(cfg.data, "l_lognormal_k_exponent", 0.25))
     k_cap = float(getattr(cfg.data, "l_lognormal_k_cap", 15))
 
-    # A single LogNormal(l_loc, l_scale) puts negligible mass on lengthscales
-    # long relative to the per-episode-standardized (std=1) input domain --
-    # e.g. l_scale=0.5 gives <2% mass above l=3 -- so near-constant-function
-    # episodes are almost never seen in training despite being valid GP draws.
-    # long_prob mixes in a second LogNormal component shifted up by long_shift
-    # (in log-space, so it's a multiplicative factor on the median lengthscale)
-    # with probability long_prob per sampled value, via torch.distributions'
-    # own MixtureSameFamily rather than hand-rolled resampling. Default 0.0
-    # (long_prob<=0) preserves the plain single-component prior exactly.
-    long_prob = float(getattr(cfg.data, "l_lognormal_long_prob", 0.0))
-    long_shift = float(getattr(cfg.data, "l_lognormal_long_shift", math.log(6.0)))
-
-    def lengthscale_prior(k: int):
+    def lengthscale_prior(k: int) -> LogNormalPrior:
         shift = k_exponent * math.log(max(min(k, k_cap), 1))
-        loc = l_loc + shift
-        if long_prob <= 0.0:
-            return LogNormalPrior(loc, l_scale)
-        locs = torch.tensor([loc, loc + long_shift])
-        scales = torch.tensor([l_scale, l_scale])
-        components = torch.distributions.LogNormal(locs, scales)
-        mixture = torch.distributions.Categorical(torch.tensor([1.0 - long_prob, long_prob]))
-        return torch.distributions.MixtureSameFamily(mixture, components)
+        return LogNormalPrior(l_loc + shift, l_scale)
 
     # cosine has no `.lengthscale` attribute — its one shape parameter is
     # `.period_length`, playing the same role "l" does in cosine_kernel's
