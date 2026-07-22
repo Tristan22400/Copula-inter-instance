@@ -13,4 +13,4 @@ src/models/__pycache__/
 *.pdf
 *.png
 plots/era5_real_default.nc
-benchmarks/
+eval/data/
