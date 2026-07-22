@@ -47,13 +47,9 @@ n_tasks: 20000000
 # active kernel dims. Without the k-dependent shift, the k-dims-summed
 # squared distance grows ~linearly in k for standardized iid inputs, so a
 # fixed-in-k lengthscale collapses R_star toward the identity as k grows
-# (see data_gen.py::_kernel_prior_spec). 0.25 was tuned against
-# tests/test_dataset_corr_uniform.py's abs(mean)<0.30 bound for this file's
-# systematic_composition mix and the current HEBO+-derived nugget floor
-# below -- a prior, fuller (0.5=sqrt(k)) version of this shift was tried and
-# reverted (see f72a3d2) because it pushed correlations toward a
-# uniform/degenerate regime once the nugget floor was tightened; re-tune if
-# composite_exclude_kernels or the nugget prior change again.
+# (see data_gen.py::_kernel_prior_spec). Re-tune against
+# tests/test_dataset_corr_uniform.py's abs(mean)<0.30 bound if
+# composite_exclude_kernels or the nugget prior change.
 l_lognormal_loc: 0.0    # log(1.0)
 l_lognormal_scale: 0.5
 l_lognormal_k_exponent: 0.5
