@@ -1262,7 +1262,7 @@ def main() -> None:
                              "regenerate an on-disk dataset with that metadata. Default: "
                              "True unless --dataset_dir is given. --episode_idx is ignored "
                              "in this mode (episodes are freshly sampled, not indexed).")
-    parser.add_argument("--n_episodes",   type=int,   default=5)
+    parser.add_argument("--n_episodes",   type=int,   default=30)
     parser.add_argument("--episode_idx",  type=int,   default=0)
     parser.add_argument("--n_steps_mle",  type=int,   default=1000,
                         help="Adam steps for GP kernel MLE fitting (also used for ARD variants)")

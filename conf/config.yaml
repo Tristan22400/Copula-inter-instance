@@ -19,7 +19,7 @@ training:
   warmup_steps: 1000
   clip_grad_norm: 1.0
   log_every: 100
-  val_every: 500
+  val_every: 1000
   save_every: 5000
   ckpt_dir: null
   # Path to a checkpoint saved by save_checkpoint() (model + optimizer +
@@ -28,7 +28,7 @@ training:
   # config, not the one baked into the checkpoint.
   # Usage: python src/train.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
   resume_ckpt: null
-  dataset_dir: ./data/systematic_composition-8/pit
+  dataset_dir: ./data/systematic_composition-k5/pit
   val_fraction: 0.05   # fraction of episodes held out for validation
   # For sharded datasets: shuffle within blocks of this many shards at a time
   # (all shuffled together, IO-cache resident) instead of one global shuffle
