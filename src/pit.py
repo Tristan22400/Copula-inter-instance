@@ -203,9 +203,9 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
 
     Args:
         task: raw task dict returned by generate_gp_task (must contain
-              kernel, l, alpha2, nugget, period, rq_alpha, l_b, alpha2_b,
-              period_b, rq_alpha_b, kernel_feature_indices, x_norm_train,
-              y_train, y_test, mu_star, sigma_star).
+              kernel, l, alpha2, nugget, period, rq_alpha, power, l_b,
+              alpha2_b, period_b, rq_alpha_b, power_b, kernel_feature_indices,
+              x_norm_train, y_train, y_test, mu_star, sigma_star).
         eps:  unused (kept for API symmetry with run_pit).
 
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
@@ -223,6 +223,9 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     # PeriodicKernel ties period_length's ard_num_dims to lengthscale's).
     period   = _optional_param(task["period"])
     rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
+    # "polynomial"'s integer degree — same 0.0 sentinel convention (its own
+    # default is never 0, see data_gen's poly_power_min/max).
+    power    = task["power"].item() if task["power"].item() != 0.0 else None
     # Composite ("A+B"/"A*B") kernels' second component — same 0.0 sentinel
     # convention. Omitting these previously made build_kernel_fn silently
     # reconstruct composites with l_b/alpha2_b=None, crashing with a
@@ -233,6 +236,7 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     alpha2_b   = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
     period_b   = _optional_param(task["period_b"])
     rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
+    power_b    = task["power_b"].item() if task["power_b"].item() != 0.0 else None
 
     # active_dims (gpytorch's own kernel kwarg) lets kernel_fn take the
     # full-width x_norm_train straight through and select its k active
@@ -240,8 +244,8 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     # so no manual column slicing is needed here either.
     cols = task["kernel_feature_indices"].tolist()
     kernel_fn = build_kernel_fn(
-        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha,
-        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b,
+        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
+        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
         active_dims=cols,
     )
     x_k_train = task["x_norm_train"]   # (P, d_features)
