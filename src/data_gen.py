@@ -2125,15 +2125,25 @@ def generate_gp_batch(
     the retries so a pathological config (e.g. one that's non-PSD by
     construction regardless of jitter) fails loudly instead of hanging.
     """
+    base_seed = getattr(cfg, "seed", None)
     episodes = _generate_gp_batch_raw(cfg, B, device, return_kernel_metadata=return_kernel_metadata)
     max_rounds = 20
-    for _ in range(max_rounds):
+    for round_idx in range(1, max_rounds + 1):
         if len(episodes) >= B:
             break
         shortfall = B - len(episodes)
+        if base_seed is not None:
+            # _generate_gp_batch_raw reseeds every RNG from cfg.seed on each
+            # call, so retrying with the same cfg.seed would deterministically
+            # redraw the identical (failing) kernel/hyperparameters every
+            # round. Offset by a large prime per round so top-up retries
+            # actually sample a fresh draw instead of repeating the failure.
+            cfg.seed = base_seed + round_idx * 104_729
         episodes += _generate_gp_batch_raw(
             cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata
         )
+    if base_seed is not None:
+        cfg.seed = base_seed
     if len(episodes) < B:
         raise RuntimeError(
             f"generate_gp_batch: could not assemble {B} valid episodes after "
