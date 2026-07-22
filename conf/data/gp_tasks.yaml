@@ -50,28 +50,19 @@ n_tasks: 20000000
 # (see data_gen.py::_kernel_prior_spec). Re-tune against
 # tests/test_dataset_corr_uniform.py's abs(mean)<0.30 bound if
 # composite_exclude_kernels or the nugget prior change.
+#
+# Inputs are always per-episode z-normalized to std=1 (see generate_gp_batch),
+# so l_lognormal_scale=0.5 put negligible mass on lengthscales long relative
+# to that fixed ~unit-scale domain (<2% above l=3) -- near-constant-function
+# episodes were almost never seen in training. Raised to 1.0 (pilot-validated:
+# 3000-episode dataset + tests/test_dataset_corr_uniform.py) instead of adding
+# a second mixture component -- a two-component mixture was tried first but
+# empirically didn't outperform this simpler single-distribution widening on
+# either the correlation-uniformity bounds or R_star conditioning.
 l_lognormal_loc: 0.0    # log(1.0)
-l_lognormal_scale: 0.5
+l_lognormal_scale: 1.0
 l_lognormal_k_exponent: 0.5
 l_lognormal_k_cap: 15
-
-# Inputs are always per-episode z-normalized to std=1 (see
-# generate_gp_batch), so the single LogNormal(l_lognormal_loc,
-# l_lognormal_scale) above puts negligible mass on lengthscales long
-# relative to that fixed ~unit-scale domain (e.g. <2% above l=3 at
-# l_lognormal_scale=0.5) -- near-constant-function episodes are almost never
-# seen in training. l_lognormal_long_prob mixes in a second LogNormal
-# component, shifted up in log-space by l_lognormal_long_shift, with that
-# probability per sampled lengthscale value (data_gen.py::_kernel_prior_spec,
-# via torch.distributions.MixtureSameFamily). These two values were pilot-
-# validated (3000-episode dataset + tests/test_dataset_corr_uniform.py)
-# against the CURRENT composite_exclude_kernels below: 0.15/log(6) pushed 3/500
-# episodes' R_star below the min-eigenvalue floor (near-constant functions are
-# nearly rank-1), 0.10/log(4) did not. Re-validate after changing either value
-# or composite_exclude_kernels.
-l_lognormal_long_prob: 0.10
-l_lognormal_long_shift: 1.386   # log(4) -- long-regime median lengthscale is 4x the base one
-
 alpha2_gamma_concentration: 4.0   # outputscale ~ Gamma(concentration, rate)
 alpha2_gamma_rate: 3.0
 
