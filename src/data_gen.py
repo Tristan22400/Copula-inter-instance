@@ -987,10 +987,11 @@ def build_kernel_fn(
 # build_kernel_fn assigns hyperparameters through gpytorch's `.lengthscale =`
 # / `.outputscale =` setters, which do an in-place `.initialize()` copy that
 # breaks autograd back to those inputs (the forward pass on X1/X2 itself is
-# still differentiable). src/evaluate_baselines.py's from-scratch GP-MLE fit
-# needs exactly that backprop, so it keeps its own local plain-torch copies of
-# rbf_kernel/periodic_kernel/rational_quadratic_kernel instead of importing
-# these — see its module comment.
+# still differentiable). eval/baselines/classical.py's GP-MLE fit needs
+# exactly that backprop, so it sidesteps the issue entirely by constructing
+# gpytorch kernel objects (RBFKernel/MaternKernel/PeriodicKernel/RQKernel/
+# LinearKernel) directly and optimizing their own native trainable
+# parameters, instead of importing these free functions.
 # ---------------------------------------------------------------------------
 
 
