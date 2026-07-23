@@ -30,6 +30,27 @@ training:
   resume_ckpt: null
   dataset_dir: ./data/systematic_composition-k5/pit
   val_fraction: 0.05   # fraction of episodes held out for validation
+  # Live generation: skip dataset_dir entirely and generate episodes on the
+  # fly via DataLoader workers (see live_dataset.py) — no disk reads/writes
+  # for training data. Temporary, storage-constrained-environment mode;
+  # false (default) uses the on-disk dataset_dir pipeline unchanged.
+  live_generation: false
+  live_num_workers: 8      # CPU-bound generation is heavier than a shard read; size to keep the GPU fed
+  # generate_gp_batch() call size = batch_size * live_group_multiplier. Must be
+  # a multiple of batch_size: generate_gp_batch samples kernel/P/N/active_dims
+  # (and, for variable-d configs, d_features itself) once per call, shared by
+  # every episode in it — collate_fn cannot pad across a mismatched feature
+  # axis, so a batch straddling two differently-sampled calls would fail
+  # exactly like the disk path's variable-d datasets without
+  # ShardHomogeneousBatchSampler. 1 (one call per batch) is also close to the
+  # throughput ceiling: generate_gp_batch has ~1s of fixed per-call setup
+  # overhead, benchmarked ~1.2s/episode at call-size 1 vs ~0.03s/episode at
+  # call-size 32 (2026-07-23) — small call sizes are both less safe and far
+  # slower. Cross-batch diversity comes from live_num_workers running
+  # independently-seeded streams, the live analogue of ShardBlockSampler.
+  live_group_multiplier: 1
+  live_val_episodes: 500   # fixed validation set size, generated once at startup
+  live_val_seed: 20260723  # fixed seed for the validation set (independent of the training seed stream)
   # For sharded datasets: shuffle within blocks of this many shards at a time
   # (all shuffled together, IO-cache resident) instead of one global shuffle
   # across every shard — avoids thrashing the shard LRU cache on network
