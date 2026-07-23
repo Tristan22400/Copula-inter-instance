@@ -239,7 +239,7 @@ def apply_lora(
     rank: int,
     alpha: float,
     target: str = "qkvo",
-    stages: List[str] = ("icl",),
+    stages: List[str] = ("icl", "row", "col"),
 ) -> int:
     """Replace MultiheadAttention modules inside *backbone* with LoRA-augmented versions.
 
