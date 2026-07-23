@@ -1,6 +1,6 @@
 #!/bin/bash
 #OAR -n CopulaEval
-#OAR -l gpu=1,walltime=2:00:00
+#OAR -l gpu=1,walltime=12:00:00
 #OAR -O logs/eval_%jobid%.out
 #OAR -E logs/eval_%jobid%.err
 #
