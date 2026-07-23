@@ -1676,7 +1676,8 @@ def apply_mlp_feature_mixing(
 
 @torch.no_grad()
 def _generate_gp_batch_raw(
-    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
+    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
+    d_override: Optional[int] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in a single vectorised call — the
     "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
@@ -1741,7 +1742,13 @@ def _generate_gp_batch_raw(
     if seed is not None:
         _seed_everything(seed)
 
-    d = _sample_d_features(cfg)
+    # d_override lets generate_gp_batch's top-up rounds (which reseed with a
+    # different cfg.seed to escape a degenerate draw) pin d to the value the
+    # shard's first round already committed to. Unlike kernel_name/P/N —
+    # which vary freely across rounds because collate_fn pads them — d is a
+    # hard tensor axis with no padding, so every episode in a shard must
+    # share it (see ShardHomogeneousBatchSampler / _sample_d_features).
+    d = d_override if d_override is not None else _sample_d_features(cfg)
 
     # --- Shared settings for this batch ---
     # systematic_composition (CauKer-style, see _sample_kernel_chain_structure)
@@ -2117,7 +2124,13 @@ def generate_gp_batch(
     indexing for every shard after it. This wrapper preserves that
     invariant by topping up the shortfall with fresh top-up calls (which
     resample their own kernel/P/N/active_dims independently, same as any
-    other call) until exactly B valid episodes are assembled.
+    other call — collate_fn pads over P/N and doesn't care about kernel)
+    until exactly B valid episodes are assembled. d_features is the one
+    exception: it is pinned to the first round's value (see d_override)
+    because it's an unpadded tensor axis, not row-masked like P/N — a
+    top-up round resampling its own d would silently mix feature counts
+    within one shard, which ShardHomogeneousBatchSampler/collate_fn assume
+    can't happen.
 
     In practice this loop almost never repeats more than once: the discard
     rate is astronomically rare (an episode has to defeat escalating jitter
@@ -2127,6 +2140,12 @@ def generate_gp_batch(
     """
     base_seed = getattr(cfg, "seed", None)
     episodes = _generate_gp_batch_raw(cfg, B, device, return_kernel_metadata=return_kernel_metadata)
+    # Pin every top-up round to the first round's d_features. Top-up rounds
+    # reseed with a different cfg.seed (below), which would otherwise
+    # re-sample d independently (variable-d datasets, see _sample_d_features)
+    # and silently mix feature counts within one shard — collate_fn cannot
+    # pad across the feature axis, unlike P/N, so this must stay fixed.
+    d_fixed = int(episodes[0]["x_norm_train"].shape[-1]) if episodes else None
     max_rounds = 20
     for round_idx in range(1, max_rounds + 1):
         if len(episodes) >= B:
@@ -2139,9 +2158,13 @@ def generate_gp_batch(
             # round. Offset by a large prime per round so top-up retries
             # actually sample a fresh draw instead of repeating the failure.
             cfg.seed = base_seed + round_idx * 104_729
-        episodes += _generate_gp_batch_raw(
-            cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata
+        new_episodes = _generate_gp_batch_raw(
+            cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata,
+            d_override=d_fixed,
         )
+        if d_fixed is None and new_episodes:
+            d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
+        episodes += new_episodes
     if base_seed is not None:
         cfg.seed = base_seed
     if len(episodes) < B:

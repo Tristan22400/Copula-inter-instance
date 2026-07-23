@@ -430,6 +430,43 @@ def test_polynomial_power_varies_across_batches(small_cfg):
     assert len(seen_powers) > 1, f"power never varied across 20 batches: {seen_powers}"
 
 
+def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
+    """generate_gp_batch's top-up rounds (triggered when a round's episodes
+    get discarded as degenerate) must reuse the first round's d_features
+    rather than resampling their own — d is an unpadded tensor axis (unlike
+    P/N, which collate_fn pads), so a shard mixing d across rounds breaks
+    ShardHomogeneousBatchSampler's per-shard-homogeneous-d invariant
+    (regression: a real dataset run produced a shard with 254 episodes at
+    d=16 and 2 stragglers at d=31 from an unpinned top-up round)."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
+    cfg.data.d_features_lognormal_scale = 0.4
+    cfg.seed = 123
+
+    real_raw = dg._generate_gp_batch_raw
+    state = {"n_calls": 0}
+
+    def truncating_raw(cfg, B, device="cpu", *, return_kernel_metadata=False, d_override=None):
+        episodes = real_raw(
+            cfg, B, device, return_kernel_metadata=return_kernel_metadata, d_override=d_override
+        )
+        state["n_calls"] += 1
+        if state["n_calls"] == 1:
+            episodes = episodes[:-5]  # force a shortfall so top-up fires
+        return episodes
+
+    monkeypatch.setattr(dg, "_generate_gp_batch_raw", truncating_raw)
+
+    episodes = dg.generate_gp_batch(cfg, B=20, device="cpu")
+    assert state["n_calls"] > 1, "test setup didn't actually trigger a top-up round"
+    assert len(episodes) == 20
+    d_set = {ep["x_norm_train"].shape[-1] for ep in episodes}
+    assert len(d_set) == 1, f"top-up round used a different d_features than round 0: {d_set}"
+
+
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
 def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name):
     """The saved l (offset)/alpha2/power schema must round-trip through
