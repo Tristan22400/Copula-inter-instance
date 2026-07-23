@@ -2004,13 +2004,26 @@ def _generate_gp_batch_raw(
 
     # LOO residuals are N(0,1) by construction (R&W Eq. 5.12); no empirical
     # rescaling needed.  Filter degenerate episodes instead.
+    #
+    # z_std itself is NaN whenever z_train contains a NaN/Inf (e.g. alpha or
+    # K_inv_diag blowing up on a near-singular K_ff that jitter didn't fully
+    # fix), and NaN comparisons are always False in PyTorch — so the std
+    # threshold check below silently misses exactly the episodes it most
+    # needs to catch unless non-finite z_train is checked for explicitly.
+    non_finite = ~torch.isfinite(z_train).all(dim=1)
     z_std = z_train.std(dim=1)
-    degen = (z_std < 0.1) | (z_std > 3.0)
+    degen = non_finite | (z_std < 0.1) | (z_std > 3.0)
     if degen.any():
         warnings.warn(
-            f"generate_gp_batch: {int(degen.sum())}/{B} episodes have degenerate LOO z.",
+            f"generate_gp_batch: {int(degen.sum())}/{B} episodes have degenerate LOO z "
+            f"({int(non_finite.sum())} non-finite) and will be discarded.",
             RuntimeWarning,
         )
+    # Fold into the same discard mask as the Cholesky-failure episodes above
+    # (see `discard`/`keep` below) — previously computed but never applied,
+    # so degenerate/NaN z_train episodes were saved to disk and only
+    # surfaced much later as a training-time crash.
+    discard = discard | degen
 
     # Reconstruct full posterior covariance (for Y-space oracle)
     Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
