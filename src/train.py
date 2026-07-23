@@ -551,7 +551,7 @@ def main(cfg: DictConfig) -> None:
     lora_cfg = cfg.get("lora", None)
     lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
     if lora_enabled:
-        lora_stages = "+".join(lora_cfg.get("stages", ["icl"]))
+        lora_stages = "+".join(lora_cfg.get("stages", ["icl", "row", "col"]))
         lora_str = f"_lora-r{lora_cfg.get('rank', 8)}-a{lora_cfg.get('alpha', 16.0)}-{lora_stages}"
     else:
         lora_str = "_nolora"
