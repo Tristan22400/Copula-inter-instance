@@ -547,8 +547,7 @@ def main(cfg: DictConfig) -> None:
 
     t = cfg.training
     dataset_path = os.path.normpath(t.dataset_dir)
-    dataset_parent, dataset_leaf = os.path.split(dataset_path)
-    dataset_name = f"{os.path.basename(dataset_parent)}_{dataset_leaf}" if dataset_parent else dataset_leaf
+    dataset_name = os.path.basename(dataset_path)
     lora_cfg = cfg.get("lora", None)
     lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
     if lora_enabled:
