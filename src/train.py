@@ -521,21 +521,19 @@ def save_checkpoint(model, optimizer, scheduler, cfg, step: int, scaler=None) ->
     )
 
 
-def load_checkpoint(ckpt_path: str, model: nn.Module, optimizer, scheduler, device: str, scaler=None) -> int:
-    """Restore model/optimizer/scheduler(/scaler) state from a checkpoint saved by save_checkpoint().
+def load_checkpoint(ckpt_path: str, model: nn.Module, device: str) -> None:
+    """Restore only the model weights from a checkpoint saved by save_checkpoint().
 
-    Returns the step to resume from (checkpoint step + 1).
+    Optimizer/scheduler/scaler state is intentionally NOT restored: resuming
+    always restarts training at step 0 with a fresh warmup/cosine schedule
+    and the full step budget, rather than continuing the previous run's
+    schedule and step count.
     """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
     raw = getattr(model, "_orig_mod", model)
     raw.load_state_dict(ckpt["state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.load_state_dict(ckpt["scheduler"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
-    return int(ckpt["step"]) + 1
 
 
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
@@ -786,8 +784,8 @@ def main(cfg: DictConfig) -> None:
 
     start_step = 0
     if resume_ckpt:
-        start_step = load_checkpoint(resume_ckpt, model, optimizer, scheduler, device, scaler=scaler)
-        print(f"Resumed from {resume_ckpt} — continuing at step {start_step}")
+        load_checkpoint(resume_ckpt, model, device)
+        print(f"Resumed weights from {resume_ckpt} — restarting schedule at step 0")
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     nll_weight = float(t.get("nll_weight", 1.0))
