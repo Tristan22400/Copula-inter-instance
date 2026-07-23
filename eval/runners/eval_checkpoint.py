@@ -31,6 +31,16 @@ docstring): GP-MLE/DKL/per_ep_transformer fitting dominates runtime and is
 unaffected by which checkpoint is under test, so repeated runs against a new
 checkpoint reuse the cached fits and only redo the cheap ICL forward pass +
 oracle NLL.
+
+With --live_generate (the default), the episodes themselves come from
+--config's own cfg.data — resolved through Hydra's defaults list, NOT the
+checkpoint's own saved training cfg (see _load_full_config) — so the same
+--config + --seed always produces the same episodes and the same baseline
+cache fingerprint no matter which --ckpt you point at, even across
+checkpoints trained under different cfg.data. The tradeoff: every checkpoint
+is scored against one shared distribution (whatever --config currently
+says) rather than its own training distribution. Edit --config or pass a
+different file to change that distribution deliberately.
 """
 
 from __future__ import annotations
@@ -41,9 +51,11 @@ import os
 import random
 import sys
 
+import hydra
 import numpy as np
 import torch
 import torch.nn as nn
+from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
 from torch import Tensor
 
@@ -76,6 +88,28 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _load_full_config(config_path: str) -> OmegaConf:
+    """Resolve --config through Hydra's defaults list (model/data groups +
+    _self_), the same composition train.py's @hydra.main gets, instead of a
+    bare OmegaConf.load (which would leave cfg.data missing entirely — see
+    conf/config.yaml's `defaults:` block).
+
+    This is deliberately independent of any checkpoint: it's the fixed
+    episode-generating distribution used for live generation and for the
+    baseline cache's fingerprint (see main()), so switching --ckpt between
+    checkpoints trained under different cfg.data no longer invalidates cached
+    baseline fits — only editing --config itself, or passing a different
+    one, does.
+    """
+    config_path = os.path.abspath(config_path)
+    config_dir = os.path.dirname(config_path)
+    config_name = os.path.splitext(os.path.basename(config_path))[0]
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    with hydra.initialize_config_dir(config_dir=config_dir, version_base=None):
+        return hydra.compose(config_name=config_name)
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +236,7 @@ def _kernel_composition_label(ep: dict) -> str:
     return label
 
 
-def _live_generate_alternating(icl_cfg, n_ep: int, device, seed: int) -> list[dict]:
+def _live_generate_alternating(gen_cfg, n_ep: int, device, seed: int) -> list[dict]:
     """Live-generate n_ep episodes, forcing every even local index (0, 2, 4,
     ...) to a single elementary kernel (no composition) so each consecutive
     pair of evaluated episodes includes one non-composite draw — otherwise
@@ -218,7 +252,7 @@ def _live_generate_alternating(icl_cfg, n_ep: int, device, seed: int) -> list[di
     """
     episodes: list[dict] = []
     for local_i in range(n_ep):
-        ep_cfg = copy.deepcopy(icl_cfg)
+        ep_cfg = copy.deepcopy(gen_cfg)
         ep_cfg.seed = seed + local_i
         if local_i % 2 == 0:
             # Force non-composite for both kernel-selection modes
@@ -278,7 +312,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate ICL checkpoint vs baselines on inter-instance copula episodes"
     )
-    parser.add_argument("--config",       default="conf/config.yaml")
+    parser.add_argument("--config",       default="conf/config.yaml",
+                        help="Hydra config defining the eval-episode-generating "
+                             "distribution (cfg.data) for --live_generate, "
+                             "resolved through its own defaults list — "
+                             "independent of --ckpt's saved training cfg. "
+                             "Keeping this fixed is what lets the baseline "
+                             "cache survive switching checkpoints.")
     parser.add_argument("--ckpt",         required=True)
     parser.add_argument("--dataset_dir",  default=None,
                         help="Episode directory to evaluate on (overrides "
@@ -348,7 +388,15 @@ def main() -> None:
     )
     print(f"Device: {device}")
 
-    cfg = OmegaConf.load(args.config)
+    # cfg is the eval-episode-generating config, resolved from --config's own
+    # Hydra defaults (model/data groups + _self_) — deliberately NOT the
+    # checkpoint's own saved training cfg. Keeping it fixed across --ckpt
+    # values is what lets the baseline cache (see fingerprint below) survive
+    # switching between checkpoints trained under different cfg.data: the
+    # tradeoff is that all checkpoints are now scored against one shared
+    # distribution rather than each against its own training distribution.
+    # Point --config at a different file (or edit this one) to change it.
+    cfg = _load_full_config(args.config)
 
     # ---- Load ICL model ----
     print(f"\nLoading ICL checkpoint: {args.ckpt}")
@@ -358,21 +406,21 @@ def main() -> None:
     print(f"ICL model parameters: {n_params:,}  rank={icl_rank}")
 
     # GP-MLE/DKL must score against the same convention used to build this
-    # dataset's R_star ("prior" ignores training conditioning entirely,
+    # run's R_star ("prior" ignores training conditioning entirely,
     # "posterior" conditions on X_train) — see classical.fit_and_eval_gpytorch's
-    # docstring. Read from the checkpoint's own saved training cfg by
-    # default, since that's the actual generation config for this run's
-    # dataset; falls back to "prior" (this repo's current datasets all use
-    # oracle_mode=prior, unlike data_gen.py's own historical "posterior"
-    # default for dataset *generation*).
-    oracle_mode = args.oracle_mode or OmegaConf.select(icl_cfg, "data.oracle_mode", default="prior")
+    # docstring. Read from cfg (the fixed eval-generating config above), the
+    # actual generation config for these episodes; falls back to "prior"
+    # (this repo's current datasets all use oracle_mode=prior, unlike
+    # data_gen.py's own historical "posterior" default for dataset
+    # *generation*).
+    oracle_mode = args.oracle_mode or OmegaConf.select(cfg, "data.oracle_mode", default="prior")
     print(f"Oracle mode: {oracle_mode}")
 
-    # GP-MLE/DKL hyperpriors: read the exact LogNormal/Gamma constants this
-    # checkpoint's dataset was generated with, falling back to
-    # classical._DEFAULT_PRIOR_CFG for any missing key (e.g. an older
-    # checkpoint saved before a given key existed).
-    data_cfg = OmegaConf.select(icl_cfg, "data", default=None)
+    # GP-MLE/DKL hyperpriors: read the exact LogNormal/Gamma constants these
+    # episodes are actually generated with (cfg, not the checkpoint's own
+    # training cfg — see cfg's definition above), falling back to
+    # classical._DEFAULT_PRIOR_CFG for any missing key.
+    data_cfg = OmegaConf.select(cfg, "data", default=None)
     prior_cfg = OmegaConf.to_container(data_cfg) if data_cfg is not None else {}
     print(f"GP-MLE restarts: {args.n_restarts_mle}")
 
@@ -386,14 +434,15 @@ def main() -> None:
     plot_R_oracle: Tensor | None = None
 
     if live_generate:
-        # icl_cfg is the checkpoint's own saved training config (same source
-        # already used for prior_cfg above), so live-generated episodes match
-        # the kernel family/hyperprior distribution the ICL model was
-        # actually trained on.
+        # cfg (the fixed eval-generating config, not icl_cfg) drives live
+        # generation — same source already used for prior_cfg above — so
+        # every checkpoint evaluated against this --config gets identical
+        # episodes for a given seed, regardless of what that checkpoint was
+        # itself trained on.
         print(f"\nLive-generating {n_ep} episodes via generate_gp_batch "
               f"(return_kernel_metadata=True), seed={args.seed}, "
               "alternating every-other episode to a non-composite kernel")
-        live_episodes = _live_generate_alternating(icl_cfg, n_ep, device, args.seed)
+        live_episodes = _live_generate_alternating(cfg, n_ep, device, args.seed)
     else:
         dataset_dir = args.dataset_dir or cfg.training.dataset_dir
         dataset = CopulaDataset(episode_dir=dataset_dir)
@@ -408,7 +457,7 @@ def main() -> None:
     # episodes already scored under an identical generation/fitting config ----
     use_cache = not args.no_baseline_cache
     fingerprint = baseline_fingerprint(
-        icl_cfg, live_generate, args.dataset_dir, args.seed, icl_rank, oracle_mode,
+        cfg, live_generate, args.dataset_dir, args.seed, icl_rank, oracle_mode,
         args.n_steps_mle, args.lr_mle, args.n_restarts_mle,
         args.n_steps_dkl, args.lr_dkl, args.n_steps_per_ep, args.patience_per_ep,
     )

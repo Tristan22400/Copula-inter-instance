@@ -845,7 +845,7 @@ def eval_baselines_episode(
 
 
 def baseline_fingerprint(
-    icl_cfg,
+    gen_cfg,
     live_generate: bool,
     dataset_dir: str | None,
     seed: int,
@@ -862,17 +862,22 @@ def baseline_fingerprint(
     """Everything that determines the *baseline* fit results for an episode,
     other than which episode it is (see episode_cache_key for that half).
 
-    Includes cfg.data (the generating distribution episodes are drawn from,
-    and the source of prior_cfg's hyperpriors) and icl_rank (sizes
+    Includes gen_cfg.data (the generating distribution episodes are drawn
+    from, and the source of prior_cfg's hyperpriors) and icl_rank (sizes
     per_ep_transformer's low-rank factor — see train_per_episode's docstring)
     since both change what a "correct" baseline fit looks like, even though
     neither is a baseline-fitting hyperparameter in the argparse sense.
-    Deliberately excludes the rest of icl_cfg (e.g. model architecture,
+
+    gen_cfg is eval_checkpoint.main's fixed --config-derived cfg, not the
+    checkpoint's own saved training cfg — deliberately, so that switching
+    --ckpt between checkpoints trained under different cfg.data doesn't
+    invalidate the cache (episode content only depends on gen_cfg + seed).
+    Deliberately excludes the rest of gen_cfg (e.g. model architecture,
     optimizer settings) — those affect the ICL model, not the baselines being
     cached here, and including them would invalidate the cache every time an
     unrelated training run tweaks something baselines never see.
     """
-    data_cfg = OmegaConf.select(icl_cfg, "data", default=None)
+    data_cfg = OmegaConf.select(gen_cfg, "data", default=None)
     return {
         "data_cfg": OmegaConf.to_container(data_cfg) if data_cfg is not None else {},
         "icl_rank": icl_rank,
