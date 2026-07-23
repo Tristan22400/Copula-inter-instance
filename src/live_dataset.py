@@ -80,8 +80,10 @@ class LiveGPDataset(IterableDataset):
         # collisions are astronomically unlikely over a training run. A
         # collision would only cost a moment of duplicated episodes, not
         # correctness, so this doesn't need to be bulletproof.
+        # _seed_everything (data_gen.py) forwards this to np.random.seed, which
+        # requires 0 <= seed < 2**32 — mod into that range, not a wider one.
         raw = (self._base_seed + 1) * 1_000_003 + worker_id * 1_000_000_007 + call_idx
-        return raw % (2**63 - 1)
+        return raw % (2**32)
 
     def __iter__(self) -> Iterator[dict]:
         info = get_worker_info()
