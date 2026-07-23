@@ -1282,6 +1282,186 @@ def _build_kernel_chain(
     return kernel, component_params, outer_params
 
 
+class _MeanFunctionBank(gpytorch.means.Mean):
+    """Full CauKer-style mean bank (github.com/ShifengXIE/CauKer): each
+    episode gets exactly one of {Linear (incl. constant-only), Exponential,
+    Sparse-Anomaly}, chosen by a per-episode categorical draw, or exact zero
+    (handled upstream in _sample_mean_module by never constructing this
+    class). All three non-zero families are deterministic functions of x
+    alone (never of row order/index -- this repo's rows are i.i.d. tabular
+    instances, not a time series, so mu_star must be reproducible from
+    x_test regardless of which rows land in train vs test at call time).
+
+    Linear reuses the per-feature coefficient vector `weight` (one
+    coefficient per input dim, matching CauKer's per-feature trend and
+    gpytorch.means.LinearMean's own convention). Exponential and Anomaly
+    instead each need a single scalar "progression" axis, not one
+    coefficient per feature -- exp()/a threshold only stay well-behaved
+    if their input is O(1) regardless of d, so both project x onto a
+    *unit-norm* random direction (`exp_direction`/`anomaly_direction`)
+    rather than sampling per-feature coefficients the way `weight` does.
+    Given the per-episode z-normalised features this file always produces
+    (see generate_gp_batch), a unit-direction projection is approximately
+    N(0, 1) by the CLT regardless of d, which is what lets
+    `anomaly_threshold` below be calibrated from a target sparsity
+    fraction via the inverse normal CDF.
+
+    The exponential exponent is clamped to [-10, 10] before `exp()`: without
+    this, a rare large sample of `exp_rate * exp_proj` could overflow to inf,
+    and `inf * 0` is nan -- silently poisoning the *other* families' rows
+    through the one-hot sum below even though their own term is finite.
+    """
+
+    def __init__(
+        self,
+        weight: Tensor,
+        bias: Tensor,
+        exp_direction: Tensor,
+        exp_rate: Tensor,
+        exp_scale: Tensor,
+        anomaly_direction: Tensor,
+        anomaly_threshold: Tensor,
+        anomaly_magnitude: Tensor,
+        family_onehot: Tensor,
+    ):
+        super().__init__()
+        self.register_buffer("weight", weight)  # (B, d)
+        self.register_buffer("bias", bias)  # (B,)
+        self.register_buffer("exp_direction", exp_direction)  # (B, d), unit norm
+        self.register_buffer("exp_rate", exp_rate)  # (B,)
+        self.register_buffer("exp_scale", exp_scale)  # (B,)
+        self.register_buffer("anomaly_direction", anomaly_direction)  # (B, d), unit norm
+        self.register_buffer("anomaly_threshold", anomaly_threshold)  # (B,)
+        self.register_buffer("anomaly_magnitude", anomaly_magnitude)  # (B,)
+        self.register_buffer("family_onehot", family_onehot)  # (B, 3): [linear, exponential, anomaly]
+
+    def forward(self, x: Tensor) -> Tensor:  # x: (B, n, d)
+        linear_val = (x * self.weight.unsqueeze(1)).sum(-1) + self.bias.unsqueeze(-1)
+
+        exp_proj = (x * self.exp_direction.unsqueeze(1)).sum(-1)
+        exponent = torch.clamp(self.exp_rate.unsqueeze(-1) * exp_proj, min=-10.0, max=10.0)
+        exp_val = self.exp_scale.unsqueeze(-1) * torch.exp(exponent)
+
+        anomaly_proj = (x * self.anomaly_direction.unsqueeze(1)).sum(-1)
+        anomaly_hit = (anomaly_proj > self.anomaly_threshold.unsqueeze(-1)).to(x.dtype)
+        anomaly_val = anomaly_hit * self.anomaly_magnitude.unsqueeze(-1)
+
+        stacked = torch.stack([linear_val, exp_val, anomaly_val], dim=-1)  # (B, n, 3)
+        return (stacked * self.family_onehot.unsqueeze(1)).sum(-1)
+
+
+def _sample_mean_module(cfg, d: int, B: int, device) -> tuple[gpytorch.means.Mean, Dict[str, Tensor]]:
+    """Non-zero GP mean bank (CauKer-inspired, github.com/ShifengXIE/CauKer:
+    their Table 1 shows "Mean+KernelSynth" — adding a non-zero mean function
+    — clearly beats zero-mean KernelSynth). Covers all four of CauKer's own
+    mean families: Zero, Linear, Exponential, Sparse Anomalies (see
+    _MeanFunctionBank for the Exponential/Anomaly formulas).
+
+    Mathematically inert for R_star/Sigma_star/sigma_star regardless of
+    which family fires: a GP's posterior *covariance* never depends on its
+    mean function (only mu_star does — see R&W §2.7), so this only
+    diversifies mu_star/z_train/z_test's realism and can never perturb the
+    correlation structure this pipeline exists to report. It DOES need
+    mu_star/z_train/z_test to be computed against this same mean (see
+    _generate_gp_batch_raw's oracle_mode branches and _GeneratorGP) — adding
+    a mean to y_all without also updating those would silently miscalibrate
+    the PIT.
+
+    Per-episode gating (batched, no Python loop over B):
+      - nonzero_mask ~ Bernoulli(mean_fn_prob): does this episode get any
+        non-zero mean at all? (else exact ZeroMean)
+      - family_idx ~ Categorical(mean_fn_family_probs) over
+        {linear, exponential, anomaly}, AND'd with nonzero_mask via
+        family_onehot (a fully-zeroed one-hot row makes _MeanFunctionBank's
+        forward() return exactly 0 for that episode, i.e. ZeroMean).
+      - Within the linear family: linear_mask ~
+        Bernoulli(mean_fn_linear_prob) decides whether it carries a trend
+        (a random direction across the full d-dimensional feature space) or
+        is constant-only (weight forced to 0, bias kept).
+    cfg.data.mean_fn_enabled defaults to False (byte-for-byte no-op — same
+    convention as mlp_mixing_enabled) — every existing config/dataset is
+    unaffected until this is explicitly turned on, and the disabled path
+    returns a plain gpytorch.means.ZeroMean (no RNG draws at all, so no
+    save/restore of RNG state is needed there).
+
+    Returns (mean_module, params) where params (for return_kernel_metadata)
+    holds "mean_weight" (B, d), "mean_bias" (B,), "mean_nonzero" (B,) bool,
+    "mean_family" (B,) long in {0=linear, 1=exponential, 2=anomaly} (only
+    meaningful where mean_nonzero is True), "mean_linear" (B,) bool.
+    """
+    batch_shape = torch.Size([B])
+
+    if not bool(getattr(cfg.data, "mean_fn_enabled", False)):
+        mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape).to(device)
+        params = {
+            "mean_weight": torch.zeros(B, d, device=device),
+            "mean_bias": torch.zeros(B, device=device),
+            "mean_nonzero": torch.zeros(B, dtype=torch.bool, device=device),
+            "mean_family": torch.zeros(B, dtype=torch.long, device=device),
+            "mean_linear": torch.zeros(B, dtype=torch.bool, device=device),
+        }
+        return mean_module, params
+
+    prob_nonzero = float(getattr(cfg.data, "mean_fn_prob", 0.5))
+    prob_linear = float(getattr(cfg.data, "mean_fn_linear_prob", 0.5))
+    weight_std = float(getattr(cfg.data, "mean_fn_weight_std", 0.5))
+    bias_std = float(getattr(cfg.data, "mean_fn_bias_std", 1.0))
+    family_probs = list(getattr(cfg.data, "mean_fn_family_probs", [0.5, 0.25, 0.25]))
+    exp_rate_std = float(getattr(cfg.data, "mean_fn_exp_rate_std", 0.5))
+    exp_scale_std = float(getattr(cfg.data, "mean_fn_exp_scale_std", 1.0))
+    anomaly_frac = float(getattr(cfg.data, "mean_fn_anomaly_frac", 0.1))
+    anomaly_magnitude_std = float(getattr(cfg.data, "mean_fn_anomaly_magnitude_std", 2.0))
+
+    nonzero_mask = torch.rand(B, device=device) < prob_nonzero
+
+    family_weights = torch.tensor(family_probs, device=device, dtype=torch.float32)
+    family_idx = torch.multinomial(family_weights.expand(B, -1), 1, replacement=True).squeeze(-1)  # (B,) in {0,1,2}
+    family_onehot = torch.zeros(B, 3, device=device)
+    family_onehot.scatter_(1, family_idx.unsqueeze(-1), 1.0)
+    family_onehot = family_onehot * nonzero_mask.unsqueeze(-1)  # zero out episodes with no mean at all
+
+    is_linear = nonzero_mask & (family_idx == 0)
+    linear_mask = is_linear & (torch.rand(B, device=device) < prob_linear)
+    weight = torch.randn(B, d, device=device) * weight_std * linear_mask.unsqueeze(-1)
+    bias = torch.randn(B, device=device) * bias_std * is_linear
+
+    exp_direction = torch.randn(B, d, device=device)
+    exp_direction = exp_direction / exp_direction.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    exp_rate = torch.randn(B, device=device) * exp_rate_std
+    exp_scale = torch.randn(B, device=device) * exp_scale_std
+
+    anomaly_direction = torch.randn(B, d, device=device)
+    anomaly_direction = anomaly_direction / anomaly_direction.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    # Projection onto a unit direction of per-episode z-normalised features is
+    # approximately N(0, 1) (CLT), so the inverse normal CDF of (1 -
+    # anomaly_frac) gives a threshold that fires on approximately
+    # anomaly_frac of instances, independent of d.
+    anomaly_threshold_value = math.sqrt(2.0) * torch.erfinv(torch.tensor(2.0 * (1.0 - anomaly_frac) - 1.0))
+    anomaly_threshold = anomaly_threshold_value.to(device).expand(B).clone()
+    anomaly_magnitude = torch.randn(B, device=device) * anomaly_magnitude_std
+
+    mean_module = _MeanFunctionBank(
+        weight=weight,
+        bias=bias,
+        exp_direction=exp_direction,
+        exp_rate=exp_rate,
+        exp_scale=exp_scale,
+        anomaly_direction=anomaly_direction,
+        anomaly_threshold=anomaly_threshold,
+        anomaly_magnitude=anomaly_magnitude,
+        family_onehot=family_onehot,
+    ).to(device)
+
+    params = {
+        "mean_weight": weight,
+        "mean_bias": bias,
+        "mean_nonzero": nonzero_mask,
+        "mean_family": family_idx,
+        "mean_linear": linear_mask,
+    }
+    return mean_module, params
+
+
 # ---------------------------------------------------------------------------
 # GP posterior (kernel-agnostic)
 # ---------------------------------------------------------------------------
@@ -1343,9 +1523,16 @@ class _GeneratorGP(gpytorch.models.ExactGP):
     diff) to the old manual computation, given max_cholesky_size forced
     high enough (see _MAX_CHOLESKY) and fast_pred_var disabled at call time."""
 
-    def __init__(self, train_x: Tensor, train_y: Tensor, likelihood, kernel: gpytorch.kernels.Kernel, batch_shape: torch.Size):
+    def __init__(
+        self, train_x: Tensor, train_y: Tensor, likelihood, kernel: gpytorch.kernels.Kernel,
+        batch_shape: torch.Size, mean_module: Optional[gpytorch.means.Mean] = None,
+    ):
         super().__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
+        # Defaults to ZeroMean for any other caller (none currently exist)
+        # that doesn't pass one — _generate_gp_batch_raw always passes its
+        # own _sample_mean_module result (an exact ZeroMean when
+        # cfg.data.mean_fn_enabled is False, else a _MeanFunctionBank).
+        self.mean_module = mean_module if mean_module is not None else gpytorch.means.ZeroMean(batch_shape=batch_shape)
         self.covar_module = kernel
 
     def forward(self, x: Tensor) -> gpytorch.distributions.MultivariateNormal:
@@ -1821,6 +2008,11 @@ def _generate_gp_batch_raw(
     likelihood = _build_likelihood(cfg, kernel_name, B, device)
     nugget = likelihood.noise.reshape(B)  # "nugget" name kept for the saved-metadata schema
 
+    # --- Non-zero mean bank (CauKer-inspired, see _sample_mean_module) ---
+    # Built once per batch call, independent hyperparameters per episode —
+    # same granularity as kernel_obj/likelihood above.
+    mean_module, mean_params = _sample_mean_module(cfg, d, B, device)
+
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
     x_raw = tabiclv2_warp_features(x_raw)
@@ -1887,7 +2079,13 @@ def _generate_gp_batch_raw(
     # offered no such guarantee for the *reported* K_all.
     L_all, failed_all = _psd_safe_batch(K_all_raw)
     K_all = L_all @ L_all.mT                          # (B, T, T), PSD by construction
-    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero prior mean
+    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero-mean GP sample
+    # Add the (possibly all-zero) mean bank on top — a deterministic function
+    # of x_norm alone, so this stays an exact GP(mean_module, K_all) sample;
+    # oracle_mode branches below read mu_star off this same mean_module, not
+    # off a hardcoded zero, so z_train/z_test stay correctly calibrated (see
+    # _sample_mean_module's docstring).
+    y_all = y_all + mean_module(x_norm)
 
     x_norm_train = x_norm[:, :P]   # (B, P, d)
     x_norm_test  = x_norm[:, P:]   # (B, N, d)
@@ -1926,7 +2124,7 @@ def _generate_gp_batch_raw(
         # not a slice of an unprotected raw materialization. A principal
         # submatrix of a PSD matrix is itself PSD, so no further repair is
         # needed at this point.
-        mu_star    = torch.zeros(B, N, device=device)
+        mu_star    = mean_module(x_norm_test)
         Sigma_star = K_ss
     elif oracle_mode == "posterior":
         # Posterior oracle: condition on (x_train, y_train) via gpytorch's own
@@ -1956,6 +2154,7 @@ def _generate_gp_batch_raw(
             post_model = _GeneratorGP(
                 x_kernel_train.double(), y_train.double(),
                 likelihood.double(), kernel_obj.double(), batch_shape,
+                mean_module.double(),
             ).eval()
             post = post_model(x_kernel_test.double())
             mu_star    = post.mean.to(out_dtype)               # (B, N)
@@ -2025,6 +2224,8 @@ def _generate_gp_batch_raw(
     # surfaced much later as a training-time crash.
     discard = discard | degen
 
+    discard = discard | degen
+
     # Reconstruct full posterior covariance (for Y-space oracle)
     Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
 
@@ -2043,6 +2244,26 @@ def _generate_gp_batch_raw(
         "mu_star":      mu_star.cpu(),
         "sigma_star":   sigma_star.cpu(),
     }
+
+    # Belt-and-braces: any saved field containing NaN/Inf means a numerically
+    # degenerate episode slipped past the checks above (e.g. R_star/Sigma_star
+    # blowing up from a near-singular posterior covariance — a different
+    # failure mode than the LOO z_train check, since it comes from the K_ss/
+    # K_st/K_ff test-side conditioning rather than K_ff's LOO diag). NaN/Inf
+    # is never a legitimate value regardless of kernel, so this is safe to
+    # enforce unconditionally (unlike a min-eigenvalue floor, which would also
+    # reject legitimate near-singular-but-finite draws).
+    non_finite = torch.zeros(B, dtype=torch.bool)
+    for _t in tensors.values():
+        non_finite = non_finite | ~_t.reshape(_t.shape[0], -1).isfinite().all(dim=1)
+    if non_finite.any():
+        warnings.warn(
+            f"generate_gp_batch: {int(non_finite.sum())}/{B} episodes contain "
+            f"NaN/Inf in a saved field and will be discarded.",
+            RuntimeWarning,
+        )
+    discard = discard | non_finite.to(discard.device)
+
     n_tr = torch.tensor(P)
     n_te = torch.tensor(N)
     extra: Dict[str, object] = {"n_train": n_tr, "n_test": n_te}
@@ -2072,6 +2293,8 @@ def _generate_gp_batch_raw(
             tensors[key] = params[key].cpu()
         tensors["nugget"] = nugget.cpu()
         tensors["mlp_mixed"] = mlp_mixed.cpu()
+        for key in ("mean_weight", "mean_bias", "mean_nonzero", "mean_family", "mean_linear"):
+            tensors[key] = mean_params[key].cpu()
         tensors["_L_ff"] = L_ff
         tensors["_alpha"] = alpha
         extra["kernel"] = kernel_name
