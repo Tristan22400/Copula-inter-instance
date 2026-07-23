@@ -105,6 +105,50 @@ mlp_num_layers_max: 4
 # fan-in scaling -- keeps the pre-activation roughly variance-preserving.
 mlp_mix_weight_std: 1.0
 
+# Non-zero GP mean bank (CauKer-inspired, github.com/ShifengXIE/CauKer):
+# CAUKER's own ablation (Table 1, "Mean+KernelSynth" vs zero-mean
+# "KernelSynth") shows adding a non-zero mean is one of the two clearest
+# wins in their pipeline (the other being the SCM causal graph, which this
+# repo deliberately does NOT port to sampled outputs -- see
+# apply_mlp_feature_mixing's docstring -- since that would force Monte
+# Carlo and break the exact analytic R_star/Cholesky oracle). A non-zero
+# *mean*, by contrast, is completely free: GP posterior covariance never
+# depends on the mean function (only mu_star does), so this diversifies
+# mu_star/z_train/z_test realism without perturbing R_star/Sigma_star at
+# all. Covers all four of CauKer's own mean families -- Zero, Linear,
+# Exponential, Sparse Anomalies. See data_gen.py::_sample_mean_module /
+# _MeanFunctionBank / _GeneratorGP.
+# Default off (byte-for-byte no-op, same convention as mlp_mixing_enabled)
+# at the code level; turned on here.
+mean_fn_enabled: true
+# Per-episode probability of getting any non-zero mean at all (else exact
+# ZeroMean).
+mean_fn_prob: 0.5
+# Conditional on non-zero (above), categorical weights over which family
+# fires: [linear, exponential, anomaly] (data_gen.py::_MeanFunctionBank).
+mean_fn_family_probs: [0.5, 0.25, 0.25]
+# Within the linear family, probability it also carries a linear trend (a
+# random direction across the full d-dimensional feature space) rather than
+# being a constant-only offset.
+mean_fn_linear_prob: 0.5
+# Std of the linear family's per-episode random trend direction / constant
+# offset. Kept modest relative to the GP's own alpha2 (outputscale) scale so
+# the mean diversifies mu_star without dwarfing the kernel-driven signal --
+# validate against tests/test_dataset_corr_uniform.py before raising.
+mean_fn_weight_std: 0.5
+mean_fn_bias_std: 1.0
+# Exponential family: mu(x) = exp_scale * exp(exp_rate * <unit_direction, x>).
+# exp_rate can be negative (decay) as easily as positive (growth) -- both are
+# sampled symmetrically around 0 via these stds.
+mean_fn_exp_rate_std: 0.5
+mean_fn_exp_scale_std: 1.0
+# Sparse-anomaly family: a spike of size ~N(0, mean_fn_anomaly_magnitude_std)
+# added wherever a random unit-direction projection of x exceeds a threshold
+# calibrated (via inverse normal CDF) to fire on approximately this fraction
+# of instances.
+mean_fn_anomaly_frac: 0.1
+mean_fn_anomaly_magnitude_std: 2.0
+
 # Nugget/noise: single diagonal regulariser ~ LogNormal(nugget_lognormal_loc,
 # nugget_lognormal_scale), shared by ALL kernels — defaults to the tuned
 # "HEBO+" noise prior from the PFN4BO paper (github.com/automl/PFNs4BO,
