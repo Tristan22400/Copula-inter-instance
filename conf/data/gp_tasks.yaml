@@ -153,7 +153,7 @@ composite_num_kernels_max: 8
 # "polynomial" is excluded here for now (like periodic/cosine/dot_product):
 # new addition, not yet validated against tests/test_dataset_corr_uniform.py
 # in long chains — remove it from this list once validated.
-composite_exclude_kernels: [periodic, cosine, dot_product, polynomial]
+composite_exclude_kernels: [periodic, cosine]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
@@ -161,7 +161,7 @@ period_lognormal_scale: 0.4
 rq_alpha_gamma_concentration: 2.0    # rational_quadratic kernel's `rq_alpha`
 rq_alpha_gamma_rate: 1.0
 poly_power_min: 2     # polynomial kernel's integer degree d, sampled once per
-poly_power_max: 4     # generate_gp_batch call (shared by the whole batch — see data_gen.py)
+poly_power_max: 5     # generate_gp_batch call (shared by the whole batch — see data_gen.py)
 poly_offset_gamma_concentration: 2.0    # polynomial kernel's offset c
 poly_offset_gamma_rate: 1.0
 
@@ -201,8 +201,8 @@ poly_offset_gamma_rate: 1.0
 # validate -- a fixed prob that works for 8-component chains will likely be
 # too aggressive for bare/2-component kernels (e.g. prob=1.0 on a bare
 # kernel already gives neg_frac ~0.36, see SignModulatedKernel's docstring).
-sign_modulation_component_prob: 0.0
-sign_modulation_outer_prob: 0.0
+sign_modulation_component_prob: 0.7
+sign_modulation_outer_prob: 0.5
 
 # PIT epsilon for probit clamping (analytical pipeline)
 pit_eps: 1.0e-6
