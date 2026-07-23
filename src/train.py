@@ -59,6 +59,7 @@ from dataset import (
     ShardHomogeneousBatchSampler,
     collate_fn,
 )
+from live_dataset import build_fixed_live_val_batches, build_live_train_loader
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
 from muon import Muon
@@ -610,127 +611,142 @@ def main(cfg: DictConfig) -> None:
         config=OmegaConf.to_container(cfg, resolve=True),
     )
 
-    meta_path   = os.path.join(t.dataset_dir, "meta.pt")
-    shard_files = sorted(glob(os.path.join(t.dataset_dir, "shard_*.pt")))
+    live_generation = bool(t.get("live_generation", False))
 
-    train_sampler = None
-    train_batch_sampler = None
-    val_batch_sampler = None
-    if shard_files and os.path.exists(meta_path):
-        shard_block_shards = int(t.get("shard_block_shards", 16))
-        # Cache must hold a full active block, or each worker still thrashes
-        # against the block's shards one-by-one (+4 margin: workers process
-        # batches round-robin, so a worker can straddle two blocks briefly).
-        full_dataset = CopulaDataset(
-            episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4
+    if live_generation:
+        # No on-disk dataset at all: episodes are generated on the fly by
+        # DataLoader worker processes (see live_dataset.py). Temporary
+        # substitute for the disk pipeline below — set training.live_generation
+        # =false (the default) to fall back to it unchanged.
+        print(
+            "[train] live_generation=true — generating episodes on the fly, "
+            f"no dataset_dir read ({t.dataset_dir!r} ignored)."
         )
-        n = len(full_dataset)
-        n_val = min(500, max(1, int(n * t.val_fraction)))
-        # generate_gp_batch (data_gen.py) samples kernel_name/P/N/active_dims
-        # once per shard call, shared by every episode in that shard — a
-        # contiguous index block smaller than shard_size (as a plain
-        # range(n_val) would be) pins validation to a single task shape
-        # instead of sampling the full config distribution train sees. Stride
-        # evenly across the whole dataset so val spans many shards/configs.
-        val_indices = sorted(set(int(i) for i in torch.linspace(0, n - 1, n_val)))
-        val_set = set(val_indices)
-        train_indices = [i for i in range(n) if i not in val_set]
-        train_dataset = Subset(full_dataset, train_indices)
-        val_dataset   = Subset(full_dataset, val_indices)
-
-        # Detect per-shard-varying d_features. Such datasets store a different
-        # feature count per shard (data_gen.py::_sample_d_features); a batch that
-        # mixes shards then has mismatched feature columns and cannot be stacked
-        # by collate_fn (TabICL consumes one (B, T, d_x) tensor; the row masks do
-        # not cover the feature axis). Probe a handful of shards for varying d.
-        shard_size = full_dataset.shard_size
-        n_shards = (n + shard_size - 1) // shard_size
-        probe_ids = torch.randperm(n_shards)[:8].tolist()
-        d_seen = {
-            int(full_dataset[min(sid * shard_size, n - 1)]["x_norm_train"].shape[-1])
-            for sid in probe_ids
-        }
-        variable_d = len(d_seen) > 1
-
-        if variable_d:
-            # Batch strictly within one shard (train AND val) so every minibatch
-            # is feature-homogeneous. A shard also shares one kernel/P/N/
-            # active_dims, so these batches are single-task — the accepted price
-            # of variable-d. shard_block_shards (cross-shard mixing) is moot here.
-            print(
-                "[train] per-shard-varying d_features detected "
-                f"({sorted(d_seen)}...) → batching within single shards "
-                "(single-task batches; shard_block_shards ignored)."
-            )
-            train_batch_sampler = ShardHomogeneousBatchSampler(
-                train_dataset.indices,
-                shard_size=shard_size,
-                batch_size=t.batch_size,
-                shuffle=True,
-            )
-            val_batch_sampler = ShardHomogeneousBatchSampler(
-                val_dataset.indices,
-                shard_size=shard_size,
-                batch_size=t.batch_size,
-                shuffle=False,
-            )
-        else:
-            # Fixed-d: sharded datasets can span thousands of shards; a global
-            # shuffle scatters each batch across dozens of them, thrashing the
-            # shard LRU cache (dataset.py) with repeated full-shard reloads from
-            # disk/NFS. Shuffle at shard-block granularity instead — still a true
-            # per-epoch permutation (see ShardBlockSampler docstring), just with
-            # locality-friendly ordering. Cross-shard mixing within a batch is
-            # fine (and desirable) because every shard shares the same d.
-            train_sampler = ShardBlockSampler(
-                train_dataset.indices,
-                shard_size=shard_size,
-                block_shards=shard_block_shards,
-            )
+        train_loader = build_live_train_loader(cfg, t, device)
+        val_loader   = build_fixed_live_val_batches(cfg, t)
+        print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
     else:
-        all_files = sorted(glob(os.path.join(t.dataset_dir, "task_*.pt")))
-        if not all_files:
-            raise RuntimeError(
-                f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first."
+        meta_path   = os.path.join(t.dataset_dir, "meta.pt")
+        shard_files = sorted(glob(os.path.join(t.dataset_dir, "shard_*.pt")))
+
+        train_sampler = None
+        train_batch_sampler = None
+        val_batch_sampler = None
+        if shard_files and os.path.exists(meta_path):
+            shard_block_shards = int(t.get("shard_block_shards", 16))
+            # Cache must hold a full active block, or each worker still thrashes
+            # against the block's shards one-by-one (+4 margin: workers process
+            # batches round-robin, so a worker can straddle two blocks briefly).
+            full_dataset = CopulaDataset(
+                episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4
             )
-        n_val = min(500, max(1, int(len(all_files) * t.val_fraction)))
-        train_dataset = CopulaDataset(file_list=all_files[n_val:])
-        val_dataset   = CopulaDataset(file_list=all_files[:n_val])
+            n = len(full_dataset)
+            n_val = min(500, max(1, int(n * t.val_fraction)))
+            # generate_gp_batch (data_gen.py) samples kernel_name/P/N/active_dims
+            # once per shard call, shared by every episode in that shard — a
+            # contiguous index block smaller than shard_size (as a plain
+            # range(n_val) would be) pins validation to a single task shape
+            # instead of sampling the full config distribution train sees. Stride
+            # evenly across the whole dataset so val spans many shards/configs.
+            val_indices = sorted(set(int(i) for i in torch.linspace(0, n - 1, n_val)))
+            val_set = set(val_indices)
+            train_indices = [i for i in range(n) if i not in val_set]
+            train_dataset = Subset(full_dataset, train_indices)
+            val_dataset   = Subset(full_dataset, val_indices)
 
-    print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} episodes")
-
-    # A batch_sampler (variable-d homogeneous batching) is mutually exclusive
-    # with batch_size/sampler/shuffle, so pick one construction or the other.
-    train_loader = DataLoader(
-        train_dataset,
-        collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=(device == "cuda"),
-        persistent_workers=True,
-        prefetch_factor=4,
-        **(
-            {"batch_sampler": train_batch_sampler}
-            if train_batch_sampler is not None
-            else {
-                "batch_size": t.batch_size,
-                "sampler": train_sampler,
-                "shuffle": (train_sampler is None),
+            # Detect per-shard-varying d_features. Such datasets store a different
+            # feature count per shard (data_gen.py::_sample_d_features); a batch that
+            # mixes shards then has mismatched feature columns and cannot be stacked
+            # by collate_fn (TabICL consumes one (B, T, d_x) tensor; the row masks do
+            # not cover the feature axis). Probe a handful of shards for varying d.
+            shard_size = full_dataset.shard_size
+            n_shards = (n + shard_size - 1) // shard_size
+            probe_ids = torch.randperm(n_shards)[:8].tolist()
+            d_seen = {
+                int(full_dataset[min(sid * shard_size, n - 1)]["x_norm_train"].shape[-1])
+                for sid in probe_ids
             }
-        ),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=(device == "cuda"),
-        persistent_workers=True,
-        prefetch_factor=4,
-        **(
-            {"batch_sampler": val_batch_sampler}
-            if val_batch_sampler is not None
-            else {"batch_size": t.batch_size, "shuffle": False}
-        ),
-    )
+            variable_d = len(d_seen) > 1
+
+            if variable_d:
+                # Batch strictly within one shard (train AND val) so every minibatch
+                # is feature-homogeneous. A shard also shares one kernel/P/N/
+                # active_dims, so these batches are single-task — the accepted price
+                # of variable-d. shard_block_shards (cross-shard mixing) is moot here.
+                print(
+                    "[train] per-shard-varying d_features detected "
+                    f"({sorted(d_seen)}...) → batching within single shards "
+                    "(single-task batches; shard_block_shards ignored)."
+                )
+                train_batch_sampler = ShardHomogeneousBatchSampler(
+                    train_dataset.indices,
+                    shard_size=shard_size,
+                    batch_size=t.batch_size,
+                    shuffle=True,
+                )
+                val_batch_sampler = ShardHomogeneousBatchSampler(
+                    val_dataset.indices,
+                    shard_size=shard_size,
+                    batch_size=t.batch_size,
+                    shuffle=False,
+                )
+            else:
+                # Fixed-d: sharded datasets can span thousands of shards; a global
+                # shuffle scatters each batch across dozens of them, thrashing the
+                # shard LRU cache (dataset.py) with repeated full-shard reloads from
+                # disk/NFS. Shuffle at shard-block granularity instead — still a true
+                # per-epoch permutation (see ShardBlockSampler docstring), just with
+                # locality-friendly ordering. Cross-shard mixing within a batch is
+                # fine (and desirable) because every shard shares the same d.
+                train_sampler = ShardBlockSampler(
+                    train_dataset.indices,
+                    shard_size=shard_size,
+                    block_shards=shard_block_shards,
+                )
+        else:
+            all_files = sorted(glob(os.path.join(t.dataset_dir, "task_*.pt")))
+            if not all_files:
+                raise RuntimeError(
+                    f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first."
+                )
+            n_val = min(500, max(1, int(len(all_files) * t.val_fraction)))
+            train_dataset = CopulaDataset(file_list=all_files[n_val:])
+            val_dataset   = CopulaDataset(file_list=all_files[:n_val])
+
+        print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} episodes")
+
+        # A batch_sampler (variable-d homogeneous batching) is mutually exclusive
+        # with batch_size/sampler/shuffle, so pick one construction or the other.
+        train_loader = DataLoader(
+            train_dataset,
+            collate_fn=collate_fn,
+            num_workers=4,
+            pin_memory=(device == "cuda"),
+            persistent_workers=True,
+            prefetch_factor=4,
+            **(
+                {"batch_sampler": train_batch_sampler}
+                if train_batch_sampler is not None
+                else {
+                    "batch_size": t.batch_size,
+                    "sampler": train_sampler,
+                    "shuffle": (train_sampler is None),
+                }
+            ),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            collate_fn=collate_fn,
+            num_workers=4,
+            pin_memory=(device == "cuda"),
+            persistent_workers=True,
+            prefetch_factor=4,
+            **(
+                {"batch_sampler": val_batch_sampler}
+                if val_batch_sampler is not None
+                else {"batch_size": t.batch_size, "shuffle": False}
+            ),
+        )
 
     baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
     synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
