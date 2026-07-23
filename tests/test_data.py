@@ -467,6 +467,53 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     assert len(d_set) == 1, f"top-up round used a different d_features than round 0: {d_set}"
 
 
+def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
+    """A non-finite z_train (near-singular K_ff blowing past the jitter
+    escalation ladder) must be discarded before an episode is saved, not
+    merely warned about and left in the output.
+
+    Regression: data_gen.py computed a `degen` mask for exactly this case
+    but never folded it into `discard`, and even where it did fire, NaN
+    comparisons are always False in PyTorch, so the std-based threshold
+    check (`z_std < 0.1 or > 3.0`) silently missed non-finite z_train
+    entirely. A corrupted episode reached disk and only surfaced much
+    later as a training crash deep inside TabICL's column embedder
+    ("cannot convert float NaN to integer" from `y_train.max()`). See
+    dataset.py's `CopulaDataset` load-time guard for the equivalent safety
+    net over datasets generated before this fix.
+    """
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.seed = 7
+
+    real_cholesky_solve = torch.cholesky_solve
+    state = {"poisoned": False}
+
+    def poisoning_cholesky_solve(b, L, *args, **kwargs):
+        # alpha = cholesky_solve(y_train, L_ff) is the first call to this
+        # function inside _generate_gp_batch_raw (line ~1907), ahead of the
+        # oracle_mode branch — poisoning only the very first global call
+        # corrupts exactly one episode's alpha, and hence its z_train.
+        out = real_cholesky_solve(b, L, *args, **kwargs)
+        if not state["poisoned"]:
+            state["poisoned"] = True
+            out = out.clone()
+            out[0] = float("nan")
+        return out
+
+    monkeypatch.setattr(torch, "cholesky_solve", poisoning_cholesky_solve)
+
+    episodes = dg.generate_gp_batch(cfg, B=8, device="cpu")
+
+    assert state["poisoned"], "test setup didn't actually poison an episode's alpha"
+    assert len(episodes) == 8
+    for ep in episodes:
+        assert torch.isfinite(ep["z_train"]).all()
+        assert torch.isfinite(ep["y_train"]).all()
+
+
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
 def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name):
     """The saved l (offset)/alpha2/power schema must round-trip through
@@ -776,3 +823,27 @@ def test_copula_dataset_load(tmp_path):
     assert "x_norm_train" in item
     assert "z_train" in item
     assert "R_star" in item
+
+
+def test_copula_dataset_skips_stale_nonfinite_episode(tmp_path):
+    """Datasets generated before the data_gen.py LOO-PIT degeneracy fix
+    (see test_degenerate_loo_z_is_discarded_not_leaked) can still have a
+    handful of non-finite z_train/y_train episodes already baked into
+    written shards -- regenerating a multi-hundred-GB dataset just to drop
+    a few episodes isn't worth it. CopulaDataset must skip past a
+    corrupted episode at load time (warn + advance to the next index)
+    instead of handing a NaN straight to the model, which crashes deep
+    inside TabICL's column embedder."""
+    samples = [_make_sample(P=6, N=3) for _ in range(4)]
+    samples[1]["z_train"] = torch.full_like(samples[1]["z_train"], float("nan"))
+
+    torch.save(samples, tmp_path / "shard_000000.pt")
+    torch.save({"n_total": len(samples), "shard_size": len(samples)}, tmp_path / "meta.pt")
+
+    ds = CopulaDataset(episode_dir=str(tmp_path))
+    assert len(ds) == 4
+
+    with pytest.warns(RuntimeWarning, match="non-finite"):
+        item = ds[1]
+    assert torch.isfinite(item["z_train"]).all()
+    assert torch.isfinite(item["y_train"]).all()

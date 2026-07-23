@@ -23,6 +23,18 @@ from typing import List, Optional, Sequence
 import torch
 from torch.utils.data import Dataset, Sampler
 
+# Keys checked for NaN/Inf before an episode is handed to the model. Datasets
+# generated before the data_gen.py LOO-PIT degeneracy fix (near-singular
+# K_ff producing a non-finite z_train that only tripped a warning, not a
+# discard) can still have a handful of these baked into already-written
+# shards; regenerating a multi-hundred-GB dataset just to drop a few episodes
+# isn't worth it, so this validates at load time and skips forward instead.
+_FINITE_CHECK_KEYS = ("z_train", "z_test", "y_train", "y_test")
+
+
+def _episode_is_finite(ep: dict) -> bool:
+    return all(torch.isfinite(ep[k]).all() for k in _FINITE_CHECK_KEYS if k in ep)
+
 
 class CopulaDataset(Dataset):
     """Dataset of pre-computed PIT episodes.
@@ -131,7 +143,9 @@ class CopulaDataset(Dataset):
     # Sharded loading with LRU cache
     # ------------------------------------------------------------------
 
-    def _get_sharded(self, idx: int) -> dict:
+    _MAX_INVALID_RETRIES = 8
+
+    def _load_shard_entry(self, idx: int) -> dict:
         shard_idx  = min(idx // self._shard_size, len(self._shard_files) - 1)
         local_idx  = idx  - shard_idx * self._shard_size
         shard_path = self._shard_files[shard_idx]
@@ -149,6 +163,32 @@ class CopulaDataset(Dataset):
         shard     = self._shard_cache[shard_path]
         local_idx = min(local_idx, len(shard) - 1)   # guard for last shard
         return shard[local_idx]
+
+    def _get_sharded(self, idx: int) -> dict:
+        # Non-finite z_train/y_train (see _episode_is_finite) shouldn't reach
+        # the model — that's what crashes training much later inside TabICL's
+        # column embedder with an opaque "cannot convert float NaN to
+        # integer". Skip forward to the next episode instead, same "warn AND
+        # exclude" convention data_gen.py uses for its own degenerate
+        # episodes, just applied at load time for shards written before that
+        # fix existed.
+        probe = idx
+        for _ in range(self._MAX_INVALID_RETRIES):
+            ep = self._load_shard_entry(probe)
+            if _episode_is_finite(ep):
+                return ep
+            import warnings
+            warnings.warn(
+                f"CopulaDataset: episode at idx {probe} has non-finite "
+                f"z_train/y_train (stale degenerate episode); skipping to "
+                f"idx {(probe + 1) % self._n_total}.",
+                RuntimeWarning,
+            )
+            probe = (probe + 1) % self._n_total
+        raise RuntimeError(
+            f"CopulaDataset: {self._MAX_INVALID_RETRIES} consecutive non-finite "
+            f"episodes starting at idx {idx} — dataset may need regeneration."
+        )
 
 
 def collate_fn(samples: List[dict]) -> dict:
