@@ -186,7 +186,7 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
         cfg.lora.rank                  (default 8)
         cfg.lora.alpha                 (default 16.0)
         cfg.lora.target                (default "qkvo")
-        cfg.lora.stages                (default ["icl"])
+        cfg.lora.stages                (default ["icl", "row", "col"])
     """
     pretrained = bool(cfg.tabicl.get("pretrained", True))
     if pretrained:
@@ -204,11 +204,11 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
             rank=int(lora_cfg.get("rank", 8)),
             alpha=float(lora_cfg.get("alpha", 16.0)),
             target=str(lora_cfg.get("target", "qkvo")),
-            stages=list(lora_cfg.get("stages", ["icl"])),
+            stages=list(lora_cfg.get("stages", ["icl", "row", "col"])),
         )
         print(f"LoRA applied: {n} MultiheadAttention modules replaced "
               f"(rank={lora_cfg.get('rank', 8)}, alpha={lora_cfg.get('alpha', 16.0)}, "
-              f"target={lora_cfg.get('target', 'qkvo')}, stages={list(lora_cfg.get('stages', ['icl']))})")
+              f"target={lora_cfg.get('target', 'qkvo')}, stages={list(lora_cfg.get('stages', ['icl', 'row', 'col']))})")
         # copula_head is always trainable; backbone LoRA params set by apply_lora
         return model
 
