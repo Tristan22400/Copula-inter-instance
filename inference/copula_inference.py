@@ -222,7 +222,7 @@ def load_copula_model(
 ) -> tuple[CopulaTabICL, DictConfig]:
     """Load a trained CopulaTabICL checkpoint.
 
-    Mirrors ``src/evaluate_baselines.py``'s loading pattern: reads the training
+    Used directly by ``eval/runners/eval_checkpoint.py``: reads the training
     config saved inside the checkpoint (falling back to ``config_path`` if
     given, or raising if neither is available), builds the model architecture
     from it, then loads the state dict.
