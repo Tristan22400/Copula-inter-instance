@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 from data_gen import (
     ALL_KERNELS,
     _kernel_needs_scalar_input,
+    _sample_mean_module,
     apply_mlp_feature_mixing,
     generate_gp_batch,
     generate_gp_task,
@@ -660,6 +661,147 @@ def test_mlp_mixing_goldilocks_and_psd(small_cfg, kernel_name):
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
         f"{kernel_name}: MLP mixing degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mean-function bank tests
+# ---------------------------------------------------------------------------
+
+
+def test_mean_fn_default_off_is_noop(small_cfg):
+    """mean_fn_enabled defaults False: _sample_mean_module must return an
+    exact ZeroMean (all-zero weights/family) and must not touch the global
+    RNG stream, so every existing config/dataset is unaffected."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    d = cfg.data.d_features
+
+    torch.manual_seed(0)
+    baseline = torch.randn(5)
+
+    torch.manual_seed(0)
+    mean_module, params = _sample_mean_module(cfg, d, B=4, device="cpu")
+    after = torch.randn(5)
+
+    assert torch.equal(baseline, after), "disabled mean bank perturbed the global RNG stream"
+    assert torch.equal(params["mean_weight"], torch.zeros(4, d))
+    assert torch.equal(params["mean_bias"], torch.zeros(4))
+    assert not params["mean_nonzero"].any()
+    assert torch.equal(params["mean_family"], torch.zeros(4, dtype=torch.long))
+    assert not params["mean_linear"].any()
+
+    x = torch.randn(4, 6, d)
+    assert torch.equal(mean_module(x), torch.zeros(4, 6))
+
+
+def test_mean_fn_prob_zero_is_noop(small_cfg):
+    """mean_fn_enabled=True but mean_fn_prob=0.0 must still yield an
+    everywhere-zero mean (regression safety: the gate must genuinely gate)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 0.0
+    d = cfg.data.d_features
+
+    mean_module, params = _sample_mean_module(cfg, d, B=8, device="cpu")
+    assert not params["mean_nonzero"].any()
+
+    x = torch.randn(8, 6, d)
+    assert torch.equal(mean_module(x), torch.zeros(8, 6))
+
+
+def test_mean_fn_all_families_reachable(small_cfg):
+    """With mean_fn_prob=1.0 and even family weights, all three non-zero
+    families (linear, exponential, anomaly) must actually occur over a
+    large-enough batch — guards against a silently-inert or mis-wired
+    family selector."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = [1 / 3, 1 / 3, 1 / 3]
+
+    torch.manual_seed(0)
+    _, params = _sample_mean_module(cfg, d=4, B=300, device="cpu")
+    assert params["mean_nonzero"].all()
+    counts = torch.bincount(params["mean_family"], minlength=3)
+    assert (counts > 0).all(), f"expected all 3 families to occur, got counts={counts.tolist()}"
+
+
+@pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+def test_mean_fn_diversifies_mu_star(small_cfg, family_probs):
+    """Forcing each family in turn must produce a non-trivial (non all-zero)
+    mu_star — guards against a family formula that's silently inert (e.g. an
+    exponential/anomaly term that never fires)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = family_probs
+    cfg.data.mean_fn_anomaly_frac = 0.5  # generous, so the sparse-anomaly family fires reliably at small N
+
+    torch.manual_seed(abs(hash(("mean_fn_mu_star", tuple(family_probs)))) % (2**31))
+    any_nonzero = False
+    for _ in range(20):
+        task = generate_gp_task(cfg)
+        if task["mu_star"].abs().max().item() > 1e-6:
+            any_nonzero = True
+            break
+    assert any_nonzero, f"family_probs={family_probs}: mu_star stayed all-zero over 20 draws"
+
+
+@pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+@pytest.mark.parametrize("oracle_mode", ["prior", "posterior"])
+def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs, oracle_mode):
+    """R_star must stay a valid, PSD, non-trivial correlation matrix under
+    every mean family and both oracle modes -- the mean-invariance argument
+    (GP posterior covariance never depends on the mean function) must hold
+    in practice, not just in theory."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.kernel = "rbf"
+    cfg.data.oracle_mode = oracle_mode
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = family_probs
+
+    torch.manual_seed(abs(hash(("mean_fn_psd", tuple(family_probs), oracle_mode))) % (2**31))
+    off_diag_abs = []
+    for _ in range(20):
+        task = generate_gp_task(cfg)
+        R = task["R_star"]
+        N = R.shape[0]
+
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4)
+        assert torch.allclose(R, R.T, atol=1e-5)
+        eigvals = torch.linalg.eigvalsh(R)
+        assert (eigvals >= -1e-4).all(), f"not PSD with mean family {family_probs} (min eig={eigvals.min():.6f})"
+        assert R.abs().max() <= 1.0 + 1e-5
+
+        mask = ~torch.eye(N, dtype=torch.bool)
+        off_diag_abs.append(R[mask].abs())
+
+    mean_abs_r = torch.cat(off_diag_abs).mean().item()
+    assert mean_abs_r > _COLLAPSE_THRESHOLD, (
+        f"family {family_probs}: mean bank collapsed correlation, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+    assert mean_abs_r < _DEGENERATE_THRESHOLD, (
+        f"family {family_probs}: mean bank degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+
+
+def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg):
+    """Within the linear family, mean_fn_linear_prob=0.0 must force a
+    constant-only offset (weight exactly zero, bias free) rather than a
+    trend -- regression guard for the nested linear/constant gate."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = [1.0, 0.0, 0.0]
+    cfg.data.mean_fn_linear_prob = 0.0
+
+    _, params = _sample_mean_module(cfg, d=4, B=16, device="cpu")
+    assert not params["mean_linear"].any()
+    assert torch.equal(params["mean_weight"], torch.zeros(16, 4))
 
 
 def test_gp_posterior_helper():
