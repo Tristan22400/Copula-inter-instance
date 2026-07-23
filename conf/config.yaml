@@ -110,7 +110,19 @@ baselines:
   synth_seed: 20260718      # fixed seed -> same probe episodes every run
 
 # LoRA fine-tuning of the TabICL backbone.
+# When enabled=true, the pretrained TabICL weights are frozen and only the
+# LoRA A/B matrices + the copula_head are trained.
+#
 # Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]
+#
+# enabled : bool — activate LoRA (false = standard full fine-tune)
+# rank    : int  — low-rank dimension r; try 4/8/16/32
+# alpha   : float — scaling factor; effective scale = alpha/rank
+# target  : str  — projections to adapt; any subset of "qkvo" (q/k/v/output)
+# stages  : list — which TabICL sub-modules to patch:
+#             icl → icl_predictor  (12 transformer blocks, most params)
+#             row → row_interactor (3 blocks)
+#             col → col_embedder   (3 induced-SA blocks, 2 MHAs each)
 lora:
   enabled: false
   rank: 8
@@ -118,3 +130,5 @@ lora:
   target: "qkvo"
   stages:
     - icl
+    - row
+    - col
