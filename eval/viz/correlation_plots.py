@@ -12,6 +12,7 @@ __all__ = [
     "collect_pair_distances_and_values",
     "plot_correlation_vs_distance",
     "plot_correlation_heatmaps",
+    "plot_corr_grid",
 ]
 
 
@@ -106,3 +107,72 @@ def plot_correlation_heatmaps(R_by_method: dict[str, np.ndarray], out_path: str)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_corr_grid(
+    estimators: dict[str, "torch.Tensor"],
+    oracle_R: "torch.Tensor",
+    title: str = "",
+    max_show: int = 40,
+) -> "plt.Figure":
+    """Side-by-side heatmaps of oracle R_star vs each estimator's predicted R,
+    for a single episode — every fitted baseline plus the ICL model in one
+    row, oracle first with a highlighted border.
+
+    Unlike plot_correlation_heatmaps (numpy arrays, no designated "ground
+    truth" panel, used to compare a handful of methods pooled/averaged across
+    a whole benchmark), this takes torch tensors straight from
+    eval_baselines_episode / the ICL forward pass for one episode, always
+    puts oracle first with a red border, and subsamples down to max_show
+    points so a >40-point episode's heatmap stays legible.
+
+    Args:
+        estimators : {label: (N, N) tensor}
+        oracle_R   : (N, N) tensor — ground-truth correlation
+        title      : overall figure title
+        max_show   : max N to display (subsampled if larger)
+    Returns:
+        matplotlib Figure — caller is responsible for savefig/close.
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    labels = ["oracle"] + list(estimators.keys())
+    mats = [oracle_R.cpu().float()] + [v.cpu().float() for v in estimators.values()]
+
+    N = oracle_R.shape[0]
+    if N > max_show:
+        import torch
+
+        idx = torch.linspace(0, N - 1, max_show).long()
+        mats = [m[idx][:, idx] for m in mats]
+
+    n_cols = len(labels)
+    fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
+    if n_cols == 1:
+        axes = [axes]
+
+    for ax, lbl, R in zip(axes, labels, mats):
+        R_np = R.numpy()
+        sns.heatmap(
+            R_np,
+            ax=ax,
+            cmap="coolwarm",
+            center=0,
+            vmin=-1,
+            vmax=1,
+            square=True,
+            xticklabels=False,
+            yticklabels=False,
+            cbar=lbl == labels[-1],
+        )
+        color = "red" if lbl == "oracle" else "black"
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(2 if lbl == "oracle" else 1)
+        ax.set_title(lbl, fontsize=9)
+
+    if title:
+        fig.suptitle(title, fontsize=11, y=1.01)
+    plt.tight_layout()
+    return fig
