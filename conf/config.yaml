@@ -58,7 +58,7 @@ training:
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
-  muon_lr: 2.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
+  muon_lr: 4.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
   muon_lr_min: 1.0e-6         # cosine decay floor
   muon_momentum: 0.95
   muon_weight_decay: 0.01     # cautious weight decay (Chen et al. 2025a)
@@ -110,19 +110,7 @@ baselines:
   synth_seed: 20260718      # fixed seed -> same probe episodes every run
 
 # LoRA fine-tuning of the TabICL backbone.
-# When enabled=true, the pretrained TabICL weights are frozen and only the
-# LoRA A/B matrices + the copula_head are trained.
-#
 # Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]
-#
-# enabled : bool — activate LoRA (false = standard full fine-tune)
-# rank    : int  — low-rank dimension r; try 4/8/16/32
-# alpha   : float — scaling factor; effective scale = alpha/rank
-# target  : str  — projections to adapt; any subset of "qkvo" (q/k/v/output)
-# stages  : list — which TabICL sub-modules to patch:
-#             icl → icl_predictor  (12 transformer blocks, most params)
-#             row → row_interactor (3 blocks)
-#             col → col_embedder   (3 induced-SA blocks, 2 MHAs each)
 lora:
   enabled: false
   rank: 8
@@ -130,5 +118,3 @@ lora:
   target: "qkvo"
   stages:
     - icl
-    - row
-    - col
