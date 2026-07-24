@@ -153,7 +153,7 @@ def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig) -> List[dict]:
     device itself, so a list of CPU batch dicts satisfies that contract with
     no changes to validate().
     """
-    n_val = int(t.get("live_val_episodes", 500))
+    n_val = int(t.get("val_episodes", 500))
     val_seed = int(t.get("live_val_seed", 20260723))
     batch_size = int(t.batch_size)
     n_batches = max(1, (n_val + batch_size - 1) // batch_size)
