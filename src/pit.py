@@ -246,15 +246,23 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     # (unlike l/period/etc., whose priors never actually produce exactly 0).
     # Absent entirely for episodes saved before this feature existed (older
     # datasets on disk) -- task.get(..., 0.0) defaults to "not applied".
-    def _sign_pair(applied_key: str, w_key: str, b_key: str):
+    # sign_a (the tanh sharpness -- see SignModulatedKernel) may itself be
+    # absent even when sign_applied*==1.0, for datasets saved by the earlier
+    # hard-sign() version of this feature (which had no sharpness knob);
+    # data_gen._wrap_concrete_sign_modulated substitutes a very large `a` in
+    # that case, numerically recovering the hard sign() those episodes were
+    # actually generated with, so their saved z_train/z_test still round-trip.
+    def _sign_pair(applied_key: str, w_key: str, b_key: str, a_key: str):
         applied = task.get(applied_key)
         if applied is None or applied.item() == 0.0:
-            return None, None
-        return task[w_key], task[b_key]
+            return None, None, None
+        return task[w_key], task[b_key], task.get(a_key)
 
-    sign_w, sign_b = _sign_pair("sign_applied", "sign_w", "sign_b")
-    sign_w_b, sign_b_b = _sign_pair("sign_applied_b", "sign_w_b", "sign_b_b")
-    sign_w_outer, sign_b_outer = _sign_pair("sign_applied_outer", "sign_w_outer", "sign_b_outer")
+    sign_w, sign_b, sign_a = _sign_pair("sign_applied", "sign_w", "sign_b", "sign_a")
+    sign_w_b, sign_b_b, sign_a_b = _sign_pair("sign_applied_b", "sign_w_b", "sign_b_b", "sign_a_b")
+    sign_w_outer, sign_b_outer, sign_a_outer = _sign_pair(
+        "sign_applied_outer", "sign_w_outer", "sign_b_outer", "sign_a_outer"
+    )
 
     # active_dims (gpytorch's own kernel kwarg) lets kernel_fn take the
     # full-width x_norm_train straight through and select its k active
@@ -265,8 +273,9 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
         l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
         active_dims=cols,
-        sign_w=sign_w, sign_b=sign_b, sign_w_b=sign_w_b, sign_b_b=sign_b_b,
-        sign_w_outer=sign_w_outer, sign_b_outer=sign_b_outer,
+        sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
+        sign_w_b=sign_w_b, sign_b_b=sign_b_b, sign_a_b=sign_a_b,
+        sign_w_outer=sign_w_outer, sign_b_outer=sign_b_outer, sign_a_outer=sign_a_outer,
     )
     x_k_train = task["x_norm_train"]   # (P, d_features)
     y_train    = task["y_train"]                  # (P,)
