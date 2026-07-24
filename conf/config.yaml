@@ -29,7 +29,12 @@ training:
   # Usage: python src/train.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
   resume_ckpt: null
   dataset_dir: ./data/systematic_composition-k5/pit
-  val_fraction: 0.05   # fraction of episodes held out for validation
+  # Target validation-set size, shared by both the on-disk path (below, capped
+  # at the dataset's total episode count) and live_generation (live_dataset.py)
+  # — same knob so the val plots (e.g. val/corr_density) are comparable in
+  # point count across modes instead of the disk path silently getting a
+  # smaller val set on datasets under ~10k episodes.
+  val_episodes: 500
   # Live generation: skip dataset_dir entirely and generate episodes on the
   # fly via DataLoader workers (see live_dataset.py) — no disk reads/writes
   # for training data. Temporary, storage-constrained-environment mode;
@@ -49,7 +54,6 @@ training:
   # slower. Cross-batch diversity comes from live_num_workers running
   # independently-seeded streams, the live analogue of ShardBlockSampler.
   live_group_multiplier: 1
-  live_val_episodes: 500   # fixed validation set size, generated once at startup
   live_val_seed: 20260723  # fixed seed for the validation set (independent of the training seed stream)
   # For sharded datasets: shuffle within blocks of this many shards at a time
   # (all shuffled together, IO-cache resident) instead of one global shuffle
