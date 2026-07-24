@@ -105,6 +105,51 @@ mlp_num_layers_max: 4
 # fan-in scaling -- keeps the pre-activation roughly variance-preserving.
 mlp_mix_weight_std: 1.0
 
+# Structural feature warp: optionally apply TempoPFN-inspired (github.com/
+# automl/TempoPFN) transforms to each feature column independently, per
+# episode -- mirrors TempoPFN's own 6-category orchestration
+# (UnivariateOfflineAugmentor.apply): invariances (yflip/time_flip),
+# structure (regime_change/shock_recovery), seasonality (amplitude
+# modulation), artifacts (resample), analytic (smoothing/derivative/
+# integral), discrete (quantize/censor). Runs on x alongside
+# tabiclv2_warp_features/mlp_mixing (never on sampled y), so the same
+# deterministic-feature-map argument keeps R_star/Sigma_star exact. See
+# data_gen.py::apply_structural_feature_warp / _STRUCTURAL_CATEGORIES.
+# Default off: byte-for-byte no-op for every existing config/dataset. Unlike
+# mlp_mixing/mean_fn above, NOT turned on here yet -- validate against
+# tests/test_dataset_corr_uniform.py on a pilot dataset before enabling by
+# default; these transforms are new and unvalidated at scale.
+structural_warp_enabled: false
+# Per-(episode, column) probability of applying any transform at all.
+structural_warp_prob: 0.3
+# How many of the 6 categories to compose (sampled WITHOUT replacement,
+# applied in the fixed category order below) per gated column -- mirrors
+# TempoPFN's own num_ops=randint(2,6).
+structural_warp_num_ops_min: 2
+structural_warp_num_ops_max: 6
+# Category weights, exactly TempoPFN's own defaults. One op is drawn per
+# chosen category (uniform, except discrete: quantize 0.6 / censor 0.4, also
+# matching TempoPFN) -- see data_gen.py::_CATEGORY_OPS/_CATEGORY_SUB_OP_WEIGHTS.
+structural_warp_category_weights:
+  invariances: 0.6
+  structure: 0.6
+  seasonality: 0.5
+  artifacts: 0.3
+  analytic: 0.4
+  discrete: 0.6
+# Pseudo-time axis for order-dependent ops (regime_change, shock_recovery,
+# amplitude_modulation, differential, resample_artifact, time_flip): value-
+# rank by default (decoupled from the train/test split, since the split is a
+# plain row-index slice -- see data_gen.py::_structural_warp_column). Setting
+# structural_warp_index_axis_enabled: true lets a structural_warp_index_axis_ratio
+# fraction of gated columns instead use the raw row-index axis (a more
+# faithful port of TempoPFN's real time axis), which *can* introduce a fixed
+# train/test coupling for those columns. Off by default (ratio ignored unless
+# enabled=true) -- switch off entirely by leaving structural_warp_index_axis_enabled
+# at its default False, regardless of the ratio value.
+structural_warp_index_axis_enabled: false
+structural_warp_index_axis_ratio: 0.0
+
 # Non-zero GP mean bank (CauKer-inspired, github.com/ShifengXIE/CauKer):
 # CAUKER's own ablation (Table 1, "Mean+KernelSynth" vs zero-mean
 # "KernelSynth") shows adding a non-zero mean is one of the two clearest
