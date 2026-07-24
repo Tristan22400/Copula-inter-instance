@@ -113,17 +113,51 @@ Sign modulation (cfg.data.sign_modulation_component_prob / _outer_prob)
 -------------------------------------------------------------------------
   An optional Schur-product wrapper (SignModulatedKernel) that injects
   negative pairwise correlation into R_star without any new positivity
-  argument: K'(x1, x2) = K(x1, x2) * sign(w.x1[active]+b) *
-  sign(w.x2[active]+b), where (w, b) is a random affine hyperplane over the
-  wrapped kernel's own active-column subspace, one independent draw per
-  episode (w ~ N(0, I_k), b ~ N(0, 1)). PSD holds via the Schur product
-  theorem: the sign vector's outer product s s^T is rank-1 PSD, and an
-  elementwise product of two PSD matrices is PSD.
+  argument: K'(x1, x2) = K(x1, x2) * s(x1) * s(x2), where
+  s(x) = tanh(a * (w.x[active]+b)) in [-1, 1] is a smooth soft-sign split of
+  the wrapped kernel's own active-column subspace along a random affine
+  hyperplane, one independent draw per episode (w ~ N(0, I_k)/sqrt(k) so the
+  raw margin z = w.x+b has O(1) scale regardless of k, b ~ N(0, 1), and a
+  positive sharpness a ~ LogNormal(sign_modulation_sharpness_lognormal_loc/
+  _scale) controlling how closely s approximates a hard sign flip). PSD
+  holds for ANY real-valued s(x), not just +-1: the outer product s s^T is
+  always rank-1 PSD, and an elementwise product of two PSD matrices is PSD
+  (Schur product theorem) — this was true before the tanh replacement too,
+  and remains the whole positivity argument.
+
+  This replaces an earlier bare torch.sign(w.x+b) (a hard +-1 flip): a
+  fresh (w, b) is drawn per episode with no cross-episode transfer, so the
+  model has to infer the hyperplane from the correlation pattern in y alone
+  and extrapolate it to unseen query points — under a hard sign, every point
+  strictly on one side of the (a priori unknown) hyperplane is
+  indistinguishable from every other point on that side, and the boundary
+  carries a discontinuous jump with zero local gradient anywhere except
+  exactly on it, which empirically left the model unable to learn the
+  correlation sign at all (near-chance-or-below cross-hyperplane sign
+  agreement, flat across context size and training step). tanh(a*z) keeps
+  the same random-hyperplane structure but turns that jump into a smooth
+  ramp of width ~1/a in raw z units, giving the model a local gradient to
+  climb near the boundary while a controls how much of that softening
+  bleeds into the bulk of the distribution (z's spread is ~sqrt(2)
+  regardless of k, given the w normalisation above): large a recovers the
+  original hard-sign behaviour (and its learnability problem) almost
+  everywhere except a shrinking boundary strip; small a smooths the
+  transition over a wide region at the cost of attenuating correlation
+  magnitude there too. The default LogNormal (median a=3) sits with most of
+  its mass already near-saturated (tanh(3*1) ~= 0.995) at one z-std out,
+  so the softening is concentrated near the boundary rather than smeared
+  across the whole distribution.
+
+  One consequence of replacing sign() with tanh(): the hard-sign version was
+  exactly diagonal-invariant (s(x)^2 == 1 a.e., so K'(x,x) == K(x,x)); tanh
+  breaks this (s(x)^2 < 1 away from saturation), so K'(x,x) = K(x,x)*s(x)^2
+  <= K(x,x) — points near the hyperplane get a (mild, a-dependent) marginal
+  variance shrinkage in addition to the correlation-sign/magnitude effect.
 
   Two independently Bernoulli-per-batch-call-gated injection points (same
   granularity as mlp_mixing_enabled/mlp_mixing_prob — if the coin flip
   fires for a given generate_gp_batch call, every episode in that call gets
-  its own independent (w, b), same "shared gate, independent draw"
+  its own independent (w, b, a), same "shared gate, independent draw"
   convention used throughout this file):
     - cfg.data.sign_modulation_component_prob: per elementary component,
       wired into the shared _build_kernel_component choke point — covers
@@ -140,13 +174,17 @@ Sign modulation (cfg.data.sign_modulation_component_prob / _outer_prob)
 
   Saved/reconstructed via new sign_applied[_b|_outer] (0.0/1.0 float
   sentinel — same "0 means N/A" convention dot_product's l=0 already uses)
-  and sign_w[_b|_outer]/sign_b[_b|_outer] schema keys (see
+  and sign_w[_b|_outer]/sign_b[_b|_outer]/sign_a[_b|_outer] schema keys (see
   generate_gp_batch's return_kernel_metadata handling and build_kernel_fn's
   signature), following the same flat-schema/zero-sentinel pattern as
   l/alpha2/period/rq_alpha/power. Systematic-composition chains instead
   carry their per-component sign fields inside each entry of
   kernel_component_params (same non-reconstructible-via-build_kernel_fn
   caveat as every other systematic-composition hyperparameter — see above).
+  pit.py::gp_analytical_pit falls back to a very large `a` (numerically
+  recovering the old hard sign()) when replaying sign_w/sign_b saved by a
+  pre-tanh dataset that has no sign_a field, so older on-disk episodes still
+  reconstruct their original (already-baked) z_train/z_test exactly.
 
 Kernel selection (cfg.data.kernel / cfg.data.kernels)
 ------------------------------------------------------
@@ -492,16 +530,17 @@ def _build_scaled_kernel(
 
 class SignModulatedKernel(gpytorch.kernels.Kernel):
     """Schur-product sign modulation: K'(x1, x2) = K(x1, x2) * s(x1) * s(x2),
-    where s(x) = sign(w . x[active_cols] + b) in {-1, +1} is a random affine
-    hyperplane split of the (active-column subspace of the) input space, one
-    independent (w, b) draw per episode (batch_shape=[B], mirroring
-    ScaleKernel/_build_scaled_kernel above).
+    where s(x) = tanh(a * (w . x[active_cols] + b)) in [-1, +1] is a smooth
+    soft-sign split of the (active-column subspace of the) input space along
+    a random affine hyperplane, one independent (w, b, a) draw per episode
+    (batch_shape=[B], mirroring ScaleKernel/_build_scaled_kernel above).
 
-    PSD rationale: s(x1)*s(x2) is the outer product of a +-1 vector with
-    itself, i.e. a rank-1 PSD matrix (s s^T), and the elementwise (Schur/
-    Hadamard) product of two PSD matrices is PSD (Schur product theorem), so
-    K' is PSD whenever K is -- no new positivity argument needed beyond what
-    every existing kernel in this file already relies on.
+    PSD rationale: s(x1)*s(x2) is the outer product of a real-valued vector
+    with itself, i.e. a rank-1 PSD matrix (s s^T) for ANY s (not just +-1),
+    and the elementwise (Schur/Hadamard) product of two PSD matrices is PSD
+    (Schur product theorem), so K' is PSD whenever K is -- no new positivity
+    argument needed beyond what every existing kernel in this file already
+    relies on, and none was needed for the tanh replacement either.
 
     `active_cols` intentionally reuses whatever column subset the wrapped
     base_kernel itself was built with (the caller passes the same
@@ -513,12 +552,14 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
     None means every column (matching gpytorch's own active_dims convention
     elsewhere in this file).
 
-    sign(0) edge case: torch.sign(0) == 0, which would zero out (not flip)
-    the covariance for any point that lands exactly on the hyperplane -- a
-    measure-zero event for continuous inputs (the z-normalised features this
-    file generates are effectively continuous), so it is accepted as-is
-    rather than nudged to +-1; it costs nothing in practice and keeps the
-    formula identical to the textbook sign() function.
+    Diagonal invariance (lost vs. the old hard sign()): torch.sign(z)^2 == 1
+    a.e., so the old K'(x,x) == K(x,x) exactly; tanh(a*z)^2 < 1 away from
+    saturation, so K'(x,x) = K(x,x)*s(x)^2 <= K(x,x) -- points near the
+    hyperplane get a mild, a-dependent marginal-variance shrinkage on top of
+    the correlation-sign effect. See the module docstring's "Sign
+    modulation" section for the full tradeoff this tanh replaces a bare
+    sign() to address (identifiability/learnability of a fresh per-episode
+    hyperplane) and why a is drawn from a LogNormal prior rather than fixed.
     """
 
     def __init__(
@@ -526,6 +567,7 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
         base_kernel: gpytorch.kernels.Kernel,
         w: Tensor,
         b: Tensor,
+        a: Tensor,
         active_dims: Optional[List[int]] = None,
         **kwargs,
     ):
@@ -535,29 +577,32 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
         self.base_kernel = base_kernel
         self.register_buffer("w", w)   # (B, k)
         self.register_buffer("b", b)   # (B,)
+        self.register_buffer("a", a)   # (B,) sharpness, > 0
         self.active_cols = list(active_dims) if active_dims is not None else None
 
     def _signs(self, x: Tensor) -> Tensor:
-        """sign(w . x[..., active_cols] + b), shape (..., n) for x of shape
-        (..., n, d) -- same batch/broadcast convention gpytorch kernels use
-        for their own forward() (x's leading dims are batch dims, its last
-        two are (n, d)).
+        """tanh(a * (w . x[..., active_cols] + b)), shape (..., n) for x of
+        shape (..., n, d) -- same batch/broadcast convention gpytorch kernels
+        use for their own forward() (x's leading dims are batch dims, its
+        last two are (n, d)).
 
-        w has shape (B, k), b has shape (B,) -- both are unsqueezed with one
-        extra axis right before their last dim (giving (B, 1, k) / (B, 1))
-        so they broadcast against x_active's (..., n, k) / (..., n) from the
-        right, the same way e.g. gpytorch's own outputscale (B,) broadcasts
-        against a (B, n1, n2) covariance elsewhere in this file. Any further
-        leading dims gpytorch's own kernel machinery adds (e.g. an extra
-        singleton batch dim for some composition paths) broadcast for free
-        via ordinary right-aligned torch broadcasting -- no manual padding
-        needed for those.
+        w has shape (B, k), b/a have shape (B,) -- all three are unsqueezed
+        with one extra axis right before their last dim (giving (B, 1, k) /
+        (B, 1) / (B, 1)) so they broadcast against x_active's (..., n, k) /
+        (..., n) from the right, the same way e.g. gpytorch's own
+        outputscale (B,) broadcasts against a (B, n1, n2) covariance
+        elsewhere in this file. Any further leading dims gpytorch's own
+        kernel machinery adds (e.g. an extra singleton batch dim for some
+        composition paths) broadcast for free via ordinary right-aligned
+        torch broadcasting -- no manual padding needed for those.
         """
         cols = self.active_cols
         x_active = x[..., cols] if cols is not None else x
         w = self.w.unsqueeze(-2)   # (B, 1, k)
         b = self.b.unsqueeze(-1)   # (B, 1)
-        return torch.sign((x_active * w).sum(-1) + b)
+        a = self.a.unsqueeze(-1)   # (B, 1)
+        z = (x_active * w).sum(-1) + b
+        return torch.tanh(a * z)
 
     def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params) -> Tensor:
         K = self.base_kernel(x1, x2, diag=diag, **params)
@@ -570,19 +615,28 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
 
 
 def _sample_sign_modulation(
-    k: int, B: int, device
-) -> tuple[Tensor, Tensor]:
-    """Sample one (w, b) hyperplane per episode: w ~ N(0, I_k), b ~ N(0, 1),
-    i.i.d. standard normal -- a roughly balanced (not degenerate) random
-    split of the active-column subspace, reused for both the per-component
-    and post-composition SignModulatedKernel injection points (see the
-    module docstring's "Sign modulation" section)."""
-    w = torch.randn(B, k, device=device)
+    cfg, k: int, B: int, device
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Sample one (w, b, a) hyperplane per episode: w ~ N(0, I_k)/sqrt(k) (so
+    the raw margin z = w.x[active]+b has O(1) scale regardless of k -- the
+    hard sign() this replaced was scale-invariant so w's magnitude never
+    mattered, but tanh(a*z)'s effective sharpness is a*||w||, so w needs a
+    fixed scale for `a`'s prior to mean the same thing across episodes with
+    different active-dims counts k), b ~ N(0, 1), and a positive sharpness
+    a ~ LogNormal(sign_modulation_sharpness_lognormal_loc/_scale) -- reused
+    for both the per-component and post-composition SignModulatedKernel
+    injection points (see the module docstring's "Sign modulation"
+    section)."""
+    w = torch.randn(B, k, device=device) / math.sqrt(max(k, 1))
     b = torch.randn(B, device=device)
-    return w, b
+    a_loc = float(getattr(cfg.data, "sign_modulation_sharpness_lognormal_loc", math.log(3.0)))
+    a_scale = float(getattr(cfg.data, "sign_modulation_sharpness_lognormal_scale", 0.5))
+    a = LogNormalPrior(a_loc, a_scale).sample(torch.Size([B])).to(device)
+    return w, b, a
 
 
 def _maybe_wrap_sign_modulated(
+    cfg,
     kernel: gpytorch.kernels.Kernel,
     prob: float,
     k: int,
@@ -595,30 +649,33 @@ def _maybe_wrap_sign_modulated(
     mlp_mixing_enabled/mlp_mixing_prob's own gate -- see
     apply_mlp_feature_mixing) deciding whether to wrap `kernel` in a
     SignModulatedKernel at all for this generate_gp_batch call. When gated
-    on, EVERY episode in the batch gets its own independent (w, b) draw (the
-    B-batched SignModulatedKernel itself), matching how every other batched
-    hyperparameter in this file (l, alpha2, ...) is drawn once per call but
-    independently per episode within it.
+    on, EVERY episode in the batch gets its own independent (w, b, a) draw
+    (the B-batched SignModulatedKernel itself), matching how every other
+    batched hyperparameter in this file (l, alpha2, ...) is drawn once per
+    call but independently per episode within it.
 
     Returns (possibly-wrapped kernel, params) where params has
     "sign_applied{suffix}" (0.0/1.0 float sentinel, same "0 means N/A"
-    convention dot_product's l=0 already uses), "sign_w{suffix}" (B, k) and
-    "sign_b{suffix}" (B,) -- zero-filled/no-op when not applied, so the
-    output schema always has these keys regardless of the coin flip.
+    convention dot_product's l=0 already uses), "sign_w{suffix}" (B, k),
+    "sign_b{suffix}" (B,) and "sign_a{suffix}" (B,) -- zero-filled/no-op when
+    not applied, so the output schema always has these keys regardless of
+    the coin flip.
     """
     if prob > 0.0 and random.random() < prob:
-        w, b = _sample_sign_modulation(k, B, device)
-        wrapped = SignModulatedKernel(kernel, w, b, active_dims=active_dims)
+        w, b, a = _sample_sign_modulation(cfg, k, B, device)
+        wrapped = SignModulatedKernel(kernel, w, b, a, active_dims=active_dims)
         params = {
             f"sign_applied{param_suffix}": torch.ones(B, device=device),
             f"sign_w{param_suffix}": w,
             f"sign_b{param_suffix}": b,
+            f"sign_a{param_suffix}": a,
         }
         return wrapped, params
     params = {
         f"sign_applied{param_suffix}": torch.zeros(B, device=device),
         f"sign_w{param_suffix}": torch.zeros(B, max(k, 1), device=device),
         f"sign_b{param_suffix}": torch.zeros(B, device=device),
+        f"sign_a{param_suffix}": torch.zeros(B, device=device),
     }
     return kernel, params
 
@@ -689,7 +746,7 @@ def _build_kernel_component(
         # span every column (d_total, defaulting to k), not the caller's
         # (possibly smaller) active_dims subset.
         kernel, sign_params = _maybe_wrap_sign_modulated(
-            kernel, sign_prob, d_total if d_total is not None else k, B, device, active_dims=None
+            cfg, kernel, sign_prob, d_total if d_total is not None else k, B, device, active_dims=None
         )
         params.update(sign_params)
         return kernel, params
@@ -725,14 +782,14 @@ def _build_kernel_component(
             "power": torch.full((B,), float(power), device=device),
         }
         scaled, sign_params = _maybe_wrap_sign_modulated(
-            scaled, sign_prob, k, B, device, active_dims=active_dims
+            cfg, scaled, sign_prob, k, B, device, active_dims=active_dims
         )
         params.update(sign_params)
         return scaled, params
     spec = _kernel_prior_spec(cfg, name)
     scaled, params = _build_scaled_kernel(name, spec, k, B, device, active_dims=active_dims)
     scaled, sign_params = _maybe_wrap_sign_modulated(
-        scaled, sign_prob, k, B, device, active_dims=active_dims
+        cfg, scaled, sign_prob, k, B, device, active_dims=active_dims
     )
     params.update(sign_params)
     return scaled, params
@@ -789,7 +846,7 @@ def _sample_episode_kernel(
 
     outer_prob = float(getattr(cfg.data, "sign_modulation_outer_prob", 0.0))
     kernel, outer_params = _maybe_wrap_sign_modulated(
-        kernel, outer_prob, k, B, device, active_dims=active_dims, param_suffix="_outer"
+        cfg, kernel, outer_prob, k, B, device, active_dims=active_dims, param_suffix="_outer"
     )
     params.update(outer_params)
 
@@ -797,19 +854,26 @@ def _sample_episode_kernel(
 
 
 def _wrap_concrete_sign_modulated(
-    kernel: gpytorch.kernels.Kernel, sign_w, sign_b, active_dims: Optional[List[int]]
+    kernel: gpytorch.kernels.Kernel, sign_w, sign_b, sign_a, active_dims: Optional[List[int]]
 ) -> gpytorch.kernels.Kernel:
     """Wrap a non-batched, already-built concrete `kernel` in
-    SignModulatedKernel using CONCRETE (already-known) sign_w/sign_b values
-    — the _build_concrete_kernel-side counterpart of _maybe_wrap_sign_modulated
-    (which samples fresh w/b; this reconstructs from saved ones). No-op
-    (returns `kernel` unchanged) when sign_w/sign_b are None (the "not
-    applied" case — callers check the sign_applied* 0.0/1.0 sentinel before
-    calling this, same convention _optional_param callers use for period/
-    rq_alpha/power elsewhere in this file).
+    SignModulatedKernel using CONCRETE (already-known) sign_w/sign_b/sign_a
+    values — the _build_concrete_kernel-side counterpart of
+    _maybe_wrap_sign_modulated (which samples fresh w/b/a; this reconstructs
+    from saved ones). No-op (returns `kernel` unchanged) when sign_w/sign_b
+    are None (the "not applied" case — callers check the sign_applied*
+    0.0/1.0 sentinel before calling this, same convention _optional_param
+    callers use for period/rq_alpha/power elsewhere in this file).
 
-    sign_w/sign_b are reshaped to a (1, k)/(1,) leading "batch" axis:
-    SignModulatedKernel is written batched (mirroring ScaleKernel), and
+    sign_a=None (sign_w/sign_b present) means a dataset saved before this
+    sharpness parameter existed -- a very large sharpness is substituted so
+    tanh(a*z) numerically recovers the hard sign() that dataset was actually
+    generated with (see the module docstring's "Sign modulation" section and
+    pit.py::gp_analytical_pit's `_sign_pair`, which is the caller that
+    resolves this fallback).
+
+    sign_w/sign_b/sign_a are reshaped to a (1, k)/(1,)/(1,) leading "batch"
+    axis: SignModulatedKernel is written batched (mirroring ScaleKernel), and
     gpytorch kernels with batch_shape=[1] broadcast fine against the
     non-batched (n, d) X1/X2 build_kernel_fn's callers pass in — consistent
     with how every other concrete kernel built here has no explicit
@@ -819,14 +883,19 @@ def _wrap_concrete_sign_modulated(
         return kernel
     w_t = sign_w if torch.is_tensor(sign_w) else torch.as_tensor(sign_w, dtype=torch.get_default_dtype())
     b_t = sign_b if torch.is_tensor(sign_b) else torch.as_tensor(sign_b, dtype=torch.get_default_dtype())
+    if sign_a is None:
+        a_t = torch.full_like(b_t, 1e6)
+    else:
+        a_t = sign_a if torch.is_tensor(sign_a) else torch.as_tensor(sign_a, dtype=torch.get_default_dtype())
     w_t = w_t.reshape(1, -1)
     b_t = b_t.reshape(1)
-    return SignModulatedKernel(kernel, w_t, b_t, active_dims=active_dims)
+    a_t = a_t.reshape(1)
+    return SignModulatedKernel(kernel, w_t, b_t, a_t, active_dims=active_dims)
 
 
 def _build_concrete_kernel(
     name: str, l, alpha2, *, period=None, rq_alpha=None, power=None, active_dims: Optional[List[int]] = None,
-    sign_w=None, sign_b=None,
+    sign_w=None, sign_b=None, sign_a=None,
 ) -> gpytorch.kernels.Kernel:
     """Construct a non-batched gpytorch Kernel with CONCRETE hyperparameter
     values assigned — reconstruction (given known values), not sampling.
@@ -850,11 +919,11 @@ def _build_concrete_kernel(
     full-width input (gpytorch's own kwarg — see _build_scaled_kernel);
     None means every column.
 
-    sign_w/sign_b: CONCRETE per-component sign-modulation hyperplane values
-    (see SignModulatedKernel / _maybe_wrap_sign_modulated), applied via
-    _wrap_concrete_sign_modulated right before returning. None (the default)
-    means "not applied" -- a no-op, matching the sign_applied 0.0 sentinel
-    convention build_kernel_fn's caller checks. Ignored (forced to
+    sign_w/sign_b/sign_a: CONCRETE per-component sign-modulation hyperplane
+    values (see SignModulatedKernel / _maybe_wrap_sign_modulated), applied
+    via _wrap_concrete_sign_modulated right before returning. None (the
+    default) means "not applied" -- a no-op, matching the sign_applied 0.0
+    sentinel convention build_kernel_fn's caller checks. Ignored (forced to
     active_dims=None) for "dot_product", same override the sampling-time
     _build_kernel_component uses -- the hyperplane must span every column,
     matching how it was actually sampled.
@@ -862,7 +931,7 @@ def _build_concrete_kernel(
     if name == "dot_product":
         kernel = gpytorch.kernels.LinearKernel()
         kernel.variance = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(kernel.variance.shape)
-        return _wrap_concrete_sign_modulated(kernel, sign_w, sign_b, active_dims=None)
+        return _wrap_concrete_sign_modulated(kernel, sign_w, sign_b, sign_a, active_dims=None)
 
     if name == "polynomial":
         power_int = int(round(float(power))) if power is not None else 2
@@ -874,7 +943,7 @@ def _build_concrete_kernel(
         base.offset = offset_t.reshape(base.offset.shape)
         scale = gpytorch.kernels.ScaleKernel(base)
         scale.outputscale = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(scale.outputscale.shape)
-        return _wrap_concrete_sign_modulated(scale, sign_w, sign_b, active_dims=active_dims)
+        return _wrap_concrete_sign_modulated(scale, sign_w, sign_b, sign_a, active_dims=active_dims)
 
     l_t = l if torch.is_tensor(l) else torch.as_tensor(l, dtype=torch.get_default_dtype())
     # l having more than one element means this episode was generated ARD
@@ -896,7 +965,7 @@ def _build_concrete_kernel(
 
     scale = gpytorch.kernels.ScaleKernel(base)
     scale.outputscale = torch.as_tensor(alpha2, dtype=torch.get_default_dtype()).reshape(scale.outputscale.shape)
-    return _wrap_concrete_sign_modulated(scale, sign_w, sign_b, active_dims=active_dims)
+    return _wrap_concrete_sign_modulated(scale, sign_w, sign_b, sign_a, active_dims=active_dims)
 
 
 def build_kernel_fn(
@@ -915,10 +984,13 @@ def build_kernel_fn(
     active_dims: Optional[List[int]] = None,
     sign_w=None,
     sign_b=None,
+    sign_a=None,
     sign_w_b=None,
     sign_b_b=None,
+    sign_a_b=None,
     sign_w_outer=None,
     sign_b_outer=None,
+    sign_a_outer=None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
     """Return a kernel(X1, X2) -> K callable with hyperparameters baked in.
 
@@ -936,39 +1008,42 @@ def build_kernel_fn(
     active_dims kwarg selects the columns internally. None means every
     column (e.g. "dot_product" tasks that draw on all d_features).
 
-    sign_w/sign_b (component A) and sign_w_b/sign_b_b (component B, composite
-    only) are the PER-COMPONENT sign-modulation hyperplanes (see
-    SignModulatedKernel / cfg.data.sign_modulation_component_prob); None
-    (the default) means "not applied" for that component -- callers should
-    pass None (not the saved 0.0-filled tensor) whenever that episode's
-    sign_applied[_b] sentinel is 0.0, same pattern _optional_param already
-    uses for period/rq_alpha/power/l_b (see pit.py::gp_analytical_pit).
-    sign_w_outer/sign_b_outer is the POST-COMPOSITION hyperplane (cfg.data.
-    sign_modulation_outer_prob), applied LAST -- after A/B are built and
-    combined -- wrapping the whole (possibly composite) kernel, mirroring
-    the order _sample_episode_kernel/_build_kernel_chain apply it at
-    generation time (per-component first, then once more on the composed
-    result).
+    sign_w/sign_b/sign_a (component A) and sign_w_b/sign_b_b/sign_a_b
+    (component B, composite only) are the PER-COMPONENT sign-modulation
+    hyperplanes (see SignModulatedKernel / cfg.data.sign_modulation_component_prob);
+    None (the default) means "not applied" for that component -- callers
+    should pass None (not the saved 0.0-filled tensor) whenever that
+    episode's sign_applied[_b] sentinel is 0.0, same pattern _optional_param
+    already uses for period/rq_alpha/power/l_b (see
+    pit.py::gp_analytical_pit). sign_w_outer/sign_b_outer/sign_a_outer is the
+    POST-COMPOSITION hyperplane (cfg.data. sign_modulation_outer_prob),
+    applied LAST -- after A/B are built and combined -- wrapping the whole
+    (possibly composite) kernel, mirroring the order
+    _sample_episode_kernel/_build_kernel_chain apply it at generation time
+    (per-component first, then once more on the composed result). sign_a[_b|
+    _outer]=None while its paired sign_w[_b|_outer] is not None falls back to
+    a very large sharpness (recovering the pre-tanh hard sign()) -- see
+    _wrap_concrete_sign_modulated's docstring.
     """
     composite = _parse_composite(kernel_name)
     if composite is None:
         kernel = _build_concrete_kernel(
             kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims,
-            sign_w=sign_w, sign_b=sign_b,
+            sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
         )
     else:
         name_a, op, name_b = composite
         kernel_a = _build_concrete_kernel(
             name_a, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims,
-            sign_w=sign_w, sign_b=sign_b,
+            sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
         )
         kernel_b = _build_concrete_kernel(
             name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, power=power_b, active_dims=active_dims,
-            sign_w=sign_w_b, sign_b=sign_b_b,
+            sign_w=sign_w_b, sign_b=sign_b_b, sign_a=sign_a_b,
         )
         kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
 
-    kernel = _wrap_concrete_sign_modulated(kernel, sign_w_outer, sign_b_outer, active_dims=active_dims)
+    kernel = _wrap_concrete_sign_modulated(kernel, sign_w_outer, sign_b_outer, sign_a_outer, active_dims=active_dims)
 
     # kernel's parameters are CPU-resident regardless of the device l/alpha2
     # were on (see _build_scaled_kernel's docstring note) — move lazily to
@@ -1276,7 +1351,7 @@ def _build_kernel_chain(
 
     outer_prob = float(getattr(cfg.data, "sign_modulation_outer_prob", 0.0))
     kernel, outer_params = _maybe_wrap_sign_modulated(
-        kernel, outer_prob, k, B, device, active_dims=active_dims, param_suffix="_outer"
+        cfg, kernel, outer_prob, k, B, device, active_dims=active_dims, param_suffix="_outer"
     )
 
     return kernel, component_params, outer_params
@@ -2294,23 +2369,24 @@ def _generate_gp_batch_raw(
         # Per-episode (sliceable via val[b]) hyperparameters/factors, plus
         # the batch-shared kernel name and active_dims — the schema
         # generate_gp_task / pit.py::gp_analytical_pit / diag_kernels.py need.
-        # sign_applied_outer/sign_w_outer/sign_b_outer (post-composition sign
-        # modulation — see _sample_episode_kernel/_build_kernel_chain) are
-        # always present in `params` (zero-filled when not applied), same
-        # 0.0-sentinel convention as period/rq_alpha/power above. The
-        # per-component sign_applied/sign_w/sign_b (bare or non-systematic
-        # composite kernel_name) are likewise always in `params` for the
-        # non-systematic path -- systematic chains instead carry their
-        # per-component sign fields inside kernel_component_params below.
+        # sign_applied_outer/sign_w_outer/sign_b_outer/sign_a_outer
+        # (post-composition sign modulation — see
+        # _sample_episode_kernel/_build_kernel_chain) are always present in
+        # `params` (zero-filled when not applied), same 0.0-sentinel
+        # convention as period/rq_alpha/power above. The per-component
+        # sign_applied/sign_w/sign_b/sign_a (bare or non-systematic composite
+        # kernel_name) are likewise always in `params` for the non-systematic
+        # path -- systematic chains instead carry their per-component sign
+        # fields inside kernel_component_params below.
         flat_keys = [
             "l", "alpha2", "period", "rq_alpha", "power",
             "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b",
-            "sign_applied_outer", "sign_w_outer", "sign_b_outer",
+            "sign_applied_outer", "sign_w_outer", "sign_b_outer", "sign_a_outer",
         ]
         if not systematic:
-            flat_keys += ["sign_applied", "sign_w", "sign_b"]
+            flat_keys += ["sign_applied", "sign_w", "sign_b", "sign_a"]
             if _parse_composite(kernel_name) is not None:
-                flat_keys += ["sign_applied_b", "sign_w_b", "sign_b_b"]
+                flat_keys += ["sign_applied_b", "sign_w_b", "sign_b_b", "sign_a_b"]
         for key in flat_keys:
             tensors[key] = params[key].cpu()
         tensors["nugget"] = nugget.cpu()
