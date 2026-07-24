@@ -20,9 +20,15 @@ from omegaconf import OmegaConf
 
 from data_gen import (
     ALL_KERNELS,
+    _CATEGORY_OPS,
+    _DEFAULT_CATEGORY_WEIGHTS,
     _kernel_needs_scalar_input,
     _sample_mean_module,
+    _sample_structural_ops,
+    _structural_warp_column,
+    _STRUCTURAL_CATEGORIES,
     apply_mlp_feature_mixing,
+    apply_structural_feature_warp,
     generate_gp_batch,
     generate_gp_task,
     gp_posterior,
@@ -707,6 +713,345 @@ def test_mlp_mixing_goldilocks_and_psd(small_cfg, kernel_name):
     )
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
         f"{kernel_name}: MLP mixing degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural feature warp tests
+# ---------------------------------------------------------------------------
+
+
+def test_structural_warp_default_off_is_noop(small_cfg):
+    """structural_warp_enabled defaults False: apply_structural_feature_warp
+    must be a byte-for-byte identity, so every existing config/dataset is
+    unaffected."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    x = torch.randn(4, 32, cfg.data.d_features)
+    out = apply_structural_feature_warp(x, cfg, "cpu")
+    assert torch.equal(out, x)
+
+
+def test_structural_warp_prob_zero_is_noop(small_cfg):
+    """structural_warp_enabled=True but structural_warp_prob=0.0 must still be
+    a no-op (the gate must genuinely gate, not just decorate)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 0.0
+    x = torch.randn(4, 32, cfg.data.d_features)
+    out = apply_structural_feature_warp(x, cfg, "cpu")
+    assert torch.equal(out, x)
+
+
+def test_structural_warp_shapes_preserved(small_cfg):
+    """Warping (when enabled) must preserve tensor shape/dtype exactly, and
+    generate_gp_batch's full output schema must still round-trip correctly."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0  # force a transform on every column
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 32, cfg.data.d_features)
+    out = apply_structural_feature_warp(x, cfg, "cpu")
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+    assert torch.isfinite(out).all()
+
+    torch.manual_seed(1)
+    episodes = generate_gp_batch(cfg, B=4, device="cpu")
+    for ep in episodes:
+        d = cfg.data.d_features
+        assert ep["x_norm_train"].shape[-1] == d
+        assert ep["x_norm_test"].shape[-1] == d
+
+
+def test_structural_warp_prob_one_changes_output(small_cfg):
+    """Sanity check the warp actually does something when forced on for every
+    column (guards against a silently-inert implementation)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 32, cfg.data.d_features)
+    out = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+    assert not torch.equal(out, x)
+
+
+def test_structural_warp_partial_gate_leaves_some_columns_unwarped(small_cfg):
+    """0 < structural_warp_prob < 1 over a large-enough batch should leave at
+    least one episode identical to its pre-warp input and at least one
+    changed — verifies the per-(episode, column) Bernoulli gate."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 0.5
+
+    torch.manual_seed(0)
+    B = 64
+    x = torch.randn(B, 32, cfg.data.d_features)
+    out = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+    n_unchanged = sum(torch.equal(out[b], x[b]) for b in range(B))
+    n_changed = B - n_unchanged
+    assert n_unchanged > 0, "expected some episodes left unwarped at prob=0.5"
+    assert n_changed > 0, "expected some episodes warped at prob=0.5"
+
+
+@pytest.mark.parametrize("kernel_name", ALL_KERNELS)
+def test_structural_warp_goldilocks_and_psd(small_cfg, kernel_name):
+    """Every registered kernel must still produce a valid, PSD, non-trivial
+    R_star with structural warping forced on for every episode/column — same
+    band as test_kernel_goldilocks_and_psd, the key regression guard against
+    correlation collapse or degeneracy introduced by the new transforms."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 1 / 3
+    cfg.data.inactive_frac_max = 5 / 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+
+    torch.manual_seed(abs(hash("structural_warp_" + kernel_name)) % (2**31))
+    off_diag_abs = []
+    for _ in range(20):
+        task = generate_gp_task(cfg)
+        R = task["R_star"]
+        N = R.shape[0]
+
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4)
+        assert torch.allclose(R, R.T, atol=1e-5)
+        eigvals = torch.linalg.eigvalsh(R)
+        assert (eigvals >= -1e-4).all(), (
+            f"{kernel_name}: not PSD with structural warping (min eig={eigvals.min():.6f})"
+        )
+        assert R.abs().max() <= 1.0 + 1e-5
+
+        mask = ~torch.eye(N, dtype=torch.bool)
+        off_diag_abs.append(R[mask].abs())
+
+    mean_abs_r = torch.cat(off_diag_abs).mean().item()
+    assert mean_abs_r > _COLLAPSE_THRESHOLD, (
+        f"{kernel_name}: structural warping collapsed correlation, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+    assert mean_abs_r < _DEGENERATE_THRESHOLD, (
+        f"{kernel_name}: structural warping degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+
+
+def test_structural_warp_ops_sampled_without_replacement():
+    """_sample_structural_ops must never draw two ops from the same category
+    within one draw (categories chosen WITHOUT replacement), must respect
+    [num_ops_min, num_ops_max], and must return ops in _STRUCTURAL_CATEGORIES's
+    fixed canonical order regardless of draw order (mirrors TempoPFN's
+    fixed-order category composition)."""
+    for _ in range(200):
+        ops = _sample_structural_ops(_DEFAULT_CATEGORY_WEIGHTS, num_ops_min=2, num_ops_max=4)
+        assert 2 <= len(ops) <= 4
+        # Map each returned op back to its category; categories must be unique.
+        op_to_category = {op: cat for cat, ops_in_cat in _CATEGORY_OPS.items() for op in ops_in_cat}
+        categories = [op_to_category[op] for op in ops]
+        assert len(categories) == len(set(categories)), f"duplicate category sampled: {ops}"
+        idx = [_STRUCTURAL_CATEGORIES.index(c) for c in categories]
+        assert idx == sorted(idx), f"categories not in canonical order: {ops}"
+
+
+def test_structural_warp_category_weights_zero_excludes_category():
+    """A category weighted to 0 must never be sampled, even when forced to
+    draw the maximum number of ops."""
+    weights = dict(_DEFAULT_CATEGORY_WEIGHTS)
+    weights["discrete"] = 0.0
+    for _ in range(100):
+        ops = _sample_structural_ops(weights, num_ops_min=5, num_ops_max=5)
+        assert "quantize" not in ops and "censor" not in ops
+
+
+def test_structural_warp_num_ops_defaults_match_tempopfn(small_cfg):
+    """structural_warp_num_ops_min/max default to 2/6 and
+    structural_warp_category_weights default to TempoPFN's own weights --
+    mirroring UnivariateOfflineAugmentor.apply's num_ops=randint(2,6) and
+    category weight dict exactly."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    assert int(getattr(cfg.data, "structural_warp_num_ops_min", 2)) == 2
+    assert int(getattr(cfg.data, "structural_warp_num_ops_max", 6)) == 6
+    weights = dict(getattr(cfg.data, "structural_warp_category_weights", _DEFAULT_CATEGORY_WEIGHTS))
+    assert weights == _DEFAULT_CATEGORY_WEIGHTS
+
+
+# Explicit (category, op) pairs, since categories have different arities.
+_ALL_OPS = [(cat, op) for cat, ops in _CATEGORY_OPS.items() for op in ops]
+
+
+@pytest.mark.parametrize("use_index_axis", [False, True])
+@pytest.mark.parametrize("category,op", _ALL_OPS)
+def test_structural_warp_op_preserves_shape_and_finite_direct(category, op, use_index_axis):
+    """Every individual op, called directly under both pseudo-time axes, must
+    preserve shape/dtype and produce finite output -- the key regression net
+    for the new ops added to diversify the prior (yflip, time_flip, amplitude
+    modulation, quantize, differential) alongside the ones already covered by
+    the goldilocks test."""
+    torch.manual_seed(abs(hash(f"op_direct_{category}_{op}_{use_index_axis}")) % (2**31))
+    col = torch.randn(64)
+    out = _structural_warp_column(col.clone(), op, use_index_axis=use_index_axis)
+    assert out.shape == col.shape
+    assert out.dtype == col.dtype
+    assert torch.isfinite(out).all()
+
+
+def test_structural_warp_quantize_snaps_to_few_unique_levels():
+    """quantize must reduce a continuous column to at most 10 distinct
+    values (n_levels in [3,10]) -- a direct sanity check that it's actually
+    discretizing, not silently behaving like an identity/no-op."""
+    torch.manual_seed(0)
+    col = torch.randn(500)
+    out = _structural_warp_column(col.clone(), "quantize")
+    assert out.unique().numel() <= 10
+    assert not torch.equal(out, col)
+
+
+def test_structural_warp_yflip_negates_column():
+    col = torch.randn(32)
+    out = _structural_warp_column(col.clone(), "yflip")
+    assert torch.equal(out, -col)
+
+
+def test_structural_warp_time_flip_reverses_index_axis():
+    """use_index_axis=True must reverse raw row order (TempoPFN's literal
+    TimeFlipAugmenter)."""
+    col = torch.randn(32)
+    out = _structural_warp_column(col.clone(), "time_flip", use_index_axis=True)
+    assert torch.equal(out, col.flip(dims=[0]))
+
+
+def test_structural_warp_time_flip_reverses_value_rank_by_default():
+    """Default (use_index_axis=False) reverses VALUE rank instead: the point
+    holding the smallest value swaps with the one holding the largest, etc.
+    (Sorting `out` can't distinguish this from a no-op, since it's the same
+    multiset either way -- so this reconstructs the expected pointwise
+    reassignment directly instead of comparing sorted arrays.)"""
+    col = torch.randn(32)
+    out = _structural_warp_column(col.clone(), "time_flip")
+    sort_idx = torch.argsort(col)
+    expected = torch.empty_like(col)
+    expected[sort_idx] = col[sort_idx].flip(dims=[0])
+    assert torch.equal(out, expected)
+    # Not the same as a raw index-reversal (extremely unlikely to coincide
+    # for random data) -- guards against the two modes silently collapsing.
+    assert not torch.equal(out, col.flip(dims=[0]))
+
+
+def test_structural_warp_num_ops_composes_multiple_categories(small_cfg):
+    """Forcing num_ops_min=num_ops_max=6 applies one op from EVERY category to
+    every gated column, deterministically differing from a single-category
+    draw -- guards against composition being a silently-inert no-op."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+    cfg.data.structural_warp_num_ops_min = len(_STRUCTURAL_CATEGORIES)
+    cfg.data.structural_warp_num_ops_max = len(_STRUCTURAL_CATEGORIES)
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 64, cfg.data.d_features)
+    out_all = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+    assert out_all.shape == x.shape
+    assert torch.isfinite(out_all).all()
+
+    cfg.data.structural_warp_num_ops_min = 1
+    cfg.data.structural_warp_num_ops_max = 1
+    torch.manual_seed(0)
+    out_single = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+
+    assert not torch.equal(out_all, out_single)
+
+
+def test_structural_warp_index_axis_disabled_by_default(small_cfg):
+    """structural_warp_index_axis_enabled defaults False, so setting a ratio
+    without also enabling it must have no effect -- output must be identical
+    to leaving the ratio at 0."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+    cfg.data.structural_warp_index_axis_ratio = 1.0  # enabled defaults False, so this must be ignored
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 64, cfg.data.d_features)
+
+    torch.manual_seed(1)  # both calls must start from the identical RNG state
+    out_ratio_set = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+
+    cfg.data.structural_warp_index_axis_ratio = 0.0
+    torch.manual_seed(1)
+    out_ratio_zero = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+
+    assert torch.equal(out_ratio_set, out_ratio_zero)
+
+
+def test_structural_warp_index_axis_ratio_one_forces_index_axis(small_cfg):
+    """structural_warp_index_axis_enabled=True with ratio=1.0 must always use
+    the index axis, differing from ratio=0.0 (always value-rank) -- guards
+    against the enable/ratio wiring being a silent no-op."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+    cfg.data.structural_warp_index_axis_enabled = True
+    cfg.data.structural_warp_index_axis_ratio = 1.0
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 64, cfg.data.d_features)
+
+    torch.manual_seed(1)  # both calls must start from the identical RNG state
+    out_index = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+
+    cfg.data.structural_warp_index_axis_ratio = 0.0
+    torch.manual_seed(1)
+    out_rank = apply_structural_feature_warp(x.clone(), cfg, "cpu")
+
+    assert not torch.equal(out_index, out_rank)
+
+
+@pytest.mark.parametrize("kernel_name", ALL_KERNELS)
+def test_structural_warp_composed_goldilocks_and_psd(small_cfg, kernel_name):
+    """Same PSD/goldilocks guard as test_structural_warp_goldilocks_and_psd,
+    but with every gated column forced to compose one op from ALL 6
+    categories -- the worst-case stacking scenario for correlation collapse
+    or degeneracy."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 1 / 3
+    cfg.data.inactive_frac_max = 5 / 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+    cfg.data.structural_warp_num_ops_min = len(_STRUCTURAL_CATEGORIES)
+    cfg.data.structural_warp_num_ops_max = len(_STRUCTURAL_CATEGORIES)
+
+    torch.manual_seed(abs(hash("structural_warp_composed_" + kernel_name)) % (2**31))
+    off_diag_abs = []
+    for _ in range(20):
+        task = generate_gp_task(cfg)
+        R = task["R_star"]
+        N = R.shape[0]
+
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4)
+        assert torch.allclose(R, R.T, atol=1e-5)
+        eigvals = torch.linalg.eigvalsh(R)
+        assert (eigvals >= -1e-4).all(), (
+            f"{kernel_name}: not PSD with composed structural warping (min eig={eigvals.min():.6f})"
+        )
+        assert R.abs().max() <= 1.0 + 1e-5
+
+        mask = ~torch.eye(N, dtype=torch.bool)
+        off_diag_abs.append(R[mask].abs())
+
+    mean_abs_r = torch.cat(off_diag_abs).mean().item()
+    assert mean_abs_r > _COLLAPSE_THRESHOLD, (
+        f"{kernel_name}: composed structural warping collapsed correlation, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+    assert mean_abs_r < _DEGENERATE_THRESHOLD, (
+        f"{kernel_name}: composed structural warping degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
 
 
