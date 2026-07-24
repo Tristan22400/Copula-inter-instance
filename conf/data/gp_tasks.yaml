@@ -210,11 +210,23 @@ poly_offset_gamma_concentration: 2.0    # polynomial kernel's offset c
 poly_offset_gamma_rate: 1.0
 
 # Sign-modulated (Schur product) kernel wrapper: K'(x1,x2) = K(x1,x2) *
-# sign(w.x1+b) * sign(w.x2+b), a random hyperplane split of the kernel's own
-# active-column subspace, PSD via the Schur product theorem (rank-1 PSD s s^T
-# times PSD K stays PSD) — see data_gen.py::SignModulatedKernel. w ~ N(0, I_k),
-# b ~ N(0, 1), one independent draw per episode. Injects negative pairwise
+# s(x1) * s(x2), s(x) = tanh(a*(w.x+b)), a random hyperplane split of the
+# kernel's own active-column subspace, PSD via the Schur product theorem
+# (rank-1 PSD s s^T times PSD K stays PSD, for ANY real-valued s — see
+# data_gen.py::SignModulatedKernel) — see data_gen.py::SignModulatedKernel.
+# w ~ N(0, I_k)/sqrt(k), b ~ N(0, 1), a ~ LogNormal(sharpness_lognormal_loc/
+# _scale), one independent draw per episode. Injects negative pairwise
 # correlation into R_star without touching oracle_mode or gp_posterior.
+# tanh (replacing an earlier bare torch.sign()) trades the old hard +-1 flip
+# (exact but with zero local gradient off a single measure-zero boundary —
+# empirically unlearnable, since (w,b) is fresh per episode with no
+# cross-episode transfer) for a smooth ramp of width ~1/a: large `a` recovers
+# hard-sign behaviour (and its learnability problem) almost everywhere;
+# small `a` smooths the transition over more of the input space at the cost
+# of attenuating correlation magnitude there. See SignModulatedKernel's
+# docstring for the full tradeoff.
+sign_modulation_sharpness_lognormal_loc: 1.0986   # log(3.0) -- median sharpness a=3
+sign_modulation_sharpness_lognormal_scale: 0.5
 # Two independently-gated injection points, each a Bernoulli-per-batch-call
 # coin flip (same granularity as mlp_mixing_prob — if it fires, EVERY episode
 # in that generate_gp_batch call gets its own independent (w, b) draw):
