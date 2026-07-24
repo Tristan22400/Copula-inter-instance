@@ -1839,6 +1839,381 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
     return warped_x
 
 
+# Structural feature-warp categories/ops, ported from TempoPFN's
+# (github.com/automl/TempoPFN) offline per-series augmentor
+# (UnivariateOfflineAugmentor.apply, offline_per_sample_iid_augmentations.py):
+# TempoPFN applies these post-hoc to sampled *outputs*, which isn't valid
+# here — our oracle target (R_star/Sigma_star) is derived analytically from
+# the kernel evaluated on x, so any transform of the sampled y that isn't
+# itself expressible as a kernel change invalidates the label. Instead these
+# run on x, alongside tabiclv2_warp_features/apply_mlp_feature_mixing: a
+# fixed, deterministic feature map f still yields a valid kernel
+# k(f(x_i), f(x_j)), so R_star computed downstream stays exact, regardless of
+# how many ops are composed or in what order.
+#
+# TempoPFN's own orchestration is two-level: sample 2-6 CATEGORIES (out of 6)
+# without replacement, weighted, then apply at most ONE op per chosen
+# category, always in the fixed category order below. Mirrored exactly here,
+# except:
+#   - "seasonality" drops the calendar-injection op (real day-of-week/
+#     month-end effects need actual pd.Timestamps, which GP points don't
+#     have) and keeps only amplitude_modulation, redefined on the value-rank
+#     pseudo-time axis (see _structural_warp_column) instead of a real
+#     position axis, per the same reasoning as regime_change/shock_recovery.
+#   - "analytic" (TempoPFN's DifferentialAugmenter: gaussian-smooth / sobel /
+#     laplace / integral / 3rd-/4th-derivative, one chosen uniformly) is
+#     ported as a 4-way choice {smooth, first-derivative, second-derivative,
+#     cumulative integral} -- 3rd/4th derivatives amplify noise enough on
+#     already-warped Gaussian data to risk destabilizing R_star's Cholesky
+#     (see the NotPSDError handling in _generate_gp_batch_raw), so they're
+#     dropped rather than risk an unrecoverable draw for marginal benefit.
+#   - cross-episode mixup has no analogue here — it combines *episodes*,
+#     which would need a corresponding kernel combination to stay
+#     label-safe (that's what the composite/sum-product kernels already do).
+_STRUCTURAL_CATEGORIES: List[str] = [
+    "invariances",
+    "structure",
+    "seasonality",
+    "artifacts",
+    "analytic",
+    "discrete",
+]
+
+_CATEGORY_OPS: Dict[str, List[str]] = {
+    "invariances": ["yflip", "time_flip"],
+    "structure": ["regime_change", "shock_recovery"],
+    "seasonality": ["amplitude_modulation"],
+    "artifacts": ["resample_artifact"],
+    "analytic": ["differential"],
+    "discrete": ["quantize", "censor"],
+}
+
+# TempoPFN's own default category weights (offline_per_sample_iid_augmentations.py).
+_DEFAULT_CATEGORY_WEIGHTS: Dict[str, float] = {
+    "invariances": 0.6,
+    "structure": 0.6,
+    "seasonality": 0.5,
+    "artifacts": 0.3,
+    "analytic": 0.4,
+    "discrete": 0.6,
+}
+
+# Sub-op weights within a category, for categories with >1 op. "discrete"
+# matches TempoPFN's own quantize/censor split; "invariances" and "structure"
+# are uniform in TempoPFN (plain rng.choice over the enabled ops).
+_CATEGORY_SUB_OP_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "discrete": {"quantize": 0.6, "censor": 0.4},
+}
+
+
+def _structural_warp_column(col_data: Tensor, op: str, use_index_axis: bool = False) -> Tensor:
+    """Apply one structural transform to a single (episode, column) feature
+    vector of shape (T,).
+
+    GP episodes have no time axis, unlike TempoPFN's series. By default
+    (use_index_axis=False) "order" here is each point's own VALUE-RANK within
+    this column -- decoupled from the train/test split (a plain index slice,
+    see generate_gp_batch), so an order-dependent op can't systematically land
+    on one side of the split. Setting use_index_axis=True instead uses the
+    literal row position 0..T-1 (the same axis the split is defined on) as
+    TempoPFN's real series would -- a more faithful port, but one that *can*
+    introduce a fixed train/test coupling (see apply_structural_feature_warp's
+    structural_warp_index_axis_ratio). Either way this stays a fixed,
+    deterministic function of col_data alone (independent of the other d-1
+    columns), keeping the overall column map a valid deterministic feature
+    map (see the module-level comment above `_STRUCTURAL_CATEGORIES`).
+    """
+    T = col_data.shape[0]
+    device = col_data.device
+    std = col_data.std()
+    if not torch.isfinite(std) or std <= 0:
+        std = torch.ones((), device=device)
+
+    # Ops that don't need either pseudo-time axis at all.
+    if op == "yflip":
+        return -col_data
+
+    if op == "censor":
+        # Elementwise clip between two random quantiles — no ordering needed.
+        q_low, q_high = float(torch.rand(1)), float(torch.rand(1))
+        q_low, q_high = min(q_low, q_high), max(q_low, q_high)
+        sorted_vals = torch.sort(col_data).values
+        lo = sorted_vals[int(q_low * (T - 1))]
+        hi = sorted_vals[int(q_high * (T - 1))]
+        return col_data.clamp(min=lo.item(), max=hi.item())
+
+    if op == "quantize":
+        # Non-equidistant quantization (TempoPFN's QuantizationAugmenter):
+        # snap each value to its nearest of n_levels levels, where levels are
+        # {min, max} plus (n_levels-2) random interior points -- uniform
+        # random interior points here instead of TempoPFN's Sobol sequence
+        # (same idea: non-equidistant levels, no new dependency).
+        lo, hi = col_data.min(), col_data.max()
+        if not torch.isfinite(hi - lo) or (hi - lo).item() <= 0:
+            return col_data
+        n_levels = int(torch.randint(3, 11, (1,)).item())
+        n_interior = max(0, n_levels - 2)
+        interior = lo + (hi - lo) * torch.rand(n_interior, device=device)
+        levels = torch.sort(torch.cat([lo.view(1), hi.view(1), interior])).values
+        idx = torch.argmin((col_data.unsqueeze(1) - levels.unsqueeze(0)).abs(), dim=1)
+        return levels[idx]
+
+    # Remaining ops act on a pseudo-time axis: value-rank (default) or, if
+    # use_index_axis, the raw row position (sort_idx is then the identity
+    # permutation, so "sorted_vals" is just col_data itself and the final
+    # scatter-back is a no-op reassignment).
+    if use_index_axis:
+        sort_idx = torch.arange(T, device=device)
+    else:
+        sort_idx = torch.argsort(col_data)
+    sorted_vals = col_data[sort_idx]
+    rank = torch.arange(T, device=device, dtype=torch.float32)
+
+    if op == "time_flip":
+        # Whole-axis reversal (TempoPFN's TimeFlipAugmenter) along whichever
+        # pseudo-time axis is active: reverses raw row order if
+        # use_index_axis, otherwise reverses the value-rank order (the point
+        # holding the smallest value swaps with the one holding the largest,
+        # etc.) -- either way a fixed permutation, still a valid deterministic
+        # feature map.
+        transformed = sorted_vals.flip(dims=[0])
+
+    elif op == "regime_change":
+        min_seg = max(4, T // 16)
+        valid_hi = T - min_seg
+        if valid_hi <= min_seg:
+            transformed = sorted_vals
+        else:
+            num_cp = int(torch.randint(1, 4, (1,)).item())
+            valid = torch.arange(min_seg, valid_hi, device=device)
+            num_cp = min(num_cp, valid.numel())
+            cp = torch.sort(valid[torch.randperm(valid.numel(), device=device)[:num_cp]]).values
+            boundaries = torch.cat(
+                [
+                    torch.zeros(1, device=device, dtype=cp.dtype),
+                    cp,
+                    torch.full((1,), T, device=device, dtype=cp.dtype),
+                ]
+            )
+            transformed = sorted_vals.clone()
+            for i in range(boundaries.numel() - 1):
+                s, e = int(boundaries[i]), int(boundaries[i + 1])
+                if e <= s:
+                    continue
+                seg = sorted_vals[s:e]
+                scale = float(torch.empty(1).uniform_(0.8, 1.25))
+                shift = float(torch.randn(1)) * 0.15 * std.item()
+                seg_mean = seg.mean()
+                transformed[s:e] = (seg - seg_mean) * scale + seg_mean + shift
+
+    elif op == "shock_recovery":
+        lo = max(1, T // 16)
+        hi = max(lo + 1, T - T // 16)
+        t0 = int(torch.randint(lo, hi, (1,)).item())
+        mag = float(torch.empty(1).uniform_(0.5, 2.0)) * std.item()
+        if torch.rand(1).item() < 0.5:
+            mag = -mag
+        half_life = max(1.0, float(torch.empty(1).uniform_(0.05, 0.3)) * T)
+        decay = torch.exp(-(rank - t0).clamp(min=0) / half_life)
+        transformed = sorted_vals + mag * decay
+
+    elif op == "amplitude_modulation":
+        # Rescale one contiguous rank-window's amplitude around its local
+        # mean (TempoPFN's _apply_seasonality_amplitude_modulation, redefined
+        # on the rank axis -- no shift, unlike regime_change, and only ONE
+        # window rather than partitioning the whole column).
+        min_w = max(4, T // 16)
+        max_w = max(min_w + 1, T // 2)
+        win = int(torch.randint(min_w, max_w + 1, (1,)).item())
+        start = int(torch.randint(0, max(1, T - win) + 1, (1,)).item())
+        end = min(T, start + win)
+        transformed = sorted_vals.clone()
+        seg = sorted_vals[start:end]
+        if seg.numel() > 0:
+            seg_mean = seg.mean()
+            amp = float(torch.empty(1).uniform_(0.5, 1.8))
+            transformed[start:end] = (seg - seg_mean) * amp + seg_mean
+
+    elif op == "differential":
+        # TempoPFN's DifferentialAugmenter, reduced to a 4-way choice (see
+        # module comment): gaussian-smooth, 1st derivative (Sobel-like),
+        # 2nd derivative (Laplace-like), or a cumulative integral -- always
+        # applied on top of a box-smoothed version, then rescaled back into
+        # the original value range (matches TempoPFN's _rescale_signal).
+        k = max(3, T // 32)
+        k = k + 1 if k % 2 == 0 else k
+        box = torch.ones(k, device=device) / k
+        padded = torch.nn.functional.pad(sorted_vals.view(1, 1, -1), (k // 2, k // 2), mode="reflect")
+        smoothed = torch.nn.functional.conv1d(padded, box.view(1, 1, -1)).view(-1)
+
+        sub_op = int(torch.randint(0, 4, (1,)).item())
+        if sub_op == 0:
+            raw = smoothed
+        elif sub_op == 1:  # first derivative
+            sk = torch.tensor([-1.0, 0.0, 1.0], device=device)
+            p = torch.nn.functional.pad(smoothed.view(1, 1, -1), (1, 1), mode="reflect")
+            raw = torch.nn.functional.conv1d(p, sk.view(1, 1, -1)).view(-1)
+        elif sub_op == 2:  # second derivative
+            sk = torch.tensor([1.0, -2.0, 1.0], device=device)
+            p = torch.nn.functional.pad(smoothed.view(1, 1, -1), (1, 1), mode="reflect")
+            raw = torch.nn.functional.conv1d(p, sk.view(1, 1, -1)).view(-1)
+        else:  # cumulative integral, running from the left or right
+            if torch.rand(1).item() < 0.5:
+                raw = torch.cumsum(smoothed, dim=0)
+            else:
+                raw = torch.flip(torch.cumsum(torch.flip(smoothed, dims=[0]), dim=0), dims=[0])
+
+        r_min, r_max = raw.min(), raw.max()
+        s_min, s_max = sorted_vals.min(), sorted_vals.max()
+        denom = (r_max - r_min).clamp(min=1e-8)
+        transformed = (raw - r_min) / denom * (s_max - s_min) + s_min
+
+    elif op == "resample_artifact":
+        # Downsample (with a random phase offset) then upsample back via one
+        # of 3 modes (TempoPFN: linear interp / step-hold / linear+smooth).
+        max_factor = max(2, min(8, T // 32))
+        factor = int(torch.randint(2, max_factor + 1, (1,)).item())
+        offset = int(torch.randint(0, factor, (1,)).item())
+        ds_idx = torch.arange(offset, T, factor, device=device)
+        if ds_idx.numel() < 3:
+            transformed = sorted_vals
+        else:
+            ds_vals_np = sorted_vals[ds_idx].detach().cpu().numpy()
+            ds_idx_np = ds_idx.detach().cpu().numpy().astype(np.float64)
+            rank_np = rank.detach().cpu().numpy()
+            mode_idx = int(torch.multinomial(torch.tensor([0.5, 0.2, 0.3]), 1).item())
+            if mode_idx == 0:  # linear
+                us_np = np.interp(rank_np, ds_idx_np, ds_vals_np)
+            elif mode_idx == 1:  # step-hold: forward-fill from the last downsampled point
+                us_np = ds_vals_np[np.searchsorted(ds_idx_np, rank_np, side="right") - 1]
+            else:  # linear + light smoothing
+                us_np = np.interp(rank_np, ds_idx_np, ds_vals_np)
+                sm_k = max(3, T // 128)
+                sm_kernel = np.ones(sm_k) / sm_k
+                us_np = np.convolve(us_np, sm_kernel, mode="same")
+            transformed = torch.from_numpy(us_np).to(device=device, dtype=sorted_vals.dtype)
+
+    else:
+        raise ValueError(f"Unknown structural warp op '{op}'")
+
+    warped = torch.empty_like(col_data)
+    warped[sort_idx] = transformed
+    return warped
+
+
+def _sample_structural_ops(category_weights: Dict[str, float], num_ops_min: int, num_ops_max: int) -> List[str]:
+    """Sample 1 op per chosen category, mirroring TempoPFN's own two-level
+    orchestration (UnivariateOfflineAugmentor.apply): first draw 2..6
+    categories WITHOUT replacement (weighted by category_weights, zero-weight
+    categories excluded), then always in the FIXED canonical category order
+    (_STRUCTURAL_CATEGORIES) -- never in draw order -- pick exactly one op
+    per chosen category (weighted by _CATEGORY_SUB_OP_WEIGHTS if the category
+    has more than one op).
+
+    Uses torch's RNG throughout (torch.multinomial/randint), not numpy's, so
+    this is governed by the same torch.manual_seed/_seed_everything calls as
+    every other draw in this file.
+    """
+    eligible = [c for c in _STRUCTURAL_CATEGORIES if category_weights.get(c, 0.0) > 0.0]
+    if not eligible:
+        return []
+    k = min(int(torch.randint(num_ops_min, num_ops_max + 1, (1,)).item()), len(eligible))
+    weights = torch.tensor([category_weights[c] for c in eligible], dtype=torch.float32)
+    weights = weights / weights.sum()
+    idx = torch.multinomial(weights, k, replacement=False)
+    chosen_categories = {eligible[i] for i in idx.tolist()}
+
+    ops: List[str] = []
+    for category in _STRUCTURAL_CATEGORIES:  # fixed canonical order, not draw order
+        if category not in chosen_categories:
+            continue
+        candidates = _CATEGORY_OPS[category]
+        if len(candidates) == 1:
+            ops.append(candidates[0])
+            continue
+        sub_weights_map = _CATEGORY_SUB_OP_WEIGHTS.get(category)
+        if sub_weights_map is None:
+            sub_weights = torch.ones(len(candidates))
+        else:
+            sub_weights = torch.tensor([sub_weights_map[c] for c in candidates], dtype=torch.float32)
+        sub_weights = sub_weights / sub_weights.sum()
+        pick = int(torch.multinomial(sub_weights, 1).item())
+        ops.append(candidates[pick])
+    return ops
+
+
+def apply_structural_feature_warp(x: Tensor, cfg, device) -> Tensor:
+    """Optionally apply TempoPFN-inspired transforms — invariances (yflip/
+    time_flip), regime changes/shock-recovery, amplitude modulation,
+    resample artifacts, differential (smoothing/derivative/integral), and
+    discretization (quantize/censor) — to each feature column independently,
+    per episode.
+
+    Runs on the GP's INPUT coordinates x (never on sampled outputs y), same
+    place and same reasoning as tabiclv2_warp_features/apply_mlp_feature_mixing:
+    a deterministic feature map keeps k(f(x_i), f(x_j)) a valid kernel, so
+    R_star/Sigma_star computed downstream stay exact. See the module-level
+    comment above `_STRUCTURAL_CATEGORIES` for why this differs from
+    TempoPFN's own (output-side) augmentor.
+
+    Composition: once a column is gated in (structural_warp_prob), 1 op per
+    chosen category is drawn, categories chosen WITHOUT replacement
+    (structural_warp_num_ops_min/max out of the 6 categories, weighted by
+    structural_warp_category_weights) and applied in the fixed category
+    order — see _sample_structural_ops, mirroring TempoPFN's own num_ops =
+    randint(2,6) category composition exactly.
+
+    Pseudo-time axis: every order-dependent op in the composition for a given
+    column uses value-rank by default (decoupled from the train/test split),
+    or the raw row-index axis with probability structural_warp_index_axis_ratio
+    when structural_warp_index_axis_enabled is True — see
+    _structural_warp_column's docstring. The choice is made ONCE per gated
+    column (not per op), so a column's whole composed transform is consistent
+    about which axis it treats as "time."
+
+    Args:
+        x: (B, T, d) tensor. This repo calls it between tabiclv2_warp_features
+            and apply_mlp_feature_mixing; either order is valid.
+        cfg: Hydra config; reads cfg.data.structural_warp_* keys, all optional
+            via getattr (structural_warp_enabled defaults False -> exact
+            no-op for every existing config/dataset).
+        device: unused; kept for signature symmetry with
+            apply_mlp_feature_mixing so call sites don't special-case this.
+
+    Returns:
+        (B, T, d) tensor, same shape/dtype as x.
+    """
+    if not bool(getattr(cfg.data, "structural_warp_enabled", False)):
+        return x
+
+    prob = float(getattr(cfg.data, "structural_warp_prob", 0.3))
+    if prob <= 0.0:
+        return x
+
+    category_weights = dict(getattr(cfg.data, "structural_warp_category_weights", _DEFAULT_CATEGORY_WEIGHTS))
+
+    num_ops_max = int(getattr(cfg.data, "structural_warp_num_ops_max", 6))
+    num_ops_max = max(1, min(num_ops_max, len(_STRUCTURAL_CATEGORIES)))
+    num_ops_min = int(getattr(cfg.data, "structural_warp_num_ops_min", 2))
+    num_ops_min = max(1, min(num_ops_min, num_ops_max))
+
+    index_axis_enabled = bool(getattr(cfg.data, "structural_warp_index_axis_enabled", False))
+    index_axis_ratio = float(getattr(cfg.data, "structural_warp_index_axis_ratio", 0.0))
+
+    B, T, d = x.shape
+    warped_x = x.clone()
+    for b in range(B):
+        for col in range(d):
+            if torch.rand(1).item() >= prob:
+                continue
+            use_index_axis = index_axis_enabled and torch.rand(1).item() < index_axis_ratio
+            col_data = warped_x[b, :, col]
+            for op in _sample_structural_ops(category_weights, num_ops_min, num_ops_max):
+                col_data = _structural_warp_column(col_data, op, use_index_axis=use_index_axis)
+            warped_x[b, :, col] = col_data
+    return warped_x
+
+
 # Activation bank for MLP feature mixing (adapted from CauKer's SCM activation
 # set, applied here to GP *input coordinates* rather than sampled *outputs* —
 # see apply_mlp_feature_mixing's docstring for why this preserves exact
@@ -2113,6 +2488,7 @@ def _generate_gp_batch_raw(
     # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
     x_raw = torch.randn(B, T, d, device=device)
     x_raw = tabiclv2_warp_features(x_raw)
+    x_raw = apply_structural_feature_warp(x_raw, cfg, device)
     if return_kernel_metadata:
         x_raw, mlp_mixed = apply_mlp_feature_mixing(x_raw, cfg, device, return_gate=True)
     else:
@@ -2129,22 +2505,26 @@ def _generate_gp_batch_raw(
         prior_dist = gpytorch.distributions.MultivariateNormal(
             torch.zeros(B, T, device=device), kernel_obj(x_norm)
         )
-        noisy_dist = likelihood(prior_dist)
         try:
+            noisy_dist = likelihood(prior_dist)
             K_all_raw = noisy_dist.covariance_matrix  # (B, T, T), nugget already on diagonal
         except NotPSDError:
             # Some composite/systematic kernel chains (esp. under sign
-            # modulation — see _build_kernel_chain) leave an intermediate
+            # modulation — see _build_kernel_chain, or heavily-composed
+            # structural warps pushing feature geometry to an extreme —
+            # see apply_structural_feature_warp) leave an intermediate
             # partial-sum LinearOperator that gpytorch's own low-rank
             # __add__ path (add_low_rank -> root_inv_decomposition) can't
             # Cholesky-factor, even before _psd_safe_batch below gets a
-            # chance to repair the final K_all. This raises straight out of
-            # gpytorch's kernel evaluation, for the whole batch at once, so
-            # the individual bad episode(s) can't be isolated the way
-            # _psd_safe_batch/_batched_cholesky isolate per-row failures
-            # below. Discard the whole B-episode batch (this call's kernel/
-            # hyperparameter draw) and let generate_gp_batch's top-up loop
-            # resample a fresh one, rather than crashing the whole run.
+            # chance to repair the final K_all. This can raise straight out
+            # of either likelihood(prior_dist) or .covariance_matrix — both
+            # can trigger gpytorch's eager internal decomposition — for the
+            # whole batch at once, so the individual bad episode(s) can't be
+            # isolated the way _psd_safe_batch/_batched_cholesky isolate
+            # per-row failures below. Discard the whole B-episode batch
+            # (this call's kernel/hyperparameter draw) and let
+            # generate_gp_batch's top-up loop resample a fresh one, rather
+            # than crashing the whole run.
             warnings.warn(
                 f"_generate_gp_batch_raw: kernel evaluation for this "
                 f"{B}-episode batch (kernel={kernel_name!r}) raised NotPSDError "
