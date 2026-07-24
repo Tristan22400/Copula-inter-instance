@@ -546,8 +546,14 @@ def main(cfg: DictConfig) -> None:
     )
 
     t = cfg.training
-    dataset_path = os.path.normpath(t.dataset_dir)
-    dataset_name = os.path.basename(dataset_path)
+    live_generation = bool(t.get("live_generation", False))
+    if live_generation:
+        # dataset_dir is ignored entirely in this mode (see below) — naming the
+        # run after it would be misleading, so use a fixed marker instead.
+        dataset_name = "live-generation"
+    else:
+        dataset_path = os.path.normpath(t.dataset_dir)
+        dataset_name = os.path.basename(dataset_path)
     lora_cfg = cfg.get("lora", None)
     lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
     if lora_enabled:
@@ -609,8 +615,6 @@ def main(cfg: DictConfig) -> None:
         name=run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
     )
-
-    live_generation = bool(t.get("live_generation", False))
 
     if live_generation:
         # No on-disk dataset at all: episodes are generated on the fly by
