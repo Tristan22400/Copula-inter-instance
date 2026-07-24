@@ -19,6 +19,7 @@ train.py. Nothing in this module touches disk.
 from __future__ import annotations
 
 import copy
+import warnings
 from typing import Iterator, List
 
 import torch
@@ -90,6 +91,13 @@ class LiveGPDataset(IterableDataset):
         worker_id = info.id if info is not None else 0
         cfg = copy.deepcopy(self._cfg)
         call_idx = 0
+        # data_gen.py warns (RuntimeWarning) on every degenerate-episode
+        # discard — a routine, expected event at this call rate (every worker,
+        # every call, for the whole training run), unlike the disk pipeline's
+        # one-shot generate_pit_dataset.py run where the same warnings are
+        # informative. Episodes are still discarded regardless; only the
+        # console spam is silenced here.
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
         while True:
             cfg.seed = self._seed_for(worker_id, call_idx)
             call_idx += 1
@@ -151,9 +159,15 @@ def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig) -> List[dict]:
     n_batches = max(1, (n_val + batch_size - 1) // batch_size)
 
     batches = []
-    for i in range(n_batches):
-        val_cfg = copy.deepcopy(cfg)
-        val_cfg.seed = val_seed + i * 104_729  # distinct, fixed, reproducible per batch
-        episodes = generate_gp_batch(val_cfg, batch_size, device="cpu")
-        batches.append(collate_fn(episodes))
+    with warnings.catch_warnings():
+        # Same degenerate-episode discard warnings as LiveGPDataset.__iter__
+        # above, silenced here too (scoped to this call, not process-global,
+        # since this runs once in the main process rather than a dedicated
+        # live-generation worker).
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        for i in range(n_batches):
+            val_cfg = copy.deepcopy(cfg)
+            val_cfg.seed = val_seed + i * 104_729  # distinct, fixed, reproducible per batch
+            episodes = generate_gp_batch(val_cfg, batch_size, device="cpu")
+            batches.append(collate_fn(episodes))
     return batches
