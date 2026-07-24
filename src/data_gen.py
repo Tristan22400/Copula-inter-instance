@@ -1774,13 +1774,14 @@ def _psd_safe_batch(K: Tensor, max_tries: int = 6) -> tuple[Tensor, Tensor]:
 
 
 def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
-    """Warp each feature column with one of 8 random marginal transforms.
+    """Warp each feature column with one of 11 random marginal transforms.
 
     Simulates the extreme marginal heterogeneity of real tabular data
     (TabICLv2): heavy tails, power laws, ordinal steps, bimodal mixtures,
-    periodicity, and Cauchy outliers, applied on top of a Standard Normal
-    baseline. Intended to run before any per-episode mean/std normalisation,
-    so downstream kernel/covariance code keeps operating on calibrated,
+    periodicity, Cauchy outliers, zero-inflation, bounded/proportion-like
+    ranges, and left skew, applied on top of a Standard Normal baseline.
+    Intended to run before any per-episode mean/std normalisation, so
+    downstream kernel/covariance code keeps operating on calibrated,
     unit-scale features while the model still sees the warped shape.
 
     Args:
@@ -1804,7 +1805,7 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
 
     B, T, d = x.shape
     warped_x = x.clone()
-    choices = torch.randint(0, 8, (B, d), device=x.device)
+    choices = torch.randint(0, 11, (B, d), device=x.device)
 
     for b in range(B):
         for col in range(d):
@@ -1833,6 +1834,15 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
                 u = torch.erf(col_data / math.sqrt(2.0))
                 # Scale by 0.95 to keep tan() away from its asymptotes.
                 warped_x[b, :, col] = torch.tan(u * (math.pi / 2.0 * 0.95))
+            elif c == 8:  # Zero-inflation — point mass at 0 mixed with a continuous tail
+                spike_frac = float(torch.empty(1).uniform_(0.2, 0.6))
+                mask = torch.rand_like(col_data) < spike_frac
+                warped_x[b, :, col] = torch.where(mask, torch.zeros_like(col_data), col_data)
+            elif c == 9:  # Bounded / sigmoid squash — proportions, percentages, probabilities
+                scale = float(torch.empty(1).uniform_(0.5, 3.0))
+                warped_x[b, :, col] = torch.sigmoid(col_data * scale)
+            elif c == 10:  # Left-skew — mirror of the log-normal/exponential (c == 3) above
+                warped_x[b, :, col] = -torch.exp((-col_data).clamp(min=-5.0, max=4.0))
 
     if added_batch_dim:
         warped_x = warped_x.squeeze(0)
