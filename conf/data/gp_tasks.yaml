@@ -245,7 +245,7 @@ poly_offset_gamma_rate: 1.0
 # validate -- a fixed prob that works for 8-component chains will likely be
 # too aggressive for bare/2-component kernels (e.g. prob=1.0 on a bare
 # kernel already gives neg_frac ~0.36, see SignModulatedKernel's docstring).
-sign_modulation_component_prob: 0.7
+sign_modulation_component_prob: 0.5
 sign_modulation_outer_prob: 0.5
 
 # PIT epsilon for probit clamping (analytical pipeline)

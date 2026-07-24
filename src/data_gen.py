@@ -194,7 +194,7 @@ import numpy as np
 import torch
 from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
 from gpytorch.utils.cholesky import psd_safe_cholesky
-from gpytorch.utils.errors import NotPSDError
+from gpytorch.utils.errors import NanError, NotPSDError
 from torch import Tensor
 
 from loss import _safe_cholesky
@@ -1656,16 +1656,38 @@ def _psd_safe_batch(K: Tensor, max_tries: int = 6) -> tuple[Tensor, Tensor]:
     generation" convention _batched_cholesky uses) for only those, in the
     astronomically unlikely case max_tries isn't enough. Logged (not
     silent) so a run-wide rate can be monitored.
+
+    Separately, an occasional extreme composite-kernel hyperparameter draw
+    makes gpytorch's own float32 kernel evaluation produce actual NaN
+    entries (not just a slightly negative eigenvalue) in K_all_raw.
+    psd_safe_cholesky checks for NaN over the WHOLE batch tensor and raises
+    NanError immediately if any element is NaN, before its jitter
+    escalation ever runs — so even the other, perfectly fine episodes in
+    this batch would be blocked. NaN episodes are therefore replaced with
+    identity up front so jitter escalation still gets a chance to run on
+    the rest of the batch, and are folded into `failed` like any other
+    unrecoverable episode.
     """
+    nan_failed = torch.isnan(K).any(dim=-1).any(dim=-1)
+    if nan_failed.any():
+        eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
+        K = K.clone()
+        K[nan_failed] = eye
+        warnings.warn(
+            f"_psd_safe_batch: {int(nan_failed.sum())}/{K.shape[0]} episodes had "
+            f"NaN entries in K_all (kernel evaluation produced NaN) and will be "
+            f"discarded.",
+            RuntimeWarning,
+        )
     try:
         L = psd_safe_cholesky(K, max_tries=max_tries)
-        return L, torch.zeros(K.shape[0], dtype=torch.bool, device=K.device)
+        return L, nan_failed
     except NotPSDError:
         jitter0 = gpytorch.settings.cholesky_jitter.value(K.dtype)
         max_jitter = jitter0 * (10 ** (max_tries - 1))
         eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
         L, info = torch.linalg.cholesky_ex(K + max_jitter * eye)
-        failed = info.ne(0)
+        failed = info.ne(0) | nan_failed
         warnings.warn(
             f"_psd_safe_batch: {int(failed.sum())}/{K.shape[0]} episodes fell back "
             f"to an identity K_all (unrecoverable even at jitter={max_jitter:.1e}) "

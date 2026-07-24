@@ -850,11 +850,6 @@ def main(cfg: DictConfig) -> None:
 
     for step in range(start_step, t.steps + 1):
         _t_data0 = time.perf_counter()
-        # Pre-cleared each iteration so the except branch below can always
-        # `del` them (even if the OOM struck before they were (re)assigned
-        # this step) without leaving a stale reference to last step's
-        # computation graph pinned in this long-lived loop frame.
-        out = Sigma = parts = loss = aux_mae = grad_norm = None
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -930,15 +925,7 @@ def main(cfg: DictConfig) -> None:
                 f"P={P_b}, N={N_b}, T={P_b + N_b}) — skipping step."
             )
             optimizer.zero_grad(set_to_none=True)
-            # Critical: out/Sigma/parts/loss/aux_mae/grad_norm hold the whole
-            # forward+partial-backward graph for the failed step. They're
-            # locals of this loop's single long-lived frame, not a fresh
-            # per-iteration frame, so leaving them bound after `continue`
-            # pins that memory forever — empty_cache() only reclaims
-            # cached-but-unreferenced blocks, not live tensors. Without this,
-            # one big-shard OOM cascades into every subsequent step (any
-            # size) OOMing for the rest of the run.
-            del batch, out, Sigma, parts, loss, aux_mae, grad_norm
+            del batch
             torch.cuda.empty_cache()
             continue
 
