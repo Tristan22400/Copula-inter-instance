@@ -265,6 +265,48 @@ def _run_segments(cfg: DictConfig, prefix: str, keys: list[tuple[str, str]]) -> 
     return "".join(parts)
 
 
+def _live_data_segment(data_cfg: DictConfig) -> str:
+    """Summarize which kind of data live generation is producing this run.
+
+    Unlike disk mode (where dataset_dir's basename is a user-curated name),
+    live generation reads cfg.data.* directly every step, so the run name
+    needs its own summary of the composition/correlation/warp knobs that
+    otherwise wouldn't show up anywhere but the full wandb config.
+    """
+    if bool(data_cfg.get("systematic_composition", False)):
+        lo = data_cfg.get("composite_num_kernels_min", 1)
+        hi = data_cfg.get("composite_num_kernels_max", 1)
+        kernel_str = f"syscomp{lo}-{hi}"
+    elif data_cfg.get("kernels", None) is not None:
+        kernel_str = f"mix{len(data_cfg.kernels)}"
+    else:
+        kernel_str = str(data_cfg.get("kernel", "rbf"))
+
+    dfeat_str = (
+        "logN"
+        if data_cfg.get("d_features_lognormal_loc", None) is not None
+        else str(data_cfg.get("d_features", 10))
+    )
+
+    tags = []
+    sign_comp = float(data_cfg.get("sign_modulation_component_prob", 0.0) or 0.0)
+    sign_outer = float(data_cfg.get("sign_modulation_outer_prob", 0.0) or 0.0)
+    if sign_comp > 0 or sign_outer > 0:
+        tags.append("sgn")
+    if bool(data_cfg.get("mlp_mixing_enabled", False)):
+        tags.append("mlp")
+    if bool(data_cfg.get("structural_warp_enabled", False)):
+        tags.append("struct")
+    if bool(data_cfg.get("mean_fn_enabled", False)):
+        tags.append("mean")
+    oracle = data_cfg.get("oracle_mode", None)
+    if oracle is not None and oracle != "prior":
+        tags.append(f"oracle-{oracle}")
+
+    parts = [kernel_str, dfeat_str] + tags
+    return "_d_" + "-".join(parts)
+
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -638,8 +680,8 @@ def main(cfg: DictConfig) -> None:
     live_generation = bool(t.get("live_generation", False))
     if live_generation:
         # dataset_dir is ignored entirely in this mode (see below) — naming the
-        # run after it would be misleading, so use a fixed marker instead.
-        dataset_name = "live-generation"
+        # run after it would be misleading, so summarize cfg.data.* instead.
+        dataset_name = "live" + _live_data_segment(cfg.data)
     else:
         dataset_path = os.path.normpath(t.dataset_dir)
         dataset_name = os.path.basename(dataset_path)
