@@ -12,8 +12,10 @@ Usage:
 
 from __future__ import annotations
 
+import gc
 import math
 import os
+import traceback
 
 # P/N (hence attention sequence length T=P+N) are sampled per-shard from a wide
 # range (see conf/data/gp_tasks.yaml P_min/P_max, N_min/N_max), so batches vary
@@ -541,6 +543,89 @@ def load_checkpoint(ckpt_path: str, model: nn.Module, device: str) -> None:
     raw.load_state_dict(ckpt["state_dict"])
 
 
+def _run_train_step(
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    trainable: list[nn.Parameter],
+    batch: dict[str, torch.Tensor],
+    device: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    scaler: GradScaler | None,
+    clip_grad_norm: float,
+    nll_weight: float,
+    aux_mae_weight: float,
+    jitter: float,
+    triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    phase_start,
+    phase_end,
+):
+    """Execute one training step in a short-lived frame.
+
+    This function deliberately owns all tensors which can be attached to the
+    autograd graph.  If CUDA raises ``OutOfMemoryError`` anywhere in the step,
+    the exception unwinds this frame before the caller starts the next batch.
+    Keeping this boundary separate from the long-lived training loop is
+    important: ``empty_cache()`` only releases unreferenced allocator blocks;
+    it cannot release tensors still reachable from a loop local or traceback.
+    """
+    out = Sigma = parts = loss = aux_mae = grad_norm = None
+
+    ev_fwd0 = phase_start()
+    with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+        out = model(batch)
+    phase_end("forward", ev_fwd0)
+
+    # Loss in float32 — Cholesky / log-det want full precision.
+    ev_loss0 = phase_start()
+    Sigma = low_rank_correlation(
+        out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
+    )
+    parts = y_space_nll(
+        Sigma,
+        batch["z_test"].float(),
+        batch["log_pdf_test"].float(),
+        batch["test_mask"],
+    )
+    loss = nll_weight * parts["total"]
+
+    # Auxiliary MAE (L1) on off-diagonal correlations vs oracle R_star.
+    aux_mae = Sigma.new_tensor(0.0)
+    if aux_mae_weight > 0.0:
+        n_test = Sigma.shape[1]
+        mask_2d = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
+        if n_test not in triu_cache:
+            triu_cache[n_test] = torch.triu_indices(
+                n_test, n_test, offset=1, device=Sigma.device
+            )
+        ri, ci = triu_cache[n_test]
+        valid_off = mask_2d[:, ri, ci]
+        if valid_off.any():
+            pred_off = Sigma[:, ri, ci][valid_off]
+            oracle_off = batch["R_star"].float()[:, ri, ci][valid_off]
+            aux_mae = (pred_off - oracle_off).abs().mean()
+        loss = loss + aux_mae_weight * aux_mae
+    phase_end("loss", ev_loss0)
+
+    ev_bwd0 = phase_start()
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        grad_norm = nn.utils.clip_grad_norm_(trainable, clip_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(trainable, clip_grad_norm)
+        optimizer.step()
+
+    scheduler.step()
+    phase_end("backward_step", ev_bwd0)
+    return out, Sigma, parts, loss, aux_mae, grad_norm
+
+
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.seed)
@@ -858,97 +943,91 @@ def main(cfg: DictConfig) -> None:
 
     for step in range(start_step, t.steps + 1):
         _t_data0 = time.perf_counter()
-        # Pre-cleared each iteration so the except branch below can always
-        # `del` them (even if the OOM struck before they were (re)assigned
-        # this step) without leaving a stale reference to last step's
-        # computation graph pinned in this long-lived loop frame.
+        # Pre-clear loop references.  The actual computation graph is owned by
+        # _run_train_step, but these names are still used for logging after a
+        # successful step and must be safe to clean up after an OOM.
+        batch = None
         out = Sigma = parts = loss = aux_mae = grad_norm = None
         try:
-            batch = next(train_iter)
+            # Keep the CPU batch separate so an OOM during H→D transfer can be
+            # recovered just like an OOM in the model step.
+            raw_batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            batch = next(train_iter)
-        # non_blocking overlaps H→D transfer with previous GPU work (pin_memory=True)
-        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
+            raw_batch = next(train_iter)
 
         optimizer.zero_grad(set_to_none=True)
         try:
-            _ev_fwd0 = _phase_start()
-            with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                out = model(batch)
-            _phase_end("forward", _ev_fwd0)
+            # non_blocking overlaps H→D transfer with previous GPU work
+            # (pin_memory=True).
+            batch = {k: v.to(device, non_blocking=True) for k, v in raw_batch.items()}
+            _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
 
-            # Loss in float32 — Cholesky / log-det want full precision.
-            _ev_loss0 = _phase_start()
-            Sigma = low_rank_correlation(
-                out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
+            # _run_train_step owns the graph-bearing locals.  If it raises,
+            # its frame is released as the exception unwinds.
+            out, Sigma, parts, loss, aux_mae, grad_norm = _run_train_step(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                trainable=trainable,
+                batch=batch,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                scaler=scaler,
+                clip_grad_norm=t.clip_grad_norm,
+                nll_weight=nll_weight,
+                aux_mae_weight=aux_mae_weight,
+                jitter=jitter,
+                triu_cache=_triu_cache,
+                phase_start=_phase_start,
+                phase_end=_phase_end,
             )
-            parts = y_space_nll(
-                Sigma,
-                batch["z_test"].float(),
-                batch["log_pdf_test"].float(),
-                batch["test_mask"],
-            )
-            loss = nll_weight * parts["total"]
-
-            # Auxiliary MAE (L1) on off-diagonal correlations vs oracle R_star.
-            # Gives a direct gradient toward the oracle structure; weight=0 disables.
-            # L1 (vs L2/MSE) has constant-magnitude gradient near zero, which pushes
-            # near-zero predicted correlations to exactly zero — sparsity in Sigma.
-            aux_mae = Sigma.new_tensor(0.0)
-            if aux_mae_weight > 0.0:
-                N_t = Sigma.shape[1]
-                mask_2d_t = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
-                if N_t not in _triu_cache:
-                    _triu_cache[N_t] = torch.triu_indices(N_t, N_t, offset=1, device=Sigma.device)
-                ri_t, ci_t = _triu_cache[N_t]
-                valid_off_t = mask_2d_t[:, ri_t, ci_t]  # (B, n_pairs)
-                if valid_off_t.any():
-                    pred_off = Sigma[:, ri_t, ci_t][valid_off_t]
-                    ora_off = batch["R_star"].float()[:, ri_t, ci_t][valid_off_t]
-                    aux_mae = (pred_off - ora_off).abs().mean()
-                loss = loss + aux_mae_weight * aux_mae
-            _phase_end("loss", _ev_loss0)
-
-            _ev_bwd0 = _phase_start()
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                grad_norm = nn.utils.clip_grad_norm_(trainable, t.clip_grad_norm)
-                optimizer.step()
-
-            scheduler.step()
-            _phase_end("backward_step", _ev_bwd0)
             _prof_n += 1
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as exc:
             # P/N (attention length T=P+N) vary a lot per shard (see comment at
             # top of file) while batch_size is fixed, so an occasional
             # oversized shard can exceed VRAM even though most batches fit
             # comfortably. Rather than let one bad shard kill a 500k-step run,
             # drop it and move on — one skipped step is noise at this scale.
-            P_b, N_b = batch["x_train"].shape[1], batch["x_test"].shape[1]
+            shape_batch = batch if batch is not None else raw_batch
+            P_b, N_b = shape_batch["x_train"].shape[1], shape_batch["x_test"].shape[1]
             print(
-                f"[{step:6d}] CUDA OOM on batch (B={batch['x_train'].shape[0]}, "
+                f"[{step:6d}] CUDA OOM on batch (B={shape_batch['x_train'].shape[0]}, "
                 f"P={P_b}, N={N_b}, T={P_b + N_b}) — skipping step."
             )
+            # The active exception traceback otherwise keeps the failed
+            # _run_train_step frame alive until this handler exits.  Clear its
+            # locals before empty_cache(), so the graph is truly unreachable
+            # when the allocator is asked to release cached blocks.
+            traceback.clear_frames(exc.__traceback__)
+            del exc
             optimizer.zero_grad(set_to_none=True)
-            # Critical: out/Sigma/parts/loss/aux_mae/grad_norm hold the whole
-            # forward+partial-backward graph for the failed step. They're
-            # locals of this loop's single long-lived frame, not a fresh
-            # per-iteration frame, so leaving them bound after `continue`
-            # pins that memory forever — empty_cache() only reclaims
-            # cached-but-unreferenced blocks, not live tensors. Without this,
-            # one big-shard OOM cascades into every subsequent step (any
-            # size) OOMing for the rest of the run.
-            del batch, out, Sigma, parts, loss, aux_mae, grad_norm
+            # Do not retain CUDA events from a failed/incomplete phase.  They
+            # do not own the graph, but can otherwise accumulate when OOMs are
+            # frequent between log intervals.
+            if device == "cuda":
+                for events in _prof_events.values():
+                    events.clear()
+            del raw_batch, batch, shape_batch, out, Sigma, parts, loss, aux_mae, grad_norm
+            # `del` above only drops the *names*.  A failed autograd graph is a
+            # reference *cycle* (tensor -> grad_fn -> saved tensors -> ...), and
+            # so is the exception/traceback/frame chain — CPython's refcount
+            # cannot reclaim cycles, only the cyclic collector can.  Until the
+            # cycle is broken the graph's CUDA storages keep refcount > 0, so
+            # empty_cache() cannot return their blocks.  When OOMs arrive in
+            # bursts the graphs pile up faster than the generational GC happens
+            # to run, reserved VRAM ratchets up and never recovers, and every
+            # subsequent step OOMs regardless of size.  gc.collect() forces the
+            # cycles to be broken *now*, before we ask the allocator to release
+            # cached blocks.  This is the actual fix; no amount of careful
+            # `del`-ing works without it.
+            gc.collect()
             torch.cuda.empty_cache()
             continue
+
+        # The CPU copy is no longer needed after the H→D transfer.
+        del raw_batch
 
         # Defer .item() / float() GPU syncs to logging steps — saves 2+ syncs/step
         if step % t.log_every == 0:
@@ -1044,6 +1123,14 @@ def main(cfg: DictConfig) -> None:
                 f"loss={step_ms['loss']:.1f} bwd+opt={step_ms['backward_step']:.1f} "
                 f"mem={mem_alloc_pct:.1f}%/{mem_reserved_pct:.1f}% (peak {mem_peak_pct:.1f}%)"
             )
+
+        # Release this step's autograd graph before validation / checkpointing.
+        # Otherwise out/Sigma/parts/loss stay bound to these loop locals until
+        # the top of the *next* iteration, so the full training graph is pinned
+        # on top of validate()'s own forward passes — a needless peak on a card
+        # that already runs near the VRAM ceiling.  These names are not read
+        # again this iteration (the log block above already consumed them).
+        out = Sigma = parts = loss = aux_mae = grad_norm = batch = None
 
         if step % t.val_every == 0 and step > 0:
             plot_val_every = int(t.get("plot_val_every", 5000))
