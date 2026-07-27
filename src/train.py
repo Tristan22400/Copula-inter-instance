@@ -642,7 +642,11 @@ def main(cfg: DictConfig) -> None:
         dataset_name = "live-generation"
     else:
         dataset_path = os.path.normpath(t.dataset_dir)
-        dataset_name = os.path.basename(dataset_path)
+        # Include the parent folder so runs pointing at same-named shard dirs
+        # under different parents (e.g. runA/shards vs runB/shards) stay distinct.
+        parent_name = os.path.basename(os.path.dirname(dataset_path))
+        shard_name = os.path.basename(dataset_path)
+        dataset_name = f"{parent_name}/{shard_name}" if parent_name else shard_name
     lora_cfg = cfg.get("lora", None)
     lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
     if lora_enabled:
