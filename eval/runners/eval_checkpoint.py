@@ -432,6 +432,8 @@ def main() -> None:
     all_nlls: list[dict[str, float]] = []
     plot_R_dict: dict[str, Tensor] | None = None
     plot_R_oracle: Tensor | None = None
+    plot_best_key: str | None = None
+    plot_best_R: Tensor | None = None
 
     if live_generate:
         # cfg (the fixed eval-generating config, not icl_cfg) drives live
@@ -508,16 +510,21 @@ def main() -> None:
         R_dict = {**baseline_R, **icl_R}
         all_nlls.append(nlls)
 
+        icl_nll = nlls.get("icl", float("nan"))
+        ora_nll = nlls.get("oracle", float("nan"))
+        ranked_baselines = sorted(
+            ((k, v) for k, v in nlls.items() if k not in _NON_FITTED_EXCLUDED),
+            key=lambda kv: kv[1],
+        )
+        top5 = ranked_baselines[:5]
+
         if local_i == args.plot_episode:
             plot_R_dict   = R_dict
             plot_R_oracle = R_oracle
+            if ranked_baselines:
+                plot_best_key = ranked_baselines[0][0]
+                plot_best_R   = R_dict[plot_best_key]
 
-        icl_nll = nlls.get("icl", float("nan"))
-        ora_nll = nlls.get("oracle", float("nan"))
-        top5 = sorted(
-            ((k, v) for k, v in nlls.items() if k not in _NON_FITTED_EXCLUDED),
-            key=lambda kv: kv[1],
-        )[:5]
         print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
         print(f"    icl={icl_nll:.4f}  oracle={ora_nll:.4f}")
         print("    top-5 baselines (lowest NLL, fitted only):")
@@ -539,8 +546,20 @@ def main() -> None:
         matplotlib.use("Agg")
 
         os.makedirs(args.out_dir, exist_ok=True)
-        # Exclude oracle from estimators dict (it's passed separately)
+        # Exclude oracle from estimators dict (it's passed separately). Move
+        # icl to the end and insert the best-performing fitted baseline for
+        # this episode (lowest NLL, excluding icl/oracle/independence/
+        # gp_prior_rbf — same ranking as the "top-5 baselines" console print
+        # above) right before it, so oracle / best-baseline / icl sit next to
+        # each other for a quick visual comparison instead of having to scan
+        # all the individual baseline panels.
         estimators = {k: v for k, v in plot_R_dict.items() if k != "oracle"}
+        icl_panel = estimators.pop("icl", None)
+        if plot_best_key is not None:
+            best_label = f"best_baseline ({_METHOD_LABELS.get(plot_best_key, plot_best_key)})"
+            estimators[best_label] = plot_best_R
+        if icl_panel is not None:
+            estimators["icl"] = icl_panel
         fig = plot_corr_grid(
             estimators=estimators,
             oracle_R=plot_R_oracle,
