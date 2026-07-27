@@ -2344,6 +2344,124 @@ def apply_mlp_feature_mixing(
     return x_out
 
 
+def apply_kernel_hidden_warp(
+    x_norm: Tensor, cfg, device, *, return_gate: bool = False
+) -> Tensor | tuple[Tensor, Tensor]:
+    """Warp the already-normalised GP input coordinates through a SEPARATE,
+    hidden-only stack (down-projection -> nonlinear mixing at reduced width
+    -> up-projection -> per-episode z-norm) that only the kernel/mean oracle
+    ever sees. The model's own x_norm_train/x_norm_test (saved/returned by
+    _generate_gp_batch_raw) are computed from `x_norm` directly and never
+    touch this function's output.
+
+    Why this exists: without it, kernel_obj/mean_module are evaluated on the
+    exact same tensor the model is given (x_norm), so for any kernel that's a
+    function of pairwise distance (rbf/matern/rq/...) the model can solve
+    "predict R_star" by recognising the kernel family/hyperparameters
+    straight from its own input and applying the closed-form formula, never
+    needing the in-context y samples at all. Hiding the oracle's coordinate
+    system behind another stack of the SAME kind as apply_mlp_feature_mixing
+    would not be enough on its own: fan-in-scaled random d->d layers are, in
+    expectation, close to a uniform rescaling of every pairwise distance
+    (`E[||delta @ W||^2] = w_std^2 * ||delta||^2`, independent of delta's
+    direction -- the same variance-preservation argument as He/Xavier init),
+    so a model could still absorb the whole stack as one unknown scalar
+    lengthscale correction. The down-projection to width r < d below is what
+    actually breaks this: for delta = x_i - x_j, `delta @ W_down` depends
+    only on delta's component inside the random r-dimensional row space of
+    W_down; the (d-r)-dimensional orthogonal component is annihilated
+    outright, so no single per-episode rescaling can map kernel-space
+    distances back to model-space ones.
+
+    R_star stays an exact oracle regardless of any of this: this function's
+    output is still a deterministic function of the full realised randomness
+    of the episode (x_norm plus this function's own fresh
+    W_down/W_l/W_up/b_* draws) -- the same PSD/exactness argument already
+    relied on for tabiclv2_warp_features/apply_mlp_feature_mixing composes
+    through this additional deterministic map without change.
+
+    Args:
+        x_norm: (B, T, d) tensor, the fully-formed model-visible input (post
+            tabiclv2_warp_features / apply_structural_feature_warp /
+            apply_mlp_feature_mixing / z-normalisation) -- untouched by this
+            function; its output is consumed ONLY by kernel_obj/mean_module
+            in _generate_gp_batch_raw.
+        cfg: Hydra config; reads cfg.data.kernel_hidden_* keys (see
+            conf/data/gp_tasks.yaml), all optional/backward-compatible via
+            getattr defaults (kernel_hidden_enabled defaults False -> exact
+            no-op, byte-for-byte, for every existing config/dataset).
+        device: torch device string, threaded through for the new weight
+            tensors (same convention as apply_mlp_feature_mixing).
+        return_gate: if True, also return the (B,) bool tensor recording
+            which episodes actually got the hidden warp (used by
+            generate_gp_batch's return_kernel_metadata=True path, same
+            convention as apply_mlp_feature_mixing's mlp_mixed). Default
+            False preserves a single-tensor return for every existing call
+            site.
+
+    Returns:
+        (B, T, d) tensor, same shape/dtype as x_norm (down-then-up-projected
+        back to width d, so kernel_obj's active_dims/d_total=d wiring needs
+        no changes downstream). Episodes not selected by the per-episode
+        Bernoulli gate (kernel_hidden_prob) fall back to x_norm unchanged
+        (oracle == model input for those episodes, same partial-coverage
+        convention as apply_mlp_feature_mixing's mlp_mixing_prob). If
+        return_gate=True, returns (x_kernel, gate) instead, where gate is a
+        (B,) bool tensor (all False when disabled/no-op).
+    """
+    if not bool(getattr(cfg.data, "kernel_hidden_enabled", False)):
+        if return_gate:
+            return x_norm, torch.zeros(x_norm.shape[0], dtype=torch.bool, device=x_norm.device)
+        return x_norm
+
+    hidden_prob = float(getattr(cfg.data, "kernel_hidden_prob", 1.0))
+    if hidden_prob <= 0.0:
+        if return_gate:
+            return x_norm, torch.zeros(x_norm.shape[0], dtype=torch.bool, device=x_norm.device)
+        return x_norm
+
+    H_min = int(getattr(cfg.data, "kernel_hidden_layers_min", 1))
+    H_max = int(getattr(cfg.data, "kernel_hidden_layers_max", 2))
+    w_std = float(getattr(cfg.data, "kernel_hidden_weight_std", 1.0))
+    bottleneck_frac = float(getattr(cfg.data, "kernel_hidden_bottleneck_frac", 0.5))
+
+    B, T, d = x_norm.shape
+    # Clamp to [1, d-1] so r is always a genuine rank reduction, even for the
+    # small d (~8-15 typical, see d_features_lognormal_* in
+    # conf/data/gp_tasks.yaml) this repo generates episodes with.
+    r = max(1, min(d - 1, round(bottleneck_frac * d)))
+
+    W_down = torch.randn(B, d, r, device=device) * (w_std / math.sqrt(d))
+    b_down = torch.randn(B, 1, r, device=device) * w_std
+    h = torch.einsum("btd,bdr->btr", x_norm, W_down) + b_down
+
+    H = random.randint(H_min, H_max)
+    # Same batch-shared-topology / per-episode-weights convention as
+    # apply_mlp_feature_mixing: activation sequence sampled once per batch
+    # call, weight matrices independent per episode.
+    activations = [random.choice(_MLP_MIX_ACTIVATIONS) for _ in range(H)]
+    for act_name in activations:
+        W_l = torch.randn(B, r, r, device=device) * (w_std / math.sqrt(r))
+        b_l = torch.randn(B, 1, r, device=device) * w_std
+        h = torch.einsum("btr,brs->bts", h, W_l) + b_l
+        h = _apply_mlp_activation(h, act_name)
+
+    W_up = torch.randn(B, r, d, device=device) * (w_std / math.sqrt(r))
+    b_up = torch.randn(B, 1, d, device=device) * w_std
+    x_hidden = torch.einsum("btr,brd->btd", h, W_up) + b_up
+    x_hidden = (
+        (x_hidden - x_hidden.mean(1, keepdim=True))
+        / x_hidden.std(1, keepdim=True).clamp(min=1e-8)
+    )
+
+    gate_1d = torch.rand(B, device=device) < hidden_prob  # (B,)
+    gate = gate_1d[:, None, None]  # (B,1,1), see apply_mlp_feature_mixing
+    x_kernel = torch.where(gate, x_hidden, x_norm)
+    if return_gate:
+        return x_kernel, gate_1d
+    return x_kernel
+
+
 @torch.no_grad()
 def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
@@ -2505,6 +2623,21 @@ def _generate_gp_batch_raw(
         x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
+    # --- Kernel-hidden warp: kernel_obj/mean_module (and the actual y_all
+    # draw below) are evaluated on x_kernel, a further HIDDEN-ONLY transform
+    # of x_norm the model never sees -- x_norm/x_norm_train/x_norm_test stay
+    # exactly as computed above regardless of this. See
+    # apply_kernel_hidden_warp's docstring for why this is needed (stop the
+    # model solving R_star from its own input) and why the bottleneck
+    # (not just extra depth) is what actually prevents it. Identity
+    # (x_kernel is x_norm) when kernel_hidden_enabled is False (default).
+    if return_kernel_metadata:
+        x_kernel, kernel_hidden_applied = apply_kernel_hidden_warp(
+            x_norm, cfg, device, return_gate=True
+        )
+    else:
+        x_kernel = apply_kernel_hidden_warp(x_norm, cfg, device)
+
     # --- Joint prior sample + noisy covariance (B, T, T), via gpytorch's own
     # GaussianLikelihood(MultivariateNormal) — replaces the old manual
     # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly.
@@ -2513,7 +2646,7 @@ def _generate_gp_batch_raw(
     # approximate CG/Lanczos fallback.
     with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
         prior_dist = gpytorch.distributions.MultivariateNormal(
-            torch.zeros(B, T, device=device), kernel_obj(x_norm)
+            torch.zeros(B, T, device=device), kernel_obj(x_kernel)
         )
         try:
             noisy_dist = likelihood(prior_dist)
@@ -2568,16 +2701,20 @@ def _generate_gp_batch_raw(
     K_all = L_all @ L_all.mT                          # (B, T, T), PSD by construction
     y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero-mean GP sample
     # Add the (possibly all-zero) mean bank on top — a deterministic function
-    # of x_norm alone, so this stays an exact GP(mean_module, K_all) sample;
-    # oracle_mode branches below read mu_star off this same mean_module, not
-    # off a hardcoded zero, so z_train/z_test stay correctly calibrated (see
+    # of x_kernel alone, so this stays an exact GP(mean_module, K_all) sample
+    # (K_all above is also built from kernel_obj(x_kernel), so the mean and
+    # covariance oracles share one coordinate system); oracle_mode branches
+    # below read mu_star off this same mean_module/x_kernel, not off a
+    # hardcoded zero, so z_train/z_test stay correctly calibrated (see
     # _sample_mean_module's docstring).
-    y_all = y_all + mean_module(x_norm)
+    y_all = y_all + mean_module(x_kernel)
 
-    x_norm_train = x_norm[:, :P]   # (B, P, d)
-    x_norm_test  = x_norm[:, P:]   # (B, N, d)
-    y_train      = y_all[:,  :P]   # (B, P)
-    y_test       = y_all[:,  P:]   # (B, N)
+    x_norm_train   = x_norm[:, :P]     # (B, P, d) -- model-visible, saved/returned below
+    x_norm_test    = x_norm[:, P:]     # (B, N, d)
+    x_kernel_train = x_kernel[:, :P]   # (B, P, d) -- oracle-only, never saved/returned
+    x_kernel_test  = x_kernel[:, P:]   # (B, N, d)
+    y_train        = y_all[:,  :P]     # (B, P)
+    y_test         = y_all[:,  P:]     # (B, N)
 
     # --- Sub-matrices of K_all (nugget already on diagonal) ---
     K_ff = K_all[:, :P, :P]   # (B, P, P)
@@ -2611,7 +2748,7 @@ def _generate_gp_batch_raw(
         # not a slice of an unprotected raw materialization. A principal
         # submatrix of a PSD matrix is itself PSD, so no further repair is
         # needed at this point.
-        mu_star    = mean_module(x_norm_test)
+        mu_star    = mean_module(x_kernel_test)
         Sigma_star = K_ss
     elif oracle_mode == "posterior":
         # Posterior oracle: condition on (x_train, y_train) via gpytorch's own
@@ -2633,9 +2770,10 @@ def _generate_gp_batch_raw(
         # likelihood are mutated in place by .double() (nn.Module convention)
         # but are not read again after this branch, so that's safe; casting
         # back to float32 keeps the returned schema consistent with every
-        # other tensor in this function.
-        x_kernel_train = x_norm[:, :P]
-        x_kernel_test  = x_norm[:, P:]
+        # other tensor in this function. x_kernel_train/x_kernel_test are
+        # the oracle-only hidden-warp coordinates computed above (see
+        # apply_kernel_hidden_warp) -- identical to x_norm_train/x_norm_test
+        # when kernel_hidden_enabled is False (default).
         out_dtype = x_norm.dtype
         with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY), gpytorch.settings.fast_pred_var(False):
             post_model = _GeneratorGP(
@@ -2781,6 +2919,7 @@ def _generate_gp_batch_raw(
             tensors[key] = params[key].cpu()
         tensors["nugget"] = nugget.cpu()
         tensors["mlp_mixed"] = mlp_mixed.cpu()
+        tensors["kernel_hidden_applied"] = kernel_hidden_applied.cpu()
         for key in ("mean_weight", "mean_bias", "mean_nonzero", "mean_family", "mean_linear"):
             tensors[key] = mean_params[key].cpu()
         tensors["_L_ff"] = L_ff

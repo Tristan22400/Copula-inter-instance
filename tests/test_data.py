@@ -27,6 +27,7 @@ from data_gen import (
     _sample_structural_ops,
     _structural_warp_column,
     _STRUCTURAL_CATEGORIES,
+    apply_kernel_hidden_warp,
     apply_mlp_feature_mixing,
     apply_structural_feature_warp,
     generate_gp_batch,
@@ -824,6 +825,230 @@ def test_mlp_mixing_goldilocks_and_psd(small_cfg, kernel_name):
     )
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
         f"{kernel_name}: MLP mixing degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kernel-hidden warp tests
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_hidden_warp_default_off_is_noop(small_cfg):
+    """kernel_hidden_enabled defaults False: apply_kernel_hidden_warp must be
+    a byte-for-byte identity, so every existing config/dataset is
+    unaffected."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    x = torch.randn(4, 10, cfg.data.d_features)
+    out = apply_kernel_hidden_warp(x, cfg, "cpu")
+    assert torch.equal(out, x)
+
+
+def test_kernel_hidden_warp_prob_zero_is_noop(small_cfg):
+    """kernel_hidden_enabled=True but kernel_hidden_prob=0.0 must still be a
+    no-op (the gate must genuinely gate, not just decorate)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_prob = 0.0
+    x = torch.randn(4, 10, cfg.data.d_features)
+    out = apply_kernel_hidden_warp(x, cfg, "cpu")
+    assert torch.equal(out, x)
+
+
+def test_kernel_hidden_warp_shapes_preserved(small_cfg):
+    """The hidden warp (when enabled) must preserve tensor shape/dtype
+    exactly -- down-then-up-projected back to width d -- and
+    generate_gp_batch's full output schema must still round-trip correctly,
+    with x_norm_train/x_norm_test (the model-visible tensors) completely
+    unaffected."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_prob = 1.0  # force the warp on every episode
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 10, cfg.data.d_features)
+    out = apply_kernel_hidden_warp(x, cfg, "cpu")
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+
+    torch.manual_seed(1)
+    episodes = generate_gp_batch(cfg, B=4, device="cpu")
+    for ep in episodes:
+        d = cfg.data.d_features
+        assert ep["x_norm_train"].shape[-1] == d
+        assert ep["x_norm_test"].shape[-1] == d
+
+
+def test_kernel_hidden_warp_prob_one_changes_output(small_cfg):
+    """Sanity check the warp actually does something when forced on for every
+    episode (guards against a silently-inert implementation)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_prob = 1.0
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 10, cfg.data.d_features)
+    out = apply_kernel_hidden_warp(x.clone(), cfg, "cpu")
+    assert not torch.equal(out, x)
+
+
+def test_kernel_hidden_warp_partial_gate_leaves_some_episodes_unwarped(small_cfg):
+    """0 < kernel_hidden_prob < 1 over a large-enough B should leave at least
+    one episode identical to its pre-warp input and at least one changed --
+    verifies the per-episode Bernoulli gate (not an all-or-nothing switch)."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_prob = 0.5
+
+    torch.manual_seed(0)
+    B = 64
+    x = torch.randn(B, 10, cfg.data.d_features)
+    out = apply_kernel_hidden_warp(x.clone(), cfg, "cpu")
+    n_unchanged = sum(torch.equal(out[b], x[b]) for b in range(B))
+    n_changed = B - n_unchanged
+    assert n_unchanged > 0, "expected some episodes left unwarped at prob=0.5"
+    assert n_changed > 0, "expected some episodes warped at prob=0.5"
+
+
+def test_kernel_hidden_warp_disabled_matches_unmodified_pipeline(small_cfg):
+    """Backward-compatibility guard: with kernel_hidden_enabled left at its
+    default (False), generate_gp_batch's R_star/y_train/y_test must be
+    byte-for-byte identical to a config that doesn't mention the new keys at
+    all -- the kernel_hidden_* wiring inside _generate_gp_batch_raw must be a
+    true no-op, not just individually-tested-in-isolation."""
+    cfg_a = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg_a.data.d_features = 6
+    cfg_b = OmegaConf.create(OmegaConf.to_container(cfg_a, resolve=True))
+    cfg_b.data.kernel_hidden_enabled = False  # explicit, same as default
+
+    torch.manual_seed(7)
+    random.seed(7)
+    eps_a = generate_gp_batch(cfg_a, B=4, device="cpu")
+    torch.manual_seed(7)
+    random.seed(7)
+    eps_b = generate_gp_batch(cfg_b, B=4, device="cpu")
+
+    for a, b in zip(eps_a, eps_b):
+        assert torch.equal(a["R_star"], b["R_star"])
+        assert torch.equal(a["y_train"], b["y_train"])
+        assert torch.equal(a["y_test"], b["y_test"])
+
+
+@pytest.mark.parametrize("kernel_name", ALL_KERNELS)
+def test_kernel_hidden_warp_goldilocks_and_psd(small_cfg, kernel_name):
+    """Every registered kernel must still produce a valid, PSD, non-trivial
+    R_star with the kernel-hidden warp forced on for every episode -- same
+    band as test_mlp_mixing_goldilocks_and_psd, this is the key regression
+    guard against correlation collapse or degeneracy introduced by the
+    down-project/mix/up-project stack."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.d_features = 6
+    cfg.data.inactive_frac_min = 1 / 3
+    cfg.data.inactive_frac_max = 5 / 6
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_prob = 1.0
+
+    torch.manual_seed(abs(hash("kernel_hidden_" + kernel_name)) % (2**31))
+    off_diag_abs = []
+    for _ in range(20):
+        task = generate_gp_task(cfg)
+        R = task["R_star"]
+        N = R.shape[0]
+
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4)
+        assert torch.allclose(R, R.T, atol=1e-5)
+        eigvals = torch.linalg.eigvalsh(R)
+        assert (eigvals >= -1e-4).all(), (
+            f"{kernel_name}: not PSD with kernel-hidden warp (min eig={eigvals.min():.6f})"
+        )
+        assert R.abs().max() <= 1.0 + 1e-5
+
+        mask = ~torch.eye(N, dtype=torch.bool)
+        off_diag_abs.append(R[mask].abs())
+
+    mean_abs_r = torch.cat(off_diag_abs).mean().item()
+    assert mean_abs_r > _COLLAPSE_THRESHOLD, (
+        f"{kernel_name}: kernel-hidden warp collapsed correlation, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+    assert mean_abs_r < _DEGENERATE_THRESHOLD, (
+        f"{kernel_name}: kernel-hidden warp degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
+    )
+
+
+def _pairwise_dists(x: torch.Tensor) -> torch.Tensor:
+    """Flattened upper-triangle pairwise Euclidean distances for one episode's
+    (T, d) feature matrix."""
+    diff = x.unsqueeze(0) - x.unsqueeze(1)
+    D = diff.norm(dim=-1)
+    T = D.shape[0]
+    iu = torch.triu_indices(T, T, offset=1)
+    return D[iu[0], iu[1]]
+
+
+def test_kernel_hidden_warp_breaks_isometry(small_cfg):
+    """Direct empirical check of the reason this feature exists: a smaller
+    kernel_hidden_bottleneck_frac (more rank loss) must leave LESS of the
+    model-space pairwise-distance structure recoverable in kernel-space than
+    a larger one, and the aggressive-bottleneck case must fall well below
+    the near-isometry that a full-rank random map would give.
+
+    Calibration note: at this repo's actual d_features regime (~8-15,
+    LogNormal-centered at 10 -- see conf/data/gp_tasks.yaml), a random
+    fan-in-scaled linear/nonlinear stack does NOT concentrate anywhere near
+    a pure isometry the way the textbook Johnson-Lindenstrauss argument
+    suggests for large d: even at kernel_hidden_bottleneck_frac=0.9 (minimal,
+    1-dimension rank loss at d=10) measured
+    corr(dist_model, dist_kernel) is empirically ~0.3-0.4, not ~1.0. The
+    thresholds below are set from that measurement (generous margins, not
+    exact), not from the large-d asymptotic. The key property this test
+    guards is the MONOTONIC direction -- more rank loss -> less recoverable
+    distance structure -- and an absolute upper bound confirming the default
+    bottleneck (0.5) is meaningfully below "no information loss".
+    """
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 10
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_layers_min = 2
+    cfg.data.kernel_hidden_layers_max = 2
+
+    def measure(frac: float, n_calls: int = 20, B: int = 16, T: int = 30) -> float:
+        cfg_local = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        cfg_local.data.kernel_hidden_bottleneck_frac = frac
+        all_model, all_kernel = [], []
+        for call in range(n_calls):
+            torch.manual_seed(1000 + call)
+            random.seed(1000 + call)
+            x_norm = torch.randn(B, T, cfg_local.data.d_features)
+            x_norm = (
+                (x_norm - x_norm.mean(1, keepdim=True))
+                / x_norm.std(1, keepdim=True).clamp(min=1e-8)
+            )
+            x_kernel = apply_kernel_hidden_warp(x_norm, cfg_local, "cpu")
+            for b in range(B):
+                all_model.append(_pairwise_dists(x_norm[b]))
+                all_kernel.append(_pairwise_dists(x_kernel[b]))
+        dm = torch.cat(all_model)
+        dk = torch.cat(all_kernel)
+        return torch.corrcoef(torch.stack([dm, dk]))[0, 1].item()
+
+    corr_mild = measure(frac=0.9)      # near-minimal rank loss (r = d-1)
+    corr_default = measure(frac=0.5)   # this repo's default
+    corr_aggressive = measure(frac=0.2)
+
+    assert corr_aggressive < corr_default < corr_mild + 1e-6, (
+        f"expected more rank loss -> lower distance-correlation, got "
+        f"mild={corr_mild:.4f} default={corr_default:.4f} aggressive={corr_aggressive:.4f}"
+    )
+    assert corr_mild < 0.6, (
+        f"even minimal rank loss should already be well below a near-isometry "
+        f"at this repo's small d_features, got corr={corr_mild:.4f}"
+    )
+    assert corr_aggressive < 0.35, (
+        f"aggressive bottleneck should leave little recoverable distance "
+        f"structure, got corr={corr_aggressive:.4f}"
     )
 
 
