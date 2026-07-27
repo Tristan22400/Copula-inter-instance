@@ -488,7 +488,7 @@ def validate(
             lo = min(float(off_o.min()), float(off_p.min()))
             hi = max(float(off_o.max()), float(off_p.max()))
             mse = float(np.mean((off_p - off_o) ** 2))
-            neg_frac = float(np.mean(off_p < 0))
+            neg_frac = float(np.mean(off_o < 0))
             fig_den, ax_den = plt.subplots(figsize=(5, 5))
             hb = ax_den.hexbin(off_o, off_p, gridsize=60, cmap="YlOrRd", mincnt=1, bins="log")
             fig_den.colorbar(hb, ax=ax_den, label="log10(count)")
