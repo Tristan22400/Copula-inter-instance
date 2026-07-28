@@ -1462,7 +1462,13 @@ def _sample_mean_module(cfg, d: int, B: int, device) -> tuple[gpytorch.means.Mea
     Returns (mean_module, params) where params (for return_kernel_metadata)
     holds "mean_weight" (B, d), "mean_bias" (B,), "mean_nonzero" (B,) bool,
     "mean_family" (B,) long in {0=linear, 1=exponential, 2=anomaly} (only
-    meaningful where mean_nonzero is True), "mean_linear" (B,) bool.
+    meaningful where mean_nonzero is True), "mean_linear" (B,) bool, plus
+    the exponential/anomaly families' own params ("mean_exp_direction" (B,
+    d), "mean_exp_rate" (B,), "mean_exp_scale" (B,), "mean_anomaly_direction"
+    (B, d), "mean_anomaly_threshold" (B,), "mean_anomaly_magnitude" (B,)) --
+    every family's params are always present (0.0-sentinel convention, same
+    as period/rq_alpha/power elsewhere in this file) so pit.py::gp_analytical_pit
+    can reconstruct mean_module for *any* family, not just linear.
     """
     batch_shape = torch.Size([B])
 
@@ -1474,6 +1480,12 @@ def _sample_mean_module(cfg, d: int, B: int, device) -> tuple[gpytorch.means.Mea
             "mean_nonzero": torch.zeros(B, dtype=torch.bool, device=device),
             "mean_family": torch.zeros(B, dtype=torch.long, device=device),
             "mean_linear": torch.zeros(B, dtype=torch.bool, device=device),
+            "mean_exp_direction": torch.zeros(B, d, device=device),
+            "mean_exp_rate": torch.zeros(B, device=device),
+            "mean_exp_scale": torch.zeros(B, device=device),
+            "mean_anomaly_direction": torch.zeros(B, d, device=device),
+            "mean_anomaly_threshold": torch.zeros(B, device=device),
+            "mean_anomaly_magnitude": torch.zeros(B, device=device),
         }
         return mean_module, params
 
@@ -1533,6 +1545,12 @@ def _sample_mean_module(cfg, d: int, B: int, device) -> tuple[gpytorch.means.Mea
         "mean_nonzero": nonzero_mask,
         "mean_family": family_idx,
         "mean_linear": linear_mask,
+        "mean_exp_direction": exp_direction,
+        "mean_exp_rate": exp_rate,
+        "mean_exp_scale": exp_scale,
+        "mean_anomaly_direction": anomaly_direction,
+        "mean_anomaly_threshold": anomaly_threshold,
+        "mean_anomaly_magnitude": anomaly_magnitude,
     }
     return mean_module, params
 
@@ -2588,8 +2606,15 @@ def _generate_gp_batch_raw(
     # No clean gpytorch public API exposes diag(K_ff^-1) for an ExactGP, so
     # this stays hand-rolled (_batched_cholesky), just sourced from the
     # gpytorch-native K_all above instead of a separately hand-added nugget.
+    # Eq. 5.12 is derived for a zero-mean joint Gaussian: alpha must be
+    # K_ff^-1 @ (y_train - mean_train), not K_ff^-1 @ y_train directly, or
+    # the LOO residual silently carries a leftover K_ff^-1 @ mean_train term
+    # whenever mean_module is non-zero (see _sample_mean_module's docstring —
+    # z_test already goes through mean_module via mu_star, so this keeps
+    # z_train consistent with it).
     L_ff, failed_ff = _batched_cholesky(K_ff)
-    alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L_ff).squeeze(-1)          # (B, P)
+    mean_train = mean_module(x_norm_train)                                        # (B, P)
+    alpha = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L_ff).squeeze(-1)  # (B, P)
 
     # Episodes where either Cholesky repair above bottomed out at an
     # identity placeholder are not valid GP episodes (K_all/K_ff no longer
@@ -2643,7 +2668,15 @@ def _generate_gp_batch_raw(
                 likelihood.double(), kernel_obj.double(), batch_shape,
                 mean_module.double(),
             ).eval()
-            post = post_model(x_kernel_test.double())
+            # post_model(x_test) alone returns the LATENT f* posterior (no
+            # observation noise on the diagonal); y_test is a noisy sample
+            # (K_all has the nugget on every diagonal entry, train and test
+            # alike -- see K_ff/K_ss above), so Sigma_star must go through
+            # the likelihood too, same as noisy_dist = likelihood(prior_dist)
+            # above, or z_test is systematically over-dispersed (sigma_star
+            # undersized by the missing noise term).
+            # likelihood was already mutated to double() as a _GeneratorGP ctor arg above.
+            post = likelihood(post_model(x_kernel_test.double()))
             mu_star    = post.mean.to(out_dtype)               # (B, N)
             Sigma_star = post.covariance_matrix.to(out_dtype)  # (B, N, N)
     else:
@@ -2781,7 +2814,11 @@ def _generate_gp_batch_raw(
             tensors[key] = params[key].cpu()
         tensors["nugget"] = nugget.cpu()
         tensors["mlp_mixed"] = mlp_mixed.cpu()
-        for key in ("mean_weight", "mean_bias", "mean_nonzero", "mean_family", "mean_linear"):
+        for key in (
+            "mean_weight", "mean_bias", "mean_nonzero", "mean_family", "mean_linear",
+            "mean_exp_direction", "mean_exp_rate", "mean_exp_scale",
+            "mean_anomaly_direction", "mean_anomaly_threshold", "mean_anomaly_magnitude",
+        ):
             tensors[key] = mean_params[key].cpu()
         tensors["_L_ff"] = L_ff
         tensors["_alpha"] = alpha

@@ -1291,6 +1291,89 @@ def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs, oracle_mode):
     )
 
 
+@pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+def test_mean_fn_z_train_stays_calibrated(small_cfg, family_probs):
+    """z_train is a leave-one-out PIT (R&W Eq. 5.12), which is derived for a
+    zero-mean joint Gaussian: the LOO alpha must be K_ff^-1 @ (y_train -
+    mean_module(x_train)), not K_ff^-1 @ y_train. Forcing every episode to
+    carry a large mean (each family in turn) is exactly the regime that
+    would expose a missing mean-subtraction as inflated z_train variance."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.P_min = cfg.data.P_max = 40
+    cfg.data.kernel = "rbf"
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = family_probs
+    cfg.data.mean_fn_linear_prob = 1.0
+    cfg.data.mean_fn_weight_std = 1.0
+    cfg.data.mean_fn_bias_std = 1.0
+
+    torch.manual_seed(abs(hash(("mean_fn_z_train", tuple(family_probs)))) % (2**31))
+    episodes = generate_gp_batch(cfg, B=300, device="cpu")
+    z_train = torch.cat([ep["z_train"] for ep in episodes])
+
+    assert z_train.mean().abs().item() < 0.15, (
+        f"family {family_probs}: z_train mean={z_train.mean():.4f} (expected ~0)"
+    )
+    assert abs(z_train.std().item() - 1.0) < 0.15, (
+        f"family {family_probs}: z_train std={z_train.std():.4f} (expected ~1 -- "
+        f"a large deviation indicates the mean bank's contribution is leaking "
+        f"into the LOO residual uncancelled)"
+    )
+
+
+def test_posterior_oracle_z_test_calibrated(small_cfg):
+    """oracle_mode='posterior' must give z_test ~N(0,1), same as 'prior'.
+    post_model(x_test) alone returns the LATENT f* posterior (no observation
+    noise), but y_test is a noisy sample -- Sigma_star must go through
+    likelihood(...) or sigma_star is systematically undersized and z_test
+    over-dispersed."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 3
+    cfg.data.P_min = cfg.data.P_max = 40
+    cfg.data.N_min = cfg.data.N_max = 20
+    cfg.data.kernel = "rbf"
+    cfg.data.oracle_mode = "posterior"
+
+    torch.manual_seed(0)
+    episodes = generate_gp_batch(cfg, B=1500, device="cpu")
+    z_test = torch.cat([ep["z_test"] for ep in episodes])
+
+    assert z_test.mean().abs().item() < 0.1, f"z_test mean={z_test.mean():.4f} (expected ~0)"
+    assert abs(z_test.std().item() - 1.0) < 0.15, (
+        f"z_test std={z_test.std():.4f} (expected ~1 -- sigma_star likely missing "
+        f"the observation-noise term)"
+    )
+
+
+@pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg, family_probs):
+    """gp_analytical_pit's disk-reconstruction fallback (no cached _L_ff/_alpha)
+    must match the cached path's z_train for every mean family, not just
+    linear -- guards data_gen._sample_mean_module's exp/anomaly params
+    actually round-tripping through the saved task dict and pit._mean_train_from_task
+    reconstructing the same mean_module(x_train) used at generation time."""
+    from pit import gp_analytical_pit
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.kernel = "rbf"
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = family_probs
+    cfg.data.mean_fn_anomaly_frac = 0.5
+
+    torch.manual_seed(abs(hash(("mean_fn_pit_reconstruct", tuple(family_probs)))) % (2**31))
+    for _ in range(10):
+        task = generate_gp_task(cfg)
+        cached = gp_analytical_pit(task)
+        reconstructed_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}
+        reconstructed = gp_analytical_pit(reconstructed_task)
+        assert torch.allclose(cached["z_train"], reconstructed["z_train"], atol=1e-3)
+        assert torch.allclose(cached["z_test"], reconstructed["z_test"], atol=1e-3)
+
+
 def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg):
     """Within the linear family, mean_fn_linear_prob=0.0 must force a
     constant-only offset (weight exactly zero, bias free) rather than a
