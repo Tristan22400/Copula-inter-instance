@@ -52,6 +52,34 @@ def _optional_param(t: torch.Tensor):
     return t.item() if t.numel() == 1 else t
 
 
+def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
+    """Reconstruct mean_module(x) from a task dict's saved mean-bank params
+    (see data_gen._MeanFunctionBank / _sample_mean_module) -- same formula,
+    unbatched. Needed so gp_analytical_pit's LOO alpha can be residualized
+    against the same mean the episode was actually generated with (see
+    data_gen._generate_gp_batch_raw's alpha computation for why: R&W Eq.
+    5.12 is derived for a zero-mean joint Gaussian). Older tasks saved before
+    "mean_*" existed default to an all-zero (no-op) mean, same convention as
+    the sign-modulation fields above.
+    """
+    zero = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+    if not bool(task.get("mean_nonzero", torch.tensor(False)).item()):
+        return zero
+
+    family = int(task["mean_family"].item())
+    if family == 0:  # linear (incl. constant-only, when mean_weight is all-zero)
+        return (x * task["mean_weight"]).sum(-1) + task["mean_bias"]
+    elif family == 1:  # exponential
+        proj = (x * task["mean_exp_direction"]).sum(-1)
+        exponent = torch.clamp(task["mean_exp_rate"] * proj, min=-10.0, max=10.0)
+        return task["mean_exp_scale"] * torch.exp(exponent)
+    elif family == 2:  # sparse anomaly
+        proj = (x * task["mean_anomaly_direction"]).sum(-1)
+        hit = (proj > task["mean_anomaly_threshold"]).to(x.dtype)
+        return hit * task["mean_anomaly_magnitude"]
+    raise ValueError(f"Unknown mean_family {family}; expected 0, 1, or 2.")
+
+
 # ---------------------------------------------------------------------------
 # TabICL loader
 # ---------------------------------------------------------------------------
@@ -193,10 +221,13 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         y_test[i] | D_train ~ N(mu_star[i], sigma_star[i]²)  (exact)
         z_test[i] = (y_test[i] - mu_star[i]) / sigma_star[i]
 
-    Training instances — exact GP LOO (Rasmussen & Williams, GPML Eq. 5.12):
+    Training instances — exact GP LOO (Rasmussen & Williams, GPML Eq. 5.12),
+    derived for a zero-mean joint Gaussian, so alpha uses the mean-residual
+    (y_train - mean_train), not y_train directly, whenever the episode's
+    mean bank (see data_gen._MeanFunctionBank) is non-zero:
         sigma²_i^LOO  = 1 / [K_ff⁻¹]_ii
         z_train[i]    = alpha_i / sqrt([K_ff⁻¹]_ii)
-        where alpha = K_ff⁻¹ y_train
+        where alpha = K_ff⁻¹ (y_train - mean_train), mean_train = mean_module(x_train)
 
     Cost: one O(P³) Cholesky per episode vs. O(K × P × forward_pass) for
     the TabICL K-fold approach.
@@ -205,7 +236,9 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         task: raw task dict returned by generate_gp_task (must contain
               kernel, l, alpha2, nugget, period, rq_alpha, power, l_b,
               alpha2_b, period_b, rq_alpha_b, power_b, kernel_feature_indices,
-              x_norm_train, y_train, y_test, mu_star, sigma_star).
+              x_norm_train, y_train, y_test, mu_star, sigma_star, and the
+              mean_* fields from data_gen._sample_mean_module — see
+              _mean_train_from_task).
         eps:  unused (kept for API symmetry with run_pit).
 
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
@@ -300,9 +333,10 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         L     = task["_L_ff"]
         alpha = task["_alpha"]
     else:
-        K_ff  = kernel_fn(x_k_train, x_k_train) + nugget * torch.eye(P, device=y_train.device)
-        L     = _safe_cholesky(K_ff)
-        alpha = torch.cholesky_solve(y_train.unsqueeze(-1), L).squeeze(-1)   # (P,)
+        K_ff       = kernel_fn(x_k_train, x_k_train) + nugget * torch.eye(P, device=y_train.device)
+        L          = _safe_cholesky(K_ff)
+        mean_train = _mean_train_from_task(task, x_k_train)
+        alpha      = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L).squeeze(-1)  # (P,)
 
     # diag(K_ff^{-1}) = column-wise squared-norm of L^{-1}
     L_inv      = torch.linalg.solve_triangular(
