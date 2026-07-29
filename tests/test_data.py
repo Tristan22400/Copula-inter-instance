@@ -629,6 +629,56 @@ def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
         assert torch.isfinite(ep["y_train"]).all()
 
 
+@pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
+def test_degenerate_active_kernel_column_is_discarded_not_leaked(small_cfg, kernel_name, monkeypatch):
+    """periodic/cosine are always capped to a single active dim (k=1, see
+    generate_gp_batch's kernel_cols selection), so if that one column ever
+    collapses to a near-constant value -- observed via more than one
+    independent upstream cause: a structural-warp "censor" quantile-index
+    collision (now guarded directly in _structural_warp_column) and
+    mlp_mixing's ReLU/sigmoid saturating a unit to one value for every point
+    (ordinary "dead ReLU" behaviour, not itself a bug) -- the kernel's r=0
+    for every pair and R_star silently becomes a constant, uninformative
+    correlation matrix that still passes the existing PSD/Cholesky/LOO-z
+    discard checks (a constant matrix plus nugget is perfectly well-behaved
+    numerically). Same discard-and-regenerate pattern as
+    test_degenerate_loo_z_is_discarded_not_leaked, but poisoning
+    tabiclv2_warp_features directly (collapsing every column of one episode)
+    instead of relying on any single op's failure probability, so this stays
+    a regression net regardless of which upstream stage is the cause."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.systematic_composition = False
+    cfg.seed = 3
+
+    real_tabiclv2 = dg.tabiclv2_warp_features
+    state = {"poisoned": False}
+
+    def poisoning_tabiclv2(x, seed=None):
+        out = real_tabiclv2(x, seed=seed)
+        if not state["poisoned"]:
+            state["poisoned"] = True
+            out = out.clone()
+            out[0, :, :] = 0.0  # collapse every column of episode 0 to a constant
+        return out
+
+    monkeypatch.setattr(dg, "tabiclv2_warp_features", poisoning_tabiclv2)
+
+    with pytest.warns(RuntimeWarning, match="degenerate .*active kernel column"):
+        episodes = dg.generate_gp_batch(cfg, B=8, device="cpu", return_kernel_metadata=True)
+
+    assert state["poisoned"], "test setup didn't actually poison an episode's feature columns"
+    assert len(episodes) == 8
+    for ep in episodes:
+        col = int(ep["kernel_feature_indices"][0])
+        x = torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)
+        assert float(x[:, col].std()) > 1e-4, (
+            f"{kernel_name}: a degenerate active kernel column reached the returned episodes"
+        )
+
+
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
 def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name):
     """The saved l (offset)/alpha2/power schema must round-trip through
@@ -1007,6 +1057,64 @@ def test_structural_warp_op_preserves_shape_and_finite_direct(category, op, use_
     assert out.shape == col.shape
     assert out.dtype == col.dtype
     assert torch.isfinite(out).all()
+
+
+def test_structural_warp_censor_never_collapses_whole_column():
+    """censor picks two random quantile FRACTIONS but indexes into a
+    discrete sorted array (int(q * (T-1))) -- for small T, many distinct
+    (q_low, q_high) pairs round to the very same index, so lo == hi and
+    clamp(min=lo, max=hi) used to flatten the ENTIRE column to one constant
+    instead of just clipping its tails. Regression for the missing guard
+    (quantize already has the equivalent lo==hi check just below this)."""
+    torch.manual_seed(0)
+    n_collapsed = 0
+    n_trials = 0
+    for T in (4, 8, 16, 32, 64):
+        for _ in range(500):
+            col = torch.randn(T)
+            out = _structural_warp_column(col.clone(), "censor")
+            n_trials += 1
+            if float(out.std()) < 1e-9:
+                n_collapsed += 1
+    assert n_collapsed == 0, (
+        f"{n_collapsed}/{n_trials} censor calls collapsed the whole column to a constant"
+    )
+
+
+@pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
+def test_no_degenerate_active_kernel_column_with_structural_warp(small_cfg, kernel_name):
+    """End-to-end regression net for the censor-collapse bug: periodic and
+    cosine are always capped to a single active dim (generate_gp_batch's
+    kernel_cols, k=1 -- see "periodic ... also capped to k=1" comment there),
+    so if structural warping ever collapses THAT ONE column to a constant,
+    the kernel's r=0 for every pair and the whole episode's R_star silently
+    becomes a constant/degenerate correlation structure instead of a valid
+    periodic/cosine covariance -- unlike kernels with k>1 active dims, which
+    only lose one dimension's contribution. Forces every category (including
+    "discrete", which contains censor) into every gated column and disables
+    mlp_mixing so the raw single-column pathway is exercised directly, then
+    checks the actual sampled active column (x_norm_train ++ x_norm_test, at
+    kernel_feature_indices) never degenerates to near-zero variance."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+    cfg.data.mlp_mixing_enabled = False
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+    cfg.data.structural_warp_num_ops_min = 6
+    cfg.data.structural_warp_num_ops_max = 6
+    cfg.seed = abs(hash("no_degenerate_active_col_" + kernel_name)) % (2**31)
+
+    episodes = generate_gp_batch(cfg, B=500, device="cpu", return_kernel_metadata=True)
+    assert len(episodes) == 500
+    for ep in episodes:
+        col = int(ep["kernel_feature_indices"][0])
+        x = torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)[:, col]
+        assert float(x.std()) > 1e-6, (
+            f"{kernel_name}: active kernel column (idx {col}) collapsed to a "
+            f"near-constant value -- degenerate covariance structure"
+        )
 
 
 def test_structural_warp_quantize_snaps_to_few_unique_levels():
