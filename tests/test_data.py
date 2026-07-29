@@ -13,6 +13,7 @@ Tests verify:
 from __future__ import annotations
 
 import random
+import warnings
 
 import pytest
 import torch
@@ -679,6 +680,95 @@ def test_degenerate_active_kernel_column_is_discarded_not_leaked(small_cfg, kern
         )
 
 
+def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeypatch):
+    """Generalisation of test_degenerate_active_kernel_column_is_discarded_not_leaked
+    to kernels with k>1 active dims (e.g. rbf): if EVERY active column
+    collapses to a near-constant value, the kernel has no dimension left to
+    vary on and R_star degenerates the same way the k=1 (periodic/cosine)
+    case does, so this must still be caught and discarded. Forces a fixed
+    3-of-4 active-dims subset via monkeypatching _sample_active_dims (rather
+    than relying on the random inactive_frac draw), then poisons all three
+    active columns of episode 0 to a constant."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+    cfg.seed = 3
+
+    monkeypatch.setattr(dg, "_sample_active_dims", lambda d_total, cfg: [0, 1, 2])
+
+    real_tabiclv2 = dg.tabiclv2_warp_features
+    state = {"poisoned": False}
+
+    def poisoning_tabiclv2(x, seed=None):
+        out = real_tabiclv2(x, seed=seed)
+        if not state["poisoned"]:
+            state["poisoned"] = True
+            out = out.clone()
+            out[0, :, [0, 1, 2]] = 0.0  # collapse every active column of episode 0
+        return out
+
+    monkeypatch.setattr(dg, "tabiclv2_warp_features", poisoning_tabiclv2)
+
+    with pytest.warns(RuntimeWarning, match="degenerate .*active kernel column"):
+        episodes = dg.generate_gp_batch(cfg, B=8, device="cpu", return_kernel_metadata=True)
+
+    assert state["poisoned"], "test setup didn't actually poison an episode's feature columns"
+    assert len(episodes) == 8
+    for ep in episodes:
+        cols = ep["kernel_feature_indices"].tolist()
+        x = torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)
+        assert max(float(x[:, c].std()) for c in cols) > 1e-4, (
+            "rbf: an episode with every active column collapsed reached the returned episodes"
+        )
+
+
+def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch):
+    """Mirror of test_multi_dim_active_kernel_fully_collapsed_is_discarded:
+    collapsing only ONE of several active columns (others still vary) is
+    reduced effective dimensionality, not a broken episode -- rbf/matern-style
+    kernels still produce a non-constant R_star through their remaining
+    active dims. This must NOT be discarded, unlike the fully-collapsed case
+    above and the k=1 periodic/cosine case."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+    cfg.seed = 3
+
+    monkeypatch.setattr(dg, "_sample_active_dims", lambda d_total, cfg: [0, 1, 2])
+
+    real_tabiclv2 = dg.tabiclv2_warp_features
+    state = {"poisoned": False}
+
+    def poisoning_tabiclv2(x, seed=None):
+        out = real_tabiclv2(x, seed=seed)
+        if not state["poisoned"]:
+            state["poisoned"] = True
+            out = out.clone()
+            out[0, :, 0] = 0.0  # collapse only ONE of the three active columns
+        return out
+
+    monkeypatch.setattr(dg, "tabiclv2_warp_features", poisoning_tabiclv2)
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        episodes = dg.generate_gp_batch(cfg, B=8, device="cpu", return_kernel_metadata=True)
+    degen_warns = [str(w.message) for w in rec if "active kernel column" in str(w.message)]
+
+    assert state["poisoned"], "test setup didn't actually poison an episode's feature columns"
+    assert not degen_warns, f"partial collapse should not be discarded, got: {degen_warns}"
+    assert len(episodes) == 8
+    stds = [float(torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)[:, 0].std()) for ep in episodes]
+    assert min(stds) < 1e-4, (
+        "the partially-collapsed episode should have been kept, not discarded/regenerated away"
+    )
+
+
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
 def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name):
     """The saved l (offset)/alpha2/power schema must round-trip through
@@ -1078,6 +1168,47 @@ def test_structural_warp_censor_never_collapses_whole_column():
                 n_collapsed += 1
     assert n_collapsed == 0, (
         f"{n_collapsed}/{n_trials} censor calls collapsed the whole column to a constant"
+    )
+
+
+def test_structural_warp_differential_flat_derivative_does_not_collapse_column(monkeypatch):
+    """differential's rescale step ((raw - r_min) / clamp(denom, 1e-8) * range + s_min)
+    divides a numerically-zero numerator by a floor-clamped denominator whenever the
+    derivative signal (`raw`) comes out perfectly flat -- the same "whole column
+    flattens to one constant" failure shape as the censor lo==hi bug this mirrors,
+    just triggered by a flat derivative instead of a quantile-index collision. An
+    empirical sweep (20k+ trials over continuous, linear-ramp, and heavily-quantized
+    columns) never produced a flat `raw` through this op's normal random dispatch, so
+    unlike censor this isn't reachable through everyday random input -- it's forced
+    here directly by patching the derivative convolution to return a constant tensor,
+    confirming the op no-ops (returns the column unchanged) instead of collapsing a
+    column that has genuine variance."""
+    torch.manual_seed(0)
+    col = torch.randn(64)  # T=64 -> k = max(3, 64 // 32) = 3
+
+    real_conv1d = torch.nn.functional.conv1d
+    calls = {"n": 0}
+
+    def patched_conv1d(inp, weight, *args, **kwargs):
+        calls["n"] += 1
+        out = real_conv1d(inp, weight, *args, **kwargs)
+        # Call #1 is the box-smoothing conv (must stay real, or `raw` never even
+        # reaches the derivative kernel below); call #2 is the derivative kernel
+        # conv (sk) for whichever of sub_op in {1, 2} gets chosen -- forcing that
+        # one flat reproduces "differentiating an already-flat/linear signal".
+        if calls["n"] == 2:
+            return torch.zeros_like(out)
+        return out
+
+    monkeypatch.setattr(torch.nn.functional, "conv1d", patched_conv1d)
+    monkeypatch.setattr(torch, "randint", lambda *a, **k: torch.tensor([2]))  # force sub_op=2
+
+    out = _structural_warp_column(col.clone(), "differential")
+    assert calls["n"] == 2, "test setup didn't reach the derivative conv -- sub_op wasn't forced"
+    assert torch.isfinite(out).all()
+    assert torch.equal(out, col), (
+        "a flat derivative signal should leave a genuinely-varying column unchanged, "
+        "not collapse it to a single constant"
     )
 
 
