@@ -226,24 +226,33 @@ def _plot_field_grid(
     output_path: str, row0_label: str, suptitle: str,
     predicted_fields: "list[np.ndarray] | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
+    oracle_fields: "list[np.ndarray] | None" = None,
     context_coords: "np.ndarray | None" = None,
     pred_row_label: str = "Copula model\n(predicted)\nLatitude",
     indep_row_label: str = "Independent\n(no copula)\nLatitude",
+    oracle_row_label: str = "Oracle correlation\n+ marginal\nLatitude",
     xlabel: str = "Longitude", cbar_label: str = "Residual (deg C)",
 ) -> None:
     """Shared small-multiples renderer behind both plot_residual_grid (real
     ERA5 days) and plot_synthetic_residual_grid (synthetic GP draws): top row
-    `true_fields` (already grid_shape-shaped), optional predicted/independent
-    rows below (flat (D,) arrays, reshaped to grid_shape here) -- see
-    plot_residual_grid's docstring for the row semantics this preserves.
-    All rows share one color scale and the Moran's I annotation (see
-    morans_i) so both callers render pixel-identically."""
+    `true_fields` (already grid_shape-shaped), then an optional
+    oracle-correlation row, then optional predicted/independent rows below
+    (flat (D,) arrays, reshaped to grid_shape here) -- see plot_residual_grid's
+    docstring for the row semantics this preserves. `oracle_fields` is only
+    ever passed by plot_synthetic_residual_grid (the real-ERA5 branch has no
+    oracle covariance), inserted right below ground truth so the row order
+    reads: ground truth -> best-case copula (oracle correlation) -> actual
+    model (R_pred) -> no-correlation baseline. All rows share one color scale
+    and the Moran's I annotation (see morans_i) so both callers render
+    pixel-identically."""
     has_pred = predicted_fields is not None
     has_indep = independent_fields is not None
+    has_oracle = oracle_fields is not None
     pred_grids = [f.reshape(grid_shape) for f in predicted_fields] if has_pred else []
     indep_grids = [f.reshape(grid_shape) for f in independent_fields] if has_indep else []
+    oracle_grids = [f.reshape(grid_shape) for f in oracle_fields] if has_oracle else []
 
-    vmax = float(np.max(np.abs(true_fields + pred_grids + indep_grids)))
+    vmax = float(np.max(np.abs(true_fields + pred_grids + indep_grids + oracle_grids)))
 
     def _annotate_morans_i(ax, field):
         # See morans_i's docstring: smoothness of THIS single snapshot, not the
@@ -255,7 +264,7 @@ def _plot_field_grid(
         )
 
     n_cols = len(true_fields)
-    n_rows = 1 + int(has_pred) + int(has_indep)
+    n_rows = 1 + int(has_oracle) + int(has_pred) + int(has_indep)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False)
     mesh = None
     for j, (title, field) in enumerate(zip(col_titles, true_fields)):
@@ -280,6 +289,9 @@ def _plot_field_grid(
         return mesh_local
 
     row = 1
+    if has_oracle:
+        mesh = _plot_row(row, oracle_grids, oracle_row_label)
+        row += 1
     if has_pred:
         mesh = _plot_row(row, pred_grids, pred_row_label)
         row += 1
@@ -337,19 +349,27 @@ def plot_synthetic_residual_grid(
     grid_y: np.ndarray, grid_x: np.ndarray, grid_shape: tuple,
     true_fields: list, predicted_fields: list, independent_fields: list,
     output_path: str, context_coords: "np.ndarray | None" = None,
+    oracle_fields: "list[np.ndarray] | None" = None,
 ) -> None:
     """Synthetic-mode analogue of plot_residual_grid: one column per
     independent GP draw from the sampled ground-truth kernel (see
     run_synthetic_mode) instead of one column per real ERA5 day, with the
-    SAME three rows (ground truth / copula-predicted / independent) and
-    shared color scale / Moran's I annotation, via the same _plot_field_grid
-    renderer plot_residual_grid uses."""
+    SAME four rows (ground truth / oracle-correlation+marginal /
+    copula-predicted / independent) and shared color scale / Moran's I
+    annotation, via the same _plot_field_grid renderer plot_residual_grid
+    uses. `oracle_fields` (see run_synthetic_mode) reuses the TabICLv2
+    marginal from the predicted row but with the TRUE kernel correlation
+    matrix instead of the model's R_pred, isolating correlation-estimation
+    error from marginal-estimation error -- optional so plot_residual_grid's
+    real-ERA5 caller (which has no oracle covariance) is unaffected."""
     col_titles = [f"draw {i + 1}" for i in range(len(true_fields))]
     _plot_field_grid(
         grid_y, grid_x, grid_shape, true_fields, col_titles, output_path,
         row0_label="Ground truth\n(synthetic kernel)\ny", suptitle="Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
         predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
+        oracle_fields=oracle_fields,
         pred_row_label="Copula model\n(predicted)\ny", indep_row_label="Independent\n(no copula)\ny",
+        oracle_row_label="Oracle correlation\n+ TabICLv2 marginal\ny",
         xlabel="x", cbar_label="Field value",
     )
 
@@ -578,11 +598,19 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
     over context days) -- then plots the SAME three diagnostics as the real
     branch: distance-vs-correlation, heatmap comparison (both via
     generate_plots.plot_spatial_correlation_diagnostics), and the
-    ground-truth/predicted/independent field small-multiples (via
-    plot_synthetic_residual_grid, sharing predict_copula_residual_field with
-    the real branch's plot_residual_grid).
+    ground-truth/oracle-correlation/predicted/independent field small-multiples
+    (via plot_synthetic_residual_grid, sharing predict_copula_residual_field
+    with the real branch's plot_residual_grid). The oracle-correlation row
+    isolates correlation-estimation error from marginal-estimation error: it
+    reuses the model's real TabICLv2 marginal (same as the predicted row) but
+    injects the TRUE kernel's correlation matrix instead of the model's own
+    R_pred, holding the shared latent noise fixed so the only difference from
+    the predicted row is Sigma_hat (model) vs. Sigma_true (oracle).
     """
+    import torch
+
     from generate_plots import _safe_cholesky
+    from data_gen import sigma_to_correlation
 
     grid_size = max(2, int(round(np.sqrt(args.n_synthetic_points))))
     axis = np.linspace(-1.0, 1.0, grid_size)
@@ -596,6 +624,17 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
     print(f"Sampling a synthetic ground-truth covariance over {D} points from a single data_gen.py kernel...")
     true_cov, kernel_name = sample_simple_kernel_covariance(cfg, coords, seed=args.seed)
 
+    # sample_simple_kernel_covariance returns a raw GP COVARIANCE (outputscale
+    # sampled per-episode, so its diagonal is not generally 1), but
+    # predict_copula_residual_field's R_context argument must be a unit-diagonal
+    # CORRELATION matrix (it Cholesky-factors R_context and feeds norm.cdf of the
+    # resulting latent straight in as the PIT quantile -- see low_rank_correlation
+    # in src/model.py, whose Sigma output is likewise unit-diagonal). Reuse the
+    # same covariance -> correlation normalization training uses (data_gen.py's
+    # sigma_to_correlation) rather than re-deriving it here.
+    R_true, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
+    R_true = R_true.numpy()
+
     n_context = min(args.n_synthetic_context, D)
     context_frac = n_context / D
     if context_frac >= 0.01:
@@ -607,7 +646,7 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
 
     L = _safe_cholesky(true_cov)
     R_indep = np.eye(D)
-    R_pred_draws, true_fields, predicted_fields, independent_fields = [], [], [], []
+    R_pred_draws, true_fields, predicted_fields, independent_fields, oracle_marginal_fields = [], [], [], [], []
     for i in range(args.n_synthetic_draws):
         z_true = L @ rng.standard_normal(D)
         context_values = z_true[context_idx]
@@ -619,14 +658,18 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
         R_pred_draws.append(R_pred)
         true_fields.append(z_true)
 
-        # Same shared latent noise for both draws below (see
-        # predict_copula_residual_field's docstring): isolates what the
-        # learned cross-location correlation itself adds on top of the
-        # per-point marginal prediction, rather than an unrelated random
-        # redraw -- same convention the real branch's main() loop uses.
+        # Same shared latent noise for all three draws below (see
+        # predict_copula_residual_field's docstring): isolates what each of the
+        # learned cross-location correlation (R_pred) and the oracle correlation
+        # (R_true) add on top of the same per-point marginal prediction, rather
+        # than an unrelated random redraw -- same convention the real branch's
+        # main() loop uses.
         z_shared = rng.standard_normal(D)
         predicted_fields.append(
             predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_pred, device, z_shared)
+        )
+        oracle_marginal_fields.append(
+            predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_true, device, z_shared)
         )
         independent_fields.append(
             predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_indep, device, z_shared)
@@ -636,13 +679,14 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
     print(f"Plotting synthetic ground-truth ('{kernel_name}' kernel) vs. predicted spatial correlation diagnostics...")
     plot_generic_diagnostics(predicted_cov, coords, true_cov=true_cov, tag=tag)
 
-    print(f"Plotting the synthetic ground-truth vs. copula-model-predicted fields for "
-          f"{args.n_synthetic_draws} draws on the same grid...")
+    print(f"Plotting the synthetic ground-truth vs. oracle-correlation vs. copula-model-predicted "
+          f"fields for {args.n_synthetic_draws} draws on the same grid...")
     grid_shape = (grid_size, grid_size)
     true_grids = [f.reshape(grid_shape) for f in true_fields]
     plot_synthetic_residual_grid(
         axis, axis, grid_shape, true_grids, predicted_fields, independent_fields,
         os.path.join(_PLOTS_DIR, f"residual_grid_{tag}.png"), context_coords=context_coords,
+        oracle_fields=oracle_marginal_fields,
     )
 
 
