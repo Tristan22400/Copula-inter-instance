@@ -2096,8 +2096,19 @@ def _structural_warp_column(col_data: Tensor, op: str, use_index_axis: bool = Fa
 
         r_min, r_max = raw.min(), raw.max()
         s_min, s_max = sorted_vals.min(), sorted_vals.max()
-        denom = (r_max - r_min).clamp(min=1e-8)
-        transformed = (raw - r_min) / denom * (s_max - s_min) + s_min
+        # If raw comes out perfectly flat (e.g. a linear column's 2nd
+        # derivative, or a constant-slope column's 1st derivative), the old
+        # unconditional rescale ((raw - r_min) / clamp(denom, 1e-8) * range +
+        # s_min) divides a numerically-zero numerator by a floor-clamped
+        # denominator, which is finite but still collapses transformed to the
+        # single constant s_min for every point -- the same "whole column
+        # flattens to one value" failure shape as the censor lo==hi bug this
+        # mirrors. No-op instead of collapsing.
+        if not torch.isfinite(r_max - r_min) or (r_max - r_min).item() <= 1e-8:
+            transformed = sorted_vals
+        else:
+            denom = r_max - r_min
+            transformed = (raw - r_min) / denom * (s_max - s_min) + s_min
 
     elif op == "resample_artifact":
         # Downsample (with a random phase offset) then upsample back via one
@@ -2712,30 +2723,38 @@ def _generate_gp_batch_raw(
     # surfaced much later as a training-time crash.
     discard = discard | degen
 
-    # Kernels capped to a single active dim (periodic/cosine, and any
-    # composite/systematic chain containing either — see the kernel_cols
-    # selection above) have no other dimension to fall back on: if that one
-    # column collapses to a near-constant value, the kernel's r=0 for every
-    # point pair and R_star silently becomes a constant, uninformative
-    # correlation matrix instead of reflecting the sampled kernel at all.
-    # This has been observed via more than one independent upstream cause
-    # (a structural-warp "censor" quantile-index collision — now guarded in
-    # _structural_warp_column — and mlp_mixing's ReLU/sigmoid saturating a
-    # unit to one value for every point, which is ordinary "dead ReLU"
-    # behaviour, not a bug, and can't be prevented at the source), so this
-    # is checked post-hoc here rather than patched at each possible cause.
-    # x_norm is per-episode z-normalised already (see above), so a healthy
-    # column has std ~= 1.0 and a collapsed one has std ~= 0.0 -- no
-    # ambiguous middle ground to threshold carefully.
-    if kernel_cols is not None and len(kernel_cols) == 1:
-        degenerate_active_col = x_norm[:, :, kernel_cols[0]].std(dim=1) < 1e-4
-        if degenerate_active_col.any():
-            warnings.warn(
-                f"generate_gp_batch: {int(degenerate_active_col.sum())}/{B} episodes have a "
-                f"degenerate (near-constant) single active kernel column and will be discarded.",
-                RuntimeWarning,
-            )
-        discard = discard | degenerate_active_col
+    # If every active dimension a kernel actually reads collapses to a
+    # near-constant value, the kernel's r=0 for every point pair and R_star
+    # silently becomes a constant, uninformative correlation matrix instead
+    # of reflecting the sampled kernel at all. This has been observed via
+    # more than one independent upstream cause (a structural-warp "censor"
+    # quantile-index collision — now guarded in _structural_warp_column —
+    # and mlp_mixing's ReLU/sigmoid saturating a unit to one value for every
+    # point, which is ordinary "dead ReLU" behaviour, not a bug, and can't be
+    # prevented at the source), so this is checked post-hoc here rather than
+    # patched at each possible cause. x_norm is per-episode z-normalised
+    # already (see above), so a healthy column has std ~= 1.0 and a
+    # collapsed one has std ~= 0.0 -- no ambiguous middle ground to threshold
+    # carefully.
+    #
+    # Only ALL-active-dims-collapsed counts as degenerate here: kernels
+    # capped to k=1 (periodic/cosine) have no other dimension to fall back
+    # on, so any collapse is total. Kernels with k>1 active dims (including
+    # kernel_cols=None, meaning full ARD over every one of the d columns)
+    # still vary through their other active dims if only some collapse —
+    # that's reduced effective dimensionality, not a broken episode, so only
+    # the all-collapsed case (the true multi-dim analogue of the k=1 bug) is
+    # discarded.
+    active_cols = kernel_cols if kernel_cols is not None else list(range(d))
+    active_stds = x_norm[:, :, active_cols].std(dim=1)             # (B, len(active_cols))
+    degenerate_active_col = (active_stds.max(dim=1).values) < 1e-4
+    if degenerate_active_col.any():
+        warnings.warn(
+            f"generate_gp_batch: {int(degenerate_active_col.sum())}/{B} episodes have a "
+            f"degenerate (near-constant) active kernel column and will be discarded.",
+            RuntimeWarning,
+        )
+    discard = discard | degenerate_active_col
 
     # Reconstruct full posterior covariance (for Y-space oracle)
     Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
