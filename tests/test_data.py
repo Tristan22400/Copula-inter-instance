@@ -1252,21 +1252,19 @@ def test_mean_fn_diversifies_mu_star(small_cfg, family_probs):
 
 
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-@pytest.mark.parametrize("oracle_mode", ["prior", "posterior"])
-def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs, oracle_mode):
+def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs):
     """R_star must stay a valid, PSD, non-trivial correlation matrix under
-    every mean family and both oracle modes -- the mean-invariance argument
-    (GP posterior covariance never depends on the mean function) must hold
-    in practice, not just in theory."""
+    every mean family -- the mean-invariance argument (GP covariance never
+    depends on the mean function) must hold in practice, not just in theory."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
     cfg.data.kernel = "rbf"
-    cfg.data.oracle_mode = oracle_mode
+    cfg.data.oracle_mode = "prior"
     cfg.data.mean_fn_enabled = True
     cfg.data.mean_fn_prob = 1.0
     cfg.data.mean_fn_family_probs = family_probs
 
-    torch.manual_seed(abs(hash(("mean_fn_psd", tuple(family_probs), oracle_mode))) % (2**31))
+    torch.manual_seed(abs(hash(("mean_fn_psd", tuple(family_probs)))) % (2**31))
     off_diag_abs = []
     for _ in range(20):
         task = generate_gp_task(cfg)
@@ -1323,12 +1321,13 @@ def test_mean_fn_z_train_stays_calibrated(small_cfg, family_probs):
     )
 
 
-def test_posterior_oracle_z_test_calibrated(small_cfg):
-    """oracle_mode='posterior' must give z_test ~N(0,1), same as 'prior'.
-    post_model(x_test) alone returns the LATENT f* posterior (no observation
-    noise), but y_test is a noisy sample -- Sigma_star must go through
-    likelihood(...) or sigma_star is systematically undersized and z_test
-    over-dispersed."""
+def test_oracle_mode_posterior_unsupported(small_cfg):
+    """oracle_mode='posterior' was removed (its float64-then-float32 Schur
+    complement could still leave R_star's min eigenvalue below the
+    well-conditioned/PSD floors for composite kernels, and nothing caught it
+    before saving -- see tests/test_dataset_corr_uniform.py::test_r_star_well_conditioned).
+    Only 'prior' is supported now; requesting 'posterior' must fail loudly
+    rather than silently falling back."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 3
     cfg.data.P_min = cfg.data.P_max = 40
@@ -1337,14 +1336,8 @@ def test_posterior_oracle_z_test_calibrated(small_cfg):
     cfg.data.oracle_mode = "posterior"
 
     torch.manual_seed(0)
-    episodes = generate_gp_batch(cfg, B=1500, device="cpu")
-    z_test = torch.cat([ep["z_test"] for ep in episodes])
-
-    assert z_test.mean().abs().item() < 0.1, f"z_test mean={z_test.mean():.4f} (expected ~0)"
-    assert abs(z_test.std().item() - 1.0) < 0.15, (
-        f"z_test std={z_test.std():.4f} (expected ~1 -- sigma_star likely missing "
-        f"the observation-noise term)"
-    )
+    with pytest.raises(ValueError, match="oracle_mode"):
+        generate_gp_batch(cfg, B=4, device="cpu")
 
 
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])

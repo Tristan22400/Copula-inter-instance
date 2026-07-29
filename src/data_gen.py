@@ -4,8 +4,8 @@ data_gen.py — Stage A: GP task generation for inter-instance copula.
 Each task samples a random GP with a configurable PSD kernel, draws P+N
 instances, normalises features over the full P+N set, samples targets jointly
 from the GP, computes the analytical correlation matrix R* at the test points
-(from either the GP posterior conditioned on training data or the raw GP
-prior, per cfg.data.oracle_mode), and saves all required tensors.
+from the raw GP prior (cfg.data.oracle_mode == "prior", the only supported
+mode), and saves all required tensors.
 
 Kernels are built from gpytorch.kernels (RBFKernel, MaternKernel,
 PeriodicKernel, RQKernel, CosineKernel, LinearKernel) wrapped in ScaleKernel
@@ -280,10 +280,9 @@ def _dist(X1: Tensor, X2: Tensor) -> Tensor:
 #   - _sample_episode_kernel: draws fresh hyperparameters from gpytorch
 #     LogNormal/Gamma priors for B episodes at once. Its kernel object feeds
 #     BOTH of the following:
-#       - generate_gp_batch / generate_gp_task's own sampling and posterior
-#         conditioning, done via gpytorch's native GaussianLikelihood +
-#         ExactGP (_build_likelihood, _GeneratorGP below) rather than
-#         hand-rolled Gram-matrix + noise math.
+#       - generate_gp_batch / generate_gp_task's own sampling, done via
+#         gpytorch's native GaussianLikelihood (_build_likelihood) rather
+#         than hand-rolled Gram-matrix + noise math.
 #       - build_kernel_fn (below), for reconstructing a kernel from already-
 #         known concrete hyperparameter values.
 #   - build_kernel_fn: builds a kernel(X1, X2) -> K callable from CONCRETE,
@@ -1438,9 +1437,8 @@ def _sample_mean_module(cfg, d: int, B: int, device) -> tuple[gpytorch.means.Mea
     diversifies mu_star/z_train/z_test's realism and can never perturb the
     correlation structure this pipeline exists to report. It DOES need
     mu_star/z_train/z_test to be computed against this same mean (see
-    _generate_gp_batch_raw's oracle_mode branches and _GeneratorGP) — adding
-    a mean to y_all without also updating those would silently miscalibrate
-    the PIT.
+    _generate_gp_batch_raw's oracle_mode branch) — adding a mean to y_all
+    without also updating those would silently miscalibrate the PIT.
 
     Per-episode gating (batched, no Python loop over B):
       - nonzero_mask ~ Bernoulli(mean_fn_prob): does this episode get any
@@ -1604,32 +1602,6 @@ def gp_posterior(
     if return_factors:
         return mu_star, Sigma_star, L_ff, alpha
     return mu_star, Sigma_star
-
-
-class _GeneratorGP(gpytorch.models.ExactGP):
-    """Thin ExactGP wrapper so oracle_mode="posterior" conditioning goes
-    through gpytorch's own exact-inference machinery (`model(x_test)` in
-    eval mode) instead of the hand-rolled K_ss - K_sf K_ff^-1 K_fs formula
-    gp_posterior used. `kernel` is the already-sampled (batch_shape=[B])
-    Kernel object from _sample_episode_kernel — one instance, no per-family
-    branching needed here. Verified numerically equivalent (~1e-6 max abs
-    diff) to the old manual computation, given max_cholesky_size forced
-    high enough (see _MAX_CHOLESKY) and fast_pred_var disabled at call time."""
-
-    def __init__(
-        self, train_x: Tensor, train_y: Tensor, likelihood, kernel: gpytorch.kernels.Kernel,
-        batch_shape: torch.Size, mean_module: Optional[gpytorch.means.Mean] = None,
-    ):
-        super().__init__(train_x, train_y, likelihood)
-        # Defaults to ZeroMean for any other caller (none currently exist)
-        # that doesn't pass one — _generate_gp_batch_raw always passes its
-        # own _sample_mean_module result (an exact ZeroMean when
-        # cfg.data.mean_fn_enabled is False, else a _MeanFunctionBank).
-        self.mean_module = mean_module if mean_module is not None else gpytorch.means.ZeroMean(batch_shape=batch_shape)
-        self.covar_module = kernel
-
-    def forward(self, x: Tensor) -> gpytorch.distributions.MultivariateNormal:
-        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
 
 
 def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
@@ -2388,9 +2360,8 @@ def _generate_gp_batch_raw(
     draw B independent hyperparameter sets in one call (see
     _sample_episode_kernel), and a batch_shape=[B] GaussianLikelihood
     (_build_likelihood) draws B independent noise values the same way.
-    Sampling and GP-posterior conditioning both go through gpytorch's own
-    MultivariateNormal/ExactGP machinery (see _GeneratorGP and the
-    max_cholesky_size discussion in the module docstring) rather than
+    Sampling goes through gpytorch's own MultivariateNormal machinery (see
+    the max_cholesky_size discussion in the module docstring) rather than
     hand-rolled Gram-matrix + Cholesky code, evaluated once for all B
     episodes at once. This removes the Python-loop overhead of B separate
     generate_gp_task calls and enables GPU or CPU-SIMD acceleration for the
@@ -2625,11 +2596,11 @@ def _generate_gp_batch_raw(
     # exactly B valid episodes.
     discard = failed_all | failed_ff
 
-    oracle_mode = getattr(cfg.data, "oracle_mode", "posterior")
+    oracle_mode = getattr(cfg.data, "oracle_mode", "prior")
     if oracle_mode == "prior":
         # Prior oracle: ignore training conditioning — R_star reflects the raw
         # kernel structure among test points; mu_star is the GP prior mean (0).
-        # No conditioning needed, so this branch never touches _GeneratorGP.
+        # No conditioning needed.
         # Sigma_star = K_ss is already guaranteed PSD here: K_ss is a
         # principal submatrix of K_all, which is constructed above as
         # L_all @ L_all.mT (PSD by construction, via psd_safe_cholesky) —
@@ -2638,49 +2609,17 @@ def _generate_gp_batch_raw(
         # needed at this point.
         mu_star    = mean_module(x_norm_test)
         Sigma_star = K_ss
-    elif oracle_mode == "posterior":
-        # Posterior oracle: condition on (x_train, y_train) via gpytorch's own
-        # exact-inference ExactGP.__call__ instead of the hand-rolled
-        # K_ss - K_sf K_ff^-1 K_fs formula gp_posterior used — same likelihood
-        # object as the joint sample above, so the noise model matches.
-        # fast_pred_var(False) disables gpytorch's LOVE variance shortcut (a
-        # separate approximation from the Cholesky-size one).
-        #
-        # Done in float64: the Schur-complement subtraction K_ss - V^T V that
-        # ExactGP performs internally is a cancellation between two close
-        # quantities, and in float32 this measurably breaks PSD-ness for
-        # composite kernels combining a heavy-tailed component (e.g.
-        # rational_quadratic, whose small-alpha tail makes K_ff ill-
-        # conditioned) with an oscillatory one (cosine/periodic) — observed
-        # min eigenvalues down to -1.1e-3 across repeated sampling. float64
-        # brings the worst case to ~5e-13 (machine-epsilon noise), confirming
-        # this is precision, not a genuine non-PSD kernel. kernel_obj/
-        # likelihood are mutated in place by .double() (nn.Module convention)
-        # but are not read again after this branch, so that's safe; casting
-        # back to float32 keeps the returned schema consistent with every
-        # other tensor in this function.
-        x_kernel_train = x_norm[:, :P]
-        x_kernel_test  = x_norm[:, P:]
-        out_dtype = x_norm.dtype
-        with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY), gpytorch.settings.fast_pred_var(False):
-            post_model = _GeneratorGP(
-                x_kernel_train.double(), y_train.double(),
-                likelihood.double(), kernel_obj.double(), batch_shape,
-                mean_module.double(),
-            ).eval()
-            # post_model(x_test) alone returns the LATENT f* posterior (no
-            # observation noise on the diagonal); y_test is a noisy sample
-            # (K_all has the nugget on every diagonal entry, train and test
-            # alike -- see K_ff/K_ss above), so Sigma_star must go through
-            # the likelihood too, same as noisy_dist = likelihood(prior_dist)
-            # above, or z_test is systematically over-dispersed (sigma_star
-            # undersized by the missing noise term).
-            # likelihood was already mutated to double() as a _GeneratorGP ctor arg above.
-            post = likelihood(post_model(x_kernel_test.double()))
-            mu_star    = post.mean.to(out_dtype)               # (B, N)
-            Sigma_star = post.covariance_matrix.to(out_dtype)  # (B, N, N)
     else:
-        raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; expected 'prior' or 'posterior'.")
+        # oracle_mode="posterior" (GP posterior conditioned on x_train/y_train
+        # via a Schur complement) was removed: the float64 Schur-complement
+        # computation followed by a cast back to float32 could still leave
+        # R_star's minimum eigenvalue below the well-conditioned/PSD floors
+        # for composite "systematic composition" kernels (observed min eig as
+        # low as -1.8e-5 in data/systematic_composition-k5-posterior/pit),
+        # and _generate_gp_batch_raw's discard mask never checked Sigma_star/
+        # R_star's own eigenvalues to catch it. Only 'prior' is supported for
+        # now — see git history for the removed implementation.
+        raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; only 'prior' is supported.")
     Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
 
     # sigma_to_correlation (batched)
@@ -2693,11 +2632,9 @@ def _generate_gp_batch_raw(
 
     # --- Prior correlation among the test points -------------------------------
     # K_ss is the joint-prior test block (nugget already on the diagonal) that
-    # y_test was actually drawn from (noisy_dist above). Its correlation is the
-    # "sampling prior": identical to R_star when oracle_mode="prior", but a
-    # distinct, informative reference under oracle_mode="posterior" — it shows the
-    # raw kernel structure before conditioning on the training points. Stored per
-    # episode so downstream plots can compare prior vs oracle vs prediction.
+    # y_test was actually drawn from (noisy_dist above). With oracle_mode="prior"
+    # the only supported mode, this is always identical to R_star; kept as its
+    # own field for schema stability (downstream plots/tests read R_prior).
     # Same batched D^{-1/2} K D^{-1/2} normalization used for R_star just above.
     prior_var  = K_ss.diagonal(dim1=1, dim2=2).clamp(min=1e-10)                   # (B, N)
     prior_inv  = prior_var.rsqrt()
