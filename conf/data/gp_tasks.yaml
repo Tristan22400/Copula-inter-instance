@@ -93,7 +93,7 @@ mlp_mixing_enabled: true
 # Fraction of episodes per generate_gp_batch call that get mixed at all
 # (Bernoulli gate); the rest pass through unmixed, mirroring
 # tabiclv2_warp_features's identity-transform choice.
-mlp_mixing_prob: 0.6
+mlp_mixing_prob: 0.9
 # Number of mixing layers, sampled once per batch call (shared by every
 # episode in that call). Kept small (1-2): each layer risks collapsing
 # R_star toward independence or saturating an activation -- validate any
@@ -119,7 +119,7 @@ mlp_mix_weight_std: 1.0
 # mlp_mixing/mean_fn above, NOT turned on here yet -- validate against
 # tests/test_dataset_corr_uniform.py on a pilot dataset before enabling by
 # default; these transforms are new and unvalidated at scale.
-structural_warp_enabled: false
+structural_warp_enabled: true
 # Per-(episode, column) probability of applying any transform at all.
 structural_warp_prob: 0.3
 # How many of the 6 categories to compose (sampled WITHOUT replacement,
@@ -302,8 +302,8 @@ sign_modulation_sharpness_lognormal_scale: 0.5
 # validate -- a fixed prob that works for 8-component chains will likely be
 # too aggressive for bare/2-component kernels (e.g. prob=1.0 on a bare
 # kernel already gives neg_frac ~0.36, see SignModulatedKernel's docstring).
-sign_modulation_component_prob: 0.5
-sign_modulation_outer_prob: 0.5
+sign_modulation_component_prob: 0.0
+sign_modulation_outer_prob: 0.0
 
 # PIT epsilon for probit clamping (analytical pipeline)
 pit_eps: 1.0e-6
