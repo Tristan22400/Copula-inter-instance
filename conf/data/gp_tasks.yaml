@@ -223,16 +223,35 @@ kernel: rbf
 
 # Systematic composition (CauKer-style, github.com/ShifengXIE/CauKer): if
 # true, ignores kernel/kernels above entirely and instead samples a random
-# chain length M ~ Uniform[composite_num_kernels_min, composite_num_kernels_max],
+# chain length M ~ round(LogNormal(composite_num_kernels_lognormal_loc,
+# _scale)), clipped to [composite_num_kernels_min, composite_num_kernels_max],
 # draws M elementary kernels with replacement from data_gen._COMPOSABLE_KERNELS
 # (minus composite_exclude_kernels below), and combines them left-to-right
 # with independently-sampled +/* operators — see data_gen.py::
 # _sample_kernel_chain_structure / _build_kernel_chain. Produces chain names
 # like "rbf+cosine*periodic" that are NOT in ALL_KERNELS/KERNEL_REGISTRY
 # (unbounded cardinality) and are not reconstructible via build_kernel_fn.
+#
+# LogNormal (replacing an earlier Uniform[min, max], 2026-07-29) concentrates
+# most episodes on short chains: long +/* chains empirically shrink |R_star|
+# toward 0 (each "*" link damps magnitude, each "+" link averages toward the
+# population mean via a CLT-like effect), which was the dominant reason
+# extreme (near +-1) correlations were rare. loc=0.55/scale=1.05 give
+# P(m=1)=0.45, P(m=2)=0.19, P(m=3)=0.11 (75% of episodes at m<=3, roughly
+# preserving the old chain-length-1/2/3 relative 60:25:15 shape) and a
+# decaying tail out to composite_num_kernels_max. Validated (many
+# independent small-B generate_gp_batch calls — see the batch-sampling
+# gotcha in data_gen.py's module docstring) against
+# tests/test_dataset_corr_uniform.py: mean +0.166->+0.264 (still inside the
+# abs(mean)<0.30 bound), frac(R>0.7) 0.093->0.179. Does not address the
+# negative-correlation side (frac(R<-0.7) stays ~0.004-0.005) — that needs
+# sign_modulation_component_prob/_outer_prob below, deliberately out of
+# scope for this change.
 systematic_composition: true
 composite_num_kernels_min: 1
 composite_num_kernels_max: 8
+composite_num_kernels_lognormal_loc: 0.55
+composite_num_kernels_lognormal_scale: 1.05
 # Optional: drop elementary kernels from the systematic_composition sampling
 # pool (data_gen._COMPOSABLE_KERNELS) without affecting the static
 # COMPOSITE_KERNELS pool used by the non-systematic path. e.g. [periodic] to
