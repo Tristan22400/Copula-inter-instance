@@ -28,6 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.io import netcdf_file
+from scipy.spatial.distance import pdist, squareform
 from scipy.special import gammaln, logsumexp
 from scipy.stats import chi2, multivariate_normal, norm
 from sklearn.gaussian_process.kernels import Matern
@@ -468,7 +469,7 @@ def plot_correlation_vs_distance(data, C, pdf=None):
 # ---------------------------------------------------------------------------
 # Plot 3: Predicted vs. ground-truth correlation matrix
 # ---------------------------------------------------------------------------
-def plot_correlation_matrix_comparison(C, C_true, pdf=None):
+def plot_correlation_matrix_comparison(C, C_true, pdf=None, filename="correlation_matrix_comparison.pdf"):
     """
     Directly visualize the model's predicted MxM correlation matrix next to
     the ground-truth reference (see `ground_truth_correlation_matrix`), plus
@@ -512,7 +513,118 @@ def plot_correlation_matrix_comparison(C, C_true, pdf=None):
 
     plt.tight_layout()
     fig.colorbar(im1, ax=axes[:2].tolist(), shrink=0.85, label="Correlation")
-    _save_fig(fig, "correlation_matrix_comparison.pdf", pdf)
+    _save_fig(fig, filename, pdf)
+
+
+# ---------------------------------------------------------------------------
+# Plot 3b: Spatial correlation diagnostics -- generalizes plot_correlation_vs_distance
+# / plot_correlation_matrix_comparison above to either a known synthetic
+# ground-truth covariance or a real, empirically-estimated one, using the
+# same colors/cmap/figsize/layout as those two functions.
+# ---------------------------------------------------------------------------
+def _cov_to_corr(cov: np.ndarray) -> np.ndarray:
+    """Normalize a covariance matrix to a correlation matrix (unit diagonal)."""
+    std = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+    corr = cov / np.outer(std, std)
+    np.fill_diagonal(corr, 1.0)
+    return corr
+
+
+def plot_spatial_correlation_diagnostics(
+    predicted_cov: np.ndarray,
+    coordinates: np.ndarray,
+    true_cov: "np.ndarray | None" = None,
+    raw_observations: "np.ndarray | None" = None,
+    pdf=None,
+    tag: str = "",
+):
+    """
+    Same two diagnostic views as plot_correlation_vs_distance /
+    plot_correlation_matrix_comparison above, generalized to route to either
+    a known ground-truth covariance (synthetic data, `true_cov`) or raw
+    observations used to estimate one empirically (real data,
+    `raw_observations`, shape (n_samples, M)) as the baseline -- exactly one
+    of the two must be given.
+
+    `coordinates` (M, d) is plain Euclidean space here (unlike
+    haversine_distance_km elsewhere in this file, which assumes lon/lat
+    degrees), so Plot 1's x-axis is a plain pairwise Euclidean distance.
+
+    `tag`, if given, is appended to both output filenames (e.g. a
+    checkpoint/mode identifier) so repeated calls across different
+    checkpoints or modes don't silently overwrite each other's plots.
+    """
+    suffix = f"_{tag}" if tag else ""
+    if (true_cov is None) == (raw_observations is None):
+        raise ValueError("Provide exactly one of `true_cov` (synthetic) or `raw_observations` (real).")
+
+    baseline_cov = true_cov if true_cov is not None else np.cov(raw_observations, rowvar=False)
+    baseline_label = "Ground Truth" if true_cov is not None else "Empirical, raw obs."
+
+    C_base = _cov_to_corr(np.asarray(baseline_cov))
+    C_pred = _cov_to_corr(np.asarray(predicted_cov))
+
+    # --- Plot 1: distance vs. correlation, baseline vs. predicted overlay ---
+    dist = squareform(pdist(coordinates))
+    iu = np.triu_indices_from(C_base, k=1)
+    dist_iu, base_iu, pred_iu = dist[iu], C_base[iu], C_pred[iu]
+
+    # Moving average (same convolution convention as plot_correlation_vs_distance
+    # above), computed from the FULL pair set before any scatter subsampling below
+    # so the trend line reflects every pair, not just the plotted subsample.
+    def _moving_average(d, v):
+        order = np.argsort(d)
+        d_sorted, v_sorted = d[order], v[order]
+        window = max(len(d) // 50, 1)
+        box = np.ones(window) / window
+        return np.convolve(d_sorted, box, mode="valid"), np.convolve(v_sorted, box, mode="valid")
+
+    dist_avg_base, base_avg = _moving_average(dist_iu, base_iu)
+    dist_avg_pred, pred_avg = _moving_average(dist_iu, pred_iu)
+
+    # Subsample for the scatter (same convention/threshold as
+    # plot_correlation_vs_distance above): an unbounded number of upper-
+    # triangle pairs grows O(M^2) in the point count and, past a few
+    # thousand points, plotting/saving becomes extremely slow (each marker
+    # is its own path in the PDF) without changing what the plot shows.
+    n_pairs = len(dist_iu)
+    max_scatter_points = 4000
+    if n_pairs > max_scatter_points:
+        sel = RNG.choice(n_pairs, size=max_scatter_points, replace=False)
+        dist_iu, base_iu, pred_iu = dist_iu[sel], base_iu[sel], pred_iu[sel]
+
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    ax.scatter(dist_iu, base_iu, s=4, alpha=0.15, color="black", label=f"{baseline_label} pairs")
+    ax.scatter(dist_iu, pred_iu, s=4, alpha=0.15, color="steelblue", label="Predicted pairs")
+    ax.plot(dist_avg_base, base_avg, color="dimgray", linewidth=2.2, label=f"{baseline_label} mean")
+    ax.plot(dist_avg_pred, pred_avg, color="crimson", linewidth=2.2, label="Predicted mean")
+    ax.set_xlabel("Spatial distance")
+    ax.set_ylabel(r"Correlation $\rho_{ij}$")
+    ax.legend()
+    plt.tight_layout()
+    _save_fig(fig, f"spatial_correlation_diagnostics_distance{suffix}.png", pdf)
+
+    # --- Plot 2: baseline / predicted / residual heatmaps ---
+    residual = C_base - C_pred
+    res_max = float(np.max(np.abs(residual))) or 1e-8
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    im0 = axes[0].imshow(C_base, cmap="coolwarm", vmin=-1, vmax=1)
+    axes[0].set_title(f"Baseline ({baseline_label}) $C$")
+    im1 = axes[1].imshow(C_pred, cmap="coolwarm", vmin=-1, vmax=1)
+    axes[1].set_title("Predicted $\\hat{C}$")
+    for ax_i in axes[:2]:
+        ax_i.set_xlabel("Grid index $j$")
+        ax_i.set_ylabel("Grid index $i$")
+    im2 = axes[2].imshow(residual, cmap="coolwarm", vmin=-res_max, vmax=res_max)
+    axes[2].set_title("Residual (Baseline - Predicted)")
+    axes[2].set_xlabel("Grid index $j$")
+    axes[2].set_ylabel("Grid index $i$")
+
+    plt.tight_layout()
+    fig.colorbar(im1, ax=axes[:2].tolist(), shrink=0.85, label="Correlation")
+    fig.colorbar(im2, ax=axes[2], shrink=0.85, label="Residual")
+    _save_fig(fig, f"spatial_correlation_diagnostics_heatmaps{suffix}.png", pdf)
 
 
 # ---------------------------------------------------------------------------
