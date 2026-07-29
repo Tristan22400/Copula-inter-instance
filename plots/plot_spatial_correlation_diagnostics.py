@@ -92,9 +92,23 @@ if _REPO_ROOT not in sys.path:
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from generate_plots import haversine_distance_km, load_era5_data  # noqa: E402
+from generate_plots import (  # noqa: E402
+    haversine_distance_km,
+    load_era5_data,
+    plot_correlation_matrix_comparison,
+    plot_spatial_correlation_diagnostics as plot_generic_diagnostics,
+)
 
-OUT_PATH = os.path.join(_PLOTS_DIR, "spatial_correlation_diagnostics.png")
+def _ckpt_mode_tag(ckpt_path: str, mode: str) -> str:
+    """Short, filesystem-safe tag identifying (checkpoint run dir + step,
+    mode), used to give every output file this script produces a distinct
+    name -- so comparing several checkpoints and/or --mode real vs.
+    synthetic back-to-back doesn't silently overwrite the previous run's
+    plots (both modes, and every checkpoint, otherwise write the same
+    fixed filenames)."""
+    run_dir = os.path.basename(os.path.dirname(os.path.abspath(ckpt_path)))
+    step_name = os.path.splitext(os.path.basename(ckpt_path))[0]
+    return f"{run_dir}_{step_name}_{mode}"
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +136,222 @@ def empirical_spatial_correlation(data: dict) -> np.ndarray:
     """Pearson correlation matrix R_emp (D x D) of the 24h persistence residuals."""
     residuals = compute_persistence_residuals(data["t2m"])
     return np.corrcoef(residuals.T)
+
+
+def morans_i(field: np.ndarray) -> float:
+    """Global Moran's I (Moran, 1950) with rook (4-neighbor) adjacency on a
+    regular (H, W) grid: the standard spatial-autocorrelation statistic for
+    how smooth/locally coherent a SINGLE snapshot is --
+
+        I = N * sum_edges (x_i - xbar)(x_j - xbar) / (E * sum_i (x_i - xbar)^2)
+
+    where the sum is over unordered rook-adjacent cell pairs (E of them).
+    +1 means neighboring cells are highly similar (smooth field), 0 means
+    spatially random (no local structure, i.e. noise), negative means
+    neighboring cells tend to differ (checkerboard-like roughness).
+
+    This is a DIFFERENT notion of "spatial correlation" than R_emp/R_context
+    elsewhere in this script: those measure whether two FIXED locations'
+    time series correlate across days; this measures whether one day's
+    spatial PATTERN is itself locally smooth.
+    """
+    x = field - field.mean()
+    cross_h = x[:, :-1] * x[:, 1:]
+    cross_v = x[:-1, :] * x[1:, :]
+    n_edges = cross_h.size + cross_v.size
+    numerator = cross_h.sum() + cross_v.sum()
+    denominator = (x ** 2).sum()
+    return float(field.size * numerator / (n_edges * denominator))
+
+
+def predict_copula_residual_field(
+    tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
+    coords_test: np.ndarray, R_context: np.ndarray, device: str, z_shared: np.ndarray,
+) -> np.ndarray:
+    """One joint draw (D,) from the copula model's implied residual field:
+    inject its predicted spatial correlation `R_context` (see
+    extract_model_context_correlation, SAME forward pass / SAME context) into
+    the given shared latent Gaussian vector `z_shared` via Cholesky, then map
+    each coordinate through the frozen TabICL marginal quantile function
+    (tabicl_marginal.icdf, conditioned on the same real context) -- i.e.
+    y = F_hat^{-1}(Phi(z)), the exact inverse of the PIT definition
+    u = F_hat(y), z = Phi^-1(u) this script already uses to build z_train
+    elsewhere -- rather than approximating the marginal as Gaussian(mean, std).
+
+    `z_shared` is passed in (not drawn here) so callers can reuse the SAME
+    underlying noise across R_context vs. R_indep (see generate_plots.
+    plot_spatial_map_comparison's identical convention): the only difference
+    between the two resulting fields is then whether cross-location
+    correlation was injected, not an unrelated random redraw.
+
+    Falls back to a naive Gaussian(mean, std) marginal if `tabicl_marginal`
+    is None (scratch-trained backbone, see load_marginal_tabicl).
+    """
+    from generate_plots import _safe_cholesky
+    from scipy.stats import norm
+
+    L = _safe_cholesky(R_context)
+    z_copula = L @ z_shared
+    u_copula = np.clip(norm.cdf(z_copula), 1e-6, 1.0 - 1e-6)
+
+    if tabicl_marginal is None:
+        y_std = max(context_values.std(), 1e-8)
+        return context_values.mean() + y_std * z_copula
+
+    import torch
+
+    x_mean = context_coords.mean(axis=0, keepdims=True)
+    x_std = context_coords.std(axis=0, keepdims=True).clip(min=1e-8)
+    x_train_norm = (context_coords - x_mean) / x_std
+    x_test_norm = (coords_test - x_mean) / x_std
+
+    x_full = np.concatenate([x_train_norm, x_test_norm], axis=0)
+    x_batch = torch.as_tensor(x_full, dtype=torch.float32, device=device).unsqueeze(0)  # (1, P+N, p_x)
+    y_train_batch = torch.as_tensor(context_values, dtype=torch.float32, device=device).unsqueeze(0)  # (1, P)
+    with torch.no_grad():
+        logits = tabicl_marginal(x_batch, y_train_batch)  # (1, N, Q) -- N test rows only, per src/pit.py::run_pit
+        n_test = coords_test.shape[0]
+        dist = tabicl_marginal.quantile_dist(logits.reshape(n_test, -1))
+        # icdf's 1-D alpha shape means "same n probability levels evaluated for every
+        # batch element" (broadcasts to (*batch_shape, n)) -- NOT "one alpha per batch
+        # element". We need the latter (one u per grid point), so pass alpha shaped
+        # (*batch_shape, 1) explicitly and drop the resulting trailing singleton dim.
+        u_t = torch.as_tensor(u_copula, dtype=torch.float32, device=device).unsqueeze(-1)
+        y_pred = dist.icdf(u_t).squeeze(-1)
+    return y_pred.cpu().numpy()
+
+
+def _plot_field_grid(
+    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, true_fields: list, col_titles: list,
+    output_path: str, row0_label: str, suptitle: str,
+    predicted_fields: "list[np.ndarray] | None" = None,
+    independent_fields: "list[np.ndarray] | None" = None,
+    context_coords: "np.ndarray | None" = None,
+    pred_row_label: str = "Copula model\n(predicted)\nLatitude",
+    indep_row_label: str = "Independent\n(no copula)\nLatitude",
+    xlabel: str = "Longitude", cbar_label: str = "Residual (deg C)",
+) -> None:
+    """Shared small-multiples renderer behind both plot_residual_grid (real
+    ERA5 days) and plot_synthetic_residual_grid (synthetic GP draws): top row
+    `true_fields` (already grid_shape-shaped), optional predicted/independent
+    rows below (flat (D,) arrays, reshaped to grid_shape here) -- see
+    plot_residual_grid's docstring for the row semantics this preserves.
+    All rows share one color scale and the Moran's I annotation (see
+    morans_i) so both callers render pixel-identically."""
+    has_pred = predicted_fields is not None
+    has_indep = independent_fields is not None
+    pred_grids = [f.reshape(grid_shape) for f in predicted_fields] if has_pred else []
+    indep_grids = [f.reshape(grid_shape) for f in independent_fields] if has_indep else []
+
+    vmax = float(np.max(np.abs(true_fields + pred_grids + indep_grids)))
+
+    def _annotate_morans_i(ax, field):
+        # See morans_i's docstring: smoothness of THIS single snapshot, not the
+        # cross-day spatial correlation R_emp/R_context already plotted elsewhere.
+        ax.text(
+            0.97, 0.95, f"$I$={morans_i(field):.2f}", transform=ax.transAxes,
+            ha="right", va="top", fontsize=7,
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.7, edgecolor="none"),
+        )
+
+    n_cols = len(true_fields)
+    n_rows = 1 + int(has_pred) + int(has_indep)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False)
+    mesh = None
+    for j, (title, field) in enumerate(zip(col_titles, true_fields)):
+        mesh = axes[0][j].pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+        axes[0][j].set_title(title, fontsize=9)
+        _annotate_morans_i(axes[0][j], field)
+    axes[0][0].set_ylabel(row0_label)
+
+    def _plot_row(row_idx, grids, ylabel):
+        for j, field in enumerate(grids):
+            mesh_local = axes[row_idx][j].pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+            _annotate_morans_i(axes[row_idx][j], field)
+            if context_coords is not None:
+                axes[row_idx][j].scatter(
+                    context_coords[:, 0], context_coords[:, 1],
+                    c="black", s=8, marker="o", linewidths=0.4, edgecolors="white",
+                    label="Context points" if j == 0 else None,
+                )
+        axes[row_idx][0].set_ylabel(ylabel)
+        if context_coords is not None:
+            axes[row_idx][0].legend(loc="upper left", fontsize=6, framealpha=0.7)
+        return mesh_local
+
+    row = 1
+    if has_pred:
+        mesh = _plot_row(row, pred_grids, pred_row_label)
+        row += 1
+    if has_indep:
+        mesh = _plot_row(row, indep_grids, indep_row_label)
+
+    for j in range(n_cols):
+        axes[-1][j].set_xlabel(xlabel)
+    fig.suptitle(suptitle)
+    plt.tight_layout(rect=(0.0, 0.0, 0.93, 0.96))
+    fig.colorbar(mesh, ax=axes.ravel().tolist(), shrink=0.85, label=cbar_label)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {output_path}")
+
+
+def plot_residual_grid(
+    data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: str,
+    context_coords: "np.ndarray | None" = None,
+    independent_fields: "list[np.ndarray] | None" = None,
+) -> None:
+    """Small-multiples panel of the 24h persistence residual field E_t =
+    Z_t - Z_{t-24} on the lat/lon grid, one column per day in `days`: top row
+    is the ground-truth field (the same residual fields that feed both R_emp
+    and the real-context conditioning); if `predicted_fields` is given, the
+    next row is the copula model's predicted field for that SAME day (see
+    predict_copula_residual_field); if `independent_fields` is also given, a
+    third row shows the SAME marginal-per-point prediction with the copula's
+    cross-location correlation switched off (R replaced by the identity --
+    the "Independent TabICLv2" case already used in the correlogram/
+    correlation-matrix plots), isolating what the learned correlation
+    structure itself adds on top of the per-point marginal. All rows share
+    one color scale so they are directly comparable pixel-for-pixel. If
+    `context_coords` is given, the (fixed, same-every-day) real-context
+    locations that condition both predicted rows are overlaid as black
+    markers on those rows only -- the ground-truth row shows the process
+    being measured, not what the model was told about it.
+    """
+    lat, lon = data["latitude"], data["longitude"]
+    grid_shape = data["t2m"][0].shape
+    true_fields = [data["t2m"][d] - data["t2m"][d - 1] for d in days]
+    col_titles = [f"day {d}: $E_t = Z_{{{d}}} - Z_{{{d - 1}}}$" for d in days]
+    suptitle = (
+        "24h Persistence Residual Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
+        else "24h Persistence Residual Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
+    )
+    _plot_field_grid(
+        lat, lon, grid_shape, true_fields, col_titles, output_path,
+        row0_label="Ground truth\nLatitude", suptitle=suptitle,
+        predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
+    )
+
+
+def plot_synthetic_residual_grid(
+    grid_y: np.ndarray, grid_x: np.ndarray, grid_shape: tuple,
+    true_fields: list, predicted_fields: list, independent_fields: list,
+    output_path: str, context_coords: "np.ndarray | None" = None,
+) -> None:
+    """Synthetic-mode analogue of plot_residual_grid: one column per
+    independent GP draw from the sampled ground-truth kernel (see
+    run_synthetic_mode) instead of one column per real ERA5 day, with the
+    SAME three rows (ground truth / copula-predicted / independent) and
+    shared color scale / Moran's I annotation, via the same _plot_field_grid
+    renderer plot_residual_grid uses."""
+    col_titles = [f"draw {i + 1}" for i in range(len(true_fields))]
+    _plot_field_grid(
+        grid_y, grid_x, grid_shape, true_fields, col_titles, output_path,
+        row0_label="Ground truth\n(synthetic kernel)\ny", suptitle="Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
+        predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
+        pred_row_label="Copula model\n(predicted)\ny", indep_row_label="Independent\n(no copula)\ny",
+        xlabel="x", cbar_label="Field value",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +502,151 @@ def extract_model_context_correlation(
 
 
 # ---------------------------------------------------------------------------
+# Synthetic mode: known ground-truth covariance from a single data_gen.py
+# kernel, vs. the model's real forward-pass prediction on a matching draw --
+# a no-real-data-confounds sanity check, using the same two generic plots
+# (generate_plots.plot_spatial_correlation_diagnostics) as the real branch.
+# ---------------------------------------------------------------------------
+def sample_simple_kernel_covariance(cfg, coordinates: np.ndarray, seed: "int | None" = None) -> "tuple[np.ndarray, str]":
+    """Ground-truth covariance for synthetic mode: samples ONE elementary
+    (non-composite) kernel from src/data_gen.py's registry, with
+    hyperparameters drawn from the SAME LogNormal/Gamma hyperpriors training
+    episodes use (data_gen._kernel_prior_spec, via _build_kernel_component)
+    -- bypassing data_gen's sum/product composition path entirely (see
+    cfg.data.systematic_composition there), per project convention that a
+    synthetic sanity check should isolate one kernel family at a time.
+
+    `coordinates` (M, d) is standardized (zero mean, unit variance) before
+    evaluating the kernel, since data_gen's lengthscale prior is calibrated
+    for that scale (see _kernel_prior_spec's docstring) -- the same
+    normalization convention extract_model_context_correlation already uses
+    for x_train/x_test.
+
+    cfg.data.sign_modulation_component_prob (default 0.5, see
+    conf/data/gp_tasks.yaml) is forced to 0 for this call: sign modulation
+    is a separate per-component training-diversity augmentation, not part of
+    "the list of available kernels", and it breaks the constant-diagonal
+    prior covariance a single plain kernel should have here.
+
+    Returns (Sigma, kernel_name).
+    """
+    import random as _random
+
+    import torch
+    from omegaconf import OmegaConf
+
+    from data_gen import _build_kernel_component, _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS
+
+    if seed is not None:
+        _random.seed(seed)
+        torch.manual_seed(seed)
+
+    cfg = OmegaConf.merge(cfg, OmegaConf.create({"data": {"sign_modulation_component_prob": 0.0}}))
+
+    coords = np.asarray(coordinates, dtype=np.float64)
+    x_std = (coords - coords.mean(axis=0)) / coords.std(axis=0).clip(min=1e-8)
+    k = x_std.shape[1]
+
+    # Exclude "dot_product"/"polynomial" (no real lengthscale -- not a
+    # distance-decay kernel) and, for k > 1 coordinates, "cosine" (only PSD
+    # for scalar input -- see _SCALAR_ONLY_KERNELS in data_gen.py).
+    candidates = [
+        name for name in _COMPOSABLE_KERNELS
+        if name not in ("dot_product", "polynomial") and not (k > 1 and name in _SCALAR_ONLY_KERNELS)
+    ]
+    kernel_name = _random.choice(candidates)
+
+    kernel, params = _build_kernel_component(cfg, kernel_name, k=k, B=1, device="cpu")
+    x_t = torch.as_tensor(x_std, dtype=torch.get_default_dtype()).unsqueeze(0)  # (1, N, k)
+    with torch.no_grad():
+        Sigma = kernel(x_t, x_t).to_dense()[0].numpy()
+
+    param_str = ", ".join(f"{name}={v.item():.3f}" for name, v in params.items() if v.numel() == 1)
+    print(f"Synthetic ground truth: sampled kernel '{kernel_name}' ({param_str})")
+    return Sigma, kernel_name
+
+
+def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str) -> None:
+    """Synthetic-data branch of main(): draws coordinates on a regular 2D
+    grid (so plot_synthetic_residual_grid can pcolormesh them, same as the
+    real branch's lon/lat grid), samples a known ground-truth covariance
+    from ONE data_gen.py kernel (sample_simple_kernel_covariance), draws
+    --n-synthetic-draws independent joint GP samples from it as in-context
+    conditioning values, and extracts the model's predicted correlation via
+    the SAME extract_model_context_correlation forward pass the real branch
+    uses (averaged over the draws, mirroring the real branch's averaging
+    over context days) -- then plots the SAME three diagnostics as the real
+    branch: distance-vs-correlation, heatmap comparison (both via
+    generate_plots.plot_spatial_correlation_diagnostics), and the
+    ground-truth/predicted/independent field small-multiples (via
+    plot_synthetic_residual_grid, sharing predict_copula_residual_field with
+    the real branch's plot_residual_grid).
+    """
+    from generate_plots import _safe_cholesky
+
+    grid_size = max(2, int(round(np.sqrt(args.n_synthetic_points))))
+    axis = np.linspace(-1.0, 1.0, grid_size)
+    x_grid, y_grid = np.meshgrid(axis, axis)
+    coords = np.column_stack([x_grid.ravel(), y_grid.ravel()])  # (D, 2)
+    D = coords.shape[0]
+    if D != args.n_synthetic_points:
+        print(f"Note: --n-synthetic-points={args.n_synthetic_points} rounded to the nearest "
+              f"square grid, D={D} ({grid_size}x{grid_size}), so it can be shown as a field grid.")
+
+    print(f"Sampling a synthetic ground-truth covariance over {D} points from a single data_gen.py kernel...")
+    true_cov, kernel_name = sample_simple_kernel_covariance(cfg, coords, seed=args.seed)
+
+    n_context = min(args.n_synthetic_context, D)
+    context_frac = n_context / D
+    if context_frac >= 0.01:
+        print(f"Warning: --n-synthetic-context={n_context} is {context_frac:.1%} of the grid "
+              f"(D={D}) -- consider raising --n-synthetic-points to keep the in-context sample "
+              f"under 1% of the field.")
+    context_idx = rng.choice(D, size=n_context, replace=False)
+    context_coords = coords[context_idx]
+
+    L = _safe_cholesky(true_cov)
+    R_indep = np.eye(D)
+    R_pred_draws, true_fields, predicted_fields, independent_fields = [], [], [], []
+    for i in range(args.n_synthetic_draws):
+        z_true = L @ rng.standard_normal(D)
+        context_values = z_true[context_idx]
+        print(f"Extracting the joint copula correlation matrix with real context "
+              f"(synthetic draw {i + 1}/{args.n_synthetic_draws})...")
+        R_pred = extract_model_context_correlation(
+            model, device, tabicl_marginal, context_coords, context_values, coords, k_folds=args.pit_k_folds,
+        )
+        R_pred_draws.append(R_pred)
+        true_fields.append(z_true)
+
+        # Same shared latent noise for both draws below (see
+        # predict_copula_residual_field's docstring): isolates what the
+        # learned cross-location correlation itself adds on top of the
+        # per-point marginal prediction, rather than an unrelated random
+        # redraw -- same convention the real branch's main() loop uses.
+        z_shared = rng.standard_normal(D)
+        predicted_fields.append(
+            predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_pred, device, z_shared)
+        )
+        independent_fields.append(
+            predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_indep, device, z_shared)
+        )
+    predicted_cov = np.mean(R_pred_draws, axis=0)
+
+    print(f"Plotting synthetic ground-truth ('{kernel_name}' kernel) vs. predicted spatial correlation diagnostics...")
+    plot_generic_diagnostics(predicted_cov, coords, true_cov=true_cov, tag=tag)
+
+    print(f"Plotting the synthetic ground-truth vs. copula-model-predicted fields for "
+          f"{args.n_synthetic_draws} draws on the same grid...")
+    grid_shape = (grid_size, grid_size)
+    true_grids = [f.reshape(grid_shape) for f in true_fields]
+    plot_synthetic_residual_grid(
+        axis, axis, grid_shape, true_grids, predicted_fields, independent_fields,
+        os.path.join(_PLOTS_DIR, f"residual_grid_{tag}.png"), context_coords=context_coords,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Distance binning shared by every curve
 # ---------------------------------------------------------------------------
 def _bin_indices(d: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
@@ -319,6 +694,31 @@ def pair_counts_by_distance(dist: np.ndarray, bin_edges: np.ndarray) -> np.ndarr
     bin_idx = _bin_indices(iu_dist, bin_edges)
     counts = np.bincount(bin_idx[bin_idx >= 0], minlength=n_bins)
     return counts[:n_bins]
+
+
+# ---------------------------------------------------------------------------
+# Correlation-matrix seriation: reorder the D grid points so strongly-
+# correlated pairs sit near the diagonal in the heatmap comparison.
+# ---------------------------------------------------------------------------
+def seriate_by_correlation(R: np.ndarray) -> np.ndarray:
+    """Permutation of R's indices via average-linkage hierarchical clustering
+    with optimal leaf ordering (Bar-Joseph et al. 2001) on the correlation
+    distance d_ij = 1 - rho_ij -- the standard "seriation" trick for making a
+    correlation-matrix heatmap interpretable. The grid's raw index order
+    (raveled lon/lat meshgrid, see main()) has no reason to place spatially
+    close -- hence strongly correlated -- points at nearby indices, which is
+    why the un-seriated heatmap shows diagonal-adjacent structure only for
+    the block that happens to share a latitude row.
+    """
+    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.spatial.distance import squareform
+
+    dist = 1.0 - np.clip(R, -1.0, 1.0)
+    np.fill_diagonal(dist, 0.0)
+    dist = (dist + dist.T) / 2.0  # enforce exact symmetry; R may only be numerically symmetric
+    condensed = squareform(dist, checks=False)
+    Z = linkage(condensed, method="average", optimal_ordering=True)
+    return np.asarray(leaves_list(Z))
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +883,43 @@ def main():
     )
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     parser.add_argument(
+        "--mode", type=str, default="real", choices=["real", "synthetic"],
+        help="'real' (default): the full ERA5/TabICLv2 diagnostic pipeline below, unchanged. "
+        "'synthetic': skip ERA5 entirely and instead sample a known ground-truth covariance from "
+        "ONE non-composite src/data_gen.py kernel (sample_simple_kernel_covariance) over a "
+        "synthetic coordinate grid, then check whether the model's real forward pass "
+        "(extract_model_context_correlation, same as the real branch) recovers it -- a "
+        "no-real-data-confounds sanity check, producing the two generic diagnostics "
+        "(distance-vs-correlation, heatmap comparison) via "
+        "generate_plots.plot_spatial_correlation_diagnostics, plus a residual-field small-multiples "
+        "panel (plot_synthetic_residual_grid, one column per --n-synthetic-draws draw) -- the "
+        "synthetic analogue of --residual-grid-output below. --days/--theory-models/--output/"
+        "--residual-grid-output are ignored in this mode (see --n-synthetic-points/--n-synthetic-draws "
+        "instead); every output filename is auto-tagged with the checkpoint + mode (see "
+        "_ckpt_mode_tag) so repeated comparisons across checkpoints/modes don't overwrite each other.",
+    )
+    parser.add_argument(
+        "--n-synthetic-points", type=int, default=2500,
+        help="[--mode synthetic] Number of synthetic 2D coordinates to sample the ground-truth "
+        "kernel and model prediction over (rounded up to the nearest square grid -- see "
+        "run_synthetic_mode). Default 2500 (50x50) so the default --n-synthetic-context=20 stays "
+        "under 1% of the grid -- a small, genuinely sparse in-context sample rather than a large "
+        "fraction of the whole field.",
+    )
+    parser.add_argument(
+        "--n-synthetic-context", type=int, default=20,
+        help="[--mode synthetic] Number of historical context points sampled per draw (the "
+        "synthetic-mode analogue of --n-context below, kept separate since the real ERA5 grid and "
+        "the synthetic grid have very different natural sizes).",
+    )
+    parser.add_argument(
+        "--n-synthetic-draws", type=int, default=12,
+        help="[--mode synthetic] Number of independent joint GP draws from the sampled ground-truth "
+        "covariance to average the model's predicted correlation over, and the number of columns "
+        "shown in the residual-grid small-multiples panel (mirrors the real branch's "
+        "averaging over --days).",
+    )
+    parser.add_argument(
         "--days",
         type=int,
         nargs="+",
@@ -524,10 +961,38 @@ def main():
         "(free smoothness nu, the most flexible fit -- nu is estimated directly by the fit, not assumed). "
         "Pass 'none' alone to disable the overlay entirely.",
     )
-    parser.add_argument("--output", type=str, default=OUT_PATH)
+    parser.add_argument(
+        "--output", type=str, default=None,
+        help="[--mode real] Where to save the correlogram PNG. Default: auto-tagged with the "
+        "checkpoint + mode (see _ckpt_mode_tag), spatial_correlation_diagnostics_<tag>.png.",
+    )
+    parser.add_argument(
+        "--residual-grid-output", type=str, default=None,
+        help="[--mode real] Where to save the small-multiples panel of the 24h persistence residual "
+        "fields (one per --days entry), on the same ERA5 grid used for the correlogram above. "
+        "Default: auto-tagged, residual_grid_<tag>.png.",
+    )
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
+
+    print(f"Loading TabICLv2 checkpoint '{args.ckpt}'...")
+    model, cfg, device = load_copula_model(args.ckpt, device=args.device)
+
+    print("Loading frozen pretrained TabICL quantile head for context PIT...")
+    tabicl_marginal = load_marginal_tabicl(cfg, device)
+
+    tag = _ckpt_mode_tag(args.ckpt, args.mode)
+
+    if args.mode == "synthetic":
+        run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag)
+        return
+
+    if args.output is None:
+        args.output = os.path.join(_PLOTS_DIR, f"spatial_correlation_diagnostics_{tag}.png")
+    if args.residual_grid_output is None:
+        args.residual_grid_output = os.path.join(_PLOTS_DIR, f"residual_grid_{tag}.png")
+
     data = load_era5_data()
     lat, lon = data["latitude"], data["longitude"]
     lon_grid, lat_grid = np.meshgrid(lon, lat)
@@ -543,15 +1008,10 @@ def main():
             parser.error(f"each --days value must be in [1, {n_days - 1}] (need day-1 to form a 24h residual), got {d}")
 
     print("Computing empirical spatial correlation from 24h persistence residuals...")
+    residuals = compute_persistence_residuals(data["t2m"])  # raw observations feeding both R_emp and Plot_generic's baseline
     R_emp = empirical_spatial_correlation(data)
 
     R_indep = np.eye(D)
-
-    print(f"Loading TabICLv2 checkpoint '{args.ckpt}'...")
-    model, cfg, device = load_copula_model(args.ckpt, device=args.device)
-
-    print("Loading frozen pretrained TabICL quantile head for context PIT...")
-    tabicl_marginal = load_marginal_tabicl(cfg, device)
 
     print("Extracting the model's unconditional correlation matrix (dummy context)...")
     R_dummy_context = extract_model_dummy_context_correlation(model, device, coords)
@@ -574,6 +1034,9 @@ def main():
     context_coords = coords[context_idx]
 
     rho_context_per_day = []
+    R_context_per_day = []
+    predicted_fields = []
+    independent_fields = []
     for d in args.days:
         print(f"Extracting the joint copula correlation matrix with real context (context day={d}, "
               f"conditioned on the 24h persistence residual field[{d}] - field[{d - 1}])...")
@@ -582,9 +1045,25 @@ def main():
         R_context = extract_model_context_correlation(
             model, device, tabicl_marginal, context_coords, context_values, coords, k_folds=args.pit_k_folds,
         )
+        R_context_per_day.append(R_context)
         rho_context_per_day.append(bin_correlation_by_distance(R_context, dist, bin_edges))
+        # Same shared latent noise for both draws below (see predict_copula_residual_field's
+        # docstring): isolates what the learned cross-location correlation itself adds on
+        # top of the per-point marginal prediction, rather than an unrelated random redraw.
+        z_shared = rng.standard_normal(D)
+        predicted_fields.append(
+            predict_copula_residual_field(
+                tabicl_marginal, context_coords, context_values, coords, R_context, device, z_shared,
+            )
+        )
+        independent_fields.append(
+            predict_copula_residual_field(
+                tabicl_marginal, context_coords, context_values, coords, R_indep, device, z_shared,
+            )
+        )
     rho_context_per_day = np.array(rho_context_per_day)  # (n_days, n_bins)
     rho_context_mean = np.nanmean(rho_context_per_day, axis=0)
+    R_context_mean = np.mean(R_context_per_day, axis=0)  # (D, D), elementwise mean matrix over context days
 
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_indep = bin_correlation_by_distance(R_indep, dist, bin_edges)
@@ -655,6 +1134,27 @@ def main():
     fig.savefig(args.output, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {args.output}")
+
+    print("Seriating the correlation matrix (hierarchical clustering on the ground-truth "
+          "correlation distance) so strongly-correlated grid points sit near the diagonal...")
+    order = seriate_by_correlation(R_emp)
+    print("Plotting predicted (mean over context days) vs. empirical correlation matrix "
+          f"on the same {D}-point ERA5 grid, reordered by seriation...")
+    plot_correlation_matrix_comparison(
+        R_context_mean[np.ix_(order, order)], R_emp[np.ix_(order, order)], pdf=None,
+        filename=f"correlation_matrix_comparison_{tag}.png",
+    )
+
+    print(f"Plotting the ground-truth vs. copula-model-predicted residual fields for days {args.days} "
+          "on the same grid...")
+    plot_residual_grid(
+        data, args.days, predicted_fields, args.residual_grid_output,
+        context_coords=context_coords, independent_fields=independent_fields,
+    )
+
+    print("Plotting the generic distance-vs-correlation / heatmap diagnostics "
+          "(baseline = empirical correlation of the real 24h persistence residuals)...")
+    plot_generic_diagnostics(R_context_mean, coords, raw_observations=residuals, tag=tag)
 
 
 if __name__ == "__main__":
