@@ -62,7 +62,7 @@ training:
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
-  muon_lr: 4.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
+  muon_lr: 2.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
   muon_lr_min: 1.0e-6         # cosine decay floor
   muon_momentum: 0.95
   muon_weight_decay: 0.01     # cautious weight decay (Chen et al. 2025a)
