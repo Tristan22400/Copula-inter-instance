@@ -228,7 +228,7 @@ def _plot_field_grid(
     independent_fields: "list[np.ndarray] | None" = None,
     oracle_fields: "list[np.ndarray] | None" = None,
     context_coords: "np.ndarray | None" = None,
-    pred_row_label: str = "Copula model\n(predicted)\nLatitude",
+    pred_row_label: str = "Copula model\n(predicted)\n +marginal\nLatitude",
     indep_row_label: str = "Independent\n(no copula)\nLatitude",
     oracle_row_label: str = "Oracle correlation\n+ marginal\nLatitude",
     xlabel: str = "Longitude", cbar_label: str = "Residual (deg C)",
