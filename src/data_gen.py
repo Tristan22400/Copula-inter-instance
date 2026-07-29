@@ -97,8 +97,10 @@ Composite kernels ("A+B" / "A*B")
 
   Systematic composition (cfg.data.systematic_composition, CauKer-style —
   github.com/ShifengXIE/CauKer): an alternative, opt-in generative mode that
-  samples a random chain length M ~ Uniform[composite_num_kernels_min,
-  composite_num_kernels_max], draws M elementary kernels with replacement
+  samples a random chain length M ~ round(LogNormal(
+  composite_num_kernels_lognormal_loc, _scale)), clipped to
+  [composite_num_kernels_min, composite_num_kernels_max], draws M elementary
+  kernels with replacement
   from _COMPOSABLE_KERNELS (minus cfg.data.composite_exclude_kernels), and
   combines them left-to-right with independently-sampled +/* operators (see
   _sample_kernel_chain_structure / _build_kernel_chain), instead of the
@@ -1283,21 +1285,37 @@ def _resolve_kernel_name(cfg) -> str:
 
 def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
     """CauKer-style composition (github.com/ShifengXIE/CauKer): sample a
-    random component COUNT m ~ Uniform[composite_num_kernels_min,
-    composite_num_kernels_max], then a length-m list of elementary kernels
-    (with replacement) from _COMPOSABLE_KERNELS, then m-1 independently
-    sampled +/* operators to combine them left-to-right (functools.reduce,
-    see _build_kernel_chain) — instead of picking from the fixed 56-entry
-    COMPOSITE_KERNELS pool. Active only when cfg.data.systematic_composition
-    is True (see _resolve_kernel_name's docstring for the non-systematic
-    path). cfg.data.composite_exclude_kernels (optional list, default empty)
-    drops named elementary kernels from the sampling pool without touching
+    random component COUNT m ~ round(LogNormal(composite_num_kernels_lognormal_loc,
+    _scale)), clipped to [composite_num_kernels_min, composite_num_kernels_max],
+    then a length-m list of elementary kernels (with replacement) from
+    _COMPOSABLE_KERNELS, then m-1 independently sampled +/* operators to
+    combine them left-to-right (functools.reduce, see _build_kernel_chain) —
+    instead of picking from the fixed 56-entry COMPOSITE_KERNELS pool. Active
+    only when cfg.data.systematic_composition is True (see
+    _resolve_kernel_name's docstring for the non-systematic path).
+    cfg.data.composite_exclude_kernels (optional list, default empty) drops
+    named elementary kernels from the sampling pool without touching
     _COMPOSABLE_KERNELS itself — that constant also seeds the static 56-entry
     COMPOSITE_KERNELS/KERNEL_REGISTRY at import time (module-level loop
     above), which must stay unfiltered for the non-systematic path. Returns
     (names, ops, chain_name) where chain_name is the same "A+B*C"-style
     left-to-right string the static composites already use (m=1 degenerates
-    to a bare base-kernel name, no ops)."""
+    to a bare base-kernel name, no ops).
+
+    LogNormal (replacing an earlier Uniform[min, max]) concentrates most
+    episodes on short chains -- long "+"/"*" chains empirically shrink
+    |R_star| toward 0 (each "*" link damps magnitude, each "+" link averages
+    toward the population mean via a CLT-like effect), which was the
+    dominant reason extreme (near +-1) correlations were rare under the old
+    uniform sampling. Default loc/scale (0.55, 1.05) give P(m=1)=0.45,
+    P(m=2)=0.19, P(m=3)=0.11 (75% of episodes at m<=3, preserving roughly
+    the old relative 60:25:15 shape among those three) and a decaying tail
+    out to composite_num_kernels_max -- validated via many independent
+    small-B generate_gp_batch calls (see the batch-sampling gotcha in this
+    file's module docstring) against tests/test_dataset_corr_uniform.py:
+    mean +0.166->+0.264 (still inside the abs(mean)<0.30 bound), frac(R>0.7)
+    0.093->0.179. Re-validate if composite_exclude_kernels or the nugget
+    prior change."""
     exclude = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
     pool = [k for k in _COMPOSABLE_KERNELS if k not in exclude]
     if not pool:
@@ -1307,7 +1325,9 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
         )
     lo = int(getattr(cfg.data, "composite_num_kernels_min", 1))
     hi = int(getattr(cfg.data, "composite_num_kernels_max", 4))
-    m = random.randint(lo, hi)
+    m_loc = float(getattr(cfg.data, "composite_num_kernels_lognormal_loc", 0.55))
+    m_scale = float(getattr(cfg.data, "composite_num_kernels_lognormal_scale", 1.05))
+    m = min(max(round(random.lognormvariate(m_loc, m_scale)), lo), hi)
     names = random.choices(pool, k=m)
     ops = [random.choice(("+", "*")) for _ in range(m - 1)]
     chain_name = names[0] + "".join(f"{op}{name}" for op, name in zip(ops, names[1:]))
