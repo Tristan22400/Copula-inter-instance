@@ -681,7 +681,11 @@ def main(cfg: DictConfig) -> None:
     if live_generation:
         # dataset_dir is ignored entirely in this mode (see below) — naming the
         # run after it would be misleading, so summarize cfg.data.* instead.
-        dataset_name = "live" + _live_data_segment(cfg.data)
+        # Also fold in ckpt_dir's basename since it's often the only
+        # user-chosen, human-readable identifier for a live-generation run.
+        ckpt_dir = t.get("ckpt_dir", None)
+        ckpt_str = f"_ckpt-{os.path.basename(os.path.normpath(ckpt_dir))}" if ckpt_dir else ""
+        dataset_name = "live" + _live_data_segment(cfg.data) + ckpt_str
     else:
         dataset_path = os.path.normpath(t.dataset_dir)
         # Include the parent folder so runs pointing at same-named shard dirs
@@ -758,7 +762,8 @@ def main(cfg: DictConfig) -> None:
         # =false (the default) to fall back to it unchanged.
         print(
             "[train] live_generation=true — generating episodes on the fly, "
-            f"no dataset_dir read ({t.dataset_dir!r} ignored)."
+            f"no dataset_dir read ({t.dataset_dir!r} ignored). "
+            f"ckpt_dir={t.get('ckpt_dir', None)!r}"
         )
         train_loader = build_live_train_loader(cfg, t, device)
         val_loader   = build_fixed_live_val_batches(cfg, t)
