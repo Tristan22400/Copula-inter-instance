@@ -83,6 +83,13 @@ training:
 tabicl:
   pretrained: true   # false → randomly-initialised backbone (uses arch section below)
   ckpt: tabicl-regressor-v2-20260212.ckpt  # ignored when pretrained=false
+  # Gradient checkpointing (torch.utils.checkpoint) through the pretrained
+  # backbone's col/row/icl transformer stages: recomputes activations during
+  # backward instead of holding them all, trading ~20-30% extra compute for a
+  # large cut in peak activation memory. Attention length T=P+N (see
+  # conf/data/gp_tasks.yaml N_max/P_max) dominates that memory; turn this on
+  # instead of shrinking N_max/P_max/batch_size when hitting CUDA OOM.
+  recompute: false
   # Architecture params — only used when pretrained=false.
   # Defaults match the released tabicl-regressor-v2 checkpoint.
   # arch:
