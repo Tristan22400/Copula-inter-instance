@@ -23,9 +23,12 @@ training:
   save_every: 5000
   ckpt_dir: null
   # Path to a checkpoint saved by save_checkpoint() (model + optimizer +
-  # scheduler + step). When set, training resumes from step+1 instead of 0.
-  # Everything else (steps, LR schedule, dataset, etc.) follows this run's
-  # config, not the one baked into the checkpoint.
+  # scheduler + step). When set, model weights and optimizer/scaler state
+  # (Adam/Muon moments, AMP grad scale) are restored, but the step counter
+  # and LR scheduler always restart at 0 with a fresh warmup/cosine schedule,
+  # so this run's step count tracks the new run rather than continuing the
+  # checkpoint's. Everything else (steps, LR schedule, dataset, etc.) follows
+  # this run's config, not the one baked into the checkpoint.
   # Usage: python src/train.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
   resume_ckpt: null
   dataset_dir: ./data/systematic_composition-k5/pit
