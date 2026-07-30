@@ -17,6 +17,39 @@ if _SRC not in sys.path:
 
 
 @pytest.fixture(scope="session")
+def small_model_cfg():
+    """Minimal CopulaTabICL config: scratch (untrained) TabICL backbone.
+
+    Sized for fast CPU forward passes in model structural tests, not for
+    learning anything useful.
+    """
+    return OmegaConf.create(
+        {
+            "model": {
+                "rank": 2,
+                "unfreeze_backbone": True,
+            },
+            "tabicl": {
+                "pretrained": False,
+                "arch": {
+                    "embed_dim": 16,
+                    "col_num_blocks": 1,
+                    "col_nhead": 2,
+                    "col_num_inds": 8,
+                    "row_num_blocks": 1,
+                    "row_nhead": 2,
+                    "row_num_cls": 2,
+                    "icl_num_blocks": 1,
+                    "icl_nhead": 2,
+                    "ff_factor": 1,
+                    "dropout": 0.0,
+                },
+            },
+        }
+    )
+
+
+@pytest.fixture(scope="session")
 def small_cfg():
     """Minimal Hydra-like config for fast CPU tests (no GPU required)."""
     return OmegaConf.create(
