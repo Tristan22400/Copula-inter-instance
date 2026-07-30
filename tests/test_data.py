@@ -12,6 +12,7 @@ Tests verify:
 
 from __future__ import annotations
 
+import math
 import random
 import warnings
 
@@ -283,6 +284,76 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
         f"{kernel_name}: degenerate/trivial, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
+
+
+@pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
+def test_periodic_and_cosine_period_recoverable_in_r_star(small_cfg, kernel_name):
+    """R_star for a bare periodic/cosine episode must equal the exact
+    analytic kernel formula reconstructed from the episode's own recorded
+    active column, l/period, alpha2 and nugget -- not merely "some" valid
+    correlation matrix. This is the regression net for a wrong active-
+    column index or a recorded l/period that doesn't actually match what
+    was baked into the gpytorch kernel R_star was drawn from.
+
+    Formulas (gpytorch v1.15.2; ScaleKernel(base) with outputscale=alpha2):
+      periodic: base(x1, x2) = exp(-2 sin^2(pi (x1-x2) / period) / l)
+      cosine:   base(x1, x2) = cos(pi (x1 - x2) / period_length)
+                (period_length is stored under the "l" schema key for
+                cosine -- see _kernel_prior_spec's lengthscale_attr; cosine
+                has no separate "period" entry at all)
+    Sigma_star = K_ss carries the likelihood's +nugget on its diagonal only
+    (GaussianLikelihood adds noise to the diagonal, not off-diagonal), so
+    R_star's off-diagonal is the bare kernel value scaled by
+    alpha2 / (alpha2 + nugget) relative to the diagonal.
+    """
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+
+    torch.manual_seed(abs(hash(kernel_name)) % (2**31))
+    for i in range(10):
+        cfg.seed = i
+        task = generate_gp_task(cfg)
+
+        col = task["kernel_feature_indices"][0].item()
+        x = task["x_norm_test"][:, col]
+        diff = x.unsqueeze(0) - x.unsqueeze(1)  # (N, N)
+
+        alpha2 = task["alpha2"].item()
+        nugget = task["nugget"].item()
+
+        if kernel_name == "periodic":
+            l = task["l"].item()
+            period = task["period"].item()
+            base = torch.exp(-2.0 * torch.sin(math.pi * diff / period) ** 2 / l)
+        else:  # cosine: "l" holds period_length (see _kernel_prior_spec)
+            period = task["l"].item()
+            base = torch.cos(math.pi * diff / period)
+
+        R_theory = base * (alpha2 / (alpha2 + nugget))
+        R_theory.fill_diagonal_(1.0)
+
+        max_diff = (R_theory - task["R_star"]).abs().max().item()
+        assert torch.allclose(R_theory, task["R_star"], atol=1e-4), (
+            f"{kernel_name}: R_star doesn't match the analytic kernel formula "
+            f"reconstructed from the recorded active column/l/period/alpha2/"
+            f"nugget (max abs diff={max_diff:.6g})"
+        )
+
+        # Sanity check the test itself isn't vacuous: a deliberately wrong
+        # period must NOT reproduce R_star, so an active-column/period bug
+        # would actually be caught by the assertion above.
+        wrong_period = period * 1.7 + 0.3
+        if kernel_name == "periodic":
+            wrong_base = torch.exp(-2.0 * torch.sin(math.pi * diff / wrong_period) ** 2 / l)
+        else:
+            wrong_base = torch.cos(math.pi * diff / wrong_period)
+        wrong_R = wrong_base * (alpha2 / (alpha2 + nugget))
+        wrong_R.fill_diagonal_(1.0)
+        assert not torch.allclose(wrong_R, task["R_star"], atol=1e-4), (
+            f"{kernel_name}: test is vacuous -- a wrong period still matches R_star"
+        )
 
 
 def test_kernel_needs_scalar_input_handles_n_way_chains():
