@@ -116,6 +116,29 @@ def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
     return {"mse": mse, "mae": mae, "pearson": pearson, "bias": bias}
 
 
+def _oracle_diagonal_order(R_ora: np.ndarray) -> np.ndarray:
+    """Permutation that reorders R_ora's rows/cols so strongly-correlated test
+    points sit next to each other, concentrating high |correlation| along the
+    diagonal instead of scattered uniformly across the heatmap.
+
+    Hierarchical-clustering seriation (average-linkage, optimal leaf ordering)
+    on the distance ``1 - |R_ora|`` — points the oracle says are strongly
+    (anti-)correlated get small distance and land close together in the
+    leaf order. N < 3 has no meaningful ordering.
+    """
+    n = R_ora.shape[0]
+    if n < 3:
+        return np.arange(n)
+    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.spatial.distance import squareform
+
+    dist = 1.0 - np.abs(R_ora)
+    np.fill_diagonal(dist, 0.0)
+    dist = 0.5 * (dist + dist.T)  # guard against float32 asymmetry
+    link = linkage(squareform(dist, checks=False), method="average", optimal_ordering=True)
+    return np.asarray(leaves_list(link))
+
+
 def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     """Correlation-matrix grid: each estimator paired side-by-side with the oracle.
 
@@ -126,6 +149,11 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     annotated with its per-episode upper-triangle MSE against the oracle.
     Episodes are wrapped across ``_CORR_GRID_N_WRAP`` stacked bands instead of
     one very wide row, so the figure stays a reasonable aspect ratio on screen.
+
+    Rows/cols of both oracle and prediction are reordered per episode by
+    ``_oracle_diagonal_order`` (derived from the oracle alone, then reused for
+    the prediction) so the oracle's correlation structure is as diagonal-heavy
+    as possible and the two panels stay directly comparable.
     """
     n_ep = len(plot_episodes)
 
@@ -156,13 +184,16 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     im = None
     for idx, ep in enumerate(plot_episodes):
         line, col = divmod(idx, per_line)
-        R_ora = ep["R_ora"]
+        order = _oracle_diagonal_order(ep["R_ora"])
+        R_ora = ep["R_ora"][order][:, order]
         ri, ci = np.triu_indices(R_ora.shape[0], k=1)
         c_ora, c_est = 2 * col, 2 * col + 1
 
         for row_idx, (row_label, key) in enumerate(rows):
             row = line * n_est + row_idx
             mat = ep.get(key)  # top-level key: R_pred
+            if mat is not None:
+                mat = mat[order][:, order]  # same permutation as the oracle, for a fair comparison
 
             # Left cell: the oracle, redrawn beside every estimator as its reference.
             ax_o = axes[row, c_ora]
