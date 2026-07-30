@@ -178,6 +178,7 @@ _METHOD_ORDER = [
     ("gp_mle_rq",           "GP-MLE-RQ"),
     ("gp_mle_ard_rq",       "GP-MLE-ARD-RQ"),
     ("gp_mle_dot_product",  "GP-MLE-DotProduct"),
+    ("gp_mle_polynomial",   "GP-MLE-Polynomial"),
     ("dkl_rbf",             "Deep Kernel Learning (RBF)"),
     ("dkl_matern32",        "Deep Kernel Learning (Matern32)"),
     ("dkl_rq",              "Deep Kernel Learning (RQ)"),

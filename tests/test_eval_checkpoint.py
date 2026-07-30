@@ -100,7 +100,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         "independence", "gp_prior_rbf",
         "gp_mle_rbf", "gp_mle_ard_rbf", "gp_mle_matern32", "gp_mle_ard_matern32",
         "gp_mle_periodic", "gp_mle_ard_periodic", "gp_mle_rq", "gp_mle_ard_rq",
-        "gp_mle_dot_product",
+        "gp_mle_dot_product", "gp_mle_polynomial",
         "dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product",
         "per_ep_transformer",
     }
