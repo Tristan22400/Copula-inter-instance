@@ -131,12 +131,25 @@ class CopulaTabICL(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _load_pretrained_tabicl(ckpt_name: str) -> TabICL:
+def _load_pretrained_tabicl(ckpt_name: str, recompute: bool = False) -> TabICL:
     from huggingface_hub import hf_hub_download
 
     ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    base = TabICL(**ckpt["config"])
+    # The checkpoint's saved config carries whatever `recompute` value the
+    # original TabICL training run used (checkpointing is a training-time-only
+    # memory/compute tradeoff, so it's almost always False in a saved config).
+    # Override it here rather than after construction: `recompute` is threaded
+    # through TabICL.__init__ into col_embedder/row_interactor/icl_predictor
+    # and further down into their own nested encoders, each capturing its own
+    # `self.recompute` at construction time — flipping an attribute post-hoc
+    # on only the top-level submodules would miss those nested copies. It adds
+    # no parameters (pure torch.utils.checkpoint control flow), so this has no
+    # effect on `load_state_dict` compatibility below.
+    ckpt_config = dict(ckpt["config"])
+    if recompute:
+        ckpt_config["recompute"] = True
+    base = TabICL(**ckpt_config)
     base.load_state_dict(ckpt["state_dict"])
     return base
 
@@ -180,6 +193,12 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
         cfg.model.rank
         cfg.tabicl.pretrained          (default True)
         cfg.tabicl.ckpt                (only when pretrained=True)
+        cfg.tabicl.recompute           (default False; gradient checkpointing
+                                         through the TabICL backbone — trades
+                                         ~20-30% extra compute for a large cut
+                                         in peak activation memory, useful when
+                                         large N_max/P_max push attention
+                                         length T=P+N close to the VRAM ceiling)
         cfg.tabicl.arch.*              (only when pretrained=False)
         cfg.model.unfreeze_backbone    (default True)
         cfg.lora.enabled               (default False)
@@ -189,8 +208,9 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
         cfg.lora.stages                (default ["icl", "row", "col"])
     """
     pretrained = bool(cfg.tabicl.get("pretrained", True))
+    recompute = bool(cfg.tabicl.get("recompute", False))
     if pretrained:
-        base = _load_pretrained_tabicl(cfg.tabicl.ckpt)
+        base = _load_pretrained_tabicl(cfg.tabicl.ckpt, recompute=recompute)
     else:
         base = _build_tabicl_scratch(cfg)
 
