@@ -8,8 +8,14 @@ Four empirical/model curves plus theoretical-law overlays, all binned (or,
 for the theory curves, evaluated) by great-circle distance and plotted
 together:
 
-  1. Ground truth: empirical correlation of 24h persistence residuals
-     E_t = Z_true_t - Z_true_{t-24} across the spatial grid.
+  1. Ground truth: empirical correlation of the quantity selected by
+     --target across the spatial grid. --target raw (the default) uses the
+     raw absolute temperature field Z_true_t itself; --target residual uses
+     the 24h persistence residual E_t = Z_true_t - Z_true_{t-24} instead
+     (the original convention this script used before --target existed —
+     kept for comparison, since differencing removes common-mode structure
+     like the seasonal cycle that raw temperature keeps in). See
+     get_ground_truth_observations.
   2. Independent TabICLv2: a model with no inter-instance copula assumes
      conditional independence across the grid, so its implied correlation
      matrix IS the identity by construction — no forward pass needed.
@@ -21,17 +27,18 @@ together:
      ignoring in-context conditioning.
   4. Copula model with N context points: a real joint forward pass over all
      D grid points at once, conditioned on a historical in-context sample of
-     the SAME 24h persistence residual field as (1) — not the raw absolute
-     temperatures — so it's conditioned on the same physical quantity whose
-     spatial decay it's being compared against. This is likewise NOT a
-     Bayesian posterior — it's the same forward pass as (3), just with real
-     context instead of a dummy one. Context labels z_train are NOT a naive
-     (y - mean) / std standardization: they are the K-fold leave-one-out
-     Probability Integral Transform of each context point's true residual
-     under TabICLv2's own learned marginal (see src/pit.py::run_pit) — i.e.
-     u_i = F_hat(y_i | other context points), z_i = Phi^-1(u_i) — matching
-     how z_train is actually defined during training (data_gen.py's
-     GP-oracle LOO PIT) instead of assuming a Gaussian marginal by fiat.
+     the SAME --target quantity as (1) (raw temperature by default, or the
+     24h persistence residual under --target residual) — so it's conditioned
+     on the same physical quantity whose spatial decay it's being compared
+     against. This is likewise NOT a Bayesian posterior — it's the same
+     forward pass as (3), just with real context instead of a dummy one.
+     Context labels z_train are NOT a naive (y - mean) / std standardization:
+     they are the K-fold leave-one-out Probability Integral Transform of
+     each context point's true value under TabICLv2's own learned marginal
+     (see src/pit.py::run_pit) — i.e. u_i = F_hat(y_i | other context
+     points), z_i = Phi^-1(u_i) — matching how z_train is actually defined
+     during training (data_gen.py's GP-oracle LOO PIT) instead of assuming a
+     Gaussian marginal by fiat.
   5. Theoretical decay laws (--theory-models, default: ALL FOUR at once):
      every isotropic correlation law in the reference literature --
      exponential (Hansen & Lebedeff 1987, nu=1/2), Gaussian (nu->infinity),
@@ -63,6 +70,8 @@ Reuses:
 
 Usage:
     python plots/plot_spatial_correlation_diagnostics.py --ckpt ./checkpoints/systematic-composition-8/step_0180000.pt
+    # fit the 24h persistence residual instead of the default raw temperature field:
+    python plots/plot_spatial_correlation_diagnostics.py --ckpt ./checkpoints/systematic-composition-8/step_0180000.pt --target residual
 """
 
 from __future__ import annotations
@@ -99,16 +108,22 @@ from generate_plots import (  # noqa: E402
     plot_spatial_correlation_diagnostics as plot_generic_diagnostics,
 )
 
-def _ckpt_mode_tag(ckpt_path: str, mode: str) -> str:
+def _ckpt_mode_tag(ckpt_path: str, mode: str, target: "str | None" = None) -> str:
     """Short, filesystem-safe tag identifying (checkpoint run dir + step,
-    mode), used to give every output file this script produces a distinct
-    name -- so comparing several checkpoints and/or --mode real vs.
-    synthetic back-to-back doesn't silently overwrite the previous run's
-    plots (both modes, and every checkpoint, otherwise write the same
-    fixed filenames)."""
+    mode, target), used to give every output file this script produces a
+    distinct name -- so comparing several checkpoints, --mode real vs.
+    synthetic, and/or --target raw vs. residual back-to-back doesn't
+    silently overwrite a previous run's plots (all three, and every
+    checkpoint, otherwise write the same fixed filenames). `target` is
+    only meaningful for --mode real (synthetic mode's ground truth is a
+    sampled GP draw, not real temperature, so raw/residual doesn't apply
+    there) -- pass None to omit it from the tag."""
     run_dir = os.path.basename(os.path.dirname(os.path.abspath(ckpt_path)))
     step_name = os.path.splitext(os.path.basename(ckpt_path))[0]
-    return f"{run_dir}_{step_name}_{mode}"
+    tag = f"{run_dir}_{step_name}_{mode}"
+    if target is not None:
+        tag = f"{tag}_{target}"
+    return tag
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +147,41 @@ def compute_persistence_residuals(field_all: np.ndarray) -> np.ndarray:
     return flat[1:] - flat[:-1]
 
 
-def empirical_spatial_correlation(data: dict) -> np.ndarray:
-    """Pearson correlation matrix R_emp (D x D) of the 24h persistence residuals."""
-    residuals = compute_persistence_residuals(data["t2m"])
-    return np.corrcoef(residuals.T)
+def compute_raw_temperature_observations(field_all: np.ndarray) -> np.ndarray:
+    """Raw per-day temperature Z_t across the spatial grid, with NO
+    differencing -- the --target raw counterpart to
+    compute_persistence_residuals's --target residual. Unlike the 24h
+    persistence residual (which removes any quantity shared across days,
+    e.g. the seasonal cycle or a large-scale weather regime), this keeps
+    that common-mode structure in, so its spatial correlation reflects
+    "do these two locations tend to have similar absolute temperature",
+    not just "do their day-to-day fluctuations move together".
+
+    Returns (n_snapshots, H * W) -- every snapshot is used (no day is lost
+    to lag-1 differencing, unlike compute_persistence_residuals).
+    """
+    n = field_all.shape[0]
+    return field_all.reshape(n, -1)
+
+
+def get_ground_truth_observations(field_all: np.ndarray, target: str) -> np.ndarray:
+    """Dispatch on --target: the per-snapshot observation matrix (n, H*W)
+    that both empirical_spatial_correlation and main()'s per-day context
+    values are derived from -- the single place that decides what "the
+    physical quantity being diagnosed" is."""
+    if target == "raw":
+        return compute_raw_temperature_observations(field_all)
+    if target == "residual":
+        return compute_persistence_residuals(field_all)
+    raise ValueError(f"Unknown target '{target}', choose from 'raw' or 'residual'.")
+
+
+def empirical_spatial_correlation(data: dict, target: str = "raw") -> np.ndarray:
+    """Pearson correlation matrix R_emp (D x D) of the --target quantity
+    (raw temperature by default, or the 24h persistence residual -- see
+    get_ground_truth_observations)."""
+    observations = get_ground_truth_observations(data["t2m"], target)
+    return np.corrcoef(observations.T)
 
 
 def morans_i(field: np.ndarray) -> float:
@@ -312,10 +358,12 @@ def plot_residual_grid(
     data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: str,
     context_coords: "np.ndarray | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
+    target: str = "raw",
 ) -> None:
-    """Small-multiples panel of the 24h persistence residual field E_t =
-    Z_t - Z_{t-24} on the lat/lon grid, one column per day in `days`: top row
-    is the ground-truth field (the same residual fields that feed both R_emp
+    """Small-multiples panel of the --target field (raw temperature Z_t by
+    default, or the 24h persistence residual E_t = Z_t - Z_{t-24} under
+    --target residual) on the lat/lon grid, one column per day in `days`:
+    top row is the ground-truth field (the same field that feeds both R_emp
     and the real-context conditioning); if `predicted_fields` is given, the
     next row is the copula model's predicted field for that SAME day (see
     predict_copula_residual_field); if `independent_fields` is also given, a
@@ -332,16 +380,27 @@ def plot_residual_grid(
     """
     lat, lon = data["latitude"], data["longitude"]
     grid_shape = data["t2m"][0].shape
-    true_fields = [data["t2m"][d] - data["t2m"][d - 1] for d in days]
-    col_titles = [f"day {d}: $E_t = Z_{{{d}}} - Z_{{{d - 1}}}$" for d in days]
-    suptitle = (
-        "24h Persistence Residual Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
-        else "24h Persistence Residual Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
-    )
+    if target == "residual":
+        true_fields = [data["t2m"][d] - data["t2m"][d - 1] for d in days]
+        col_titles = [f"day {d}: $E_t = Z_{{{d}}} - Z_{{{d - 1}}}$" for d in days]
+        suptitle = (
+            "24h Persistence Residual Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
+            else "24h Persistence Residual Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
+        )
+        cbar_label = "Residual (deg C)"
+    else:
+        true_fields = [data["t2m"][d] for d in days]
+        col_titles = [f"day {d}: $Z_{{{d}}}$ (raw)" for d in days]
+        suptitle = (
+            "Raw Temperature Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
+            else "Raw Temperature Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
+        )
+        cbar_label = "Temperature (deg C)"
     _plot_field_grid(
         lat, lon, grid_shape, true_fields, col_titles, output_path,
         row0_label="Ground truth\nLatitude", suptitle=suptitle,
         predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
+        cbar_label=cbar_label,
     )
 
 
@@ -927,6 +986,16 @@ def main():
     )
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     parser.add_argument(
+        "--target", type=str, default="raw", choices=["raw", "residual"],
+        help="[--mode real] Physical quantity to diagnose: 'raw' (default) fits the raw absolute "
+        "temperature field Z_t itself; 'residual' fits the 24h persistence residual E_t = Z_t - "
+        "Z_{t-24} instead (this script's original convention, kept for comparison -- differencing "
+        "removes common-mode structure like the seasonal cycle that 'raw' keeps in). Governs the "
+        "ground-truth curve (empirical_spatial_correlation), the real-context conditioning values, "
+        "and the residual-grid small-multiples panel. Ignored in --mode synthetic (its ground truth "
+        "is a sampled GP draw, not real temperature).",
+    )
+    parser.add_argument(
         "--mode", type=str, default="real", choices=["real", "synthetic"],
         help="'real' (default): the full ERA5/TabICLv2 diagnostic pipeline below, unchanged. "
         "'synthetic': skip ERA5 entirely and instead sample a known ground-truth covariance from "
@@ -947,7 +1016,7 @@ def main():
         help="[--mode synthetic] Number of synthetic 2D coordinates to sample the ground-truth "
         "kernel and model prediction over (rounded up to the nearest square grid -- see "
         "run_synthetic_mode). Default 2500 (50x50) so the default --n-synthetic-context=20 stays "
-        "under 1% of the grid -- a small, genuinely sparse in-context sample rather than a large "
+        "under 1%% of the grid -- a small, genuinely sparse in-context sample rather than a large "
         "fraction of the whole field.",
     )
     parser.add_argument(
@@ -969,12 +1038,13 @@ def main():
         nargs="+",
         default=None,
         help="Day indices t providing the historical in-context sample: for each t, the model "
-        "conditions on the 24h persistence residual field[t] - field[t-1] (same quantity as the "
-        "ground-truth curve), sampled at --n-context grid points. Each must be >= 1. One "
-        "context-conditioned curve is computed per day and shown faint, plus their mean shown "
-        "bold, so you can see whether the curve's shape is a systematic model behavior or "
-        "single-day noise. Default: an evenly spaced spread of up to 8 days across the whole "
-        "dataset.",
+        "conditions on the --target quantity (raw temperature field[t] by default, or the 24h "
+        "persistence residual field[t] - field[t-1] under --target residual -- same quantity as "
+        "the ground-truth curve), sampled at --n-context grid points. Each must be >= 1 under "
+        "--target residual (>= 0 under --target raw). One context-conditioned curve is computed "
+        "per day and shown faint, plus their mean shown bold, so you can see whether the curve's "
+        "shape is a systematic model behavior or single-day noise. Default: an evenly spaced "
+        "spread of up to 8 days across the whole dataset.",
     )
     parser.add_argument("--n-context", type=int, default=50, help="Number of historical context points sampled per day.")
     parser.add_argument(
@@ -1012,8 +1082,9 @@ def main():
     )
     parser.add_argument(
         "--residual-grid-output", type=str, default=None,
-        help="[--mode real] Where to save the small-multiples panel of the 24h persistence residual "
-        "fields (one per --days entry), on the same ERA5 grid used for the correlogram above. "
+        help="[--mode real] Where to save the small-multiples panel of the --target field (raw "
+        "temperature by default, or the 24h persistence residual under --target residual; one "
+        "column per --days entry), on the same ERA5 grid used for the correlogram above. "
         "Default: auto-tagged, residual_grid_<tag>.png.",
     )
     args = parser.parse_args()
@@ -1026,7 +1097,7 @@ def main():
     print("Loading frozen pretrained TabICL quantile head for context PIT...")
     tabicl_marginal = load_marginal_tabicl(cfg, device)
 
-    tag = _ckpt_mode_tag(args.ckpt, args.mode)
+    tag = _ckpt_mode_tag(args.ckpt, args.mode, target=args.target if args.mode == "real" else None)
 
     if args.mode == "synthetic":
         run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag)
@@ -1044,16 +1115,20 @@ def main():
     D = coords.shape[0]
 
     n_days = data["t2m"].shape[0]
+    # --target residual needs day d-1 to form E_t = Z_t - Z_{t-24}, so d must start at 1;
+    # --target raw has no such dependency and can use day 0 too.
+    day_min = 1 if args.target == "residual" else 0
     if args.days is None:
-        n_pick = min(8, n_days - 1)
-        args.days = sorted(set(np.linspace(1, n_days - 1, n_pick).round().astype(int).tolist()))
+        n_pick = min(8, n_days - day_min)
+        args.days = sorted(set(np.linspace(day_min, n_days - 1, n_pick).round().astype(int).tolist()))
     for d in args.days:
-        if not (1 <= d < n_days):
-            parser.error(f"each --days value must be in [1, {n_days - 1}] (need day-1 to form a 24h residual), got {d}")
+        if not (day_min <= d < n_days):
+            parser.error(f"each --days value must be in [{day_min}, {n_days - 1}] "
+                         f"(--target={args.target} needs day-1 to form a 24h residual), got {d}")
 
-    print("Computing empirical spatial correlation from 24h persistence residuals...")
-    residuals = compute_persistence_residuals(data["t2m"])  # raw observations feeding both R_emp and Plot_generic's baseline
-    R_emp = empirical_spatial_correlation(data)
+    print(f"Computing empirical spatial correlation from --target={args.target} observations...")
+    observations = get_ground_truth_observations(data["t2m"], args.target)  # feeds both R_emp and Plot_generic's baseline
+    R_emp = empirical_spatial_correlation(data, target=args.target)
 
     R_indep = np.eye(D)
 
@@ -1082,10 +1157,15 @@ def main():
     predicted_fields = []
     independent_fields = []
     for d in args.days:
-        print(f"Extracting the joint copula correlation matrix with real context (context day={d}, "
-              f"conditioned on the 24h persistence residual field[{d}] - field[{d - 1}])...")
-        residual_day = data["t2m"][d].ravel() - data["t2m"][d - 1].ravel()
-        context_values = residual_day[context_idx]
+        if args.target == "residual":
+            print(f"Extracting the joint copula correlation matrix with real context (context day={d}, "
+                  f"conditioned on the 24h persistence residual field[{d}] - field[{d - 1}])...")
+            day_values = data["t2m"][d].ravel() - data["t2m"][d - 1].ravel()
+        else:
+            print(f"Extracting the joint copula correlation matrix with real context (context day={d}, "
+                  f"conditioned on the raw temperature field[{d}])...")
+            day_values = data["t2m"][d].ravel()
+        context_values = day_values[context_idx]
         R_context = extract_model_context_correlation(
             model, device, tabicl_marginal, context_coords, context_values, coords, k_folds=args.pit_k_folds,
         )
@@ -1132,9 +1212,12 @@ def main():
         2, 1, figsize=(10.5, 7.3), sharex=True, height_ratios=[3.2, 1],
         gridspec_kw={"hspace": 0.08},
     )
-    ax.plot(dist_centers, rho_emp, "--", color="black", marker="o",
-            label="Ground Truth: empirical corr. of real 24h residuals\n"
-                  "$E_t = Z_t - Z_{t-24}$, averaged over all days")
+    if args.target == "residual":
+        ground_truth_label = ("Ground Truth: empirical corr. of real 24h residuals\n"
+                               "$E_t = Z_t - Z_{t-24}$, averaged over all days")
+    else:
+        ground_truth_label = "Ground Truth: empirical corr. of the raw temperature field $Z_t$"
+    ax.plot(dist_centers, rho_emp, "--", color="black", marker="o", label=ground_truth_label)
     r_dense = np.linspace(0.0, bin_edges[-1], 300)
     for fit in theory_fits:
         color, linestyle, linewidth, display_name = THEORY_STYLE[fit["model"]]
@@ -1189,16 +1272,16 @@ def main():
         filename=f"correlation_matrix_comparison_{tag}.png",
     )
 
-    print(f"Plotting the ground-truth vs. copula-model-predicted residual fields for days {args.days} "
-          "on the same grid...")
+    print(f"Plotting the ground-truth vs. copula-model-predicted --target={args.target} fields for "
+          f"days {args.days} on the same grid...")
     plot_residual_grid(
         data, args.days, predicted_fields, args.residual_grid_output,
-        context_coords=context_coords, independent_fields=independent_fields,
+        context_coords=context_coords, independent_fields=independent_fields, target=args.target,
     )
 
     print("Plotting the generic distance-vs-correlation / heatmap diagnostics "
-          "(baseline = empirical correlation of the real 24h persistence residuals)...")
-    plot_generic_diagnostics(R_context_mean, coords, raw_observations=residuals, tag=tag)
+          f"(baseline = empirical correlation of the real --target={args.target} observations)...")
+    plot_generic_diagnostics(R_context_mean, coords, raw_observations=observations, tag=tag)
 
 
 if __name__ == "__main__":
