@@ -21,6 +21,11 @@ Methods
   gp_mle_ard_rq      : Rational Quadratic with ARD lengthscales
   gp_mle_dot_product : GP posterior with MLE-fitted linear/dot-product kernel
                        (variance + noise term fitted), fit in raw y-space
+  gp_mle_polynomial  : GP posterior with MLE-fitted Polynomial kernel,
+                       k(x1,x2) = alpha2 * (x1^Tx2 + c)^d — degree d fixed
+                       (gpytorch.kernels.PolynomialKernel takes it as a plain
+                       int, not a differentiable parameter), offset c +
+                       outputscale + noise fitted, fit in raw y-space
   dkl_rbf/matern32/rq/dot_product :
                        Deep Kernel Learning — MLP(d_x->32->16) feature extractor
                        feeding a GP layer (chosen kernel), fit in raw y-space,
@@ -106,7 +111,19 @@ _ARD_ELIGIBLE = {
     "periodic": True,
     "rational_quadratic": True,
     "dot_product": False,
+    # PolynomialKernel has no lengthscale at all (geometry comes from the raw
+    # dot product, same as dot_product) — no per-dimension axis to assign ARD
+    # lengthscales to.
+    "polynomial": False,
 }
+
+# Fixed degree for the gp_mle_polynomial baseline. gpytorch.kernels.
+# PolynomialKernel takes `power` as a plain Python int baked into forward()'s
+# .pow(self.power) call, not a registered (constrained) Parameter — so unlike
+# offset/outputscale/noise it cannot be optimised by Adam and must be fixed
+# ahead of fitting. 2 mirrors data_gen.py's poly_power_min default (the low
+# end of the episode-generating poly_power_min/poly_power_max range).
+_POLY_BASELINE_POWER = 2
 
 # Default hyperprior constants, mirroring data_gen.py's _kernel_prior_spec /
 # _nugget_prior fallback defaults (the actual per-dataset values live in the
@@ -121,6 +138,8 @@ _DEFAULT_PRIOR_CFG: dict[str, float] = {
     "period_lognormal_scale": 0.4,
     "rq_alpha_gamma_concentration": 2.0,
     "rq_alpha_gamma_rate": 1.0,
+    "poly_offset_gamma_concentration": 2.0,
+    "poly_offset_gamma_rate": 1.0,
     "nugget_lognormal_loc": -4.63,
     "nugget_lognormal_scale": 0.5,
 }
@@ -150,6 +169,15 @@ def _kernel_priors(prior_cfg: dict, kernel_name: str, ard: bool = False) -> dict
     cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
     if kernel_name == "dot_product":
         return {"variance_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"])}
+    if kernel_name == "polynomial":
+        # Unlike dot_product, PolynomialKernel is still wrapped in a
+        # ScaleKernel (it has no built-in variance of its own — see
+        # _ExactGPModel), so it keeps the usual outputscale_prior on top of
+        # its own offset_prior.
+        return {
+            "outputscale_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"]),
+            "offset_prior": GammaPrior(cfg["poly_offset_gamma_concentration"], cfg["poly_offset_gamma_rate"]),
+        }
     priors: dict[str, Prior] = {
         "outputscale_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"]),
     }
@@ -203,6 +231,8 @@ def _randomize_init(
         base.period_length = kernel_priors["period_length_prior"].sample(base.period_length.shape).to(device)
     if "alpha_prior" in kernel_priors:
         base.alpha = kernel_priors["alpha_prior"].sample(base.alpha.shape).to(device)
+    if "offset_prior" in kernel_priors:
+        base.offset = kernel_priors["offset_prior"].sample(base.offset.shape).to(device)
     if "variance_prior" in kernel_priors:
         model.covar_module.variance = kernel_priors["variance_prior"].sample(model.covar_module.variance.shape).to(device)
     if "outputscale_prior" in kernel_priors:
@@ -210,7 +240,7 @@ def _randomize_init(
 
 
 class _ExactGPModel(gpytorch.models.ExactGP):
-    """ExactGP wrapper over one of the five baseline kernels, optionally
+    """ExactGP wrapper over one of the baseline kernels, optionally
     preceded by a learned feature extractor (Deep Kernel Learning)."""
 
     def __init__(
@@ -248,12 +278,16 @@ class _ExactGPModel(gpytorch.models.ExactGP):
             base = gpytorch.kernels.RQKernel(lengthscale_prior=kp.get("lengthscale_prior"), alpha_prior=kp.get("alpha_prior"), **ard_kw)
         elif kernel_name == "dot_product":
             base = gpytorch.kernels.LinearKernel(variance_prior=kp.get("variance_prior"))
+        elif kernel_name == "polynomial":
+            base = gpytorch.kernels.PolynomialKernel(power=_POLY_BASELINE_POWER, offset_prior=kp.get("offset_prior"))
         else:
             raise ValueError(f"Unknown kernel: {kernel_name}")
 
         # LinearKernel already has its own learnable `variance` scale;
         # wrapping it in ScaleKernel on top would just be a redundant,
-        # unidentifiable second scale factor.
+        # unidentifiable second scale factor. PolynomialKernel has no such
+        # built-in scale, so (unlike dot_product) it does get the ScaleKernel
+        # wrapper below.
         self.covar_module = (
             base if kernel_name == "dot_product"
             else gpytorch.kernels.ScaleKernel(base, outputscale_prior=kp.get("outputscale_prior"))
@@ -757,7 +791,7 @@ def eval_baselines_episode(
     R_dict["gp_prior_rbf"] = R_prior
 
     # --- GP MLE baselines (plain + ARD for lengthscale kernels) ---
-    _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic", "dot_product"]
+    _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic", "dot_product", "polynomial"]
     _LABEL_MAP = {
         ("rbf", False):                "gp_mle_rbf",
         ("rbf", True):                 "gp_mle_ard_rbf",
@@ -768,6 +802,7 @@ def eval_baselines_episode(
         ("rational_quadratic", False): "gp_mle_rq",
         ("rational_quadratic", True):  "gp_mle_ard_rq",
         ("dot_product", False):        "gp_mle_dot_product",
+        ("polynomial", False):         "gp_mle_polynomial",
     }
     for kname in _GP_KERNELS:
         for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
