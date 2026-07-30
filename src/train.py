@@ -535,6 +535,20 @@ def validate(
             hb = ax_den.hexbin(off_o, off_p, gridsize=60, cmap="YlOrRd", mincnt=1, bins="log")
             fig_den.colorbar(hb, ax=ax_den, label="log10(count)")
             ax_den.plot([lo, hi], [lo, hi], "b--", lw=1)
+
+            # Median predicted corr per oracle-corr bin.
+            n_bins = 40
+            bin_edges = np.linspace(lo, hi, n_bins + 1)
+            bin_idx = np.clip(np.digitize(off_o, bin_edges) - 1, 0, n_bins - 1)
+            bin_centers, bin_medians = [], []
+            for b in range(n_bins):
+                sel = bin_idx == b
+                if sel.any():
+                    bin_centers.append(0.5 * (bin_edges[b] + bin_edges[b + 1]))
+                    bin_medians.append(float(np.median(off_p[sel])))
+            ax_den.plot(bin_centers, bin_medians, "g-", lw=1.5, label="median pred")
+            ax_den.legend(loc="upper left", fontsize=8)
+
             ax_den.set_xlabel("Oracle off-diag corr")
             ax_den.set_ylabel("Predicted off-diag corr")
             ax_den.set_title(
