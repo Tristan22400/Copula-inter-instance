@@ -615,19 +615,31 @@ def save_checkpoint(model, optimizer, scheduler, cfg, step: int, scaler=None) ->
     )
 
 
-def load_checkpoint(ckpt_path: str, model: nn.Module, device: str) -> None:
-    """Restore only the model weights from a checkpoint saved by save_checkpoint().
+def load_checkpoint(
+    ckpt_path: str,
+    model: nn.Module,
+    device: str,
+    optimizer: torch.optim.Optimizer | None = None,
+    scaler: GradScaler | None = None,
+) -> None:
+    """Restore model weights and optimizer/scaler state from a checkpoint.
 
-    Optimizer/scheduler/scaler state is intentionally NOT restored: resuming
-    always restarts training at step 0 with a fresh warmup/cosine schedule
-    and the full step budget, rather than continuing the previous run's
-    schedule and step count.
+    The scheduler and step count are intentionally NOT restored: resuming
+    always restarts at step 0 with a fresh warmup/cosine schedule and the
+    full step budget of this run's config, rather than continuing the
+    previous run's schedule and step count. Optimizer moments (Adam/Muon)
+    and the AMP grad scaler state are restored so the run doesn't have to
+    relearn gradient statistics from scratch.
     """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
     raw = getattr(model, "_orig_mod", model)
     raw.load_state_dict(ckpt["state_dict"])
+    if optimizer is not None and ckpt.get("optimizer") is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
 
 
 def _run_train_step(
@@ -988,8 +1000,8 @@ def main(cfg: DictConfig) -> None:
 
     start_step = 0
     if resume_ckpt:
-        load_checkpoint(resume_ckpt, model, device)
-        print(f"Resumed weights from {resume_ckpt} — restarting schedule at step 0")
+        load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
+        print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — restarting schedule at step 0")
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     nll_weight = float(t.get("nll_weight", 1.0))
