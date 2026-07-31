@@ -84,7 +84,27 @@ __all__ = [
     "episode_cache_key",
     "load_baseline_cache",
     "save_baseline_cache",
+    "EXPECTED_BASELINE_KEYS",
 ]
+
+# Every key eval_baselines_episode is supposed to populate in its returned
+# nlls/R_dict — kept in sync by hand with the method bodies below (independence
+# + gp_prior_rbf + every _LABEL_MAP/_DKL_LABEL_MAP value + per_ep_transformer).
+# eval_checkpoint.py compares a cached episode's keys against this set: a
+# cache built before a new baseline (e.g. gp_mle_polynomial) was added here
+# would otherwise be missing that key forever (same episode/fingerprint, so
+# it looks "valid") and silently mean() to NaN instead of getting computed.
+EXPECTED_BASELINE_KEYS = frozenset(
+    {"independence", "gp_prior_rbf", "per_ep_transformer"}
+    | {
+        "gp_mle_rbf", "gp_mle_ard_rbf",
+        "gp_mle_matern32", "gp_mle_ard_matern32",
+        "gp_mle_periodic", "gp_mle_ard_periodic",
+        "gp_mle_rq", "gp_mle_ard_rq",
+        "gp_mle_dot_product", "gp_mle_polynomial",
+    }
+    | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
+)
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
