@@ -383,7 +383,6 @@ def corrupt_z_train(
     z_train: torch.Tensor,
     train_mask: torch.Tensor,
     data_cfg,
-    step: int,
 ) -> torch.Tensor:
     """Randomly corrupt a batch of exact GP-LOO z_train toward i.i.d. N(0, 1)
     noise, per data_cfg.z_train_corruption_* knobs (see conf/data/gp_tasks.yaml).
@@ -417,8 +416,6 @@ def corrupt_z_train(
                      live_generation and Hydra CLI overrides (e.g. an oarsub
                      command's data.z_train_corruption_enabled=true) apply
                      without any separate wiring.
-        step       : current global training step, for the optional linear
-                     warmup curriculum (data_cfg.z_train_corruption_curriculum).
 
     Returns:
         (B, P_max) corrupted z_train, same dtype/device as the input.
@@ -426,22 +423,9 @@ def corrupt_z_train(
     if not bool(data_cfg.get("z_train_corruption_enabled", False)):
         return z_train
 
-    target_prob = float(data_cfg.get("z_train_corruption_prob", 0.5))
+    prob = float(data_cfg.get("z_train_corruption_prob", 0.5))
     beta_a = float(data_cfg.get("z_train_corruption_rho_beta_a", DEFAULT_Z_CORRUPTION_RHO_BETA_A))
     beta_b = float(data_cfg.get("z_train_corruption_rho_beta_b", DEFAULT_Z_CORRUPTION_RHO_BETA_B))
-    curriculum = str(data_cfg.get("z_train_corruption_curriculum", "linear_warmup"))
-    warmup_steps = int(data_cfg.get("z_train_corruption_warmup_steps", 10000))
-
-    if curriculum == "linear_warmup":
-        ramp = min(1.0, max(0.0, step / max(1, warmup_steps)))
-    elif curriculum == "none":
-        ramp = 1.0
-    else:
-        raise ValueError(
-            f"Unknown data.z_train_corruption_curriculum '{curriculum}'; "
-            "choose 'linear_warmup' or 'none'."
-        )
-    prob = target_prob * ramp
     if prob <= 0.0:
         return z_train
 

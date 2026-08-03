@@ -338,9 +338,9 @@ pit_eps: 1.0e-6
 # mlp_mixing_enabled/structural_warp_enabled/mean_fn_enabled above. Off by
 # default -- opt in per run/fine-tune.
 z_train_corruption_enabled: false
-# Fraction of batches corrupted at all (once curriculum ramp reaches 1.0);
-# the rest stay on the pristine closed-form signal so in-distribution
-# sharpness isn't diluted more than needed.
+# Fraction of batches corrupted at all; the rest stay on the pristine
+# closed-form signal so in-distribution sharpness isn't diluted more than
+# needed.
 z_train_corruption_prob: 0.5
 # Beta(a, b) shape for the per-episode "signal fraction" rho (rho=1 leaves
 # z_train untouched, rho=0 fully replaces it with i.i.d. N(0,1) noise).
@@ -349,13 +349,6 @@ z_train_corruption_prob: 0.5
 # correlation, spread from p10~=0.14 (severe) to p90~=0.68 (mild).
 z_train_corruption_rho_beta_a: 2.0
 z_train_corruption_rho_beta_b: 3.0
-# "linear_warmup": ramp corruption probability from 0 to z_train_corruption_prob
-# linearly over z_train_corruption_warmup_steps -- recommended when fine-
-# tuning an already-converged checkpoint, so the augmentation doesn't
-# destabilize it from step 0. "none": corruption_prob applies at full
-# strength immediately (appropriate for a from-scratch run).
-z_train_corruption_curriculum: linear_warmup
-z_train_corruption_warmup_steps: 10000
 
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
