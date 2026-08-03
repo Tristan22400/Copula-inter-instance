@@ -1046,7 +1046,7 @@ def main():
         "shape is a systematic model behavior or single-day noise. Default: an evenly spaced "
         "spread of up to 8 days across the whole dataset.",
     )
-    parser.add_argument("--n-context", type=int, default=50, help="Number of historical context points sampled per day.")
+    parser.add_argument("--n-context", type=int, default=2500, help="Number of historical context points sampled per day.")
     parser.add_argument(
         "--pit-k-folds", type=int, default=10,
         help="Number of disjoint folds for the K-fold leave-one-out PIT that turns real context "
