@@ -94,16 +94,10 @@ training:
   # the rest stay on the pristine closed-form signal so in-distribution
   # sharpness isn't diluted more than needed.
   z_train_corruption_prob: 0.5
-  # "noise_blend" (B1, blend toward i.i.d. N(0,1) -- targets the noisy-but-
-  # still-whitened TabICL-PIT-like failure mode), "raw_blend" (B2, blend
-  # toward the raw unwhitened per-episode y_train standardization -- targets
-  # the un-whitened naive-standardization-like failure mode), or "mixed"
-  # (per-episode coin flip between the two, recommended default).
-  z_train_corruption_mode: mixed
   # Beta(a, b) shape for the per-episode "signal fraction" rho (rho=1 leaves
-  # z_train untouched, rho=0 fully replaces it). Defaults (2.0, 3.0) give
-  # E[sqrt(rho)] ~= 0.61 (corr(z_train, z_corrupted) in expectation for
-  # noise_blend) -- centered near the measured 0.6-0.65 TabICL-PIT signal
+  # z_train untouched, rho=0 fully replaces it with i.i.d. N(0,1) noise).
+  # Defaults (2.0, 3.0) give E[sqrt(rho)] ~= 0.61 (corr(z_train, z_corrupted)
+  # in expectation) -- centered near the measured 0.6-0.65 TabICL-PIT signal
   # correlation, spread from p10~=0.14 (severe) to p90~=0.68 (mild).
   z_train_corruption_rho_beta_a: 2.0
   z_train_corruption_rho_beta_b: 3.0

@@ -1070,16 +1070,16 @@ def main(cfg: DictConfig) -> None:
             # non_blocking overlaps H→D transfer with previous GPU work
             # (pin_memory=True).
             batch = {k: v.to(device, non_blocking=True) for k, v in raw_batch.items()}
-            # Robustness augmentation: corrupt z_train toward a noisier/
-            # unwhitened proxy of the exact GP-LOO residual it's otherwise
-            # always trained on (see pit.py::corrupt_z_train's docstring for
-            # why -- deployment on real, non-GP data can only ever produce an
-            # approximate PIT). No-op unless training.z_train_corruption_enabled
-            # is set; applies identically regardless of whether `batch` came
-            # from the disk pipeline or live_generation (both produce the same
-            # collated schema by this point).
+            # Robustness augmentation: corrupt z_train toward a noisier proxy
+            # of the exact GP-LOO residual it's otherwise always trained on
+            # (see pit.py::corrupt_z_train's docstring for why -- deployment
+            # on real, non-GP data can only ever produce an approximate PIT).
+            # No-op unless training.z_train_corruption_enabled is set; applies
+            # identically regardless of whether `batch` came from the disk
+            # pipeline or live_generation (both produce the same collated
+            # schema by this point).
             batch["z_train"] = corrupt_z_train(
-                batch["z_train"], batch["y_train"], batch["train_mask"], t, step,
+                batch["z_train"], batch["train_mask"], t, step,
             )
             _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
 
