@@ -232,6 +232,18 @@ def predict_copula_residual_field(
 
     Falls back to a naive Gaussian(mean, std) marginal if `tabicl_marginal`
     is None (scratch-trained backbone, see load_marginal_tabicl).
+
+    `context_values` are z-scored before being handed to the frozen TabICL
+    module directly, same reasoning and same StandardScaler-mirroring
+    convention as extract_model_context_correlation's z_train construction
+    (this function calls the raw module too, not TabICLRegressor, since it
+    needs `.icdf` at an arbitrary probability level rather than
+    TabICLRegressor.predict()'s fixed output types) -- otherwise absolute-
+    scale context values saturate the quantile head's CDF and this
+    function's `y_pred` would collapse toward a near-constant value instead
+    of a properly-varying field. The prediction is un-scaled back to
+    context_values' original units afterward, since (unlike z_train) this
+    function's return value is a physical field, not a Gaussianized rank.
     """
     from generate_plots import _safe_cholesky
     from scipy.stats import norm
@@ -240,9 +252,11 @@ def predict_copula_residual_field(
     z_copula = L @ z_shared
     u_copula = np.clip(norm.cdf(z_copula), 1e-6, 1.0 - 1e-6)
 
+    y_mean = context_values.mean()
+    y_std = max(context_values.std(), 1e-8)
+
     if tabicl_marginal is None:
-        y_std = max(context_values.std(), 1e-8)
-        return context_values.mean() + y_std * z_copula
+        return y_mean + y_std * z_copula
 
     import torch
 
@@ -253,7 +267,8 @@ def predict_copula_residual_field(
 
     x_full = np.concatenate([x_train_norm, x_test_norm], axis=0)
     x_batch = torch.as_tensor(x_full, dtype=torch.float32, device=device).unsqueeze(0)  # (1, P+N, p_x)
-    y_train_batch = torch.as_tensor(context_values, dtype=torch.float32, device=device).unsqueeze(0)  # (1, P)
+    context_values_scaled = (context_values - y_mean) / y_std
+    y_train_batch = torch.as_tensor(context_values_scaled, dtype=torch.float32, device=device).unsqueeze(0)  # (1, P)
     with torch.no_grad():
         logits = tabicl_marginal(x_batch, y_train_batch)  # (1, N, Q) -- N test rows only, per src/pit.py::run_pit
         n_test = coords_test.shape[0]
@@ -263,8 +278,13 @@ def predict_copula_residual_field(
         # element". We need the latter (one u per grid point), so pass alpha shaped
         # (*batch_shape, 1) explicitly and drop the resulting trailing singleton dim.
         u_t = torch.as_tensor(u_copula, dtype=torch.float32, device=device).unsqueeze(-1)
-        y_pred = dist.icdf(u_t).squeeze(-1)
-    return y_pred.cpu().numpy()
+        # dist.icdf returns float16 regardless of tabicl_marginal's own float32
+        # parameters (QuantileDistribution's internal dtype) -- upcast before the
+        # un-scaling affine transform, or a real-scale y_mean/y_std silently
+        # overflows float16's ~65504 max into inf (see get_marginal_quantiles's
+        # docstring in inference/copula_inference.py for the same issue).
+        y_pred_scaled = dist.icdf(u_t).squeeze(-1).double()
+    return y_mean + y_std * y_pred_scaled.cpu().numpy()
 
 
 def _plot_field_grid(
@@ -556,22 +576,46 @@ def extract_model_context_correlation(
 
     If `tabicl_marginal` is None (scratch-trained backbone, no quantile
     head available), falls back to the naive standardization.
+
+    `context_values` are z-scored before being handed to `run_pit`, mirroring
+    the StandardScaler step tabicl._sklearn.regressor.TabICLRegressor.fit()
+    always applies to y before calling this same underlying frozen module
+    (regressor.py's `y_scaled = self.y_scaler_.fit_transform(y)`). run_pit
+    talks to the raw TabICL module directly instead of going through
+    TabICLRegressor because PIT needs two things TabICLRegressor's
+    sklearn-shaped predict() doesn't expose: the CDF at an arbitrary
+    (continuous, already-observed) y rather than a fixed alpha grid, and
+    leave-one-fold-out scoring of the context set against itself rather than
+    against new test rows -- but that also means the y-scaling
+    TabICLRegressor would normally apply is skipped unless redone here.
+    Without it, absolute-scale values (e.g. raw temperature ~20 degC) are
+    far outside what the pretrained quantile head was calibrated for and
+    saturate its predicted CDF to ~1 for every context point alike --
+    collapsing z_train's spread (observed std ~0.2-0.4 vs. ~1.2-2.1 for
+    already-small-scale values like a 24h residual) and destroying the very
+    spatial signal z_train is supposed to carry into the copula model. This
+    doesn't change the PIT ranks in principle (probability integral
+    transform is scale-invariant for a perfect F_hat), only how well the
+    imperfect, saturating quantile head can resolve them.
     """
     x_mean = context_coords.mean(axis=0, keepdims=True)
     x_std = context_coords.std(axis=0, keepdims=True).clip(min=1e-8)
     x_train_norm = (context_coords - x_mean) / x_std
     x_test_norm = (coords_test - x_mean) / x_std
 
+    y_mean = context_values.mean()
+    y_std = max(context_values.std(), 1e-8)
+    context_values_scaled = (context_values - y_mean) / y_std
+
     if tabicl_marginal is None:
-        y_std = max(context_values.std(), 1e-8)
-        z_train = (context_values - context_values.mean()) / y_std
+        z_train = context_values_scaled
     else:
         import torch
 
         from src.pit import run_pit
 
         X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
-        Y_train_t = torch.as_tensor(context_values, dtype=torch.float32, device=device).unsqueeze(-1)  # (P, 1)
+        Y_train_t = torch.as_tensor(context_values_scaled, dtype=torch.float32, device=device).unsqueeze(-1)  # (P, 1)
         pit_out = run_pit(
             tabicl_marginal, X_train_t, Y_train_t, X_train_t[:1], Y_train_t[:1], k_folds=k_folds,
         )
