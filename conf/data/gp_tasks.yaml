@@ -341,7 +341,7 @@ z_train_corruption_enabled: false
 # Fraction of batches corrupted at all; the rest stay on the pristine
 # closed-form signal so in-distribution sharpness isn't diluted more than
 # needed.
-z_train_corruption_prob: 0.5
+z_train_corruption_prob: 1.0
 # Beta(a, b) shape for the per-episode "signal fraction" rho (rho=1 leaves
 # z_train untouched, rho=0 fully replaces it with i.i.d. N(0,1) noise).
 # Defaults (2.0, 3.0) give E[sqrt(rho)] ~= 0.61 (corr(z_train, z_corrupted)
