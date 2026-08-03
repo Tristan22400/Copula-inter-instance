@@ -64,7 +64,6 @@ from dataset import (
 )
 from live_dataset import build_fixed_live_val_batches, build_live_train_loader
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
-from pit import corrupt_z_train
 from model import build_copula_transformer, low_rank_correlation
 from muon import Muon
 
@@ -1222,21 +1221,6 @@ def main(cfg: DictConfig) -> None:
             # non_blocking overlaps H→D transfer with previous GPU work
             # (pin_memory=True).
             batch = {k: v.to(device, non_blocking=True) for k, v in raw_batch.items()}
-            # Robustness augmentation: corrupt z_train toward a noisier proxy
-            # of the exact GP-LOO residual it's otherwise always trained on
-            # (see pit.py::corrupt_z_train's docstring for why -- deployment
-            # on real, non-GP data can only ever produce an approximate PIT).
-            # Reads cfg.data (not cfg.training) -- a data-generation-time
-            # modulation, same convention as sign_modulation_component_prob/
-            # mlp_mixing_enabled -- so an oarsub override like
-            # data.z_train_corruption_enabled=true applies with no separate
-            # wiring. No-op unless data.z_train_corruption_enabled is set;
-            # applies identically regardless of whether `batch` came from the
-            # disk pipeline or live_generation (both produce the same
-            # collated schema by this point).
-            batch["z_train"] = corrupt_z_train(
-                batch["z_train"], batch["train_mask"], cfg.data, step,
-            )
             _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
             _prof_T_sum += batch["x_train"].shape[1] + batch["x_test"].shape[1]
 
