@@ -46,6 +46,7 @@ import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
+from torch.utils.flop_counter import FlopCounterMode
 
 import wandb
 
@@ -70,6 +71,68 @@ from muon import Muon
 _MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
 _CORR_GRID_N_WRAP = 3  # stack corr_grid episodes across this many bands
+
+# Peak dense FP16/BF16 tensor-core throughput (TFLOPS) per NVIDIA datasheets.
+# torch has no API to query this, so match torch.cuda.get_device_name() against
+# these substrings for Model FLOPs Utilization (MFU) logging (see
+# get_gpu_peak_flops). Ordered — first match wins, so keys that are a prefix
+# of another entry's name (e.g. "H100" vs "H100 PCIE", "L40S" vs "L4") must
+# come after it.
+#
+# Covers every GPU model currently in the Grid5000 Grenoble site's `oarnodes`
+# inventory (vercors2/3/4/5/7/8/9/10/11/12/13/14/15/16/17/18, drac, kinovis,
+# adonis), plus the common cloud/datacenter cards from the original request,
+# so a job lands with an accurate MFU denominator on whichever cluster it's
+# scheduled to. Pascal (P100/TITAN Xp/TITAN X) and older Fermi/Tesla-10-series
+# (C1060/C2050) cards predate Tensor Cores entirely, so their entries are
+# standard CUDA-core FP16/FP32 peak instead — MFU numbers on those nodes are a
+# rough proxy, not a Tensor Core utilization figure. C1060/C2050 (adonis) are
+# also old enough (CUDA compute capability 1.3/2.0) that current PyTorch likely
+# can't run on them at all; included only for completeness.
+_GPU_PEAK_TFLOPS: dict[str, float] = {
+    "H100 PCIE": 756e12,
+    "H100": 989e12,               # SXM/HBM3/bare "H100" — no PCIe suffix in the name
+    "RTX PRO 6000 BLACKWELL": 1021e12,  # vercors18 — estimate, not verified against a datasheet
+    "A100": 312e12,
+    "V100": 125e12,
+    "RTX 4090": 165e12,
+    "RTX 3090": 142e12,
+    "RTX A6000": 130e12,
+    "RTX A5000": 111e12,          # vercors9/10
+    "RTX 6000 ADA": 728e12,       # vercors14/15 — this training node's GPU
+    "L40S": 362e12,               # kinovis, vercors17 — must precede "L4"
+    "L4": 121e12,                 # vercors16
+    "QUADRO RTX 8000": 130.5e12,  # vercors5/8/11
+    "TITAN RTX": 130.5e12,        # vercors4/7/12 — same TU102 die as Quadro RTX 8000
+    "P100": 21.2e12,              # drac — Pascal, no Tensor Cores: CUDA-core FP16 peak
+    "TITAN XP": 12.15e12,         # vercors3 — Pascal, no Tensor Cores: CUDA-core FP32 peak
+    "TITAN X (PASCAL)": 10.97e12, # vercors2 — Pascal, no Tensor Cores: CUDA-core FP32 peak
+    "C2050": 1.03e12,             # adonis (Fermi) — no Tensor Cores: CUDA-core FP32 peak
+    "C1060": 0.933e12,            # adonis (Tesla 10-series) — no Tensor Cores: CUDA-core FP32 peak
+}
+_GPU_PEAK_FLOPS_DEFAULT = 100e12
+
+
+def get_gpu_peak_flops(device: int = 0) -> float:
+    """Theoretical peak dense FP16/BF16 tensor-core FLOPs for the active GPU.
+
+    PyTorch has no API for this, so match torch.cuda.get_device_name() against
+    a hardcoded table of common datacenter/consumer cards (_GPU_PEAK_TFLOPS).
+    Falls back to a conservative default (with a printed warning) for anything
+    unrecognized, so MFU numbers on an unrecognized GPU are directional only.
+    """
+    if not torch.cuda.is_available():
+        return _GPU_PEAK_FLOPS_DEFAULT
+    name = torch.cuda.get_device_name(device).upper()
+    for key, tflops in _GPU_PEAK_TFLOPS.items():
+        if key in name:
+            return tflops
+    print(
+        f"[train] WARNING: unrecognized GPU {name!r} — no entry in the MFU "
+        f"peak-FLOPs table, falling back to {_GPU_PEAK_FLOPS_DEFAULT / 1e12:.0f} "
+        "TFLOPS. MFU numbers will be approximate."
+    )
+    return _GPU_PEAK_FLOPS_DEFAULT
 
 
 def _sigma_stats(Sigma: torch.Tensor, mask: torch.Tensor) -> dict:
@@ -643,36 +706,25 @@ def load_checkpoint(
         scaler.load_state_dict(ckpt["scaler"])
 
 
-def _run_train_step(
+def _forward_and_loss(
     *,
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    trainable: list[nn.Parameter],
     batch: dict[str, torch.Tensor],
     device: str,
     use_amp: bool,
     amp_dtype: torch.dtype,
-    scaler: GradScaler | None,
-    clip_grad_norm: float,
     nll_weight: float,
     aux_mae_weight: float,
     jitter: float,
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    phase_start,
-    phase_end,
+    phase_start=lambda: None,
+    phase_end=lambda name, start: None,
 ):
-    """Execute one training step in a short-lived frame.
-
-    This function deliberately owns all tensors which can be attached to the
-    autograd graph.  If CUDA raises ``OutOfMemoryError`` anywhere in the step,
-    the exception unwinds this frame before the caller starts the next batch.
-    Keeping this boundary separate from the long-lived training loop is
-    important: ``empty_cache()`` only releases unreferenced allocator blocks;
-    it cannot release tensors still reachable from a loop local or traceback.
+    """Forward pass + NLL(+aux MAE) loss — shared by _run_train_step and the
+    throwaway FLOP-measurement pass in _measure_step_flops (phase_start/
+    phase_end default to no-ops there, since that pass must not pollute the
+    fwd/loss/backward_step timers with a second, throwaway forward).
     """
-    out = Sigma = parts = loss = aux_mae = grad_norm = None
-
     ev_fwd0 = phase_start()
     with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
         out = model(batch)
@@ -708,6 +760,90 @@ def _run_train_step(
             aux_mae = (pred_off - oracle_off).abs().mean()
         loss = loss + aux_mae_weight * aux_mae
     phase_end("loss", ev_loss0)
+    return out, Sigma, parts, loss, aux_mae
+
+
+def _measure_step_flops(
+    *,
+    model: nn.Module,
+    batch: dict[str, torch.Tensor],
+    device: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    nll_weight: float,
+    aux_mae_weight: float,
+    jitter: float,
+    triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+) -> float:
+    """Throwaway forward+backward (no optimizer/scheduler step) under
+    FlopCounterMode, to measure this step's real dispatched FLOPs for MFU.
+
+    Deliberately run *after*, not instead of, the real timed training step
+    (see the call site in main()): FlopCounterMode's per-op Python dispatch
+    hook adds real wall-clock overhead on GPU (measured ~3x on an RTX A5000
+    smoke test), so wrapping the actual training step in it would bias
+    iter_time_sec high and mfu_pct/tokens_per_sec low. This redundant pass
+    costs one extra forward+backward, but only at log_every steps.
+    """
+    with FlopCounterMode(display=False) as flop_ctr:
+        _, _, _, loss, _ = _forward_and_loss(
+            model=model,
+            batch=batch,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            nll_weight=nll_weight,
+            aux_mae_weight=aux_mae_weight,
+            jitter=jitter,
+            triu_cache=triu_cache,
+        )
+        loss.backward()
+    model.zero_grad(set_to_none=True)
+    return flop_ctr.get_total_flops()
+
+
+def _run_train_step(
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    trainable: list[nn.Parameter],
+    batch: dict[str, torch.Tensor],
+    device: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    scaler: GradScaler | None,
+    clip_grad_norm: float,
+    nll_weight: float,
+    aux_mae_weight: float,
+    jitter: float,
+    triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    phase_start,
+    phase_end,
+):
+    """Execute one training step in a short-lived frame.
+
+    This function deliberately owns all tensors which can be attached to the
+    autograd graph.  If CUDA raises ``OutOfMemoryError`` anywhere in the step,
+    the exception unwinds this frame before the caller starts the next batch.
+    Keeping this boundary separate from the long-lived training loop is
+    important: ``empty_cache()`` only releases unreferenced allocator blocks;
+    it cannot release tensors still reachable from a loop local or traceback.
+    """
+    out, Sigma, parts, loss, aux_mae = _forward_and_loss(
+        model=model,
+        batch=batch,
+        device=device,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        nll_weight=nll_weight,
+        aux_mae_weight=aux_mae_weight,
+        jitter=jitter,
+        triu_cache=triu_cache,
+        phase_start=phase_start,
+        phase_end=phase_end,
+    )
+    grad_norm = None
 
     ev_bwd0 = phase_start()
     if scaler is not None:
@@ -733,6 +869,12 @@ def main(cfg: DictConfig) -> None:
         "cuda" if cfg.training.device == "auto" and torch.cuda.is_available()
         else ("cpu" if cfg.training.device == "auto" else cfg.training.device)
     )
+    gpu_peak_flops = get_gpu_peak_flops() if device == "cuda" else None
+    if device == "cuda":
+        print(
+            f"[train] GPU: {torch.cuda.get_device_name(0)} — assumed peak "
+            f"{gpu_peak_flops / 1e12:.0f} TFLOPS (dense bf16/fp16 tensor core) for MFU"
+        )
 
     t = cfg.training
     live_generation = bool(t.get("live_generation", False))
@@ -1032,6 +1174,11 @@ def main(cfg: DictConfig) -> None:
         {k: [] for k in _prof_phases} if device == "cuda" else {}
     )
     _prof_n = 0
+    _prof_T_sum = 0  # sum of per-step sequence length T=P+N, for MFU's avg batch shape
+    # This step's own (not window-averaged) phase ms — only meaningful on the
+    # CPU path, where _phase_end has no per-event list to pull a single step's
+    # timing back out of after the fact (see the "last_step_ms" readout below).
+    _prof_last_ms = {k: 0.0 for k in _prof_phases}
     _last_log_wall = time.perf_counter()
     _last_log_step = 0
 
@@ -1048,7 +1195,9 @@ def main(cfg: DictConfig) -> None:
             end.record()
             _prof_events[name].append((start, end))
         else:
-            _prof_ms[name] += (time.perf_counter() - start) * 1000.0
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            _prof_ms[name] += elapsed_ms
+            _prof_last_ms[name] = elapsed_ms
 
     for step in range(start_step, t.steps + 1):
         _t_data0 = time.perf_counter()
@@ -1057,6 +1206,7 @@ def main(cfg: DictConfig) -> None:
         # successful step and must be safe to clean up after an OOM.
         batch = None
         out = Sigma = parts = loss = aux_mae = grad_norm = None
+        step_flops = None
         try:
             # Keep the CPU batch separate so an OOM during H→D transfer can be
             # recovered just like an OOM in the model step.
@@ -1082,6 +1232,7 @@ def main(cfg: DictConfig) -> None:
                 batch["z_train"], batch["y_train"], batch["train_mask"], t, step,
             )
             _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
+            _prof_T_sum += batch["x_train"].shape[1] + batch["x_test"].shape[1]
 
             # _run_train_step owns the graph-bearing locals.  If it raises,
             # its frame is released as the exception unwinds.
@@ -1103,6 +1254,55 @@ def main(cfg: DictConfig) -> None:
                 phase_start=_phase_start,
                 phase_end=_phase_end,
             )
+            # At log steps only, run one throwaway forward+backward under
+            # FlopCounterMode to measure this step's *actual* dispatched
+            # FLOPs for MFU (see the "Model FLOPs Utilization" comment
+            # further below) instead of estimating them analytically. An
+            # analytic count (params * batch * seq_len, PaLM-style) is wrong
+            # here on two counts: this model attends over both rows *and*
+            # columns (model.py wraps TabICL's col_embedder -> row_interactor
+            # -> icl_predictor stack, so backbone compute scales with
+            # d_features too, not just P+N), and `n_train_params` undercounts
+            # forward FLOPs whenever the backbone is frozen
+            # (model.unfreeze_backbone=false, or LoRA-only training) since a
+            # frozen module still runs a full forward pass. FlopCounterMode
+            # counts real dispatched ops, so it's automatically correct for
+            # both: it sees the true column/row op graph, and autograd's own
+            # graph pruning means backward-through-frozen-only subtrees is
+            # (correctly) never dispatched, hence never counted.
+            #
+            # This is a *separate* pass from the real step above rather than
+            # wrapping the real step itself, because FlopCounterMode's per-op
+            # dispatch hook has real wall-clock cost on GPU — wrapping the
+            # timed step would inflate iter_time_sec and understate
+            # mfu_pct/tokens_per_sec (confirmed ~3x on an RTX A5000 smoke
+            # test). The throwaway pass's own grads are discarded and never
+            # touch the optimizer/scheduler, so it doesn't affect training;
+            # it costs one extra forward+backward, but only every log_every
+            # steps.
+            if step % t.log_every == 0:
+                try:
+                    step_flops = _measure_step_flops(
+                        model=model,
+                        batch=batch,
+                        device=device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        nll_weight=nll_weight,
+                        aux_mae_weight=aux_mae_weight,
+                        jitter=jitter,
+                        triu_cache=_triu_cache,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    # The real step above already completed and applied its
+                    # optimizer update — this is only the throwaway FLOP
+                    # measurement running out of headroom, not a failed
+                    # training step, so just skip the FLOP count for this
+                    # log line rather than falling into the OOM handler
+                    # below (which assumes the whole step needs discarding).
+                    step_flops = None
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
             _prof_n += 1
         except torch.cuda.OutOfMemoryError as exc:
             # P/N (attention length T=P+N) vary a lot per shard (see comment at
@@ -1171,14 +1371,24 @@ def main(cfg: DictConfig) -> None:
 
             # ---- Profiling readout (one sync here, piggy-backing on the ----
             # ---- syncs the .item() calls above already forced) ------------
+            # Also captures this exact step's own forward/loss/backward_step
+            # ms (last_step_ms) alongside the window-averaged step_ms below —
+            # needed to pair with step_flops (measured for this step only via
+            # FlopCounterMode), since batch shapes vary per shard and a
+            # window-averaged time would be the wrong denominator for a
+            # single step's exact FLOP count.
+            last_step_ms = dict(_prof_last_ms)  # CPU fallback; overwritten below on CUDA
             if device == "cuda" and _prof_n > 0:
                 torch.cuda.synchronize()
                 for name in _prof_phases:
-                    _prof_ms[name] += sum(s.elapsed_time(e) for s, e in _prof_events[name])
+                    elapsed = [s.elapsed_time(e) for s, e in _prof_events[name]]
+                    _prof_ms[name] += sum(elapsed)
+                    last_step_ms[name] = elapsed[-1] if elapsed else 0.0
                     _prof_events[name].clear()
             now = time.perf_counter()
             steps_done = max(step - _last_log_step, 1)
             step_ms = {k: v / _prof_n for k, v in _prof_ms.items()} if _prof_n else {k: 0.0 for k in _prof_ms}
+            avg_T = _prof_T_sum / _prof_n if _prof_n else 0
             wall_step_ms = (now - _last_log_wall) / steps_done * 1000.0
             steps_per_sec = steps_done / max(now - _last_log_wall, 1e-9)
             _last_log_wall = now
@@ -1186,6 +1396,34 @@ def main(cfg: DictConfig) -> None:
             for k in _prof_ms:
                 _prof_ms[k] = 0.0
             _prof_n = 0
+            _prof_T_sum = 0
+
+            # ---- Model FLOPs Utilization (MFU) ----
+            # flops_per_iter is step_flops: this exact step's dispatched FLOPs
+            # as measured by FlopCounterMode above (not an analytic estimate —
+            # see the comment at that call site for why an analytic PaLM-style
+            # count would be wrong for this table-shaped, partially-frozen
+            # model). iter_time_sec pairs it with THIS SAME step's own
+            # forward+loss+backward_step time (last_step_ms, from the CUDA
+            # events just read out above), not the window-averaged step_ms —
+            # batch shapes vary per shard (see the OOM handler above), so
+            # averaging would mismatch the single-step FLOP count. t.batch_size
+            # is already the per-process micro-batch (single-GPU script, no
+            # DDP/FSDP). avg_T (mean seq_len this window) is only used below
+            # for tokens_per_sec, a throughput metric independent of the FLOP
+            # count's accuracy.
+            iter_time_sec = sum(last_step_ms.values()) / 1000.0
+            flops_per_iter = step_flops or 0.0
+            if iter_time_sec > 0:
+                actual_flops_per_sec = flops_per_iter / iter_time_sec
+                tokens_per_sec = (t.batch_size * avg_T) / iter_time_sec
+            else:
+                actual_flops_per_sec = 0.0
+                tokens_per_sec = 0.0
+            mfu_pct = (
+                100.0 * actual_flops_per_sec / gpu_peak_flops
+                if (gpu_peak_flops and iter_time_sec > 0) else 0.0
+            )
 
             # ---- GPU memory share: fraction of device VRAM capacity held ----
             # (distinct from wandb's system "GPU Memory Access %" panel, which
@@ -1227,6 +1465,9 @@ def main(cfg: DictConfig) -> None:
                     "perf/mem_allocated_pct":      mem_alloc_pct,
                     "perf/mem_reserved_pct":        mem_reserved_pct,
                     "perf/mem_peak_pct":           mem_peak_pct,
+                    "perf/mfu_pct":                mfu_pct,
+                    "perf/tokens_per_sec":         tokens_per_sec,
+                    "perf/iter_time_sec":          iter_time_sec,
                 },
                 step=step,
             )
@@ -1241,7 +1482,8 @@ def main(cfg: DictConfig) -> None:
                 f"         perf: step={wall_step_ms:.1f}ms ({steps_per_sec:.2f} it/s) "
                 f"data={step_ms['data']:.1f} fwd={step_ms['forward']:.1f} "
                 f"loss={step_ms['loss']:.1f} bwd+opt={step_ms['backward_step']:.1f} "
-                f"mem={mem_alloc_pct:.1f}%/{mem_reserved_pct:.1f}% (peak {mem_peak_pct:.1f}%)"
+                f"mem={mem_alloc_pct:.1f}%/{mem_reserved_pct:.1f}% (peak {mem_peak_pct:.1f}%) "
+                f"mfu={mfu_pct:.1f}% tok/s={tokens_per_sec:,.0f}"
             )
 
         # Release this step's autograd graph before validation / checkpointing.
