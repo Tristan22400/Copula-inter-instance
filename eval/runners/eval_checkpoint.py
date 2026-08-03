@@ -72,6 +72,7 @@ from inference.copula_inference import load_copula_model  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
+    EXPECTED_BASELINE_KEYS,
     baseline_fingerprint,
     corr_nll_single,
     episode_cache_key,
@@ -480,6 +481,14 @@ def main() -> None:
 
         cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, local_i, ep_i)
         cached = cache_entries.get(cache_key) if (use_cache and not args.refresh_baselines) else None
+        if cached is not None and not EXPECTED_BASELINE_KEYS.issubset(cached["nlls"].keys()):
+            # Same episode/fingerprint, but this entry predates a baseline
+            # that was added to eval_baselines_episode since it was cached
+            # (e.g. gp_mle_polynomial) — refit everything for this episode
+            # rather than silently serving a result with that key missing.
+            missing = EXPECTED_BASELINE_KEYS - cached["nlls"].keys()
+            print(f"  [ep {ep_i}] cached baselines missing {sorted(missing)} — refitting")
+            cached = None
         if cached is not None:
             baseline_nlls = cached["nlls"]
             baseline_R    = {k: v.to(device) for k, v in cached["R_dict"].items()}
