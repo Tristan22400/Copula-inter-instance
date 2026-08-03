@@ -151,7 +151,7 @@ tabicl:
 # with training progress (unlike a fixed, data-only baseline would).
 baselines:
   enabled: true
-  kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic]
+  kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic, periodic]
   synth_n_episodes: 64      # fixed episodes generated once per kernel family
   synth_seed: 20260718      # fixed seed -> same probe episodes every run
 
