@@ -1235,7 +1235,7 @@ def main(cfg: DictConfig) -> None:
             # disk pipeline or live_generation (both produce the same
             # collated schema by this point).
             batch["z_train"] = corrupt_z_train(
-                batch["z_train"], batch["train_mask"], cfg.data, step,
+                batch["z_train"], batch["train_mask"], cfg.data,
             )
             _prof_ms["data"] += (time.perf_counter() - _t_data0) * 1000.0
             _prof_T_sum += batch["x_train"].shape[1] + batch["x_test"].shape[1]
