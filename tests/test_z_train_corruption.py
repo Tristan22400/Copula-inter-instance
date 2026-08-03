@@ -1,12 +1,12 @@
 """
 test_z_train_corruption.py — Sanity checks for pit.py::corrupt_z_train, the
-z_train robustness augmentation (see its docstring / conf/config.yaml's
-training.z_train_corruption_* knobs for the motivation: CopulaTabICL is
-trained exclusively on the exact closed-form GP-LOO whitened residual, but
-real (non-GP) deployment data can only ever produce an approximate PIT).
+z_train robustness augmentation (see its docstring / conf/data/gp_tasks.yaml's
+z_train_corruption_* knobs for the motivation: CopulaTabICL is trained
+exclusively on the exact closed-form GP-LOO whitened residual, but real
+(non-GP) deployment data can only ever produce an approximate PIT).
 
 Tests verify:
-  1. Disabled by default (training_cfg without z_train_corruption_enabled) is
+  1. Disabled by default (data_cfg without z_train_corruption_enabled) is
      an exact no-op.
   2. z_train_corruption_prob=0 (or a curriculum ramp that hasn't started yet)
      is an exact no-op.
