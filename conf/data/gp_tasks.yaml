@@ -347,8 +347,8 @@ z_train_corruption_prob: 1.0
 # Defaults (2.0, 3.0) give E[sqrt(rho)] ~= 0.61 (corr(z_train, z_corrupted)
 # in expectation) -- centered near the measured 0.6-0.65 TabICL-PIT signal
 # correlation, spread from p10~=0.14 (severe) to p90~=0.68 (mild).
-z_train_corruption_rho_beta_a: 2.0
-z_train_corruption_rho_beta_b: 3.0
+z_train_corruption_rho_beta_a: 3.5
+z_train_corruption_rho_beta_b: 1.5
 
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
