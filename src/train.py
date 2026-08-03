@@ -66,6 +66,7 @@ from live_dataset import build_fixed_live_val_batches, build_live_train_loader
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, low_rank_correlation
 from muon import Muon
+from pit import DEFAULT_K_FOLDS, load_tabicl, run_pit
 
 _MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
@@ -217,12 +218,24 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     ``_oracle_diagonal_order`` (derived from the oracle alone, then reused for
     the prediction) so the oracle's correlation structure is as diagonal-heavy
     as possible and the two panels stay directly comparable.
+
+    A second row, "Pred (z_tabicl)", is added when any episode carries an
+    "R_pred_tabicl" key — the same model forward pass, but conditioned on
+    TabICL's own K-fold PIT z_train instead of the exact GP-LOO one (see
+    _build_tabicl_val_z / the do_plot block in validate()). This is the
+    sim-to-real check: does the model's correlation prediction hold up when
+    fed the imperfect PIT it will actually get at real-data deployment time,
+    not just the closed-form oracle one it's trained on almost everywhere
+    else. Episodes without that key (e.g. the kernel_fit probes appended
+    below) simply leave that row blank for that column.
     """
     n_ep = len(plot_episodes)
 
     # (row_label, lookup) for each *estimator*: Pred is a top-level episode key.
     # The oracle is no longer a row — it is the left cell of every episode pair.
-    rows: list[tuple[str, str]] = [("Pred", "R_pred")]
+    rows: list[tuple[str, str]] = [("Pred (z_exact)", "R_pred")]
+    if any("R_pred_tabicl" in ep for ep in plot_episodes):
+        rows.append(("Pred (z_tabicl)", "R_pred_tabicl"))
     n_est = len(rows)
 
     n_wrap = max(1, min(_CORR_GRID_N_WRAP, n_ep))
@@ -331,6 +344,46 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     return batches
 
 
+@torch.no_grad()
+def _build_tabicl_val_z(
+    val_loader, tabicl_marginal: nn.Module, k_folds: int, device: str,
+) -> dict[int, torch.Tensor]:
+    """Precompute the frozen TabICL marginal's K-fold PIT z_train once per
+    plot episode (see pit.py::run_pit), instead of re-running it every
+    validate() call.
+
+    tabicl_marginal never changes during training and val_loader's first
+    _PLOT_COLLECT_BATCHES batches are fixed across every call (live mode:
+    build_fixed_live_val_batches generates them once up front; disk mode:
+    val_dataset + shuffle=False iterate in the same order every time) — so
+    z_train_tabicl is the same value every validate() call and only needs
+    computing once, here, before the training loop starts.
+
+    Returns {batch_idx: (B, P_max) tensor}, CPU, zero-padded outside each
+    episode's true train length (matching train_mask) — moved to device and
+    sliced per-episode inside validate()'s do_plot block.
+    """
+    cache: dict[int, torch.Tensor] = {}
+    for batch_idx, batch in enumerate(val_loader):
+        if batch_idx >= _PLOT_COLLECT_BATCHES:
+            break
+        x_train = batch["x_train"].to(device)
+        y_train = batch["y_train"].to(device)
+        train_mask = batch["train_mask"].to(device)
+        B, P_max = y_train.shape
+        z_tabicl = torch.zeros(B, P_max, device=device)
+        for b in range(B):
+            n = int(train_mask[b].sum())
+            if n < 2:
+                continue  # run_pit's fold split needs >=2 context points
+            X_b = x_train[b, :n]
+            Y_b = y_train[b, :n].unsqueeze(-1)
+            pit_out = run_pit(tabicl_marginal, X_b, Y_b, X_b[:1], Y_b[:1], k_folds=k_folds)
+            z_tabicl[b, :n] = pit_out["z_train"].squeeze(-1)
+        cache[batch_idx] = z_tabicl.cpu()
+    return cache
+
+
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
     if step < warmup:
         return step / max(1, warmup)
@@ -412,6 +465,7 @@ def validate(
     step: int = 0,
     do_plot: bool = False,
     synth_kernel_batches: dict | None = None,
+    tabicl_val_z: dict | None = None,
 ) -> tuple[dict, list]:
     # Do NOT call model.eval() here: TabICL's eval mode triggers _inference_forward
     # which uses InferenceManager with its own float16 autocast on CUDA, producing
@@ -429,6 +483,8 @@ def validate(
     all_off_ora_flat: list[np.ndarray] = []
     all_off_pred: list[np.ndarray] = []
     all_off_ora: list[np.ndarray] = []
+    all_off_pred_tabicl: list[np.ndarray] = []
+    all_off_ora_tabicl: list[np.ndarray] = []
     plot_episodes: list[dict] = []
 
     for batch_idx, batch in enumerate(val_loader):
@@ -508,6 +564,7 @@ def validate(
         # ---- Collect data for plots ----
         if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
             B = Sigma.shape[0]
+            z_cache_b = tabicl_val_z.get(batch_idx) if tabicl_val_z else None
             for b in range(B):
                 n = int(batch["test_mask"][b].sum())
                 if n < 2:
@@ -518,11 +575,33 @@ def validate(
                 all_off_pred.append(R_pred_b[ri, ci])
                 all_off_ora.append(R_ora_b[ri, ci])
                 if len(plot_episodes) < _MAX_PLOT_EPISODES:
-                    plot_episodes.append({
+                    ep_dict = {
                         "R_pred": R_pred_b,
                         "R_ora": R_ora_b,
                         "label": f"ep{batch_idx * B + b}\nN={n}",
-                    })
+                    }
+                    # Sim-to-real check: re-run the model on this SAME episode
+                    # (same x_train/x_test) but conditioned on TabICL's own
+                    # K-fold PIT z_train (precomputed once by
+                    # _build_tabicl_val_z) instead of the exact GP-LOO one.
+                    if z_cache_b is not None:
+                        n_tr = int(batch["train_mask"][b].sum())
+                        if n_tr >= 2:
+                            z_tabicl_b = z_cache_b[b, :n_tr].to(device).unsqueeze(0)
+                            sub_batch = {
+                                "x_train": batch["x_train"][b : b + 1, :n_tr],
+                                "z_train": z_tabicl_b,
+                                "x_test":  batch["x_test"][b : b + 1, :n],
+                            }
+                            out_tabicl = model(sub_batch)
+                            Sigma_tabicl = low_rank_correlation(
+                                out_tabicl["W"].float(), out_tabicl["s"].float(), jitter=jitter
+                            )
+                            R_pred_tabicl_b = Sigma_tabicl[0].float().cpu().numpy()
+                            ep_dict["R_pred_tabicl"] = R_pred_tabicl_b
+                            all_off_pred_tabicl.append(R_pred_tabicl_b[ri, ci])
+                            all_off_ora_tabicl.append(R_ora_b[ri, ci])
+                    plot_episodes.append(ep_dict)
 
     mean_cop       = sum(cop)     / len(cop)
     mean_ora_cop_z = sum(ora_cop_z) / len(ora_cop_z)
@@ -653,6 +732,22 @@ def validate(
             )
             fig_den.tight_layout()
             plot_figs.append(fig_den)
+
+            # Sim-to-real gap: same plot-subset episodes, same oracle targets,
+            # but off_p_t comes from conditioning on TabICL's own K-fold PIT
+            # z_train instead of the exact one (see the do_plot block above /
+            # _build_tabicl_val_z). Compared against `mse` from the same
+            # subset (not the full-val-set corr_mse below) so the gap isn't
+            # confounded by the two metrics covering different episode sets.
+            if all_off_pred_tabicl:
+                off_p_t = np.concatenate(all_off_pred_tabicl)
+                off_o_t = np.concatenate(all_off_ora_tabicl)
+                cq_t = _corr_quality(off_p_t, off_o_t)
+                metrics["corr_mse_tabicl_z"]     = cq_t["mse"]
+                metrics["corr_mae_tabicl_z"]     = cq_t["mae"]
+                metrics["corr_pearson_tabicl_z"] = cq_t["pearson"]
+                metrics["corr_bias_tabicl_z"]    = cq_t["bias"]
+                metrics["sim2real_gap"] = cq_t["mse"] - mse
 
         # — Oracle vs predicted correlation matrix grid —
         if plot_episodes:
@@ -1095,6 +1190,28 @@ def main(cfg: DictConfig) -> None:
     baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
     synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
 
+    # z_train sim-to-real diagnostic (see _build_tabicl_val_z / validate()'s
+    # do_plot block): needs a second, frozen TabICL copy with its native
+    # quantile head intact (unlike the copula model's backbone, which has it
+    # stripped — see model.py:CopulaTabICL) to PIT the val episodes the same
+    # way real (non-GP) deployment data would be. No quantile head exists
+    # when the backbone is trained from scratch, so this is skipped then —
+    # same condition plot_spatial_correlation_diagnostics.py's
+    # _load_tabicl_marginal uses for the real-data analogue of this check.
+    tabicl_val_z: dict = {}
+    if baselines_on and bool(cfg.tabicl.get("pretrained", True)):
+        print("[train] Loading frozen TabICL marginal for the z_train sim-to-real diagnostic...")
+        tabicl_marginal = load_tabicl(cfg.tabicl.ckpt, device)
+        pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
+        tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, pit_k_folds, device)
+        del tabicl_marginal  # only z_train_tabicl (cached above) is needed from here on
+        if device == "cuda":
+            # gc.collect() before empty_cache() (see this repo's OOM-handler
+            # gotcha): del alone doesn't free CUDA storage until any
+            # reference cycles in the eval-mode forward graph are collected.
+            gc.collect()
+            torch.cuda.empty_cache()
+
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
         torch._dynamo.config.capture_scalar_outputs = True
@@ -1490,6 +1607,7 @@ def main(cfg: DictConfig) -> None:
             metrics, plot_figs = validate(
                 model, val_loader, cfg, device, step=step, do_plot=do_plot,
                 synth_kernel_batches=synth_kernel_batches,
+                tabicl_val_z=tabicl_val_z,
             )
             log_dict = {f"val/{k}": v for k, v in metrics.items()}
             if plot_figs:
