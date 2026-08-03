@@ -349,86 +349,66 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# z_train corruption (training-time robustness augmentation, Candidate B)
+# z_train corruption (training-time robustness augmentation)
 # ---------------------------------------------------------------------------
 #
 # Motivation (see plots/plot_spatial_correlation_diagnostics.py's real-mode
-# diagnostic + the investigation that produced this module): CopulaTabICL is
-# trained exclusively on the EXACT closed-form GP-LOO whitened residual
-# (gp_analytical_pit above / data_gen.py's batched equivalent), but at
-# deployment on any dataset without a known generating kernel (e.g. real
-# ERA5), z_train can only be estimated via run_pit's K-fold TabICL-marginal
-# quantile PIT -- measured to recover only corr(z_exact, z_tabicl) ~= 0.6-0.65
-# with the true whitened residual, flat across k_folds (not a fold-size
-# artifact). The trained model turned out to have essentially zero tolerance
-# for this: real-context predictions collapsed toward ~0 correlation
-# (near-neighbour truth 0.97 -> predicted 0.05-0.13), and substituting a
-# differently-wrong proxy (naive (y-mean)/std standardization, which is
-# *unwhitened* rather than *noisily whitened*) broke the model in the
-# OPPOSITE direction (saturating to ~0.99 uniformly, ignoring distance
-# entirely) -- both failure modes confirmed on real ERA5 itself, not just
-# synthetic data. This is a train/deploy distribution-shift problem, not a
+# diagnostic): CopulaTabICL is trained exclusively on the EXACT closed-form
+# GP-LOO whitened residual (gp_analytical_pit above / data_gen.py's batched
+# equivalent), but at deployment on any dataset without a known generating
+# kernel (e.g. real ERA5), z_train can only be estimated via run_pit's K-fold
+# TabICL-marginal quantile PIT -- measured to recover only
+# corr(z_exact, z_tabicl) ~= 0.6-0.65 with the true whitened residual, flat
+# across k_folds (not a fold-size artifact). The trained model turned out to
+# have essentially zero tolerance for this: real-context predictions
+# collapsed toward ~0 correlation (near-neighbour truth 0.97 -> predicted
+# 0.05-0.13). This is a train/deploy distribution-shift problem, not a
 # lengthscale-prior or evaluation-methodology problem (both were ruled out).
 #
-# Fix: corrupt z_train during training so the model never gets to rely on it
-# being perfectly whitened -- standard input-noise-augmentation logic. This is
-# safe here specifically because cfg.data.oracle_mode="prior" decouples the
-# training TARGET (R_star = kernel(x_test, x_test)) from z_train's realized
-# values entirely, so corrupting z_train never requires inventing a different
-# loss target -- the task stays "predict the same R_star", just from a
-# noisier context signal.
-#
-# Two corruption families, chosen to bracket the two empirically-measured
-# failure-mode endpoints above rather than guessing a noise model from
-# scratch:
-#   - "noise_blend" (B1): blend toward i.i.d. N(0, 1) noise -- targets the
-#     "noisy-but-still-whitened" TabICL-PIT-like failure mode.
-#   - "raw_blend"   (B2): blend toward the raw (unwhitened) per-episode
-#     standardization of y_train -- targets the "un-whitened" naive-
-#     standardization-like failure mode directly, using a representation we
-#     already know breaks the model in the opposite direction.
-# "mixed" picks between the two per episode so training sees both regimes.
+# Fix: blend z_train toward i.i.d. N(0, 1) noise during training so the model
+# never gets to rely on it being perfectly whitened -- standard input-noise-
+# augmentation logic, with the blend strength (see DEFAULT_Z_CORRUPTION_RHO_
+# BETA_A/B below) calibrated to the measured ~0.6-0.65 real-world signal
+# correlation above. This is safe here specifically because
+# cfg.data.oracle_mode="prior" decouples the training TARGET
+# (R_star = kernel(x_test, x_test)) from z_train's realized values entirely,
+# so corrupting z_train never requires inventing a different loss target --
+# the task stays "predict the same R_star", just from a noisier context
+# signal.
 DEFAULT_Z_CORRUPTION_RHO_BETA_A = 2.0
 DEFAULT_Z_CORRUPTION_RHO_BETA_B = 3.0
 
 
 def corrupt_z_train(
     z_train: torch.Tensor,
-    y_train: torch.Tensor,
     train_mask: torch.Tensor,
     training_cfg,
     step: int,
 ) -> torch.Tensor:
-    """Randomly corrupt a batch of exact GP-LOO z_train toward a noisier or
-    unwhitened proxy, per training_cfg.z_train_corruption_* knobs (see
-    conf/config.yaml). No-op (returns z_train unchanged) unless
+    """Randomly corrupt a batch of exact GP-LOO z_train toward i.i.d. N(0, 1)
+    noise, per training_cfg.z_train_corruption_* knobs (see conf/config.yaml).
+    No-op (returns z_train unchanged) unless
     training_cfg.z_train_corruption_enabled is True.
 
     Per corrupted episode:
-        z_corrupted = sqrt(rho) * z_train + sqrt(1 - rho) * corruption_term
-    where corruption_term is either i.i.d. N(0, 1) noise ("noise_blend") or
-    the raw per-episode (y_train - mean) / std standardization ("raw_blend"),
-    and rho ~ Beta(a, b) is the per-episode "signal fraction" (rho=1 leaves
-    z_train untouched; rho=0 fully replaces it with the corruption term). For
-    "noise_blend" this construction gives corr(z_train, z_corrupted) = sqrt(rho)
-    in expectation (z_train and the i.i.d. noise term are independent, both
-    unit-variance), which is what the default Beta(2, 3) shape (E[sqrt(rho)]
+        z_corrupted = sqrt(rho) * z_train + sqrt(1 - rho) * N(0, 1)
+    where rho ~ Beta(a, b) is the per-episode "signal fraction" (rho=1 leaves
+    z_train untouched; rho=0 fully replaces it with pure noise). Since
+    z_train and the i.i.d. noise term are independent and both unit-variance,
+    this construction gives corr(z_train, z_corrupted) = sqrt(rho) in
+    expectation, which is what the default Beta(2, 3) shape (E[sqrt(rho)]
     ~= 0.61, p10~=0.14, p90~=0.68) is calibrated against -- centered near the
     measured TabICL-marginal-PIT signal correlation (~0.6-0.65) with spread
     toward both a near-clean and a more severely corrupted regime.
 
     Args:
         z_train    : (B, P_max) exact GP-LOO whitened residual.
-        y_train    : (B, P_max) raw context values (same units z_train's
-                     underlying y was drawn in) -- only read for "raw_blend"/
-                     "mixed" modes.
         train_mask : (B, P_max) bool, True at valid (non-padding) context
-                     positions -- collate_fn pads both z_train and y_train
-                     with zeros past each episode's true P, so per-episode
-                     mean/std for "raw_blend" must exclude those, and the
-                     corrupted output is re-masked to keep padding at exactly
-                     zero (matching the uncorrupted convention downstream
-                     code -- e.g. loss masking -- already relies on).
+                     positions -- collate_fn pads z_train with zeros past
+                     each episode's true P, so the corrupted output is
+                     re-masked to keep padding at exactly zero (matching the
+                     uncorrupted convention downstream code -- e.g. loss
+                     masking -- already relies on).
         training_cfg : cfg.training (Hydra DictConfig) -- see conf/config.yaml
                      for the z_train_corruption_* keys this reads.
         step       : current global training step, for the optional linear
@@ -441,7 +421,6 @@ def corrupt_z_train(
         return z_train
 
     target_prob = float(training_cfg.get("z_train_corruption_prob", 0.5))
-    mode = str(training_cfg.get("z_train_corruption_mode", "mixed"))
     beta_a = float(training_cfg.get("z_train_corruption_rho_beta_a", DEFAULT_Z_CORRUPTION_RHO_BETA_A))
     beta_b = float(training_cfg.get("z_train_corruption_rho_beta_b", DEFAULT_Z_CORRUPTION_RHO_BETA_B))
     curriculum = str(training_cfg.get("z_train_corruption_curriculum", "linear_warmup"))
@@ -459,11 +438,6 @@ def corrupt_z_train(
     prob = target_prob * ramp
     if prob <= 0.0:
         return z_train
-    if mode not in ("noise_blend", "raw_blend", "mixed"):
-        raise ValueError(
-            f"Unknown training.z_train_corruption_mode '{mode}'; "
-            "choose 'noise_blend', 'raw_blend', or 'mixed'."
-        )
 
     B, P = z_train.shape
     device = z_train.device
@@ -474,26 +448,11 @@ def corrupt_z_train(
         return z_train
 
     rho = torch.distributions.Beta(beta_a, beta_b).sample((B,)).to(device=device, dtype=z_train.dtype)
-
-    corruption_term = torch.randn(B, P, device=device, dtype=z_train.dtype)  # "noise_blend" (B1)
-    if mode != "noise_blend":
-        # "raw_blend" (B2): raw per-episode standardization of y_train,
-        # masked-mean/std so padding (zeros past each episode's true P)
-        # doesn't bias the statistics.
-        n_valid = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
-        y_mean = (y_train * mask_f).sum(dim=1, keepdim=True) / n_valid
-        y_var = ((y_train - y_mean) ** 2 * mask_f).sum(dim=1, keepdim=True) / n_valid
-        y_std = y_var.clamp(min=1e-12).sqrt()
-        z_naive = (y_train - y_mean) / y_std
-        if mode == "raw_blend":
-            corruption_term = z_naive
-        else:  # "mixed": per-episode coin flip between the two families
-            use_raw = (torch.rand(B, device=device) < 0.5).unsqueeze(-1)
-            corruption_term = torch.where(use_raw, z_naive, corruption_term)
+    noise = torch.randn(B, P, device=device, dtype=z_train.dtype)
 
     sqrt_rho = rho.clamp(0.0, 1.0).sqrt().unsqueeze(-1)
     sqrt_1m_rho = (1.0 - rho).clamp(0.0, 1.0).sqrt().unsqueeze(-1)
-    z_blend = sqrt_rho * z_train + sqrt_1m_rho * corruption_term
+    z_blend = sqrt_rho * z_train + sqrt_1m_rho * noise
 
     z_out = torch.where(apply_ep.unsqueeze(-1), z_blend, z_train)
     return z_out * mask_f  # re-zero padding regardless of which branch fed it
