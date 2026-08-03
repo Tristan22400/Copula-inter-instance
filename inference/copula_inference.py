@@ -132,7 +132,8 @@ def get_marginal_quantiles(
     Args:
         tabicl    : frozen TabICL regressor (e.g. from ``load_tabicl_marginal``).
         X_context : (n_ctx, d) context features.
-        y_context : (n_ctx,) context targets.
+        y_context : (n_ctx,) context targets, RAW scale — z-scored internally
+                    (see below) before reaching ``tabicl``.
         X_query   : (n_q, d) query features.
         probs     : optional (Q,) probability levels. If None, uses TabICL's
                     own 999-level grid (``p_j = j/1001``) directly (no extra
@@ -142,14 +143,30 @@ def get_marginal_quantiles(
                     999-grid, which would silently degrade tail accuracy.
 
     Returns:
-        quantile_grid : (n_q, len(probs)) — quantile_grid[i, j] = F_i^{-1}(probs[j])
+        quantile_grid : (n_q, len(probs)), RAW y-units — quantile_grid[i, j] = F_i^{-1}(probs[j])
         probs         : (len(probs),) probability levels actually used.
+
+    ``y_context`` is z-scored before being passed to ``tabicl`` and the
+    returned quantile grid is un-scaled back to raw y-units afterward. This
+    module's low-level ``tabicl`` (the raw ``TabICL`` class) does no target
+    scaling of its own — unlike ``tabicl.TabICLRegressor.fit()``, which fits
+    a fresh ``StandardScaler`` on y before ever calling this same underlying
+    model (see ``tabicl_upstream/.../_sklearn/regressor.py``). Without
+    replicating that scaling here, absolute-scale targets (e.g. real-world
+    units, not a zero-mean/unit-std synthetic draw) saturate the frozen
+    quantile head's CDF into its extreme tail for every context point alike,
+    collapsing the returned quantile grid instead of reflecting the true
+    conditional spread.
     """
     device = next(tabicl.parameters()).device
     dtype = next(tabicl.parameters()).dtype
 
+    y_context = np.asarray(y_context)
+    y_mean = y_context.mean()
+    y_std = max(float(y_context.std()), 1e-8)
+
     X_ctx_t = torch.as_tensor(np.asarray(X_context), dtype=dtype, device=device)
-    y_ctx_t = torch.as_tensor(np.asarray(y_context), dtype=dtype, device=device)
+    y_ctx_t = torch.as_tensor((y_context - y_mean) / y_std, dtype=dtype, device=device)
     X_qry_t = torch.as_tensor(np.asarray(X_query), dtype=dtype, device=device)
 
     X_full = torch.cat([X_ctx_t, X_qry_t], dim=0).unsqueeze(0)  # (1, T, d_x)
@@ -166,6 +183,11 @@ def get_marginal_quantiles(
         quantile_grid = dist.icdf(probs_t)[0]  # (n_q, len(probs))
         probs_out = probs_t
 
+    # dist.quantiles/icdf come back float16 regardless of tabicl's own float32
+    # parameters (QuantileDistribution's internal dtype) -- upcast before the
+    # un-scaling affine transform, or a real-scale y_mean/y_std (e.g. ~1e5 for
+    # a housing-price target) silently overflows float16's ~65504 max into inf.
+    quantile_grid = y_mean + y_std * quantile_grid.double()
     return quantile_grid.cpu().numpy(), probs_out.cpu().numpy()
 
 
@@ -193,7 +215,17 @@ def loo_pit(
     Args:
         tabicl  : frozen TabICL regressor.
         X_train : (P, d) training features.
-        y_train : (P,) training targets.
+        y_train : (P,) training targets, RAW scale — z-scored internally
+                  (see get_marginal_quantiles's docstring for why: the raw
+                  TabICL class does no target scaling of its own, unlike
+                  TabICLRegressor.fit()'s StandardScaler) before reaching
+                  ``tabicl``. No effect on the *contract* here (unlike
+                  get_marginal_quantiles) since Z_train is already a
+                  Gaussianized, unitless PIT residual — but it matters for
+                  correctness: on absolute-scale y, an unscaled call would
+                  saturate the quantile head's CDF for every point alike and
+                  collapse Z_train's spread instead of reflecting the true
+                  per-point rank.
         k_folds : number of disjoint folds (see above).
         eps     : clamp before the probit transform.
 
@@ -203,8 +235,12 @@ def loo_pit(
     device = next(tabicl.parameters()).device
     dtype = next(tabicl.parameters()).dtype
 
+    y_train = np.asarray(y_train)
+    y_std = max(float(y_train.std()), 1e-8)
+    y_train_scaled = (y_train - y_train.mean()) / y_std
+
     X_t = torch.as_tensor(np.asarray(X_train), dtype=dtype, device=device)
-    y_t = torch.as_tensor(np.asarray(y_train), dtype=dtype, device=device).unsqueeze(-1)  # (P, 1)
+    y_t = torch.as_tensor(y_train_scaled, dtype=dtype, device=device).unsqueeze(-1)  # (P, 1)
 
     out = run_pit(tabicl, X_t, y_t, X_t[:1], y_t[:1], k_folds=k_folds, eps=eps)
     return out["z_train"].squeeze(-1).cpu().numpy()
