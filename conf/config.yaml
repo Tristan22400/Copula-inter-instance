@@ -15,7 +15,7 @@ training:
   # torch.compile adds real overhead (first-step + recompiles on shape changes);
   # worth it for long runs, a drag while iterating quickly. Off by default.
   compile: false
-  steps: 500000
+  steps: 1000000
   warmup_steps: 1000
   clip_grad_norm: 1.0
   log_every: 100
@@ -126,7 +126,7 @@ tabicl:
 # with training progress (unlike a fixed, data-only baseline would).
 baselines:
   enabled: true
-  kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic]
+  kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic, periodic]
   synth_n_episodes: 64      # fixed episodes generated once per kernel family
   synth_seed: 20260718      # fixed seed -> same probe episodes every run
 
