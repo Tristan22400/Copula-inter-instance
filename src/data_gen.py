@@ -2445,15 +2445,21 @@ def corrupt_z_train(z_train: Tensor, data_cfg) -> Tensor:
     Returns:
         (B, P) corrupted z_train, same dtype/device as the input.
     """
-    if not bool(data_cfg.get("z_train_corruption_enabled", False)):
+    # getattr, not data_cfg.get(...): matches every other optional-modulation
+    # flag's access pattern in this file (mlp_mixing_enabled,
+    # structural_warp_enabled, mean_fn_enabled, sign_modulation_component_prob
+    # above) so this also works with the plain (non-OmegaConf) dataclass cfg
+    # objects some tests/scripts pass to generate_gp_task/generate_gp_batch
+    # (e.g. diag_kernels.py::DataCfg), not just Hydra's DictConfig.
+    if not bool(getattr(data_cfg, "z_train_corruption_enabled", False)):
         return z_train
 
-    prob = float(data_cfg.get("z_train_corruption_prob", 0.5))
+    prob = float(getattr(data_cfg, "z_train_corruption_prob", 0.5))
     if prob <= 0.0:
         return z_train
 
-    beta_a = float(data_cfg.get("z_train_corruption_rho_beta_a", DEFAULT_Z_CORRUPTION_RHO_BETA_A))
-    beta_b = float(data_cfg.get("z_train_corruption_rho_beta_b", DEFAULT_Z_CORRUPTION_RHO_BETA_B))
+    beta_a = float(getattr(data_cfg, "z_train_corruption_rho_beta_a", DEFAULT_Z_CORRUPTION_RHO_BETA_A))
+    beta_b = float(getattr(data_cfg, "z_train_corruption_rho_beta_b", DEFAULT_Z_CORRUPTION_RHO_BETA_B))
 
     B, P = z_train.shape
     device = z_train.device

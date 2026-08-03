@@ -93,6 +93,13 @@ tabicl:
   # conf/data/gp_tasks.yaml N_max/P_max) dominates that memory; turn this on
   # instead of shrinking N_max/P_max/batch_size when hitting CUDA OOM.
   recompute: false
+  # K-fold PIT (src/pit.py::run_pit) used only by the z_train sim-to-real
+  # validation diagnostic (train.py::_build_tabicl_val_z) — a second, frozen
+  # TabICL copy with its native quantile head PITs each val episode's own
+  # (x_train, y_train) the same way real (non-GP) data would be, so the
+  # model's correlation prediction can be checked against that approximate
+  # z_train, not just the exact GP-LOO one. Matches pit.py's DEFAULT_K_FOLDS.
+  pit_k_folds: 10
   # Architecture params — only used when pretrained=false.
   # Defaults match the released tabicl-regressor-v2 checkpoint.
   # arch:
