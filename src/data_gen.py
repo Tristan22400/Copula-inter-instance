@@ -2376,6 +2376,102 @@ def apply_mlp_feature_mixing(
     return x_out
 
 
+# ---------------------------------------------------------------------------
+# z_train corruption (robustness augmentation, see conf/data/gp_tasks.yaml)
+# ---------------------------------------------------------------------------
+#
+# Motivation (see plots/plot_spatial_correlation_diagnostics.py's real-mode
+# diagnostic): CopulaTabICL is trained exclusively on the EXACT closed-form
+# GP-LOO whitened residual computed just below, but at deployment on any
+# dataset without a known generating kernel (e.g. real ERA5), z_train can
+# only be estimated via src/pit.py::run_pit's K-fold TabICL-marginal quantile
+# PIT -- measured to recover only corr(z_exact, z_tabicl) ~= 0.6-0.65 with
+# the true whitened residual, flat across k_folds (not a fold-size
+# artifact). The trained model turned out to have essentially zero
+# tolerance for this: real-context predictions collapsed toward ~0
+# correlation (near-neighbour truth 0.97 -> predicted 0.05-0.13). This is a
+# train/deploy distribution-shift problem, not a lengthscale-prior or
+# evaluation-methodology problem (both were ruled out).
+#
+# Fix: blend z_train toward i.i.d. N(0, 1) noise at generation time so the
+# model never gets to rely on it being perfectly whitened -- standard
+# input-noise-augmentation logic, with the blend strength (see
+# DEFAULT_Z_CORRUPTION_RHO_BETA_A/B below) calibrated to the measured
+# ~0.6-0.65 real-world signal correlation above. Applied here (inside batch
+# generation) rather than in train.py: it's a modulation of z_train read
+# fresh from cfg.data on every call, the same convention as
+# sign_modulation_component_prob/mlp_mixing_enabled/etc, so it applies
+# uniformly and invisibly to every caller of generate_gp_batch (the disk
+# pipeline, live_generation, and validation/kernel-probe batches alike) with
+# no separate wiring in train.py. This is safe here specifically because
+# cfg.data.oracle_mode="prior" decouples the training TARGET
+# (R_star = kernel(x_test, x_test)) from z_train's realized values entirely,
+# so corrupting z_train never requires inventing a different loss target --
+# the task stays "predict the same R_star", just from a noisier context
+# signal.
+DEFAULT_Z_CORRUPTION_RHO_BETA_A = 2.0
+DEFAULT_Z_CORRUPTION_RHO_BETA_B = 3.0
+
+
+def corrupt_z_train(z_train: Tensor, data_cfg) -> Tensor:
+    """Randomly corrupt a batch of exact GP-LOO z_train toward i.i.d. N(0, 1)
+    noise, per data_cfg.z_train_corruption_* knobs (see
+    conf/data/gp_tasks.yaml). No-op (returns z_train unchanged) unless
+    data_cfg.z_train_corruption_enabled is True.
+
+    Per corrupted episode:
+        z_corrupted = sqrt(rho) * z_train + sqrt(1 - rho) * N(0, 1)
+    where rho ~ Beta(a, b) is the per-episode "signal fraction" (rho=1 leaves
+    z_train untouched; rho=0 fully replaces it with pure noise). Since
+    z_train and the i.i.d. noise term are independent and both unit-variance,
+    this construction gives corr(z_train, z_corrupted) = sqrt(rho) in
+    expectation, which is what the default Beta(2, 3) shape (E[sqrt(rho)]
+    ~= 0.61, p10~=0.14, p90~=0.68) is calibrated against -- centered near the
+    measured TabICL-marginal-PIT signal correlation (~0.6-0.65) with spread
+    toward both a near-clean and a more severely corrupted regime.
+
+    Called on the batched, unpadded (B, P) z_train inside
+    _generate_gp_batch_raw -- every episode in one such call shares the same
+    P (see that function's docstring), so there is no padding to mask around
+    at this stage (unlike a post-collation z_train, which pads across
+    episodes of different P).
+
+    Args:
+        z_train  : (B, P) exact GP-LOO whitened residual for this call's B
+                   episodes (all sharing this call's sampled P).
+        data_cfg : cfg.data (Hydra DictConfig) -- see conf/data/gp_tasks.yaml
+                   for the z_train_corruption_* keys this reads.
+
+    Returns:
+        (B, P) corrupted z_train, same dtype/device as the input.
+    """
+    if not bool(data_cfg.get("z_train_corruption_enabled", False)):
+        return z_train
+
+    prob = float(data_cfg.get("z_train_corruption_prob", 0.5))
+    if prob <= 0.0:
+        return z_train
+
+    beta_a = float(data_cfg.get("z_train_corruption_rho_beta_a", DEFAULT_Z_CORRUPTION_RHO_BETA_A))
+    beta_b = float(data_cfg.get("z_train_corruption_rho_beta_b", DEFAULT_Z_CORRUPTION_RHO_BETA_B))
+
+    B, P = z_train.shape
+    device = z_train.device
+
+    apply_ep = torch.rand(B, device=device) < prob  # (B,) which episodes get corrupted at all
+    if not bool(apply_ep.any()):
+        return z_train
+
+    rho = torch.distributions.Beta(beta_a, beta_b).sample((B,)).to(device=device, dtype=z_train.dtype)
+    noise = torch.randn(B, P, device=device, dtype=z_train.dtype)
+
+    sqrt_rho = rho.clamp(0.0, 1.0).sqrt().unsqueeze(-1)
+    sqrt_1m_rho = (1.0 - rho).clamp(0.0, 1.0).sqrt().unsqueeze(-1)
+    z_blend = sqrt_rho * z_train + sqrt_1m_rho * noise
+
+    return torch.where(apply_ep.unsqueeze(-1), z_blend, z_train)
+
+
 @torch.no_grad()
 def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
@@ -2758,6 +2854,12 @@ def _generate_gp_batch_raw(
 
     # Reconstruct full posterior covariance (for Y-space oracle)
     Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
+
+    # Robustness augmentation (opt-in, off by default -- see corrupt_z_train's
+    # docstring above): applied AFTER the degenerate-episode z_std check above
+    # so discard decisions are always made on the exact GP-LOO residual, never
+    # on a corrupted one.
+    z_train = corrupt_z_train(z_train, cfg.data)
 
     # --- Pack into list of dicts (single D→H transfer) ---
     tensors = {

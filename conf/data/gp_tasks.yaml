@@ -327,20 +327,24 @@ sign_modulation_outer_prob: 0.0
 # PIT epsilon for probit clamping (analytical pipeline)
 pit_eps: 1.0e-6
 
-# z_train corruption (see src/pit.py::corrupt_z_train's docstring): trains
+# z_train corruption (see data_gen.py::corrupt_z_train's docstring): trains
 # the model to be robust to z_train NOT being the exact closed-form GP-LOO
 # whitened residual, since real (non-GP) deployment data can only ever
 # produce an approximate PIT (measured corr(z_exact, z_tabicl) ~= 0.6-0.65
 # via TabICL's K-fold marginal quantile PIT, flat across k_folds). Lives
-# here rather than conf/config.yaml: it's a modulation of z_train applied at
-# data-generation time, read fresh every step by both live_generation and
-# the disk pipeline — same convention as sign_modulation_component_prob/
-# mlp_mixing_enabled/structural_warp_enabled/mean_fn_enabled above. Off by
-# default -- opt in per run/fine-tune.
+# here rather than conf/config.yaml: it's a modulation of z_train applied
+# inside generate_gp_batch itself, read fresh every call — same convention
+# as sign_modulation_component_prob/mlp_mixing_enabled/structural_warp_enabled/
+# mean_fn_enabled above, and so applies uniformly (and invisibly to train.py)
+# to every caller: the disk pipeline (generate_pit_dataset.py, baked
+# permanently into the saved shards), live_generation (re-corrupted fresh
+# every call), AND validation/kernel-probe batches (build_fixed_live_val_batches/
+# _build_synthetic_kernel_batches in train.py). Off by default -- opt in per
+# run/fine-tune.
 z_train_corruption_enabled: false
-# Fraction of batches corrupted at all (once curriculum ramp reaches 1.0);
-# the rest stay on the pristine closed-form signal so in-distribution
-# sharpness isn't diluted more than needed.
+# Fraction of episodes corrupted at all per generate_gp_batch call; the rest
+# stay on the pristine closed-form signal so in-distribution sharpness isn't
+# diluted more than needed.
 z_train_corruption_prob: 0.5
 # Beta(a, b) shape for the per-episode "signal fraction" rho (rho=1 leaves
 # z_train untouched, rho=0 fully replaces it with i.i.d. N(0,1) noise).
@@ -349,13 +353,6 @@ z_train_corruption_prob: 0.5
 # correlation, spread from p10~=0.14 (severe) to p90~=0.68 (mild).
 z_train_corruption_rho_beta_a: 2.0
 z_train_corruption_rho_beta_b: 3.0
-# "linear_warmup": ramp corruption probability from 0 to z_train_corruption_prob
-# linearly over z_train_corruption_warmup_steps -- recommended when fine-
-# tuning an already-converged checkpoint, so the augmentation doesn't
-# destabilize it from step 0. "none": corruption_prob applies at full
-# strength immediately (appropriate for a from-scratch run).
-z_train_corruption_curriculum: linear_warmup
-z_train_corruption_warmup_steps: 10000
 
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
