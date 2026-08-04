@@ -18,6 +18,11 @@ Usage
         [--lr_dkl 0.01]           # learning rate for DKL Adam
         [--n_steps_per_ep 500]    # training steps for PerEpisodeTransformer
         [--patience_per_ep 100]   # early stopping patience (steps without improvement)
+        [--z_train_source oracle] # or 'tabicl': feed the ICL model TabICL's own
+                                   # K-fold PIT estimate of z_train instead of the
+                                   # exact GP-LOO one, to measure the sim-to-real gap
+        [--tabicl_ckpt ...]        # TabICL checkpoint for --z_train_source=tabicl
+        [--tabicl_pit_k_folds 10]  # K-fold count for --z_train_source=tabicl
         [--plot_episode 0]        # local episode index to plot corr_grid for
         [--out_dir ./eval/results]  # directory to save corr_grid figure
         [--device auto]
@@ -70,6 +75,7 @@ from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
+from pit import DEFAULT_K_FOLDS, load_tabicl, run_pit  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
@@ -122,13 +128,23 @@ def _eval_icl_episode(
     ep: dict,
     icl_model: nn.Module,
     device: torch.device,
+    z_train_override: Tensor | None = None,
 ) -> tuple[dict[str, float], dict[str, Tensor], Tensor]:
     """Evaluate just the ICL model + oracle lower bound on one episode — the
     cheap, per-checkpoint part of the comparison (no fitting/training loop),
     always recomputed even when the baseline results are served from cache.
+
+    z_train_override, when given (see --z_train_source=tabicl in main()),
+    replaces the episode's own exact GP-LOO z_train as the ICL model's
+    conditioning input — everything else (z_test, R_oracle, the baselines)
+    still scores/fits against the episode's true values, since only the
+    model's *input* is meant to change, not what "correct" means.
     """
     X_train = ep["x_norm_train"].to(device)   # (P, d_x)
-    z_train = ep["z_train"].to(device)         # (P,)  oracle LOO-PIT residual, used to train icl only
+    z_train = (
+        z_train_override.to(device) if z_train_override is not None
+        else ep["z_train"].to(device)
+    )                                            # (P,)  ICL's conditioning input — oracle LOO-PIT residual by default
     X_test  = ep["x_norm_test"].to(device)     # (N, d_x)
     z_test  = ep["z_test"].to(device)          # (N,)
     R_oracle = ep["R_star"].to(device)         # (N, N)
@@ -161,6 +177,49 @@ def _eval_icl_episode(
     R_dict["oracle"] = R_oracle
 
     return nlls, R_dict, R_oracle
+
+
+def _tabicl_z_train(
+    ep: dict,
+    tabicl_marginal: nn.Module,
+    k_folds: int,
+    device: torch.device,
+) -> Tensor | None:
+    """K-fold PIT z_train from the frozen TabICL marginal (pit.py::run_pit),
+    in place of the episode's exact GP-LOO z_train — the same "does the
+    model's correlation prediction hold up against TabICL's own estimated
+    marginals instead of the oracle ones" check src/train.py's
+    _build_tabicl_val_z runs during training, used here at eval time via
+    --z_train_source=tabicl.
+
+    Returns None (caller falls back to the oracle z_train) when the episode
+    has fewer than 2 training points, since run_pit's fold split needs at
+    least that many.
+
+    y_train is z-scored before reaching the raw TabICL module: run_pit does
+    no target scaling of its own (unlike tabicl.TabICLRegressor.fit(), which
+    fits a fresh StandardScaler before ever calling this same underlying
+    model — see inference/copula_inference.py::loo_pit's docstring, fixed
+    for that call site in 99e6286 but never touched here or in
+    train.py::_build_tabicl_val_z). Episode y_train's scale is not fixed —
+    outputscale is drawn from a GammaPrior (data_gen.py's generative
+    process) — so an unscaled call risks saturating the pretrained quantile
+    head's CDF into its extreme tail for every point alike on
+    high-outputscale episodes, collapsing z_train's spread instead of
+    reflecting the true per-point rank.
+    """
+    X_train = ep["x_norm_train"].to(device)   # (P, d_x)
+    y_train = ep["y_train"].to(device)         # (P,)
+    P = X_train.shape[0]
+    if P < 2:
+        return None
+    y_std = y_train.std().clamp(min=1e-8)
+    y_train_scaled = (y_train - y_train.mean()) / y_std
+    Y_train = y_train_scaled.unsqueeze(-1)      # (P, 1)
+    pit_out = run_pit(
+        tabicl_marginal, X_train, Y_train, X_train[:1], Y_train[:1], k_folds=k_folds,
+    )
+    return pit_out["z_train"].squeeze(-1)      # (P,)
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +343,7 @@ def _live_generate_alternating(gen_cfg, n_ep: int, device, seed: int) -> list[di
     return episodes
 
 
-def _print_table(all_nlls: list[dict[str, float]]) -> None:
+def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "oracle") -> None:
     means = {k: float(np.nanmean([m.get(k, float("nan")) for m in all_nlls]))
              for k, _ in _METHOD_ORDER}
     stds  = {k: float(np.nanstd( [m.get(k, float("nan")) for m in all_nlls]))
@@ -294,6 +353,8 @@ def _print_table(all_nlls: list[dict[str, float]]) -> None:
     total = col + 2 * 12
     print(f"\n{'─' * total}")
     print(f"Inter-instance copula NLL (z-space) — lower is better  [N={len(all_nlls)} episodes]")
+    print(f"ICL z_train source: {z_train_source}"
+          + ("  (exact GP-LOO PIT)" if z_train_source == "oracle" else "  (TabICL K-fold PIT estimate)"))
     print(f"{'─' * total}")
     print(f"{'Method':<{col}}{'Mean NLL':>12}{'Std NLL':>12}")
     print(f"{'─' * col}{'─' * 12}{'─' * 12}")
@@ -356,6 +417,26 @@ def main() -> None:
                         help="Training steps for PerEpisodeTransformer")
     parser.add_argument("--patience_per_ep", type=int, default=500,
                         help="Early stopping patience for PerEpisodeTransformer")
+    parser.add_argument("--z_train_source", default="oracle", choices=["oracle", "tabicl"],
+                        help="What the ICL model conditions on for each episode's z_train. "
+                             "'oracle' (default): the episode's exact GP-LOO PIT residual "
+                             "(R&W Eq. 5.12) computed from the true generating kernel — "
+                             "unavailable on real data, but exact here since the kernel is "
+                             "known by construction. 'tabicl': a K-fold cross-fitted PIT "
+                             "estimate from the frozen TabICL marginal (pit.py::run_pit), "
+                             "the same proxy real-world evaluation is stuck with — use this "
+                             "to measure the sim-to-real gap between the two (icl_nll under "
+                             "each source is unaffected in every other respect: z_test, "
+                             "R_oracle, and every baseline still score/fit against the "
+                             "episode's true values). Adds the cost of one extra frozen "
+                             "TabICL forward pass per fold per episode.")
+    parser.add_argument("--tabicl_ckpt",  default=None,
+                        help="TabICL checkpoint filename for --z_train_source=tabicl. "
+                             "Default: read from --config's cfg.tabicl.ckpt.")
+    parser.add_argument("--tabicl_pit_k_folds", type=int, default=None,
+                        help="K-fold count for --z_train_source=tabicl's run_pit call. "
+                             f"Default: cfg.tabicl.pit_k_folds, falling back to "
+                             f"pit.DEFAULT_K_FOLDS ({DEFAULT_K_FOLDS}).")
     parser.add_argument("--plot_episode", type=int,   default=0,
                         help="Local episode index to generate the corr_grid plot for")
     parser.add_argument("--out_dir",      default=os.path.join(_REPO_ROOT, "eval", "results"),
@@ -411,6 +492,25 @@ def main() -> None:
     icl_rank = int(icl_cfg.model.rank)
     n_params = sum(p.numel() for p in icl_model.parameters())
     print(f"ICL model parameters: {n_params:,}  rank={icl_rank}")
+
+    # ---- Optionally load a second, frozen TabICL marginal purely to
+    # K-fold-PIT each episode's z_train (see --z_train_source's help text) ----
+    tabicl_marginal: nn.Module | None = None
+    tabicl_pit_k_folds = DEFAULT_K_FOLDS
+    if args.z_train_source == "tabicl":
+        tabicl_ckpt = args.tabicl_ckpt or OmegaConf.select(cfg, "tabicl.ckpt", default=None)
+        if not tabicl_ckpt:
+            raise ValueError(
+                "--z_train_source=tabicl requires a TabICL checkpoint: pass --tabicl_ckpt "
+                "or set cfg.tabicl.ckpt in --config."
+            )
+        tabicl_pit_k_folds = args.tabicl_pit_k_folds or int(
+            OmegaConf.select(cfg, "tabicl.pit_k_folds", default=DEFAULT_K_FOLDS)
+        )
+        print(f"\nLoading frozen TabICL marginal for --z_train_source=tabicl: {tabicl_ckpt} "
+              f"(k_folds={tabicl_pit_k_folds})")
+        tabicl_marginal = load_tabicl(tabicl_ckpt, str(device))
+    print(f"z_train source (ICL conditioning input): {args.z_train_source}")
 
     # GP-MLE/DKL must score against the same convention used to build this
     # run's R_star ("prior" ignores training conditioning entirely,
@@ -519,7 +619,18 @@ def main() -> None:
                 }
                 cache_dirty = True
 
-        icl_nlls, icl_R, R_oracle = _eval_icl_episode(ep=ep, icl_model=icl_model, device=device)
+        z_train_override = None
+        if tabicl_marginal is not None:
+            z_train_override = _tabicl_z_train(
+                ep=ep, tabicl_marginal=tabicl_marginal, k_folds=tabicl_pit_k_folds, device=device,
+            )
+            if z_train_override is None:
+                print(f"  [ep {ep_i}] fewer than 2 training points — "
+                      "falling back to oracle z_train for this episode")
+
+        icl_nlls, icl_R, R_oracle = _eval_icl_episode(
+            ep=ep, icl_model=icl_model, device=device, z_train_override=z_train_override,
+        )
 
         nlls   = {**baseline_nlls, **icl_nlls}
         R_dict = {**baseline_R, **icl_R}
@@ -559,7 +670,7 @@ def main() -> None:
         print("No episodes evaluated successfully.")
         return
 
-    _print_table(all_nlls)
+    _print_table(all_nlls, z_train_source=args.z_train_source)
 
     # ---- Correlation heatmap ----
     if plot_R_dict is not None and plot_R_oracle is not None:
