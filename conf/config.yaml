@@ -49,7 +49,15 @@ training:
   # for training data. Temporary, storage-constrained-environment mode;
   # false (default) uses the on-disk dataset_dir pipeline unchanged.
   live_generation: false
-  live_num_workers: 8      # CPU-bound generation is heavier than a shard read; size to keep the GPU fed
+  # CPU-bound generation is heavier than a shard read; size to keep the GPU
+  # fed. 16 (not 8) because generate_gp_batch's fixed per-call overhead means
+  # aggregate worker throughput doesn't scale with batch_size on its own —
+  # measured 8 workers falling behind at batch_size=256 (data=30-55ms/step,
+  # more than the rest of the step combined) while 16 stayed flat
+  # (data<1ms/step) at both batch_size=128 and 256 on a 44-core node. Bump
+  # this further (in step with batch_size) if you have more cores and go
+  # bigger; 16 was already at the floor — 24 gave no further improvement.
+  live_num_workers: 16
   # generate_gp_batch() call size = batch_size * live_group_multiplier. Must be
   # a multiple of batch_size: generate_gp_batch samples kernel/P/N/active_dims
   # (and, for variable-d configs, d_features itself) once per call, shared by
