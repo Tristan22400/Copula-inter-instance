@@ -1,12 +1,40 @@
-d_model: 32
-n_heads: 8
-n_layers_s1: 3
-n_layers_s2: 3
-n_layers_s3: 12
-n_inducing: 128
-n_cls: 4
-p_max: 20
-d_max: 8
-rank: 16
-d_ff: null
-dropout: 0.0
+# @package _global_
+# Fast dev-loop preset: tiny from-scratch backbone + small-rank head, in one
+# override — `model=copula_tabicl_v2` alone fully configures a fast run, no
+# need to also pass `tabicl=scratch_nano` separately. Uses `_global_`
+# packaging so this single file (still selected via the `model:` group) can
+# also set `tabicl.*` directly, since backbone architecture lives under that
+# separate config group (see conf/tabicl/pretrained_v2.yaml /
+# conf/tabicl/scratch_nano.yaml, which still work standalone if you want to
+# mix a nano backbone with a different rank, or vice versa — this file's
+# `tabicl:` block below is kept in sync with conf/tabicl/scratch_nano.yaml
+# by hand; if you change one, change the other).
+#
+# NOTE: previously held a dead d_model/n_heads/n_layers_s1/s2/s3/n_inducing/
+# n_cls/p_max/d_max schema that build_copula_transformer (src/model.py) never
+# read — orphaned since the repo's initial commit.
+#
+# Usage:
+#   python src/train.py model=copula_tabicl_v2 \
+#     data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \
+#     training.live_generation=true training.ckpt_dir=./checkpoints/copula_nano
+model:
+  rank: 8                  # vs. 32 in copula_transformer.yaml
+  sigma_jitter: 1.0e-4
+  unfreeze_backbone: true
+
+tabicl:
+  pretrained: false
+  recompute: false
+  arch:
+    embed_dim: 32
+    col_num_blocks: 1
+    col_nhead: 4
+    col_num_inds: 16
+    row_num_blocks: 1
+    row_nhead: 4
+    row_num_cls: 2
+    icl_num_blocks: 2
+    icl_nhead: 4
+    ff_factor: 2
+    dropout: 0.0

@@ -1,0 +1,30 @@
+# Tiny from-scratch TabICL backbone for fast dev-loop iteration — NOT a
+# production model. Shrink episode size via CLI overrides too (e.g.
+# data.P_max=64 data.N_max=32): attention cost per ICL block is O(T^2*d) vs.
+# O(T*d^2) for the QKV/FFN projections (T=P+N, d=embed_dim) — once d is this
+# small, a narrow model at full episode length is still attention-
+# bottlenecked, so shrinking T matters too.
+#
+# For the one-override fast-run shortcut (this arch + a matching small
+# rank), use `model=copula_tabicl_v2` alone instead — it inlines this same
+# arch directly (kept in sync by hand) so it doesn't need `tabicl=` at all.
+# Use THIS file standalone only if you want to mix the nano backbone with a
+# different model=... (e.g. copula_transformer's rank=32 head):
+#
+#   python src/train.py model=copula_transformer tabicl=scratch_nano \
+#     data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \
+#     training.live_generation=true training.ckpt_dir=./checkpoints/copula_nano
+pretrained: false
+recompute: false
+arch:
+  embed_dim: 32
+  col_num_blocks: 1
+  col_nhead: 4
+  col_num_inds: 16
+  row_num_blocks: 1
+  row_nhead: 4
+  row_num_cls: 2
+  icl_num_blocks: 2
+  icl_nhead: 4
+  ff_factor: 2
+  dropout: 0.0
