@@ -55,6 +55,7 @@ import copy
 import os
 import random
 import sys
+from collections import Counter
 
 import hydra
 import numpy as np
@@ -222,6 +223,94 @@ def _tabicl_z_train(
     return pit_out["z_train"].squeeze(-1)      # (P,)
 
 
+def _make_folds(n: int, k: int, seed: int) -> list[Tensor]:
+    """Deterministic, per-episode partition of the n test-point indices into
+    k disjoint folds of near-equal size (sizes differ by at most 1) —
+    independent of the global RNG (a fresh CPU-seeded Generator), so it
+    doesn't perturb the GP-MLE/DKL restarts' own randomness elsewhere in the
+    run.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=gen)
+    base, extra = divmod(n, k)
+    folds: list[Tensor] = []
+    start = 0
+    for i in range(k):
+        size = base + (1 if i < extra else 0)
+        folds.append(perm[start:start + size])
+        start += size
+    return folds
+
+
+def _select_best_baseline_cv(
+    baseline_R: dict[str, Tensor], z_test: Tensor, n_folds: int, min_fold_size: int, seed: int,
+) -> tuple[float, str | None, list[dict]]:
+    """Pick the per-episode best *fitted* baseline honestly via nested
+    (leave-one-fold-out) cross-validation over the n test points, instead of
+    argmin-ing directly over the same z_test the winner is then scored on
+    (a selection-bias/winner's-curse leak — see Cawley & Talbot 2010, "On
+    Over-fitting in Model Selection and Subsequent Selection Bias in
+    Performance Evaluation") and instead of a single fixed val/test split
+    (this function's predecessor, _select_best_baseline_holdout), which
+    permanently sacrifices a fraction of the points to selection alone —
+    wasteful and noisy at this repo's small N (N_min=8).
+
+    For each of K folds: rank candidates by NLL on the other K-1 folds
+    (val), then score the winner's NLL on the held-out fold (test) — every
+    point plays val in K-1 folds and test in exactly 1, so no point is ever
+    used to both select and score the same baseline.
+
+    R_star being a valid (N, N) correlation matrix means any principal
+    submatrix R[idx][:, idx] is too, so this needs no refit — the same NxN
+    correlation each baseline already produced at fit time is just scored
+    against different index subsets.
+
+    K = min(n_folds, n // min_fold_size), so no fold — nor its (K-1)-fold
+    val complement, which is always >= one fold's own size — ever scores a
+    candidate on fewer than min_fold_size points. Returns (nan, None, [])
+    when there are no fitted candidates or this leaves K < 2 (no CV
+    possible, n_test too small): with min_fold_size=20 and this repo's
+    N_min=8/N_max=128 (uniform), that's true for about a quarter of
+    episodes (N < 40) — those simply contribute no best_baseline value
+    rather than a noisy one (see _print_table's valid-count note).
+
+    The pooled NLL returned is the size-weighted average of the K held-out
+    fold NLLs (each already normalized by its own fold size in
+    corr_nll_single) — i.e. the total unnormalized NLL summed across the K
+    independent fold-blocks, divided by n. fold_details records each fold's
+    selection/scores for diagnostics (console printing).
+    """
+    keys = [k for k in baseline_R if k not in _NON_FITTED_EXCLUDED]
+    n = z_test.shape[0]
+    if not keys or n // min_fold_size < 2:
+        return float("nan"), None, []
+
+    k_folds = min(n_folds, n // min_fold_size)
+    folds = [f.to(z_test.device) for f in _make_folds(n, k_folds, seed)]
+
+    def _sub_nll(key: str, idx: Tensor) -> float:
+        R = baseline_R[key]
+        R_sub = R.index_select(0, idx).index_select(1, idx)
+        return corr_nll_single(R_sub, z_test.index_select(0, idx))
+
+    fold_details: list[dict] = []
+    weighted_sum = 0.0
+    for i, test_idx in enumerate(folds):
+        val_idx = torch.cat([f for j, f in enumerate(folds) if j != i])
+        val_nll = {key: _sub_nll(key, val_idx) for key in keys}
+        selected = min(val_nll, key=val_nll.get)
+        test_nll = _sub_nll(selected, test_idx)
+        weighted_sum += test_idx.numel() * test_nll
+        fold_details.append({
+            "fold": i, "size": test_idx.numel(), "selected": selected,
+            "val_nll": val_nll[selected], "test_nll": test_nll,
+        })
+
+    pooled_nll = weighted_sum / n
+    mode_key = Counter(fd["selected"] for fd in fold_details).most_common(1)[0][0]
+    return pooled_nll, mode_key, fold_details
+
+
 # ---------------------------------------------------------------------------
 # Table printing
 # ---------------------------------------------------------------------------
@@ -362,7 +451,9 @@ def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "oracle
         m, s = means.get(key, float("nan")), stds.get(key, float("nan"))
         marker = ""
         if key == "best_baseline":
-            marker = "  ← per-episode best baseline"
+            n_valid = sum(1 for ep_m in all_nlls if not np.isnan(ep_m.get(key, float("nan"))))
+            marker = (f"  ← per-episode best baseline (nested CV; "
+                      f"valid for {n_valid}/{len(all_nlls)} episodes)")
         elif key == "icl":
             marker = "  ← our model"
         elif key == "oracle":
@@ -443,6 +534,36 @@ def main() -> None:
                         help="Directory for saved corr_grid figure")
     parser.add_argument("--device",       default="auto")
     parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--n_folds",      type=int,   default=5,
+                        help="Number of folds for nested (leave-one-fold-out) "
+                             "cross-validation of the per-episode best_baseline pick: "
+                             "each fold's held-out NLL is scored using a baseline "
+                             "selected (argmin NLL) on the other K-1 folds only, and "
+                             "the K fold NLLs are pooled — instead of argmin-ing "
+                             "directly over z_test, which lets the winner peek at the "
+                             "very data it's scored on (see _select_best_baseline_cv). "
+                             "Actual K is capped at n_test // 3 per episode, so small-N "
+                             "episodes automatically use fewer folds. The fold split is "
+                             "deterministic per episode (seeded from --seed + episode "
+                             "index) and never touches icl/oracle or any individual "
+                             "baseline's own diagnostic row, which keep scoring against "
+                             "the full test set as before.")
+    parser.add_argument("--min_fold_size", type=int, default=20,
+                        help="Minimum points required on both sides of every "
+                             "leave-one-fold-out split (a fold's own size, and its "
+                             "(K-1)-fold val complement) before a candidate baseline's "
+                             "NLL there is trusted enough to base a selection on. Below "
+                             "this, ranking ~12 candidate kernels by NLL on a handful of "
+                             "points is closer to a coin flip than a real comparison, and "
+                             "an occasional spurious pick of a blow-up-prone candidate "
+                             "(e.g. dot_product/polynomial kernels, whose NLL is "
+                             "unbounded above when misspecified) can drag the averaged "
+                             "best_baseline mean above even a single steady fixed kernel "
+                             "used for every episode. Effective K per episode is "
+                             "min(--n_folds, n_test // min_fold_size); episodes where "
+                             "that's < 2 report best_baseline=nan (excluded from its "
+                             "mean/std, not silently zero) instead of forcing a low-"
+                             "confidence selection.")
     parser.add_argument("--oracle_mode",  default=None, choices=["prior", "posterior"],
                         help="How R_star was built for this dataset. Determines whether "
                              "GP-MLE/DKL score the fitted kernel's posterior (conditioned "
@@ -642,24 +763,43 @@ def main() -> None:
             key=lambda kv: kv[1],
         )
         top5 = ranked_baselines[:5]
-        # Per-episode best fitted baseline's NLL — averaging this across
-        # episodes (see _print_table's "Best-of-Baselines" row) is a tighter,
+        # Per-episode best fitted baseline's NLL, selected via nested
+        # (leave-one-fold-out) CV over this episode's test points (see
+        # _select_best_baseline_cv) — averaging this across episodes (see
+        # _print_table's "Best-of-Baselines" row) is a tighter,
         # per-episode-optimal reference than any single baseline's own
         # average, so its gap to ICL's mean is the real "how much is ICL
-        # leaving on the table vs. always picking the best baseline" number.
-        nlls["best_baseline"] = ranked_baselines[0][1] if ranked_baselines else float("nan")
+        # leaving on the table vs. always picking the best baseline" number,
+        # without the winner having been picked by peeking at the same
+        # z_test it's scored on.
+        holdout_seed = (args.seed * 1_000_003 + ep_i) % (2 ** 31 - 1)
+        best_nll, mode_key, fold_details = _select_best_baseline_cv(
+            baseline_R, ep["z_test"].to(device), args.n_folds, args.min_fold_size, holdout_seed,
+        )
+        nlls["best_baseline"] = best_nll
         all_nlls.append(nlls)
 
         if local_i == args.plot_episode:
             plot_R_dict   = R_dict
             plot_R_oracle = R_oracle
-            if ranked_baselines:
-                plot_best_key = ranked_baselines[0][0]
-                plot_best_R   = R_dict[plot_best_key]
+            if mode_key is not None:
+                plot_best_key = mode_key
+                plot_best_R   = R_dict[mode_key]
 
         print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
         print(f"    icl={icl_nll:.4f}  oracle={ora_nll:.4f}")
-        print("    top-5 baselines (lowest NLL, fitted only):")
+        if fold_details:
+            fold_summary = ", ".join(
+                f"fold{fd['fold']}={_METHOD_LABELS.get(fd['selected'], fd['selected'])}"
+                for fd in fold_details
+            )
+            print(f"    best_baseline (nested {len(fold_details)}-fold CV, "
+                  f"pooled test NLL)={best_nll:.4f}")
+            print(f"      per-fold picks: {fold_summary}")
+        else:
+            print("    best_baseline: unavailable (too few test points for nested CV)")
+        print("    top-5 baselines (lowest NLL on full test set, diagnostic only — "
+              "not the selection used for best_baseline above):")
         for key, val in top5:
             print(f"      {_METHOD_LABELS.get(key, key):<28}{val:.4f}")
 
