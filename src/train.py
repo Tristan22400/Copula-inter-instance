@@ -362,6 +362,18 @@ def _build_tabicl_val_z(
     Returns {batch_idx: (B, P_max) tensor}, CPU, zero-padded outside each
     episode's true train length (matching train_mask) — moved to device and
     sliced per-episode inside validate()'s do_plot block.
+
+    y_train is z-scored per-episode before reaching the raw TabICL module:
+    run_pit does no target scaling of its own (unlike
+    tabicl.TabICLRegressor.fit(), which fits a fresh StandardScaler before
+    ever calling this same underlying model — see
+    inference/copula_inference.py::loo_pit's docstring, fixed for that call
+    site and eval_checkpoint.py's mirror of this function in 99e6286).
+    Episode y_train's scale is not fixed — outputscale is drawn from a
+    GammaPrior (data_gen.py's generative process) — so an unscaled call
+    risks saturating the pretrained quantile head's CDF into its extreme
+    tail for every point alike on high-outputscale episodes, collapsing
+    z_train's spread instead of reflecting the true per-point rank.
     """
     cache: dict[int, torch.Tensor] = {}
     for batch_idx, batch in enumerate(val_loader):
@@ -377,7 +389,9 @@ def _build_tabicl_val_z(
             if n < 2:
                 continue  # run_pit's fold split needs >=2 context points
             X_b = x_train[b, :n]
-            Y_b = y_train[b, :n].unsqueeze(-1)
+            y_b = y_train[b, :n]
+            y_b_scaled = (y_b - y_b.mean()) / y_b.std().clamp(min=1e-8)
+            Y_b = y_b_scaled.unsqueeze(-1)
             pit_out = run_pit(tabicl_marginal, X_b, Y_b, X_b[:1], Y_b[:1], k_folds=k_folds)
             z_tabicl[b, :n] = pit_out["z_train"].squeeze(-1)
         cache[batch_idx] = z_tabicl.cpu()
