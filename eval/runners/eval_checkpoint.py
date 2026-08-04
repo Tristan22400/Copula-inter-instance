@@ -185,14 +185,17 @@ _METHOD_ORDER = [
     ("dkl_rq",              "Deep Kernel Learning (RQ)"),
     ("dkl_dot_product",     "Deep Kernel Learning (DotProduct)"),
     ("per_ep_transformer",  "PerEp-Transformer"),
+    ("best_baseline",       "Best-of-Baselines (per-episode)"),
     ("icl",                 "ICL (pretrained)"),
     ("oracle",              "Oracle"),
 ]
 
 # Excluded from the "5 best baselines" ranking: independence/gp_prior_rbf
-# are trivial, no-fit reference points rather than baselines, and icl/oracle
-# aren't baselines at all (icl is our model, oracle is the lower bound).
-_NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle"}
+# are trivial, no-fit reference points rather than baselines, icl/oracle
+# aren't baselines at all (icl is our model, oracle is the lower bound), and
+# best_baseline is itself derived from this same ranking (added after it's
+# computed each episode — see main()'s loop).
+_NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle", "best_baseline"}
 
 _METHOD_LABELS = dict(_METHOD_ORDER)
 
@@ -297,7 +300,9 @@ def _print_table(all_nlls: list[dict[str, float]]) -> None:
     for key, label in _METHOD_ORDER:
         m, s = means.get(key, float("nan")), stds.get(key, float("nan"))
         marker = ""
-        if key == "icl":
+        if key == "best_baseline":
+            marker = "  ← per-episode best baseline"
+        elif key == "icl":
             marker = "  ← our model"
         elif key == "oracle":
             marker = "  ← lower bound"
@@ -518,7 +523,6 @@ def main() -> None:
 
         nlls   = {**baseline_nlls, **icl_nlls}
         R_dict = {**baseline_R, **icl_R}
-        all_nlls.append(nlls)
 
         icl_nll = nlls.get("icl", float("nan"))
         ora_nll = nlls.get("oracle", float("nan"))
@@ -527,6 +531,13 @@ def main() -> None:
             key=lambda kv: kv[1],
         )
         top5 = ranked_baselines[:5]
+        # Per-episode best fitted baseline's NLL — averaging this across
+        # episodes (see _print_table's "Best-of-Baselines" row) is a tighter,
+        # per-episode-optimal reference than any single baseline's own
+        # average, so its gap to ICL's mean is the real "how much is ICL
+        # leaving on the table vs. always picking the best baseline" number.
+        nlls["best_baseline"] = ranked_baselines[0][1] if ranked_baselines else float("nan")
+        all_nlls.append(nlls)
 
         if local_i == args.plot_episode:
             plot_R_dict   = R_dict
