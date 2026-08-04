@@ -233,17 +233,26 @@ def predict_copula_residual_field(
     Falls back to a naive Gaussian(mean, std) marginal if `tabicl_marginal`
     is None (scratch-trained backbone, see load_marginal_tabicl).
 
-    `context_values` are z-scored before being handed to the frozen TabICL
-    module directly, same reasoning and same StandardScaler-mirroring
-    convention as extract_model_context_correlation's z_train construction
-    (this function calls the raw module too, not TabICLRegressor, since it
-    needs `.icdf` at an arbitrary probability level rather than
-    TabICLRegressor.predict()'s fixed output types) -- otherwise absolute-
-    scale context values saturate the quantile head's CDF and this
-    function's `y_pred` would collapse toward a near-constant value instead
-    of a properly-varying field. The prediction is un-scaled back to
-    context_values' original units afterward, since (unlike z_train) this
-    function's return value is a physical field, not a Gaussianized rank.
+    `context_values` are z-scored via ``pit.normalize_targets`` before being
+    handed to the frozen TabICL module directly — the same helper
+    extract_model_context_correlation's z_train construction and every
+    other run_pit/raw-TabICL call site in the repo uses (train-only stats;
+    `coords_test`'s targets are never observed here, matching a real
+    deployment) -- otherwise absolute-scale context values saturate the
+    quantile head's CDF and this function's `y_pred` would collapse toward
+    a near-constant value instead of a properly-varying field. The
+    prediction is un-scaled back to context_values' original units
+    afterward, since (unlike z_train) this function's return value is a
+    physical field, not a Gaussianized rank.
+
+    `context_coords`/`coords_test` are z-scored via
+    ``inference.copula_inference.normalize_features`` (joint train+test
+    stats, matching data_gen.py's training-time convention and every other
+    Copula-model/TabICL call site) rather than context-only stats — unlike
+    `context_values`, both endpoints' coordinates ARE known up front (this
+    is a fixed spatial grid), so there's no real-deployment reason to
+    withhold `coords_test` from the normalization statistics the way
+    `context_values`' unobserved counterpart must be.
     """
     from generate_plots import _safe_cholesky
     from scipy.stats import norm
@@ -260,15 +269,16 @@ def predict_copula_residual_field(
 
     import torch
 
-    x_mean = context_coords.mean(axis=0, keepdims=True)
-    x_std = context_coords.std(axis=0, keepdims=True).clip(min=1e-8)
-    x_train_norm = (context_coords - x_mean) / x_std
-    x_test_norm = (coords_test - x_mean) / x_std
+    from inference.copula_inference import normalize_features
+    from pit import normalize_targets
+
+    x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
 
     x_full = np.concatenate([x_train_norm, x_test_norm], axis=0)
     x_batch = torch.as_tensor(x_full, dtype=torch.float32, device=device).unsqueeze(0)  # (1, P+N, p_x)
-    context_values_scaled = (context_values - y_mean) / y_std
-    y_train_batch = torch.as_tensor(context_values_scaled, dtype=torch.float32, device=device).unsqueeze(0)  # (1, P)
+    context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
+    context_values_scaled_t, _, y_mean_t, y_std_t = normalize_targets(context_values_t)
+    y_train_batch = context_values_scaled_t.unsqueeze(0)  # (1, P)
     with torch.no_grad():
         logits = tabicl_marginal(x_batch, y_train_batch)  # (1, N, Q) -- N test rows only, per src/pit.py::run_pit
         n_test = coords_test.shape[0]
@@ -284,7 +294,7 @@ def predict_copula_residual_field(
         # overflows float16's ~65504 max into inf (see get_marginal_quantiles's
         # docstring in inference/copula_inference.py for the same issue).
         y_pred_scaled = dist.icdf(u_t).squeeze(-1).double()
-    return y_mean + y_std * y_pred_scaled.cpu().numpy()
+    return (y_mean_t.double() + y_std_t.double() * y_pred_scaled).cpu().numpy()
 
 
 def _plot_field_grid(
@@ -540,6 +550,14 @@ def extract_model_dummy_context_correlation(model, device, coords_test: np.ndarr
     conf/data/gp_tasks.yaml), R_star is defined to ignore training-context
     conditioning entirely, so a well-trained model's output here should not
     be sensitive to which dummy value is fed in.
+
+    x_test is normalized from its own stats alone, NOT via
+    ``inference.copula_inference.normalize_features``'s train+test-combined
+    convention (unlike extract_model_context_correlation's real-context
+    sibling) — the "train" side here is a fake all-zero coordinate carrying
+    no real spatial information, so folding it into the mean/std would bias
+    the statistics with a point that isn't part of the actual coordinate
+    distribution.
     """
     coords_test = np.asarray(coords_test, dtype=np.float64)
     x_mean = coords_test.mean(axis=0, keepdims=True)
@@ -577,45 +595,54 @@ def extract_model_context_correlation(
     If `tabicl_marginal` is None (scratch-trained backbone, no quantile
     head available), falls back to the naive standardization.
 
-    `context_values` are z-scored before being handed to `run_pit`, mirroring
-    the StandardScaler step tabicl._sklearn.regressor.TabICLRegressor.fit()
-    always applies to y before calling this same underlying frozen module
-    (regressor.py's `y_scaled = self.y_scaler_.fit_transform(y)`). run_pit
-    talks to the raw TabICL module directly instead of going through
-    TabICLRegressor because PIT needs two things TabICLRegressor's
-    sklearn-shaped predict() doesn't expose: the CDF at an arbitrary
-    (continuous, already-observed) y rather than a fixed alpha grid, and
-    leave-one-fold-out scoring of the context set against itself rather than
-    against new test rows -- but that also means the y-scaling
-    TabICLRegressor would normally apply is skipped unless redone here.
-    Without it, absolute-scale values (e.g. raw temperature ~20 degC) are
-    far outside what the pretrained quantile head was calibrated for and
-    saturate its predicted CDF to ~1 for every context point alike --
-    collapsing z_train's spread (observed std ~0.2-0.4 vs. ~1.2-2.1 for
-    already-small-scale values like a 24h residual) and destroying the very
-    spatial signal z_train is supposed to carry into the copula model. This
-    doesn't change the PIT ranks in principle (probability integral
-    transform is scale-invariant for a perfect F_hat), only how well the
-    imperfect, saturating quantile head can resolve them.
-    """
-    x_mean = context_coords.mean(axis=0, keepdims=True)
-    x_std = context_coords.std(axis=0, keepdims=True).clip(min=1e-8)
-    x_train_norm = (context_coords - x_mean) / x_std
-    x_test_norm = (coords_test - x_mean) / x_std
+    `context_values` are z-scored via ``pit.normalize_targets`` before being
+    handed to `run_pit`, mirroring the StandardScaler step
+    tabicl._sklearn.regressor.TabICLRegressor.fit() always applies to y
+    before calling this same underlying frozen module (regressor.py's
+    `y_scaled = self.y_scaler_.fit_transform(y)`) — the same helper every
+    other run_pit/raw-TabICL call site in the repo uses. run_pit talks to
+    the raw TabICL module directly instead of going through TabICLRegressor
+    because PIT needs two things TabICLRegressor's sklearn-shaped predict()
+    doesn't expose: the CDF at an arbitrary (continuous, already-observed) y
+    rather than a fixed alpha grid, and leave-one-fold-out scoring of the
+    context set against itself rather than against new test rows -- but
+    that also means the y-scaling TabICLRegressor would normally apply is
+    skipped unless redone here. Without it, absolute-scale values (e.g. raw
+    temperature ~20 degC) are far outside what the pretrained quantile head
+    was calibrated for and saturate its predicted CDF to ~1 for every
+    context point alike -- collapsing z_train's spread (observed std
+    ~0.2-0.4 vs. ~1.2-2.1 for already-small-scale values like a 24h
+    residual) and destroying the very spatial signal z_train is supposed to
+    carry into the copula model. This doesn't change the PIT ranks in
+    principle (probability integral transform is scale-invariant for a
+    perfect F_hat), only how well the imperfect, saturating quantile head
+    can resolve them.
 
-    y_mean = context_values.mean()
-    y_std = max(context_values.std(), 1e-8)
-    context_values_scaled = (context_values - y_mean) / y_std
+    `context_coords`/`coords_test` are z-scored via
+    ``inference.copula_inference.normalize_features`` (joint train+test
+    stats, matching data_gen.py's training-time convention) rather than
+    context-only stats — both endpoints' coordinates are known up front
+    (a fixed spatial grid), unlike `context_values`, whose `coords_test`
+    counterpart is never observed.
+    """
+    from inference.copula_inference import normalize_features
+    from pit import normalize_targets
+
+    x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
 
     if tabicl_marginal is None:
-        z_train = context_values_scaled
+        y_mean = context_values.mean()
+        y_std = max(context_values.std(), 1e-8)
+        z_train = (context_values - y_mean) / y_std
     else:
         import torch
 
         from src.pit import run_pit
 
         X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
-        Y_train_t = torch.as_tensor(context_values_scaled, dtype=torch.float32, device=device).unsqueeze(-1)  # (P, 1)
+        context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
+        context_values_scaled_t, _, _, _ = normalize_targets(context_values_t)
+        Y_train_t = context_values_scaled_t.unsqueeze(-1)  # (P, 1)
         pit_out = run_pit(
             tabicl_marginal, X_train_t, Y_train_t, X_train_t[:1], Y_train_t[:1], k_folds=k_folds,
         )

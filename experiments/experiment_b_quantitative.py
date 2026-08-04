@@ -59,7 +59,7 @@ for _p in (_REPO_ROOT, _SRC):
 
 from data_gen import gp_posterior, sigma_to_correlation  # noqa: E402
 from loss import y_space_nll  # noqa: E402
-from pit import run_pit  # noqa: E402
+from pit import normalize_targets, run_pit  # noqa: E402
 
 from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402
@@ -157,16 +157,34 @@ def run_one_function(
     # this copula checkpoint was trained — anything cruder would make R_test's
     # evaluation unfair to the model. PFN4BO has no such training-time coupling,
     # so its simpler self-consistent approximation (_quantile_grid_pit) is fine.
+    #
+    # y is z-scored via pit.normalize_targets before reaching the raw TabICL
+    # module -- the same helper every other run_pit/raw-TabICL call site in
+    # the repo uses (inference/copula_inference.py::loo_pit,
+    # eval_checkpoint.py::_tabicl_z_train, train.py::_build_tabicl_val_z) --
+    # or this GP draw's random outputscale saturates the pretrained quantile
+    # head's CDF into its extreme tail, collapsing Z_train/z_ours' spread
+    # instead of reflecting the true per-point rank. y_test is scaled with
+    # y_train's own mean/std (never its own), matching a real deployment
+    # where test targets are unknown at normalization time.
     tabicl_device = next(tabicl_model.parameters()).device
+    y_train_scaled, y_test_scaled, y_mean, y_std = normalize_targets(
+        y_train_t.to(tabicl_device), y_test_t.to(tabicl_device)
+    )
     pit_out = run_pit(
         tabicl_model,
-        X_train_norm_t.to(tabicl_device), y_train_t.to(tabicl_device).unsqueeze(-1),
-        X_test_norm_t.to(tabicl_device), y_test_t.to(tabicl_device).unsqueeze(-1),
+        X_train_norm_t.to(tabicl_device), y_train_scaled.unsqueeze(-1),
+        X_test_norm_t.to(tabicl_device), y_test_scaled.unsqueeze(-1),
         k_folds=min(10, len(X_train)),
     )
     Z_train = pit_out["z_train"].squeeze(-1).cpu().numpy()
     z_ours = pit_out["z_test"].squeeze(-1).cpu().numpy()
-    log_pdf_ours = pit_out["log_pdf_test"].squeeze(-1).cpu().numpy()
+    # log_pdf_test is the density of the SCALED y_test under the scaled call;
+    # convert back to raw y-units via the standardization's Jacobian
+    # (log p_raw(y) = log p_scaled(y_scaled) - log(std)) to match
+    # loss.y_space_nll's "raw y-unit marginal log-density" contract -- the
+    # same convention data_gen.py's analytic GP-LOO log_pdf_test uses.
+    log_pdf_ours = (pit_out["log_pdf_test"].squeeze(-1) - y_std.log()).cpu().numpy()
 
     R_test = get_test_correlation(copula_model, X_train_norm, Z_train, X_test_norm)
 

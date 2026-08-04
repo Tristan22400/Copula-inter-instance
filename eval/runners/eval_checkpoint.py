@@ -75,7 +75,7 @@ from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
-from pit import DEFAULT_K_FOLDS, load_tabicl, run_pit  # noqa: E402
+from pit import DEFAULT_K_FOLDS, load_tabicl, normalize_targets, run_pit  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
@@ -196,25 +196,25 @@ def _tabicl_z_train(
     has fewer than 2 training points, since run_pit's fold split needs at
     least that many.
 
-    y_train is z-scored before reaching the raw TabICL module: run_pit does
-    no target scaling of its own (unlike tabicl.TabICLRegressor.fit(), which
-    fits a fresh StandardScaler before ever calling this same underlying
-    model — see inference/copula_inference.py::loo_pit's docstring, fixed
-    for that call site in 99e6286 but never touched here or in
-    train.py::_build_tabicl_val_z). Episode y_train's scale is not fixed —
-    outputscale is drawn from a GammaPrior (data_gen.py's generative
-    process) — so an unscaled call risks saturating the pretrained quantile
-    head's CDF into its extreme tail for every point alike on
-    high-outputscale episodes, collapsing z_train's spread instead of
-    reflecting the true per-point rank.
+    y_train is z-scored via pit.normalize_targets before reaching the raw
+    TabICL module: run_pit does no target scaling of its own (unlike
+    tabicl.TabICLRegressor.fit(), which fits a fresh StandardScaler before
+    ever calling this same underlying model). Every other run_pit call site
+    in the repo (inference/copula_inference.py::loo_pit,
+    train.py::_build_tabicl_val_z) goes through the same helper, so this
+    conditioning input is computed identically everywhere. Episode
+    y_train's scale is not fixed — outputscale is drawn from a GammaPrior
+    (data_gen.py's generative process) — so an unscaled call risks
+    saturating the pretrained quantile head's CDF into its extreme tail for
+    every point alike on high-outputscale episodes, collapsing z_train's
+    spread instead of reflecting the true per-point rank.
     """
     X_train = ep["x_norm_train"].to(device)   # (P, d_x)
     y_train = ep["y_train"].to(device)         # (P,)
     P = X_train.shape[0]
     if P < 2:
         return None
-    y_std = y_train.std().clamp(min=1e-8)
-    y_train_scaled = (y_train - y_train.mean()) / y_std
+    y_train_scaled, _, _, _ = normalize_targets(y_train)
     Y_train = y_train_scaled.unsqueeze(-1)      # (P, 1)
     pit_out = run_pit(
         tabicl_marginal, X_train, Y_train, X_train[:1], Y_train[:1], k_folds=k_folds,

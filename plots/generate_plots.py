@@ -314,18 +314,21 @@ def build_copula_correlation_fn(ckpt_path, device, context_coords, context_value
     # for real/synthetic ERA5 fields, so we approximate z_train with an
     # empirical standardization of the context temperatures -- reasonable
     # since the model only needs z_train ~ N(0, 1) marginally.
-    x_mean = context_coords.mean(axis=0, keepdims=True)
-    x_std = context_coords.std(axis=0, keepdims=True).clip(min=1e-8)
-    x_train_norm = (context_coords - x_mean) / x_std
-
     y_std = max(context_values.std(), 1e-8)
     z_train = (context_values - context_values.mean()) / y_std
-
-    x_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device).unsqueeze(0)
     z_train_t = torch.as_tensor(z_train, dtype=torch.float32, device=device).unsqueeze(0)
 
+    from inference.copula_inference import normalize_features
+
     def corr_fn(coords_test):
-        x_test_norm = (coords_test - x_mean) / x_std
+        # X is z-scored jointly over context+coords_test (normalize_features,
+        # matching data_gen.py's training-time convention and every other
+        # Copula-model call site) rather than context-only stats — both
+        # endpoints' coordinates are known up front (a fixed spatial grid),
+        # so there's no reason to withhold coords_test from the statistics
+        # the way context_values' unobserved test-side counterpart must be.
+        x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
+        x_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device).unsqueeze(0)
         x_test_t = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device).unsqueeze(0)
         batch = {"x_train": x_train_t, "x_test": x_test_t, "z_train": z_train_t}
         with torch.no_grad():
