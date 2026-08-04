@@ -1,14 +1,20 @@
-# Tiny from-scratch TabICL backbone for fast dev-loop iteration — NOT a
-# production model. Shrink episode size via CLI overrides too (e.g.
-# data.P_max=64 data.N_max=32): attention cost per ICL block is O(T^2*d) vs.
-# O(T*d^2) for the QKV/FFN projections (T=P+N, d=embed_dim) — once d is this
-# small, a narrow model at full episode length is still attention-
-# bottlenecked, so shrinking T matters too.
+# Narrow (not shallow) from-scratch TabICL backbone for fast dev-loop
+# iteration — NOT a production model. Only embed_dim differs from the
+# pretrained tabicl-regressor-v2 checkpoint's own architecture (see the
+# commented `arch:` template in conf/tabicl/pretrained_v2.yaml) — every
+# other axis (block counts, heads, inducing points, CLS tokens, ff_factor)
+# matches it exactly, so this is a pure width ablation of the real model,
+# not a different shape. Attention cost per ICL block is O(T^2*d) vs.
+# O(T*d^2) for the QKV/FFN projections (T=P+N, d=embed_dim) — keeping the
+# full 12 icl_num_blocks means T still gets visited 12 times per step, so
+# shrinking episode size via CLI overrides (e.g. data.P_max=64 data.N_max=32)
+# still matters for wall-clock speed even though embed_dim alone already
+# cuts most of the per-layer FLOPs.
 #
 # For the one-override fast-run shortcut (this arch + a matching small
 # rank), use `model=copula_tabicl_v2` alone instead — it inlines this same
 # arch directly (kept in sync by hand) so it doesn't need `tabicl=` at all.
-# Use THIS file standalone only if you want to mix the nano backbone with a
+# Use THIS file standalone only if you want to mix this backbone with a
 # different model=... (e.g. copula_transformer's rank=32 head):
 #
 #   python src/train.py model=copula_transformer tabicl=scratch_nano \
@@ -17,14 +23,14 @@
 pretrained: false
 recompute: false
 arch:
-  embed_dim: 32
-  col_num_blocks: 1
-  col_nhead: 4
-  col_num_inds: 16
-  row_num_blocks: 1
-  row_nhead: 4
-  row_num_cls: 2
-  icl_num_blocks: 2
-  icl_nhead: 4
+  embed_dim: 32       # vs. 128 in the pretrained checkpoint — the one intentional change
+  col_num_blocks: 3   # matches pretrained
+  col_nhead: 8         # matches pretrained
+  col_num_inds: 128    # matches pretrained
+  row_num_blocks: 3    # matches pretrained
+  row_nhead: 8         # matches pretrained
+  row_num_cls: 4       # matches pretrained
+  icl_num_blocks: 12   # matches pretrained
+  icl_nhead: 8         # matches pretrained
   ff_factor: 2
   dropout: 0.0
