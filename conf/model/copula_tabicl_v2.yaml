@@ -1,12 +1,13 @@
 # @package _global_
-# Fast dev-loop preset: tiny from-scratch backbone + small-rank head, in one
+# Fast dev-loop preset: narrow (width-only shrink, same depth/heads as the
+# pretrained checkpoint) from-scratch backbone + small-rank head, in one
 # override — `model=copula_tabicl_v2` alone fully configures a fast run, no
 # need to also pass `tabicl=scratch_nano` separately. Uses `_global_`
 # packaging so this single file (still selected via the `model:` group) can
 # also set `tabicl.*` directly, since backbone architecture lives under that
 # separate config group (see conf/tabicl/pretrained_v2.yaml /
 # conf/tabicl/scratch_nano.yaml, which still work standalone if you want to
-# mix a nano backbone with a different rank, or vice versa — this file's
+# mix this backbone with a different rank, or vice versa — this file's
 # `tabicl:` block below is kept in sync with conf/tabicl/scratch_nano.yaml
 # by hand; if you change one, change the other).
 #
@@ -27,14 +28,14 @@ tabicl:
   pretrained: false
   recompute: false
   arch:
-    embed_dim: 32
-    col_num_blocks: 1
-    col_nhead: 4
-    col_num_inds: 16
-    row_num_blocks: 1
-    row_nhead: 4
-    row_num_cls: 2
-    icl_num_blocks: 2
-    icl_nhead: 4
+    embed_dim: 32       # vs. 128 in the pretrained checkpoint — the one intentional change
+    col_num_blocks: 3   # matches pretrained
+    col_nhead: 8         # matches pretrained
+    col_num_inds: 128    # matches pretrained
+    row_num_blocks: 3    # matches pretrained
+    row_nhead: 8         # matches pretrained
+    row_num_cls: 4       # matches pretrained
+    icl_num_blocks: 12   # matches pretrained
+    icl_nhead: 8         # matches pretrained
     ff_factor: 2
     dropout: 0.0
