@@ -22,10 +22,12 @@ Methods
   gp_mle_dot_product : GP posterior with MLE-fitted linear/dot-product kernel
                        (variance + noise term fitted), fit in raw y-space
   gp_mle_polynomial  : GP posterior with MLE-fitted Polynomial kernel,
-                       k(x1,x2) = alpha2 * (x1^Tx2 + c)^d — degree d fixed
+                       k(x1,x2) = alpha2 * (x1^Tx2 + c)^d — degree d searched
+                       over every value in [poly_power_min, poly_power_max]
                        (gpytorch.kernels.PolynomialKernel takes it as a plain
-                       int, not a differentiable parameter), offset c +
-                       outputscale + noise fitted, fit in raw y-space
+                       int, not a differentiable parameter, so each candidate
+                       is a separate fit; see _poly_degree_candidates), offset
+                       c + outputscale + noise fitted, fit in raw y-space
   dkl_rbf/matern32/rq/dot_product :
                        Deep Kernel Learning — MLP(d_x->32->16) feature extractor
                        feeding a GP layer (chosen kernel), fit in raw y-space,
@@ -106,6 +108,16 @@ EXPECTED_BASELINE_KEYS = frozenset(
     | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
 )
 
+# Bump whenever a baseline's *fitting algorithm* changes in a way that
+# baseline_fingerprint's other inputs (gen_cfg.data, oracle_mode, step
+# counts, ...) wouldn't otherwise detect — e.g. gp_mle_polynomial switching
+# from a single fixed degree to searching every degree in
+# [poly_power_min, poly_power_max] (see _poly_degree_candidates) uses the
+# exact same gen_cfg.data as before, so without this the fingerprint would
+# match an old cache built under the old fixed-degree fit and silently keep
+# serving it as if it were still correct.
+_BASELINE_ALGO_VERSION = 1
+
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
     """Copula NLL for a single (N, N) correlation matrix and (N,) z-vector."""
@@ -137,13 +149,35 @@ _ARD_ELIGIBLE = {
     "polynomial": False,
 }
 
-# Fixed degree for the gp_mle_polynomial baseline. gpytorch.kernels.
-# PolynomialKernel takes `power` as a plain Python int baked into forward()'s
-# .pow(self.power) call, not a registered (constrained) Parameter — so unlike
-# offset/outputscale/noise it cannot be optimised by Adam and must be fixed
-# ahead of fitting. 2 mirrors data_gen.py's poly_power_min default (the low
-# end of the episode-generating poly_power_min/poly_power_max range).
+# Fallback degree for the gp_mle_polynomial baseline, used only when a caller
+# builds an _ExactGPModel(kernel_name="polynomial") without specifying
+# poly_power explicitly. gpytorch.kernels.PolynomialKernel takes `power` as a
+# plain Python int baked into forward()'s .pow(self.power) call, not a
+# registered (constrained) Parameter — so unlike offset/outputscale/noise it
+# cannot be optimised by Adam and must be fixed ahead of fitting. 2 mirrors
+# data_gen.py's poly_power_min default (the low end of the
+# episode-generating poly_power_min/poly_power_max range). The actual
+# gp_mle_polynomial baseline below no longer uses this fallback: it searches
+# every degree in that same [poly_power_min, poly_power_max] range instead of
+# guessing one fixed degree — see _poly_degree_candidates.
 _POLY_BASELINE_POWER = 2
+
+
+def _poly_degree_candidates(prior_cfg: dict) -> list[int]:
+    """Every integer degree data_gen.py's generative process can sample for a
+    polynomial-kernel episode: Uniform{poly_power_min, ..., poly_power_max}
+    (see data_gen.py's `if name == "polynomial":` branch). A real baseline
+    never has oracle access to which degree generated a given episode, so
+    gp_mle_polynomial fits one GP per candidate degree here (each with its
+    own n_restarts restarts — see fit_and_eval_gpytorch) and keeps whichever
+    reaches the best training loss, instead of assuming a single fixed
+    degree and being systematically misspecified whenever the true episode
+    used a different one.
+    """
+    power_min = int(prior_cfg.get("poly_power_min", 2))
+    power_max = int(prior_cfg.get("poly_power_max", 4))
+    return list(range(power_min, power_max + 1))
+
 
 # Default hyperprior constants, mirroring data_gen.py's _kernel_prior_spec /
 # _nugget_prior fallback defaults (the actual per-dataset values live in the
@@ -272,6 +306,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         ard_num_dims: int | None = None,
         feature_extractor: nn.Module | None = None,
         kernel_priors: dict[str, Prior] | None = None,
+        poly_power: int = _POLY_BASELINE_POWER,
     ) -> None:
         super().__init__(X_train, y_train, likelihood)
         self.feature_extractor = feature_extractor
@@ -299,7 +334,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         elif kernel_name == "dot_product":
             base = gpytorch.kernels.LinearKernel(variance_prior=kp.get("variance_prior"))
         elif kernel_name == "polynomial":
-            base = gpytorch.kernels.PolynomialKernel(power=_POLY_BASELINE_POWER, offset_prior=kp.get("offset_prior"))
+            base = gpytorch.kernels.PolynomialKernel(power=poly_power, offset_prior=kp.get("offset_prior"))
         else:
             raise ValueError(f"Unknown kernel: {kernel_name}")
 
@@ -378,6 +413,16 @@ def fit_and_eval_gpytorch(
     inits (each sampled from those same priors — see _randomize_init),
     keeping whichever restart reaches the best final training loss.
 
+    kernel_name="polynomial" additionally loops over every integer degree in
+    prior_cfg's [poly_power_min, poly_power_max] range (see
+    _poly_degree_candidates) — the one hyperparameter PolynomialKernel can't
+    expose to Adam — running the full n_restarts fit at each candidate degree
+    and keeping the overall best (degree, restart) combination. This makes
+    gp_mle_polynomial a spectrum-wide model-selection baseline covering the
+    same degree range the episodes are actually generated from, rather than
+    being systematically misspecified whenever an episode's true degree
+    differs from one hardcoded guess.
+
     When feature_extractor is given (DKL), training instead holds out a 20%
     validation split of X_train/y_train and keeps whichever training step's
     weights reached the best held-out predictive NLL, instead of just running
@@ -429,75 +474,99 @@ def fit_and_eval_gpytorch(
     else:
         X_fit, y_fit = X_train, y_train
 
+    # Only "polynomial" has a degree to search: every other kernel_name gets
+    # a single-element list so the loop below is a no-op restructuring for
+    # them (poly_power is simply ignored by _ExactGPModel in that case).
+    poly_powers = _poly_degree_candidates(prior_cfg or {}) if kernel_name == "polynomial" else [_POLY_BASELINE_POWER]
+
     best_loss: float | None = None
     best_model: _ExactGPModel | None = None
     best_likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
 
-    for _ in range(max(1, n_restarts)):
-        # Mirrors the previous hand-rolled code's log_noise clamp range
-        # (exp(-8)..exp(2)) — keeps optimisation stable / prevents noise
-        # collapsing to (near-)zero. Built fresh every restart: gpytorch's
-        # Interval holds its bounds as plain (non-parameter) tensors, so
-        # reusing one Interval instance across multiple GaussianLikelihoods
-        # in this loop means the *next* likelihood constructed from it
-        # inherits whatever device the *previous* iteration's `.to(device)`
-        # left those bounds on, in-place — a shared-mutable-state footgun
-        # that surfaces as a CPU/CUDA device-mismatch on restart 2+.
-        noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
-        likelihood = gpytorch.likelihoods.GaussianLikelihood(
-            noise_constraint=noise_constraint, noise_prior=noise_prior,
+    for poly_power in poly_powers:
+        for _ in range(max(1, n_restarts)):
+          try:
+            # Mirrors the previous hand-rolled code's log_noise clamp range
+            # (exp(-8)..exp(2)) — keeps optimisation stable / prevents noise
+            # collapsing to (near-)zero. Built fresh every restart: gpytorch's
+            # Interval holds its bounds as plain (non-parameter) tensors, so
+            # reusing one Interval instance across multiple GaussianLikelihoods
+            # in this loop means the *next* likelihood constructed from it
+            # inherits whatever device the *previous* iteration's `.to(device)`
+            # left those bounds on, in-place — a shared-mutable-state footgun
+            # that surfaces as a CPU/CUDA device-mismatch on restart 2+.
+            noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
+            likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=noise_constraint, noise_prior=noise_prior,
+            )
+            # Sampled (not fixed at 0.1) so restarts are actually independent —
+            # clamped strictly inside noise_constraint's open interval.
+            likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(X_train.device).clamp(
+                min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
+            )
+
+            model = _ExactGPModel(
+                X_fit, y_fit, likelihood, kernel_name,
+                ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
+                kernel_priors=kernel_priors, poly_power=poly_power,
+            ).to(X_train.device)
+            _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
+
+            model.train()
+            likelihood.train()
+            opt = Adam(model.parameters(), lr=lr)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+            best_step_val: float = float("inf")
+            best_step_state: tuple[dict, dict] | None = None
+            loss = None
+            for step in range(n_steps):
+                opt.zero_grad()
+                loss = -mll(model(X_fit), y_fit)
+                loss.backward()
+                opt.step()
+
+                if use_val and (step % val_every == 0 or step == n_steps - 1):
+                    model.eval()
+                    likelihood.eval()
+                    with torch.no_grad():
+                        val_nll = -likelihood(model(X_val)).log_prob(y_val).item() / X_val.shape[0]
+                    model.train()
+                    likelihood.train()
+                    if val_nll < best_step_val:
+                        best_step_val = val_nll
+                        best_step_state = (
+                            copy.deepcopy(model.state_dict()),
+                            copy.deepcopy(likelihood.state_dict()),
+                        )
+
+            if use_val:
+                model.load_state_dict(best_step_state[0])
+                likelihood.load_state_dict(best_step_state[1])
+                final_loss = best_step_val
+            else:
+                final_loss = loss.item()
+
+            if best_loss is None or final_loss < best_loss:
+                best_loss, best_model, best_likelihood = final_loss, model, likelihood
+          except Exception as exc:
+            # Higher polynomial degrees raise the raw dot-product to a larger
+            # power, which can blow up K_ff's conditioning far more easily
+            # than degree 2 ever did (this loop previously only ever tried
+            # degree 2, so a NotPSDError here is a real consequence of now
+            # searching the full [poly_power_min, poly_power_max] range, not
+            # a pre-existing failure mode). One bad (degree, restart)
+            # combination shouldn't discard every other candidate that fit
+            # fine — skip it and keep searching; only actually failing every
+            # single one raises (via best_model still being None below).
+            print(f"  [gp_mle_polynomial power={poly_power}] restart failed: {exc}")
+            continue
+
+    if best_model is None:
+        raise RuntimeError(
+            f"fit_and_eval_gpytorch(kernel_name={kernel_name!r}): every candidate degree/restart "
+            f"combination in {poly_powers} failed (see printed exceptions above)."
         )
-        # Sampled (not fixed at 0.1) so restarts are actually independent —
-        # clamped strictly inside noise_constraint's open interval.
-        likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(X_train.device).clamp(
-            min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
-        )
-
-        model = _ExactGPModel(
-            X_fit, y_fit, likelihood, kernel_name,
-            ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
-            kernel_priors=kernel_priors,
-        ).to(X_train.device)
-        _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
-
-        model.train()
-        likelihood.train()
-        opt = Adam(model.parameters(), lr=lr)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-
-        best_step_val: float = float("inf")
-        best_step_state: tuple[dict, dict] | None = None
-        loss = None
-        for step in range(n_steps):
-            opt.zero_grad()
-            loss = -mll(model(X_fit), y_fit)
-            loss.backward()
-            opt.step()
-
-            if use_val and (step % val_every == 0 or step == n_steps - 1):
-                model.eval()
-                likelihood.eval()
-                with torch.no_grad():
-                    val_nll = -likelihood(model(X_val)).log_prob(y_val).item() / X_val.shape[0]
-                model.train()
-                likelihood.train()
-                if val_nll < best_step_val:
-                    best_step_val = val_nll
-                    best_step_state = (
-                        copy.deepcopy(model.state_dict()),
-                        copy.deepcopy(likelihood.state_dict()),
-                    )
-
-        if use_val:
-            model.load_state_dict(best_step_state[0])
-            likelihood.load_state_dict(best_step_state[1])
-            final_loss = best_step_val
-        else:
-            final_loss = loss.item()
-
-        if best_loss is None or final_loss < best_loss:
-            best_loss, best_model, best_likelihood = final_loss, model, likelihood
-
     model, likelihood = best_model, best_likelihood
     if use_val:
         # The val split only mattered for picking which training step's
@@ -934,6 +1003,7 @@ def baseline_fingerprint(
     """
     data_cfg = OmegaConf.select(gen_cfg, "data", default=None)
     return {
+        "algo_version": _BASELINE_ALGO_VERSION,
         "data_cfg": OmegaConf.to_container(data_cfg) if data_cfg is not None else {},
         "icl_rank": icl_rank,
         "live_generate": live_generate,
