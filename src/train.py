@@ -982,6 +982,17 @@ def main(cfg: DictConfig) -> None:
     )
     gpu_peak_flops = get_gpu_peak_flops() if device == "cuda" else None
     if device == "cuda":
+        # TF32 tensor-core matmul on Ampere+/Ada+/Hopper: NOT enabled by torch
+        # by default, even though the model's own forward already runs under
+        # bf16 autocast. What that autocast doesn't cover — Muon's Newton-
+        # Schulz orthogonalization (src/muon.py, fp32 grad-derived matmuls,
+        # confirmed the single most expensive part of each step: bwd+opt time
+        # is several times forward time in profiling) and y_space_nll's
+        # Cholesky/logdet path — still runs fp32 matmuls at full CUDA-core
+        # precision without this. One-line, ~free win (negligible accuracy
+        # cost, standard recommendation for Ampere+) that raises MFU's
+        # numerator directly. See torch.set_float32_matmul_precision docs.
+        torch.set_float32_matmul_precision("high")
         print(
             f"[train] GPU: {torch.cuda.get_device_name(0)} — assumed peak "
             f"{gpu_peak_flops / 1e12:.0f} TFLOPS (dense bf16/fp16 tensor core) for MFU"
