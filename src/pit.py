@@ -28,6 +28,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -106,6 +107,44 @@ def _probit(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Clamp u to (eps, 1-eps) then apply Φ⁻¹ via erfinv."""
     u = u.clamp(eps, 1.0 - eps)
     return torch.erfinv(2.0 * u - 1.0) * math.sqrt(2.0)
+
+
+def normalize_targets(
+    y_train: torch.Tensor, y_test: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Z-score targets to the scale the frozen TabICL quantile head expects.
+
+    ``run_pit`` (and the raw TabICL module it wraps) does no target scaling
+    of its own — unlike ``tabicl.TabICLRegressor.fit()``, which always fits
+    a fresh StandardScaler on y before calling this same underlying model
+    (see ``tabicl_upstream/.../_sklearn/regressor.py``). Every call site
+    that hands ``y`` to ``run_pit`` (or the raw module directly) must
+    replicate that scaling first, or absolute-scale targets (e.g. real-world
+    units, or a synthetic draw with a random GammaPrior-drawn outputscale)
+    saturate the frozen quantile head's CDF into its extreme tail for every
+    point alike, collapsing the returned PIT residuals'/quantiles' spread
+    instead of reflecting the true per-point rank.
+
+    ``y_test``, if given, is scaled with ``y_train``'s own mean/std (never
+    its own) — mirrors ``TabICLRegressor.fit()``, which fits its scaler on
+    training data only, and matches every real deployment where test
+    targets are unknown at normalization time.
+
+    Args:
+        y_train : (P,) training targets, raw scale.
+        y_test  : optional (N,) test targets, raw scale.
+
+    Returns:
+        (y_train_scaled, y_test_scaled_or_None, mean, std). ``mean``/``std``
+        are needed to un-scale any raw-y-unit output (e.g. a quantile
+        value) or Jacobian-correct any log-density output computed from the
+        scaled call: ``log p_raw(y) = log p_scaled(y_scaled) - log(std)``.
+    """
+    mean = y_train.mean()
+    std = y_train.std().clamp(min=1e-8)
+    y_train_scaled = (y_train - mean) / std
+    y_test_scaled = (y_test - mean) / std if y_test is not None else None
+    return y_train_scaled, y_test_scaled, mean, std
 
 
 # ---------------------------------------------------------------------------
