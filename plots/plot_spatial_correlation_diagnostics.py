@@ -291,10 +291,12 @@ def _plot_field_grid(
     lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, true_fields: list, col_titles: list,
     output_path: str, row0_label: str, suptitle: str,
     predicted_fields: "list[np.ndarray] | None" = None,
+    predicted_fields_2: "list[np.ndarray] | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
     oracle_fields: "list[np.ndarray] | None" = None,
     context_coords: "np.ndarray | None" = None,
     pred_row_label: str = "Copula model\n(predicted)\n +marginal\nLatitude",
+    pred2_row_label: str = "Copula model\n(2nd variant)\nLatitude",
     indep_row_label: str = "Independent\n(no copula)\nLatitude",
     oracle_row_label: str = "Oracle correlation\n+ marginal\nLatitude",
     xlabel: str = "Longitude", cbar_label: str = "Residual (deg C)",
@@ -302,23 +304,30 @@ def _plot_field_grid(
     """Shared small-multiples renderer behind both plot_residual_grid (real
     ERA5 days) and plot_synthetic_residual_grid (synthetic GP draws): top row
     `true_fields` (already grid_shape-shaped), then an optional
-    oracle-correlation row, then optional predicted/independent rows below
-    (flat (D,) arrays, reshaped to grid_shape here) -- see plot_residual_grid's
-    docstring for the row semantics this preserves. `oracle_fields` is only
-    ever passed by plot_synthetic_residual_grid (the real-ERA5 branch has no
-    oracle covariance), inserted right below ground truth so the row order
-    reads: ground truth -> best-case copula (oracle correlation) -> actual
-    model (R_pred) -> no-correlation baseline. All rows share one color scale
+    oracle-correlation row, then optional predicted/predicted_2/independent
+    rows below (flat (D,) arrays, reshaped to grid_shape here) -- see
+    plot_residual_grid's docstring for the row semantics this preserves.
+    `oracle_fields` is only ever passed by plot_synthetic_residual_grid (the
+    real-ERA5 branch has no oracle covariance), inserted right below ground
+    truth so the row order reads: ground truth -> best-case copula (oracle
+    correlation) -> predicted (R_pred) -> optional 2nd predicted variant ->
+    no-correlation baseline. `predicted_fields_2` is likewise only ever
+    passed by plot_synthetic_residual_grid, to show a second copula-model
+    row (predicted with a different z_train source) right below
+    `predicted_fields` -- see run_synthetic_mode's true-z_train vs.
+    TabICLv2-estimated-z_train comparison. All rows share one color scale
     and the Moran's I annotation (see morans_i) so both callers render
     pixel-identically."""
     has_pred = predicted_fields is not None
+    has_pred2 = predicted_fields_2 is not None
     has_indep = independent_fields is not None
     has_oracle = oracle_fields is not None
     pred_grids = [f.reshape(grid_shape) for f in predicted_fields] if has_pred else []
+    pred2_grids = [f.reshape(grid_shape) for f in predicted_fields_2] if has_pred2 else []
     indep_grids = [f.reshape(grid_shape) for f in independent_fields] if has_indep else []
     oracle_grids = [f.reshape(grid_shape) for f in oracle_fields] if has_oracle else []
 
-    vmax = float(np.max(np.abs(true_fields + pred_grids + indep_grids + oracle_grids)))
+    vmax = float(np.max(np.abs(true_fields + pred_grids + pred2_grids + indep_grids + oracle_grids)))
 
     def _annotate_morans_i(ax, field):
         # See morans_i's docstring: smoothness of THIS single snapshot, not the
@@ -330,7 +339,7 @@ def _plot_field_grid(
         )
 
     n_cols = len(true_fields)
-    n_rows = 1 + int(has_oracle) + int(has_pred) + int(has_indep)
+    n_rows = 1 + int(has_oracle) + int(has_pred) + int(has_pred2) + int(has_indep)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False)
     mesh = None
     for j, (title, field) in enumerate(zip(col_titles, true_fields)):
@@ -360,6 +369,9 @@ def _plot_field_grid(
         row += 1
     if has_pred:
         mesh = _plot_row(row, pred_grids, pred_row_label)
+        row += 1
+    if has_pred2:
+        mesh = _plot_row(row, pred2_grids, pred2_row_label)
         row += 1
     if has_indep:
         mesh = _plot_row(row, indep_grids, indep_row_label)
@@ -426,28 +438,42 @@ def plot_residual_grid(
 
 def plot_synthetic_residual_grid(
     grid_y: np.ndarray, grid_x: np.ndarray, grid_shape: tuple,
-    true_fields: list, predicted_fields: list, independent_fields: list,
+    true_fields: list, predicted_fields_true_z: list, predicted_fields_tabicl_z: list,
+    independent_fields: list,
     output_path: str, context_coords: "np.ndarray | None" = None,
     oracle_fields: "list[np.ndarray] | None" = None,
 ) -> None:
     """Synthetic-mode analogue of plot_residual_grid: one column per
     independent GP draw from the sampled ground-truth kernel (see
     run_synthetic_mode) instead of one column per real ERA5 day, with the
-    SAME four rows (ground truth / oracle-correlation+marginal /
-    copula-predicted / independent) and shared color scale / Moran's I
+    SAME five rows (ground truth / oracle-correlation+marginal /
+    copula-predicted-with-true-z_train / copula-predicted-with-TabICLv2-
+    estimated-z_train / independent) and shared color scale / Moran's I
     annotation, via the same _plot_field_grid renderer plot_residual_grid
     uses. `oracle_fields` (see run_synthetic_mode) reuses the TabICLv2
-    marginal from the predicted row but with the TRUE kernel correlation
+    marginal from the predicted rows but with the TRUE kernel correlation
     matrix instead of the model's R_pred, isolating correlation-estimation
     error from marginal-estimation error -- optional so plot_residual_grid's
-    real-ERA5 caller (which has no oracle covariance) is unaffected."""
+    real-ERA5 caller (which has no oracle covariance) is unaffected.
+    `predicted_fields_true_z` (see extract_model_true_z_train_correlation)
+    and `predicted_fields_tabicl_z` (see extract_model_context_correlation)
+    are the SAME copula-model forward pass, differing only in whether
+    z_train is the exact GP leave-one-out value (only knowable here, since
+    synthetic mode is the one setting where the true generating kernel is
+    known) or TabICLv2's practical K-fold PIT estimate of it -- isolating
+    how much of the sim-to-real gap comes from z_train estimation error
+    alone, on top of the correlation-estimation error the oracle row
+    already isolates."""
     col_titles = [f"draw {i + 1}" for i in range(len(true_fields))]
     _plot_field_grid(
         grid_y, grid_x, grid_shape, true_fields, col_titles, output_path,
         row0_label="Ground truth\n(synthetic kernel)\ny", suptitle="Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
-        predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
+        predicted_fields=predicted_fields_true_z, predicted_fields_2=predicted_fields_tabicl_z,
+        independent_fields=independent_fields, context_coords=context_coords,
         oracle_fields=oracle_fields,
-        pred_row_label="Copula model\n(predicted)\ny", indep_row_label="Independent\n(no copula)\ny",
+        pred_row_label="Copula model\n(true z_train)\ny",
+        pred2_row_label="Copula model\n(TabICLv2 z_train)\ny",
+        indep_row_label="Independent\n(no copula)\ny",
         oracle_row_label="Oracle correlation\n+ TabICLv2 marginal\ny",
         xlabel="x", cbar_label="Field value",
     )
@@ -497,6 +523,17 @@ def load_marginal_tabicl(cfg, device: str):
     from src.pit import load_tabicl
 
     return load_tabicl(cfg.tabicl.ckpt, device)
+
+
+def _normalize_context_coords(context_coords: np.ndarray, coords_test: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+    """Standardize `coords_test` by `context_coords`' own mean/std (zero mean,
+    unit variance) -- the same x-normalization convention
+    extract_model_context_correlation and extract_model_true_z_train_correlation
+    both need before a _forward_correlation call, factored out so it's
+    defined in exactly one place."""
+    x_mean = context_coords.mean(axis=0, keepdims=True)
+    x_std = context_coords.std(axis=0, keepdims=True).clip(min=1e-8)
+    return (context_coords - x_mean) / x_std, (coords_test - x_mean) / x_std
 
 
 def _forward_correlation(model, device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray) -> np.ndarray:
@@ -598,10 +635,7 @@ def extract_model_context_correlation(
     transform is scale-invariant for a perfect F_hat), only how well the
     imperfect, saturating quantile head can resolve them.
     """
-    x_mean = context_coords.mean(axis=0, keepdims=True)
-    x_std = context_coords.std(axis=0, keepdims=True).clip(min=1e-8)
-    x_train_norm = (context_coords - x_mean) / x_std
-    x_test_norm = (coords_test - x_mean) / x_std
+    x_train_norm, x_test_norm = _normalize_context_coords(context_coords, coords_test)
 
     y_mean = context_values.mean()
     y_std = max(context_values.std(), 1e-8)
@@ -622,6 +656,56 @@ def extract_model_context_correlation(
         z_train = pit_out["z_train"].squeeze(-1).cpu().numpy()  # (P,)
 
     return _forward_correlation(model, device, x_train_norm, z_train, x_test_norm)
+
+
+def _exact_gp_loo_z_train(K_ff: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Exact zero-mean GP leave-one-out PIT z-scores (Rasmussen & Williams,
+    GPML Eq. 5.12), computed directly from the TRUE synthetic kernel
+    covariance restricted to the context points -- the noise-free "true
+    z_train" that extract_model_true_z_train_correlation conditions on,
+    as opposed to extract_model_context_correlation's TabICLv2 K-fold PIT
+    *estimate* of the same quantity (run_pit). Synthetic mode's
+    context_values ARE exact zero-mean draws from `K_ff` by construction
+    (see run_synthetic_mode's z_true = L @ standard_normal), so this is
+    available in closed form here -- unlike real data, where the
+    generating kernel is unknown and z_train can only be estimated from a
+    learned marginal. Same formula as src/pit.py::gp_analytical_pit's train
+    branch, re-derived here directly from a raw numpy covariance matrix
+    instead of a data_gen.py task dict (this script's synthetic covariance
+    comes from sample_simple_kernel_covariance, not generate_gp_task, so no
+    task dict exists to hand to gp_analytical_pit):
+
+        alpha = K_ff^-1 y
+        z_train[i] = alpha_i / sqrt([K_ff^-1]_ii)
+    """
+    from scipy.linalg import cho_solve, solve_triangular
+
+    from generate_plots import _safe_cholesky
+
+    L = _safe_cholesky(K_ff)
+    alpha = cho_solve((L, True), y)
+    L_inv = solve_triangular(L, np.eye(L.shape[0]), lower=True)
+    K_inv_diag = np.clip(np.sum(L_inv ** 2, axis=0), 1e-12, None)
+    return alpha / np.sqrt(K_inv_diag)
+
+
+def extract_model_true_z_train_correlation(
+    model, device, context_coords: np.ndarray, K_ff_context: np.ndarray,
+    context_values: np.ndarray, coords_test: np.ndarray,
+) -> np.ndarray:
+    """Extract the model's correlation matrix conditioned on the EXACT GP
+    leave-one-out z_train (_exact_gp_loo_z_train) instead of
+    extract_model_context_correlation's TabICLv2 K-fold PIT *estimate* of
+    the same quantity -- the "if the model were handed the true z_train"
+    reference this script's synthetic branch compares its practical
+    TabICLv2-estimated counterpart against, since synthetic mode is the one
+    setting where the true generating kernel (and hence the true z_train)
+    is actually known. Same forward pass as extract_model_context_correlation
+    (see _forward_correlation), only the z_train source differs.
+    """
+    x_train_norm, x_test_norm = _normalize_context_coords(context_coords, coords_test)
+    z_train_true = _exact_gp_loo_z_train(K_ff_context, context_values)
+    return _forward_correlation(model, device, x_train_norm, z_train_true, x_test_norm)
 
 
 # ---------------------------------------------------------------------------
@@ -701,14 +785,23 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
     over context days) -- then plots the SAME three diagnostics as the real
     branch: distance-vs-correlation, heatmap comparison (both via
     generate_plots.plot_spatial_correlation_diagnostics), and the
-    ground-truth/oracle-correlation/predicted/independent field small-multiples
-    (via plot_synthetic_residual_grid, sharing predict_copula_residual_field
-    with the real branch's plot_residual_grid). The oracle-correlation row
-    isolates correlation-estimation error from marginal-estimation error: it
-    reuses the model's real TabICLv2 marginal (same as the predicted row) but
+    ground-truth/oracle-correlation/predicted-true-z/predicted-TabICLv2-z/
+    independent field small-multiples (via plot_synthetic_residual_grid,
+    sharing predict_copula_residual_field with the real branch's
+    plot_residual_grid). The oracle-correlation row isolates
+    correlation-estimation error from marginal-estimation error: it reuses
+    the model's real TabICLv2 marginal (same as the predicted rows) but
     injects the TRUE kernel's correlation matrix instead of the model's own
     R_pred, holding the shared latent noise fixed so the only difference from
-    the predicted row is Sigma_hat (model) vs. Sigma_true (oracle).
+    the predicted rows is Sigma_hat (model) vs. Sigma_true (oracle). The two
+    predicted rows in turn isolate z_train-estimation error specifically:
+    both condition the SAME model forward pass on the SAME context, differing
+    only in whether z_train is the exact GP leave-one-out value
+    (extract_model_true_z_train_correlation, only knowable here since
+    synthetic mode is the one setting where the true kernel is known) or
+    TabICLv2's K-fold PIT estimate of it (extract_model_context_correlation)
+    -- the latter is what real, non-synthetic data (ERA5) must always use,
+    since its true generating process is unknown.
     """
     import torch
 
@@ -746,30 +839,43 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
               f"under 1% of the field.")
     context_idx = rng.choice(D, size=n_context, replace=False)
     context_coords = coords[context_idx]
+    # True kernel covariance restricted to the context points -- the "known
+    # generating kernel" _exact_gp_loo_z_train needs to compute the exact
+    # (as opposed to TabICLv2 K-fold PIT-estimated) z_train below. Fixed
+    # across draws since context_idx itself doesn't change per draw.
+    K_ff_context = true_cov[np.ix_(context_idx, context_idx)]
 
     L = _safe_cholesky(true_cov)
     R_indep = np.eye(D)
-    R_pred_draws, true_fields, predicted_fields, independent_fields, oracle_marginal_fields = [], [], [], [], []
+    R_pred_draws, true_fields = [], []
+    predicted_fields_true_z, predicted_fields_tabicl_z = [], []
+    independent_fields, oracle_marginal_fields = [], []
     for i in range(args.n_synthetic_draws):
         z_true = L @ rng.standard_normal(D)
         context_values = z_true[context_idx]
         print(f"Extracting the joint copula correlation matrix with real context "
               f"(synthetic draw {i + 1}/{args.n_synthetic_draws})...")
-        R_pred = extract_model_context_correlation(
+        R_pred_tabicl_z = extract_model_context_correlation(
             model, device, tabicl_marginal, context_coords, context_values, coords, k_folds=args.pit_k_folds,
         )
-        R_pred_draws.append(R_pred)
+        R_pred_true_z = extract_model_true_z_train_correlation(
+            model, device, context_coords, K_ff_context, context_values, coords,
+        )
+        R_pred_draws.append(R_pred_tabicl_z)
         true_fields.append(z_true)
 
-        # Same shared latent noise for all three draws below (see
+        # Same shared latent noise for all four draws below (see
         # predict_copula_residual_field's docstring): isolates what each of the
-        # learned cross-location correlation (R_pred) and the oracle correlation
-        # (R_true) add on top of the same per-point marginal prediction, rather
-        # than an unrelated random redraw -- same convention the real branch's
-        # main() loop uses.
+        # learned cross-location correlation (R_pred_true_z / R_pred_tabicl_z)
+        # and the oracle correlation (R_true) add on top of the same per-point
+        # marginal prediction, rather than an unrelated random redraw -- same
+        # convention the real branch's main() loop uses.
         z_shared = rng.standard_normal(D)
-        predicted_fields.append(
-            predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_pred, device, z_shared)
+        predicted_fields_true_z.append(
+            predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_pred_true_z, device, z_shared)
+        )
+        predicted_fields_tabicl_z.append(
+            predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_pred_tabicl_z, device, z_shared)
         )
         oracle_marginal_fields.append(
             predict_copula_residual_field(tabicl_marginal, context_coords, context_values, coords, R_true, device, z_shared)
@@ -783,11 +889,12 @@ def run_synthetic_mode(args, rng, model, cfg, device, tabicl_marginal, tag: str)
     plot_generic_diagnostics(predicted_cov, coords, true_cov=true_cov, tag=tag)
 
     print(f"Plotting the synthetic ground-truth vs. oracle-correlation vs. copula-model-predicted "
-          f"fields for {args.n_synthetic_draws} draws on the same grid...")
+          f"(true z_train vs. TabICLv2-estimated z_train) fields for {args.n_synthetic_draws} draws "
+          f"on the same grid...")
     grid_shape = (grid_size, grid_size)
     true_grids = [f.reshape(grid_shape) for f in true_fields]
     plot_synthetic_residual_grid(
-        axis, axis, grid_shape, true_grids, predicted_fields, independent_fields,
+        axis, axis, grid_shape, true_grids, predicted_fields_true_z, predicted_fields_tabicl_z, independent_fields,
         os.path.join(_PLOTS_DIR, f"residual_grid_{tag}.png"), context_coords=context_coords,
         oracle_fields=oracle_marginal_fields,
     )
