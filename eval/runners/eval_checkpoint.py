@@ -564,6 +564,20 @@ def main() -> None:
                              "that's < 2 report best_baseline=nan (excluded from its "
                              "mean/std, not silently zero) instead of forcing a low-"
                              "confidence selection.")
+    parser.add_argument("--min_test_points", type=int, default=None,
+                        help="Floor on eval episodes' test-point count N, so every episode "
+                             "is valid for the nested-CV best_baseline selection (see "
+                             "--min_fold_size: _select_best_baseline_cv needs n_test // "
+                             "min_fold_size >= 2 folds, i.e. n_test >= 2 * min_fold_size, "
+                             "or it reports best_baseline=nan for that episode — silently "
+                             "excluding it from the summary table's best_baseline mean while "
+                             "every other row's mean still includes it). Default: "
+                             "2 * --min_fold_size (40 under the argparse defaults). For "
+                             "--live_generate (the default), this raises cfg.data.N_min for "
+                             "this run only — conf/data/gp_tasks.yaml's own N_min=8, and "
+                             "hence training's distribution, is untouched. For --dataset_dir, "
+                             "episode sizes are fixed by the pre-built dataset and can't be "
+                             "regenerated, so episodes below this floor are skipped instead.")
     parser.add_argument("--oracle_mode",  default=None, choices=["prior", "posterior"],
                         help="How R_star was built for this dataset. Determines whether "
                              "GP-MLE/DKL score the fitted kernel's posterior (conditioned "
@@ -663,12 +677,24 @@ def main() -> None:
     plot_best_key: str | None = None
     plot_best_R: Tensor | None = None
 
+    # Eval-only floor on episodes' test-point count N (see --min_test_points'
+    # help text) — 2 * --min_fold_size by default, the minimum n_test
+    # _select_best_baseline_cv needs for >=2 CV folds.
+    min_test_points = args.min_test_points if args.min_test_points is not None else 2 * args.min_fold_size
+
     if live_generate:
         # cfg (the fixed eval-generating config, not icl_cfg) drives live
         # generation — same source already used for prior_cfg above — so
         # every checkpoint evaluated against this --config gets identical
         # episodes for a given seed, regardless of what that checkpoint was
         # itself trained on.
+        if cfg.data.N_min < min_test_points:
+            print(f"Raising eval episode N_min {cfg.data.N_min} -> {min_test_points} "
+                  f"(--min_test_points) for this run only — training's own "
+                  "conf/data/gp_tasks.yaml N_min is untouched")
+            cfg.data.N_min = min_test_points
+            if cfg.data.N_max < cfg.data.N_min:
+                cfg.data.N_max = cfg.data.N_min
         print(f"\nLive-generating {n_ep} episodes via generate_gp_batch "
               f"(return_kernel_metadata=True), seed={args.seed}, "
               "alternating every-other episode to a non-composite kernel")
@@ -704,6 +730,12 @@ def main() -> None:
                 print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")
                 continue
             ep = dataset[ep_i]
+            n_test = ep["z_test"].shape[0]
+            if n_test < min_test_points:
+                print(f"  [ep {ep_i}] only {n_test} test points (< --min_test_points="
+                      f"{min_test_points}), skipping — best_baseline needs enough for "
+                      ">=2 nested-CV folds")
+                continue
 
         cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, local_i, ep_i)
         cached = cache_entries.get(cache_key) if (use_cache and not args.refresh_baselines) else None
