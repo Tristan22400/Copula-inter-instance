@@ -4,6 +4,3 @@
 [submodule "pfns4bo_upstream"]
 	path = pfns4bo_upstream
 	url = https://github.com/automl/PFNs4BO.git
-[submodule "tempopfn_upstream"]
-	path = tempopfn_upstream
-	url = https://github.com/automl/TempoPFN.git
