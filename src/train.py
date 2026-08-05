@@ -344,6 +344,26 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     return batches
 
 
+def _resolve_pit_ckpt(cfg) -> str | None:
+    """Which checkpoint (if any) to load as the frozen TabICL marginal for
+    the z_train sim-to-real diagnostic (see _build_tabicl_val_z below).
+
+    This is a separate model instance from the backbone this run actually
+    trains, so its checkpoint is its own knob (tabicl.pit_ckpt) rather than
+    reusing tabicl.pretrained/tabicl.ckpt (which describe this run's own
+    backbone) — a from-scratch backbone (tabicl.pretrained=false, e.g.
+    copula_nano) can still opt in by setting pit_ckpt explicitly, since
+    PIT-ing val episodes with a released checkpoint's quantile head doesn't
+    depend on this run's own architecture. Defaults to tabicl.ckpt when the
+    backbone itself is pretrained (copula_prod's original behaviour), else
+    None (diagnostic off) unless pit_ckpt is set explicitly.
+    """
+    pit_ckpt = cfg.tabicl.get("pit_ckpt", None)
+    if pit_ckpt is None and bool(cfg.tabicl.get("pretrained", True)):
+        pit_ckpt = cfg.tabicl.get("ckpt", None)
+    return pit_ckpt
+
+
 @torch.no_grad()
 def _build_tabicl_val_z(
     val_loader, tabicl_marginal: nn.Module, k_folds: int, device: str,
@@ -1220,14 +1240,13 @@ def main(cfg: DictConfig) -> None:
     # do_plot block): needs a second, frozen TabICL copy with its native
     # quantile head intact (unlike the copula model's backbone, which has it
     # stripped — see model.py:CopulaTabICL) to PIT the val episodes the same
-    # way real (non-GP) deployment data would be. No quantile head exists
-    # when the backbone is trained from scratch, so this is skipped then —
-    # same condition plot_spatial_correlation_diagnostics.py's
-    # _load_tabicl_marginal uses for the real-data analogue of this check.
+    # way real (non-GP) deployment data would be. See _resolve_pit_ckpt for
+    # which checkpoint (if any) that uses.
+    pit_ckpt = _resolve_pit_ckpt(cfg)
     tabicl_val_z: dict = {}
-    if baselines_on and bool(cfg.tabicl.get("pretrained", True)):
+    if baselines_on and pit_ckpt:
         print("[train] Loading frozen TabICL marginal for the z_train sim-to-real diagnostic...")
-        tabicl_marginal = load_tabicl(cfg.tabicl.ckpt, device)
+        tabicl_marginal = load_tabicl(pit_ckpt, device)
         pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
         tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, pit_k_folds, device)
         del tabicl_marginal  # only z_train_tabicl (cached above) is needed from here on

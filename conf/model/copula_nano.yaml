@@ -33,6 +33,13 @@ model:
 tabicl:
   pretrained: false
   recompute: false
+  # z_train sim-to-real diagnostic (src/train.py::_build_tabicl_val_z) needs
+  # a frozen TabICL copy with its pretrained quantile head to PIT val
+  # episodes — independent of this run's own from-scratch backbone above, so
+  # it's set here explicitly rather than inherited from `pretrained: false`.
+  # Same checkpoint copula_prod.yaml's backbone loads; only ever used frozen,
+  # for validation, never trained.
+  pit_ckpt: tabicl-regressor-v2-20260212.ckpt
   arch:
     embed_dim: 32       # vs. 128 in the pretrained checkpoint
     col_num_blocks: 1   # vs. 3 in the pretrained checkpoint

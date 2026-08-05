@@ -27,6 +27,10 @@ Tests verify:
      carries an R_pred_tabicl key, and only the original single row when
      none do (unchanged behaviour for kernel_fit probe episodes, which never
      carry that key).
+  5. _resolve_pit_ckpt (which checkpoint, if any, main() loads as the frozen
+     marginal above) resolves correctly across the tabicl.pretrained/
+     tabicl.ckpt/tabicl.pit_ckpt combinations copula_prod and copula_nano
+     each rely on — see conf/model/{copula_prod,copula_nano}.yaml.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from train import _build_tabicl_val_z, _corr_grid_fig
+from train import _build_tabicl_val_z, _corr_grid_fig, _resolve_pit_ckpt
 
 
 class FakeTabICL(nn.Module):
@@ -144,3 +148,46 @@ def test_corr_grid_single_row_when_tabicl_absent():
     expected_grid_axes = n_wrap * 2 * per_line
     assert len(fig.axes) == expected_grid_axes + 1  # +1 colorbar
     plt.close(fig)
+
+
+class _FakeTabiclGroup:
+    """Minimal stand-in for the Hydra `cfg.tabicl` node: only needs `.get`,
+    matching how _resolve_pit_ckpt reads it."""
+
+    def __init__(self, **kw):
+        self._d = kw
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+
+class _FakeCfg:
+    def __init__(self, **tabicl_kw):
+        self.tabicl = _FakeTabiclGroup(**tabicl_kw)
+
+
+def test_resolve_pit_ckpt_pretrained_backbone_defaults_to_its_own_ckpt():
+    """copula_prod.yaml's original behaviour: pretrained=true + ckpt set,
+    no pit_ckpt override -> the diagnostic reuses the backbone's checkpoint."""
+    cfg = _FakeCfg(pretrained=True, ckpt="tabicl-regressor-v2-20260212.ckpt")
+    assert _resolve_pit_ckpt(cfg) == "tabicl-regressor-v2-20260212.ckpt"
+
+
+def test_resolve_pit_ckpt_scratch_backbone_opts_in_via_pit_ckpt():
+    """copula_nano.yaml's behaviour: pretrained=false (from-scratch backbone,
+    no tabicl.ckpt at all) but pit_ckpt set explicitly -> the diagnostic still
+    runs, using a checkpoint wholly separate from the backbone being trained."""
+    cfg = _FakeCfg(pretrained=False, pit_ckpt="tabicl-regressor-v2-20260212.ckpt")
+    assert _resolve_pit_ckpt(cfg) == "tabicl-regressor-v2-20260212.ckpt"
+
+
+def test_resolve_pit_ckpt_scratch_backbone_without_override_disables_diagnostic():
+    """A from-scratch backbone that does NOT set pit_ckpt gets no diagnostic
+    (the pre-decoupling behaviour) rather than erroring on a missing ckpt."""
+    cfg = _FakeCfg(pretrained=False)
+    assert _resolve_pit_ckpt(cfg) is None
+
+
+def test_resolve_pit_ckpt_explicit_override_wins_over_backbone_ckpt():
+    cfg = _FakeCfg(pretrained=True, ckpt="backbone.ckpt", pit_ckpt="other-marginal.ckpt")
+    assert _resolve_pit_ckpt(cfg) == "other-marginal.ckpt"
