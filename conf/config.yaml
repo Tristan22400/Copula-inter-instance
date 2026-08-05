@@ -1,11 +1,9 @@
 defaults:
-  # tabicl: before model: — a model preset can use `# @package _global_` to
-  # also set tabicl.* (see conf/model/copula_tabicl_v2.yaml's one-override
-  # fast-run preset); Hydra's defaults list merges later entries over
-  # earlier ones, so model: must resolve after tabicl: for such an override
-  # to actually win instead of being clobbered by tabicl:'s own default.
-  - tabicl: pretrained_v2
-  - model: copula_transformer
+  # Each conf/model/*.yaml is the single file for one experiment: it uses
+  # `# @package _global_` to set both `model.*` (the copula head) and
+  # `tabicl.*` (the backbone) in one place, so switching experiments is one
+  # `model=...` override instead of coordinating a separate `tabicl:` group.
+  - model: copula_prod
   - data: gp_tasks
   - _self_
 

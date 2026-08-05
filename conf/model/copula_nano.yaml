@@ -1,0 +1,47 @@
+# @package _global_
+# Fast dev-loop preset (single file: backbone + head) — from-scratch, narrow
+# AND shallow TabICL backbone (small-rank head to match) for quick iteration.
+# NOT a production model — see conf/model/copula_prod.yaml for that.
+# `model=copula_nano` alone fully configures a fast run — no separate
+# backbone config needed.
+#
+# vs. the pretrained tabicl-regressor-v2 checkpoint's architecture (see the
+# commented `arch:` template in conf/model/copula_prod.yaml):
+#   embed_dim        32 vs 128  (width)
+#   col_num_blocks    1 vs 3    (depth)
+#   row_num_blocks    1 vs 3    (depth)
+#   icl_num_blocks    2 vs 12   (depth)
+# heads/inducing points/CLS tokens/ff_factor unchanged. Attention cost per
+# ICL block is O(T^2*d) vs O(T*d^2) for the QKV/FFN projections (T=P+N,
+# d=embed_dim), so shrinking episode size via CLI overrides (e.g.
+# data.P_max=64 data.N_max=32) still matters for wall-clock speed on top of
+# this width+depth cut.
+#
+# NOTE: previously held a dead d_model/n_heads/n_layers_s1/s2/s3/n_inducing/
+# n_cls/p_max/d_max schema that build_copula_transformer (src/model.py) never
+# read — orphaned since the repo's initial commit.
+#
+# Usage:
+#   python src/train.py model=copula_nano \
+#     data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \
+#     training.live_generation=true training.ckpt_dir=./checkpoints/copula_nano
+model:
+  rank: 8                  # vs. 32 in copula_prod.yaml
+  sigma_jitter: 1.0e-4
+  unfreeze_backbone: true
+
+tabicl:
+  pretrained: false
+  recompute: false
+  arch:
+    embed_dim: 32       # vs. 128 in the pretrained checkpoint
+    col_num_blocks: 1   # vs. 3 in the pretrained checkpoint
+    col_nhead: 8         # matches pretrained
+    col_num_inds: 128    # matches pretrained
+    row_num_blocks: 1    # vs. 3 in the pretrained checkpoint
+    row_nhead: 8         # matches pretrained
+    row_num_cls: 4       # matches pretrained
+    icl_num_blocks: 2   # vs. 12 in the pretrained checkpoint
+    icl_nhead: 8         # matches pretrained
+    ff_factor: 2
+    dropout: 0.0
