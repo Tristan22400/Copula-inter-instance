@@ -36,7 +36,7 @@ P_max: 512             # fewer train points → more residual posterior uncertai
 
 # Test/query set size range (copula is over these N instances)
 N_min: 8
-N_max: 128
+N_max: 1024
 
 # Number of tasks to generate
 n_tasks: 20000000
@@ -148,7 +148,7 @@ structural_warp_category_weights:
 # enabled=true) -- switch off entirely by leaving structural_warp_index_axis_enabled
 # at its default False, regardless of the ratio value.
 structural_warp_index_axis_enabled: false
-structural_warp_index_axis_ratio: 0.0
+structural_warp_index_axis_ratio: 0.5
 
 # Non-zero GP mean bank (CauKer-inspired, github.com/ShifengXIE/CauKer):
 # CAUKER's own ablation (Table 1, "Mean+KernelSynth" vs zero-mean
@@ -261,7 +261,7 @@ composite_num_kernels_lognormal_scale: 1.05
 # "polynomial" is excluded here for now (like periodic/cosine/dot_product):
 # new addition, not yet validated against tests/test_dataset_corr_uniform.py
 # in long chains — remove it from this list once validated.
-composite_exclude_kernels: [periodic, cosine]
+composite_exclude_kernels: [cosine]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
