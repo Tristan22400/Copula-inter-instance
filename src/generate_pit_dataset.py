@@ -26,6 +26,12 @@ Usage
 -----
     python src/generate_pit_dataset.py data.n_tasks=5000
     python src/generate_pit_dataset.py data.n_tasks=5000000 data.shard_size=512
+
+    # z_train from the real frozen TabICL marginal's K-fold PIT instead of
+    # the exact analytic GP-LOO residual (see data.z_train_source in
+    # conf/data/gp_tasks.yaml) — substantially slower, pilot on a small
+    # n_tasks first:
+    python src/generate_pit_dataset.py data.n_tasks=5000 data.z_train_source=tabicl
 """
 
 from __future__ import annotations
@@ -66,8 +72,33 @@ def main(cfg: DictConfig) -> None:
     n_shards   = (n_tasks + B - 1) // B
     base_seed  = getattr(cfg, "seed", None)
 
+    # z_train source override (see data.z_train_source's docstring in
+    # conf/data/gp_tasks.yaml): load the frozen TabICL marginal once, up
+    # front, and thread it through every generate_gp_batch call below rather
+    # than reloading per shard.
+    z_train_source = cfg.data.get("z_train_source", "analytic")
+    tabicl_model = None
+    tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
+    if z_train_source == "tabicl":
+        from pit import load_tabicl
+        from train import _resolve_pit_ckpt
+
+        ckpt = _resolve_pit_ckpt(cfg)
+        if ckpt is None:
+            raise ValueError(
+                "data.z_train_source=tabicl requires a resolvable TabICL checkpoint "
+                "-- set tabicl.ckpt (with tabicl.pretrained=true) or tabicl.pit_ckpt."
+            )
+        print(f"Loading frozen TabICL marginal for data.z_train_source=tabicl: {ckpt}")
+        tabicl_model = load_tabicl(ckpt, device)
+    elif z_train_source != "analytic":
+        raise ValueError(
+            f"Unknown data.z_train_source {z_train_source!r}; expected 'analytic' or 'tabicl'."
+        )
+
     print(f"Generating {n_tasks} episodes → {pit_dir}")
-    print(f"Batch/shard size: {B}  |  Total shards: {n_shards}  |  Device: {device}")
+    print(f"Batch/shard size: {B}  |  Total shards: {n_shards}  |  Device: {device}  |  "
+          f"z_train_source: {z_train_source}")
 
     # meta.pt from the start (n_total=0) so CopulaDataset never sees a
     # shard_*.pt without a matching meta.pt during the very first shard.
@@ -90,7 +121,10 @@ def main(cfg: DictConfig) -> None:
             # shard so shards don't restart from the identical RNG state.
             if base_seed is not None:
                 cfg.seed = base_seed + shard_idx
-            episodes = generate_gp_batch(cfg, n_this, device)
+            episodes = generate_gp_batch(
+                cfg, n_this, device,
+                tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+            )
             torch.save(episodes, out_path)
 
             n_generated += n_this
