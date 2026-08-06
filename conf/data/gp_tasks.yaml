@@ -327,6 +327,31 @@ sign_modulation_outer_prob: 0.0
 # PIT epsilon for probit clamping (analytical pipeline)
 pit_eps: 1.0e-6
 
+# z_train source for the on-disk dataset pipeline (generate_pit_dataset.py
+# only -- live_generation/train.py's validation batches are unaffected and
+# always use the analytic oracle, unlike z_train_corruption below which
+# applies everywhere):
+#   analytic: exact closed-form GP-LOO whitened residual (R&W Eq. 5.12) --
+#             see data_gen.py::_generate_gp_batch_raw.
+#   tabicl:   real K-fold PIT through the frozen TabICL marginal quantile
+#             head (pit.py::run_pit_batched), the same approximate estimator
+#             real (non-GP) deployment data would produce -- measured
+#             corr(z_exact, z_tabicl) ~= 0.6-0.65, see z_train_corruption's
+#             docstring below. Checkpoint comes from cfg.tabicl.ckpt/
+#             cfg.tabicl.pit_ckpt (train.py::_resolve_pit_ckpt's resolution
+#             order -- see conf/model/copula_prod.yaml), not a separate key
+#             here. z_test/log_pdf_test are untouched (still the oracle
+#             values); only the ICL conditioning input z_train changes.
+# "tabicl" needs network access on first run (downloads the checkpoint from
+# HuggingFace) and is substantially slower than "analytic" (z_train_tabicl_k_folds+1
+# TabICL forward passes per shard-generation batch instead of one closed-form
+# Cholesky) -- pilot on a small n_tasks before scaling a production run up.
+z_train_source: analytic
+# K-fold count for z_train_source=tabicl's run_pit_batched call (same
+# semantics/default as pit.py::DEFAULT_K_FOLDS). Ignored when
+# z_train_source=analytic.
+z_train_tabicl_k_folds: 10
+
 # z_train corruption (see data_gen.py::corrupt_z_train's docstring): trains
 # the model to be robust to z_train NOT being the exact closed-form GP-LOO
 # whitened residual, since real (non-GP) deployment data can only ever

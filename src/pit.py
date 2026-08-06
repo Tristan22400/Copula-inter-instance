@@ -245,6 +245,119 @@ def run_pit(
 
 
 # ---------------------------------------------------------------------------
+# Batch-of-episodes PIT (dataset-generation use)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def run_pit_batched(
+    tabicl: nn.Module,
+    X_train: torch.Tensor,
+    Y_train: torch.Tensor,
+    X_test: torch.Tensor,
+    Y_test: torch.Tensor,
+    k_folds: int = DEFAULT_K_FOLDS,
+    eps: float = 1e-6,
+) -> dict:
+    """``run_pit``, vectorised over a leading batch-of-episodes axis B.
+
+    Only valid when every episode in the batch shares the same P and N —
+    true for one ``data_gen._generate_gp_batch_raw`` call (all B episodes in
+    a shard-generation batch share P/N by construction), which is the
+    intended caller. The B and target-dim (d) axes are folded together into
+    TabICL's own batch axis (mirrors how ``run_pit`` already folds d alone),
+    so this costs one (B*d)-batched forward pass per fold instead of B
+    separate single-episode ``run_pit`` calls — B*(K+1)x fewer Python-level
+    TabICL invocations, though the K-fold loop's iteration count (and hence
+    wall-clock scaling in K) is unchanged.
+
+    Args:
+        tabicl  : frozen TabICL regressor (max_classes=0)
+        X_train : (B, P, p_x)
+        Y_train : (B, P, d)
+        X_test  : (B, N, p_x)
+        Y_test  : (B, N, d)
+        k_folds : as in ``run_pit`` — clamped into [2, P], shared by every
+                  episode in the batch since P is shared.
+        eps     : clamp before probit.
+
+    Returns dict with:
+        z_train      : (B, P, d)
+        z_test       : (B, N, d)
+        log_pdf_test : (B, N, d)   marginal log-densities at Y_test
+    """
+    device = X_train.device
+    B, P, p_x = X_train.shape
+    N = X_test.shape[1]
+    d = Y_train.shape[2]
+
+    K = max(2, min(int(k_folds), P))
+
+    # ------------------------------------------------------------------ #
+    # A) Test instances: one forward, batch axis = B*d.                   #
+    # ------------------------------------------------------------------ #
+    X_concat = torch.cat([X_train, X_test], dim=1)                              # (B, P+N, p_x)
+    X_test_batch = (
+        X_concat.unsqueeze(1).expand(B, d, P + N, p_x).reshape(B * d, P + N, p_x).contiguous()
+    )
+    y_train_batch = Y_train.permute(0, 2, 1).reshape(B * d, P).contiguous()     # (B*d, P)
+
+    logits = tabicl(X_test_batch, y_train_batch)                                # (B*d, N, Q)
+    Q = logits.shape[-1]
+    dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
+
+    y_test_flat = Y_test.permute(0, 2, 1).reshape(B * d * N)
+    u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)            # (B, N, d)
+    log_pdf_test = dist.log_prob(y_test_flat).reshape(B, d, N).permute(0, 2, 1)  # (B, N, d)
+
+    # ------------------------------------------------------------------ #
+    # B) Training instances: K disjoint folds (fixed K, ≪ P), batch axis  #
+    #    = B*d, fold membership shared across the batch since P is.       #
+    # ------------------------------------------------------------------ #
+    fold_size = math.ceil(P / K)
+    u_train = torch.empty(B, P, d, device=device, dtype=Y_train.dtype)
+    indices = torch.arange(P, device=device)
+
+    for k in range(K):
+        start = k * fold_size
+        end = min(start + fold_size, P)
+        if start >= end:
+            break
+
+        qry_idx = indices[start:end]
+        ctx_mask = torch.ones(P, dtype=torch.bool, device=device)
+        ctx_mask[qry_idx] = False
+        ctx_idx = indices[ctx_mask]
+        F = qry_idx.numel()
+
+        X_fold = torch.cat([X_train[:, ctx_idx], X_train[:, qry_idx]], dim=1)   # (B, P-F+F, p_x)
+        X_fold_batch = (
+            X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x)
+            .reshape(B * d, X_fold.shape[1], p_x).contiguous()
+        )
+        y_ctx_batch = (
+            Y_train[:, ctx_idx].permute(0, 2, 1).reshape(B * d, P - F).contiguous()
+        )
+
+        logits_fold = tabicl(X_fold_batch, y_ctx_batch)                        # (B*d, F, Q)
+        dist_fold = tabicl.quantile_dist(logits_fold.reshape(B * d * F, Q))
+
+        y_qry_flat = Y_train[:, qry_idx].permute(0, 2, 1).reshape(B * d * F)
+        u_train[:, qry_idx, :] = (
+            dist_fold.cdf(y_qry_flat).reshape(B, d, F).permute(0, 2, 1)
+        )
+
+    z_train = _probit(u_train, eps)
+    z_test = _probit(u_test, eps)
+
+    return {
+        "z_train": z_train,
+        "z_test": z_test,
+        "log_pdf_test": log_pdf_test,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Analytical GP PIT (no model inference required)
 # ---------------------------------------------------------------------------
 
