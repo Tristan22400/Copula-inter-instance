@@ -186,7 +186,14 @@ class CopulaTabICL(nn.Module):
         nn.init.zeros_(self.copula_head.bias)
 
         if correlation_parametrization == "sparse_covnorm":
-            self.sparse_lambda_raw = nn.Parameter(torch.zeros(1))
+            # softplus(-6) ~= 0.0025, far below copula_head's ~0.02-std initial
+            # W scale, so the soft-threshold starts near-inactive (W_tilde ~= W,
+            # matching CovNorm's warm start) instead of zeroing every entry out
+            # from step 0. Initializing at 0 (softplus(0) ~= 0.69) is a dead
+            # unit: relu's zero-gradient region blocks all gradient to both W
+            # and lambda simultaneously, so the threshold could never learn to
+            # shrink back down.
+            self.sparse_lambda_raw = nn.Parameter(torch.full((1,), -6.0))
 
     def forward(self, batch: dict) -> dict:
         """Forward over a padded batch from ``dataset.collate_fn``.
