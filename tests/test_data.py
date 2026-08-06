@@ -636,10 +636,8 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     real_raw = dg._generate_gp_batch_raw
     state = {"n_calls": 0}
 
-    def truncating_raw(cfg, B, device="cpu", *, return_kernel_metadata=False, d_override=None):
-        episodes = real_raw(
-            cfg, B, device, return_kernel_metadata=return_kernel_metadata, d_override=d_override
-        )
+    def truncating_raw(cfg, B, device="cpu", **kwargs):
+        episodes = real_raw(cfg, B, device, **kwargs)
         state["n_calls"] += 1
         if state["n_calls"] == 1:
             episodes = episodes[:-5]  # force a shortfall so top-up fires

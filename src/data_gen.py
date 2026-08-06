@@ -2482,6 +2482,8 @@ def corrupt_z_train(z_train: Tensor, data_cfg) -> Tensor:
 def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
     d_override: Optional[int] = None,
+    tabicl_model: Optional[torch.nn.Module] = None,
+    tabicl_k_folds: int = 10,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in a single vectorised call — the
     "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
@@ -2537,6 +2539,15 @@ def _generate_gp_batch_raw(
             generate_gp_task/pit.py::gp_analytical_pit/diag_kernels.py need.
             Off by default so the production shard schema
             (generate_pit_dataset.py) is unaffected.
+        tabicl_model: if given, z_train is overridden with this frozen
+            TabICL's own K-fold PIT (pit.py::run_pit_batched) instead of the
+            exact analytic GP-LOO residual — see cfg.data.z_train_source in
+            conf/data/gp_tasks.yaml. z_test/log_pdf_test are untouched
+            (still the oracle values); only the ICL conditioning input
+            z_train changes. None (default) preserves the exact analytic
+            pipeline.
+        tabicl_k_folds: K-fold count for tabicl_model's PIT, ignored when
+            tabicl_model is None.
 
     Returns:
         list of B episode dicts ready for torch.save.
@@ -2861,6 +2872,34 @@ def _generate_gp_batch_raw(
     # Reconstruct full posterior covariance (for Y-space oracle)
     Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
 
+    # z_train source override (cfg.data.z_train_source="tabicl"): replace the
+    # exact analytic GP-LOO residual with the real frozen TabICL's own
+    # K-fold PIT (pit.py::run_pit_batched) -- trains/evaluates against the
+    # same approximate marginal real (non-GP) deployment data would produce,
+    # instead of the closed-form oracle. Deliberately AFTER the degenerate-
+    # episode z_std check above (discard decisions are always made on the
+    # exact residual, never on the substituted one) and BEFORE
+    # corrupt_z_train, which is free to further blend either source toward
+    # noise. y_train is z-scored per episode first -- run_pit_batched (like
+    # every other run_pit call site) does no target scaling of its own, and
+    # episode y_train's scale is unconstrained (outputscale ~ GammaPrior),
+    # so an unscaled call risks saturating the pretrained quantile head's
+    # CDF into its extreme tail. X_test/Y_test are a dummy 1-point slice
+    # (unused; run_pit_batched always computes a test-side PIT too) --
+    # z_test/log_pdf_test stay the oracle values already computed above.
+    if tabicl_model is not None:
+        from pit import run_pit_batched  # local: pit.py imports from this module
+
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)   # (B, P, 1)
+        tabicl_pit = run_pit_batched(
+            tabicl_model, x_norm_train, y_train_scaled,
+            x_norm_train[:, :1], y_train_scaled[:, :1],
+            k_folds=tabicl_k_folds,
+        )
+        z_train = tabicl_pit["z_train"].squeeze(-1)                   # (B, P)
+
     # Robustness augmentation (opt-in, off by default -- see corrupt_z_train's
     # docstring above): applied AFTER the degenerate-episode z_std check above
     # so discard decisions are always made on the exact GP-LOO residual, never
@@ -2989,7 +3028,9 @@ def _generate_gp_batch_raw(
 
 
 def generate_gp_batch(
-    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False
+    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
+    tabicl_model: Optional[torch.nn.Module] = None,
+    tabicl_k_folds: int = 10,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, discarding and regenerating any that
     turn out degenerate (see _generate_gp_batch_raw's `discard` — an
@@ -3019,7 +3060,10 @@ def generate_gp_batch(
     construction regardless of jitter) fails loudly instead of hanging.
     """
     base_seed = getattr(cfg, "seed", None)
-    episodes = _generate_gp_batch_raw(cfg, B, device, return_kernel_metadata=return_kernel_metadata)
+    episodes = _generate_gp_batch_raw(
+        cfg, B, device, return_kernel_metadata=return_kernel_metadata,
+        tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+    )
     # Pin every top-up round to the first round's d_features. Top-up rounds
     # reseed with a different cfg.seed (below), which would otherwise
     # re-sample d independently (variable-d datasets, see _sample_d_features)
@@ -3041,6 +3085,7 @@ def generate_gp_batch(
         new_episodes = _generate_gp_batch_raw(
             cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata,
             d_override=d_fixed,
+            tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
