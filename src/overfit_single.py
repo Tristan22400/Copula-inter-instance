@@ -84,6 +84,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Freeze TabICL backbone (faster but may converge slower)",
     )
+    p.add_argument(
+        "--model",
+        default="copula_prod",
+        help="conf/model/<name>.yaml preset to load (default: copula_prod)",
+    )
+    p.add_argument(
+        "--parametrization",
+        default=None,
+        help="Override cfg.model.correlation_parametrization (default: whatever "
+        "the --model preset sets, normally 'covnorm'). One of covnorm, cossim, "
+        "tanhnorm, sparse_covnorm — see src/correlation_factory.py.",
+    )
     return p.parse_args()
 
 
@@ -153,18 +165,20 @@ def main() -> None:
     # Build config from yaml files without Hydra.
     base_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "config.yaml"))
     model_cfg = OmegaConf.load(
-        os.path.join(_ROOT, "conf", "model", "copula_prod.yaml")
+        os.path.join(_ROOT, "conf", "model", f"{args.model}.yaml")
     )
     data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
-    # copula_prod.yaml uses Hydra `# @package _global_` packaging, so it
-    # already has top-level `model:`/`tabicl:` keys — merge it directly
-    # instead of nesting it under `model:` a second time (which would have
-    # left cfg.tabicl missing, since this loader bypasses Hydra's defaults
-    # composition entirely).
+    # copula_prod.yaml/copula_nano.yaml use Hydra `# @package _global_`
+    # packaging, so they already have top-level `model:`/`tabicl:` keys —
+    # merge directly instead of nesting under `model:` a second time (which
+    # would have left cfg.tabicl missing, since this loader bypasses Hydra's
+    # defaults composition entirely).
     cfg = OmegaConf.merge(base_cfg, model_cfg, OmegaConf.create({"data": data_cfg}))
     if args.freeze_backbone:
         cfg.model.unfreeze_backbone = False
+    if args.parametrization is not None:
+        cfg.model.correlation_parametrization = args.parametrization
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
