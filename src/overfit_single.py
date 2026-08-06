@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.join(_ROOT, "tabicl_upstream", "src"))
 from data_gen import generate_gp_batch
 from dataset import collate_fn
 from loss import _safe_cholesky, oracle_copula_nll, y_space_nll
-from model import build_copula_transformer, low_rank_correlation
+from model import build_copula_transformer, build_sigma
 
 
 def parse_args() -> argparse.Namespace:
@@ -249,9 +249,7 @@ def main() -> None:
             batch = {k: v.to(device) for k, v in batch.items()}
 
             out = model(batch)
-            Sigma = low_rank_correlation(
-                out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
-            )
+            Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
             parts = y_space_nll(
                 Sigma,
                 batch["z_test"].float(),
@@ -273,12 +271,7 @@ def main() -> None:
                     eval_batch = collate_fn([realizations[0]])
                     eval_batch = {k: v.to(device) for k, v in eval_batch.items()}
                     out_eval = model(eval_batch)
-                    Sigma_eval = low_rank_correlation(
-                        out_eval["W"].float(),
-                        out_eval["s"].float(),
-                        eval_batch["test_mask"],
-                        jitter=jitter,
-                    )
+                    Sigma_eval = build_sigma(out_eval, cfg, jitter=jitter, test_mask=eval_batch["test_mask"])
                     R_hat = Sigma_eval[0, :n_test, :n_test]
                     frob = (R_hat - R_star).norm().item()
                     frob_per_n2 = frob / (n_test ** 2)
@@ -294,12 +287,7 @@ def main() -> None:
         eval_batch = collate_fn([realizations[0]])
         eval_batch = {k: v.to(device) for k, v in eval_batch.items()}
         out_final = model(eval_batch)
-        Sigma_final = low_rank_correlation(
-            out_final["W"].float(),
-            out_final["s"].float(),
-            eval_batch["test_mask"],
-            jitter=jitter,
-        )
+        Sigma_final = build_sigma(out_final, cfg, jitter=jitter, test_mask=eval_batch["test_mask"])
         R_hat_final = Sigma_final[0, :n_test, :n_test]
 
     show = min(n_test, 5)

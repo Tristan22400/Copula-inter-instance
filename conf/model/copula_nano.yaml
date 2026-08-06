@@ -29,6 +29,11 @@ model:
   rank: 8                  # vs. 32 in copula_prod.yaml
   sigma_jitter: 1.0e-4
   unfreeze_backbone: true
+  # Which src/correlation_factory.py builder turns the copula head's raw
+  # output into a valid low-rank correlation matrix: covnorm (default,
+  # matches the original hard-coded implementation) | cossim | tanhnorm |
+  # sparse_covnorm. Override from CLI, e.g. model.correlation_parametrization=cossim.
+  correlation_parametrization: covnorm
 
 tabicl:
   pretrained: false

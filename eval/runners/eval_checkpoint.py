@@ -165,7 +165,12 @@ def _eval_icl_episode(
         }
         with torch.no_grad():
             out = icl_model(batch)
-            Sigma_icl = low_rank_correlation(out["W"], out["s"])  # (1, N, N)
+            Sigma_icl = low_rank_correlation(
+                out["W"],
+                out.get("s"),
+                parametrization=getattr(icl_model, "correlation_parametrization", "covnorm"),
+                lam=out.get("lam"),
+            )  # (1, N, N)
         R_icl = Sigma_icl[0, :N, :N]
         nlls["icl"] = corr_nll_single(R_icl, z_test)
         R_dict["icl"] = R_icl
