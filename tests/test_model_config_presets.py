@@ -27,10 +27,11 @@ from __future__ import annotations
 import os
 
 import hydra
+import pytest
 import torch
 from conftest import make_batch
 
-from model import build_copula_transformer, low_rank_correlation
+from model import build_copula_transformer, build_sigma, low_rank_correlation
 from train import _resolve_pit_ckpt
 
 _CONF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "conf")
@@ -48,6 +49,7 @@ def test_copula_prod_resolves_pretrained_backbone():
     assert cfg.tabicl.pretrained is True
     assert cfg.tabicl.ckpt  # non-empty HF checkpoint name; not downloaded here
     assert cfg.tabicl.pit_k_folds == 10
+    assert cfg.model.correlation_parametrization == "covnorm"
     # z_train diagnostic (_resolve_pit_ckpt) falls back to the backbone's own
     # pretrained checkpoint here -- no pit_ckpt override needed.
     assert _resolve_pit_ckpt(cfg) == cfg.tabicl.ckpt
@@ -68,6 +70,7 @@ def test_copula_nano_resolves_scratch_backbone():
     # than being silently skipped because tabicl.pretrained is false.
     assert cfg.tabicl.pit_ckpt
     assert _resolve_pit_ckpt(cfg) == cfg.tabicl.pit_ckpt
+    assert cfg.model.correlation_parametrization == "covnorm"
 
 
 def test_copula_nano_builds_and_runs_forward():
@@ -92,6 +95,45 @@ def test_copula_nano_builds_and_runs_forward():
     assert out["s"].shape == (2, 5)
 
     Sigma = low_rank_correlation(out["W"], out["s"], batch["test_mask"])
+    diag = Sigma.diagonal(dim1=-2, dim2=-1)
+    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-3), f"Diagonal not 1: {diag}"
+    for b in range(Sigma.shape[0]):
+        eigvals = torch.linalg.eigvalsh(Sigma[b])
+        assert (eigvals >= -1e-4).all(), f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
+
+
+@pytest.mark.parametrize(
+    "parametrization", ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
+)
+def test_copula_nano_builds_and_runs_forward_per_parametrization(parametrization):
+    """Same CPU build+forward smoke test as
+    test_copula_nano_builds_and_runs_forward, swept over every
+    correlation_parametrization value — catches head-width / missing-key
+    mistakes (e.g. tanhnorm's copula_head having no trailing scalar column,
+    sparse_covnorm's extra learned lambda) before they reach a real
+    oarsub training job.
+    """
+    cfg = _compose("copula_nano")
+    cfg.model.correlation_parametrization = parametrization
+    torch.manual_seed(0)
+    model = build_copula_transformer(cfg)
+    model.train()
+
+    batch = make_batch(B=2, P=10, N=5)
+    with torch.no_grad():
+        out = model(batch)
+
+    rank = cfg.model.rank
+    assert out["W"].shape == (2, 5, rank)
+    if parametrization == "tanhnorm":
+        assert "s" not in out
+    else:
+        assert out["s"].shape == (2, 5)
+    if parametrization == "sparse_covnorm":
+        assert out["lam"].shape == (1,)
+
+    with torch.no_grad():
+        Sigma = build_sigma(out, cfg, test_mask=batch["test_mask"])
     diag = Sigma.diagonal(dim1=-2, dim2=-1)
     assert torch.allclose(diag, torch.ones_like(diag), atol=1e-3), f"Diagonal not 1: {diag}"
     for b in range(Sigma.shape[0]):

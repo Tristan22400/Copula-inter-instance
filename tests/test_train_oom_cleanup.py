@@ -39,7 +39,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
     }
     graph_ref = {}
 
-    def fake_correlation(W, _s, _mask, jitter):
+    def fake_correlation(W, _s, _mask, jitter, **_kwargs):
         graph_ref["tensor"] = weakref.ref(W)
         return W[..., :1] @ W[..., :1].transpose(-1, -2)
 

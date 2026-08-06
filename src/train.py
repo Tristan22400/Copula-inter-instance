@@ -2,7 +2,10 @@
 train.py — Train the Copula Transformer in Y-space NLL via Sklar's theorem.
 
 Loss:  L = Copula_NLL(z_test; Σ̂) + Marginal_NLL(y_test; TabICL log-pdf)
-Σ̂ is built by ``low_rank_correlation(W, s)`` from the model output.
+Σ̂ is built by ``model.build_sigma(out, cfg)`` from the model output — the
+correlation parametrization (covnorm/cossim/tanhnorm/sparse_covnorm) is
+selected by ``cfg.model.correlation_parametrization`` (see
+correlation_factory.py).
 
 Usage:
     python src/train.py
@@ -64,7 +67,7 @@ from dataset import (
 )
 from live_dataset import build_fixed_live_val_batches, build_live_train_loader
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
-from model import build_copula_transformer, low_rank_correlation
+from model import build_copula_transformer, build_sigma, low_rank_correlation
 from muon import Muon
 from pit import DEFAULT_K_FOLDS, load_tabicl, normalize_targets, run_pit
 
@@ -526,9 +529,7 @@ def validate(
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             out = model(batch)
-        Sigma = low_rank_correlation(
-            out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
-        )
+        Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
 
         parts = y_space_nll(
             Sigma,
@@ -629,9 +630,7 @@ def validate(
                                 "x_test":  batch["x_test"][b : b + 1, :n],
                             }
                             out_tabicl = model(sub_batch)
-                            Sigma_tabicl = low_rank_correlation(
-                                out_tabicl["W"].float(), out_tabicl["s"].float(), jitter=jitter
-                            )
+                            Sigma_tabicl = build_sigma(out_tabicl, cfg, jitter=jitter)
                             R_pred_tabicl_b = Sigma_tabicl[0].float().cpu().numpy()
                             ep_dict["R_pred_tabicl"] = R_pred_tabicl_b
                             all_off_pred_tabicl.append(R_pred_tabicl_b[ri, ci])
@@ -694,9 +693,7 @@ def validate(
     # so these move with training progress (unlike a fixed data-only baseline).
     for family, sbatch in (synth_kernel_batches or {}).items():
         out_s = model(sbatch)
-        Sigma_s = low_rank_correlation(
-            out_s["W"].float(), out_s["s"].float(), sbatch["test_mask"], jitter=jitter
-        )
+        Sigma_s = build_sigma(out_s, cfg, jitter=jitter, test_mask=sbatch["test_mask"])
         parts_s = y_space_nll(
             Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
         )
@@ -848,6 +845,7 @@ def _forward_and_loss(
     aux_mae_weight: float,
     jitter: float,
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    parametrization: str = "covnorm",
     phase_start=lambda: None,
     phase_end=lambda name, start: None,
 ):
@@ -863,8 +861,15 @@ def _forward_and_loss(
 
     # Loss in float32 — Cholesky / log-det want full precision.
     ev_loss0 = phase_start()
+    s = out.get("s")
+    lam = out.get("lam")
     Sigma = low_rank_correlation(
-        out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
+        out["W"].float(),
+        s.float() if s is not None else None,
+        batch["test_mask"],
+        jitter=jitter,
+        parametrization=parametrization,
+        lam=lam.float() if lam is not None else None,
     )
     parts = y_space_nll(
         Sigma,
@@ -905,6 +910,7 @@ def _measure_step_flops(
     aux_mae_weight: float,
     jitter: float,
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    parametrization: str = "covnorm",
 ) -> float:
     """Throwaway forward+backward (no optimizer/scheduler step) under
     FlopCounterMode, to measure this step's real dispatched FLOPs for MFU.
@@ -927,6 +933,7 @@ def _measure_step_flops(
             aux_mae_weight=aux_mae_weight,
             jitter=jitter,
             triu_cache=triu_cache,
+            parametrization=parametrization,
         )
         loss.backward()
     model.zero_grad(set_to_none=True)
@@ -951,6 +958,7 @@ def _run_train_step(
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
     phase_start,
     phase_end,
+    parametrization: str = "covnorm",
 ):
     """Execute one training step in a short-lived frame.
 
@@ -973,6 +981,7 @@ def _run_train_step(
         triu_cache=triu_cache,
         phase_start=phase_start,
         phase_end=phase_end,
+        parametrization=parametrization,
     )
     grad_norm = None
 
@@ -1310,6 +1319,7 @@ def main(cfg: DictConfig) -> None:
         print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — restarting schedule at step 0")
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
+    parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
     aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
 
@@ -1405,6 +1415,7 @@ def main(cfg: DictConfig) -> None:
                 triu_cache=_triu_cache,
                 phase_start=_phase_start,
                 phase_end=_phase_end,
+                parametrization=parametrization,
             )
             # At log steps only, run one throwaway forward+backward under
             # FlopCounterMode to measure this step's *actual* dispatched
@@ -1444,6 +1455,7 @@ def main(cfg: DictConfig) -> None:
                         aux_mae_weight=aux_mae_weight,
                         jitter=jitter,
                         triu_cache=_triu_cache,
+                        parametrization=parametrization,
                     )
                 except torch.cuda.OutOfMemoryError:
                     # The real step above already completed and applied its

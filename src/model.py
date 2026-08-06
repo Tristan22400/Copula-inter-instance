@@ -9,11 +9,16 @@ Pattern (ResNet/feature-extractor style):
   3. Add our own ``copula_head : R^{icl_dim} → R^{r+1}`` as a SEPARATE
      module.  Output splits into ``(w_i ∈ R^r, s_i ∈ R)``.
 
-Correlation projection (unconstrained):
+Correlation projection (unconstrained), default "covnorm" parametrization:
 
     D = diag(softplus(s_i))
     S = W W^T + D
     Σ = Λ^{-1/2} S Λ^{-1/2}  +  jitter·I,    Λ = diag(diag(S))
+
+Three alternative parametrizations ("cossim", "tanhnorm", "sparse_covnorm",
+selected via cfg.model.correlation_parametrization) live in
+correlation_factory.py and are dispatched through low_rank_correlation()/
+build_sigma() below.
 """
 
 from __future__ import annotations
@@ -36,6 +41,16 @@ if _TABICL_SRC not in sys.path:
 
 from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
+from correlation_factory import (
+    cossim_correlation,
+    sparse_covnorm_correlation,
+    tanhnorm_correlation,
+)
+
+# Parametrizations whose copula_head output has no trailing scalar column
+# (W only, no s) — see CopulaTabICL.__init__.
+_NO_SCALAR_COLUMN = {"tanhnorm"}
+
 
 # ---------------------------------------------------------------------------
 # Correlation projection
@@ -44,30 +59,80 @@ from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
 def low_rank_correlation(
     W: Tensor,
-    s: Tensor,
+    s: Optional[Tensor] = None,
     test_mask: Optional[Tensor] = None,
     jitter: float = 1e-4,
+    parametrization: str = "covnorm",
+    lam: Optional[Tensor] = None,
 ) -> Tensor:
-    """Build per-batch correlation matrices Σ from (W, s).
+    """Build per-batch correlation matrices Σ from raw copula-head outputs.
 
     Args:
         W      : (B, N, r)
-        s      : (B, N)        — raw scalars; softplus(s) sits on the diagonal
+        s      : (B, N) raw scalars — meaning depends on ``parametrization``:
+                 softplus(s) diagonal variance for "covnorm"/"sparse_covnorm",
+                 a sigmoid gate for "cossim", unused for "tanhnorm".
         test_mask : unused inside; caller slices N_b out of Σ before Cholesky
-        jitter : added to the diagonal of Σ for numerical stability
+        jitter : added to the diagonal of Σ for numerical stability, applied
+                 uniformly after building Σ regardless of parametrization
+        parametrization : one of "covnorm" (default — original behaviour,
+                 byte-identical to the pre-existing implementation),
+                 "cossim", "tanhnorm", "sparse_covnorm". See
+                 correlation_factory.py for the exact math of each.
+        lam    : (B,) or (1,) raw threshold, required only for
+                 "sparse_covnorm" (see correlation_factory.sparse_covnorm_correlation)
 
     Returns:
-        Sigma : (B, N, N) symmetric PSD, unit diagonal up to ``jitter``.
+        Sigma : (B, N, N) symmetric PD, unit diagonal up to ``jitter``.
     """
     B, N, _ = W.shape
-    D = F.softplus(s)                                   # (B, N) > 0
-    S = torch.matmul(W, W.transpose(-1, -2))            # (B, N, N)
-    S = S + torch.diag_embed(D)
-    diag = S.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
-    inv_sqrt = diag.rsqrt()
-    Sigma = S * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
     eye = torch.eye(N, device=W.device, dtype=W.dtype).expand(B, N, N)
-    return Sigma + jitter * eye
+
+    if parametrization == "covnorm":
+        D = F.softplus(s)                                   # (B, N) > 0
+        S = torch.matmul(W, W.transpose(-1, -2))            # (B, N, N)
+        S = S + torch.diag_embed(D)
+        diag = S.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
+        inv_sqrt = diag.rsqrt()
+        Sigma = S * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
+        return Sigma + jitter * eye
+    elif parametrization == "cossim":
+        factor = cossim_correlation(W, s)
+    elif parametrization == "tanhnorm":
+        factor = tanhnorm_correlation(W)
+    elif parametrization == "sparse_covnorm":
+        if lam is None:
+            raise ValueError("parametrization='sparse_covnorm' requires `lam`")
+        factor = sparse_covnorm_correlation(W, s, lam)
+    else:
+        raise ValueError(f"unknown correlation parametrization: {parametrization!r}")
+
+    return factor.dense() + jitter * eye
+
+
+def build_sigma(
+    out: dict,
+    cfg: DictConfig,
+    jitter: float = 1e-4,
+    test_mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Dense Σ from a CopulaTabICL forward-pass dict, dispatched by
+    ``cfg.model.correlation_parametrization``.
+
+    Single choke point so call sites don't need to know per-parametrization
+    argument differences (tanhnorm's ``out`` has no "s" key; sparse_covnorm's
+    has an extra "lam" key) — they just call ``build_sigma(out, cfg, ...)``
+    instead of ``low_rank_correlation(out["W"], out["s"], ...)`` directly.
+    """
+    parametrization = cfg.model.get("correlation_parametrization", "covnorm")
+    return low_rank_correlation(
+        out["W"],
+        out.get("s"),
+        test_mask=test_mask,
+        jitter=jitter,
+        parametrization=parametrization,
+        lam=out.get("lam"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -83,10 +148,20 @@ class CopulaTabICL(nn.Module):
     each test instance — because we have replaced its ICL decoder with
     ``nn.Identity()``.
 
-    ``self.copula_head`` then projects to (W, s).
+    ``self.copula_head`` then projects to (W, s) — or just W for
+    "tanhnorm", which needs no extra scalar column (see
+    correlation_factory.py). "sparse_covnorm" additionally carries a single
+    learned soft-threshold shared across the batch (``self.sparse_lambda_raw``)
+    — the spec's λ ∈ R^{B×1} is a global learned scalar, not data-conditional,
+    so it lives on the module rather than as an extra head output.
     """
 
-    def __init__(self, base: TabICL, rank: int):
+    def __init__(
+        self,
+        base: TabICL,
+        rank: int,
+        correlation_parametrization: str = "covnorm",
+    ):
         super().__init__()
         # 1. Discover the feature dimension before stripping the decoder.
         decoder = base.icl_predictor.decoder
@@ -100,16 +175,25 @@ class CopulaTabICL(nn.Module):
         self.feature_extractor = base
         self.rank = rank
         self.feature_dim = in_features
+        self.correlation_parametrization = correlation_parametrization
 
-        # 4. Our own copula head — completely separate module.
-        self.copula_head = nn.Linear(in_features, rank + 1)
+        # 4. Our own copula head — completely separate module. Output width
+        #    varies per parametrization: tanhnorm needs only the r-dim raw
+        #    factor, the others also need one trailing scalar column.
+        head_out_dim = rank if correlation_parametrization in _NO_SCALAR_COLUMN else rank + 1
+        self.copula_head = nn.Linear(in_features, head_out_dim)
         nn.init.normal_(self.copula_head.weight, std=0.02)
         nn.init.zeros_(self.copula_head.bias)
+
+        if correlation_parametrization == "sparse_covnorm":
+            self.sparse_lambda_raw = nn.Parameter(torch.zeros(1))
 
     def forward(self, batch: dict) -> dict:
         """Forward over a padded batch from ``dataset.collate_fn``.
 
-        Returns dict(W=(B, N_max, r), s=(B, N_max)).
+        Returns dict(W=(B, N_max, r)), plus "s"=(B, N_max) unless
+        correlation_parametrization=="tanhnorm", plus "lam"=(1,) iff
+        correlation_parametrization=="sparse_covnorm".
         """
         x_train = batch["x_train"]            # (B, P_max, d_x)
         x_test = batch["x_test"]              # (B, N_max, d_x)
@@ -120,10 +204,15 @@ class CopulaTabICL(nn.Module):
         # With decoder replaced by Identity, out_dim == feature_dim.
         features = self.feature_extractor(X, z_train)      # (B, N_max, icl_dim)
 
-        head_out = self.copula_head(features)              # (B, N_max, r+1)
-        W = head_out[..., : self.rank]                     # (B, N_max, r)
-        s = head_out[..., self.rank]                       # (B, N_max)
-        return {"W": W, "s": s}
+        head_out = self.copula_head(features)              # (B, N_max, head_out_dim)
+        W = head_out[..., : self.rank]                      # (B, N_max, r)
+
+        out = {"W": W}
+        if self.correlation_parametrization not in _NO_SCALAR_COLUMN:
+            out["s"] = head_out[..., self.rank]              # (B, N_max)
+        if self.correlation_parametrization == "sparse_covnorm":
+            out["lam"] = self.sparse_lambda_raw
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +280,10 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
 
     Reads:
         cfg.model.rank
+        cfg.model.correlation_parametrization
+                                        (default "covnorm"; one of "covnorm",
+                                         "cossim", "tanhnorm", "sparse_covnorm"
+                                         — see correlation_factory.py)
         cfg.tabicl.pretrained          (default True)
         cfg.tabicl.ckpt                (only when pretrained=True)
         cfg.tabicl.recompute           (default False; gradient checkpointing
@@ -214,7 +307,11 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
     else:
         base = _build_tabicl_scratch(cfg)
 
-    model = CopulaTabICL(base=base, rank=int(cfg.model.rank))
+    model = CopulaTabICL(
+        base=base,
+        rank=int(cfg.model.rank),
+        correlation_parametrization=str(cfg.model.get("correlation_parametrization", "covnorm")),
+    )
 
     lora_cfg = cfg.get("lora", {})
     if bool(lora_cfg.get("enabled", False)):
