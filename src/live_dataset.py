@@ -19,6 +19,7 @@ train.py. Nothing in this module touches disk.
 from __future__ import annotations
 
 import copy
+import os
 import warnings
 from typing import Iterator, List
 
@@ -117,6 +118,25 @@ def build_live_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
     group_multiplier = max(1, int(t.get("live_group_multiplier", 1)))
     group_size = batch_size * group_multiplier
     num_workers = int(t.get("live_num_workers", 8))
+    # live_num_workers=16 is tuned for a 44-core node (see conf/config.yaml);
+    # on a smaller cpuset (e.g. an OAR/Grid5000 job allocated 8 cores) that
+    # oversubscribes CPU 2x and has been observed to OOM-kill workers/the main
+    # process outright — every job in a same-sized 12-job sweep died this way
+    # on 2026-08-06 (one crashed inside a Muon torch.compile trace with a
+    # confusing "RuntimeError when making fake tensor call" that was actually
+    # a killed worker surfacing mid-compile). Clamp to what this process can
+    # actually schedule onto.
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available_cpus = os.cpu_count() or num_workers
+    if num_workers > available_cpus:
+        print(
+            f"[live_dataset] live_num_workers={num_workers} exceeds this "
+            f"process's {available_cpus} available CPUs; clamping to "
+            f"{available_cpus} to avoid oversubscription/OOM."
+        )
+        num_workers = available_cpus
     live_ds = LiveGPDataset(cfg, group_size=group_size)
     return DataLoader(
         live_ds,
