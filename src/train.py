@@ -1183,20 +1183,21 @@ def main(cfg: DictConfig) -> None:
                 # small constant — enough for the current shard plus one prefetch
                 # margin at a shard boundary, not shard_block_shards-worth.
                 #
-                # That alone wasn't sufficient in practice (still OOM'd a GPU node
-                # on systematic-composition-all-base with the real batch_size=32/
-                # val_episodes=500 config, vs. the smaller smoke-test values that
-                # first validated this fix): DataLoader's batch_sampler round-robin
+                # That alone wasn't sufficient in practice (still OOM'd a GPU node on
+                # systematic-composition-all-base with the real batch_size=32/
+                # val_episodes=500 config): DataLoader's batch_sampler round-robin
                 # hands consecutive batches to different workers, but
                 # ShardHomogeneousBatchSampler emits every batch for one shard
-                # consecutively before moving to the next — so with 4 workers, all
-                # 4 end up needing the SAME shard resident at once, each holding its
-                # own independent ~1-1.8GB copy (worker processes don't share this
-                # cache; only the returned batch tensors go through shared memory).
-                # 4 workers x cache=2 was still up to ~4x redundant copies of the
-                # same shard per loader. Cut num_workers too, so the loader-level
-                # peak is (workers x cache) resident shard-equivalents instead of
-                # scaling with the fixed-d default's worker count.
+                # consecutively before moving to the next — so with 4 workers, all 4
+                # end up needing the SAME shard resident at once, each holding its own
+                # independent ~1-1.8GB copy (worker processes don't share this cache;
+                # only the returned batch tensors go through shared memory). Turned out
+                # NOT to be caused by worker count, though (see the cache.clear() note
+                # below for the real culprit) — verified empirically that num_workers=4
+                # with the cache properly cleared stays bounded (~24GB peak on a 62GB
+                # test node for this dataset's largest shards, vs ~16GB at
+                # num_workers=2). If this ever needs to run on a smaller-RAM node,
+                # dropping this back to 2 is the lever to pull.
                 full_dataset._SHARD_CACHE_SIZE = min(full_dataset._SHARD_CACHE_SIZE, 2)
                 # Lowering the cap alone doesn't shrink an already-oversized cache:
                 # dataset.py's LRU only evicts one entry per one new insertion (never
@@ -1208,7 +1209,7 @@ def main(cfg: DictConfig) -> None:
                 # That stale, oversized cache then gets inherited by every forked
                 # DataLoader worker. Clear it now so the new cap actually applies.
                 full_dataset._shard_cache.clear()
-                loader_num_workers = 2
+                loader_num_workers = 4
                 print(
                     "[train] per-shard-varying d_features detected "
                     f"({sorted(d_seen)}...) → batching within single shards "
