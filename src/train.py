@@ -1167,6 +1167,20 @@ def main(cfg: DictConfig) -> None:
                 # is feature-homogeneous. A shard also shares one kernel/P/N/
                 # active_dims, so these batches are single-task — the accepted price
                 # of variable-d. shard_block_shards (cross-shard mixing) is moot here.
+                #
+                # full_dataset was constructed above with shard_cache_size=
+                # shard_block_shards+4 (default 20), sized for ShardBlockSampler's
+                # cross-shard blocking. ShardHomogeneousBatchSampler never blocks
+                # across shards — its own docstring guarantees "at most one shard
+                # is resident at a time" — so that 20-slot cache is dead weight
+                # here: with num_workers=4 on train + 4 on val, 20 cached shards/
+                # worker on datasets with multi-hundred-MB-to-multi-GB shards (e.g.
+                # systematic-composition-all-base, up to ~1.8GB/shard) can push
+                # aggregate resident memory into the tens-to-hundreds of GB and get
+                # a DataLoader worker SIGKILLed by the OS OOM killer. Shrink to a
+                # small constant — enough for the current shard plus one prefetch
+                # margin at a shard boundary, not shard_block_shards-worth.
+                full_dataset._SHARD_CACHE_SIZE = min(full_dataset._SHARD_CACHE_SIZE, 2)
                 print(
                     "[train] per-shard-varying d_features detected "
                     f"({sorted(d_seen)}...) → batching within single shards "
