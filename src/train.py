@@ -1212,17 +1212,21 @@ def main(cfg: DictConfig) -> None:
                 # That stale, oversized cache then gets inherited by every forked
                 # DataLoader worker. Clear it now so the new cap actually applies.
                 full_dataset._shard_cache.clear()
-                # This OAR job's cgroup caps RAM at ~31GB (vs the 62GB test node the
-                # num_workers=4 figure above was verified on) — pulling the
-                # documented smaller-RAM-node lever to stay under that cap by
-                # default. Now that dataset.py loads shards with mmap=True
-                # (near-zero per-shard RSS instead of a full eager copy),
-                # more workers may be safe again — override via
-                # training.loader_num_workers to test higher values.
+                # Was dropped to 2 on this ~31GB-cgroup-capped OAR job because
+                # eager per-shard loading multiplied shard_cache_size x
+                # num_workers x full shard size into RSS. dataset.py now loads
+                # shards with mmap=True (near-zero per-shard RSS), which
+                # removed that constraint — re-verified empirically
+                # (2026-08-11, this same dataset/job): GPU duty cycle averaged
+                # ~30% at num_workers=2 vs ~60-65% at 4/6/8 (nvidia-smi dmon,
+                # 1s samples), with cgroup RSS flat (~4.9GB) across all of
+                # them — a plateau, not a monotonic win, so 4 is the practical
+                # default rather than pushing higher for no further gain.
+                # Override via training.loader_num_workers to test further.
                 loader_num_workers = (
                     int(loader_num_workers_override)
                     if loader_num_workers_override is not None
-                    else 2
+                    else 4
                 )
                 print(
                     "[train] per-shard-varying d_features detected "
