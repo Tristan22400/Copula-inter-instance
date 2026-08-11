@@ -2478,6 +2478,44 @@ def corrupt_z_train(z_train: Tensor, data_cfg) -> Tensor:
     return torch.where(apply_ep.unsqueeze(-1), z_blend, z_train)
 
 
+def _max_batch_for_context(B: int, T: int, device: str) -> int:
+    """Cap the per-call episode batch at B episodes given context length
+    T=P+N, to avoid CUDA OOM in _generate_gp_batch_raw below.
+
+    P/N (and hence T) are resampled per call from wide, independent ranges
+    (see conf/data/gp_tasks.yaml's P_max/N_max, currently up to 512/1024),
+    while B defaults to cfg.data.shard_size (256) regardless of T -- several
+    (B, T, T) float32 buffers are live at once around the K_all_raw -> L_all
+    -> K_all Cholesky/reconstruction (see _generate_gp_batch_raw), so peak
+    VRAM scales like B*T^2. Most draws keep T small, but an occasional big
+    P+N draw at the configured shard_size can exceed available memory even
+    though the vast majority of shards generate fine -- this is what
+    produced a mid-run `torch.OutOfMemoryError` in _generate_gp_batch_raw's
+    `K_all = L_all @ L_all.mT` line after ~600 successful shards.
+
+    Uses live free memory (torch.cuda.mem_get_info) rather than a static
+    threshold so it adapts to whatever else is already resident -- notably
+    the frozen TabICL marginal + its K-fold forward passes when
+    cfg.data.z_train_source="tabicl" is active, which eats a large,
+    P-dependent chunk of VRAM on top of the GP machinery here. Returning
+    less than the requested B is safe and already part of
+    _generate_gp_batch_raw's contract ("may return FEWER than B episodes");
+    generate_gp_batch's top-up loop resamples a fresh (smaller, with high
+    probability) T and tops up the shortfall.
+    """
+    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+        return B
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    # Empirical: ~6 live (B,T,T) float32 buffers at peak (K_all_raw, L_all,
+    # K_all, plus gpytorch/linear_operator's internal copies during
+    # covariance_matrix materialization and psd_safe_cholesky's jitter
+    # retries); budget only half of free memory as headroom for the
+    # TabICL marginal and allocator fragmentation.
+    bytes_per_episode = 6 * T * T * 4
+    budget = 0.5 * free_bytes
+    return max(1, min(B, int(budget // bytes_per_episode)))
+
+
 @torch.no_grad()
 def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
@@ -2583,6 +2621,12 @@ def _generate_gp_batch_raw(
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
+    # Cap B for this call so the (B, T, T) buffers below fit in free VRAM --
+    # see _max_batch_for_context's docstring. Safe to shrink B here: this
+    # function is already documented to possibly return fewer than the
+    # requested B episodes, and generate_gp_batch's top-up loop assembles
+    # the shortfall via additional calls.
+    B = _max_batch_for_context(B, T, device)
     batch_shape = torch.Size([B])
 
     # active_dims (and hence k) is sampled once per batch call and shared by
