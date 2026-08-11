@@ -47,6 +47,10 @@ training:
   # variable-d) — set explicitly to tune, e.g. now that dataset.py loads
   # shards with mmap=True instead of an eager full copy.
   loader_num_workers: null
+  # Batches queued ahead per DataLoader worker (train.py's prefetch_factor).
+  # null keeps the built-in default (4) — bump to give workers more runway
+  # to hide NFS shard-read latency behind GPU compute.
+  prefetch_factor: null
   # Live generation: skip dataset_dir entirely and generate episodes on the
   # fly via DataLoader workers (see live_dataset.py) — no disk reads/writes
   # for training data. Temporary, storage-constrained-environment mode;
