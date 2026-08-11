@@ -1209,7 +1209,10 @@ def main(cfg: DictConfig) -> None:
                 # That stale, oversized cache then gets inherited by every forked
                 # DataLoader worker. Clear it now so the new cap actually applies.
                 full_dataset._shard_cache.clear()
-                loader_num_workers = 4
+                # This OAR job's cgroup caps RAM at ~31GB (vs the 62GB test node the
+                # num_workers=4 figure above was verified on) — pulling the
+                # documented smaller-RAM-node lever to stay under that cap.
+                loader_num_workers = 2
                 print(
                     "[train] per-shard-varying d_features detected "
                     f"({sorted(d_seen)}...) → batching within single shards "
