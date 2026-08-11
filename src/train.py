@@ -1131,6 +1131,16 @@ def main(cfg: DictConfig) -> None:
         loader_num_workers = (
             int(loader_num_workers_override) if loader_num_workers_override is not None else 4
         )
+        # Batches queued ahead per worker. Default 4 happened to equal exactly
+        # one shard's worth of batches at num_workers=4 (shard_size=256,
+        # batch_size=16 -> 16 batches/shard = num_workers*prefetch_factor),
+        # leaving no buffer across a shard boundary — bump via
+        # training.prefetch_factor to give workers more runway to read ahead
+        # through NFS latency bursts.
+        prefetch_factor_override = t.get("prefetch_factor", None)
+        prefetch_factor = (
+            int(prefetch_factor_override) if prefetch_factor_override is not None else 4
+        )
         if shard_files and os.path.exists(meta_path):
             shard_block_shards = int(t.get("shard_block_shards", 16))
             # Cache must hold a full active block, or each worker still thrashes
@@ -1278,7 +1288,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=loader_num_workers,
             pin_memory=(device == "cuda"),
             persistent_workers=True,
-            prefetch_factor=4,
+            prefetch_factor=prefetch_factor,
             **(
                 {"batch_sampler": train_batch_sampler}
                 if train_batch_sampler is not None
@@ -1295,7 +1305,7 @@ def main(cfg: DictConfig) -> None:
             num_workers=loader_num_workers,
             pin_memory=(device == "cuda"),
             persistent_workers=True,
-            prefetch_factor=4,
+            prefetch_factor=prefetch_factor,
             **(
                 {"batch_sampler": val_batch_sampler}
                 if val_batch_sampler is not None
