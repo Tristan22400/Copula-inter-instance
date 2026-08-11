@@ -9,6 +9,15 @@ defaults:
 
 seed: 42
 
+# Multi-process parallel dataset generation only (src/generate_pit_dataset.py,
+# launched via scripts/generate_dataset.sh's GEN_WORKERS) -- ignored by
+# train.py. worker_id/num_workers default to 0/1 (single process, original
+# behaviour); N cooperating processes pointed at the same data.dataset_dir
+# each set num_workers=N and a distinct worker_id in [0, N) to partition the
+# shard range with no overlap and no coordination beyond the shared pit_dir.
+worker_id: 0
+num_workers: 1
+
 wandb:
   project: copula-inter-instance
   entity: null   # override with your wandb username/org
