@@ -178,14 +178,26 @@ class CopulaDataset(Dataset):
             if len(self._shard_cache) >= self._SHARD_CACHE_SIZE:
                 self._shard_cache.popitem(last=False)   # evict LRU
             shard = torch.load(shard_path, map_location="cpu", weights_only=False, mmap=True)
-            self._shard_cache[shard_path] = [_add_derived_fields(ep) for ep in shard]
+            self._shard_cache[shard_path] = shard
         else:
             # Move to end to mark as most-recently used
             self._shard_cache.move_to_end(shard_path)
 
         shard     = self._shard_cache[shard_path]
         local_idx = min(local_idx, len(shard) - 1)   # guard for last shard
-        return shard[local_idx]
+        # Derive R_prior/Sigma_star on a shallow copy instead of caching them
+        # on the shard itself: computing eagerly for all shard_size episodes
+        # up front (and retaining them for the shard's whole time in the LRU
+        # cache) re-materializes in RAM the exact bytes generate_pit_dataset.py
+        # stopped persisting to disk (they're each an N_max x N_max float32
+        # matrix, ~2/3 of a shard's pre-fix size) -- times shard_cache_size x
+        # num_workers resident shards, this was pushing RSS to the cgroup cap
+        # on large-N_max datasets (e.g. systematic-composition-all-base).
+        # Deriving per-episode and returning a shallow copy leaves the cached
+        # shard holding only the cheap mmap-backed raw fields; the derived
+        # matrices are freed once collate_fn consumes them instead of staying
+        # pinned for the shard's entire cache lifetime.
+        return _add_derived_fields(dict(shard[local_idx]))
 
     def _get_sharded(self, idx: int) -> dict:
         # Non-finite z_train/y_train (see _episode_is_finite) shouldn't reach
