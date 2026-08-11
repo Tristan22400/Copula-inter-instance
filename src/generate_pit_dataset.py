@@ -36,8 +36,17 @@ Usage
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
+import warnings
+
+# Must be set before any CUDA call (i.e. before `import torch`) -- see the
+# identical setdefault in train.py. expandable_segments avoids OOMs caused by
+# allocator fragmentation (a request failing despite enough total free memory
+# because it's split across pieces too small individually), which compounds
+# the risk _generate_shard_with_oom_retry below is a safety net for.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import hydra
 import torch
@@ -49,6 +58,63 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from data_gen import generate_gp_batch
+
+
+def _generate_shard_with_oom_retry(
+    cfg, n_this: int, device: str, *, tabicl_model, tabicl_k_folds: int,
+) -> list:
+    """Generate n_this episodes for one shard, halving the chunk size and
+    retrying on CUDA OOM instead of killing a multi-day generation run.
+
+    data_gen.py::_max_batch_for_context already estimates a safe per-call
+    batch size up front from live free VRAM, so this should rarely fire --
+    it's a safety net for when that estimate is wrong (e.g. another process
+    sharing the GPU, or the frozen TabICL marginal's own memory footprint
+    when cfg.data.z_train_source="tabicl" varying with P in a way the
+    estimate doesn't fully capture).
+
+    On OOM: gc.collect() BEFORE empty_cache(). A CUDA OOM's traceback keeps
+    the failed batch's tensors alive via a reference cycle (exception ->
+    traceback -> frame -> locals -> ... ); plain refcounting doesn't free
+    cycles, only the cyclic GC does, so empty_cache() alone would see those
+    blocks as still "in use" and reclaim nothing (see the identical fix,
+    and the three prior attempts that didn't work, for train.py's OOM
+    handler in feedback memory / git history). Chunk calls use a distinct
+    cfg.seed offset per chunk so a halved retry doesn't just redraw the
+    identical (still-too-large) batch from the same RNG state -- same
+    "offset by a large prime" convention generate_gp_batch's own top-up
+    loop uses, kept in a different range so the two don't collide.
+    """
+    base_seed = getattr(cfg, "seed", None)
+    episodes: list = []
+    remaining = n_this
+    chunk = n_this
+    chunk_idx = 0
+    while remaining > 0:
+        this_chunk = min(chunk, remaining)
+        if base_seed is not None:
+            cfg.seed = base_seed + chunk_idx * 900_001
+        try:
+            episodes += generate_gp_batch(
+                cfg, this_chunk, device,
+                tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+            )
+            remaining -= this_chunk
+            chunk_idx += 1
+        except torch.cuda.OutOfMemoryError:
+            if this_chunk == 1:
+                raise  # nothing smaller left to try -- a genuine failure
+            gc.collect()
+            torch.cuda.empty_cache()
+            chunk = max(1, this_chunk // 2)
+            warnings.warn(
+                f"generate_pit_dataset: CUDA OOM generating a {this_chunk}-episode "
+                f"chunk; retrying at chunk size {chunk}.",
+                RuntimeWarning,
+            )
+    if base_seed is not None:
+        cfg.seed = base_seed
+    return episodes
 
 
 def _write_meta(pit_dir: str, n_total: int, shard_size: int) -> None:
@@ -121,7 +187,7 @@ def main(cfg: DictConfig) -> None:
             # shard so shards don't restart from the identical RNG state.
             if base_seed is not None:
                 cfg.seed = base_seed + shard_idx
-            episodes = generate_gp_batch(
+            episodes = _generate_shard_with_oom_retry(
                 cfg, n_this, device,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             )
