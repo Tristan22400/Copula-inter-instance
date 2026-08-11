@@ -57,9 +57,15 @@ training:
   # shards with mmap=True instead of an eager full copy.
   loader_num_workers: null
   # Batches queued ahead per DataLoader worker (train.py's prefetch_factor).
-  # null keeps the built-in default (4) — bump to give workers more runway
-  # to hide NFS shard-read latency behind GPU compute.
-  prefetch_factor: null
+  # 8 empirically holds cgroup RSS flat (~7GB, well under a 31GB-capped OAR
+  # job) while still getting data-wait down near loss's own cost (~2ms vs
+  # ~5ms) on systematic-composition-all-base. Pushing deeper (16, 32) grows
+  # RSS enough to OOM-kill the run — the per-batch payload (R_star/R_prior/
+  # Sigma_star are full N_max x N_max matrices) is large enough on its own
+  # that a 32-deep x num_workers queue fills the cgroup even after fixing
+  # the shard-cache's own leak (see dataset.py's _load_shard_entry). Override
+  # via training.prefetch_factor to tune further on a different dataset/node.
+  prefetch_factor: 8
   # Live generation: skip dataset_dir entirely and generate episodes on the
   # fly via DataLoader workers (see live_dataset.py) — no disk reads/writes
   # for training data. Temporary, storage-constrained-environment mode;
