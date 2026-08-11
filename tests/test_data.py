@@ -652,6 +652,50 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     assert len(d_set) == 1, f"top-up round used a different d_features than round 0: {d_set}"
 
 
+def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
+    """generate_pit_dataset.py's _generate_shard_with_oom_retry splits one
+    shard's generation across multiple generate_gp_batch calls when a chunk
+    hits CUDA OOM (or a transient cusolver/cublas error) and must reuse the
+    first successful chunk's d_features on every retry chunk, the same way
+    generate_gp_batch already pins d_features across its own internal
+    top-up rounds (test_topup_round_reuses_first_round_d_features above) --
+    without the pin, each retry chunk independently samples its own d.
+
+    Regression: this exact path (not the top-up-round path already covered
+    above) left 7/140 shards in a live systematic-composition-all-base
+    dataset run with internally-mixed d_features (e.g. one shard mixing
+    d=5 and d=9), each later crashing training with collate_fn's "mixed
+    feature counts" error -- ShardHomogeneousBatchSampler assumes every
+    shard is feature-homogeneous and doesn't verify it."""
+    import generate_pit_dataset as gpd
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
+    cfg.data.d_features_lognormal_scale = 0.4
+    cfg.seed = 123
+
+    real_generate_gp_batch = dg.generate_gp_batch
+    state = {"n_calls": 0}
+
+    def oom_first_chunk(cfg, B, device="cpu", **kwargs):
+        state["n_calls"] += 1
+        if state["n_calls"] == 1:
+            raise torch.cuda.OutOfMemoryError("synthetic OOM")
+        return real_generate_gp_batch(cfg, B, device, **kwargs)
+
+    monkeypatch.setattr(gpd, "generate_gp_batch", oom_first_chunk)
+
+    episodes = gpd._generate_shard_with_oom_retry(
+        cfg, n_this=20, device="cpu", tabicl_model=None, tabicl_k_folds=10,
+    )
+    assert state["n_calls"] > 1, "test setup didn't actually trigger a retry chunk"
+    assert len(episodes) == 20
+    d_set = {ep["x_norm_train"].shape[-1] for ep in episodes}
+    assert len(d_set) == 1, f"retry chunk used a different d_features than the first chunk: {d_set}"
+
+
 def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
     """A non-finite z_train (near-singular K_ff blowing past the jitter
     escalation ladder) must be discarded before an episode is saved, not
