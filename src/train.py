@@ -1127,7 +1127,10 @@ def main(cfg: DictConfig) -> None:
         train_batch_sampler = None
         val_batch_sampler = None
         variable_d = False
-        loader_num_workers = 4
+        loader_num_workers_override = t.get("loader_num_workers", None)
+        loader_num_workers = (
+            int(loader_num_workers_override) if loader_num_workers_override is not None else 4
+        )
         if shard_files and os.path.exists(meta_path):
             shard_block_shards = int(t.get("shard_block_shards", 16))
             # Cache must hold a full active block, or each worker still thrashes
@@ -1211,8 +1214,16 @@ def main(cfg: DictConfig) -> None:
                 full_dataset._shard_cache.clear()
                 # This OAR job's cgroup caps RAM at ~31GB (vs the 62GB test node the
                 # num_workers=4 figure above was verified on) — pulling the
-                # documented smaller-RAM-node lever to stay under that cap.
-                loader_num_workers = 2
+                # documented smaller-RAM-node lever to stay under that cap by
+                # default. Now that dataset.py loads shards with mmap=True
+                # (near-zero per-shard RSS instead of a full eager copy),
+                # more workers may be safe again — override via
+                # training.loader_num_workers to test higher values.
+                loader_num_workers = (
+                    int(loader_num_workers_override)
+                    if loader_num_workers_override is not None
+                    else 2
+                )
                 print(
                     "[train] per-shard-varying d_features detected "
                     f"({sorted(d_seen)}...) → batching within single shards "
