@@ -15,7 +15,7 @@ wandb:
 
 training:
   device: auto
-  batch_size: 32
+  batch_size: 16
   # torch.compile adds real overhead (first-step + recompiles on shape changes);
   # worth it for long runs, a drag while iterating quickly. Off by default.
   compile: false
@@ -41,7 +41,7 @@ training:
   # — same knob so the val plots (e.g. val/corr_density) are comparable in
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
-  val_episodes: 500
+  val_episodes: 100
   # Override for the on-disk dataset DataLoader worker count (train.py's
   # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
   # variable-d) — set explicitly to tune, e.g. now that dataset.py loads
@@ -60,7 +60,7 @@ training:
   # (data<1ms/step) at both batch_size=128 and 256 on a 44-core node. Bump
   # this further (in step with batch_size) if you have more cores and go
   # bigger; 16 was already at the floor — 24 gave no further improvement.
-  live_num_workers: 16
+  live_num_workers: 8
   # generate_gp_batch() call size = batch_size * live_group_multiplier. Must be
   # a multiple of batch_size: generate_gp_batch samples kernel/P/N/active_dims
   # (and, for variable-d configs, d_features itself) once per call, shared by
