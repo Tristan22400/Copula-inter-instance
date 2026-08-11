@@ -199,6 +199,25 @@ def main(cfg: DictConfig) -> None:
             # n_total must never claim a shard that isn't fully on disk yet.
             _write_meta(pit_dir, n_generated, B)
 
+            # Periodic cache trim: P/N (context length T) are resampled per
+            # shard from wide, independent ranges, so the CUDA allocator sees
+            # a different (B,T,T) shape almost every call. Without ever
+            # trimming, reserved-but-fragmented blocks from earlier (large-T)
+            # shards accumulate across a multi-day, 100k+-shard run and are
+            # never returned to the driver -- torch.cuda.mem_get_info (which
+            # _max_batch_for_context uses to size each call) sees less and
+            # less "free" memory over time even though little is genuinely
+            # live, so the per-call batch size ratchets down and per-episode
+            # overhead (esp. the tabicl_model K-fold forward under
+            # z_train_source="tabicl") dominates. gc.collect() must run
+            # before empty_cache() -- same reference-cycle reasoning as
+            # _generate_shard_with_oom_retry's OOM handler above and
+            # train.py's OOM handler (a bare empty_cache() does not reclaim
+            # tensors still held alive by a cycle).
+            if device == "cuda" and shard_idx % 50 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
     print(f"Done. {n_shards} shards written to {pit_dir}")
 
 
