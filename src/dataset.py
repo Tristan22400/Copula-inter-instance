@@ -207,19 +207,33 @@ class CopulaDataset(Dataset):
         # exclude" convention data_gen.py uses for its own degenerate
         # episodes, just applied at load time for shards written before that
         # fix existed.
+        #
+        # The skip must stay within idx's own shard: variable-d_features
+        # datasets store a different feature count per shard, and
+        # ShardHomogeneousBatchSampler guarantees every batch stays within one
+        # shard on the assumption that __getitem__ never crosses that
+        # boundary either. Wrapping globally (mod self._n_total) broke that
+        # guarantee whenever the non-finite episode was last in its shard —
+        # the skip would land in the next shard, silently handing back an
+        # episode with a different d_features and blowing up collate_fn with
+        # a "mixed feature counts" error much later.
+        shard_size  = self._shard_size
+        shard_start = (idx // shard_size) * shard_size
+        shard_len   = min(shard_size, self._n_total - shard_start)
         probe = idx
         for _ in range(self._MAX_INVALID_RETRIES):
             ep = self._load_shard_entry(probe)
             if _episode_is_finite(ep):
                 return ep
+            next_probe = shard_start + (probe - shard_start + 1) % shard_len
             import warnings
             warnings.warn(
                 f"CopulaDataset: episode at idx {probe} has non-finite "
                 f"z_train/y_train (stale degenerate episode); skipping to "
-                f"idx {(probe + 1) % self._n_total}.",
+                f"idx {next_probe}.",
                 RuntimeWarning,
             )
-            probe = (probe + 1) % self._n_total
+            probe = next_probe
         raise RuntimeError(
             f"CopulaDataset: {self._MAX_INVALID_RETRIES} consecutive non-finite "
             f"episodes starting at idx {idx} — dataset may need regeneration."
