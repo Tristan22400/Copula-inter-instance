@@ -578,14 +578,19 @@ def validate(
             cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f ** 2).sum(-1)) / n_safe_cur
             cop_per_task.extend(cop_cur[valid_cur].cpu().tolist())
 
-            # W row-norms and s means (masked mean over valid test instances)
+            # W row-norms and s means (masked mean over valid test instances).
+            # "s" is absent for "tanhnorm" (see model.py's _NO_SCALAR_COLUMN /
+            # build_sigma's out.get("s") pattern) — skip the s-diagnostic for
+            # that parametrization instead of KeyError-ing.
             W_f = out["W"].float()
-            s_f = out["s"].float()
             mask_f = batch["test_mask"].float()
             W_norm_cur = (W_f.norm(dim=-1) * mask_f).sum(-1) / n_safe_cur
-            s_mean_cur = (s_f * mask_f).sum(-1) / n_safe_cur
             all_W_norms.extend(W_norm_cur[valid_cur].cpu().tolist())
-            all_s_vals.extend(s_mean_cur[valid_cur].cpu().tolist())
+            s_raw = out.get("s")
+            if s_raw is not None:
+                s_f = s_raw.float()
+                s_mean_cur = (s_f * mask_f).sum(-1) / n_safe_cur
+                all_s_vals.extend(s_mean_cur[valid_cur].cpu().tolist())
 
             # Off-diagonal and diagonal statistics (all valid entries in one shot)
             ri_cur, ci_cur = torch.triu_indices(N_cur, N_cur, offset=1, device=Sigma.device)
