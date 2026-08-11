@@ -3075,6 +3075,7 @@ def generate_gp_batch(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
+    d_override: Optional[int] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, discarding and regenerating any that
     turn out degenerate (see _generate_gp_batch_raw's `discard` — an
@@ -3097,6 +3098,14 @@ def generate_gp_batch(
     within one shard, which ShardHomogeneousBatchSampler/collate_fn assume
     can't happen.
 
+    d_override lets a caller that itself assembles one shard across multiple
+    generate_gp_batch calls (generate_pit_dataset.py's
+    _generate_shard_with_oom_retry, which splits into smaller chunks on CUDA
+    OOM) pin every chunk to the same d — without it, each chunk call would
+    independently sample its own d via _sample_d_features and the shard could
+    end up with the same kind of internally-mixed feature counts this
+    function already prevents across its own top-up rounds.
+
     In practice this loop almost never repeats more than once: the discard
     rate is astronomically rare (an episode has to defeat escalating jitter
     up to ~0.1 — see _psd_safe_batch/_batched_cholesky). max_rounds bounds
@@ -3106,14 +3115,19 @@ def generate_gp_batch(
     base_seed = getattr(cfg, "seed", None)
     episodes = _generate_gp_batch_raw(
         cfg, B, device, return_kernel_metadata=return_kernel_metadata,
+        d_override=d_override,
         tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
     )
-    # Pin every top-up round to the first round's d_features. Top-up rounds
-    # reseed with a different cfg.seed (below), which would otherwise
+    # Pin every top-up round to the first round's d_features (or the
+    # caller-supplied d_override, if the first round came up empty). Top-up
+    # rounds reseed with a different cfg.seed (below), which would otherwise
     # re-sample d independently (variable-d datasets, see _sample_d_features)
     # and silently mix feature counts within one shard — collate_fn cannot
     # pad across the feature axis, unlike P/N, so this must stay fixed.
-    d_fixed = int(episodes[0]["x_norm_train"].shape[-1]) if episodes else None
+    if episodes:
+        d_fixed = int(episodes[0]["x_norm_train"].shape[-1])
+    else:
+        d_fixed = d_override
     max_rounds = 20
     for round_idx in range(1, max_rounds + 1):
         if len(episodes) >= B:
