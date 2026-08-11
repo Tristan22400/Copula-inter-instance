@@ -42,6 +42,11 @@ training:
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
   val_episodes: 500
+  # Override for the on-disk dataset DataLoader worker count (train.py's
+  # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
+  # variable-d) — set explicitly to tune, e.g. now that dataset.py loads
+  # shards with mmap=True instead of an eager full copy.
+  loader_num_workers: null
   # Live generation: skip dataset_dir entirely and generate episodes on the
   # fly via DataLoader workers (see live_dataset.py) — no disk reads/writes
   # for training data. Temporary, storage-constrained-environment mode;
