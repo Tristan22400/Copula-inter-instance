@@ -38,6 +38,26 @@ def _episode_is_finite(ep: dict) -> bool:
     return all(torch.isfinite(ep[k]).all() for k in _FINITE_CHECK_KEYS if k in ep)
 
 
+def _add_derived_fields(ep: dict) -> dict:
+    """Reconstruct R_prior/Sigma_star when a shard was written without them.
+
+    generate_pit_dataset.py stops persisting these two N_max x N_max fields:
+    with oracle_mode="prior" (the only supported mode) they're exact
+    functions of R_star/sigma_star, which ARE stored -- R_prior == R_star,
+    and Sigma_star == R_star * outer(sigma_star, sigma_star) (see
+    data_gen.py's oracle_mode="prior" branch). Recomputing here is lossless
+    and keeps every downstream consumer (collate_fn, train.py, loss.py)
+    unaware of which schema a given shard was written with. Shards that DO
+    carry these keys (written before this change) are left untouched.
+    """
+    if "Sigma_star" not in ep:
+        sigma = ep["sigma_star"]
+        ep["Sigma_star"] = ep["R_star"] * sigma.unsqueeze(0) * sigma.unsqueeze(1)
+    if "R_prior" not in ep:
+        ep["R_prior"] = ep["R_star"].clone()
+    return ep
+
+
 class CopulaDataset(Dataset):
     """Dataset of pre-computed PIT episodes.
 
@@ -132,15 +152,16 @@ class CopulaDataset(Dataset):
 
     def _get_individual(self, idx: int) -> dict:
         try:
-            return torch.load(self._files[idx], map_location="cpu", weights_only=True, mmap=True)
+            ep = torch.load(self._files[idx], map_location="cpu", weights_only=True, mmap=True)
         except FileNotFoundError:
             candidates = [i for i in range(len(self._files)) if i != idx]
             if not candidates:
                 raise
-            return torch.load(
+            ep = torch.load(
                 self._files[random.choice(candidates)],
                 map_location="cpu", weights_only=True, mmap=True,
             )
+        return _add_derived_fields(ep)
 
     # ------------------------------------------------------------------
     # Sharded loading with LRU cache
@@ -156,9 +177,8 @@ class CopulaDataset(Dataset):
         if shard_path not in self._shard_cache:
             if len(self._shard_cache) >= self._SHARD_CACHE_SIZE:
                 self._shard_cache.popitem(last=False)   # evict LRU
-            self._shard_cache[shard_path] = torch.load(
-                shard_path, map_location="cpu", weights_only=False, mmap=True
-            )
+            shard = torch.load(shard_path, map_location="cpu", weights_only=False, mmap=True)
+            self._shard_cache[shard_path] = [_add_derived_fields(ep) for ep in shard]
         else:
             # Move to end to mark as most-recently used
             self._shard_cache.move_to_end(shard_path)

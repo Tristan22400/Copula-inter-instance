@@ -37,7 +37,7 @@ from data_gen import (
     sigma_to_correlation,
     tabiclv2_warp_features,
 )
-from dataset import CopulaDataset, collate_fn
+from dataset import CopulaDataset, _add_derived_fields, collate_fn
 
 # ---------------------------------------------------------------------------
 # tabiclv2_warp_features tests
@@ -1829,3 +1829,81 @@ def test_copula_dataset_skips_stale_nonfinite_episode(tmp_path):
         item = ds[1]
     assert torch.isfinite(item["z_train"]).all()
     assert torch.isfinite(item["y_train"]).all()
+
+
+def test_add_derived_fields_reconstructs_sigma_and_prior():
+    """R_prior/Sigma_star should be reconstructed exactly from R_star and
+    sigma_star when a shard was written without them (the dedup applied in
+    generate_pit_dataset.py to shrink on-disk shard size)."""
+    sample = _make_sample(P=6, N=4)
+    expected_R_prior = sample["R_star"].clone()
+    expected_Sigma_star = (
+        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
+    )
+    del sample["Sigma_star"]
+
+    out = _add_derived_fields(sample)
+
+    assert torch.allclose(out["R_prior"], expected_R_prior)
+    assert torch.allclose(out["Sigma_star"], expected_Sigma_star)
+
+
+def test_add_derived_fields_leaves_stored_values_untouched():
+    """If a shard DOES carry R_prior/Sigma_star (written before the dedup,
+    or with genuinely different values), _add_derived_fields must not
+    overwrite them."""
+    sample = _make_sample(P=6, N=4)
+    sample["R_prior"] = torch.full((4, 4), 0.5)
+    sample["Sigma_star"] = torch.full((4, 4), 2.0)
+
+    out = _add_derived_fields(sample)
+
+    assert torch.equal(out["R_prior"], torch.full((4, 4), 0.5))
+    assert torch.equal(out["Sigma_star"], torch.full((4, 4), 2.0))
+
+
+def test_copula_dataset_individual_reconstructs_missing_fields(tmp_path):
+    """Individual-file (task_*.pt) shards written without R_prior/Sigma_star
+    should still load with both fields present and correct."""
+    sample = _make_sample(P=6, N=4)
+    del sample["Sigma_star"]
+    torch.save(sample, tmp_path / "task_000000.pt")
+
+    ds = CopulaDataset(episode_dir=str(tmp_path))
+    item = ds[0]
+
+    assert "R_prior" in item and "Sigma_star" in item
+    assert torch.allclose(item["R_prior"], sample["R_star"])
+    expected_Sigma_star = (
+        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
+    )
+    assert torch.allclose(item["Sigma_star"], expected_Sigma_star)
+
+    # collate_fn must still work end-to-end on the reconstructed episode.
+    batch = collate_fn([item])
+    assert batch["Sigma_star"].shape == (1, 4, 4)
+    assert batch["R_prior"].shape == (1, 4, 4)
+
+
+def test_copula_dataset_sharded_reconstructs_missing_fields(tmp_path):
+    """Sharded (shard_*.pt) datasets written without R_prior/Sigma_star --
+    the new, smaller on-disk schema -- should still serve complete episodes
+    and collate identically to a dataset that stored all fields."""
+    samples = [_make_sample(P=6, N=4) for _ in range(3)]
+    for s in samples:
+        del s["Sigma_star"]
+        s.pop("R_prior", None)
+
+    torch.save(samples, tmp_path / "shard_000000.pt")
+    torch.save({"n_total": len(samples), "shard_size": len(samples)}, tmp_path / "meta.pt")
+
+    ds = CopulaDataset(episode_dir=str(tmp_path))
+    assert len(ds) == 3
+
+    item = ds[1]
+    assert "R_prior" in item and "Sigma_star" in item
+    assert torch.allclose(item["R_prior"], samples[1]["R_star"])
+
+    batch = collate_fn([ds[0], ds[1], ds[2]])
+    assert batch["Sigma_star"].shape == (3, 4, 4)
+    assert batch["R_prior"].shape == (3, 4, 4)

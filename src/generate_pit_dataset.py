@@ -12,8 +12,18 @@ Each shard_XXXXXX.pt is a list of B episode dicts with the schema:
 
     x_norm_train, x_norm_test, y_train, y_test  — raw features / targets
     z_train, z_test, log_pdf_test               — standardised PIT + marginals
-    R_star, Sigma_star, mu_star, sigma_star     — oracle (posterior or prior, per cfg.data.oracle_mode)
+    R_star, mu_star, sigma_star                 — oracle (prior, per cfg.data.oracle_mode)
     n_train, n_test                             — episode sizes
+
+R_prior and Sigma_star are NOT stored: with oracle_mode="prior" (the only
+supported mode) they're exact functions of R_star/sigma_star already in the
+dict (R_prior == R_star; Sigma_star == R_star * outer(sigma_star, sigma_star)
+— see data_gen.py's oracle_mode="prior" branch), and together they were 2/3
+of on-disk shard size for no new information. dataset.py's CopulaDataset
+reconstructs both transparently at load time (see _add_derived_fields), so
+this is invisible to every downstream consumer (collate_fn, train.py,
+loss.py). Older shards that DO have these keys stored are left untouched
+and loaded as-is.
 
 A meta.pt file records {"n_total": int, "shard_size": int} so CopulaDataset
 can build the episode index without loading any shard. It is (re)written
@@ -191,6 +201,15 @@ def main(cfg: DictConfig) -> None:
                 cfg, n_this, device,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             )
+            # Drop the two fields reconstructible from R_star/sigma_star at
+            # load time (see module docstring) -- cuts on-disk shard size by
+            # ~2/3 for free. Left untouched in the in-memory dict returned by
+            # generate_gp_batch/_generate_shard_with_oom_retry, so live-
+            # generation training and any other direct caller keep seeing
+            # the full schema.
+            for ep in episodes:
+                ep.pop("R_prior", None)
+                ep.pop("Sigma_star", None)
             torch.save(episodes, out_path)
 
             n_generated += n_this
