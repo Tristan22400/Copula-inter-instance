@@ -121,6 +121,14 @@ def _generate_shard_with_oom_retry(
     identical (still-too-large) batch from the same RNG state -- same
     "offset by a large prime" convention generate_gp_batch's own top-up
     loop uses, kept in a different range so the two don't collide.
+
+    Every chunk is pinned to the first chunk's d_features (via
+    generate_gp_batch's d_override) for the same reason generate_gp_batch
+    pins it across its own top-up rounds: an OOM/cusolver retry here splits
+    one shard's episodes across multiple generate_gp_batch calls, and
+    without the pin each call would independently sample its own d and the
+    shard could come out with internally-mixed feature counts --
+    ShardHomogeneousBatchSampler/collate_fn assume that can't happen.
     """
     base_seed = getattr(cfg, "seed", None)
     episodes: list = []
@@ -128,15 +136,19 @@ def _generate_shard_with_oom_retry(
     chunk = n_this
     chunk_idx = 0
     cusolver_retries = 0
+    d_fixed = None
     while remaining > 0:
         this_chunk = min(chunk, remaining)
         if base_seed is not None:
             cfg.seed = base_seed + chunk_idx * 900_001
         try:
-            episodes += generate_gp_batch(
-                cfg, this_chunk, device,
+            new_episodes = generate_gp_batch(
+                cfg, this_chunk, device, d_override=d_fixed,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             )
+            if d_fixed is None and new_episodes:
+                d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
+            episodes += new_episodes
             remaining -= this_chunk
             chunk_idx += 1
         except torch.cuda.OutOfMemoryError:
