@@ -9,7 +9,9 @@ Supports two on-disk layouts (auto-detected):
 The sharded layout is produced by generate_pit_dataset.py and is much faster
 on NFS because it reduces file-metadata operations by a factor of B.
 A small LRU shard cache (default 4 shards) keeps recently accessed shards
-in memory to amortise repeated random accesses within a DataLoader.
+memory-mapped (torch.load(..., mmap=True), not eagerly copied into RAM) to
+amortise repeated random accesses within a DataLoader while keeping each
+worker's RSS low.
 """
 
 from __future__ import annotations
@@ -130,13 +132,14 @@ class CopulaDataset(Dataset):
 
     def _get_individual(self, idx: int) -> dict:
         try:
-            return torch.load(self._files[idx], map_location="cpu", weights_only=True)
+            return torch.load(self._files[idx], map_location="cpu", weights_only=True, mmap=True)
         except FileNotFoundError:
             candidates = [i for i in range(len(self._files)) if i != idx]
             if not candidates:
                 raise
             return torch.load(
-                self._files[random.choice(candidates)], map_location="cpu", weights_only=True
+                self._files[random.choice(candidates)],
+                map_location="cpu", weights_only=True, mmap=True,
             )
 
     # ------------------------------------------------------------------
@@ -154,7 +157,7 @@ class CopulaDataset(Dataset):
             if len(self._shard_cache) >= self._SHARD_CACHE_SIZE:
                 self._shard_cache.popitem(last=False)   # evict LRU
             self._shard_cache[shard_path] = torch.load(
-                shard_path, map_location="cpu", weights_only=False
+                shard_path, map_location="cpu", weights_only=False, mmap=True
             )
         else:
             # Move to end to mark as most-recently used
