@@ -696,6 +696,87 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
     assert len(d_set) == 1, f"retry chunk used a different d_features than the first chunk: {d_set}"
 
 
+def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeypatch):
+    """_generate_gp_batch_raw must catch torch.linalg.LinAlgError the same
+    way it already catches gpytorch's NotPSDError -- discard the whole
+    B-episode batch and let generate_gp_batch's top-up loop resample,
+    instead of propagating and killing the worker process.
+
+    Regression: gpytorch's add_low_rank -> root_decomposition -> _symeig
+    path can raise torch.linalg.LinAlgError (LAPACK eigh failing to
+    converge on an ill-conditioned matrix) instead of NotPSDError out of
+    the exact same call this function already wraps in a try/except --
+    only NotPSDError was caught, so this exception type killed live
+    generation workers (job 3000710, worker 2, 4 times before the worker
+    gave up for good)."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.seed = 11
+
+    real_build_likelihood = dg._build_likelihood
+    state = {"n_calls": 0}
+
+    class _PoisonedLikelihood:
+        def __init__(self, real):
+            self._real = real
+
+        def __call__(self, *args, **kwargs):
+            state["n_calls"] += 1
+            if state["n_calls"] == 1:
+                raise torch.linalg.LinAlgError(
+                    "linalg.eigh: synthetic non-convergence for test"
+                )
+            return self._real(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def poisoned_build_likelihood(cfg, kernel_name, B, device):
+        return _PoisonedLikelihood(real_build_likelihood(cfg, kernel_name, B, device))
+
+    monkeypatch.setattr(dg, "_build_likelihood", poisoned_build_likelihood)
+
+    episodes = dg.generate_gp_batch(cfg, B=6, device="cpu")
+    assert state["n_calls"] > 1, "test setup didn't actually trigger a retry"
+    assert len(episodes) == 6
+
+
+def test_is_transient_cusolver_error_covers_tabicl_contention_errors():
+    """_is_transient_cusolver_error must also flag the two RuntimeError
+    messages seen from tabicl's InferenceManager under the same
+    concurrent-GEN_WORKERS GPU contention window as the cusolver/cublas
+    races it already retries, and must NOT flag a genuine unrelated
+    RuntimeError as transient.
+
+    Regression: job 3000709, worker 2 hit "CPU memory allocation failed
+    (CUDA error: invalid argument...) and disk offload is not available"
+    from tabicl's pinned-CPU-alloc fallback, then on a later attempt
+    "Expected all tensors to be on the same device, ... cuda:0 and cpu" out
+    of tabicl's quantile_dist.cdf -- neither matched "cusolver"/"cublas",
+    so both propagated straight out of _generate_shard_with_oom_retry and
+    killed the process; the worker was still dead hours later since
+    scripts/generate_dataset.sh's outer restart budget (5 attempts) was
+    exhausted by the repeated crash."""
+    import generate_pit_dataset as gpd
+
+    assert gpd._is_transient_cusolver_error(
+        RuntimeError(
+            "CPU memory allocation failed (CUDA error: invalid argument) "
+            "and disk offload is not available."
+        )
+    )
+    assert gpd._is_transient_cusolver_error(
+        RuntimeError(
+            "Expected all tensors to be on the same device, but found at "
+            "least two devices, cuda:0 and cpu!"
+        )
+    )
+    assert not gpd._is_transient_cusolver_error(RuntimeError("index out of range"))
+    assert not gpd._is_transient_cusolver_error(torch.cuda.OutOfMemoryError("oom"))
+
+
 def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
     """A non-finite z_train (near-singular K_ff blowing past the jitter
     escalation ladder) must be discarded before an episode is saved, not

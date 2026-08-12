@@ -1284,11 +1284,27 @@ def main(cfg: DictConfig) -> None:
 
         print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} episodes")
 
+        # collate_fn (dataset.py) also assembles an (B, N_max, N_max) R_prior
+        # tensor for schema-complete consumers (eval/plotting scripts, per its
+        # docstring) — but no training code path reads batch["R_prior"] (only
+        # R_star/Sigma_star feed loss.py/model.py; grep-verified). On datasets
+        # with large N this is a full extra big-matrix copy per batch (equal in
+        # size to R_star/Sigma_star) purely to populate an unused key, and it's
+        # redundant besides: dataset.py derives R_prior as a clone of R_star for
+        # oracle_mode="prior" datasets (the only mode this repo writes), so it
+        # never carries information collate_fn's R_star output doesn't already
+        # have. Drop it before the shared collate_fn runs so its has_prior
+        # branch (the actual allocate+copy cost) never fires for training.
+        def _train_collate_fn(samples):
+            for s in samples:
+                s.pop("R_prior", None)
+            return collate_fn(samples)
+
         # A batch_sampler (variable-d homogeneous batching) is mutually exclusive
         # with batch_size/sampler/shuffle, so pick one construction or the other.
         train_loader = DataLoader(
             train_dataset,
-            collate_fn=collate_fn,
+            collate_fn=_train_collate_fn,
             num_workers=loader_num_workers,
             pin_memory=(device == "cuda"),
             persistent_workers=True,
@@ -1305,7 +1321,7 @@ def main(cfg: DictConfig) -> None:
         )
         val_loader = DataLoader(
             val_dataset,
-            collate_fn=collate_fn,
+            collate_fn=_train_collate_fn,
             num_workers=loader_num_workers,
             pin_memory=(device == "cuda"),
             persistent_workers=True,

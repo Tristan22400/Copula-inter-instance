@@ -2706,7 +2706,7 @@ def _generate_gp_batch_raw(
         try:
             noisy_dist = likelihood(prior_dist)
             K_all_raw = noisy_dist.covariance_matrix  # (B, T, T), nugget already on diagonal
-        except NotPSDError:
+        except (NotPSDError, torch.linalg.LinAlgError):
             # Some composite/systematic kernel chains (esp. under sign
             # modulation — see _build_kernel_chain, or heavily-composed
             # structural warps pushing feature geometry to an extreme —
@@ -2723,11 +2723,20 @@ def _generate_gp_batch_raw(
             # (this call's kernel/hyperparameter draw) and let
             # generate_gp_batch's top-up loop resample a fresh one, rather
             # than crashing the whole run.
+            #
+            # add_low_rank's __add__ path doesn't always fail with NotPSDError
+            # though: when the intermediate LinearOperator IS symmetric but
+            # numerically ill-conditioned (near-repeated eigenvalues), gpytorch
+            # falls through to root_decomposition -> _symeig -> torch.linalg.eigh,
+            # whose LAPACK syevd/heevd routine can itself fail to converge and
+            # raises torch.linalg.LinAlgError (not NotPSDError) straight out of
+            # this same try block -- observed killing whole worker processes in
+            # production runs (job 3000710) since it wasn't caught here.
             warnings.warn(
                 f"_generate_gp_batch_raw: kernel evaluation for this "
                 f"{B}-episode batch (kernel={kernel_name!r}) raised NotPSDError "
-                f"before psd_safe_cholesky repair could run; discarding the "
-                f"whole batch and resampling.",
+                f"or LinAlgError before psd_safe_cholesky repair could run; "
+                f"discarding the whole batch and resampling.",
                 RuntimeWarning,
             )
             return []

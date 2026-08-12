@@ -75,8 +75,8 @@ _MAX_CUSOLVER_RETRIES = 8
 
 
 def _is_transient_cusolver_error(exc: BaseException) -> bool:
-    """True for the cusolver/cublas handle-creation races seen when several
-    generate_pit_dataset.py workers (scripts/generate_dataset.sh's
+    """True for the cusolver/cublas/pinned-allocation contention races seen
+    when several generate_pit_dataset.py workers (scripts/generate_dataset.sh's
     GEN_WORKERS) call into CUDA driver/context APIs at close to the same
     instant -- e.g. `cusolverDnCreate` returning CUSOLVER_STATUS_INTERNAL_ERROR
     with no OOM involved (mem_get_info showed plenty of free VRAM when this
@@ -85,13 +85,35 @@ def _is_transient_cusolver_error(exc: BaseException) -> bool:
     it's a transient contention error that clears itself on a short delay and
     retry -- so it must not be confused with a genuine bug's RuntimeError,
     which should still propagate and kill the run.
+
+    Same contention window also hits data.z_train_source="tabicl" runs via a
+    different code path: tabicl's InferenceManager._allocate_output_buffer
+    (tabicl_upstream/src/tabicl/_model/inference.py) tries a GPU alloc, falls
+    back to a *pinned* CPU alloc (cudaHostAlloc) on failure, and that pinned
+    alloc itself competes for the same limited GPU-managed pinned-memory pool
+    across GEN_WORKERS -- observed raising "CPU memory allocation failed
+    (CUDA error: invalid argument...) and disk offload is not available" from
+    that fallback (job 3000709, worker 2, 4 consecutive occurrences). The
+    same contention window was also seen manifesting one attempt later as
+    "Expected all tensors to be on the same device, but found at least two
+    devices, cuda:0 and cpu" out of tabicl's quantile_dist.cdf -- a mixed-
+    device tensor left over from a GPU/CPU offload-mode fallback that raced
+    with another worker's own allocation. Neither is a genuine bug in our
+    code (tabicl_upstream is vendored, kept pristine -- see its own retry
+    convention here rather than patching it in place), so both are treated
+    as transient and retried the same way as the cusolver races above.
     """
     if isinstance(exc, torch.cuda.OutOfMemoryError):
         return False
     if not isinstance(exc, RuntimeError):
         return False
     msg = str(exc).lower()
-    return "cusolver" in msg or "cublas" in msg
+    return (
+        "cusolver" in msg
+        or "cublas" in msg
+        or "cpu memory allocation failed" in msg
+        or "found at least two devices" in msg
+    )
 
 
 def _generate_shard_with_oom_retry(
