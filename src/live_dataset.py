@@ -21,13 +21,13 @@ from __future__ import annotations
 import copy
 import os
 import warnings
-from typing import Iterator, List
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from data_gen import generate_gp_batch
+from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
 
 
@@ -67,15 +67,32 @@ class LiveGPDataset(IterableDataset):
     hash-like combination of base_seed/worker_id/call_idx, so distinct workers
     (separate processes — safe to mutate global RNG state independently) and
     distinct calls within one worker never repeat the same episodes.
+
+    kernel_weights (optional): a `data_gen._COMPOSABLE_KERNELS`-ordered
+    torch.Tensor created with .share_memory_() by build_live_train_loader
+    (see training.adaptive_kernel_sampling). Passed straight through to every
+    generate_gp_batch call — since it's shared memory allocated before the
+    DataLoader forks its workers, the main training loop can mutate it in
+    place (train.py, after each validate() call) and every worker picks up
+    the update on its very next draw, with no explicit IPC. None (default)
+    means unweighted/uniform sampling, unchanged from before this feature.
     """
 
-    def __init__(self, cfg: DictConfig, group_size: int = 1):
+    def __init__(
+        self,
+        cfg: DictConfig,
+        group_size: int = 1,
+        kernel_weights: Optional[torch.Tensor] = None,
+    ):
         # Deep-copy so mutating .seed per call never touches the caller's cfg
         # (and so pickling this Dataset to worker processes doesn't drag along
         # anything unexpected the caller's cfg object might reference later).
         self._cfg = copy.deepcopy(cfg)
         self._base_seed = int(getattr(cfg, "seed", None) or 0)
         self.group_size = group_size
+        # NOT deep-copied: must stay the same shared-memory tensor the main
+        # process updates post-fork (see class docstring above).
+        self.kernel_weights = kernel_weights
 
     def _seed_for(self, worker_id: int, call_idx: int) -> int:
         # Not a cryptographic mix — just enough spread that (worker_id, call_idx)
@@ -102,17 +119,28 @@ class LiveGPDataset(IterableDataset):
         while True:
             cfg.seed = self._seed_for(worker_id, call_idx)
             call_idx += 1
-            episodes = generate_gp_batch(cfg, self.group_size, device="cpu")
+            episodes = generate_gp_batch(
+                cfg, self.group_size, device="cpu", kernel_weights=self.kernel_weights
+            )
             for ep in episodes:
                 yield ep
 
 
-def build_live_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> DataLoader:
+def build_live_train_loader(
+    cfg: DictConfig, t: DictConfig, device: str
+) -> Tuple[DataLoader, Optional[torch.Tensor]]:
     """Training DataLoader backed by LiveGPDataset instead of an on-disk
     CopulaDataset. Mirrors the disk path's DataLoader kwargs (train.py) so
     downstream code — batch dict shape, the non_blocking .to(device) call, the
     train_iter/StopIteration re-creation loop — is unaffected. LiveGPDataset
     never raises StopIteration, so that re-creation branch simply never fires.
+
+    Returns (loader, kernel_weights): kernel_weights is a
+    `_COMPOSABLE_KERNELS`-ordered, .share_memory_()'d tensor of per-family
+    sampling weights when t.adaptive_kernel_sampling is true, else None. Must
+    be created before the loader is first iterated (i.e. before workers fork)
+    for the shared-memory update path in train.py to reach the workers — see
+    LiveGPDataset's docstring.
     """
     batch_size = int(t.batch_size)
     group_multiplier = max(1, int(t.get("live_group_multiplier", 1)))
@@ -137,8 +165,12 @@ def build_live_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
             f"{available_cpus} to avoid oversubscription/OOM."
         )
         num_workers = available_cpus
-    live_ds = LiveGPDataset(cfg, group_size=group_size)
-    return DataLoader(
+    kernel_weights = None
+    if bool(t.get("adaptive_kernel_sampling", False)):
+        n = len(_COMPOSABLE_KERNELS)
+        kernel_weights = torch.full((n,), 1.0 / n, dtype=torch.float32).share_memory_()
+    live_ds = LiveGPDataset(cfg, group_size=group_size, kernel_weights=kernel_weights)
+    loader = DataLoader(
         live_ds,
         batch_size=t.batch_size,
         collate_fn=collate_fn,
@@ -147,6 +179,7 @@ def build_live_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
     )
+    return loader, kernel_weights
 
 
 def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig) -> List[dict]:
