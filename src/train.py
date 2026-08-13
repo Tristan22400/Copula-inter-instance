@@ -58,7 +58,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from classical_kernels import DEFAULT_FAMILIES
-from data_gen import KERNEL_REGISTRY, generate_gp_batch
+from data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, generate_gp_batch
 from dataset import (
     CopulaDataset,
     ShardBlockSampler,
@@ -345,6 +345,50 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
         batch = collate_fn(episodes)
         batches[family] = {k: v.to(device) for k, v in batch.items()}
     return batches
+
+
+def _update_adaptive_kernel_weights(
+    prev_weights: torch.Tensor, metrics: dict, lr: float, floor: float
+) -> torch.Tensor:
+    """DoReMi/GroupDRO-style exponentiated-gradient update of per-kernel-family
+    live-generation sampling weights (see training.adaptive_kernel_sampling),
+    ordered to match data_gen._COMPOSABLE_KERNELS.
+
+    Signal is the per-family excess loss (regret) already computed by
+    validate()'s kernel_fit/<family> probes: gap = copula_nll -
+    oracle_copula_nll (NLL is lower-is-better, and oracle_copula_nll is the
+    lower bound achievable by a perfect model — see loss.oracle_copula_nll —
+    so this is typically >=0, bigger when the model is further from oracle on
+    that family = more room to improve). Families with no probe (metrics
+    missing either key — e.g. not in cfg.baselines.kernels) get gap=0, i.e. no
+    update pressure, only the floor's implicit pull toward uniform.
+
+    w' = prev_weights * exp(lr * gap), renormalized, then blended with a
+    uniform floor: w = (1 - floor) * w' + floor * uniform — prevents any
+    family's weight collapsing toward 0 and being effectively dropped from
+    the curriculum. Pure function: caller is responsible for writing the
+    result into the shared-memory tensor DataLoader workers read from
+    (`kernel_weights_tensor.copy_(...)`, never rebind).
+    """
+    n = len(_COMPOSABLE_KERNELS)
+    gaps = torch.zeros(n, dtype=torch.float32)
+    for i, family in enumerate(_COMPOSABLE_KERNELS):
+        cop = metrics.get(f"kernel_fit/{family}/copula_nll")
+        ora = metrics.get(f"kernel_fit/{family}/oracle_copula_nll")
+        if cop is not None and ora is not None and math.isfinite(cop) and math.isfinite(ora):
+            gaps[i] = cop - ora
+    # Clamp the exponent, not the gap itself, so a single wild probe can't
+    # overflow exp() into inf and NaN out every family's weight via the
+    # shared normalization below.
+    exponent = torch.clamp(lr * gaps, min=-30.0, max=30.0)
+    raw = prev_weights.float() * torch.exp(exponent)
+    total = raw.sum()
+    uniform = torch.full((n,), 1.0 / n, dtype=torch.float32)
+    if not torch.isfinite(total) or total <= 0:
+        raw = uniform.clone()
+    else:
+        raw = raw / total
+    return (1.0 - floor) * raw + floor * uniform
 
 
 def _resolve_pit_ckpt(cfg) -> str | None:
@@ -1111,6 +1155,7 @@ def main(cfg: DictConfig) -> None:
         config=OmegaConf.to_container(cfg, resolve=True),
     )
 
+    adaptive_kernel_weights = None  # set below only when live_generation + adaptive_kernel_sampling
     if live_generation:
         # No on-disk dataset at all: episodes are generated on the fly by
         # DataLoader worker processes (see live_dataset.py). Temporary
@@ -1121,7 +1166,7 @@ def main(cfg: DictConfig) -> None:
             f"no dataset_dir read ({t.dataset_dir!r} ignored). "
             f"ckpt_dir={t.get('ckpt_dir', None)!r}"
         )
-        train_loader = build_live_train_loader(cfg, t, device)
+        train_loader, adaptive_kernel_weights = build_live_train_loader(cfg, t, device)
         val_loader   = build_fixed_live_val_batches(cfg, t)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
     else:
@@ -1758,6 +1803,19 @@ def main(cfg: DictConfig) -> None:
                 tabicl_val_z=tabicl_val_z,
             )
             log_dict = {f"val/{k}": v for k, v in metrics.items()}
+            if adaptive_kernel_weights is not None:
+                lr = float(t.get("adaptive_kernel_lr", 1.0))
+                floor = float(t.get("adaptive_kernel_floor", 0.05))
+                new_kernel_weights = _update_adaptive_kernel_weights(
+                    adaptive_kernel_weights, metrics, lr, floor
+                )
+                # In-place: adaptive_kernel_weights is the shared-memory
+                # tensor LiveGPDataset workers read from (live_dataset.py) —
+                # rebinding the name here would leave workers pointed at the
+                # old tensor instead of picking up the update.
+                adaptive_kernel_weights.copy_(new_kernel_weights)
+                for i, family in enumerate(_COMPOSABLE_KERNELS):
+                    log_dict[f"val/kernel_sampling_weight/{family}"] = float(new_kernel_weights[i])
             if plot_figs:
                 log_dict["val/corr_density"] = wandb.Image(plot_figs[0])
                 if len(plot_figs) > 1:

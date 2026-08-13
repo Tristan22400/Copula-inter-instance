@@ -1265,8 +1265,32 @@ def _sample_active_dims(d_total: int, cfg) -> List[int]:
     return sorted(random.sample(range(d_total), k))
 
 
-def _resolve_kernel_name(cfg) -> str:
-    """Pick which kernel to use for one task based on config."""
+def _weights_for_pool(pool: List[str], kernel_weights: Optional[Tensor]) -> Optional[List[float]]:
+    """Map a `_COMPOSABLE_KERNELS`-ordered weight tensor onto `pool` (a
+    filtered subset/reordering of it), renormalized over just that subset.
+
+    Returns None (meaning "uniform", i.e. random.choices' own default) when
+    kernel_weights is None, so every caller's unweighted behavior is
+    reproduced exactly when adaptive sampling is off.
+    """
+    if kernel_weights is None:
+        return None
+    idx = [_COMPOSABLE_KERNELS.index(name) for name in pool]
+    sub = [float(kernel_weights[i]) for i in idx]
+    total = sum(sub)
+    if total <= 0:
+        return None
+    return [w / total for w in sub]
+
+
+def _resolve_kernel_name(cfg, kernel_weights: Optional[Tensor] = None) -> str:
+    """Pick which kernel to use for one task based on config.
+
+    kernel_weights (optional): a `_COMPOSABLE_KERNELS`-ordered tensor of
+    sampling weights (see _sample_kernel_chain_structure) — used to bias the
+    `data.kernels` pool branch below; the fixed `data.kernel` branch has
+    nothing to weight since it's a single deterministic choice.
+    """
     data = cfg.data
     if hasattr(data, "kernel") and data.kernel:
         name = str(data.kernel)
@@ -1278,11 +1302,16 @@ def _resolve_kernel_name(cfg) -> str:
         for k in pool:
             if k not in KERNEL_REGISTRY:
                 raise ValueError(f"Unknown kernel '{k}'. Choose from {ALL_KERNELS}.")
-        return random.choice(pool)
+        weights = None
+        if all(k in _COMPOSABLE_KERNELS for k in pool):
+            weights = _weights_for_pool(pool, kernel_weights)
+        return random.choices(pool, weights=weights, k=1)[0] if weights else random.choice(pool)
     return "rbf"
 
 
-def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
+def _sample_kernel_chain_structure(
+    cfg, kernel_weights: Optional[Tensor] = None
+) -> tuple[List[str], List[str], str]:
     """CauKer-style composition (github.com/ShifengXIE/CauKer): sample a
     random component COUNT m ~ round(LogNormal(composite_num_kernels_lognormal_loc,
     _scale)), clipped to [composite_num_kernels_min, composite_num_kernels_max],
@@ -1314,7 +1343,14 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
     file's module docstring) against tests/test_dataset_corr_uniform.py:
     mean +0.166->+0.264 (still inside the abs(mean)<0.30 bound), frac(R>0.7)
     0.093->0.179. Re-validate if composite_exclude_kernels or the nugget
-    prior change."""
+    prior change.
+
+    kernel_weights (optional): a `_COMPOSABLE_KERNELS`-ordered tensor of
+    per-family sampling weights (see train.py's adaptive_kernel_sampling —
+    updated from a per-family model-vs-oracle performance gap so weaker
+    families get drawn more often). Renormalized over `pool` (post-exclude)
+    via _weights_for_pool; None (the default, and every non-adaptive caller)
+    reproduces today's uniform random.choices exactly."""
     exclude = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
     pool = [k for k in _COMPOSABLE_KERNELS if k not in exclude]
     if not pool:
@@ -1327,7 +1363,7 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
     m_loc = float(getattr(cfg.data, "composite_num_kernels_lognormal_loc", 0.55))
     m_scale = float(getattr(cfg.data, "composite_num_kernels_lognormal_scale", 1.05))
     m = min(max(round(random.lognormvariate(m_loc, m_scale)), lo), hi)
-    names = random.choices(pool, k=m)
+    names = random.choices(pool, weights=_weights_for_pool(pool, kernel_weights), k=m)
     ops = [random.choice(("+", "*")) for _ in range(m - 1)]
     chain_name = names[0] + "".join(f"{op}{name}" for op, name in zip(ops, names[1:]))
     return names, ops, chain_name
@@ -2522,6 +2558,7 @@ def _generate_gp_batch_raw(
     d_override: Optional[int] = None,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
+    kernel_weights: Optional[Tensor] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in a single vectorised call — the
     "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
@@ -2586,6 +2623,10 @@ def _generate_gp_batch_raw(
             pipeline.
         tabicl_k_folds: K-fold count for tabicl_model's PIT, ignored when
             tabicl_model is None.
+        kernel_weights: optional `_COMPOSABLE_KERNELS`-ordered sampling-weight
+            tensor forwarded to _sample_kernel_chain_structure/
+            _resolve_kernel_name (see their docstrings) — None reproduces
+            today's uniform sampling exactly.
 
     Returns:
         list of B episode dicts ready for torch.save.
@@ -2615,9 +2656,11 @@ def _generate_gp_batch_raw(
     # must share one active_dims subset (see _build_kernel_chain).
     systematic = bool(getattr(cfg.data, "systematic_composition", False))
     if systematic:
-        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg)
+        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(
+            cfg, kernel_weights=kernel_weights
+        )
     else:
-        kernel_name = _resolve_kernel_name(cfg)
+        kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
@@ -3085,6 +3128,7 @@ def generate_gp_batch(
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
     d_override: Optional[int] = None,
+    kernel_weights: Optional[Tensor] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, discarding and regenerating any that
     turn out degenerate (see _generate_gp_batch_raw's `discard` — an
@@ -3126,6 +3170,7 @@ def generate_gp_batch(
         cfg, B, device, return_kernel_metadata=return_kernel_metadata,
         d_override=d_override,
         tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+        kernel_weights=kernel_weights,
     )
     # Pin every top-up round to the first round's d_features (or the
     # caller-supplied d_override, if the first round came up empty). Top-up
@@ -3153,6 +3198,7 @@ def generate_gp_batch(
             cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata,
             d_override=d_fixed,
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+            kernel_weights=kernel_weights,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
