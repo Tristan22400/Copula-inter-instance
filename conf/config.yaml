@@ -31,9 +31,9 @@ training:
   steps: 1000000
   warmup_steps: 1000
   clip_grad_norm: 1.0
-  log_every: 100
+  log_every: 200
   val_every: 1000
-  save_every: 5000
+  save_every: 10000
   ckpt_dir: null
   # Path to a checkpoint saved by save_checkpoint() (model + optimizer +
   # scheduler + step). When set, model weights and optimizer/scaler state
@@ -50,7 +50,7 @@ training:
   # — same knob so the val plots (e.g. val/corr_density) are comparable in
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
-  val_episodes: 100
+  val_episodes: 200
   # Override for the on-disk dataset DataLoader worker count (train.py's
   # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
   # variable-d) — set explicitly to tune, e.g. now that dataset.py loads
@@ -157,9 +157,13 @@ baselines:
   # polynomial added (2026-08-13) alongside adaptive_kernel_sampling above: it
   # was in data_gen._COMPOSABLE_KERNELS (the live-sampling pool) but had no
   # probe here, so it had no kernel_fit signal and adaptive_kernel_sampling
-  # couldn't see it. periodic is kept even though composite_exclude_kernels
-  # (conf/data/gp_tasks.yaml) excludes it from that pool by default — its
-  # probe is harmless, just unused by the weight update in that case.
+  # couldn't see it. periodic is kept for the kernel_fit/periodic/* diagnostic
+  # (useful on its own even off the sampling curriculum), even though
+  # composite_exclude_kernels (conf/data/gp_tasks.yaml) excludes it from the
+  # live-sampling pool by default -- train.py's adaptive_kernel_sampling loop
+  # now skips updating/logging val/kernel_sampling_weight for any family in
+  # composite_exclude_kernels, so this probe no longer feeds a weight number
+  # that would otherwise look meaningful but never actually move sampling.
   kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic, periodic, polynomial]
   synth_n_episodes: 64      # fixed episodes generated once per kernel family
   synth_seed: 20260718      # fixed seed -> same probe episodes every run
