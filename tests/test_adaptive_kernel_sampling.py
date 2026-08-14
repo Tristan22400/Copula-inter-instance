@@ -102,6 +102,31 @@ def test_update_weights_extreme_gap_does_not_overflow():
     assert torch.isclose(out.sum(), torch.tensor(1.0), atol=1e-5)
 
 
+def test_update_weights_ignores_excluded_family_gap():
+    """A family in `exclude` must not move off-uniform even with a huge
+    oracle gap and a probe present -- it's never in _sample_kernel_chain_
+    structure's post-exclude pool, so letting its weight track performance
+    is pure noise (see composite_exclude_kernels docs in gp_tasks.yaml)."""
+    prev = _uniform_weights()
+    metrics = {
+        "kernel_fit/periodic/copula_nll": 100.0,
+        "kernel_fit/periodic/oracle_copula_nll": 0.0,
+        "kernel_fit/rbf/copula_nll": 0.5,
+        "kernel_fit/rbf/oracle_copula_nll": 0.1,
+    }
+    out_excluded = train._update_adaptive_kernel_weights(
+        prev, metrics, lr=1.0, floor=0.05, exclude={"periodic"}
+    )
+    out_included = train._update_adaptive_kernel_weights(
+        prev, metrics, lr=1.0, floor=0.05, exclude=None
+    )
+    i_periodic = _COMPOSABLE_KERNELS.index("periodic")
+    # Excluding periodic's gap keeps its weight far below what the same huge
+    # gap would otherwise drive it to.
+    assert out_excluded[i_periodic] < out_included[i_periodic]
+    assert torch.isclose(out_excluded.sum(), torch.tensor(1.0), atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # _sample_kernel_chain_structure weighting + no-op default
 # ---------------------------------------------------------------------------

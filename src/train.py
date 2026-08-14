@@ -38,6 +38,7 @@ import sys
 import time
 import zlib
 from glob import glob
+from typing import Optional
 
 import hydra
 import matplotlib
@@ -348,7 +349,8 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
 
 
 def _update_adaptive_kernel_weights(
-    prev_weights: torch.Tensor, metrics: dict, lr: float, floor: float
+    prev_weights: torch.Tensor, metrics: dict, lr: float, floor: float,
+    exclude: Optional[set] = None,
 ) -> torch.Tensor:
     """DoReMi/GroupDRO-style exponentiated-gradient update of per-kernel-family
     live-generation sampling weights (see training.adaptive_kernel_sampling),
@@ -363,6 +365,15 @@ def _update_adaptive_kernel_weights(
     missing either key — e.g. not in cfg.baselines.kernels) get gap=0, i.e. no
     update pressure, only the floor's implicit pull toward uniform.
 
+    exclude (optional): family names to hold out of the gap-driven update
+    entirely (gap forced to 0), regardless of whether a kernel_fit probe
+    exists for them. Meant for cfg.data.composite_exclude_kernels — those
+    families are never in _sample_kernel_chain_structure's sampling pool
+    (data_gen.py::_weights_for_pool already renormalizes over the
+    post-exclude pool, so their tensor entry is inert either way), so
+    driving their weight off model performance is just noise: it moves the
+    number without moving anything the number controls.
+
     w' = prev_weights * exp(lr * gap), renormalized, then blended with a
     uniform floor: w = (1 - floor) * w' + floor * uniform — prevents any
     family's weight collapsing toward 0 and being effectively dropped from
@@ -370,9 +381,12 @@ def _update_adaptive_kernel_weights(
     result into the shared-memory tensor DataLoader workers read from
     (`kernel_weights_tensor.copy_(...)`, never rebind).
     """
+    exclude = exclude or set()
     n = len(_COMPOSABLE_KERNELS)
     gaps = torch.zeros(n, dtype=torch.float32)
     for i, family in enumerate(_COMPOSABLE_KERNELS):
+        if family in exclude:
+            continue
         cop = metrics.get(f"kernel_fit/{family}/copula_nll")
         ora = metrics.get(f"kernel_fit/{family}/oracle_copula_nll")
         if cop is not None and ora is not None and math.isfinite(cop) and math.isfinite(ora):
@@ -1806,15 +1820,22 @@ def main(cfg: DictConfig) -> None:
             if adaptive_kernel_weights is not None:
                 lr = float(t.get("adaptive_kernel_lr", 1.0))
                 floor = float(t.get("adaptive_kernel_floor", 0.05))
+                excluded_kernels = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
                 new_kernel_weights = _update_adaptive_kernel_weights(
-                    adaptive_kernel_weights, metrics, lr, floor
+                    adaptive_kernel_weights, metrics, lr, floor, exclude=excluded_kernels
                 )
                 # In-place: adaptive_kernel_weights is the shared-memory
                 # tensor LiveGPDataset workers read from (live_dataset.py) —
                 # rebinding the name here would leave workers pointed at the
                 # old tensor instead of picking up the update.
                 adaptive_kernel_weights.copy_(new_kernel_weights)
+                # Excluded families are never in _sample_kernel_chain_structure's
+                # pool (data_gen.py::_weights_for_pool renormalizes over the
+                # post-exclude pool), so their weight is inert -- skip logging
+                # it to avoid implying it drives sampling.
                 for i, family in enumerate(_COMPOSABLE_KERNELS):
+                    if family in excluded_kernels:
+                        continue
                     log_dict[f"val/kernel_sampling_weight/{family}"] = float(new_kernel_weights[i])
             if plot_figs:
                 log_dict["val/corr_density"] = wandb.Image(plot_figs[0])
