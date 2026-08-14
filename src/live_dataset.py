@@ -126,6 +126,27 @@ class LiveGPDataset(IterableDataset):
                 yield ep
 
 
+def _limit_worker_threads(_worker_id: int) -> None:
+    """DataLoader worker_init_fn: pin each live-generation worker to a single
+    CPU thread.
+
+    generate_gp_batch runs GP kernel construction + Cholesky (LOO PIT) on CPU
+    inside every worker (device="cpu"). Left unset, each worker process
+    defaults to torch/BLAS intra-op parallelism sized to the *whole* machine's
+    core count, so live_num_workers processes each fan out over every core --
+    e.g. 8 workers x 20 threads on a 20-core node, ~8x oversubscription. That
+    thrash is consistent with the highly variable step "data=" wait times
+    observed in practice (a few ms up to several hundred ms on the same run):
+    contention severity depends on which other workers happen to be doing CPU
+    work at that instant. One thread per worker lets live_num_workers workers
+    run truly in parallel across the available cores instead of fighting each
+    other for them.
+    """
+    torch.set_num_threads(1)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+
 def build_live_train_loader(
     cfg: DictConfig, t: DictConfig, device: str
 ) -> Tuple[DataLoader, Optional[torch.Tensor]]:
@@ -178,6 +199,7 @@ def build_live_train_loader(
         pin_memory=(device == "cuda"),
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
+        worker_init_fn=_limit_worker_threads if num_workers > 0 else None,
     )
     return loader, kernel_weights
 
