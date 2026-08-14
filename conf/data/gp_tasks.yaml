@@ -258,10 +258,20 @@ composite_num_kernels_lognormal_scale: 1.05
 # exclude periodic chains entirely. Empty = sample from all of
 # data_gen._COMPOSABLE_KERNELS (rbf, matern12, matern32, matern52, cosine,
 # periodic, rational_quadratic, dot_product, polynomial).
-# "polynomial" is excluded here for now (like periodic/cosine/dot_product):
-# new addition, not yet validated against tests/test_dataset_corr_uniform.py
-# in long chains — remove it from this list once validated.
-composite_exclude_kernels: [cosine]
+# dot_product/polynomial excluded: both have a finite-dimensional feature map
+# (rank <= d_features, or a bit more for polynomial's degree), so their Gram
+# matrix is structurally rank-deficient whenever T=P+N (up to 1536) exceeds
+# that rank -- PSD in exact arithmetic but numerically near-singular. In
+# composite chains that near-singularity often survives the +/* combination
+# and defeats even the 0.1 jitter ceiling in _psd_safe_batch, triggering
+# _generate_gp_batch_raw's NotPSDError discard-and-resample path. Measured
+# 2026-08-13: 5% of live-generation calls hit >=1 retry round (each re-paying
+# the full ~0.5-3s generation cost), and dot_product appeared in 100% of the
+# sampled failing composite kernel strings, polynomial in most of the rest --
+# the dominant source of the "data=" step-time spikes under
+# training.live_generation=true. Same instability class as periodic/cosine
+# above, not a new phenomenon.
+composite_exclude_kernels: [cosine,periodic,dot_product,polynomial]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
