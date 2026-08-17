@@ -325,11 +325,23 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     once, with a fixed per-family seed, and reused every validation call, so
     kernel_fit/<family> only reflects the model's changing predictions on a
     frozen probe set — not resampling noise.
+
+    P_min/P_max/N_min/N_max are pinned to baselines.probe_* (NOT read from
+    cfg.data.*): this run's own gp_tasks.yaml can change its context/test-size
+    ranges (it has, repeatedly) without silently reshaping the probe episodes
+    underneath kernel_fit/<family> — otherwise two runs with different
+    data.P_min/P_max would each get a "frozen" probe that's fixed-per-run but
+    different-across-runs, defeating the entire point of a cross-run-
+    comparable benchmark.
     """
     bcfg = cfg.get("baselines", {}) or {}
     families = list(bcfg.get("kernels") or DEFAULT_FAMILIES)
     n_episodes = int(bcfg.get("synth_n_episodes", 64))
     base_seed = int(bcfg.get("synth_seed", 20260718))
+    probe_P_min = int(bcfg.get("probe_P_min", 32))
+    probe_P_max = int(bcfg.get("probe_P_max", 512))
+    probe_N_min = int(bcfg.get("probe_N_min", 8))
+    probe_N_max = int(bcfg.get("probe_N_max", 1024))
 
     batches: dict[str, dict] = {}
     for family in families:
@@ -338,9 +350,17 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
         family_seed = base_seed + (zlib.crc32(family.encode()) % 10_000)
         synth_cfg = OmegaConf.merge(
             cfg,
-            OmegaConf.create(
-                {"seed": family_seed, "data": {"kernel": family, "systematic_composition": False}}
-            ),
+            OmegaConf.create({
+                "seed": family_seed,
+                "data": {
+                    "kernel": family,
+                    "systematic_composition": False,
+                    "P_min": probe_P_min,
+                    "P_max": probe_P_max,
+                    "N_min": probe_N_min,
+                    "N_max": probe_N_max,
+                },
+            }),
         )
         episodes = generate_gp_batch(synth_cfg, n_episodes, device="cpu")
         batch = collate_fn(episodes)
@@ -754,6 +774,8 @@ def validate(
     # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
     # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
     # so these move with training progress (unlike a fixed data-only baseline).
+    family_copula_improvement: list[float] = []
+    family_corr_pearson: list[float] = []
     for family, sbatch in (synth_kernel_batches or {}).items():
         out_s = model(sbatch)
         Sigma_s = build_sigma(out_s, cfg, jitter=jitter, test_mask=sbatch["test_mask"])
@@ -770,11 +792,23 @@ def validate(
         oracle_cop_s = oracle_copula_nll(
             sbatch["R_star"].float(), sbatch["z_test"].float(), sbatch["test_mask"]
         ).item()
-        metrics[f"kernel_fit/{family}/copula_nll"]        = parts_s["copula"].item()
+        cop_s = parts_s["copula"].item()
+        metrics[f"kernel_fit/{family}/copula_nll"]        = cop_s
         metrics[f"kernel_fit/{family}/oracle_copula_nll"] = oracle_cop_s
         metrics[f"kernel_fit/{family}/corr_mse"]     = cq_s["mse"]
         metrics[f"kernel_fit/{family}/corr_mae"]     = cq_s["mae"]
         metrics[f"kernel_fit/{family}/corr_pearson"] = cq_s["pearson"]
+
+        # Same 0=identity/1=oracle normalization as the top-level
+        # copula_improvement, but per-family — lets a single family's easy/
+        # hard intrinsic NLL scale be compared against its own oracle instead
+        # of pooled in with every other family.
+        family_improvement = cop_s / oracle_cop_s if abs(oracle_cop_s) > 1e-12 else float("nan")
+        metrics[f"kernel_fit/{family}/copula_improvement"] = family_improvement
+        if not math.isnan(family_improvement):
+            family_copula_improvement.append(family_improvement)
+        if not math.isnan(cq_s["pearson"]):
+            family_corr_pearson.append(cq_s["pearson"])
 
         # One extra corr_grid column per kernel family: its own synthetic
         # episode's oracle beside the model's prediction on it — replaces the
@@ -788,6 +822,18 @@ def validate(
                     "R_ora":  sbatch["R_star"][0, :n_s, :n_s].float().cpu().numpy(),
                     "label":  f"kfit:{family}\nN={n_s}",
                 })
+
+    # Unweighted macro-average across kernel families: a single cross-run-
+    # comparable scalar. Plain averaging over synth_kernel_batches.items()
+    # would already be unweighted per-family (each family contributes one
+    # scalar regardless of n_episodes), but is computed explicitly here so it
+    # survives family list changes/NaNs without silently reweighting.
+    metrics["kernel_fit/mean_copula_improvement"] = (
+        float(np.mean(family_copula_improvement)) if family_copula_improvement else float("nan")
+    )
+    metrics["kernel_fit/mean_corr_pearson"] = (
+        float(np.mean(family_corr_pearson)) if family_corr_pearson else float("nan")
+    )
 
     model.train()
 
