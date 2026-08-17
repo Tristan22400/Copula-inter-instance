@@ -1,6 +1,6 @@
 """
 test_calibration_math.py — Null-hypothesis correctness checks for the
-multivariate spatial calibration metrics in plots/generate_plots.py
+multivariate spatial calibration metrics in eval/spatial/calibration.py
 (calc_kendall_pit, calc_mahalanobis_distances, calc_exceedance_probs,
 calc_spatial_coverage) before running them on real ERA5 data.
 
@@ -24,11 +24,11 @@ import pytest
 from scipy.stats import kstest, norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_PLOTS = os.path.join(os.path.dirname(_TESTS), "plots")
-if _PLOTS not in sys.path:
-    sys.path.insert(0, _PLOTS)
+_REPO_ROOT = os.path.dirname(_TESTS)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-import generate_plots as gp  # noqa: E402
+from eval.spatial import calibration as gp  # noqa: E402
 
 _SEED = 0
 
