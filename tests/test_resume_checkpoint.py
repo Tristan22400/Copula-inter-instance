@@ -3,17 +3,21 @@ test_resume_checkpoint.py — Verify resume_ckpt restarts training at step 0.
 
 train.load_checkpoint() used to restore optimizer/scheduler/scaler state and
 return `ckpt["step"] + 1`, so resuming continued the previous run's LR
-schedule and step count. It now restores only the model weights and returns
-nothing: resuming always restarts at step 0 with a fresh warmup/cosine
-schedule and the full step budget.
+schedule and step count. It was later changed to restore only the model
+weights, then optimizer/scaler restoration was reinstated (commit 09ea72e)
+as opt-in params so resumed runs don't have to relearn gradient statistics
+from scratch. Scheduler restoration remains intentionally excluded: resuming
+always restarts at step 0 with a fresh warmup/cosine schedule and the full
+step budget, and load_checkpoint returns nothing.
 
 Tests verify:
   1. load_checkpoint restores model weights from a checkpoint saved by
      save_checkpoint
-  2. load_checkpoint does NOT mutate optimizer state (no momentum/step
-     buffers leak from the checkpoint's optimizer)
+  2. load_checkpoint does NOT mutate optimizer state when optimizer isn't
+     passed in (no momentum/step buffers leak from the checkpoint)
   3. load_checkpoint does NOT mutate scheduler state (last_epoch stays at
-     whatever the fresh scheduler was already at, e.g. 0)
+     whatever the fresh scheduler was already at, e.g. 0) — there is no
+     scheduler param to opt into this, unlike optimizer/scaler
   4. load_checkpoint returns None (call sites must not derive a resume step
      from it; train.py's main() hardcodes start_step = 0 instead)
   5. load_checkpoint still raises FileNotFoundError for a missing path
@@ -70,7 +74,7 @@ def test_load_checkpoint_restores_weights(saved_ckpt):
     assert torch.equal(fresh_model.bias, saved_model.bias)
 
 
-def test_load_checkpoint_does_not_touch_optimizer_or_scheduler(saved_ckpt):
+def test_load_checkpoint_does_not_touch_optimizer_or_scheduler_when_not_passed(saved_ckpt):
     ckpt_path, _ = saved_ckpt
     fresh_model, fresh_optimizer, fresh_scheduler = make_model_optimizer_scheduler(seed=1)
 
@@ -79,7 +83,7 @@ def test_load_checkpoint_does_not_touch_optimizer_or_scheduler(saved_ckpt):
     assert optimizer_state_before["state"] == {}  # never stepped
     assert scheduler_state_before["last_epoch"] == 0
 
-    load_checkpoint(ckpt_path, fresh_model, device="cpu")
+    load_checkpoint(ckpt_path, fresh_model, device="cpu")  # optimizer/scaler omitted
 
     assert fresh_optimizer.state_dict() == optimizer_state_before
     assert fresh_scheduler.state_dict() == scheduler_state_before
@@ -91,10 +95,14 @@ def test_load_checkpoint_returns_none(saved_ckpt):
     assert load_checkpoint(ckpt_path, fresh_model, device="cpu") is None
 
 
-def test_load_checkpoint_signature_has_no_optimizer_scheduler_params():
-    """Guards against re-introducing optimizer/scheduler restoration."""
-    params = list(inspect.signature(load_checkpoint).parameters)
-    assert params == ["ckpt_path", "model", "device"]
+def test_load_checkpoint_signature_has_no_scheduler_param():
+    """Guards against re-introducing scheduler restoration (optimizer/scaler
+    restoration was intentionally reinstated in commit 09ea72e as opt-in
+    params, default None)."""
+    params = inspect.signature(load_checkpoint).parameters
+    assert list(params) == ["ckpt_path", "model", "device", "optimizer", "scaler"]
+    assert params["optimizer"].default is None
+    assert params["scaler"].default is None
 
 
 def test_load_checkpoint_missing_file_raises(tmp_path):
