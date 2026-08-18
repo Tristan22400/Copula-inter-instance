@@ -31,12 +31,12 @@ inactive_frac_min: 0.1
 inactive_frac_max: 0.8
 
 # Training/context set size range
-P_min: 32
-P_max: 512             # fewer train points → more residual posterior uncertainty
+P_min: 256
+P_max: 256             # fewer train points → more residual posterior uncertainty
 
 # Test/query set size range (copula is over these N instances)
-N_min: 8
-N_max: 1024
+N_min: 256
+N_max: 256
 
 # Number of tasks to generate
 n_tasks: 20000000
@@ -258,20 +258,30 @@ composite_num_kernels_lognormal_scale: 1.05
 # exclude periodic chains entirely. Empty = sample from all of
 # data_gen._COMPOSABLE_KERNELS (rbf, matern12, matern32, matern52, cosine,
 # periodic, rational_quadratic, dot_product, polynomial).
-# dot_product/polynomial excluded: both have a finite-dimensional feature map
-# (rank <= d_features, or a bit more for polynomial's degree), so their Gram
-# matrix is structurally rank-deficient whenever T=P+N (up to 1536) exceeds
-# that rank -- PSD in exact arithmetic but numerically near-singular. In
-# composite chains that near-singularity often survives the +/* combination
-# and defeats even the 0.1 jitter ceiling in _psd_safe_batch, triggering
-# _generate_gp_batch_raw's NotPSDError discard-and-resample path. Measured
-# 2026-08-13: 5% of live-generation calls hit >=1 retry round (each re-paying
-# the full ~0.5-3s generation cost), and dot_product appeared in 100% of the
-# sampled failing composite kernel strings, polynomial in most of the rest --
-# the dominant source of the "data=" step-time spikes under
-# training.live_generation=true. Same instability class as periodic/cosine
-# above, not a new phenomenon.
-composite_exclude_kernels: [cosine,periodic,dot_product,polynomial]
+# dot_product/polynomial were excluded here 2026-08-13 (both have a
+# finite-dimensional feature map -- rank <= d_features, or a bit more for
+# polynomial's degree -- so their Gram matrix is structurally rank-deficient
+# whenever T=P+N exceeds that rank), because that near-singularity was
+# defeating _psd_safe_batch's jitter ceiling AND, worse, dot_product
+# specifically (gpytorch.kernels.LinearKernel evaluates to a
+# RootLinearOperator when x1==x2) was tripping gpytorch's own
+# LinearOperator.__add__ -> add_low_rank eager root-decomposition path
+# during composite-kernel evaluation itself -- for the WHOLE batch, before
+# _psd_safe_batch ever got a chance to isolate individual episodes,
+# discarding all B episodes and forcing a full resample (~0.5-3s paid again,
+# repeatedly). Root-caused and fixed 2026-08-14: _build_kernel_chain/
+# _sample_episode_kernel/build_kernel_fn now combine composite components via
+# _DenseComposedKernel (plain dense tensor +/*, bypassing gpytorch's
+# LinearOperator addition and its add_low_rank dispatch entirely), and
+# _psd_safe_batch/_batched_cholesky now gather only the actually-failing
+# episodes before calling psd_safe_cholesky instead of re-running it on the
+# whole batch every jitter-escalation round. Re-enabled with both fixes in
+# place; if data= step-time regresses again, check for a NEW gpytorch
+# LinearOperator type triggering add_low_rank before reflexively
+# re-excluding these. cosine/periodic remain excluded for an older, separate
+# reason (not yet validated against tests/test_dataset_corr_uniform.py in
+# long chains) unrelated to this rank-deficiency mechanism.
+composite_exclude_kernels: [cosine,periodic]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
@@ -345,28 +355,111 @@ pit_eps: 1.0e-6
 #             see data_gen.py::_generate_gp_batch_raw.
 #   tabicl:   real K-fold PIT through the frozen TabICL marginal quantile
 #             head (pit.py::run_pit_batched), the same approximate estimator
-#             real (non-GP) deployment data would produce -- measured
-#             corr(z_exact, z_tabicl) ~= 0.6-0.65, see z_train_corruption's
-#             docstring below. Checkpoint comes from cfg.tabicl.ckpt/
-#             cfg.tabicl.pit_ckpt (train.py::_resolve_pit_ckpt's resolution
-#             order -- see conf/model/copula_prod.yaml), not a separate key
+#             real (non-GP) deployment data would produce -- see
+#             z_train_corruption's docstring below. Checkpoint comes from
+#             cfg.tabicl.ckpt/cfg.tabicl.pit_ckpt (train.py::_resolve_pit_ckpt's
+#             resolution order -- see conf/model/copula_prod.yaml), not a separate key
 #             here. z_test/log_pdf_test are untouched (still the oracle
 #             values); only the ICL conditioning input z_train changes.
-# "tabicl" needs network access on first run (downloads the checkpoint from
-# HuggingFace) and is substantially slower than "analytic" (z_train_tabicl_k_folds+1
-# TabICL forward passes per shard-generation batch instead of one closed-form
-# Cholesky) -- pilot on a small n_tasks before scaling a production run up.
+#   tabicl_split: same frozen TabICL marginal as "tabicl", but replaces the
+#             K-fold rotation with a single forward pass
+#             (pit.py::run_pit_calib_split_batched): an extra
+#             z_train_split_calib_frac * P pool of points is drawn from the
+#             same episode purely to serve as TabICL's context, every one of
+#             the P training points is scored against it in one pass, and
+#             the calibration pool is discarded (never saved). Costs 1
+#             TabICL forward pass per shard-generation batch instead of
+#             z_train_tabicl_k_folds+1 -- but every training point shares
+#             that one, fixed-size context, instead of K-fold's ~P(K-1)/K-
+#             sized context per point, so per-point PIT quality trades off
+#             against z_train_split_calib_frac (and hence extra GP-sampling
+#             cost) rather than against wall-clock. Same checkpoint
+#             resolution as "tabicl", but NOT the same "only z_train changes"
+#             guarantee: the calibration pool is deliberately included in the
+#             episode's per-point feature normalization (so TabICL still
+#             sees well-scaled input, benefiting from the larger sample when
+#             z_train_split_calib_frac is large), which means x_norm_train/
+#             x_norm_test/K_ff/K_ss/mu_star/sigma_star/R_star/z_test/
+#             log_pdf_test all pick up a small, deliberate dependence on
+#             z_train_split_calib_frac too -- a fully valid, self-consistent
+#             episode either way, just not byte-identical to a
+#             z_train_split_calib_frac=0 run at the same seed. See
+#             data_gen.py::_generate_gp_batch_raw's tabicl_split_calib_frac
+#             docstring for why a second renormalization pass after dropping
+#             the calibration block would be worse (decouples the saved
+#             coordinates from the already-computed oracle).
+# "tabicl"/"tabicl_split" need network access on first run (downloads the
+# checkpoint from HuggingFace) and are substantially slower than "analytic"
+# ("tabicl": z_train_tabicl_k_folds+1 TabICL forward passes per shard-
+# generation batch instead of one closed-form Cholesky; "tabicl_split": 1
+# forward pass, but over a larger context) -- pilot on a small n_tasks before
+# scaling a production run up.
 z_train_source: analytic
 # K-fold count for z_train_source=tabicl's run_pit_batched call (same
-# semantics/default as pit.py::DEFAULT_K_FOLDS). Ignored when
-# z_train_source=analytic.
+# semantics/default as pit.py::DEFAULT_K_FOLDS). Ignored unless
+# z_train_source=tabicl.
 z_train_tabicl_k_folds: 10
+# Calibration-pool size for z_train_source=tabicl_split's
+# run_pit_calib_split_batched call, as a fraction of P (the episode's
+# training-set size): P_C = max(1, round(z_train_split_calib_frac * P)).
+# Not capped at 1.0 -- a calibration pool bigger than the training set itself
+# (P_C > P) is expected and is the main lever for closing the K-fold quality
+# gap noted above, at the cost of extra (cheap) GP-sampling work per episode.
+# Ignored unless z_train_source=tabicl_split.
+z_train_split_calib_frac: 1.0
+
+# Adaptive real-TabICL z_train mixing for LIVE generation training only
+# (live_dataset.py -- ignored by the on-disk generate_pit_dataset.py path,
+# unlike z_train_source above). Orthogonal to z_train_source: instead of
+# forcing EVERY episode onto the analytic oracle or the real TabICL PIT for
+# the whole run, a per-kernel-family FRACTION of live-generation calls
+# substitutes the real TabICL K-fold PIT (same run_pit_batched path
+# z_train_source=tabicl uses) while the rest stay on the exact analytic
+# residual -- so the model is trained mostly on the clean oracle signal but
+# regularly sees the actual approximate signal real (non-GP) deployment data
+# produces, concentrated on the kernel families where that approximation is
+# worst.
+#
+# The per-family fraction is set ONCE at training startup (train.py::
+# _compute_tabicl_z_train_gap / _tabicl_gap_to_mix_frac), not re-adapted
+# during training like training.adaptive_kernel_sampling's kernel_weights:
+# the TabICL-vs-analytic z_train gap is a property of the frozen TabICL
+# marginal's quantile-head approximation quality for that kernel family, not
+# of the copula model being trained, so unlike adaptive_kernel_sampling's
+# regret signal (which moves as the model improves) it isn't a moving target
+# and doesn't need re-measuring every validate() call. Families with a
+# larger measured gap (harder for TabICL to approximate) get a higher
+# mixing fraction, linearly interpolated between the floor and max fractions
+# below over the observed [min_gap, max_gap] range across
+# data_gen._COMPOSABLE_KERNELS.
+#
+# Requires training.live_generation=true and a resolvable TabICL checkpoint
+# (same tabicl.ckpt/tabicl.pit_ckpt resolution as z_train_source=tabicl) and
+# device="cuda" (CPU-only TabICL inference was benchmarked and rejected
+# elsewhere in this codebase as too slow -- see live_dataset.py::
+# build_live_train_loader). false (default) leaves live generation exactly
+# as before this feature existed.
+z_train_tabicl_mix_enabled: false
+# Per-family mixing fraction when the measured TabICL-vs-analytic z_train
+# gap is at its observed MINIMUM across _COMPOSABLE_KERNELS (never 0: even
+# TabICL's best-approximated family should get occasional real-signal
+# exposure, mirroring adaptive_kernel_sampling's anti-starvation floor).
+z_train_tabicl_mix_floor_frac: 0.05
+# Per-family mixing fraction when the measured gap is at its observed
+# MAXIMUM. Kept well under 0.5 (real TabICL z_train stays the minority
+# source even for the hardest family): z_train_tabicl_k_folds+1 TabICL
+# forward passes per hit are substantially slower than the closed-form
+# analytic path (see z_train_source's docstring above), and the floor/max
+# split is meant to concentrate that cost on the families that most need it,
+# not to approach the full z_train_source=tabicl override.
+z_train_tabicl_mix_max_frac: 0.35
 
 # z_train corruption (see data_gen.py::corrupt_z_train's docstring): trains
 # the model to be robust to z_train NOT being the exact closed-form GP-LOO
 # whitened residual, since real (non-GP) deployment data can only ever
-# produce an approximate PIT (measured corr(z_exact, z_tabicl) ~= 0.6-0.65
-# via TabICL's K-fold marginal quantile PIT, flat across k_folds). Lives
+# produce an approximate PIT (measured to recover only a fraction of the
+# correlation with the exact residual via TabICL's K-fold marginal quantile
+# PIT, flat across k_folds). Lives
 # here rather than conf/config.yaml: it's a modulation of z_train applied
 # inside generate_gp_batch itself, read fresh every call — same convention
 # as sign_modulation_component_prob/mlp_mixing_enabled/structural_warp_enabled/

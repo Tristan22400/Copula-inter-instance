@@ -87,7 +87,22 @@ training:
   # (data<1ms/step) at both batch_size=128 and 256 on a 44-core node. Bump
   # this further (in step with batch_size) if you have more cores and go
   # bigger; 16 was already at the floor — 24 gave no further improvement.
-  live_num_workers: 8
+  # Only applies when data.z_train_source=analytic (the CPU-worker path --
+  # see live_tabicl_num_workers below for data.z_train_source=tabicl/
+  # tabicl_split, which uses a completely different, GPU-worker path).
+  live_num_workers: 16
+  # Worker count for data.z_train_source=tabicl/tabicl_split's live-generation
+  # path (live_dataset.py::build_live_train_loader) -- ignored when
+  # data.z_train_source=analytic. Each worker there runs on the GPU (CPU-only
+  # TabICL inference was benchmarked and rejected as far too slow, see that
+  # function's docstring), so unlike live_num_workers this isn't sized
+  # against CPU core count -- it's sized against how many concurrent frozen
+  # TabICL copies (~120MB resident each, ~1.4GB peak per call, measured) the
+  # training GPU can hold alongside the training job's own VRAM use. 2 is a
+  # deliberately conservative, untuned-for-your-hardware default -- raise it
+  # if profiling shows workers falling behind and VRAM allows, lower it if
+  # you see CUDA OOMs.
+  live_tabicl_num_workers: 2
   # generate_gp_batch() call size = batch_size * live_group_multiplier. Must be
   # a multiple of batch_size: generate_gp_batch samples kernel/P/N/active_dims
   # (and, for variable-d configs, d_features itself) once per call, shared by

@@ -615,6 +615,60 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
         return K * s1.unsqueeze(-1) * s2.unsqueeze(-2)
 
 
+class _DenseComposedKernel(gpytorch.kernels.Kernel):
+    """Combine two kernels via plain dense tensor +/*, INSTEAD of gpytorch's
+    own Kernel.__add__/__mul__ (which builds an AdditiveKernel/ProductKernel
+    that composes LinearOperators, not tensors) — the composite-chain
+    counterpart of SignModulatedKernel.forward's `K.to_dense() if
+    hasattr(K, "to_dense") else K` line just above, same rationale.
+
+    Why this matters: gpytorch's LinearOperator.__add__ special-cases an
+    operand that exposes a low-rank `.root` (exactly what LinearKernel's Gram
+    matrix is -- x @ x.T is a RootLinearOperator, see LinearKernel.forward)
+    by dispatching to add_low_rank, which EAGERLY computes a
+    root/root-inverse decomposition (Cholesky, falling through to eigh if
+    that fails) of the *other*, already-summed operand -- for the WHOLE
+    batch, before _psd_safe_batch ever gets a chance to isolate and repair
+    individual episodes. dot_product/polynomial (both LinearKernel/
+    PolynomialKernel-backed, both finite-dimensional-feature-map kernels
+    with rank <= d_features, often << T=P+N -- see composite_exclude_kernels'
+    docstring in conf/data/gp_tasks.yaml) are exactly the kernels most likely
+    to make that intermediate sum near-singular, so composite chains
+    involving them hit this eager factorization constantly, raising
+    NotPSDError (or, when the eigh fallback's LAPACK routine fails to
+    converge, torch.linalg.LinAlgError) straight out of kernel evaluation --
+    discarding the ENTIRE B-episode batch (see _generate_gp_batch_raw's
+    K_all_raw construction comment) rather than the individual bad
+    episode(s), by far the most expensive failure mode this pipeline has.
+
+    Every caller of a composed kernel_obj in this file immediately calls
+    .to_dense() on its output anyway (there's no downstream code that
+    benefits from a lazy/structured LinearOperator), so there is no
+    structure being thrown away by converting each side to dense before
+    combining: plain torch.Tensor +/- can never raise a linear-algebra
+    error, so this sidesteps add_low_rank entirely rather than merely
+    handling its fallout. Recursive composition (chains longer than one
+    +/* op) nests these, so only the innermost pair's kernels are ever
+    "real" gpytorch kernels -- exactly mirroring how _build_kernel_chain
+    already folds left-to-right with Python's own +/* before this class
+    existed.
+    """
+
+    def __init__(self, kernel_a: gpytorch.kernels.Kernel, op: str, kernel_b: gpytorch.kernels.Kernel, **kwargs):
+        super().__init__(**kwargs)
+        assert op in ("+", "*"), f"op must be '+' or '*', got {op!r}"
+        self.kernel_a = kernel_a
+        self.op = op
+        self.kernel_b = kernel_b
+
+    def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params) -> Tensor:
+        a = self.kernel_a(x1, x2, diag=diag, **params)
+        b = self.kernel_b(x1, x2, diag=diag, **params)
+        a = a.to_dense() if hasattr(a, "to_dense") else a
+        b = b.to_dense() if hasattr(b, "to_dense") else b
+        return a + b if self.op == "+" else a * b
+
+
 def _sample_sign_modulation(
     cfg, k: int, B: int, device
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -837,7 +891,7 @@ def _sample_episode_kernel(
         kernel_b, params_b = _build_kernel_component(
             cfg, name_b, k, B, device, active_dims=active_dims, d_total=d_total
         )
-        kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
+        kernel = _DenseComposedKernel(kernel_a, op, kernel_b)
         params = dict(params_a)
         for key, val in params_b.items():
             params[f"{key}_b"] = val
@@ -1042,7 +1096,7 @@ def build_kernel_fn(
             name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, power=power_b, active_dims=active_dims,
             sign_w=sign_w_b, sign_b=sign_b_b, sign_a=sign_a_b,
         )
-        kernel = kernel_a + kernel_b if op == "+" else kernel_a * kernel_b
+        kernel = _DenseComposedKernel(kernel_a, op, kernel_b)
 
     kernel = _wrap_concrete_sign_modulated(kernel, sign_w_outer, sign_b_outer, sign_a_outer, active_dims=active_dims)
 
@@ -1283,6 +1337,37 @@ def _weights_for_pool(pool: List[str], kernel_weights: Optional[Tensor]) -> Opti
     return [w / total for w in sub]
 
 
+def _tabicl_mix_prob_for_kernel(kernel_name: str, tabicl_mix_weights: Optional[Tensor]) -> float:
+    """Per-call probability of substituting real-TabICL-PIT z_train for the
+    exact analytic GP-LOO residual, given the kernel this call sampled — see
+    data.z_train_tabicl_mix_* in conf/data/gp_tasks.yaml.
+
+    kernel_name may be a bare _COMPOSABLE_KERNELS entry or a composite/chain
+    string ("A+B*C", the same left-to-right format _sample_kernel_chain_
+    structure and the static composite pool both use). Parsed by splitting
+    on '+'/'*' (kernel names never contain either character); the MAX weight
+    across every component family is used, not the mean or a component-count
+    average — the family TabICL approximates worst is what should drive how
+    often the whole composite gets real-signal exposure, since a chain is
+    only as realistic as its weakest-approximated component.
+
+    tabicl_mix_weights: a `_COMPOSABLE_KERNELS`-ordered tensor of per-family
+    mixing fractions (see train.py::_tabicl_gap_to_mix_frac — set once at
+    training startup from the measured TabICL-vs-analytic z_train gap, not
+    adapted during training). None (the default, and every caller before
+    this feature existed) means "unconditionally use tabicl_model whenever
+    given" — returns 1.0, reproducing the legacy always-on tabicl/
+    tabicl_split full-override behavior exactly.
+    """
+    if tabicl_mix_weights is None:
+        return 1.0
+    members = [n for n in re.split(r"[+*]", kernel_name) if n in _COMPOSABLE_KERNELS]
+    if not members:
+        return 0.0
+    idx = [_COMPOSABLE_KERNELS.index(n) for n in members]
+    return float(max(tabicl_mix_weights[i] for i in idx))
+
+
 def _resolve_kernel_name(cfg, kernel_weights: Optional[Tensor] = None) -> str:
     """Pick which kernel to use for one task based on config.
 
@@ -1401,7 +1486,7 @@ def _build_kernel_chain(
     ]
     kernel = built[0][0]
     for op, (comp_kernel, _) in zip(ops, built[1:]):
-        kernel = kernel + comp_kernel if op == "+" else kernel * comp_kernel
+        kernel = _DenseComposedKernel(kernel, op, comp_kernel)
     component_params = [params for _, params in built]
 
     outer_prob = float(getattr(cfg.data, "sign_modulation_outer_prob", 0.0))
@@ -1715,79 +1800,107 @@ def generate_gp_task(cfg) -> Dict[str, Tensor]:
 # ---------------------------------------------------------------------------
 
 
-def _batched_cholesky(K: Tensor) -> tuple[Tensor, Tensor]:
-    """Batched Cholesky (B, N, N) → (L, failed): L is (B, N, N) with automatic
-    jitter for failures; failed (B,) bool marks episodes where even the
-    maximum jitter (0.1) couldn't recover a PSD matrix — L is an identity
-    placeholder for those, and the caller (generate_gp_batch) is expected to
-    drop them rather than save a degenerate episode."""
+def _gathered_psd_safe_cholesky(K: Tensor, label: str, max_tries: int = 6) -> tuple[Tensor, Tensor]:
+    """Shared engine for _batched_cholesky/_psd_safe_batch below: batched
+    (B, N, N) -> (L, failed) Cholesky factor. failed (B,) bool marks episodes
+    where even gpytorch's psd_safe_cholesky's max jitter couldn't recover a
+    PSD matrix; L is an identity placeholder for those, and the caller is
+    expected to drop them rather than save a degenerate episode.
+
+    Tries a single plain cholesky_ex on the FULL batch first (cheap, and
+    correct for the common well-conditioned case). For whichever episodes
+    fail that, gathers ONLY those into a smaller (n_failed, N, N) tensor and
+    hands that off to gpytorch's own psd_safe_cholesky — same escalating-
+    jitter mechanism gpytorch falls back to internally (starting at
+    gpytorch.settings.cholesky_jitter, x10 per retry, matching
+    max_tries=6's ~1e-6*10^5=0.1 ceiling) — instead of calling it on the
+    whole batch. A single batched LAPACK call can't skip elements, so
+    psd_safe_cholesky's own escalation loop redoes ALL of its input every
+    retry round; calling it on the whole B-sized batch means every well-
+    conditioned episode pays for the escalation rounds too, even though only
+    the failing few need them. Gathering first keeps that cost proportional
+    to n_failed instead of B.
+
+    For composite kernels with a finite-rank component (dot_product/
+    polynomial — see composite_exclude_kernels' docstring in
+    conf/data/gp_tasks.yaml) T commonly exceeds the feature-map rank, so a
+    handful of episodes per batch routinely need the full escalation while
+    the rest of the batch is fine on the first try — the common case this
+    gathering optimizes for, not a rare edge case.
+
+    psd_safe_cholesky raises NotPSDError (rather than returning a partial
+    result) if ANY element of its input is still not PSD after max_tries —
+    so on that exception (now scoped to just the n_failed subset, not the
+    whole batch) we re-derive exactly which of THOSE are still bad at the
+    same maximum jitter and fall back to identity only for them, logging the
+    discard rate (not silent, so a run-wide rate can be monitored).
+
+    It also raises NanError immediately (before any jitter escalation) if
+    ANY element of its input is NaN — unlike a plain cholesky_ex, which
+    _batched_cholesky's pre-refactor hand-rolled loop relied on quietly
+    returning a nonzero info code for a NaN row (never actually recovering,
+    just wasting max_tries rounds before the caller's existing fallback
+    kicked in). Caught alongside NotPSDError and handled the same way: NaN
+    rows are identified explicitly (jitter can't fix them — NaN + jitter is
+    still NaN) and forced into the discarded set regardless of what
+    cholesky_ex reports for them.
+    """
     L, info = torch.linalg.cholesky_ex(K)
     failed = info.ne(0)
     if not failed.any():
         return L, failed
+    idx = failed.nonzero(as_tuple=True)[0]
     eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
-    for jitter in (1e-5, 1e-4, 1e-3, 1e-2, 0.1):
-        if not failed.any():
-            break
-        K = K.clone()
-        K[failed] = K[failed] + jitter * eye
-        L_new, info_new = torch.linalg.cholesky_ex(K)
-        L[failed] = L_new[failed]
-        failed = info_new.ne(0)
-    if failed.any():
-        # Last resort: replace with identity so this call doesn't crash.
-        # Logged (not silent) so a run-wide rate can be monitored — this
-        # means K_ff/LOO PIT (z_train) is degenerate for these episodes even
-        # after the maximum jitter escalation above. The caller discards
-        # these episodes entirely (see generate_gp_batch) rather than saving
-        # this identity placeholder.
+    try:
+        L[idx] = psd_safe_cholesky(K[idx], max_tries=max_tries)
+        return L, torch.zeros_like(failed)
+    except (NotPSDError, NanError):
+        jitter0 = gpytorch.settings.cholesky_jitter.value(K.dtype)
+        max_jitter = jitter0 * (10 ** (max_tries - 1))
+        K_boosted = K[idx] + max_jitter * eye
+        nan_mask = torch.isnan(K_boosted).any(dim=-1).any(dim=-1)
+        if nan_mask.any():
+            K_boosted = K_boosted.clone()
+            K_boosted[nan_mask] = eye
+        L_sub, info_sub = torch.linalg.cholesky_ex(K_boosted)
+        L[idx] = L_sub
+        still_failed = torch.zeros_like(failed)
+        still_failed[idx] = info_sub.ne(0) | nan_mask
         warnings.warn(
-            f"_batched_cholesky: {int(failed.sum())}/{K.shape[0]} episodes fell back "
-            f"to an identity K_ff Cholesky factor (unrecoverable even at jitter=0.1) "
-            f"and will be discarded.",
+            f"{label}: {int(still_failed.sum())}/{K.shape[0]} episodes fell back "
+            f"to an identity Cholesky factor (unrecoverable even at jitter="
+            f"{max_jitter:.1e}, or had NaN entries) and will be discarded.",
             RuntimeWarning,
         )
-        L[failed] = eye.unsqueeze(0).expand_as(L[failed])
-    return L, failed
+        L[still_failed] = eye.unsqueeze(0).expand_as(L[still_failed])
+        return L, still_failed
+
+
+def _batched_cholesky(K: Tensor) -> tuple[Tensor, Tensor]:
+    """Batched Cholesky (B, N, N) → (L, failed) for K_ff/LOO PIT — see
+    _gathered_psd_safe_cholesky's docstring for the escalation/gathering
+    mechanics. The caller (generate_gp_batch) discards episodes marked
+    failed rather than saving a degenerate K_ff-derived episode."""
+    return _gathered_psd_safe_cholesky(K, label="_batched_cholesky (K_ff)")
 
 
 def _psd_safe_batch(K: Tensor, max_tries: int = 6) -> tuple[Tensor, Tensor]:
-    """Batched (B, N, N) -> (L, failed) Cholesky factor via gpytorch's own
-    psd_safe_cholesky, instead of a hand-rolled retry loop (see
-    _batched_cholesky above, kept as-is for K_ff/LOO PIT — this is the
-    equivalent tool for K_all, used to GUARANTEE Sigma_star/R_star are PSD
-    rather than just symmetric, see generate_gp_batch's joint-sample block).
-    failed (B,) bool marks episodes where even the maximum jitter couldn't
-    recover a PSD matrix; the caller is expected to drop them.
-
-    psd_safe_cholesky adds escalating diagonal jitter (starting at
-    gpytorch.settings.cholesky_jitter, x10 per retry — the exact same
-    mechanism gpytorch itself falls back to internally, e.g. the "added
-    jitter... Using symeig method" warning this pipeline already emits for
-    marginal episodes) ONLY to the batch elements that actually fail a
-    Cholesky attempt, leaving every well-conditioned episode's matrix
-    untouched. max_tries=6 reaches a jitter ceiling of ~1e-6*10^5=0.1,
-    matching _batched_cholesky's own escalation ceiling above.
-
-    psd_safe_cholesky raises (rather than returning a partial result) if
-    ANY batch element is still not PSD after max_tries — so on that
-    exception we re-derive exactly which elements are still bad at the same
-    maximum jitter (rather than discarding the whole batch's progress) and
-    fall back to identity (same "mark the episode invalid, don't crash
-    generation" convention _batched_cholesky uses) for only those, in the
-    astronomically unlikely case max_tries isn't enough. Logged (not
-    silent) so a run-wide rate can be monitored.
+    """Batched (B, N, N) -> (L, failed) Cholesky factor for K_all, used to
+    GUARANTEE Sigma_star/R_star are PSD rather than just symmetric (see
+    generate_gp_batch's joint-sample block) — see _gathered_psd_safe_cholesky's
+    docstring for the escalation/gathering mechanics shared with
+    _batched_cholesky above.
 
     Separately, an occasional extreme composite-kernel hyperparameter draw
     makes gpytorch's own float32 kernel evaluation produce actual NaN
     entries (not just a slightly negative eigenvalue) in K_all_raw.
-    psd_safe_cholesky checks for NaN over the WHOLE batch tensor and raises
-    NanError immediately if any element is NaN, before its jitter
-    escalation ever runs — so even the other, perfectly fine episodes in
-    this batch would be blocked. NaN episodes are therefore replaced with
-    identity up front so jitter escalation still gets a chance to run on
-    the rest of the batch, and are folded into `failed` like any other
-    unrecoverable episode.
+    psd_safe_cholesky checks for NaN and raises NanError immediately, before
+    its jitter escalation ever runs — so even the other, perfectly fine
+    episodes gathered into the same failing-subset call would be blocked.
+    NaN episodes are therefore replaced with an identity placeholder up
+    front (trivially PSD, so they never enter the failing subset at all —
+    they're merged into the returned `failed` unconditionally below instead)
+    and reported separately.
     """
     nan_failed = torch.isnan(K).any(dim=-1).any(dim=-1)
     if nan_failed.any():
@@ -1800,23 +1913,8 @@ def _psd_safe_batch(K: Tensor, max_tries: int = 6) -> tuple[Tensor, Tensor]:
             f"discarded.",
             RuntimeWarning,
         )
-    try:
-        L = psd_safe_cholesky(K, max_tries=max_tries)
-        return L, nan_failed
-    except NotPSDError:
-        jitter0 = gpytorch.settings.cholesky_jitter.value(K.dtype)
-        max_jitter = jitter0 * (10 ** (max_tries - 1))
-        eye = torch.eye(K.shape[-1], device=K.device, dtype=K.dtype)
-        L, info = torch.linalg.cholesky_ex(K + max_jitter * eye)
-        failed = info.ne(0) | nan_failed
-        warnings.warn(
-            f"_psd_safe_batch: {int(failed.sum())}/{K.shape[0]} episodes fell back "
-            f"to an identity K_all (unrecoverable even at jitter={max_jitter:.1e}) "
-            f"and will be discarded.",
-            RuntimeWarning,
-        )
-        L[failed] = eye.unsqueeze(0).expand_as(L[failed])
-        return L, failed
+    L, failed = _gathered_psd_safe_cholesky(K, label="_psd_safe_batch (K_all)", max_tries=max_tries)
+    return L, failed | nan_failed
 
 
 def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
@@ -2421,9 +2519,8 @@ def apply_mlp_feature_mixing(
 # GP-LOO whitened residual computed just below, but at deployment on any
 # dataset without a known generating kernel (e.g. real ERA5), z_train can
 # only be estimated via src/pit.py::run_pit's K-fold TabICL-marginal quantile
-# PIT -- measured to recover only corr(z_exact, z_tabicl) ~= 0.6-0.65 with
-# the true whitened residual, flat across k_folds (not a fold-size
-# artifact). The trained model turned out to have essentially zero
+# PIT -- measured to recover only a fraction of the correlation with the
+# true whitened residual, flat across k_folds (not a fold-size artifact). The trained model turned out to have essentially zero
 # tolerance for this: real-context predictions collapsed toward ~0
 # correlation (near-neighbour truth 0.97 -> predicted 0.05-0.13). This is a
 # train/deploy distribution-shift problem, not a lengthscale-prior or
@@ -2433,7 +2530,7 @@ def apply_mlp_feature_mixing(
 # model never gets to rely on it being perfectly whitened -- standard
 # input-noise-augmentation logic, with the blend strength (see
 # DEFAULT_Z_CORRUPTION_RHO_BETA_A/B below) calibrated to the measured
-# ~0.6-0.65 real-world signal correlation above. Applied here (inside batch
+# real-world signal correlation above. Applied here (inside batch
 # generation) rather than in train.py: it's a modulation of z_train read
 # fresh from cfg.data on every call, the same convention as
 # sign_modulation_component_prob/mlp_mixing_enabled/etc, so it applies
@@ -2463,8 +2560,8 @@ def corrupt_z_train(z_train: Tensor, data_cfg) -> Tensor:
     this construction gives corr(z_train, z_corrupted) = sqrt(rho) in
     expectation, which is what the default Beta(2, 3) shape (E[sqrt(rho)]
     ~= 0.61, p10~=0.14, p90~=0.68) is calibrated against -- centered near the
-    measured TabICL-marginal-PIT signal correlation (~0.6-0.65) with spread
-    toward both a near-clean and a more severely corrupted regime.
+    measured TabICL-marginal-PIT signal correlation, with spread toward both
+    a near-clean and a more severely corrupted regime.
 
     Called on the batched, unpadded (B, P) z_train inside
     _generate_gp_batch_raw -- every episode in one such call shares the same
@@ -2552,13 +2649,27 @@ def _max_batch_for_context(B: int, T: int, device: str) -> int:
     return max(1, min(B, int(budget // bytes_per_episode)))
 
 
+def _evaluate_kernel_dense(kernel_obj: gpytorch.kernels.Kernel, x_norm: Tensor) -> Tensor:
+    """Evaluate kernel_obj(x_norm) as a dense (B, T, T) tensor. Split out of
+    _generate_gp_batch_raw as its own function purely as a stable
+    monkeypatch seam: tests can replace this exact call to inject a
+    synthetic NotPSDError/LinAlgError and verify the whole-batch
+    discard-and-resample fallback in _generate_gp_batch_raw still works
+    (see test_generate_gp_batch_raw_discards_batch_on_linalg_error), without
+    needing to actually construct a kernel/hyperparameter draw pathological
+    enough to trigger one for real."""
+    return kernel_obj(x_norm).to_dense()
+
+
 @torch.no_grad()
 def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
     d_override: Optional[int] = None,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
+    tabicl_split_calib_frac: float = 0.0,
     kernel_weights: Optional[Tensor] = None,
+    tabicl_mix_weights: Optional[Tensor] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in a single vectorised call — the
     "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
@@ -2622,11 +2733,46 @@ def _generate_gp_batch_raw(
             z_train changes. None (default) preserves the exact analytic
             pipeline.
         tabicl_k_folds: K-fold count for tabicl_model's PIT, ignored when
-            tabicl_model is None.
+            tabicl_model is None or tabicl_split_calib_frac > 0.
+        tabicl_split_calib_frac: if > 0 (and tabicl_model is given), replaces
+            the K-fold PIT above with pit.py::run_pit_calib_split_batched's
+            one-pass calibration-split PIT instead: an extra pool of
+            round(tabicl_split_calib_frac * P) points is drawn from the same
+            episode purely to serve as TabICL's context (see
+            cfg.data.z_train_split_calib_frac in conf/data/gp_tasks.yaml),
+            scores every training point in a single forward pass, and is
+            discarded before the episode is packed. 0.0 (default) preserves
+            the K-fold behaviour above.
+            Unlike the K-fold override, this is NOT a surgical "only z_train
+            changes" swap: the per-episode x_norm z-score (below) is
+            deliberately computed jointly over train+test+calibration (so
+            TabICL sees the same well-scaled input it would in any other
+            call here, benefiting from the larger sample when
+            tabicl_split_calib_frac is large), which means x_norm_train/
+            x_norm_test/K_ff/K_ss/mu_star/sigma_star/R_star/z_test/
+            log_pdf_test/the pre-override analytic z_train all pick up a
+            small, deliberate dependence on tabicl_split_calib_frac too —
+            still a fully valid, internally self-consistent GP episode
+            (x_norm and every value derived from it come from the exact same
+            single normalization pass), just not byte-identical to a
+            tabicl_split_calib_frac=0 run at the same seed. Renormalizing
+            x_norm_train/x_norm_test a second time after dropping the
+            calibration block would "fix" that byte-identity at the cost of
+            decoupling the saved coordinates from the already-computed
+            oracle/K_ff (which were derived from the first, calibration-
+            inclusive scale) — a real inconsistency, so this deliberately
+            does NOT do that.
         kernel_weights: optional `_COMPOSABLE_KERNELS`-ordered sampling-weight
             tensor forwarded to _sample_kernel_chain_structure/
             _resolve_kernel_name (see their docstrings) — None reproduces
             today's uniform sampling exactly.
+        tabicl_mix_weights: optional `_COMPOSABLE_KERNELS`-ordered per-family
+            probability tensor (see _tabicl_mix_prob_for_kernel and
+            data.z_train_tabicl_mix_* in conf/data/gp_tasks.yaml) gating
+            whether THIS call's z_train override actually fires, instead of
+            unconditionally substituting tabicl_model's PIT whenever it's
+            given. None (default) preserves the legacy always-on behavior of
+            tabicl_model/tabicl_split_calib_frac above exactly.
 
     Returns:
         list of B episode dicts ready for torch.save.
@@ -2663,7 +2809,28 @@ def _generate_gp_batch_raw(
         kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
-    T = P + N
+    # Extra calibration-only pool for tabicl_split_calib_frac > 0 (see this
+    # function's docstring) -- drawn jointly with the P train / N test points
+    # below (same GP sample, same kernel draw), sliced out as x_norm_calib/
+    # y_calib after the joint sample, used once as run_pit_calib_split_batched's
+    # TabICL context, and discarded before packing. 0 (default) is a no-op:
+    # T falls back to the original P + N and every P_C-indexed slice below is
+    # empty.
+    #
+    # Placed LAST in the point ordering (train, test, then calibration) --
+    # NOT because it changes x_norm's values (the per-episode z-score below
+    # is a mean/std over dim=1, which is permutation-invariant, so ordering
+    # never changes what TabICL/the kernel actually sees) but because of
+    # Cholesky's nested-block property: L_all's leading (P+N)x(P+N) block is
+    # exactly the Cholesky factor of K_all's own leading (P+N)x(P+N) block,
+    # so y_all[:, :P+N] = L_all[:, :P+N, :P+N] @ noise[:, :P+N] depends only
+    # on the train+test sub-block, never on the calibration block, as long as
+    # calibration sits after train+test rather than between them. Had
+    # calibration been sandwiched between train and test, y_test's realized
+    # sample would additionally pick up cross-terms against the calibration
+    # block's own noise draws through L_all's lower-triangular structure.
+    P_C = max(1, round(tabicl_split_calib_frac * P)) if tabicl_split_calib_frac > 0 else 0
+    T = P + N + P_C
     # Cap B for this call so the (B, T, T) buffers below fit in free VRAM --
     # see _max_batch_for_context's docstring. Safe to shrink B here: this
     # function is already documented to possibly return fewer than the
@@ -2736,53 +2903,64 @@ def _generate_gp_batch_raw(
         x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
-    # --- Joint prior sample + noisy covariance (B, T, T), via gpytorch's own
-    # GaussianLikelihood(MultivariateNormal) — replaces the old manual
-    # `kernel_obj(...).to_dense() + nugget*eye` Gram-matrix assembly.
-    # max_cholesky_size is forced high (see module docstring / _MAX_CHOLESKY)
-    # so the covariance_matrix materialization below is exact, not gpytorch's
-    # approximate CG/Lanczos fallback.
+    # --- Joint prior sample + noisy covariance (B, T, T) ---
+    # Built as plain dense kernel + diagonal nugget (kernel_obj(x_norm).to_dense()
+    # + nugget*eye), NOT via gpytorch's GaussianLikelihood(MultivariateNormal)
+    # .covariance_matrix property this used to go through. That property
+    # computes `covar + noise_covar` (_GaussianLikelihoodBase.marginal) by
+    # building an AddedDiagLinearOperator (kernel LazyTensor + DiagLinearOperator)
+    # — and gpytorch's own __add__/to_dense() for that specific combination
+    # eagerly attempts a low-rank Cholesky factorization (add_low_rank ->
+    # root_inv_decomposition) of an intermediate partial-sum LinearOperator,
+    # for the WHOLE batch at once, before _psd_safe_batch below ever gets a
+    # chance to repair anything. dot_product/polynomial have a finite-
+    # dimensional feature map (rank <= d_features, often << T = P+N — see
+    # composite_exclude_kernels' docstring in conf/data/gp_tasks.yaml), so
+    # composite chains built from them used to hit that eager factorization's
+    # near-singularity constantly; so could sign modulation and heavily-
+    # composed structural warps pushing feature geometry to an extreme (see
+    # apply_structural_feature_warp). This raised NotPSDError (or, when
+    # root_decomposition falls through to _symeig -> torch.linalg.eigh and
+    # THAT LAPACK routine fails to converge, torch.linalg.LinAlgError —
+    # observed killing whole worker processes in production runs, job
+    # 3000710) straight out of kernel evaluation, discarding the ENTIRE
+    # B-episode batch (every other, perfectly fine episode's progress along
+    # with it) and forcing generate_gp_batch's top-up loop to resample a
+    # fresh kernel/hyperparameter draw from scratch — by far the most
+    # expensive of this pipeline's failure modes.
+    #
+    # _build_kernel_chain/_sample_episode_kernel now combine composite
+    # components via _DenseComposedKernel (plain dense tensor +/*, converting
+    # each side with .to_dense() before combining — the same pattern
+    # SignModulatedKernel.forward already used for its own base_kernel call)
+    # instead of gpytorch's Kernel.__add__/__mul__, so add_low_rank's
+    # RootLinearOperator trigger (LinearKernel/dot_product's Gram matrix is
+    # exactly that) is no longer reachable from any composition point this
+    # pipeline builds — the known cause of the job 3000710 crash is
+    # structurally eliminated, not just caught. _evaluate_kernel_dense is
+    # still wrapped in a try/except as defence in depth (a future kernel
+    # addition, or a bug in _DenseComposedKernel itself, could still raise
+    # here) — plain dense tensor addition below can't raise either error, so
+    # only the to_dense() kernel evaluation itself needs the guard; no
+    # factorization happens until we explicitly call _psd_safe_batch just
+    # below, which isolates and repairs (or discards) failures per-episode
+    # instead of per-batch. max_cholesky_size is still forced high (see
+    # module docstring / _MAX_CHOLESKY) for the to_dense() kernel evaluation
+    # itself, matching every other gpytorch call in this file that sees a
+    # full (T, T) matrix.
     with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
-        prior_dist = gpytorch.distributions.MultivariateNormal(
-            torch.zeros(B, T, device=device), kernel_obj(x_norm)
-        )
         try:
-            noisy_dist = likelihood(prior_dist)
-            K_all_raw = noisy_dist.covariance_matrix  # (B, T, T), nugget already on diagonal
+            K_full_dense = _evaluate_kernel_dense(kernel_obj, x_norm)  # (B, T, T), no nugget yet
         except (NotPSDError, torch.linalg.LinAlgError):
-            # Some composite/systematic kernel chains (esp. under sign
-            # modulation — see _build_kernel_chain, or heavily-composed
-            # structural warps pushing feature geometry to an extreme —
-            # see apply_structural_feature_warp) leave an intermediate
-            # partial-sum LinearOperator that gpytorch's own low-rank
-            # __add__ path (add_low_rank -> root_inv_decomposition) can't
-            # Cholesky-factor, even before _psd_safe_batch below gets a
-            # chance to repair the final K_all. This can raise straight out
-            # of either likelihood(prior_dist) or .covariance_matrix — both
-            # can trigger gpytorch's eager internal decomposition — for the
-            # whole batch at once, so the individual bad episode(s) can't be
-            # isolated the way _psd_safe_batch/_batched_cholesky isolate
-            # per-row failures below. Discard the whole B-episode batch
-            # (this call's kernel/hyperparameter draw) and let
-            # generate_gp_batch's top-up loop resample a fresh one, rather
-            # than crashing the whole run.
-            #
-            # add_low_rank's __add__ path doesn't always fail with NotPSDError
-            # though: when the intermediate LinearOperator IS symmetric but
-            # numerically ill-conditioned (near-repeated eigenvalues), gpytorch
-            # falls through to root_decomposition -> _symeig -> torch.linalg.eigh,
-            # whose LAPACK syevd/heevd routine can itself fail to converge and
-            # raises torch.linalg.LinAlgError (not NotPSDError) straight out of
-            # this same try block -- observed killing whole worker processes in
-            # production runs (job 3000710) since it wasn't caught here.
             warnings.warn(
                 f"_generate_gp_batch_raw: kernel evaluation for this "
                 f"{B}-episode batch (kernel={kernel_name!r}) raised NotPSDError "
-                f"or LinAlgError before psd_safe_cholesky repair could run; "
-                f"discarding the whole batch and resampling.",
+                f"or LinAlgError; discarding the whole batch and resampling.",
                 RuntimeWarning,
             )
             return []
+    nugget_eye = torch.eye(T, device=device, dtype=K_full_dense.dtype).expand(B, T, T)
+    K_all_raw = K_full_dense + likelihood.noise.reshape(B, 1, 1) * nugget_eye
 
     # No explicit symmetrization needed here: torch.linalg.cholesky_ex (used
     # by psd_safe_cholesky below) only ever reads the lower triangle of its
@@ -2814,14 +2992,16 @@ def _generate_gp_batch_raw(
     # _sample_mean_module's docstring).
     y_all = y_all + mean_module(x_norm)
 
-    x_norm_train = x_norm[:, :P]   # (B, P, d)
-    x_norm_test  = x_norm[:, P:]   # (B, N, d)
-    y_train      = y_all[:,  :P]   # (B, P)
-    y_test       = y_all[:,  P:]   # (B, N)
+    x_norm_train = x_norm[:, :P]                     # (B, P, d)
+    x_norm_test  = x_norm[:, P:P + N]                # (B, N, d)
+    x_norm_calib = x_norm[:, P + N:]                 # (B, P_C, d) -- tabicl_split PIT context only
+    y_train      = y_all[:,  :P]                     # (B, P)
+    y_test       = y_all[:,  P:P + N]                # (B, N)
+    y_calib      = y_all[:,  P + N:]                 # (B, P_C)
 
     # --- Sub-matrices of K_all (nugget already on diagonal) ---
-    K_ff = K_all[:, :P, :P]   # (B, P, P)
-    K_ss = K_all[:, P:, P:]   # (B, N, N)
+    K_ff = K_all[:, :P, :P]         # (B, P, P) -- P_C never enters K_ff/LOO/oracle
+    K_ss = K_all[:, P:P + N, P:P + N]  # (B, N, N)
 
     # --- LOO PIT always needs L_ff/alpha from K_ff (R&W Eq. 5.12), regardless
     # of which oracle drives the test-side R_star/mu_star/sigma_star below.
@@ -2968,22 +3148,58 @@ def _generate_gp_batch_raw(
     # Reconstruct full posterior covariance (for Y-space oracle)
     Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
 
-    # z_train source override (cfg.data.z_train_source="tabicl"): replace the
-    # exact analytic GP-LOO residual with the real frozen TabICL's own
-    # K-fold PIT (pit.py::run_pit_batched) -- trains/evaluates against the
-    # same approximate marginal real (non-GP) deployment data would produce,
-    # instead of the closed-form oracle. Deliberately AFTER the degenerate-
-    # episode z_std check above (discard decisions are always made on the
-    # exact residual, never on the substituted one) and BEFORE
-    # corrupt_z_train, which is free to further blend either source toward
-    # noise. y_train is z-scored per episode first -- run_pit_batched (like
-    # every other run_pit call site) does no target scaling of its own, and
-    # episode y_train's scale is unconstrained (outputscale ~ GammaPrior),
-    # so an unscaled call risks saturating the pretrained quantile head's
-    # CDF into its extreme tail. X_test/Y_test are a dummy 1-point slice
-    # (unused; run_pit_batched always computes a test-side PIT too) --
-    # z_test/log_pdf_test stay the oracle values already computed above.
-    if tabicl_model is not None:
+    # z_train source override (cfg.data.z_train_source="tabicl"/"tabicl_split"):
+    # replace the exact analytic GP-LOO residual with the real frozen
+    # TabICL's own PIT -- trains/evaluates against the same approximate
+    # marginal real (non-GP) deployment data would produce, instead of the
+    # closed-form oracle. Deliberately AFTER the degenerate-episode z_std
+    # check above (discard decisions are always made on the exact residual,
+    # never on the substituted one) and BEFORE corrupt_z_train, which is
+    # free to further blend either source toward noise. y_train (and,
+    # for tabicl_split, y_calib) is z-scored per episode first -- run_pit_*
+    # (like every other run_pit call site) does no target scaling of its
+    # own, and episode y_train's scale is unconstrained (outputscale ~
+    # GammaPrior), so an unscaled call risks saturating the pretrained
+    # quantile head's CDF into its extreme tail.
+    # Per-call real-TabICL gate (data.z_train_tabicl_mix_* — see
+    # _tabicl_mix_prob_for_kernel's docstring): tabicl_mix_weights is None
+    # for every caller before this feature existed, so apply_tabicl reduces
+    # to the legacy "unconditionally use tabicl_model whenever given" check
+    # with NO extra random.random() draw in that case — keeps the RNG stream
+    # (and hence every existing z_train_source=tabicl/tabicl_split caller's
+    # exact reproducibility at a fixed seed) byte-identical to before this
+    # feature existed.
+    if tabicl_mix_weights is not None:
+        apply_tabicl = tabicl_model is not None and (
+            random.random() < _tabicl_mix_prob_for_kernel(kernel_name, tabicl_mix_weights)
+        )
+    else:
+        apply_tabicl = tabicl_model is not None
+
+    if apply_tabicl and tabicl_split_calib_frac > 0:
+        # "tabicl_split": one forward pass, x_norm_calib/y_calib (P_C points,
+        # never part of the official P-point train set) as TabICL's context
+        # -- see pit.py::run_pit_calib_split_batched's docstring. Scaled with
+        # y_train's own mean/std so context and query share one scale.
+        # x_norm_calib/y_calib are never referenced again after this call,
+        # so they're discarded (not packed into `tensors` below) simply by
+        # falling out of scope.
+        from pit import run_pit_calib_split_batched  # local: pit.py imports from this module
+
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)   # (B, P, 1)
+        y_calib_scaled = ((y_calib - y_mean) / y_std).unsqueeze(-1)   # (B, P_C, 1)
+        split_pit = run_pit_calib_split_batched(
+            tabicl_model, x_norm_train, y_train_scaled,
+            x_norm_calib, y_calib_scaled,
+        )
+        z_train = split_pit["z_train"].squeeze(-1)                    # (B, P)
+    elif apply_tabicl:
+        # "tabicl": K-fold PIT (pit.py::run_pit_batched). X_test/Y_test are a
+        # dummy 1-point slice (unused; run_pit_batched always computes a
+        # test-side PIT too) -- z_test/log_pdf_test stay the oracle values
+        # already computed above.
         from pit import run_pit_batched  # local: pit.py imports from this module
 
         y_mean = y_train.mean(dim=1, keepdim=True)
@@ -2999,8 +3215,17 @@ def _generate_gp_batch_raw(
     # Robustness augmentation (opt-in, off by default -- see corrupt_z_train's
     # docstring above): applied AFTER the degenerate-episode z_std check above
     # so discard decisions are always made on the exact GP-LOO residual, never
-    # on a corrupted one.
-    z_train = corrupt_z_train(z_train, cfg.data)
+    # on a corrupted one. Skipped when THIS call's z_train already came from
+    # the adaptive real-TabICL mix path (tabicl_mix_weights is not None and
+    # apply_tabicl fired): corrupting an already-real approximate signal
+    # toward synthetic noise defeats the point of training against the real
+    # one -- corrupt_z_train is itself a synthetic proxy for this exact gap
+    # (see its docstring's "measured TabICL-marginal-PIT signal correlation"
+    # calibration). The legacy always-on z_train_source=tabicl/tabicl_split
+    # full-override path (tabicl_mix_weights=None) keeps corrupting on top,
+    # unchanged from before this feature existed.
+    if not (tabicl_mix_weights is not None and apply_tabicl):
+        z_train = corrupt_z_train(z_train, cfg.data)
 
     # --- Pack into list of dicts (single D→H transfer) ---
     tensors = {
@@ -3127,8 +3352,10 @@ def generate_gp_batch(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
+    tabicl_split_calib_frac: float = 0.0,
     d_override: Optional[int] = None,
     kernel_weights: Optional[Tensor] = None,
+    tabicl_mix_weights: Optional[Tensor] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, discarding and regenerating any that
     turn out degenerate (see _generate_gp_batch_raw's `discard` — an
@@ -3170,7 +3397,8 @@ def generate_gp_batch(
         cfg, B, device, return_kernel_metadata=return_kernel_metadata,
         d_override=d_override,
         tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
-        kernel_weights=kernel_weights,
+        tabicl_split_calib_frac=tabicl_split_calib_frac,
+        kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
     )
     # Pin every top-up round to the first round's d_features (or the
     # caller-supplied d_override, if the first round came up empty). Top-up
@@ -3198,7 +3426,8 @@ def generate_gp_batch(
             cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata,
             d_override=d_fixed,
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
-            kernel_weights=kernel_weights,
+            tabicl_split_calib_frac=tabicl_split_calib_frac,
+            kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])

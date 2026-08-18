@@ -42,6 +42,13 @@ Usage
     # conf/data/gp_tasks.yaml) — substantially slower, pilot on a small
     # n_tasks first:
     python src/generate_pit_dataset.py data.n_tasks=5000 data.z_train_source=tabicl
+
+    # Same, but via a one-pass calibration split instead of K-fold rotation
+    # (data.z_train_split_calib_frac controls the calibration pool size) —
+    # ~(z_train_tabicl_k_folds + 1)x fewer TabICL forward passes than
+    # z_train_source=tabicl, see run_pit_calib_split_batched's docstring in
+    # pit.py for the cost/quality trade-off:
+    python src/generate_pit_dataset.py data.n_tasks=5000 data.z_train_source=tabicl_split
 """
 
 from __future__ import annotations
@@ -118,6 +125,7 @@ def _is_transient_cusolver_error(exc: BaseException) -> bool:
 
 def _generate_shard_with_oom_retry(
     cfg, n_this: int, device: str, *, tabicl_model, tabicl_k_folds: int,
+    tabicl_split_calib_frac: float = 0.0,
 ) -> list:
     """Generate n_this episodes for one shard, halving the chunk size and
     retrying on CUDA OOM (or backing off and retrying unchanged on a
@@ -167,6 +175,7 @@ def _generate_shard_with_oom_retry(
             new_episodes = generate_gp_batch(
                 cfg, this_chunk, device, d_override=d_fixed,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+                tabicl_split_calib_frac=tabicl_split_calib_frac,
             )
             if d_fixed is None and new_episodes:
                 d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
@@ -290,25 +299,32 @@ def main(cfg: DictConfig) -> None:
     # z_train source override (see data.z_train_source's docstring in
     # conf/data/gp_tasks.yaml): load the frozen TabICL marginal once, up
     # front, and thread it through every generate_gp_batch call below rather
-    # than reloading per shard.
+    # than reloading per shard. "tabicl" and "tabicl_split" share the same
+    # checkpoint -- they only differ in how pit.py scores the train set
+    # against it (K-fold rotation vs. a one-pass calibration split; see
+    # tabicl_split_calib_frac below).
     z_train_source = cfg.data.get("z_train_source", "analytic")
     tabicl_model = None
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
-    if z_train_source == "tabicl":
-        from pit import load_tabicl
-        from train import _resolve_pit_ckpt
+    tabicl_split_calib_frac = (
+        float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
+    )
+    if z_train_source in ("tabicl", "tabicl_split"):
+        from pit import load_tabicl, resolve_pit_ckpt
 
-        ckpt = _resolve_pit_ckpt(cfg)
+        ckpt = resolve_pit_ckpt(cfg)
         if ckpt is None:
             raise ValueError(
-                "data.z_train_source=tabicl requires a resolvable TabICL checkpoint "
-                "-- set tabicl.ckpt (with tabicl.pretrained=true) or tabicl.pit_ckpt."
+                f"data.z_train_source={z_train_source} requires a resolvable TabICL "
+                "checkpoint -- set tabicl.ckpt (with tabicl.pretrained=true) or "
+                "tabicl.pit_ckpt."
             )
-        print(f"Loading frozen TabICL marginal for data.z_train_source=tabicl: {ckpt}")
+        print(f"Loading frozen TabICL marginal for data.z_train_source={z_train_source}: {ckpt}")
         tabicl_model = load_tabicl(ckpt, device)
     elif z_train_source != "analytic":
         raise ValueError(
-            f"Unknown data.z_train_source {z_train_source!r}; expected 'analytic' or 'tabicl'."
+            f"Unknown data.z_train_source {z_train_source!r}; expected 'analytic', "
+            "'tabicl', or 'tabicl_split'."
         )
 
     worker_shard_idxs = range(worker_id, n_shards, num_workers)
@@ -352,6 +368,7 @@ def main(cfg: DictConfig) -> None:
             episodes = _generate_shard_with_oom_retry(
                 cfg, n_this, device,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+                tabicl_split_calib_frac=tabicl_split_calib_frac,
             )
             # Drop the two fields reconstructible from R_star/sigma_star at
             # load time (see module docstring) -- cuts on-disk shard size by

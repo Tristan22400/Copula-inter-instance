@@ -19,6 +19,12 @@ K−1 folds as context.  K is small and fixed (default 10) — true LOO
 dataset-generation time.  The test instances use the entire training set
 as context (single forward pass).
 
+``run_pit_calib_split_batched`` offers a cheaper alternative to the K-fold
+rotation: leakage is instead avoided by drawing a separate calibration point
+set that is disjoint from the training set by construction (never a K-fold
+rotation of the same pool), so every training point can be scored against it
+in a single forward pass. See its docstring for the cost/quality trade-off.
+
 This file makes **no modifications** to ``tabicl_upstream`` — leakage is
 handled purely by which points are passed in which forward call.
 """
@@ -84,6 +90,33 @@ def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # TabICL loader
 # ---------------------------------------------------------------------------
+
+
+def resolve_pit_ckpt(cfg) -> str | None:
+    """Which checkpoint (if any) to load as a frozen TabICL marginal for
+    PIT-ing episodes the way real (non-GP) deployment data would be seen.
+
+    Shared by every caller that needs this resolution (train.py's z_train
+    sim-to-real diagnostic, generate_pit_dataset.py's data.z_train_source=
+    tabicl/tabicl_split, live_dataset.py's live-generation equivalent) — was
+    previously train.py-local (train.py::_resolve_pit_ckpt), moved here so
+    live_dataset.py can reuse it without importing from train.py (which
+    itself imports live_dataset.py, so the reverse import would cycle).
+
+    This is a separate model instance from the backbone a given run actually
+    trains, so its checkpoint is its own knob (tabicl.pit_ckpt) rather than
+    reusing tabicl.pretrained/tabicl.ckpt (which describe that run's own
+    backbone) — a from-scratch backbone (tabicl.pretrained=false, e.g.
+    copula_nano) can still opt in by setting pit_ckpt explicitly, since
+    PIT-ing episodes with a released checkpoint's quantile head doesn't
+    depend on the run's own architecture. Defaults to tabicl.ckpt when the
+    backbone itself is pretrained (copula_prod's original behaviour), else
+    None (diagnostic/override off) unless pit_ckpt is set explicitly.
+    """
+    pit_ckpt = cfg.tabicl.get("pit_ckpt", None)
+    if pit_ckpt is None and bool(cfg.tabicl.get("pretrained", True)):
+        pit_ckpt = cfg.tabicl.get("ckpt", None)
+    return pit_ckpt
 
 
 def load_tabicl(ckpt_name: str, device: str) -> nn.Module:
@@ -355,6 +388,72 @@ def run_pit_batched(
         "z_test": z_test,
         "log_pdf_test": log_pdf_test,
     }
+
+
+# ---------------------------------------------------------------------------
+# Calibration-split PIT (single forward pass, no K-fold rotation)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def run_pit_calib_split_batched(
+    tabicl: nn.Module,
+    X_query: torch.Tensor,
+    Y_query: torch.Tensor,
+    X_calib: torch.Tensor,
+    Y_calib: torch.Tensor,
+    eps: float = 1e-6,
+) -> dict:
+    """One-pass alternative to ``run_pit_batched``'s K-fold query-side PIT.
+
+    ``X_calib``/``Y_calib`` is a *separate* point set (disjoint from
+    ``X_query`` by construction, e.g. extra points drawn from the same
+    episode's generating process but never part of the official training
+    set) used as TabICL's context. Every query point is then scored against
+    that single context in one forward pass — no leakage, since a query
+    point was never a member of its own context, so no fold rotation is
+    needed. This is exactly ``run_pit_batched``'s part A (the test-side PIT,
+    which already scores ``X_test`` against the full ``X_train`` context in
+    one pass), generalised to an arbitrary context/query pair.
+
+    Cost: 1 forward pass total, vs. ``k_folds`` for ``run_pit_batched``'s
+    K-fold query-side PIT. Trade-off: every query point shares the same,
+    fixed-size context, rather than K-fold's near-full-pool context per
+    point — quality depends on how large/informative ``X_calib`` is (see
+    ``conf/data/gp_tasks.yaml``'s ``z_train_split_calib_frac``).
+
+    Args:
+        tabicl  : frozen TabICL regressor (max_classes=0)
+        X_query : (B, P_Q, p_x)
+        Y_query : (B, P_Q, d) — only used to evaluate the CDF, never
+                  passed to TabICL as context.
+        X_calib : (B, P_C, p_x)
+        Y_calib : (B, P_C, d)
+        eps     : clamp before probit.
+
+    Returns dict with:
+        z_train : (B, P_Q, d)
+    """
+    device = X_query.device
+    B, P_Q, p_x = X_query.shape
+    P_C = X_calib.shape[1]
+    d = Y_query.shape[2]
+
+    X_concat = torch.cat([X_calib, X_query], dim=1)                          # (B, P_C+P_Q, p_x)
+    X_batch = (
+        X_concat.unsqueeze(1).expand(B, d, P_C + P_Q, p_x).reshape(B * d, P_C + P_Q, p_x).contiguous()
+    )
+    y_calib_batch = Y_calib.permute(0, 2, 1).reshape(B * d, P_C).contiguous()  # (B*d, P_C)
+
+    logits = tabicl(X_batch, y_calib_batch)                                  # (B*d, P_Q, Q)
+    Q = logits.shape[-1]
+    dist = tabicl.quantile_dist(logits.reshape(B * d * P_Q, Q))
+
+    y_query_flat = Y_query.permute(0, 2, 1).reshape(B * d * P_Q)
+    u_query = dist.cdf(y_query_flat).reshape(B, d, P_Q).permute(0, 2, 1)     # (B, P_Q, d)
+    z_train = _probit(u_query, eps)
+
+    return {"z_train": z_train}
 
 
 # ---------------------------------------------------------------------------

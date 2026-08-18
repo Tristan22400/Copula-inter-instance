@@ -39,7 +39,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from train import _build_tabicl_val_z, _corr_grid_fig, _resolve_pit_ckpt
+from pit import resolve_pit_ckpt as _resolve_pit_ckpt
+from train import _build_tabicl_val_z, _corr_grid_fig
 
 
 class FakeTabICL(nn.Module):
