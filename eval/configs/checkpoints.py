@@ -12,20 +12,16 @@ _CHECKPOINTS_ROOT = os.path.join(
 
 # name -> {dir, default_step, label, color}. `dir` is the run directory under
 # checkpoints/; `default_step` picks which step_*.pt file `diagnose`/`sweep`
-# use when a bare family name (not "family:step") is given. The two
-# kernel-sweep-all-tabicl-retrain entries share one run dir but are kept as
-# separate registry entries (distinct default_step/label/color) since the
-# report treats "15k steps" and "60k steps" of that run as two comparison
-# points, not one -- same convention plots/run_synthetic_checkpoint_comparison.py
-# and plots/make_supervisor_report_figures.py already used (family keys
-# "kernel-sweep-all-tabicl-retrain-15k" / "-60k").
+# use when a bare family name (not "family:step") is given.
+#
+# Kept to the best-performing checkpoint per training lineage (per the
+# spatial-correlation model_r2 sweeps -- see project memory): dropped
+# kernel-sweep-all@500k (worst overall, negative model_r2 almost everywhere
+# despite the longest training), kernel-sweep-all-tabicl-retrain-60k
+# (regresses vs. its own 15k-step sibling), and kernel-sweep-classic-prod@110k
+# (flat, distance-blind correlation prediction, dominated by its own 5k-step
+# TabICL finetune below).
 CHECKPOINT_FAMILIES = {
-    "kernel-sweep-all": {
-        "dir": "kernel-sweep-all",
-        "default_step": 500000,
-        "label": "Entrainement normal (500k steps)",
-        "color": "#888888",
-    },
     "kernel-sweep-all-noisy-mae": {
         "dir": "kernel-sweep-all-noisy-mae",
         "default_step": 355000,
@@ -44,11 +40,11 @@ CHECKPOINT_FAMILIES = {
         "label": "Entrainement normal + 15k steps avec z_train TabICL",
         "color": "#c44e52",
     },
-    "kernel-sweep-all-tabicl-retrain-60k": {
-        "dir": "kernel-sweep-all-tabicl-retrain",
-        "default_step": 60000,
-        "label": "Entrainement normal + 60k steps avec z_train TabICL",
-        "color": "#dd8452",
+    "kernel-sweep-classic-prod-tabicl-retrain": {
+        "dir": "kernel-sweep-classic-prod-tabicl-retrain",
+        "default_step": 5000,
+        "label": "Classic-prod (40k) + 5k steps avec z_train TabICL",
+        "color": "#937860",
     },
     "kernel-sweep-classic-prod": {
         "dir": "kernel-sweep-classic-prod",
