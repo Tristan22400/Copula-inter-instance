@@ -50,6 +50,18 @@ CHECKPOINT_FAMILIES = {
         "label": "Entrainement normal + 60k steps avec z_train TabICL",
         "color": "#dd8452",
     },
+    "kernel-sweep-classic-prod": {
+        "dir": "kernel-sweep-classic-prod",
+        "default_step": 40000,
+        "label": "Classic prod (40k steps)",
+        "color": "#8172b2",
+    },
+    "kernel-sweep-classic-zcorrupt-bigN-retrain": {
+        "dir": "kernel-sweep-classic-zcorrupt-noise-mild-bigN-retrain",
+        "default_step": 210000,
+        "label": "zcorrupt bigN retrain (210k steps)",
+        "color": "#937860",
+    },
 }
 
 

@@ -43,6 +43,7 @@ __all__ = [
     "extract_model_context_correlation",
     "extract_model_true_z_train_correlation",
     "sample_simple_kernel_covariance",
+    "build_synthetic_grid_task",
     "bin_correlation_by_distance",
     "pair_counts_by_distance",
     "seriate_by_correlation",
@@ -347,6 +348,68 @@ def sample_simple_kernel_covariance(
     param_str = ", ".join(f"{name}={v.item():.3f}" for name, v in params.items() if v.numel() == 1)
     print(f"Synthetic ground truth: kernel='{kernel_name}' ({param_str})")
     return Sigma, kernel_name
+
+
+def build_synthetic_grid_task(
+    cfg, kernel_name: str, grid_size: int, n_context: int, n_bins: int, seed: int, *, min_context: int = 1,
+) -> dict:
+    """Shared synthetic-task setup: the grid_size x grid_size coordinate
+    grid, ONE known ground-truth covariance sampled from it
+    (sample_simple_kernel_covariance), the derived distance/bin/pair-count
+    arrays, and one context-point sample — everything a synthetic sweep task
+    needs before it's free to diverge on what it does with a context sample
+    (average many draws' predicted correlation, as
+    sweep_core.py::run_synthetic_config does; or compare a single draw's
+    exact-GP z_train against several marginal backends' K-fold PIT estimate
+    of it, as compare_marginal_backbones.py::run_task does) — previously
+    duplicated between those two call sites.
+
+    The returned ``rng`` has already drawn `context_idx`; callers that need
+    further random draws from the SAME stream (e.g. sampling z_true =
+    L @ rng.standard_normal(D)) should keep using it rather than creating a
+    new Generator, to keep one `seed` fully determining the whole task.
+
+    Coordinate SCALE is arbitrary (sample_simple_kernel_covariance z-scores
+    before evaluating the kernel), so [-1000, 1000] is used purely so
+    `dist`'s magnitude clears fit_theoretical_law's hardcoded L >= 1.0 lower
+    bound (calibrated for real ERA5 km-distances).
+    """
+    import torch
+
+    from data_gen import sigma_to_correlation
+
+    rng = np.random.default_rng(seed)
+    axis = np.linspace(-1000.0, 1000.0, grid_size)
+    x_grid, y_grid = np.meshgrid(axis, axis)
+    coords = np.column_stack([x_grid.ravel(), y_grid.ravel()])
+    D = coords.shape[0]
+
+    true_cov, _ = sample_simple_kernel_covariance(cfg, coords, kernel_name, seed)
+    R_true, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
+    R_true = R_true.numpy()
+
+    dist = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(-1))
+    bin_edges = np.linspace(0.0, dist[np.triu_indices(D, k=1)].max(), n_bins + 1)
+    pair_counts = pair_counts_by_distance(dist, bin_edges).astype(float)
+
+    n_context_eff = max(min_context, min(n_context, D - 1))
+    context_idx = rng.choice(D, size=n_context_eff, replace=False)
+    context_coords = coords[context_idx]
+
+    return {
+        "rng": rng,
+        "coords": coords,
+        "D": D,
+        "true_cov": true_cov,
+        "R_true": R_true,
+        "dist": dist,
+        "bin_edges": bin_edges,
+        "pair_counts": pair_counts,
+        "context_idx": context_idx,
+        "context_coords": context_coords,
+        "n_context_eff": n_context_eff,
+        "L": safe_cholesky(true_cov),
+    }
 
 
 # ---------------------------------------------------------------------------
