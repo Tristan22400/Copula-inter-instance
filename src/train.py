@@ -58,6 +58,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+# eval/ (regions.py, spatial-correlation probe helpers -- see
+# _build_era5_val_batches below) lives at the repo root, not under src/.
+_REPO_ROOT = os.path.dirname(_HERE)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from classical_kernels import DEFAULT_FAMILIES
 from data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, generate_gp_batch
 from dataset import (
@@ -66,6 +72,9 @@ from dataset import (
     ShardHomogeneousBatchSampler,
     collate_fn,
 )
+from eval.configs.regions import REGIONS as ERA5_REGIONS
+from eval.spatial.diagnostics import bin_correlation_by_distance
+from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
 from live_dataset import build_fixed_live_val_batches, build_live_train_loader
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
@@ -314,6 +323,20 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     return fig
 
 
+def _name_seed(base_seed: int, name: str) -> int:
+    """Deterministic per-name seed offset from a run-level base seed, so each
+    kernel family / ERA5 region gets its own fixed-but-different probe draw
+    instead of all of them sharing one seed."""
+    return base_seed + (zlib.crc32(name.encode()) % 10_000)
+
+
+def _macro_average(values: list[float]) -> float:
+    """Unweighted mean of a metric collected across kernel families /
+    regions, NaN if none were finite — used for the kernel_fit/era5_fit
+    mean_* cross-run-comparable scalars in validate()."""
+    return float(np.mean(values)) if values else float("nan")
+
+
 def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, dict]:
     """Fixed per-kernel-family synthetic probe episodes for the
     ``kernel_fit/<family>`` validation metrics (see validate()).
@@ -347,7 +370,7 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     for family in families:
         if family not in KERNEL_REGISTRY:
             continue  # not standalone-generatable (e.g. an unregistered composite)
-        family_seed = base_seed + (zlib.crc32(family.encode()) % 10_000)
+        family_seed = _name_seed(base_seed, family)
         synth_cfg = OmegaConf.merge(
             cfg,
             OmegaConf.create({
@@ -365,6 +388,65 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
         episodes = generate_gp_batch(synth_cfg, n_episodes, device="cpu")
         batch = collate_fn(episodes)
         batches[family] = {k: v.to(device) for k, v in batch.items()}
+    return batches
+
+
+def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> dict[str, dict]:
+    """Fixed per-region real-ERA5 probes for the ``era5_fit/<region>``
+    validation metrics (see validate()) — the real-data analogue of
+    _build_synthetic_kernel_batches above.
+
+    Unlike a kernel_fit/<family> synthetic probe, real ERA5 has no known GP
+    oracle (no Sigma_star/R_star), so there is no NLL-gap metric to compute
+    here. Instead, eval.spatial.sweep_core.build_era5_probe freezes a ground-
+    truth correlation-vs-distance curve (empirical Pearson correlation, the
+    same convention eval/runners/spatial_correlation_eval.py's real-mode
+    sweep uses) plus a fixed real in-context sample (context coords/values,
+    PIT'd once against `tabicl_marginal`) for a handful of ERA5 days per
+    region. validate() re-runs only the CURRENT model's forward pass on this
+    frozen input every call and scores the resulting correlogram against the
+    frozen curve — the ERA5 fetch + PIT cost is paid once, here, not on the
+    training loop's hot path.
+
+    `tabicl_marginal` may be None (no PIT checkpoint configured): falls back
+    to naive per-context standardization, same as
+    eval.spatial.diagnostics.extract_model_context_correlation.
+    """
+    ecfg = cfg.get("baselines", {}) or {}
+    region_names = list(ecfg.get("era5_regions") or list(ERA5_REGIONS.keys()))
+    grid_size = int(ecfg.get("era5_grid_size", 10))
+    n_days_fetch = int(ecfg.get("era5_n_days_fetch", 60))
+    n_days_probe = int(ecfg.get("era5_n_days_probe", 3))
+    n_context = int(ecfg.get("era5_n_context", 30))
+    n_bins = int(ecfg.get("era5_n_bins", 12))
+    base_seed = int(ecfg.get("era5_seed", 20260818))
+
+    batches: dict[str, dict] = {}
+    for region_name in region_names:
+        if region_name not in ERA5_REGIONS:
+            continue  # not a registered eval/configs/regions.py entry
+        region_seed = _name_seed(base_seed, region_name)
+        probe = build_era5_probe(
+            region_name, grid_size, n_days_fetch, n_days_probe, n_context, n_bins,
+            tabicl_marginal, device, seed=region_seed,
+        )
+        n_days_p = probe["z_train_per_day"].shape[0]
+        x_train = torch.as_tensor(probe["x_train_norm"], dtype=torch.float32, device=device)
+        x_test = torch.as_tensor(probe["x_test_norm"], dtype=torch.float32, device=device)
+        z_train = torch.as_tensor(probe["z_train_per_day"], dtype=torch.float32, device=device)
+        model_batch = {
+            "x_train": x_train.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
+            "x_test": x_test.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
+            "z_train": z_train,
+            "test_mask": torch.ones(n_days_p, probe["D"], dtype=torch.bool, device=device),
+        }
+        batches[region_name] = {
+            "batch": model_batch,
+            "dist": probe["dist"],
+            "bin_edges": probe["bin_edges"],
+            "pair_counts": probe["pair_counts"],
+            "rho_emp": probe["rho_emp"],
+        }
     return batches
 
 
@@ -582,6 +664,7 @@ def validate(
     do_plot: bool = False,
     synth_kernel_batches: dict | None = None,
     tabicl_val_z: dict | None = None,
+    era5_val_batches: dict | None = None,
 ) -> tuple[dict, list]:
     # Do NOT call model.eval() here: TabICL's eval mode triggers _inference_forward
     # which uses InferenceManager with its own float16 autocast on CUDA, producing
@@ -828,12 +911,44 @@ def validate(
     # would already be unweighted per-family (each family contributes one
     # scalar regardless of n_episodes), but is computed explicitly here so it
     # survives family list changes/NaNs without silently reweighting.
-    metrics["kernel_fit/mean_copula_improvement"] = (
-        float(np.mean(family_copula_improvement)) if family_copula_improvement else float("nan")
-    )
-    metrics["kernel_fit/mean_corr_pearson"] = (
-        float(np.mean(family_corr_pearson)) if family_corr_pearson else float("nan")
-    )
+    metrics["kernel_fit/mean_copula_improvement"] = _macro_average(family_copula_improvement)
+    metrics["kernel_fit/mean_corr_pearson"] = _macro_average(family_corr_pearson)
+
+    # Real-ERA5 spatial-correlation probe per region (see
+    # _build_era5_val_batches / eval/spatial/sweep_core.py::build_era5_probe).
+    # There is no GP oracle for real data, so — unlike kernel_fit/<family>'s
+    # NLL gap against Sigma_star — this scores the CURRENT model's
+    # context-conditioned correlogram against the region's frozen EMPIRICAL
+    # Pearson correlation curve (rho_emp), using the same weighted
+    # shape_corr/rmse/bias/model_r2 convention
+    # eval/runners/spatial_correlation_eval.py's real-mode sweep reports.
+    region_shape_corr: list[float] = []
+    region_model_r2: list[float] = []
+    for region, probe in (era5_val_batches or {}).items():
+        out_e = model(probe["batch"])
+        Sigma_e = build_sigma(out_e, cfg, jitter=jitter, test_mask=probe["batch"]["test_mask"])
+        # Averaging the predicted correlation matrix over the probe's few
+        # fixed days before binning is equivalent to averaging the binned
+        # curve over days (binning is a per-day-identical linear reduction
+        # over (i, j) pairs, since `dist`/bin_edges don't depend on the day)
+        # — cheaper than bin_correlation_by_distance once per day.
+        R_mean = Sigma_e.float().mean(dim=0).detach().cpu().numpy()
+        rho_context = bin_correlation_by_distance(R_mean, probe["dist"], probe["bin_edges"])
+        pair_counts, rho_emp = probe["pair_counts"], probe["rho_emp"]
+        shape_corr = weighted_corr(rho_context, rho_emp, pair_counts)
+        rmse, bias = weighted_rmse_bias(rho_context, rho_emp, pair_counts)
+        model_r2 = weighted_r2(rho_context, rho_emp, pair_counts)
+        metrics[f"era5_fit/{region}/shape_corr"] = shape_corr
+        metrics[f"era5_fit/{region}/rmse"] = rmse
+        metrics[f"era5_fit/{region}/bias"] = bias
+        metrics[f"era5_fit/{region}/model_r2"] = model_r2
+        if not math.isnan(shape_corr):
+            region_shape_corr.append(shape_corr)
+        if not math.isnan(model_r2):
+            region_model_r2.append(model_r2)
+
+    metrics["era5_fit/mean_shape_corr"] = _macro_average(region_shape_corr)
+    metrics["era5_fit/mean_model_r2"] = _macro_average(region_model_r2)
 
     model.train()
 
@@ -1449,18 +1564,35 @@ def main(cfg: DictConfig) -> None:
     # which checkpoint (if any) that uses.
     pit_ckpt = _resolve_pit_ckpt(cfg)
     tabicl_val_z: dict = {}
+    # Real-ERA5 spatial-correlation probes (see _build_era5_val_batches):
+    # built here too, alongside tabicl_val_z, so the one-time PIT cost on the
+    # frozen context sample is paid before `tabicl_marginal` is discarded —
+    # not gated on pit_ckpt existing, since build_era5_probe accepts
+    # tabicl_marginal=None (naive-standardization fallback).
+    era5_val_batches: dict = {}
+    era5_on = baselines_on and bool(cfg.get("baselines", {}).get("era5_enabled", True))
     if baselines_on and pit_ckpt:
         print("[train] Loading frozen TabICL marginal for the z_train sim-to-real diagnostic...")
         tabicl_marginal = load_tabicl(pit_ckpt, device)
         pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
         tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, pit_k_folds, device)
-        del tabicl_marginal  # only z_train_tabicl (cached above) is needed from here on
+        if era5_on:
+            print("[train] Building frozen real-ERA5 spatial-correlation probes...")
+            era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)
+        del tabicl_marginal  # only the caches built above are needed from here on
         if device == "cuda":
             # gc.collect() before empty_cache() (see this repo's OOM-handler
             # gotcha): del alone doesn't free CUDA storage until any
             # reference cycles in the eval-mode forward graph are collected.
             gc.collect()
             torch.cuda.empty_cache()
+    elif era5_on:
+        print(
+            "[train] Building frozen real-ERA5 spatial-correlation probes "
+            "(no PIT checkpoint configured -- context z_train falls back to "
+            "naive standardization)..."
+        )
+        era5_val_batches = _build_era5_val_batches(cfg, None, device)
 
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
@@ -1861,6 +1993,7 @@ def main(cfg: DictConfig) -> None:
                 model, val_loader, cfg, device, step=step, do_plot=do_plot,
                 synth_kernel_batches=synth_kernel_batches,
                 tabicl_val_z=tabicl_val_z,
+                era5_val_batches=era5_val_batches,
             )
             log_dict = {f"val/{k}": v for k, v in metrics.items()}
             if adaptive_kernel_weights is not None:

@@ -25,6 +25,7 @@ from eval.data.era5_io import haversine_distance_km, load_era5_data, safe_choles
 from eval.data.fetch_era5 import fetch as fetch_era5
 from eval.spatial.diagnostics import (
     bin_correlation_by_distance,
+    compute_context_z_train,
     empirical_spatial_correlation,
     extract_model_context_correlation,
     extract_model_dummy_context_correlation,
@@ -36,7 +37,10 @@ from eval.spatial.diagnostics import (
     sample_simple_kernel_covariance,
 )
 
-__all__ = ["get_model", "run_real_config", "run_synthetic_config"]
+__all__ = [
+    "get_model", "run_real_config", "run_synthetic_config", "build_era5_probe",
+    "weighted_corr", "weighted_rmse_bias", "weighted_r2",
+]
 
 _MODEL_CACHE: dict = {}
 
@@ -52,7 +56,7 @@ def get_model(ckpt: str, device: "str | None" = None):
     return _MODEL_CACHE[ckpt]
 
 
-def _weighted_corr(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
+def weighted_corr(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
     mask = np.isfinite(a) & np.isfinite(b) & (w > 0)
     if mask.sum() < 3:
         return float("nan")
@@ -67,7 +71,7 @@ def _weighted_corr(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
     return float(cov / np.sqrt(var_a * var_b))
 
 
-def _weighted_rmse_bias(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> tuple:
+def weighted_rmse_bias(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> tuple:
     mask = np.isfinite(a) & np.isfinite(b) & (w > 0)
     if mask.sum() < 1:
         return float("nan"), float("nan")
@@ -78,7 +82,7 @@ def _weighted_rmse_bias(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> tuple:
     return rmse, bias
 
 
-def _weighted_r2(pred: np.ndarray, target: np.ndarray, n: np.ndarray) -> float:
+def weighted_r2(pred: np.ndarray, target: np.ndarray, n: np.ndarray) -> float:
     """Same weighted-R^2 convention as fit_theoretical_law (sigma =
     1/sqrt(n), i.e. bin-mean SEM weighting), applied to a model curve
     instead of a fitted theoretical law, so the two R^2 numbers are directly
@@ -146,13 +150,13 @@ def run_real_config(
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_dummy = bin_correlation_by_distance(R_dummy, dist, bin_edges)
 
-    shape_corr = _weighted_corr(rho_context_mean, rho_emp, pair_counts)
-    rmse, bias = _weighted_rmse_bias(rho_context_mean, rho_emp, pair_counts)
+    shape_corr = weighted_corr(rho_context_mean, rho_emp, pair_counts)
+    rmse, bias = weighted_rmse_bias(rho_context_mean, rho_emp, pair_counts)
     fro_ratio = float(np.sqrt(np.nanmean((rho_context_mean - rho_emp) ** 2)) /
                        max(np.sqrt(np.nanmean(rho_emp ** 2)), 1e-8))
 
     gt_fit = fit_theoretical_law(dist_centers, rho_emp, pair_counts.astype(int), "matern")
-    model_r2 = _weighted_r2(rho_context_mean, rho_emp, pair_counts)
+    model_r2 = weighted_r2(rho_context_mean, rho_emp, pair_counts)
 
     result = {
         "ckpt": ckpt,
@@ -232,9 +236,9 @@ def run_synthetic_config(
     rho_true = bin_correlation_by_distance(R_true, dist, bin_edges)
     rho_pred = bin_correlation_by_distance(R_pred_mean, dist, bin_edges)
 
-    shape_corr = _weighted_corr(rho_pred, rho_true, pair_counts)
-    rmse, bias = _weighted_rmse_bias(rho_pred, rho_true, pair_counts)
-    model_r2 = _weighted_r2(rho_pred, rho_true, pair_counts)
+    shape_corr = weighted_corr(rho_pred, rho_true, pair_counts)
+    rmse, bias = weighted_rmse_bias(rho_pred, rho_true, pair_counts)
+    model_r2 = weighted_r2(rho_pred, rho_true, pair_counts)
     gt_fit = fit_theoretical_law(dist_centers, rho_true, pair_counts.astype(int), "matern")
 
     result = {
@@ -250,3 +254,84 @@ def run_synthetic_config(
     print(f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
           f"model_r2={model_r2:.3f} bias={bias:+.3f}")
     return result
+
+
+def build_era5_probe(
+    region_name: str, grid_size: int, n_days_fetch: int, n_days_probe: int,
+    n_context: int, n_bins: int, tabicl_marginal, device: str, seed: int = SEED,
+) -> dict:
+    """Frozen real-ERA5 (context, target-grid, ground-truth correlogram)
+    probe for `region_name` — the training-loop analogue of `run_real_config`
+    above, split into a model-INDEPENDENT precompute step. Meant to be called
+    ONCE (see src/train.py::_build_era5_val_batches), not per validate() call.
+
+    Unlike a GP-generated episode, real ERA5 has no known oracle Sigma_star /
+    R_star, so what's frozen here is the ground-truth EMPIRICAL correlogram
+    (rho_emp, from Pearson correlation across days — same as run_real_config's
+    R_emp) plus the PIT z_train for a fixed context sample on a handful of
+    fixed days. Everything downstream that depends on the (still-training,
+    changing every call) copula model — the context-conditioned forward pass
+    and its scoring against rho_emp — is deliberately NOT done here; that
+    happens in train.py::validate() every call, on the cheap frozen inputs
+    this function returns.
+
+    z_train is computed via eval.spatial.diagnostics.compute_context_z_train —
+    the same K-fold LOO PIT step extract_model_context_correlation's
+    real-context z_train always uses, but only once per probe day here
+    instead of once per validate() call — `tabicl_marginal` never changes
+    during training, so re-running PIT on the same (context_coords,
+    context_values) every call would just recompute an identical result
+    (mirrors train.py::_build_tabicl_val_z's same precompute-once rationale).
+    """
+    from inference.copula_inference import normalize_features
+
+    rng = np.random.default_rng(seed)
+    lat_bounds, lon_bounds = REGIONS[region_name]
+    nc_path = fetch_era5(region_name, lat_bounds, lon_bounds, grid_size, n_days_fetch)
+    data = load_era5_data(nc_path)
+    lat, lon = data["latitude"], data["longitude"]
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
+    D = coords.shape[0]
+
+    R_emp = empirical_spatial_correlation(data, target="raw")
+    dist = haversine_distance_km(coords)
+    dist_iu = dist[np.triu_indices_from(dist, k=1)]
+    max_dist = np.percentile(dist_iu, MAX_DIST_PERCENTILE)
+    bin_edges = np.linspace(0.0, max_dist, n_bins + 1)
+    dist_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    pair_counts = pair_counts_by_distance(dist, bin_edges).astype(float)
+    rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
+
+    n_time = data["t2m"].shape[0]
+    n_pick = min(n_days_probe, n_time)
+    days = sorted(set(np.linspace(0, n_time - 1, n_pick).round().astype(int).tolist()))
+
+    n_context_eff = max(1, min(n_context, D - 1))
+    context_idx = rng.choice(D, size=n_context_eff, replace=False)
+    context_coords = coords[context_idx]
+
+    x_train_norm, x_test_norm = normalize_features(context_coords, coords)
+
+    z_train_per_day = []
+    for d in days:
+        day_values = data["t2m"][d].ravel()
+        context_values = day_values[context_idx]
+        z_train = compute_context_z_train(
+            x_train_norm, context_values, tabicl_marginal, device, k_folds=PIT_K_FOLDS,
+        )
+        z_train_per_day.append(z_train)
+
+    return {
+        "region": region_name,
+        "x_train_norm": x_train_norm,                       # (P, 2)
+        "x_test_norm": x_test_norm,                          # (D, 2)
+        "z_train_per_day": np.stack(z_train_per_day, axis=0),  # (n_days_probe, P)
+        "dist": dist,                                        # (D, D)
+        "bin_edges": bin_edges,
+        "dist_centers": dist_centers,
+        "pair_counts": pair_counts,
+        "rho_emp": rho_emp,
+        "D": int(D),
+        "n_context": int(n_context_eff),
+    }

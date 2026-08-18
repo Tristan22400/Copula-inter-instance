@@ -176,6 +176,22 @@ baselines:
   probe_N_min: 8
   probe_N_max: 1024
 
+  # era5_fit/<region>/* validation metrics (see train.py::_build_era5_val_batches):
+  # real ARCO-ERA5 spatial-correlation probes, one per eval/configs/regions.py
+  # entry, scored against empirical Pearson correlation (no GP oracle exists for
+  # real data, unlike kernel_fit/<family> above). Fetched/PIT'd once before
+  # training starts and cached -- only the model forward pass re-runs every
+  # validate() call. Kept deliberately small (grid_size/n_days_probe) since this
+  # adds real forward passes to EVERY validation call, not a one-off sweep.
+  era5_enabled: true
+  era5_regions: [western_europe, north_atlantic_ocean, sahara_desert, himalaya_tibetan_plateau, amazon_basin]
+  era5_grid_size: 24        # matches eval/configs/regions.py's low_context_7config/grid_resolution convention (grid=24, n_context=30 -> ~5% context fraction)
+  era5_n_days_fetch: 60     # days fetched/cached per region (eval.configs.constants.N_DAYS)
+  era5_n_days_probe: 3      # of those, how many are used as context-conditioning draws per validate() call
+  era5_n_context: 30        # in-context sample size (eval.configs.constants.N_CONTEXT)
+  era5_n_bins: 12           # distance bins for the correlation-vs-distance curve
+  era5_seed: 20260818       # fixed seed -> same context sample/probe days every run
+
 # LoRA fine-tuning of the TabICL backbone.
 # Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]
 lora:
