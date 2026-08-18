@@ -21,10 +21,11 @@ import torch
 
 from eval.configs.constants import MAX_DIST_PERCENTILE, N_BINS, N_CONTEXT, N_DAYS, PIT_K_FOLDS, SEED
 from eval.configs.regions import REGIONS
-from eval.data.era5_io import haversine_distance_km, load_era5_data, safe_cholesky
+from eval.data.era5_io import haversine_distance_km, load_era5_data
 from eval.data.fetch_era5 import fetch as fetch_era5
 from eval.spatial.diagnostics import (
     bin_correlation_by_distance,
+    build_synthetic_grid_task,
     empirical_spatial_correlation,
     extract_model_context_correlation,
     extract_model_dummy_context_correlation,
@@ -33,7 +34,6 @@ from eval.spatial.diagnostics import (
     load_copula_model,
     load_marginal_tabicl,
     pair_counts_by_distance,
-    sample_simple_kernel_covariance,
 )
 
 __all__ = ["get_model", "run_real_config", "run_synthetic_config"]
@@ -190,35 +190,15 @@ def run_synthetic_config(
     from one src/data_gen.py kernel (exact, zero estimation noise) and score
     how well the checkpoint's context-conditioned forward pass recovers it.
     """
-    from data_gen import sigma_to_correlation
-
-    rng = np.random.default_rng(seed)
     model, cfg, resolved_device, marginal = get_model(ckpt, device)
 
-    # Coordinate SCALE is arbitrary (sample_simple_kernel_covariance
-    # z-scores before evaluating the kernel), so a factor of 1000 is used
-    # purely so `dist`'s magnitude clears fit_theoretical_law's hardcoded
-    # L >= 1.0 lower bound (calibrated for real ERA5 km-distances).
-    axis = np.linspace(-1000.0, 1000.0, grid_size)
-    x_grid, y_grid = np.meshgrid(axis, axis)
-    coords = np.column_stack([x_grid.ravel(), y_grid.ravel()])
-    D = coords.shape[0]
-
-    true_cov, _ = sample_simple_kernel_covariance(cfg, coords, kernel_name, seed)
-    R_true, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
-    R_true = R_true.numpy()
-
-    dist = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(-1))
-    dist_iu = dist[np.triu_indices(D, k=1)]
-    bin_edges = np.linspace(0.0, dist_iu.max(), n_bins + 1)
+    task = build_synthetic_grid_task(cfg, kernel_name, grid_size, n_context, n_bins, seed, min_context=1)
+    coords, D = task["coords"], task["D"]
+    R_true, dist, bin_edges, pair_counts = task["R_true"], task["dist"], task["bin_edges"], task["pair_counts"]
+    context_idx, context_coords = task["context_idx"], task["context_coords"]
+    n_context_eff, rng, L = task["n_context_eff"], task["rng"], task["L"]
     dist_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    pair_counts = pair_counts_by_distance(dist, bin_edges).astype(float)
 
-    n_context_eff = max(1, min(n_context, D - 1))
-    context_idx = rng.choice(D, size=n_context_eff, replace=False)
-    context_coords = coords[context_idx]
-
-    L = safe_cholesky(true_cov)
     R_pred_draws = []
     for _ in range(n_draws):
         z_true = L @ rng.standard_normal(D)
