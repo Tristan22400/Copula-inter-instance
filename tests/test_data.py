@@ -703,40 +703,39 @@ def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeyp
     instead of propagating and killing the worker process.
 
     Regression: gpytorch's add_low_rank -> root_decomposition -> _symeig
-    path can raise torch.linalg.LinAlgError (LAPACK eigh failing to
+    path could raise torch.linalg.LinAlgError (LAPACK eigh failing to
     converge on an ill-conditioned matrix) instead of NotPSDError out of
-    the exact same call this function already wraps in a try/except --
-    only NotPSDError was caught, so this exception type killed live
-    generation workers (job 3000710, worker 2, 4 times before the worker
-    gave up for good)."""
+    kernel evaluation -- only NotPSDError was caught, so this exception type
+    killed live generation workers (job 3000710, worker 2, 4 times before
+    the worker gave up for good).
+
+    _build_kernel_chain/_sample_episode_kernel now combine composite kernels
+    via _DenseComposedKernel (dense tensor +/*, not gpytorch's
+    Kernel.__add__/__mul__), which structurally prevents add_low_rank's
+    RootLinearOperator trigger from ever firing -- so this specific
+    non-convergence can no longer be produced for real. The exception
+    handling around kernel evaluation (_evaluate_kernel_dense, called from
+    _generate_gp_batch_raw) is kept as defence in depth regardless, and this
+    test poisons that seam directly rather than relying on triggering a
+    genuine LAPACK failure."""
     import data_gen as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.seed = 11
 
-    real_build_likelihood = dg._build_likelihood
+    real_evaluate_kernel_dense = dg._evaluate_kernel_dense
     state = {"n_calls": 0}
 
-    class _PoisonedLikelihood:
-        def __init__(self, real):
-            self._real = real
+    def poisoned_evaluate_kernel_dense(kernel_obj, x_norm):
+        state["n_calls"] += 1
+        if state["n_calls"] == 1:
+            raise torch.linalg.LinAlgError(
+                "linalg.eigh: synthetic non-convergence for test"
+            )
+        return real_evaluate_kernel_dense(kernel_obj, x_norm)
 
-        def __call__(self, *args, **kwargs):
-            state["n_calls"] += 1
-            if state["n_calls"] == 1:
-                raise torch.linalg.LinAlgError(
-                    "linalg.eigh: synthetic non-convergence for test"
-                )
-            return self._real(*args, **kwargs)
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-    def poisoned_build_likelihood(cfg, kernel_name, B, device):
-        return _PoisonedLikelihood(real_build_likelihood(cfg, kernel_name, B, device))
-
-    monkeypatch.setattr(dg, "_build_likelihood", poisoned_build_likelihood)
+    monkeypatch.setattr(dg, "_evaluate_kernel_dense", poisoned_evaluate_kernel_dense)
 
     episodes = dg.generate_gp_batch(cfg, B=6, device="cpu")
     assert state["n_calls"] > 1, "test setup didn't actually trigger a retry"

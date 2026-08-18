@@ -65,7 +65,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from classical_kernels import DEFAULT_FAMILIES
-from data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, generate_gp_batch
+from data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, _generate_gp_batch_raw, generate_gp_batch
 from dataset import (
     CopulaDataset,
     ShardBlockSampler,
@@ -79,7 +79,7 @@ from live_dataset import build_fixed_live_val_batches, build_live_train_loader
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
 from muon import Muon
-from pit import DEFAULT_K_FOLDS, load_tabicl, normalize_targets, run_pit
+from pit import DEFAULT_K_FOLDS, load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit
 
 _MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
@@ -507,24 +507,136 @@ def _update_adaptive_kernel_weights(
     return (1.0 - floor) * raw + floor * uniform
 
 
-def _resolve_pit_ckpt(cfg) -> str | None:
-    """Which checkpoint (if any) to load as the frozen TabICL marginal for
-    the z_train sim-to-real diagnostic (see _build_tabicl_val_z below).
+@torch.no_grad()
+def _compute_tabicl_z_train_gap(
+    cfg: DictConfig, tabicl_marginal: nn.Module, k_folds: int, device: str = "cpu",
+) -> dict[str, float]:
+    """Measure, once per data_gen._COMPOSABLE_KERNELS family, how far the
+    frozen TabICL marginal's own K-fold PIT diverges from the exact
+    analytic GP-LOO z_train on the SAME episodes -- the signal
+    data.z_train_tabicl_mix_* (conf/data/gp_tasks.yaml) uses to set each
+    family's live-generation mixing fraction (see _tabicl_gap_to_mix_frac
+    below).
 
-    This is a separate model instance from the backbone this run actually
-    trains, so its checkpoint is its own knob (tabicl.pit_ckpt) rather than
-    reusing tabicl.pretrained/tabicl.ckpt (which describe this run's own
-    backbone) — a from-scratch backbone (tabicl.pretrained=false, e.g.
-    copula_nano) can still opt in by setting pit_ckpt explicitly, since
-    PIT-ing val episodes with a released checkpoint's quantile head doesn't
-    depend on this run's own architecture. Defaults to tabicl.ckpt when the
-    backbone itself is pretrained (copula_prod's original behaviour), else
-    None (diagnostic off) unless pit_ckpt is set explicitly.
+    Calls _generate_gp_batch_raw directly (not the public generate_gp_batch
+    top-up wrapper) TWICE per family with the identical cfg.seed -- once
+    with tabicl_model=None (exact analytic z_train), once with
+    tabicl_model=tabicl_marginal (real TabICL K-fold PIT) -- so both calls
+    draw byte-identical kernel/hyperparameters/x/y (see
+    _generate_gp_batch_raw's seeding-contract docstring) and differ ONLY in
+    which z_train ends up in the returned episode dicts. The discard mask
+    that determines which episodes survive is itself computed from the
+    exact analytic residual before either call's z_train override runs
+    (see _generate_gp_batch_raw's z_train-override comment), so it's
+    identical across both calls too -- episode i in one list is the same
+    episode as index i in the other, safe to pair up directly without
+    needing generate_gp_batch's reseeding top-up loop (which would risk
+    the two calls discarding different subsets on a retry round).
+
+    This is a property of TabICL's frozen marginal-quantile approximation
+    for that kernel family, not of the copula model being trained -- unlike
+    train.py::_update_adaptive_kernel_weights's regret signal, which chases
+    a moving target as the model trains, this doesn't change during
+    training, so it's computed once, up front (train.py's startup
+    sequence, alongside _build_tabicl_val_z, before `tabicl_marginal` is
+    freed), not re-measured every validate() call.
+
+    Uses cfg.baselines.synth_n_episodes/synth_seed/probe_P_*/probe_N_* (the
+    same fixed-probe-set knobs _build_synthetic_kernel_batches uses) offset
+    by +1 so this draws an independent episode stream from that function's
+    own kernel_fit/<family> probes, rather than silently reusing the exact
+    same seed for a different purpose.
+
+    device: must match wherever tabicl_marginal itself lives (train.py's
+    startup sequence passes its own `device`, typically "cuda") -- BOTH
+    paired calls below run on this same device, not just the tabicl one.
+    torch's CPU and CUDA generators are separate RNG streams that do not
+    produce identical draws from the same torch.manual_seed/cuda.manual_seed
+    even though _seed_everything seeds both every call (different underlying
+    algorithms) -- running the analytic call on "cpu" while tabicl_marginal
+    lives on "cuda" would silently break the byte-identical-pairing
+    guarantee above (and, separately, crash outright once the override
+    branch tries to mix cuda-resident TabICL weights with cpu-resident
+    x_norm_train).
+
+    Returns {family: mean |z_tabicl - z_analytic|} (CPU floats) for every
+    family that produced at least one valid paired episode. Two independent
+    standard normals have E|Z1-Z2| = 2/sqrt(pi) ~= 1.13, so this gap is
+    typically O(0-1) in these units: near 0 means TabICL's PIT tracks the
+    analytic residual closely for that family, growing toward ~1.1+ means
+    it's close to uninformative.
     """
-    pit_ckpt = cfg.tabicl.get("pit_ckpt", None)
-    if pit_ckpt is None and bool(cfg.tabicl.get("pretrained", True)):
-        pit_ckpt = cfg.tabicl.get("ckpt", None)
-    return pit_ckpt
+    bcfg = cfg.get("baselines", {}) or {}
+    n_episodes = int(bcfg.get("synth_n_episodes", 64))
+    base_seed = int(bcfg.get("synth_seed", 20260718)) + 1
+    probe_P_min = int(bcfg.get("probe_P_min", 32))
+    probe_P_max = int(bcfg.get("probe_P_max", 512))
+    probe_N_min = int(bcfg.get("probe_N_min", 8))
+    probe_N_max = int(bcfg.get("probe_N_max", 1024))
+
+    gaps: dict[str, float] = {}
+    for family in _COMPOSABLE_KERNELS:
+        family_seed = _name_seed(base_seed, family)
+        probe_cfg = OmegaConf.merge(
+            cfg,
+            OmegaConf.create({
+                "seed": family_seed,
+                "data": {
+                    "kernel": family,
+                    "systematic_composition": False,
+                    "P_min": probe_P_min, "P_max": probe_P_max,
+                    "N_min": probe_N_min, "N_max": probe_N_max,
+                },
+            }),
+        )
+        analytic_eps = _generate_gp_batch_raw(probe_cfg, n_episodes, device=device)
+        probe_cfg.seed = family_seed  # _generate_gp_batch_raw mutates nothing, but stay explicit
+        tabicl_eps = _generate_gp_batch_raw(
+            probe_cfg, n_episodes, device=device,
+            tabicl_model=tabicl_marginal, tabicl_k_folds=k_folds,
+        )
+        n = min(len(analytic_eps), len(tabicl_eps))
+        if n == 0:
+            continue
+        diffs = [
+            (tabicl_eps[i]["z_train"] - analytic_eps[i]["z_train"]).abs().mean().item()
+            for i in range(n)
+        ]
+        gaps[family] = float(sum(diffs) / len(diffs))
+    return gaps
+
+
+def _tabicl_gap_to_mix_frac(
+    gaps: dict[str, float], floor_frac: float, max_frac: float,
+) -> torch.Tensor:
+    """Map _compute_tabicl_z_train_gap's per-family gap to a
+    `_COMPOSABLE_KERNELS`-ordered live-generation mixing-fraction tensor
+    (see data.z_train_tabicl_mix_* in conf/data/gp_tasks.yaml).
+
+    Min-max normalizes gaps across the families that were actually measured
+    (missing/degenerate families -- e.g. a family with 0 valid probe
+    episodes -- fall back to floor_frac, the same anti-starvation treatment
+    _update_adaptive_kernel_weights's floor gives an unmeasured family), then
+    linearly interpolates each family's normalized gap into
+    [floor_frac, max_frac]. If every measured gap is equal (or only one
+    family was measured), normalization is undefined -- every family gets
+    floor_frac instead, since there's no relative signal to differentiate on.
+    """
+    n = len(_COMPOSABLE_KERNELS)
+    frac = torch.full((n,), floor_frac, dtype=torch.float32)
+    if len(gaps) < 2:
+        return frac
+    values = list(gaps.values())
+    lo, hi = min(values), max(values)
+    spread = hi - lo
+    if spread <= 1e-12:
+        return frac
+    for i, family in enumerate(_COMPOSABLE_KERNELS):
+        if family not in gaps:
+            continue
+        normalized = (gaps[family] - lo) / spread
+        frac[i] = floor_frac + (max_frac - floor_frac) * normalized
+    return frac
 
 
 @torch.no_grad()
@@ -1336,6 +1448,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     adaptive_kernel_weights = None  # set below only when live_generation + adaptive_kernel_sampling
+    tabicl_mix_weights = None  # set below only when live_generation + data.z_train_tabicl_mix_enabled
     if live_generation:
         # No on-disk dataset at all: episodes are generated on the fly by
         # DataLoader worker processes (see live_dataset.py). Temporary
@@ -1346,8 +1459,8 @@ def main(cfg: DictConfig) -> None:
             f"no dataset_dir read ({t.dataset_dir!r} ignored). "
             f"ckpt_dir={t.get('ckpt_dir', None)!r}"
         )
-        train_loader, adaptive_kernel_weights = build_live_train_loader(cfg, t, device)
-        val_loader   = build_fixed_live_val_batches(cfg, t)
+        train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
+        val_loader   = build_fixed_live_val_batches(cfg, t, device)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
     else:
         meta_path   = os.path.join(t.dataset_dir, "meta.pt")
@@ -1565,9 +1678,9 @@ def main(cfg: DictConfig) -> None:
     # do_plot block): needs a second, frozen TabICL copy with its native
     # quantile head intact (unlike the copula model's backbone, which has it
     # stripped — see model.py:CopulaTabICL) to PIT the val episodes the same
-    # way real (non-GP) deployment data would be. See _resolve_pit_ckpt for
-    # which checkpoint (if any) that uses.
-    pit_ckpt = _resolve_pit_ckpt(cfg)
+    # way real (non-GP) deployment data would be. See pit.py::resolve_pit_ckpt
+    # for which checkpoint (if any) that uses.
+    pit_ckpt = resolve_pit_ckpt(cfg)
     tabicl_val_z: dict = {}
     # Real-ERA5 spatial-correlation probes (see _build_era5_val_batches):
     # built here too, alongside tabicl_val_z, so the one-time PIT cost on the
@@ -1576,11 +1689,47 @@ def main(cfg: DictConfig) -> None:
     # tabicl_marginal=None (naive-standardization fallback).
     era5_val_batches: dict = {}
     era5_on = baselines_on and bool(cfg.get("baselines", {}).get("era5_enabled", True))
-    if baselines_on and pit_ckpt:
+    # tabicl_mix_weights is not None only when live_generation + data.
+    # z_train_tabicl_mix_enabled=true (see build_live_train_loader) -- needs
+    # tabicl_marginal loaded below regardless of baselines_on, since the
+    # gap measurement it drives is independent of the kernel_fit/<family>
+    # baseline probes.
+    if (baselines_on or tabicl_mix_weights is not None) and pit_ckpt:
         print("[train] Loading frozen TabICL marginal for the z_train sim-to-real diagnostic...")
         tabicl_marginal = load_tabicl(pit_ckpt, device)
         pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
         tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, pit_k_folds, device)
+        if tabicl_mix_weights is not None:
+            print(
+                "[train] Measuring per-family TabICL-vs-analytic z_train gap "
+                "for data.z_train_tabicl_mix_* (this runs once, up front)..."
+            )
+            z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
+            floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
+            max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
+            new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
+            # In-place: tabicl_mix_weights is the shared-memory tensor
+            # LiveGPDataset workers already hold a reference to (built
+            # before the DataLoader forks/spawns -- see build_live_train_
+            # loader's docstring). Workers haven't started iterating yet at
+            # this point in train.py's startup sequence, so there's no
+            # torn-read race, but .copy_() (not rebind) is used anyway to
+            # match kernel_weights's own update convention below.
+            tabicl_mix_weights.copy_(new_mix_frac)
+            for family, gap in sorted(z_gap.items(), key=lambda kv: -kv[1]):
+                idx = _COMPOSABLE_KERNELS.index(family)
+                print(
+                    f"[train]   {family}: z_train_tabicl_gap={gap:.3f} "
+                    f"-> mix_frac={float(new_mix_frac[idx]):.3f}"
+                )
+            wandb.log(
+                {f"data/z_train_tabicl_gap/{f}": g for f, g in z_gap.items()}
+                | {
+                    f"data/tabicl_mix_frac/{family}": float(new_mix_frac[i])
+                    for i, family in enumerate(_COMPOSABLE_KERNELS)
+                },
+                step=0,
+            )
         if era5_on:
             print("[train] Building frozen real-ERA5 spatial-correlation probes...")
             era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)

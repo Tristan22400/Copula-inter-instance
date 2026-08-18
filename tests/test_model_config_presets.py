@@ -16,7 +16,7 @@ Tests verify:
      stand-in (test_tabicl_z_diagnostic.py, test_reliability_diagram.py).
   2. copula_nano resolves to the from-scratch, width+depth-shrunk backbone,
      and still opts into the z_train diagnostic via its own pit_ckpt knob
-     (see train.py::_resolve_pit_ckpt) despite training from scratch.
+     (see pit.py::resolve_pit_ckpt) despite training from scratch.
   3. copula_nano is small enough to actually build + forward on CPU, so it
      also exercises the real build_copula_transformer(cfg) codepath end to
      end and checks the same structural properties as test_model.py.
@@ -32,7 +32,7 @@ import torch
 from conftest import make_batch
 
 from model import build_copula_transformer, build_sigma, low_rank_correlation
-from train import _resolve_pit_ckpt
+from pit import resolve_pit_ckpt as _resolve_pit_ckpt
 
 _CONF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "conf")
 
