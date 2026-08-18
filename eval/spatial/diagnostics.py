@@ -40,6 +40,7 @@ __all__ = [
     "load_copula_model",
     "load_marginal_tabicl",
     "extract_model_dummy_context_correlation",
+    "compute_context_z_train",
     "extract_model_context_correlation",
     "extract_model_true_z_train_correlation",
     "sample_simple_kernel_covariance",
@@ -221,44 +222,55 @@ def extract_model_dummy_context_correlation(model, device, coords_test: np.ndarr
     return _forward_correlation(model, device, x_train_norm, z_train, x_test_norm)
 
 
+def compute_context_z_train(
+    x_train_norm: np.ndarray, context_values: np.ndarray, tabicl_marginal, device: str, k_folds: int = 10,
+) -> np.ndarray:
+    """K-fold leave-one-out PIT z_train for a real in-context sample
+    (`x_train_norm` already through `normalize_features`), under
+    `tabicl_marginal`'s own predicted marginal distribution (src/pit.py::run_pit):
+    u_i = F_hat(y_i), z_i = Phi^-1(u_i) — the real-data analogue of how
+    z_train is defined during training (data_gen.py's GP-oracle LOO PIT).
+    Falls back to naive standardization if `tabicl_marginal` is None.
+
+    Shared by extract_model_context_correlation (checkpoint-sweep diagnostics,
+    below) and src/train.py's era5_fit validation probe — both need this same
+    context-PIT step, split out from the model forward pass that follows it
+    so the training loop can freeze z_train once while re-running the forward
+    pass on the currently-training model every validate() call.
+    """
+    if tabicl_marginal is None:
+        y_mean = context_values.mean()
+        y_std = max(context_values.std(), 1e-8)
+        return (context_values - y_mean) / y_std
+
+    import torch
+
+    from pit import normalize_targets
+    from src.pit import run_pit
+
+    X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
+    context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
+    context_values_scaled_t, _, _, _ = normalize_targets(context_values_t)
+    Y_train_t = context_values_scaled_t.unsqueeze(-1)  # (P, 1)
+    pit_out = run_pit(
+        tabicl_marginal, X_train_t, Y_train_t, X_train_t[:1], Y_train_t[:1], k_folds=k_folds,
+    )
+    return pit_out["z_train"].squeeze(-1).cpu().numpy()  # (P,)
+
+
 def extract_model_context_correlation(
     model, device, tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
     coords_test: np.ndarray, k_folds: int = 10,
 ) -> np.ndarray:
     """Extract the model's correlation matrix via a single joint forward
     pass over all of `coords_test` at once, conditioned on a real historical
-    in-context sample (context_coords, context_values).
-
-    z_train is the K-fold leave-one-out PIT of each context point's true
-    value under `tabicl_marginal`'s own predicted marginal distribution
-    (src/pit.py::run_pit): u_i = F_hat(y_i), z_i = Phi^-1(u_i) — the real-data
-    analogue of how z_train is defined during training (data_gen.py's
-    GP-oracle LOO PIT). Falls back to naive standardization if
-    `tabicl_marginal` is None.
+    in-context sample (context_coords, context_values). See
+    compute_context_z_train for the z_train derivation.
     """
     from inference.copula_inference import normalize_features
-    from pit import normalize_targets
 
     x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
-
-    if tabicl_marginal is None:
-        y_mean = context_values.mean()
-        y_std = max(context_values.std(), 1e-8)
-        z_train = (context_values - y_mean) / y_std
-    else:
-        import torch
-
-        from src.pit import run_pit
-
-        X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
-        context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
-        context_values_scaled_t, _, _, _ = normalize_targets(context_values_t)
-        Y_train_t = context_values_scaled_t.unsqueeze(-1)  # (P, 1)
-        pit_out = run_pit(
-            tabicl_marginal, X_train_t, Y_train_t, X_train_t[:1], Y_train_t[:1], k_folds=k_folds,
-        )
-        z_train = pit_out["z_train"].squeeze(-1).cpu().numpy()  # (P,)
-
+    z_train = compute_context_z_train(x_train_norm, context_values, tabicl_marginal, device, k_folds)
     return _forward_correlation(model, device, x_train_norm, z_train, x_test_norm)
 
 
