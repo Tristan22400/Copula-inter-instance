@@ -24,7 +24,7 @@ Subcommands:
 
 Usage:
     python eval/runners/spatial_correlation_eval.py all
-    python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-60k
+    python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-15k
     python eval/runners/spatial_correlation_eval.py sweep --mode synthetic --checkpoints all
 """
 
@@ -457,18 +457,23 @@ def cmd_report(args) -> None:
 # all — the minimal-intervention entrypoint
 # ---------------------------------------------------------------------------
 def cmd_all(args) -> None:
+    checkpoints = args.checkpoints or "all"
+    baseline_synthetic_ckpt = (
+        [t.strip() for t in checkpoints.split(",") if t.strip()][-1]
+        if checkpoints != "all" else all_family_names()[-1]
+    )
     print("=== [all] 1/5: sweep --mode real ===")
-    _sweep("real", "low_context_7config", "all", constants.N_CONTEXT, constants.N_DAYS,
+    _sweep("real", "low_context_7config", checkpoints, constants.N_CONTEXT, constants.N_DAYS,
            constants.N_SYNTHETIC_DRAWS, args.device, constants.SEED)
     print("=== [all] 2/5: sweep --mode synthetic ===")
-    _sweep("synthetic", "low_context_7config", "all", constants.N_CONTEXT, constants.N_DAYS,
+    _sweep("synthetic", "low_context_7config", checkpoints, constants.N_CONTEXT, constants.N_DAYS,
            constants.N_SYNTHETIC_DRAWS, args.device, constants.SEED)
     print("=== [all] 3/5: baseline --mode real ===")
     _baseline("real", "low_context_7config", constants.CURVE_FIT_LAWS, constants.N_DAYS, None,
               args.device, constants.SEED)
     print("=== [all] 4/5: baseline --mode synthetic ===")
     _baseline("synthetic", "low_context_7config", constants.CURVE_FIT_LAWS, constants.N_DAYS,
-              all_family_names()[-1], args.device, constants.SEED)
+              baseline_synthetic_ckpt, args.device, constants.SEED)
     print("=== [all] 5/5: report ===")
     _report(None, None, None, None, None)
     print(f"=== [all] done. Figures in {_FIGURES_DIR} ===")
@@ -538,6 +543,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_all = sub.add_parser("all", help="sweep -> baseline -> report, real+synthetic, zero required flags.")
     p_all.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
+    p_all.add_argument("--checkpoints", type=str, default=None,
+                        help="'all' (default, every registered family) or a comma-separated list of "
+                             "family names / 'family:step' / raw .pt paths, same as `sweep --checkpoints`.")
     p_all.set_defaults(func=cmd_all)
 
     return parser
