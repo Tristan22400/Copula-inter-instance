@@ -585,7 +585,12 @@ def _build_tabicl_val_z(
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
     if step < warmup:
         return step / max(1, warmup)
-    progress = (step - warmup) / max(1, total - warmup)
+    # Clamp progress to [0, 1]: with schedule-preserving resume (see
+    # load_checkpoint/train), `step` can now start above 0 and, if a resumed
+    # run's `training.steps` is set lower than the step it resumes from,
+    # exceed `total` — without clamping, cos(pi * progress) would swing back
+    # upward past progress=1 instead of holding at the min-LR floor.
+    progress = min(1.0, (step - warmup) / max(1, total - warmup))
     return lr_min_frac + (1.0 - lr_min_frac) * 0.5 * (
         1.0 + math.cos(math.pi * progress)
     )
@@ -1037,15 +1042,14 @@ def load_checkpoint(
     device: str,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: GradScaler | None = None,
-) -> None:
+) -> int:
     """Restore model weights and optimizer/scaler state from a checkpoint.
 
-    The scheduler and step count are intentionally NOT restored: resuming
-    always restarts at step 0 with a fresh warmup/cosine schedule and the
-    full step budget of this run's config, rather than continuing the
-    previous run's schedule and step count. Optimizer moments (Adam/Muon)
-    and the AMP grad scaler state are restored so the run doesn't have to
-    relearn gradient statistics from scratch.
+    Optimizer moments (Adam/Muon) and the AMP grad scaler state are restored
+    so the run doesn't have to relearn gradient statistics from scratch.
+    Returns the step the checkpoint was saved at (0 for legacy checkpoints
+    without a "step" key), which the caller uses to decide where the LR
+    schedule resumes — see the `resume_reset_schedule` handling in train().
     """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")
@@ -1056,6 +1060,7 @@ def load_checkpoint(
         optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
+    return int(ckpt.get("step", 0))
 
 
 def _forward_and_loss(
@@ -1632,19 +1637,42 @@ def main(cfg: DictConfig) -> None:
         ]
     )
     lr_min_frac = t.muon_lr_min / t.muon_lr
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda s: cosine_lr_lambda(s, t.warmup_steps, t.steps, lr_min_frac),
-    )
 
     use_amp = device == "cuda"
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
 
+    # Resume weights + optimizer/scaler state first (if requested) so we know
+    # what step the LR schedule should continue from before building the
+    # scheduler below. Default: continue the cosine schedule from the
+    # checkpoint's step, instead of re-running warmup from a from-scratch
+    # peak LR on top of already-warmed-up Adam/Muon moments — the two
+    # combined were spiking effective step size right after resume.
+    # `resume_reset_schedule=true` opts back into the old behavior, for the
+    # deliberate "warm-start a new experiment from these weights" case where
+    # a fresh warmup/cosine schedule (not a continuation) is actually wanted.
     start_step = 0
     if resume_ckpt:
-        load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
-        print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — restarting schedule at step 0")
+        ckpt_step = load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
+        if bool(t.get("resume_reset_schedule", False)):
+            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} (step {ckpt_step}) — resetting to step 0 with a fresh warmup/cosine schedule (resume_reset_schedule=true)")
+        else:
+            start_step = ckpt_step
+            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — continuing cosine schedule from step {start_step}")
+
+    if start_step > 0:
+        # LambdaLR requires 'initial_lr' on each param group to resume at a
+        # non-zero last_epoch. Rebase it to this run's configured base LR
+        # (not whatever raw 'lr' the checkpoint's optimizer state restored,
+        # which is the previous run's already-decayed value) so the cosine
+        # curve below reflects this run's schedule at start_step.
+        for group in optimizer.param_groups:
+            group["initial_lr"] = t.muon_lr
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda s: cosine_lr_lambda(s, t.warmup_steps, t.steps, lr_min_frac),
+        last_epoch=start_step - 1 if start_step > 0 else -1,
+    )
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
