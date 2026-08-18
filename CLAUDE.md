@@ -17,7 +17,7 @@ Spatial-correlation diagnostics (real ERA5 + synthetic-kernel ground truth), one
   python eval/runners/spatial_correlation_eval.py all
 
   # Individual subcommands (see --help on each for full flag list):
-  python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-60k --mode real --region western_europe --grid-size 24
+  python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-15k --mode real --region western_europe --grid-size 24
   python eval/runners/spatial_correlation_eval.py sweep --mode synthetic --checkpoints all
   python eval/runners/spatial_correlation_eval.py baseline --mode real
   python eval/runners/spatial_correlation_eval.py report
