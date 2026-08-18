@@ -24,7 +24,7 @@ Subcommands:
 
 Usage:
     python eval/runners/spatial_correlation_eval.py all
-    python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-60k
+    python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-15k
     python eval/runners/spatial_correlation_eval.py sweep --mode synthetic --checkpoints all
 """
 
