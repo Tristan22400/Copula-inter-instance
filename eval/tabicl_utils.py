@@ -73,24 +73,16 @@ def tabicl_loo_pit(
     canonically-scaled TabICLRegressor interface instead of the low-level
     TabICL model class. For each fold, fits on the other folds and PIT-
     transforms the held-out fold's true y against the fitted quantile grid.
+    The fold-splitting/PIT recipe itself lives in
+    eval/metrics/joint_nll.py::kfold_loo_pit, shared with every other
+    marginal backend (see eval/spatial/marginal_backends.py::loo_pit).
 
     Returns:
         Z_train: (n_train,) — Gaussianized PIT residuals
     """
-    from eval.metrics.joint_nll import compute_pit
+    from eval.metrics.joint_nll import kfold_loo_pit
 
-    n = len(y_train)
-    k_folds = min(k_folds, n)
-    rng = np.random.default_rng(seed)
-    fold_id = rng.permutation(n) % k_folds
-
-    z = np.empty(n)
-    for k in range(k_folds):
-        held = fold_id == k
-        rest = ~held
-        if held.sum() == 0 or rest.sum() == 0:
-            continue
-        qgrid_held = tabicl_quantiles(regressor, X_train[rest], y_train[rest], X_train[held], probs)
-        z_held, _ = compute_pit(qgrid_held, probs, y_train[held], eps)
-        z[held] = z_held
-    return z
+    return kfold_loo_pit(
+        lambda Xc, yc, Xq, _fold: tabicl_quantiles(regressor, Xc, yc, Xq, probs),
+        X_train, y_train, probs, k_folds=k_folds, eps=eps, seed=seed,
+    )
