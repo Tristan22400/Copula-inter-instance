@@ -261,7 +261,7 @@ composite_num_kernels_lognormal_scale: 1.05
 # "polynomial" is excluded here for now (like periodic/cosine/dot_product):
 # new addition, not yet validated against tests/test_dataset_corr_uniform.py
 # in long chains — remove it from this list once validated.
-composite_exclude_kernels: [cosine]
+composite_exclude_kernels: [cosine,periodic,dot_product,polynomial]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
