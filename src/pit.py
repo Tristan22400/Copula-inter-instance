@@ -707,6 +707,27 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     return {"z_train": z_train, "z_test": z_test, "log_pdf_test": log_pdf_test}
 
 
+def mvn_nll(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> float:
+    """Full multivariate-normal negative log-likelihood of ``y`` under
+    ``N(mean, Sigma)``, in raw-y units, run in float64 for the Cholesky
+    solve (matches every other linear-algebra call site in this file).
+
+    For any jointly-Gaussian predictive (mean, Sigma) — e.g. a fitted GP's
+    own posterior/prior — this single formula already equals
+    marginal-NLL + copula-NLL (Sklar's decomposition collapses to one term
+    when the marginals are Gaussian), so callers with a Gaussian predictive
+    don't need to split it via PIT/z-scoring at all.
+    """
+    y, mean, Sigma = y.double(), mean.double(), Sigma.double()
+    L = _safe_cholesky(Sigma)
+    resid = (y - mean).unsqueeze(-1)
+    sol = torch.cholesky_solve(resid, L)
+    quad = (resid * sol).sum()
+    log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
+    n = y.shape[0]
+    return (0.5 * (n * math.log(2.0 * math.pi) + log_det + quad)).item()
+
+
 @torch.no_grad()
 def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     """Exact GP posterior correlation among test points, conditioned on the
@@ -836,18 +857,9 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     # assumption anywhere to violate.
     y_test = task["y_test"].to(ref_device).double()
 
-    def _mvn_nll(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> float:
-        L = _safe_cholesky(Sigma)
-        resid = (y - mean).unsqueeze(-1)
-        sol = torch.cholesky_solve(resid, L)
-        quad = (resid * sol).sum()
-        log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
-        n = y.shape[0]
-        return (0.5 * (n * math.log(2.0 * math.pi) + log_det + quad)).item()
-
     K_ss_sym = 0.5 * (K_ss + K_ss.T)
-    nll_prior = _mvn_nll(y_test, mean_test, K_ss_sym)
-    nll_post  = _mvn_nll(y_test, mu_post, Sigma_post)
+    nll_prior = mvn_nll(y_test, mean_test, K_ss_sym)
+    nll_post  = mvn_nll(y_test, mu_post, Sigma_post)
 
     return {
         "mu_post":    mu_post.float(),
