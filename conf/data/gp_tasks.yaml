@@ -258,29 +258,6 @@ composite_num_kernels_lognormal_scale: 1.05
 # exclude periodic chains entirely. Empty = sample from all of
 # data_gen._COMPOSABLE_KERNELS (rbf, matern12, matern32, matern52, cosine,
 # periodic, rational_quadratic, dot_product, polynomial).
-# dot_product/polynomial were excluded here 2026-08-13 (both have a
-# finite-dimensional feature map -- rank <= d_features, or a bit more for
-# polynomial's degree -- so their Gram matrix is structurally rank-deficient
-# whenever T=P+N exceeds that rank), because that near-singularity was
-# defeating _psd_safe_batch's jitter ceiling AND, worse, dot_product
-# specifically (gpytorch.kernels.LinearKernel evaluates to a
-# RootLinearOperator when x1==x2) was tripping gpytorch's own
-# LinearOperator.__add__ -> add_low_rank eager root-decomposition path
-# during composite-kernel evaluation itself -- for the WHOLE batch, before
-# _psd_safe_batch ever got a chance to isolate individual episodes,
-# discarding all B episodes and forcing a full resample (~0.5-3s paid again,
-# repeatedly). Root-caused and fixed 2026-08-14: _build_kernel_chain/
-# _sample_episode_kernel/build_kernel_fn now combine composite components via
-# _DenseComposedKernel (plain dense tensor +/*, bypassing gpytorch's
-# LinearOperator addition and its add_low_rank dispatch entirely), and
-# _psd_safe_batch/_batched_cholesky now gather only the actually-failing
-# episodes before calling psd_safe_cholesky instead of re-running it on the
-# whole batch every jitter-escalation round. Re-enabled with both fixes in
-# place; if data= step-time regresses again, check for a NEW gpytorch
-# LinearOperator type triggering add_low_rank before reflexively
-# re-excluding these. cosine/periodic remain excluded for an older, separate
-# reason (not yet validated against tests/test_dataset_corr_uniform.py in
-# long chains) unrelated to this rank-deficiency mechanism.
 composite_exclude_kernels: [cosine,periodic,dot_product,polynomial]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
