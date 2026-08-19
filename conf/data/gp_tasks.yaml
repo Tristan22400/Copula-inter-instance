@@ -281,7 +281,7 @@ composite_num_kernels_lognormal_scale: 1.05
 # re-excluding these. cosine/periodic remain excluded for an older, separate
 # reason (not yet validated against tests/test_dataset_corr_uniform.py in
 # long chains) unrelated to this rank-deficiency mechanism.
-composite_exclude_kernels: [cosine,periodic]
+composite_exclude_kernels: [cosine,periodic,dot_product,polynomial]
 
 # Extra hyperparameter priors (only used by the indicated kernels)
 period_lognormal_loc: 0.1823    # log(1.2) — periodic kernel's `period` parameter
