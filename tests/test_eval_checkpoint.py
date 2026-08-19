@@ -11,6 +11,7 @@ _FakeCopulaModel) rather than a real TabICL backbone.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -122,15 +123,21 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         assert torch.isfinite(torch.tensor(nlls[method])), f"{method} produced a non-finite NLL"
         _assert_valid_correlation(R_dict[method], n_test)
     for method in expected_y_keys:
-        assert torch.isfinite(torch.tensor(y_space_nlls[method])), \
-            f"{method} produced a non-finite total Y-space NLL"
+        parts = y_space_nlls[method]
+        assert set(parts.keys()) == {"total", "marginal", "copula"}
+        for part_name, val in parts.items():
+            assert torch.isfinite(torch.tensor(val)), \
+                f"{method}'s {part_name} Y-space NLL is non-finite"
+        # Sklar's theorem: total = marginal + copula exactly, by construction
+        # (see classical.py's _nll_parts / gp_oracle_y_nll), not just approximately.
+        assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
 def test_eval_icl_episode_scores_against_oracle(tiny_episode):
     n_test = tiny_episode["x_norm_test"].shape[0]
     fake_model = _FakeICLModel(n_test=n_test, rank=2)
 
-    nlls, R_dict, R_oracle, y_space_nlls, icl_total_nll = _eval_icl_episode(
+    nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
         ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"),
     )
 
@@ -141,7 +148,50 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode):
     assert torch.equal(R_oracle, tiny_episode["R_star"])
     # No tabicl_pit given (oracle z_train mode, the default) -> no learned
     # ICL marginal to score a total Y-space NLL against.
-    assert torch.isnan(torch.tensor(icl_total_nll))
+    assert set(icl_y_parts.keys()) == {"total", "marginal", "copula"}
+    for val in icl_y_parts.values():
+        assert torch.isnan(torch.tensor(val))
+    # gp_analytical_posterior's prior/posterior are always available for this
+    # (elementary-kernel) tiny episode -- both come back as a genuine
+    # total/marginal/copula split, exactly consistent by construction.
+    for key in ("prior", "posterior"):
+        parts = y_space_nlls[key]
+        assert set(parts.keys()) == {"total", "marginal", "copula"}
+        for val in parts.values():
+            assert torch.isfinite(torch.tensor(val))
+        assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
+
+
+def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode):
+    """With a (fake, standard-normal) tabicl_pit supplied -- standing in for
+    --z_train_source=tabicl's real TabICL marginal -- icl_y_parts should be
+    finite and internally consistent (total = marginal + copula), the same
+    contract as every fitted baseline's own y_space_nlls entry."""
+    n_train = tiny_episode["x_norm_train"].shape[0]
+    n_test = tiny_episode["x_norm_test"].shape[0]
+    fake_model = _FakeICLModel(n_test=n_test, rank=2)
+
+    z_test = torch.randn(n_test)
+    tabicl_pit = {
+        "z_train": torch.randn(n_train),
+        "z_test": z_test,
+        # Standard-normal log-density at z_test -- a made-up but valid
+        # "marginal" for this smoke test (matches what run_pit would return
+        # under a marginal that reproduces the standard normal exactly).
+        "log_pdf_test": -0.5 * (z_test ** 2 + math.log(2 * math.pi)),
+    }
+
+    _, _, _, _, icl_y_parts = _eval_icl_episode(
+        ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"),
+        tabicl_pit=tabicl_pit,
+    )
+
+    assert set(icl_y_parts.keys()) == {"total", "marginal", "copula"}
+    for val in icl_y_parts.values():
+        assert torch.isfinite(torch.tensor(val))
+    assert icl_y_parts["total"] == pytest.approx(
+        icl_y_parts["marginal"] + icl_y_parts["copula"], abs=1e-3,
+    )
 
 
 def test_gp_oracle_posterior_total_nll_bayes_optimal(tiny_episode):
