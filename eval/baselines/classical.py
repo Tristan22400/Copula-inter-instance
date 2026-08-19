@@ -75,7 +75,7 @@ _SRC = os.path.join(_REPO_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from loss import oracle_copula_nll  # noqa: E402
+from loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
 
 __all__ = [
@@ -367,11 +367,16 @@ def fit_and_eval_gpytorch(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts: int = 1,
-) -> Tensor:
+) -> dict[str, Tensor]:
     """Fit a GP (optionally over a learned feature extractor, i.e. DKL) on the
     raw y-space target by maximising the exact marginal log-likelihood, and
-    return the correlation matrix at X_test to compare against the episode's
-    oracle R_star.
+    return {"R": correlation matrix, "mean": predictive mean, "Sigma":
+    predictive covariance} at X_test — R to compare against the episode's
+    oracle R_star (copula-only NLL), mean/Sigma (both raw y-units, the GP's
+    own fitted marginal) to score this baseline's total (marginal+copula)
+    Y-space NLL via gp_oracle_y_nll, the same way the ICL model can be
+    scored once it has a real (non-oracle) marginal (see
+    eval_checkpoint.py's --z_train_source=tabicl / _tabicl_pit).
 
     Fits against y_train (not the PIT-transformed z_train) because z_train is
     itself derived from the true generating kernel's own Cholesky factor —
@@ -379,10 +384,11 @@ def fit_and_eval_gpytorch(
     kernel information a real baseline never has access to, and would fit
     against a variable already whitened to unit variance, at odds with the
     alpha2/nugget hyperpriors below (which mirror data_gen.py's own *y-space*
-    generative kernel-hyperparameter priors). The resulting covariance is
-    converted to a correlation matrix (sigma_to_correlation), which is
-    coordinate-free, so scoring against z_test downstream is unaffected by
-    y_train's absolute scale/mean.
+    generative kernel-hyperparameter priors). The correlation matrix
+    (sigma_to_correlation) is coordinate-free, so scoring it against z_test
+    downstream is unaffected by y_train's absolute scale/mean — but mean/
+    Sigma are returned in that same raw y-scale on purpose, since the total
+    Y-space NLL needs real units, not a coordinate-free quantity.
 
     oracle_mode must match how the episode's own R_star was built (see
     data_gen.py's oracle_mode branch):
@@ -581,6 +587,7 @@ def fit_and_eval_gpytorch(
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         pred = likelihood(model.forward(X_test)) if oracle_mode == "prior" else likelihood(model(X_test))
+        mean_post = pred.mean
         Sigma_post = pred.covariance_matrix
         N = X_test.shape[0]
         Sigma_post = 0.5 * (Sigma_post + Sigma_post.T) + jitter * torch.eye(
@@ -590,7 +597,7 @@ def fit_and_eval_gpytorch(
     from data_gen import sigma_to_correlation  # noqa: E402  (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
 
     R, _ = sigma_to_correlation(Sigma_post)
-    return R
+    return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
 
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
@@ -845,7 +852,7 @@ def eval_baselines_episode(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
-) -> tuple[dict[str, float], dict[str, Tensor]]:
+) -> tuple[dict[str, float], dict[str, Tensor], dict[str, float]]:
     """Evaluate every classical/fitted baseline (everything except the ICL
     model and the oracle) on one episode, under identical conventions.
 
@@ -856,18 +863,36 @@ def eval_baselines_episode(
     load_baseline_cache / save_baseline_cache below.
 
     Returns:
-        nlls      : {method_name: copula_nll_float}
-        R_dict    : {method_name: (N, N) correlation tensor} — for plotting
+        nlls        : {method_name: copula_nll_float} — z-space, common
+                       oracle-standardized z_test (see corr_nll_single).
+        R_dict      : {method_name: (N, N) correlation tensor} — for plotting
+        y_space_nlls: {method_name: total_y_space_nll_float} — raw y-units,
+                       each method's OWN fitted marginal (mean/Sigma for
+                       GP-MLE/DKL, empirical train mean/std for
+                       per_ep_transformer), via gp_oracle_y_nll — comparable
+                       across methods precisely because everyone supplies
+                       their own full predictive density scored at the same
+                       real y_test, unlike `nlls`' shared-marginal design.
+                       independence/gp_prior_rbf are unfit references, not
+                       included here (mirrors _NON_FITTED_EXCLUDED).
     """
     X_train = ep["x_norm_train"].to(device)      # (P, d_x)
     y_train = ep["y_train"].to(device)            # (P,)  raw target, used to fit the GP-MLE/DKL baselines
     z_train_self = _standardize_y(y_train)        # (P,) z-scored y_train, used to train per_ep_transformer
     X_test = ep["x_norm_test"].to(device)         # (N, d_x)
     z_test = ep["z_test"].to(device)              # (N,)
+    y_test = ep["y_test"].to(device)              # (N,)  raw target, for total Y-space NLL
 
     N = X_test.shape[0]
     nlls: dict[str, float] = {}
     R_dict: dict[str, Tensor] = {}
+    y_space_nlls: dict[str, float] = {}
+    test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
+
+    def _total_nll(mean: Tensor, Sigma: Tensor) -> float:
+        return gp_oracle_y_nll(
+            Sigma.unsqueeze(0), mean.unsqueeze(0), y_test.unsqueeze(0), test_mask,
+        )["total"].item()
 
     # --- independence ---
     R_I = torch.eye(N, dtype=X_train.dtype, device=device)
@@ -897,16 +922,18 @@ def eval_baselines_episode(
         for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
             label = _LABEL_MAP[(kname, ard)]
             try:
-                R_gp = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
+                fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                              n_steps=n_steps_mle, lr=lr_mle, ard=ard,
                                              oracle_mode=oracle_mode, prior_cfg=prior_cfg,
                                              n_restarts=n_restarts_mle)
-                nlls[label] = corr_nll_single(R_gp, z_test)
-                R_dict[label] = R_gp
+                nlls[label] = corr_nll_single(fit["R"], z_test)
+                R_dict[label] = fit["R"]
+                y_space_nlls[label] = _total_nll(fit["mean"], fit["Sigma"])
             except Exception as exc:
                 print(f"  [{label}] failed: {exc}")
                 nlls[label] = float("nan")
                 R_dict[label] = R_I.clone()
+                y_space_nlls[label] = float("nan")
 
     # --- Deep Kernel Learning (MLP + GP, jointly trained), across multiple kernels ---
     # "periodic" excluded: not PD in the fixed 16-dim latent space at any dimensionality.
@@ -921,21 +948,26 @@ def eval_baselines_episode(
         label = _DKL_LABEL_MAP[kname]
         try:
             mlp = DKLFeatureExtractor(X_train.shape[1], hidden=32, out_dim=16, dropout=0.0).to(device)
-            R_dkl = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
-                                          n_steps=n_steps_dkl, lr=lr_dkl,
-                                          ard=False, feature_extractor=mlp,
-                                          oracle_mode=oracle_mode, prior_cfg=prior_cfg)
-            nlls[label] = corr_nll_single(R_dkl, z_test)
-            R_dict[label] = R_dkl
+            fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
+                                        n_steps=n_steps_dkl, lr=lr_dkl,
+                                        ard=False, feature_extractor=mlp,
+                                        oracle_mode=oracle_mode, prior_cfg=prior_cfg)
+            nlls[label] = corr_nll_single(fit["R"], z_test)
+            R_dict[label] = fit["R"]
+            y_space_nlls[label] = _total_nll(fit["mean"], fit["Sigma"])
         except Exception as exc:
             print(f"  [{label}] failed: {exc}")
             nlls[label] = float("nan")
             R_dict[label] = R_I.clone()
+            y_space_nlls[label] = float("nan")
 
     # --- per-episode transformer ---
     # Trained/queried against z_train_self (z-scored from y_train), not the
     # oracle z_train — see _standardize_y's docstring. Scored against z_test
-    # (oracle) below, same as every other baseline.
+    # (oracle) below, same as every other baseline. Its total Y-space NLL
+    # reuses that same empirical-Gaussian marginal (train mean/std,
+    # _standardize_y's own convention) rather than the oracle's — a crude
+    # but genuine (non-oracle) marginal, unlike gp_prior_rbf/independence.
     try:
         per_ep_model = train_per_episode(
             X_train, z_train_self, r=icl_rank,
@@ -947,12 +979,18 @@ def eval_baselines_episode(
             Sigma_te = low_rank_correlation(W_te.unsqueeze(0), s_te.unsqueeze(0)).squeeze(0)
         nlls["per_ep_transformer"] = corr_nll_single(Sigma_te, z_test)
         R_dict["per_ep_transformer"] = Sigma_te
+        mean_tr = y_train.mean()
+        std_tr = y_train.std(unbiased=True).clamp(min=1e-6)
+        y_space_nlls["per_ep_transformer"] = _total_nll(
+            mean_tr.expand(N), (std_tr ** 2) * Sigma_te,
+        )
     except Exception as exc:
         print(f"  [per_ep_transformer] failed: {exc}")
         nlls["per_ep_transformer"] = float("nan")
         R_dict["per_ep_transformer"] = R_I.clone()
+        y_space_nlls["per_ep_transformer"] = float("nan")
 
-    return nlls, R_dict
+    return nlls, R_dict, y_space_nlls
 
 
 # ---------------------------------------------------------------------------
