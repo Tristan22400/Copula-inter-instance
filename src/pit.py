@@ -728,6 +728,27 @@ def mvn_nll(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> float:
     return (0.5 * (n * math.log(2.0 * math.pi) + log_det + quad)).item()
 
 
+def mvn_nll_parts(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> dict:
+    """Same quantity as mvn_nll, additionally split into its Sklar
+    marginal/copula components (raw-sum units, i.e. NOT divided by n — same
+    unnormalized convention as mvn_nll itself and as gp_analytical_posterior's
+    nll_prior/nll_post; contrast with loss.gp_oracle_y_nll, the batched,
+    per-point-normalized equivalent used for the GP-MLE/DKL baselines).
+
+    marginal is the sum of each dimension's own univariate Gaussian NLL
+    under (mean_i, Sigma_ii); copula is defined as total - marginal, which
+    is exact by construction (Sklar's theorem collapses to one term for a
+    jointly-Gaussian predictive — see mvn_nll's docstring), not a
+    separately-verified quantity.
+    """
+    total = mvn_nll(y, mean, Sigma)
+    y64, mean64 = y.double(), mean.double()
+    std = Sigma.double().diagonal().clamp(min=1e-12).sqrt()
+    z = (y64 - mean64) / std
+    marginal = (0.5 * math.log(2.0 * math.pi) + std.log() + 0.5 * z ** 2).sum().item()
+    return {"total": total, "marginal": marginal, "copula": total - marginal}
+
+
 @torch.no_grad()
 def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     """Exact GP posterior correlation among test points, conditioned on the
@@ -774,9 +795,11 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     nll_post (float, the total Y-space multivariate-normal NLL of y_test
     under the unconditioned prior N(mean_test, K_ss) vs. the conditioned
     posterior N(mu_post, Sigma_post) — see the comment above the
-    `_mvn_nll` calls below for why THESE two numbers, not
+    `mvn_nll_parts` calls below for why THESE two numbers, not
     corr_nll_single(R_post, z_test), are the correct prior-vs-posterior
-    comparison).
+    comparison), plus nll_prior_marginal/nll_prior_copula and
+    nll_post_marginal/nll_post_copula (float, mvn_nll_parts' Sklar split of
+    the two totals above, same raw-sum units).
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
     # x_norm_train/test are always .cpu()'d before being packed into an
@@ -858,8 +881,8 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     y_test = task["y_test"].to(ref_device).double()
 
     K_ss_sym = 0.5 * (K_ss + K_ss.T)
-    nll_prior = mvn_nll(y_test, mean_test, K_ss_sym)
-    nll_post  = mvn_nll(y_test, mu_post, Sigma_post)
+    prior_parts = mvn_nll_parts(y_test, mean_test, K_ss_sym)
+    post_parts  = mvn_nll_parts(y_test, mu_post, Sigma_post)
 
     return {
         "mu_post":    mu_post.float(),
@@ -867,6 +890,14 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
         "R_post":     R_post,
         "min_eig":    min_eig,
         "repaired":   repaired,
-        "nll_prior":  nll_prior,
-        "nll_post":   nll_post,
+        "nll_prior":  prior_parts["total"],
+        "nll_post":   post_parts["total"],
+        # Marginal/copula split of the two totals above (same raw-sum units,
+        # see mvn_nll_parts) — lets callers show the same per-episode
+        # breakdown for the oracle that eval_baselines_episode/_eval_icl_episode
+        # now expose for every fitted baseline and the ICL model.
+        "nll_prior_marginal": prior_parts["marginal"],
+        "nll_prior_copula":   prior_parts["copula"],
+        "nll_post_marginal":  post_parts["marginal"],
+        "nll_post_copula":    post_parts["copula"],
     }

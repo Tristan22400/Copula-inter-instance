@@ -125,13 +125,19 @@ def _load_full_config(config_path: str) -> OmegaConf:
 # ICL model + oracle evaluation (the cheap, per-checkpoint part)
 # ---------------------------------------------------------------------------
 
+# Shared all-nan {"total", "marginal", "copula"} placeholder — same shape as
+# eval_baselines_episode's y_space_nlls entries (classical.py's _NAN_PARTS),
+# duplicated here rather than imported since it's a plain literal, not
+# shared state.
+_NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
+
 
 def _eval_icl_episode(
     ep: dict,
     icl_model: nn.Module,
     device: torch.device,
     tabicl_pit: dict[str, Tensor] | None = None,
-) -> tuple[dict[str, float], dict[str, Tensor], Tensor, dict[str, float], float]:
+) -> tuple[dict[str, float], dict[str, Tensor], Tensor, dict[str, dict[str, float]], dict[str, float]]:
     """Evaluate just the ICL model + oracle lower bound on one episode — the
     cheap, per-checkpoint part of the comparison (no fitting/training loop),
     always recomputed even when the baseline results are served from cache.
@@ -150,14 +156,16 @@ def _eval_icl_episode(
     only possible in --z_train_source=tabicl mode, since the default oracle
     z_test IS the ground truth (nothing to score a "marginal" against).
 
-    Returns (nlls, R_dict, R_oracle, y_space_nlls, icl_total_nll) —
-    y_space_nlls is a separate {"prior": ..., "posterior": ...} dict (see
-    gp_analytical_posterior's docstring for why these two aren't folded
-    into `nlls` alongside icl/oracle/baselines: they're a full
-    multivariate-normal Y-space NLL, not the z-space copula-only NLL every
-    other entry in `nlls` is, so they're not in the same units/comparable
-    via the same table — nan values for both keys when unavailable).
-    icl_total_nll is nan whenever tabicl_pit is None (oracle z_train mode).
+    Returns (nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts) —
+    y_space_nlls is a separate {"prior": {"total","marginal","copula"},
+    "posterior": {...}} dict (see gp_analytical_posterior's docstring for
+    why these two aren't folded into `nlls` alongside icl/oracle/baselines:
+    they're a full multivariate-normal Y-space NLL, not the z-space
+    copula-only NLL every other entry in `nlls` is, so they're not in the
+    same units/comparable via the same table — all-nan dicts when
+    unavailable). icl_y_parts is {"total","marginal","copula"}, all-nan
+    whenever tabicl_pit is None (oracle z_train mode) — same per-episode
+    Sklar split now exposed for every baseline via eval_baselines_episode.
     """
     X_train = ep["x_norm_train"].to(device)   # (P, d_x)
     z_train = (
@@ -172,7 +180,7 @@ def _eval_icl_episode(
     nlls: dict[str, float] = {}
     R_dict: dict[str, Tensor] = {}
     R_I = torch.eye(N, dtype=X_train.dtype, device=device)
-    icl_total_nll = float("nan")
+    icl_y_parts = _NAN_PARTS.copy()
 
     try:
         train_mask = torch.ones(1, P, dtype=torch.bool, device=device)
@@ -195,12 +203,13 @@ def _eval_icl_episode(
         R_dict["icl"] = R_icl
         if tabicl_pit is not None:
             test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
-            icl_total_nll = y_space_nll(
+            icl_parts = y_space_nll(
                 Sigma_icl[:, :N, :N],
                 tabicl_pit["z_test"].to(device).unsqueeze(0),
                 tabicl_pit["log_pdf_test"].to(device).unsqueeze(0),
                 test_mask,
-            )["total"].item()
+            )
+            icl_y_parts = {k: v.item() for k, v in icl_parts.items()}
     except Exception as exc:
         print(f"  [icl] failed: {exc}")
         nlls["icl"] = float("nan")
@@ -221,18 +230,29 @@ def _eval_icl_episode(
     # is still stashed into R_dict purely for the correlation-grid plot (a
     # descriptive visual of what conditioning does to the correlation
     # structure), never scored against z_test.
-    y_space_nlls = {"prior": float("nan"), "posterior": float("nan")}
+    y_space_nlls = {"prior": _NAN_PARTS.copy(), "posterior": _NAN_PARTS.copy()}
     try:
         post = gp_analytical_posterior(ep)
         R_dict["oracle_posterior"] = post["R_post"].to(device)
-        y_space_nlls = {"prior": post["nll_prior"], "posterior": post["nll_post"]}
+        y_space_nlls = {
+            "prior": {
+                "total": post["nll_prior"],
+                "marginal": post["nll_prior_marginal"],
+                "copula": post["nll_prior_copula"],
+            },
+            "posterior": {
+                "total": post["nll_post"],
+                "marginal": post["nll_post_marginal"],
+                "copula": post["nll_post_copula"],
+            },
+        }
         if post["repaired"]:
             print(f"    [oracle_posterior] PSD repair fired (min_eig={post['min_eig']:.2e})")
     except (KeyError, NotImplementedError) as exc:
         R_dict["oracle_posterior"] = R_I.clone()
         print(f"  [oracle_posterior] unavailable: {exc}")
 
-    return nlls, R_dict, R_oracle, y_space_nlls, icl_total_nll
+    return nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts
 
 
 def _tabicl_pit(
@@ -548,7 +568,7 @@ def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "oracle
     print(f"{'─' * total}\n")
 
 
-def _print_y_space_oracle(y_space_nlls: list[dict[str, float]]) -> None:
+def _print_y_space_oracle(y_space_nlls: list[dict[str, dict[str, float]]]) -> None:
     """Total (marginal + copula) Y-space multivariate-normal GP oracle NLL,
     prior vs. posterior — see gp_analytical_posterior's docstring for why
     this is a SEPARATE table from _print_table's z-space copula-only NLL
@@ -563,9 +583,9 @@ def _print_y_space_oracle(y_space_nlls: list[dict[str, float]]) -> None:
     episode missing kernel metadata) contribute NaN to both columns and are
     excluded via nanmean/nanstd, same convention as _print_table.
     """
-    prior_vals = [d["prior"] for d in y_space_nlls]
-    post_vals  = [d["posterior"] for d in y_space_nlls]
-    n_valid = sum(1 for d in y_space_nlls if not np.isnan(d["posterior"]))
+    prior_vals = [d["prior"]["total"] for d in y_space_nlls]
+    post_vals  = [d["posterior"]["total"] for d in y_space_nlls]
+    n_valid = sum(1 for d in y_space_nlls if not np.isnan(d["posterior"]["total"]))
     print(f"GP oracle total NLL (Y-space, marginal+copula) — lower is better, "
           f"posterior <= prior is a Bayes-optimality guarantee here "
           f"[valid for {n_valid}/{len(y_space_nlls)} episodes]")
@@ -585,7 +605,9 @@ _TOTAL_NLL_ORDER = [
 ]
 
 
-def _print_total_nll_table(all_total_nlls: list[dict[str, float]], z_train_source: str) -> None:
+def _print_total_nll_table(
+    all_total_nlls: list[dict[str, dict[str, float]]], z_train_source: str,
+) -> None:
     """Total (marginal + copula) Y-space NLL, EVERY method's own fitted/
     estimated marginal, all divided by that episode's own N (per-point,
     nats/point) — the genuinely cross-method-comparable counterpart to
@@ -595,24 +617,40 @@ def _print_total_nll_table(all_total_nlls: list[dict[str, float]], z_train_sourc
     real y_test, is always a valid proper-scoring-rule comparison,
     regardless of how different the marginals are).
 
+    Each `all_total_nlls[i][method]` is a {"total", "marginal", "copula"}
+    dict (see eval_baselines_episode/_eval_icl_episode) — the Marginal/
+    Copula columns below are each method's OWN split, not comparable to
+    _print_table's shared-ground-truth-marginal copula NLL (see
+    eval_baselines_episode's docstring for why those are different
+    quantities that happen to share a name).
+
     icl's row is nan whenever z_train_source == "oracle" (--z_train_source
     default): the oracle z_test the ICL model would otherwise be scored
     against IS the ground truth, so there is no learned marginal to score a
     total NLL against — --z_train_source=tabicl is required to populate it.
 
     oracle_prior/oracle_posterior here are gp_analytical_posterior's own
-    nll_prior/nll_post, divided by N for this table only — the existing
-    _print_y_space_oracle table's own numbers are NOT changed by this
-    (kept unnormalized there for backward compatibility with any previously
-    tracked output).
+    nll_prior/nll_post (and their marginal/copula split), divided by N for
+    this table only — the existing _print_y_space_oracle table's own
+    numbers are NOT changed by this (kept unnormalized there for backward
+    compatibility with any previously tracked output).
     """
-    means = {k: float(np.nanmean([m.get(k, float("nan")) for m in all_total_nlls]))
-             for k, _ in _TOTAL_NLL_ORDER}
-    stds  = {k: float(np.nanstd( [m.get(k, float("nan")) for m in all_total_nlls]))
-             for k, _ in _TOTAL_NLL_ORDER}
+    def _col(part: str) -> dict[str, float]:
+        return {
+            k: float(np.nanmean([m.get(k, _NAN_PARTS).get(part, float("nan")) for m in all_total_nlls]))
+            for k, _ in _TOTAL_NLL_ORDER
+        }
+
+    means_total = _col("total")
+    stds_total = {
+        k: float(np.nanstd([m.get(k, _NAN_PARTS).get("total", float("nan")) for m in all_total_nlls]))
+        for k, _ in _TOTAL_NLL_ORDER
+    }
+    means_marginal = _col("marginal")
+    means_copula = _col("copula")
 
     col = max(22, max(len(label) for _, label in _TOTAL_NLL_ORDER) + 2)
-    total = col + 2 * 12
+    total = col + 4 * 12
     print(f"\n{'─' * total}")
     print(f"Total NLL (Y-space, marginal+copula, own marginal per method) — "
           f"lower is better  [N={len(all_total_nlls)} episodes]")
@@ -620,12 +658,13 @@ def _print_total_nll_table(all_total_nlls: list[dict[str, float]], z_train_sourc
           + ("  (icl row n/a — oracle mode has no learned ICL marginal to score)"
              if z_train_source == "oracle" else "  (TabICL K-fold PIT estimate)"))
     print(f"{'─' * total}")
-    print(f"{'Method':<{col}}{'Mean NLL':>12}{'Std NLL':>12}")
-    print(f"{'─' * col}{'─' * 12}{'─' * 12}")
+    print(f"{'Method':<{col}}{'Mean Total':>12}{'Std Total':>12}{'Mean Marg.':>12}{'Mean Cop.':>12}")
+    print(f"{'─' * col}{'─' * 12}{'─' * 12}{'─' * 12}{'─' * 12}")
     for key, label in _TOTAL_NLL_ORDER:
-        m, s = means.get(key, float("nan")), stds.get(key, float("nan"))
+        m, s = means_total.get(key, float("nan")), stds_total.get(key, float("nan"))
+        mm, mc = means_marginal.get(key, float("nan")), means_copula.get(key, float("nan"))
         marker = "  ← our model" if key == "icl" else ""
-        print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{marker}")
+        print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{mm:>12.4f}{mc:>12.4f}{marker}")
     print(f"{'─' * total}\n")
 
 
@@ -839,8 +878,8 @@ def main() -> None:
 
     n_ep = args.n_episodes
     all_nlls: list[dict[str, float]] = []
-    all_y_space_nlls: list[dict[str, float]] = []
-    all_total_nlls: list[dict[str, float]] = []
+    all_y_space_nlls: list[dict[str, dict[str, float]]] = []
+    all_total_nlls: list[dict[str, dict[str, float]]] = []
     plot_R_dict: dict[str, Tensor] | None = None
     plot_R_oracle: Tensor | None = None
     plot_best_key: str | None = None
@@ -923,6 +962,15 @@ def main() -> None:
             # as nan for this episode.
             print(f"  [ep {ep_i}] cached entry predates total-NLL tracking — refitting")
             cached = None
+        if cached is not None and any(
+            not isinstance(v, dict) for v in cached["y_nlls"].values()
+        ):
+            # Same episode/fingerprint, but this entry predates the
+            # marginal/copula split of y_nlls (each value used to be a bare
+            # total float) — refit rather than crashing on `own["copula"]`
+            # in the per-episode top-5 print below.
+            print(f"  [ep {ep_i}] cached y_nlls predates marginal/copula split — refitting")
+            cached = None
         if cached is not None:
             baseline_nlls   = cached["nlls"]
             baseline_R      = {k: v.to(device) for k, v in cached["R_dict"].items()}
@@ -959,17 +1007,22 @@ def main() -> None:
                 print(f"  [ep {ep_i}] fewer than 2 training points — "
                       "falling back to oracle z_train for this episode")
 
-        icl_nlls, icl_R, R_oracle, y_space_nlls, icl_total_nll = _eval_icl_episode(
+        icl_nlls, icl_R, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
             ep=ep, icl_model=icl_model, device=device, tabicl_pit=tabicl_pit,
         )
         all_y_space_nlls.append(y_space_nlls)
 
         n_test = ep["z_test"].shape[0]
+        # oracle_prior/oracle_posterior: gp_analytical_posterior's raw-sum
+        # {"total","marginal","copula"} dicts, divided by n_test here to put
+        # them on the same per-point footing as every other row (baseline_y_nlls
+        # and icl_y_parts are already per-point via gp_oracle_y_nll/y_space_nll)
+        # — this table only, _print_y_space_oracle's own numbers stay raw.
         total_nlls = {
             **baseline_y_nlls,
-            "icl": icl_total_nll,
-            "oracle_prior": y_space_nlls["prior"] / n_test,
-            "oracle_posterior": y_space_nlls["posterior"] / n_test,
+            "icl": icl_y_parts,
+            "oracle_prior": {k: v / n_test for k, v in y_space_nlls["prior"].items()},
+            "oracle_posterior": {k: v / n_test for k, v in y_space_nlls["posterior"].items()},
         }
         all_total_nlls.append(total_nlls)
 
@@ -1008,11 +1061,18 @@ def main() -> None:
 
         print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
         print(f"    icl={icl_nll:.4f}  oracle(prior, z-space copula)={ora_nll:.4f}  "
-              f"GP-oracle-y-space(prior={y_space_nlls['prior']:.4f}, "
-              f"posterior={y_space_nlls['posterior']:.4f})")
-        print(f"    total Y-space NLL (own marginal): icl={total_nlls['icl']:.4f}  "
-              f"oracle_prior={total_nlls['oracle_prior']:.4f}  "
-              f"oracle_posterior={total_nlls['oracle_posterior']:.4f}")
+              f"GP-oracle-y-space(prior={y_space_nlls['prior']['total']:.4f}, "
+              f"posterior={y_space_nlls['posterior']['total']:.4f})")
+        print(f"    total Y-space NLL, own marginal (total = marginal + copula): "
+              f"icl=(cop={total_nlls['icl']['copula']:.4f}, "
+              f"marg={total_nlls['icl']['marginal']:.4f}, "
+              f"tot={total_nlls['icl']['total']:.4f})  "
+              f"oracle_prior=(cop={total_nlls['oracle_prior']['copula']:.4f}, "
+              f"marg={total_nlls['oracle_prior']['marginal']:.4f}, "
+              f"tot={total_nlls['oracle_prior']['total']:.4f})  "
+              f"oracle_posterior=(cop={total_nlls['oracle_posterior']['copula']:.4f}, "
+              f"marg={total_nlls['oracle_posterior']['marginal']:.4f}, "
+              f"tot={total_nlls['oracle_posterior']['total']:.4f})")
         if fold_details:
             fold_summary = ", ".join(
                 f"fold{fd['fold']}={_METHOD_LABELS.get(fd['selected'], fd['selected'])}"
@@ -1023,10 +1083,17 @@ def main() -> None:
             print(f"      per-fold picks: {fold_summary}")
         else:
             print("    best_baseline: unavailable (too few test points for nested CV)")
-        print("    top-5 baselines (lowest NLL on full test set, diagnostic only — "
-              "not the selection used for best_baseline above):")
+        print("    top-5 baselines (ranked by shared-ground-truth-marginal copula "
+              "NLL, diagnostic only — not the selection used for best_baseline "
+              "above; 'own' columns are this baseline's OWN fitted marginal, "
+              "NOT the same copula quantity as the ranking column — see "
+              "eval_baselines_episode's docstring):")
         for key, val in top5:
-            print(f"      {_METHOD_LABELS.get(key, key):<28}{val:.4f}")
+            own = total_nlls.get(key, _NAN_PARTS)
+            print(f"      {_METHOD_LABELS.get(key, key):<28}"
+                  f"shared_copula={val:.4f}  "
+                  f"own(cop={own['copula']:.4f}, marg={own['marginal']:.4f}, "
+                  f"tot={own['total']:.4f})")
 
     if use_cache and cache_dirty:
         save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
