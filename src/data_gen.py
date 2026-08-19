@@ -2318,6 +2318,276 @@ def _sample_structural_ops(category_weights: Dict[str, float], num_ops_min: int,
     return ops
 
 
+def _sample_structural_category_mask(
+    M: int, category_weights: Dict[str, float], num_ops_min: int, num_ops_max: int, device,
+) -> Tuple[Tensor, List[str]]:
+    """Batched equivalent of _sample_structural_ops's category-selection step
+    for M independent draws at once: for each of the M rows, choose a random
+    NUMBER of categories k in [num_ops_min, num_ops_max] (capped to the
+    number of eligible -- nonzero-weight -- categories), then choose k
+    categories from those eligible WITHOUT replacement, weighted by
+    category_weights. Sub-op-within-category selection (for categories with
+    >1 op) is handled separately by the caller, since it only needs to run
+    over the (typically much smaller) subset of rows that picked that
+    specific category.
+
+    Implemented via the Gumbel-top-k trick (argsort of log-weight + i.i.d.
+    Gumbel noise): this produces exactly a Plackett-Luce random ranking of
+    the eligible categories per row -- the same sequential
+    sample-then-renormalize distribution torch.multinomial(weights, k,
+    replacement=False) draws from -- so taking the first k of that ranking
+    per row is distributionally identical to _sample_structural_ops's
+    original per-column torch.multinomial call, just computed for all M rows
+    in one vectorised pass instead of a Python loop over M columns.
+
+    Returns (chosen_mask, eligible): chosen_mask is (M, len(eligible)) bool
+    (chosen_mask[m, i] = True iff row m selected eligible[i]); eligible is
+    the same zero-weight-excluded category list _sample_structural_ops uses
+    (fixed for the whole call, since category_weights doesn't vary per row).
+    """
+    eligible = [c for c in _STRUCTURAL_CATEGORIES if category_weights.get(c, 0.0) > 0.0]
+    n_elig = len(eligible)
+    if n_elig == 0:
+        return torch.zeros(M, 0, dtype=torch.bool, device=device), eligible
+
+    weights = torch.tensor([category_weights[c] for c in eligible], dtype=torch.float32, device=device)
+    log_w = torch.log(weights / weights.sum())
+    u = torch.rand(M, n_elig, device=device).clamp_min(1e-12)
+    gumbel = -torch.log((-torch.log(u)).clamp_min(1e-12))
+    scores = log_w.unsqueeze(0) + gumbel
+    # rank[m, i] = position of category i in row m's Gumbel-perturbed order
+    # (0 = first/most-preferred draw for that row).
+    rank = torch.argsort(torch.argsort(scores, dim=1, descending=True), dim=1)
+
+    k = torch.randint(num_ops_min, num_ops_max + 1, (M,), device=device)
+    k = torch.clamp(k, max=n_elig)
+    chosen_mask = rank < k.unsqueeze(1)
+    return chosen_mask, eligible
+
+
+def _structural_warp_batch(col_data: Tensor, op: str, use_index_axis: Tensor) -> Tensor:
+    """Batched equivalent of _structural_warp_column: applies `op` to every
+    row of col_data (M, T) independently and simultaneously (each row is one
+    gated (episode, feature-column) pair's T-length pseudo-series), matching
+    _structural_warp_column's per-row math and edge-case handling exactly,
+    just without a Python loop over M. use_index_axis: (M,) bool, one choice
+    per row (mirrors _structural_warp_column's own flag, chosen once per
+    gated column upstream in apply_structural_feature_warp).
+
+    "resample_artifact" is the one op NOT vectorised here: its numpy
+    interp/searchsorted path has a genuinely variable-length downsample index
+    per row (the factor/offset that determine ds_idx are themselves random
+    per row), which doesn't reduce to a clean batched form the way the other
+    ops' fixed-size (M, T) tensor ops do. It falls back to a bounded loop
+    over the M rows selecting this category, reusing _structural_warp_column
+    (the original, already-tested single-column implementation) unchanged
+    rather than risking a fresh reimplementation of that numpy path.
+    """
+    M, T = col_data.shape
+    device = col_data.device
+
+    if op == "resample_artifact":
+        out = torch.empty_like(col_data)
+        for i in range(M):
+            out[i] = _structural_warp_column(col_data[i], op, use_index_axis=bool(use_index_axis[i]))
+        return out
+
+    std = col_data.std(dim=1)
+    std = torch.where(torch.isfinite(std) & (std > 0), std, torch.ones_like(std))
+
+    if op == "yflip":
+        return -col_data
+
+    if op == "censor":
+        q = torch.rand(M, 2, device=device)
+        q_low = q.min(dim=1).values
+        q_high = q.max(dim=1).values
+        sorted_vals, _ = torch.sort(col_data, dim=1)
+        lo_idx = (q_low * (T - 1)).long().clamp(0, T - 1)
+        hi_idx = (q_high * (T - 1)).long().clamp(0, T - 1)
+        lo = torch.gather(sorted_vals, 1, lo_idx.unsqueeze(1)).squeeze(1)
+        hi = torch.gather(sorted_vals, 1, hi_idx.unsqueeze(1)).squeeze(1)
+        # See _structural_warp_column's "censor" branch: q_low/q_high can
+        # round to the same discrete index for small T, which would silently
+        # flatten the whole column via clamp(min=lo, max=hi) with lo==hi.
+        # +-inf bounds make the clamp a genuine no-op for those rows instead.
+        degenerate = ~torch.isfinite(hi - lo) | ((hi - lo) <= 0)
+        lo_eff = torch.where(degenerate, torch.full_like(lo, float("-inf")), lo)
+        hi_eff = torch.where(degenerate, torch.full_like(hi, float("inf")), hi)
+        return torch.clamp(col_data, min=lo_eff.unsqueeze(1), max=hi_eff.unsqueeze(1))
+
+    if op == "quantize":
+        lo = col_data.min(dim=1).values
+        hi = col_data.max(dim=1).values
+        degenerate = ~torch.isfinite(hi - lo) | ((hi - lo) <= 0)
+        max_interior = 8  # n_levels in [3,10] -> n_interior in [1,8]
+        n_levels = torch.randint(3, 11, (M,), device=device)
+        n_interior = (n_levels - 2).clamp(min=0)
+        interior_raw = torch.rand(M, max_interior, device=device)
+        interior = lo.unsqueeze(1) + (hi - lo).unsqueeze(1) * interior_raw
+        slot_idx = torch.arange(max_interior, device=device).unsqueeze(0)
+        interior_mask = slot_idx < n_interior.unsqueeze(1)
+        # Padding slots beyond this row's n_interior are set to +inf so they
+        # never win the nearest-level argmin below (real values are finite).
+        interior = torch.where(interior_mask, interior, torch.full_like(interior, float("inf")))
+        levels = torch.cat([lo.unsqueeze(1), hi.unsqueeze(1), interior], dim=1)
+        levels, _ = torch.sort(levels, dim=1)
+        diff = (col_data.unsqueeze(2) - levels.unsqueeze(1)).abs()
+        idx = diff.argmin(dim=2)
+        quantized = torch.gather(levels, 1, idx)
+        return torch.where(degenerate.unsqueeze(1), col_data, quantized)
+
+    # Remaining ops act on a pseudo-time axis: value-rank (default) or, if
+    # use_index_axis, the raw row position -- see _structural_warp_column's
+    # docstring. sort_idx/sorted_vals/rank mirror that function's per-row
+    # construction, batched across all M rows.
+    argsort_idx = torch.argsort(col_data, dim=1)
+    index_idx = torch.arange(T, device=device).unsqueeze(0).expand(M, T)
+    sort_idx = torch.where(use_index_axis.unsqueeze(1), index_idx, argsort_idx)
+    sorted_vals = torch.gather(col_data, 1, sort_idx)
+    rank = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(0).expand(M, T)
+
+    if op == "time_flip":
+        transformed = sorted_vals.flip(dims=[1])
+
+    elif op == "regime_change":
+        min_seg = max(4, T // 16)
+        valid_hi = T - min_seg
+        if valid_hi <= min_seg:
+            transformed = sorted_vals
+        else:
+            # min_seg/valid_hi/valid are scalars (T is shared by every row in
+            # this batch), so the only per-row randomness is WHICH num_cp
+            # changepoints from the shared candidate range `valid` each row
+            # draws -- a random permutation of `valid`'s indices per row
+            # (argsort of iid random keys), taking the first (up to) 3.
+            valid = torch.arange(min_seg, valid_hi, device=device)
+            n_valid = valid.numel()
+            max_cp = 3
+            num_cp = torch.randint(1, 4, (M,), device=device).clamp(max=n_valid)
+            keys = torch.rand(M, n_valid, device=device)
+            take = min(max_cp, n_valid)
+            order = torch.argsort(keys, dim=1)[:, :take]  # (M, take)
+            if take < max_cp:
+                # n_valid < max_cp (small-T edge case): pad with an arbitrary
+                # in-bounds index (0) -- these extra slots always end up
+                # masked out below since num_cp <= n_valid = take in this
+                # branch, so slot positions >= take are always >= num_cp too.
+                pad = torch.zeros(M, max_cp - take, dtype=order.dtype, device=device)
+                order = torch.cat([order, pad], dim=1)
+            chosen_pos = valid[order]  # (M, max_cp)
+            slot_idx = torch.arange(max_cp, device=device).unsqueeze(0)
+            valid_mask = slot_idx < num_cp.unsqueeze(1)
+            # Slots beyond this row's num_cp are padded with T -- sorts to
+            # the tail (real cp values are all < valid_hi < T) and produces
+            # an empty (no-op) trailing segment in the loop below, exactly
+            # equivalent to the original's shorter per-row boundaries list.
+            chosen_pos = torch.where(valid_mask, chosen_pos, torch.full_like(chosen_pos, T))
+            cp_sorted, _ = torch.sort(chosen_pos, dim=1)
+            boundaries = torch.cat(
+                [
+                    torch.zeros(M, 1, dtype=cp_sorted.dtype, device=device),
+                    cp_sorted,
+                    torch.full((M, 1), T, dtype=cp_sorted.dtype, device=device),
+                ],
+                dim=1,
+            )
+            pos = torch.arange(T, device=device).unsqueeze(0)
+            transformed = sorted_vals.clone()
+            for i in range(boundaries.shape[1] - 1):
+                s = boundaries[:, i].unsqueeze(1)
+                e = boundaries[:, i + 1].unsqueeze(1)
+                in_seg = (pos >= s) & (pos < e)
+                seg_count = in_seg.sum(dim=1).clamp(min=1)
+                seg_mean = (sorted_vals * in_seg).sum(dim=1) / seg_count
+                scale = torch.empty(M, device=device).uniform_(0.8, 1.25)
+                shift = torch.randn(M, device=device) * 0.15 * std
+                new_vals = (
+                    (sorted_vals - seg_mean.unsqueeze(1)) * scale.unsqueeze(1)
+                    + seg_mean.unsqueeze(1)
+                    + shift.unsqueeze(1)
+                )
+                transformed = torch.where(in_seg, new_vals, transformed)
+
+    elif op == "shock_recovery":
+        lo_t = max(1, T // 16)
+        hi_t = max(lo_t + 1, T - T // 16)
+        t0 = torch.randint(lo_t, hi_t, (M,), device=device).float()
+        mag_abs = torch.empty(M, device=device).uniform_(0.5, 2.0) * std
+        sign = torch.where(torch.rand(M, device=device) < 0.5, -1.0, 1.0)
+        mag = mag_abs * sign
+        half_life = torch.empty(M, device=device).uniform_(0.05, 0.3) * T
+        half_life = half_life.clamp(min=1.0)
+        decay = torch.exp(-(rank - t0.unsqueeze(1)).clamp(min=0) / half_life.unsqueeze(1))
+        transformed = sorted_vals + mag.unsqueeze(1) * decay
+
+    elif op == "amplitude_modulation":
+        min_w = max(4, T // 16)
+        max_w = max(min_w + 1, T // 2)
+        win = torch.randint(min_w, max_w + 1, (M,), device=device)
+        span = torch.clamp(T - win, min=1)  # mirrors max(1, T - win)
+        start = (torch.rand(M, device=device) * (span + 1).float()).floor().long().clamp(max=span)
+        end = (start + win).clamp(max=T)
+        pos = torch.arange(T, device=device).unsqueeze(0)
+        in_seg = (pos >= start.unsqueeze(1)) & (pos < end.unsqueeze(1))
+        seg_count = in_seg.sum(dim=1).clamp(min=1)
+        seg_mean = (sorted_vals * in_seg).sum(dim=1) / seg_count
+        amp = torch.empty(M, device=device).uniform_(0.5, 1.8)
+        new_vals = (sorted_vals - seg_mean.unsqueeze(1)) * amp.unsqueeze(1) + seg_mean.unsqueeze(1)
+        transformed = torch.where(in_seg, new_vals, sorted_vals)
+
+    elif op == "differential":
+        # Box-average and the two 3-tap derivative kernels are all fixed,
+        # tiny (in_channels=out_channels=1) filters -- torch.conv1d hits a
+        # surprisingly slow path for that shape on this GPU (~77ms/call,
+        # profiled: 24 conv1d calls dominating 1.86s of a 2.3s run), so all
+        # 3 are computed via direct slicing/cumsum instead. Mathematically
+        # identical to the conv1d formulation (conv1d is cross-correlation,
+        # not flipped convolution, so e.g. sk1=[-1,0,1] against a VALID
+        # window starting at t is -p[t]+p[t+2] = p[t+2]-p[t]; box-average is
+        # a k-wide windowed sum via a padded cumsum difference) -- just
+        # without the conv1d dispatch overhead.
+        k = max(3, T // 32)
+        k = k + 1 if k % 2 == 0 else k
+        pad_k = k // 2
+        padded = torch.nn.functional.pad(sorted_vals.unsqueeze(1), (pad_k, pad_k), mode="reflect").squeeze(1)
+        csum = torch.nn.functional.pad(padded.cumsum(dim=1), (1, 0))  # csum[:,0] = 0
+        smoothed = (csum[:, k:] - csum[:, :-k]) / k  # k-wide windowed mean, (M, T)
+
+        # All 4 sub-op candidates are computed for the whole batch (the
+        # smoothing/derivative windows are shared across rows since k
+        # depends only on T), then gathered per-row by the random sub_op
+        # choice -- cheaper and far simpler than masking/grouping rows by
+        # sub-op for 4 small per-row computations.
+        p1 = torch.nn.functional.pad(smoothed.unsqueeze(1), (1, 1), mode="reflect").squeeze(1)  # (M, T+2)
+        raw_d1 = p1[:, 2:] - p1[:, :-2]
+        raw_d2 = p1[:, :-2] - 2 * p1[:, 1:-1] + p1[:, 2:]
+        int_fwd = torch.cumsum(smoothed, dim=1)
+        int_bwd = torch.flip(torch.cumsum(torch.flip(smoothed, dims=[1]), dim=1), dims=[1])
+        int_dir = torch.rand(M, 1, device=device) < 0.5
+        raw_int = torch.where(int_dir, int_fwd, int_bwd)
+
+        candidates = torch.stack([smoothed, raw_d1, raw_d2, raw_int], dim=1)  # (M, 4, T)
+        sub_op = torch.randint(0, 4, (M,), device=device)
+        raw = torch.gather(candidates, 1, sub_op.view(M, 1, 1).expand(-1, 1, T)).squeeze(1)
+
+        r_min = raw.min(dim=1).values
+        r_max = raw.max(dim=1).values
+        s_min = sorted_vals.min(dim=1).values
+        s_max = sorted_vals.max(dim=1).values
+        degenerate = ~torch.isfinite(r_max - r_min) | ((r_max - r_min) <= 1e-8)
+        denom = torch.where(degenerate, torch.ones_like(r_max), r_max - r_min)
+        rescaled = (raw - r_min.unsqueeze(1)) / denom.unsqueeze(1) * (s_max - s_min).unsqueeze(1) + s_min.unsqueeze(1)
+        transformed = torch.where(degenerate.unsqueeze(1), sorted_vals, rescaled)
+
+    else:
+        raise ValueError(f"Unknown structural warp op '{op}'")
+
+    warped = torch.empty_like(col_data)
+    warped.scatter_(1, sort_idx, transformed)
+    return warped
+
+
 def apply_structural_feature_warp(x: Tensor, cfg, device) -> Tensor:
     """Optionally apply TempoPFN-inspired transforms — invariances (yflip/
     time_flip), regime changes/shock-recovery, amplitude modulation,
@@ -2336,8 +2606,17 @@ def apply_structural_feature_warp(x: Tensor, cfg, device) -> Tensor:
     chosen category is drawn, categories chosen WITHOUT replacement
     (structural_warp_num_ops_min/max out of the 6 categories, weighted by
     structural_warp_category_weights) and applied in the fixed category
-    order — see _sample_structural_ops, mirroring TempoPFN's own num_ops =
-    randint(2,6) category composition exactly.
+    order — mirroring TempoPFN's own num_ops = randint(2,6) category
+    composition exactly, same as _sample_structural_ops/_structural_warp_column
+    (kept as the reference single-column implementation, still directly used
+    by tests and by this function's resample_artifact fallback), just
+    computed batched across every gated (episode, column) pair at once
+    instead of a Python loop over each one -- see
+    _sample_structural_category_mask/_structural_warp_batch. The batched and
+    per-column implementations draw from the RNG in a different order/count,
+    so outputs at a fixed seed differ between them, but both realize the
+    exact same per-row distributions (gate rate, category-selection law,
+    sub-op weights, per-op parameter distributions).
 
     Pseudo-time axis: every order-dependent op in the composition for a given
     column uses value-rank by default (decoupled from the train/test split),
@@ -2377,16 +2656,66 @@ def apply_structural_feature_warp(x: Tensor, cfg, device) -> Tensor:
     index_axis_ratio = float(getattr(cfg.data, "structural_warp_index_axis_ratio", 0.0))
 
     B, T, d = x.shape
-    warped_x = x.clone()
-    for b in range(B):
-        for col in range(d):
-            if torch.rand(1).item() >= prob:
-                continue
-            use_index_axis = index_axis_enabled and torch.rand(1).item() < index_axis_ratio
-            col_data = warped_x[b, :, col]
-            for op in _sample_structural_ops(category_weights, num_ops_min, num_ops_max):
-                col_data = _structural_warp_column(col_data, op, use_index_axis=use_index_axis)
-            warped_x[b, :, col] = col_data
+    dev = x.device
+
+    # Per-(episode, column) Bernoulli(prob) gate, batched in one draw instead
+    # of B*d individual torch.rand(1).item() calls (the dominant cost this
+    # function used to pay -- see the profiling that motivated this rewrite).
+    gate = torch.rand(B, d, device=dev) < prob
+    gated_idx = gate.reshape(-1).nonzero(as_tuple=True)[0]
+    if gated_idx.numel() == 0:
+        return x.clone()  # matches the original's unconditional x.clone() up front
+
+    if index_axis_enabled:
+        axis_gate = torch.rand(B, d, device=dev) < index_axis_ratio
+    else:
+        axis_gate = torch.zeros(B, d, dtype=torch.bool, device=dev)
+
+    # (B, T, d) -> (B*d, T): row r = b*d + col holds column (b, col)'s
+    # T-length pseudo-series, matching gate.reshape(-1)'s (b, col) -> b*d+col
+    # flattening. .reshape (not .view) since the permute makes this
+    # non-contiguous; .clone() makes `flat` independent of `x`'s storage so
+    # mutating it below can never alias the input.
+    flat = x.permute(0, 2, 1).reshape(B * d, T).clone()
+    gated_cols = flat[gated_idx]
+    use_index_axis = axis_gate.reshape(-1)[gated_idx]
+
+    M = gated_idx.numel()
+    chosen_mask, eligible = _sample_structural_category_mask(
+        M, category_weights, num_ops_min, num_ops_max, dev
+    )
+
+    # Fixed, small (<=6) loop over categories -- not over the (up to B*d)
+    # gated columns -- applying each category's op(s) batched across
+    # whichever subset of the M gated columns selected it this call.
+    for category in _STRUCTURAL_CATEGORIES:
+        if category not in eligible:
+            continue
+        cat_col = eligible.index(category)
+        cat_mask = chosen_mask[:, cat_col]
+        if not bool(cat_mask.any()):
+            continue
+        sel = cat_mask.nonzero(as_tuple=True)[0]
+        candidates = _CATEGORY_OPS[category]
+        if len(candidates) == 1:
+            op = candidates[0]
+            gated_cols[sel] = _structural_warp_batch(gated_cols[sel], op, use_index_axis[sel])
+        else:
+            sub_weights_map = _CATEGORY_SUB_OP_WEIGHTS.get(category)
+            if sub_weights_map is None:
+                sub_w = torch.ones(len(candidates))
+            else:
+                sub_w = torch.tensor([sub_weights_map[c] for c in candidates], dtype=torch.float32)
+            sub_w = sub_w / sub_w.sum()
+            picks = torch.multinomial(sub_w, sel.numel(), replacement=True)
+            for k_op, op in enumerate(candidates):
+                op_sel = sel[picks == k_op]
+                if op_sel.numel() == 0:
+                    continue
+                gated_cols[op_sel] = _structural_warp_batch(gated_cols[op_sel], op, use_index_axis[op_sel])
+
+    flat[gated_idx] = gated_cols
+    warped_x = flat.reshape(B, d, T).permute(0, 2, 1).contiguous()
     return warped_x
 
 
