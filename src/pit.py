@@ -45,7 +45,7 @@ _TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
 if _TABICL_SRC not in sys.path:
     sys.path.insert(0, _TABICL_SRC)
 
-from data_gen import build_kernel_fn, _safe_cholesky  # noqa: E402
+from data_gen import build_kernel_fn, _safe_cholesky, sigma_to_correlation  # noqa: E402
 
 DEFAULT_K_FOLDS = 10
 
@@ -461,6 +461,166 @@ def run_pit_calib_split_batched(
 # ---------------------------------------------------------------------------
 
 
+def _sign_triple(d: dict, applied_key: str, w_key: str, b_key: str, a_key: str):
+    """(sign_w, sign_b, sign_a) from a dict's sign_applied* 0.0/1.0 sentinel,
+    or (None, None, None) if not applied -- shared by _kernel_fn_from_task's
+    flat schema and _kernel_fn_from_chain_task's per-component schema (see
+    data_gen.SignModulatedKernel / cfg.data.sign_modulation_component_prob /
+    sign_modulation_outer_prob). Gated on the explicit sign_applied* sentinel
+    rather than an "all entries are 0.0" check, since sign_w is a random
+    N(0, I_k) draw that isn't guaranteed nonzero even when applied (unlike
+    l/period/etc., whose priors never actually produce exactly 0). Absent
+    entirely for episodes saved before this feature existed -- d.get(...)
+    defaults to "not applied". sign_a (the tanh sharpness) may itself be
+    absent even when sign_applied*==1.0, for datasets saved by the earlier
+    hard-sign() version of this feature (no sharpness knob yet);
+    data_gen._wrap_concrete_sign_modulated substitutes a very large `a` in
+    that case, numerically recovering the hard sign() those episodes were
+    actually generated with.
+    """
+    applied = d.get(applied_key)
+    if applied is None or applied.item() == 0.0:
+        return None, None, None
+    return d[w_key], d[b_key], d.get(a_key)
+
+
+def _kernel_fn_from_chain_task(task: dict):
+    """Reconstruct (kernel_fn, nugget) for a systematic-composition chain
+    episode (cfg.data.systematic_composition=True, this repo's default —
+    see data_gen.py's "Systematic composition" docstring section and
+    generate_gp_batch's return_kernel_metadata handling).
+
+    Builds each chain link as its own single-component build_kernel_fn call
+    from task["kernel_component_params"][i] (one dict per component, already
+    per-episode-indexed — see _build_kernel_chain/_build_kernel_component),
+    then combines the resulting dense kernel matrices left-to-right per
+    task["kernel_ops"] ("+"/"*") — the exact same left-to-right dense
+    combination data_gen._DenseComposedKernel used to build the kernel this
+    episode was actually generated from, just replayed here as plain tensor
+    ops instead of a gpytorch Kernel object.
+
+    Component param dicts only carry the keys relevant to that component's
+    kernel type (see data_gen._build_scaled_kernel: "period"/"rq_alpha" are
+    present only when that kernel family uses them, no 0.0-sentinel filler
+    the way the flat/non-systematic schema does) — handled below via `in`
+    checks before falling back to build_kernel_fn's own None defaults.
+
+    Raises NotImplementedError if the whole-chain "outer" sign-modulation
+    wrap (cfg.data.sign_modulation_outer_prob, applied once to the fully
+    composed chain — see data_gen.SignModulatedKernel /
+    _wrap_concrete_sign_modulated) was actually used for this episode: that
+    wrap needs applying AFTER combination, which isn't implemented here.
+    Defaults to 0.0 (off) in every existing config, so this only fires for
+    episodes deliberately generated with that feature turned on.
+    """
+    names = task["kernel_components"]
+    ops = task["kernel_ops"]
+    comp_params = task["kernel_component_params"]
+    nugget = task["nugget"].item()
+    cols = task["kernel_feature_indices"].tolist()
+
+    sign_w_outer, sign_b_outer, sign_a_outer = _sign_triple(
+        task, "sign_applied_outer", "sign_w_outer", "sign_b_outer", "sign_a_outer"
+    )
+    if sign_w_outer is not None:
+        raise NotImplementedError(
+            "_kernel_fn_from_chain_task: whole-chain outer sign modulation "
+            "(cfg.data.sign_modulation_outer_prob) is not supported for "
+            "systematic-composition chain reconstruction."
+        )
+
+    component_fns = []
+    for name, params in zip(names, comp_params):
+        l_t = params["l"]
+        l = l_t.item() if l_t.numel() == 1 else l_t
+        alpha2 = params["alpha2"].item()
+        period = _optional_param(params["period"]) if "period" in params else None
+        rq_alpha = (
+            params["rq_alpha"].item() if "rq_alpha" in params and params["rq_alpha"].item() != 0.0 else None
+        )
+        power = (
+            params["power"].item() if "power" in params and params["power"].item() != 0.0 else None
+        )
+        sign_w, sign_b, sign_a = _sign_triple(params, "sign_applied", "sign_w", "sign_b", "sign_a")
+        component_fns.append(build_kernel_fn(
+            name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
+            active_dims=cols, sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
+        ))
+
+    def kernel_fn(X1, X2):
+        K = component_fns[0](X1, X2)
+        for op, fn in zip(ops, component_fns[1:]):
+            Ki = fn(X1, X2)
+            K = K + Ki if op == "+" else K * Ki
+        return K
+
+    return kernel_fn, nugget
+
+
+def _kernel_fn_from_task(task: dict):
+    """Reconstruct (kernel_fn, nugget) from a task dict's saved kernel
+    metadata (return_kernel_metadata=True schema — see data_gen.generate_gp_task
+    / generate_gp_batch's return_kernel_metadata handling). Shared by
+    gp_analytical_pit (train-side LOO) and gp_analytical_posterior (test-side
+    Schur-complement conditioning) so both reconstruct the exact same kernel.
+
+    Dispatches to _kernel_fn_from_chain_task for systematic-composition
+    chain episodes (identified by "kernel_components" in task) — those don't
+    fit the flat l/alpha2/l_b/alpha2_b schema handled below at all.
+    """
+    if "kernel_components" in task:
+        return _kernel_fn_from_chain_task(task)
+
+    kernel_name = task["kernel"]
+    # scalar, unless the episode was generated ARD (cfg.data.ard=True for
+    # rbf/matern32/periodic/rational_quadratic), in which case l is a
+    # per-dimension lengthscale vector (k,) — see data_gen._build_scaled_kernel.
+    l_tensor = task["l"]
+    l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
+    alpha2 = task["alpha2"].item()
+    nugget = task["nugget"].item()
+    # 0.0 sentinel means the param is not applicable for this kernel. period
+    # is likewise a per-dimension vector under periodic+ARD (gpytorch's
+    # PeriodicKernel ties period_length's ard_num_dims to lengthscale's).
+    period   = _optional_param(task["period"])
+    rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
+    # "polynomial"'s integer degree — same 0.0 sentinel convention (its own
+    # default is never 0, see data_gen's poly_power_min/max).
+    power    = task["power"].item() if task["power"].item() != 0.0 else None
+    # Composite ("A+B"/"A*B") kernels' second component — same 0.0 sentinel
+    # convention. Omitting these previously made build_kernel_fn silently
+    # reconstruct composites with l_b/alpha2_b=None, crashing with a
+    # TypeError as soon as component B's kernel function tried to use them.
+    # l_b/period_b can be ARD vectors too, same as l/period above, whenever
+    # component B is one of the ARD-eligible base kernels under cfg.data.ard.
+    l_b        = _optional_param(task["l_b"])
+    alpha2_b   = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
+    period_b   = _optional_param(task["period_b"])
+    rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
+    power_b    = task["power_b"].item() if task["power_b"].item() != 0.0 else None
+
+    sign_w, sign_b, sign_a = _sign_triple(task, "sign_applied", "sign_w", "sign_b", "sign_a")
+    sign_w_b, sign_b_b, sign_a_b = _sign_triple(task, "sign_applied_b", "sign_w_b", "sign_b_b", "sign_a_b")
+    sign_w_outer, sign_b_outer, sign_a_outer = _sign_triple(
+        task, "sign_applied_outer", "sign_w_outer", "sign_b_outer", "sign_a_outer"
+    )
+
+    # active_dims (gpytorch's own kernel kwarg) lets kernel_fn take the
+    # full-width x_norm_train straight through and select its k active
+    # columns internally — same mechanism data_gen.generate_gp_task uses,
+    # so no manual column slicing is needed here either.
+    cols = task["kernel_feature_indices"].tolist()
+    kernel_fn = build_kernel_fn(
+        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
+        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
+        active_dims=cols,
+        sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
+        sign_w_b=sign_w_b, sign_b_b=sign_b_b, sign_a_b=sign_a_b,
+        sign_w_outer=sign_w_outer, sign_b_outer=sign_b_outer, sign_a_outer=sign_a_outer,
+    )
+    return kernel_fn, nugget
+
+
 @torch.no_grad()
 def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     """Exact PIT from GP LOO (train) and posterior (test) marginals.
@@ -494,73 +654,7 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
 
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
-    kernel_name = task["kernel"]
-    # scalar, unless the episode was generated ARD (cfg.data.ard=True for
-    # rbf/matern32/periodic/rational_quadratic), in which case l is a
-    # per-dimension lengthscale vector (k,) — see data_gen._build_scaled_kernel.
-    l_tensor = task["l"]
-    l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
-    alpha2 = task["alpha2"].item()
-    nugget = task["nugget"].item()
-    # 0.0 sentinel means the param is not applicable for this kernel. period
-    # is likewise a per-dimension vector under periodic+ARD (gpytorch's
-    # PeriodicKernel ties period_length's ard_num_dims to lengthscale's).
-    period   = _optional_param(task["period"])
-    rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
-    # "polynomial"'s integer degree — same 0.0 sentinel convention (its own
-    # default is never 0, see data_gen's poly_power_min/max).
-    power    = task["power"].item() if task["power"].item() != 0.0 else None
-    # Composite ("A+B"/"A*B") kernels' second component — same 0.0 sentinel
-    # convention. Omitting these previously made build_kernel_fn silently
-    # reconstruct composites with l_b/alpha2_b=None, crashing with a
-    # TypeError as soon as component B's kernel function tried to use them.
-    # l_b/period_b can be ARD vectors too, same as l/period above, whenever
-    # component B is one of the ARD-eligible base kernels under cfg.data.ard.
-    l_b        = _optional_param(task["l_b"])
-    alpha2_b   = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
-    period_b   = _optional_param(task["period_b"])
-    rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
-    power_b    = task["power_b"].item() if task["power_b"].item() != 0.0 else None
-
-    # Sign-modulation hyperplanes (see data_gen.SignModulatedKernel /
-    # cfg.data.sign_modulation_component_prob / sign_modulation_outer_prob):
-    # gated on the explicit sign_applied*/1.0 sentinel rather than
-    # _optional_param's "all entries are 0.0" check, since sign_w is a
-    # random N(0, I_k) draw that isn't guaranteed nonzero even when applied
-    # (unlike l/period/etc., whose priors never actually produce exactly 0).
-    # Absent entirely for episodes saved before this feature existed (older
-    # datasets on disk) -- task.get(..., 0.0) defaults to "not applied".
-    # sign_a (the tanh sharpness -- see SignModulatedKernel) may itself be
-    # absent even when sign_applied*==1.0, for datasets saved by the earlier
-    # hard-sign() version of this feature (which had no sharpness knob);
-    # data_gen._wrap_concrete_sign_modulated substitutes a very large `a` in
-    # that case, numerically recovering the hard sign() those episodes were
-    # actually generated with, so their saved z_train/z_test still round-trip.
-    def _sign_pair(applied_key: str, w_key: str, b_key: str, a_key: str):
-        applied = task.get(applied_key)
-        if applied is None or applied.item() == 0.0:
-            return None, None, None
-        return task[w_key], task[b_key], task.get(a_key)
-
-    sign_w, sign_b, sign_a = _sign_pair("sign_applied", "sign_w", "sign_b", "sign_a")
-    sign_w_b, sign_b_b, sign_a_b = _sign_pair("sign_applied_b", "sign_w_b", "sign_b_b", "sign_a_b")
-    sign_w_outer, sign_b_outer, sign_a_outer = _sign_pair(
-        "sign_applied_outer", "sign_w_outer", "sign_b_outer", "sign_a_outer"
-    )
-
-    # active_dims (gpytorch's own kernel kwarg) lets kernel_fn take the
-    # full-width x_norm_train straight through and select its k active
-    # columns internally — same mechanism data_gen.generate_gp_task uses,
-    # so no manual column slicing is needed here either.
-    cols = task["kernel_feature_indices"].tolist()
-    kernel_fn = build_kernel_fn(
-        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
-        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
-        active_dims=cols,
-        sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
-        sign_w_b=sign_w_b, sign_b_b=sign_b_b, sign_a_b=sign_a_b,
-        sign_w_outer=sign_w_outer, sign_b_outer=sign_b_outer, sign_a_outer=sign_a_outer,
-    )
+    kernel_fn, nugget = _kernel_fn_from_task(task)
     x_k_train = task["x_norm_train"]   # (P, d_features)
     y_train    = task["y_train"]                  # (P,)
     y_test     = task["y_test"]                   # (N,)
@@ -597,3 +691,156 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     z_train    = alpha * K_inv_diag.rsqrt()                               # alpha_i/√[K⁻¹]_ii
 
     return {"z_train": z_train, "z_test": z_test, "log_pdf_test": log_pdf_test}
+
+
+@torch.no_grad()
+def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
+    """Exact GP posterior correlation among test points, conditioned on the
+    realized (x_train, y_train) via the Schur complement -- the "mechanism 2"
+    term cfg.data.oracle_mode="prior" (data_gen.py's only supported mode)
+    deliberately leaves out of R_star: R_star there is the raw/unconditional
+    kernel correlation K_ss, never K_ss - K_sf K_ff^-1 K_fs. This function
+    computes that missing conditioned quantity directly, for use as a true
+    Bayes-optimal reference at EVAL time (see
+    eval/runners/eval_checkpoint.py's "GP oracle total NLL (Y-space)"
+    prior-vs-posterior report, printed by _print_y_space_oracle) — it does
+    not touch training data generation or cfg.data.oracle_mode at all.
+
+    Reuses the exact kernel _kernel_fn_from_task reconstructs (same one
+    gp_analytical_pit's LOO z_train uses), and, when the task carries them
+    (return_kernel_metadata=True — see generate_gp_batch), the same
+    _L_ff/_alpha Cholesky factors gp_analytical_pit reuses, so this never
+    repeats the O(P^3) factorization already paid for elsewhere.
+
+    Supports both the flat and systematic-composition-chain kernel schemas
+    (via _kernel_fn_from_task's dispatch) — raises NotImplementedError only
+    for the rare case of whole-chain outer sign modulation on a chain
+    episode (see _kernel_fn_from_chain_task's docstring; off by default in
+    every existing config). Callers should catch NotImplementedError/KeyError
+    and report "unavailable" rather than crash a whole eval run over one
+    episode's kernel family.
+
+    All linear algebra (the Schur complement itself, plus the eigendecomposition
+    used for the PSD repair below) runs in float64 -- kernel evaluation stays
+    in the kernel's native float32, matching every other call site in this
+    file. This is the fix for the numerical gap that got cfg.data.oracle_mode
+    ="posterior" removed from data_gen.py: that removed implementation *did*
+    already use float64 for the Schur complement (then cast back to float32),
+    yet still occasionally left the minimum eigenvalue of the result below
+    the PSD floor for composite kernels, because nothing ever checked for
+    it. Here, any residual eigenvalue below eig_floor is explicitly detected
+    and clamped up (an eigenvalue-floor repair, not a discard) before
+    converting to a correlation matrix, since an eval script wants a number
+    for every episode, not a silently dropped one.
+
+    Returns dict with mu_post (N,), Sigma_post (N,N), R_post (N,N) — all
+    float32 — plus min_eig (float, pre-repair, for diagnostics), repaired
+    (bool, whether the eigenvalue floor actually fired), and nll_prior/
+    nll_post (float, the total Y-space multivariate-normal NLL of y_test
+    under the unconditioned prior N(mean_test, K_ss) vs. the conditioned
+    posterior N(mu_post, Sigma_post) — see the comment above the
+    `_mvn_nll` calls below for why THESE two numbers, not
+    corr_nll_single(R_post, z_test), are the correct prior-vs-posterior
+    comparison).
+    """
+    kernel_fn, nugget = _kernel_fn_from_task(task)
+    # x_norm_train/test are always .cpu()'d before being packed into an
+    # episode dict (see generate_gp_batch's tensors dict), but _L_ff/_alpha
+    # are deliberately left device-resident for reuse (see that same
+    # function's comment) — mismatched whenever the episode was
+    # live-generated on GPU, so move x/y onto whatever device _L_ff/_alpha
+    # already live on (falling back to x_train's own device when absent,
+    # i.e. the recompute-from-scratch branch below, which never leaves CPU).
+    ref_device = task["_L_ff"].device if "_L_ff" in task else task["x_norm_train"].device
+    x_train = task["x_norm_train"].to(ref_device)   # (P, d), float32
+    x_test  = task["x_norm_test"].to(ref_device)    # (N, d), float32
+    y_train = task["y_train"].to(ref_device)         # (P,)
+    P, N = x_train.shape[0], x_test.shape[0]
+
+    if "_L_ff" in task and "_alpha" in task:
+        L_ff  = task["_L_ff"].double()
+        alpha = task["_alpha"].double()
+    else:
+        K_ff       = kernel_fn(x_train, x_train) + nugget * torch.eye(P, device=x_train.device)
+        L_ff       = _safe_cholesky(K_ff).double()
+        mean_train = _mean_train_from_task(task, x_train)
+        alpha      = torch.cholesky_solve(
+            (y_train - mean_train).double().unsqueeze(-1), L_ff
+        ).squeeze(-1)
+
+    # K_sf carries no noise term (measurement noise is independent across
+    # distinct points, train vs. test included); K_ss does, on its diagonal
+    # only, matching K_ff's own convention above and data_gen.py's K_all
+    # (nugget added once to the full (T,T) diagonal before slicing out the
+    # K_ff/K_ss blocks) — so this is the posterior over noisy y_test, the
+    # same quantity oracle_mode="prior"'s R_star (also a K_ss slice of that
+    # same K_all) already represents unconditionally.
+    K_sf = kernel_fn(x_test, x_train).double()                                              # (N, P)
+    K_ss = (kernel_fn(x_test, x_test) + nugget * torch.eye(N, device=x_test.device)).double()  # (N, N)
+
+    V = torch.linalg.solve_triangular(L_ff, K_sf.T, upper=False)   # (P, N)
+    Sigma_post = K_ss - V.T @ V
+    Sigma_post = 0.5 * (Sigma_post + Sigma_post.T)
+
+    # mu_star under oracle_mode="prior" is exactly mean_module(x_test) (see
+    # data_gen.py's oracle_mode branch: "mu_star = mean_module(x_norm_test)")
+    # -- directly reusable as the prior mean term here, no separate
+    # mean_module reconstruction needed.
+    mean_test = task["mu_star"].to(ref_device).double()
+    mu_post = mean_test + K_sf @ alpha
+
+    eigvals = torch.linalg.eigvalsh(Sigma_post)
+    min_eig = eigvals.min().item()
+    repaired = min_eig < eig_floor
+    if repaired:
+        eigvals_c, eigvecs = torch.linalg.eigh(Sigma_post)
+        Sigma_post = eigvecs @ torch.diag(eigvals_c.clamp(min=eig_floor)) @ eigvecs.T
+        Sigma_post = 0.5 * (Sigma_post + Sigma_post.T)
+
+    R_post, _ = sigma_to_correlation(Sigma_post.float())
+
+    # --- Total (marginal + copula) Y-space NLL, prior vs. posterior -------
+    # Deliberately NOT scored via corr_nll_single(R_post, z_test): z_test is
+    # standardized under the PRIOR's own (mu_star, sigma_star) (see
+    # data_gen.py's oracle_mode="prior" branch), so it has unit marginal
+    # variance only under the prior, not under the posterior -- Var(z_test |
+    # x_train, y_train) = diag(Sigma_post)/sigma_star_prior^2 is generally
+    # < 1 once conditioned, since conditioning shrinks variance (R&W §2.2).
+    # Reusing that same unit-variance-assuming z against R_post's copula
+    # formula (which assumes z ~ N(0, R) with unit marginal variance) scores
+    # a distribution nothing was actually drawn from, and is NOT guaranteed
+    # to be a lower bound relative to the prior's own z-space score -- this
+    # was verified empirically (it comes out *worse*, i.e. a higher NLL,
+    # than the prior on a real smoke test episode, the opposite of a true
+    # lower bound). The full multivariate-normal log density below has no
+    # such assumption -- N(mu, Sigma) at y_test is valid for ANY (mu, Sigma)
+    # pair, prior or posterior alike -- so this is the sound version of
+    # "posterior is a true lower bound": E[nll_post] <= E[nll_prior] holds
+    # here because Bayesian conditioning on (x_train, y_train) is exactly
+    # the NLL-minimizing update given that information (Bayes-optimality of
+    # the posterior predictive under log-loss), with no unit-variance
+    # assumption anywhere to violate.
+    y_test = task["y_test"].to(ref_device).double()
+
+    def _mvn_nll(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> float:
+        L = _safe_cholesky(Sigma)
+        resid = (y - mean).unsqueeze(-1)
+        sol = torch.cholesky_solve(resid, L)
+        quad = (resid * sol).sum()
+        log_det = 2.0 * torch.log(torch.diagonal(L)).sum()
+        n = y.shape[0]
+        return (0.5 * (n * math.log(2.0 * math.pi) + log_det + quad)).item()
+
+    K_ss_sym = 0.5 * (K_ss + K_ss.T)
+    nll_prior = _mvn_nll(y_test, mean_test, K_ss_sym)
+    nll_post  = _mvn_nll(y_test, mu_post, Sigma_post)
+
+    return {
+        "mu_post":    mu_post.float(),
+        "Sigma_post": Sigma_post.float(),
+        "R_post":     R_post,
+        "min_eig":    min_eig,
+        "repaired":   repaired,
+        "nll_prior":  nll_prior,
+        "nll_post":   nll_post,
+    }
