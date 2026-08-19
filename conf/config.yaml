@@ -9,39 +9,71 @@ defaults:
 
 seed: 42
 
+# Multi-process parallel dataset generation only (src/generate_pit_dataset.py,
+# launched via scripts/generate_dataset.sh's GEN_WORKERS) -- ignored by
+# train.py. worker_id/num_workers default to 0/1 (single process, original
+# behaviour); N cooperating processes pointed at the same data.dataset_dir
+# each set num_workers=N and a distinct worker_id in [0, N) to partition the
+# shard range with no overlap and no coordination beyond the shared pit_dir.
+worker_id: 0
+num_workers: 1
+
 wandb:
   project: copula-inter-instance
   entity: null   # override with your wandb username/org
 
 training:
   device: auto
-  batch_size: 32
+  batch_size: 16
   # torch.compile adds real overhead (first-step + recompiles on shape changes);
   # worth it for long runs, a drag while iterating quickly. Off by default.
   compile: false
   steps: 1000000
   warmup_steps: 1000
   clip_grad_norm: 1.0
-  log_every: 100
+  log_every: 200
   val_every: 1000
-  save_every: 5000
+  save_every: 10000
   ckpt_dir: null
   # Path to a checkpoint saved by save_checkpoint() (model + optimizer +
   # scheduler + step). When set, model weights and optimizer/scaler state
-  # (Adam/Muon moments, AMP grad scale) are restored, but the step counter
-  # and LR scheduler always restart at 0 with a fresh warmup/cosine schedule,
-  # so this run's step count tracks the new run rather than continuing the
-  # checkpoint's. Everything else (steps, LR schedule, dataset, etc.) follows
-  # this run's config, not the one baked into the checkpoint.
+  # (Adam/Muon moments, AMP grad scale) are restored, and by default the step
+  # counter and LR schedule pick up from the checkpoint's step, continuing
+  # the same warmup/cosine curve rather than re-running warmup from a
+  # from-scratch peak LR on top of already-warmed-up optimizer moments.
+  # `warmup_steps`/`steps`/`muon_lr` etc. still come from this run's config,
+  # not the one baked into the checkpoint, so an extended `steps` budget
+  # smoothly stretches the remaining decay instead of starting over.
   # Usage: python src/train.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
   resume_ckpt: null
+  # Set true to opt back into the old behavior: restart at step 0 with a
+  # fresh warmup/cosine schedule instead of continuing the checkpoint's.
+  # Intended for deliberately warm-starting a new, unrelated experiment
+  # (different dataset/config) from an existing checkpoint's weights, where
+  # continuing the old run's schedule wouldn't make sense.
+  resume_reset_schedule: false
   dataset_dir: ./data/systematic_composition-k5/pit
   # Target validation-set size, shared by both the on-disk path (below, capped
   # at the dataset's total episode count) and live_generation (live_dataset.py)
   # — same knob so the val plots (e.g. val/corr_density) are comparable in
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
-  val_episodes: 500
+  val_episodes: 200
+  # Override for the on-disk dataset DataLoader worker count (train.py's
+  # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
+  # variable-d) — set explicitly to tune, e.g. now that dataset.py loads
+  # shards with mmap=True instead of an eager full copy.
+  loader_num_workers: null
+  # Batches queued ahead per DataLoader worker (train.py's prefetch_factor).
+  # 8 empirically holds cgroup RSS flat (~7GB, well under a 31GB-capped OAR
+  # job) while still getting data-wait down near loss's own cost (~2ms vs
+  # ~5ms) on systematic-composition-all-base. Pushing deeper (16, 32) grows
+  # RSS enough to OOM-kill the run — the per-batch payload (R_star/R_prior/
+  # Sigma_star are full N_max x N_max matrices) is large enough on its own
+  # that a 32-deep x num_workers queue fills the cgroup even after fixing
+  # the shard-cache's own leak (see dataset.py's _load_shard_entry). Override
+  # via training.prefetch_factor to tune further on a different dataset/node.
+  prefetch_factor: 8
   # Live generation: skip dataset_dir entirely and generate episodes on the
   # fly via DataLoader workers (see live_dataset.py) — no disk reads/writes
   # for training data. Temporary, storage-constrained-environment mode;
@@ -55,7 +87,7 @@ training:
   # (data<1ms/step) at both batch_size=128 and 256 on a 44-core node. Bump
   # this further (in step with batch_size) if you have more cores and go
   # bigger; 16 was already at the floor — 24 gave no further improvement.
-  live_num_workers: 16
+  live_num_workers: 8
   # generate_gp_batch() call size = batch_size * live_group_multiplier. Must be
   # a multiple of batch_size: generate_gp_batch samples kernel/P/N/active_dims
   # (and, for variable-d configs, d_features itself) once per call, shared by
@@ -76,6 +108,30 @@ training:
   # storage. Still a true per-epoch permutation, just chunked randomization.
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
+  # Adaptive kernel-family sampling for live generation: bias
+  # live_dataset.py's kernel-chain sampling (data_gen._sample_kernel_chain_
+  # structure) toward the kernel families the model currently fits worst,
+  # instead of sampling _COMPOSABLE_KERNELS uniformly. Only takes effect when
+  # live_generation=true AND cfg.data.systematic_composition=true (the active
+  # sampling path this feature hooks into). Uses the existing per-family
+  # kernel_fit/<family>/{copula_nll,oracle_copula_nll} validation probes
+  # (baselines.* below) as the performance signal — DoReMi/GroupDRO-style
+  # exponentiated-gradient update on the oracle gap (regret), see
+  # train.py::_update_adaptive_kernel_weights. false (default) leaves
+  # sampling exactly as before this feature existed.
+  adaptive_kernel_sampling: false
+  # Exponentiated-gradient step size η applied to the per-family oracle gap
+  # (copula_nll - oracle_copula_nll, typically O(0.1-1) in this codebase's
+  # units — unlike the cross-entropy-scale losses DoReMi tuned η against, so
+  # this default is a starting point, not a validated value; watch
+  # val/kernel_sampling_weight/<family> for over/under-reaction and adjust).
+  adaptive_kernel_lr: 1.0
+  # Uniform-blend floor per family after each update (DoReMi-style
+  # anti-starvation term) — keeps every family's sampling weight above
+  # floor/len(_COMPOSABLE_KERNELS) even if it looks perfectly fit, so it
+  # still gets occasional practice instead of being fully dropped from the
+  # curriculum.
+  adaptive_kernel_floor: 0.05
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
   muon_lr: 2.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
   muon_lr_min: 1.0e-6         # cosine decay floor
@@ -106,9 +162,43 @@ training:
 # with training progress (unlike a fixed, data-only baseline would).
 baselines:
   enabled: true
-  kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic, periodic]
+  # polynomial added (2026-08-13) alongside adaptive_kernel_sampling above: it
+  # was in data_gen._COMPOSABLE_KERNELS (the live-sampling pool) but had no
+  # probe here, so it had no kernel_fit signal and adaptive_kernel_sampling
+  # couldn't see it. periodic is kept for the kernel_fit/periodic/* diagnostic
+  # (useful on its own even off the sampling curriculum), even though
+  # composite_exclude_kernels (conf/data/gp_tasks.yaml) excludes it from the
+  # live-sampling pool by default -- train.py's adaptive_kernel_sampling loop
+  # now skips updating/logging val/kernel_sampling_weight for any family in
+  # composite_exclude_kernels, so this probe no longer feeds a weight number
+  # that would otherwise look meaningful but never actually move sampling.
+  kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic, periodic, polynomial]
   synth_n_episodes: 64      # fixed episodes generated once per kernel family
   synth_seed: 20260718      # fixed seed -> same probe episodes every run
+  # Context/test-set sizes for the probe, pinned independent of this run's own
+  # conf/data/gp_tasks.yaml P_min/P_max/N_min/N_max (which do change between
+  # runs) so kernel_fit/<family>/* stays a fixed, cross-run-comparable
+  # benchmark instead of silently reshaping with each run's own data config.
+  probe_P_min: 32
+  probe_P_max: 512
+  probe_N_min: 8
+  probe_N_max: 1024
+
+  # era5_fit/<region>/* validation metrics (see train.py::_build_era5_val_batches):
+  # real ARCO-ERA5 spatial-correlation probes, one per eval/configs/regions.py
+  # entry, scored against empirical Pearson correlation (no GP oracle exists for
+  # real data, unlike kernel_fit/<family> above). Fetched/PIT'd once before
+  # training starts and cached -- only the model forward pass re-runs every
+  # validate() call. Kept deliberately small (grid_size/n_days_probe) since this
+  # adds real forward passes to EVERY validation call, not a one-off sweep.
+  era5_enabled: true
+  era5_regions: [western_europe, north_atlantic_ocean, sahara_desert, himalaya_tibetan_plateau, amazon_basin]
+  era5_grid_size: 24        # matches eval/configs/regions.py's low_context_7config/grid_resolution convention (grid=24, n_context=30 -> ~5% context fraction)
+  era5_n_days_fetch: 60     # days fetched/cached per region (eval.configs.constants.N_DAYS)
+  era5_n_days_probe: 3      # of those, how many are used as context-conditioning draws per validate() call
+  era5_n_context: 30        # in-context sample size (eval.configs.constants.N_CONTEXT)
+  era5_n_bins: 12           # distance bins for the correlation-vs-distance curve
+  era5_seed: 20260818       # fixed seed -> same context sample/probe days every run
 
 # LoRA fine-tuning of the TabICL backbone.
 # Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]

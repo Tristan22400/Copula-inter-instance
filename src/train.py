@@ -38,6 +38,7 @@ import sys
 import time
 import zlib
 from glob import glob
+from typing import Optional
 
 import hydra
 import matplotlib
@@ -57,14 +58,23 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+# eval/ (regions.py, spatial-correlation probe helpers -- see
+# _build_era5_val_batches below) lives at the repo root, not under src/.
+_REPO_ROOT = os.path.dirname(_HERE)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from classical_kernels import DEFAULT_FAMILIES
-from data_gen import KERNEL_REGISTRY, generate_gp_batch
+from data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, generate_gp_batch
 from dataset import (
     CopulaDataset,
     ShardBlockSampler,
     ShardHomogeneousBatchSampler,
     collate_fn,
 )
+from eval.configs.regions import REGIONS as ERA5_REGIONS
+from eval.spatial.diagnostics import bin_correlation_by_distance
+from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
 from live_dataset import build_fixed_live_val_batches, build_live_train_loader
 from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
@@ -313,6 +323,20 @@ def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
     return fig
 
 
+def _name_seed(base_seed: int, name: str) -> int:
+    """Deterministic per-name seed offset from a run-level base seed, so each
+    kernel family / ERA5 region gets its own fixed-but-different probe draw
+    instead of all of them sharing one seed."""
+    return base_seed + (zlib.crc32(name.encode()) % 10_000)
+
+
+def _macro_average(values: list[float]) -> float:
+    """Unweighted mean of a metric collected across kernel families /
+    regions, NaN if none were finite — used for the kernel_fit/era5_fit
+    mean_* cross-run-comparable scalars in validate()."""
+    return float(np.mean(values)) if values else float("nan")
+
+
 def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, dict]:
     """Fixed per-kernel-family synthetic probe episodes for the
     ``kernel_fit/<family>`` validation metrics (see validate()).
@@ -324,27 +348,163 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     once, with a fixed per-family seed, and reused every validation call, so
     kernel_fit/<family> only reflects the model's changing predictions on a
     frozen probe set — not resampling noise.
+
+    P_min/P_max/N_min/N_max are pinned to baselines.probe_* (NOT read from
+    cfg.data.*): this run's own gp_tasks.yaml can change its context/test-size
+    ranges (it has, repeatedly) without silently reshaping the probe episodes
+    underneath kernel_fit/<family> — otherwise two runs with different
+    data.P_min/P_max would each get a "frozen" probe that's fixed-per-run but
+    different-across-runs, defeating the entire point of a cross-run-
+    comparable benchmark.
     """
     bcfg = cfg.get("baselines", {}) or {}
     families = list(bcfg.get("kernels") or DEFAULT_FAMILIES)
     n_episodes = int(bcfg.get("synth_n_episodes", 64))
     base_seed = int(bcfg.get("synth_seed", 20260718))
+    probe_P_min = int(bcfg.get("probe_P_min", 32))
+    probe_P_max = int(bcfg.get("probe_P_max", 512))
+    probe_N_min = int(bcfg.get("probe_N_min", 8))
+    probe_N_max = int(bcfg.get("probe_N_max", 1024))
 
     batches: dict[str, dict] = {}
     for family in families:
         if family not in KERNEL_REGISTRY:
             continue  # not standalone-generatable (e.g. an unregistered composite)
-        family_seed = base_seed + (zlib.crc32(family.encode()) % 10_000)
+        family_seed = _name_seed(base_seed, family)
         synth_cfg = OmegaConf.merge(
             cfg,
-            OmegaConf.create(
-                {"seed": family_seed, "data": {"kernel": family, "systematic_composition": False}}
-            ),
+            OmegaConf.create({
+                "seed": family_seed,
+                "data": {
+                    "kernel": family,
+                    "systematic_composition": False,
+                    "P_min": probe_P_min,
+                    "P_max": probe_P_max,
+                    "N_min": probe_N_min,
+                    "N_max": probe_N_max,
+                },
+            }),
         )
         episodes = generate_gp_batch(synth_cfg, n_episodes, device="cpu")
         batch = collate_fn(episodes)
         batches[family] = {k: v.to(device) for k, v in batch.items()}
     return batches
+
+
+def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> dict[str, dict]:
+    """Fixed per-region real-ERA5 probes for the ``era5_fit/<region>``
+    validation metrics (see validate()) — the real-data analogue of
+    _build_synthetic_kernel_batches above.
+
+    Unlike a kernel_fit/<family> synthetic probe, real ERA5 has no known GP
+    oracle (no Sigma_star/R_star), so there is no NLL-gap metric to compute
+    here. Instead, eval.spatial.sweep_core.build_era5_probe freezes a ground-
+    truth correlation-vs-distance curve (empirical Pearson correlation, the
+    same convention eval/runners/spatial_correlation_eval.py's real-mode
+    sweep uses) plus a fixed real in-context sample (context coords/values,
+    PIT'd once against `tabicl_marginal`) for a handful of ERA5 days per
+    region. validate() re-runs only the CURRENT model's forward pass on this
+    frozen input every call and scores the resulting correlogram against the
+    frozen curve — the ERA5 fetch + PIT cost is paid once, here, not on the
+    training loop's hot path.
+
+    `tabicl_marginal` may be None (no PIT checkpoint configured): falls back
+    to naive per-context standardization, same as
+    eval.spatial.diagnostics.extract_model_context_correlation.
+    """
+    ecfg = cfg.get("baselines", {}) or {}
+    region_names = list(ecfg.get("era5_regions") or list(ERA5_REGIONS.keys()))
+    grid_size = int(ecfg.get("era5_grid_size", 10))
+    n_days_fetch = int(ecfg.get("era5_n_days_fetch", 60))
+    n_days_probe = int(ecfg.get("era5_n_days_probe", 3))
+    n_context = int(ecfg.get("era5_n_context", 30))
+    n_bins = int(ecfg.get("era5_n_bins", 12))
+    base_seed = int(ecfg.get("era5_seed", 20260818))
+
+    batches: dict[str, dict] = {}
+    for region_name in region_names:
+        if region_name not in ERA5_REGIONS:
+            continue  # not a registered eval/configs/regions.py entry
+        region_seed = _name_seed(base_seed, region_name)
+        probe = build_era5_probe(
+            region_name, grid_size, n_days_fetch, n_days_probe, n_context, n_bins,
+            tabicl_marginal, device, seed=region_seed,
+        )
+        n_days_p = probe["z_train_per_day"].shape[0]
+        x_train = torch.as_tensor(probe["x_train_norm"], dtype=torch.float32, device=device)
+        x_test = torch.as_tensor(probe["x_test_norm"], dtype=torch.float32, device=device)
+        z_train = torch.as_tensor(probe["z_train_per_day"], dtype=torch.float32, device=device)
+        model_batch = {
+            "x_train": x_train.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
+            "x_test": x_test.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
+            "z_train": z_train,
+            "test_mask": torch.ones(n_days_p, probe["D"], dtype=torch.bool, device=device),
+        }
+        batches[region_name] = {
+            "batch": model_batch,
+            "dist": probe["dist"],
+            "bin_edges": probe["bin_edges"],
+            "pair_counts": probe["pair_counts"],
+            "rho_emp": probe["rho_emp"],
+        }
+    return batches
+
+
+def _update_adaptive_kernel_weights(
+    prev_weights: torch.Tensor, metrics: dict, lr: float, floor: float,
+    exclude: Optional[set] = None,
+) -> torch.Tensor:
+    """DoReMi/GroupDRO-style exponentiated-gradient update of per-kernel-family
+    live-generation sampling weights (see training.adaptive_kernel_sampling),
+    ordered to match data_gen._COMPOSABLE_KERNELS.
+
+    Signal is the per-family excess loss (regret) already computed by
+    validate()'s kernel_fit/<family> probes: gap = copula_nll -
+    oracle_copula_nll (NLL is lower-is-better, and oracle_copula_nll is the
+    lower bound achievable by a perfect model — see loss.oracle_copula_nll —
+    so this is typically >=0, bigger when the model is further from oracle on
+    that family = more room to improve). Families with no probe (metrics
+    missing either key — e.g. not in cfg.baselines.kernels) get gap=0, i.e. no
+    update pressure, only the floor's implicit pull toward uniform.
+
+    exclude (optional): family names to hold out of the gap-driven update
+    entirely (gap forced to 0), regardless of whether a kernel_fit probe
+    exists for them. Meant for cfg.data.composite_exclude_kernels — those
+    families are never in _sample_kernel_chain_structure's sampling pool
+    (data_gen.py::_weights_for_pool already renormalizes over the
+    post-exclude pool, so their tensor entry is inert either way), so
+    driving their weight off model performance is just noise: it moves the
+    number without moving anything the number controls.
+
+    w' = prev_weights * exp(lr * gap), renormalized, then blended with a
+    uniform floor: w = (1 - floor) * w' + floor * uniform — prevents any
+    family's weight collapsing toward 0 and being effectively dropped from
+    the curriculum. Pure function: caller is responsible for writing the
+    result into the shared-memory tensor DataLoader workers read from
+    (`kernel_weights_tensor.copy_(...)`, never rebind).
+    """
+    exclude = exclude or set()
+    n = len(_COMPOSABLE_KERNELS)
+    gaps = torch.zeros(n, dtype=torch.float32)
+    for i, family in enumerate(_COMPOSABLE_KERNELS):
+        if family in exclude:
+            continue
+        cop = metrics.get(f"kernel_fit/{family}/copula_nll")
+        ora = metrics.get(f"kernel_fit/{family}/oracle_copula_nll")
+        if cop is not None and ora is not None and math.isfinite(cop) and math.isfinite(ora):
+            gaps[i] = cop - ora
+    # Clamp the exponent, not the gap itself, so a single wild probe can't
+    # overflow exp() into inf and NaN out every family's weight via the
+    # shared normalization below.
+    exponent = torch.clamp(lr * gaps, min=-30.0, max=30.0)
+    raw = prev_weights.float() * torch.exp(exponent)
+    total = raw.sum()
+    uniform = torch.full((n,), 1.0 / n, dtype=torch.float32)
+    if not torch.isfinite(total) or total <= 0:
+        raw = uniform.clone()
+    else:
+        raw = raw / total
+    return (1.0 - floor) * raw + floor * uniform
 
 
 def _resolve_pit_ckpt(cfg) -> str | None:
@@ -425,7 +585,12 @@ def _build_tabicl_val_z(
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
     if step < warmup:
         return step / max(1, warmup)
-    progress = (step - warmup) / max(1, total - warmup)
+    # Clamp progress to [0, 1]: with schedule-preserving resume (see
+    # load_checkpoint/train), `step` can now start above 0 and, if a resumed
+    # run's `training.steps` is set lower than the step it resumes from,
+    # exceed `total` — without clamping, cos(pi * progress) would swing back
+    # upward past progress=1 instead of holding at the min-LR floor.
+    progress = min(1.0, (step - warmup) / max(1, total - warmup))
     return lr_min_frac + (1.0 - lr_min_frac) * 0.5 * (
         1.0 + math.cos(math.pi * progress)
     )
@@ -504,6 +669,7 @@ def validate(
     do_plot: bool = False,
     synth_kernel_batches: dict | None = None,
     tabicl_val_z: dict | None = None,
+    era5_val_batches: dict | None = None,
 ) -> tuple[dict, list]:
     # Do NOT call model.eval() here: TabICL's eval mode triggers _inference_forward
     # which uses InferenceManager with its own float16 autocast on CUDA, producing
@@ -578,14 +744,19 @@ def validate(
             cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f ** 2).sum(-1)) / n_safe_cur
             cop_per_task.extend(cop_cur[valid_cur].cpu().tolist())
 
-            # W row-norms and s means (masked mean over valid test instances)
+            # W row-norms and s means (masked mean over valid test instances).
+            # "s" is absent for "tanhnorm" (see model.py's _NO_SCALAR_COLUMN /
+            # build_sigma's out.get("s") pattern) — skip the s-diagnostic for
+            # that parametrization instead of KeyError-ing.
             W_f = out["W"].float()
-            s_f = out["s"].float()
             mask_f = batch["test_mask"].float()
             W_norm_cur = (W_f.norm(dim=-1) * mask_f).sum(-1) / n_safe_cur
-            s_mean_cur = (s_f * mask_f).sum(-1) / n_safe_cur
             all_W_norms.extend(W_norm_cur[valid_cur].cpu().tolist())
-            all_s_vals.extend(s_mean_cur[valid_cur].cpu().tolist())
+            s_raw = out.get("s")
+            if s_raw is not None:
+                s_f = s_raw.float()
+                s_mean_cur = (s_f * mask_f).sum(-1) / n_safe_cur
+                all_s_vals.extend(s_mean_cur[valid_cur].cpu().tolist())
 
             # Off-diagonal and diagonal statistics (all valid entries in one shot)
             ri_cur, ci_cur = torch.triu_indices(N_cur, N_cur, offset=1, device=Sigma.device)
@@ -691,6 +862,8 @@ def validate(
     # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
     # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
     # so these move with training progress (unlike a fixed data-only baseline).
+    family_copula_improvement: list[float] = []
+    family_corr_pearson: list[float] = []
     for family, sbatch in (synth_kernel_batches or {}).items():
         out_s = model(sbatch)
         Sigma_s = build_sigma(out_s, cfg, jitter=jitter, test_mask=sbatch["test_mask"])
@@ -707,11 +880,23 @@ def validate(
         oracle_cop_s = oracle_copula_nll(
             sbatch["R_star"].float(), sbatch["z_test"].float(), sbatch["test_mask"]
         ).item()
-        metrics[f"kernel_fit/{family}/copula_nll"]        = parts_s["copula"].item()
+        cop_s = parts_s["copula"].item()
+        metrics[f"kernel_fit/{family}/copula_nll"]        = cop_s
         metrics[f"kernel_fit/{family}/oracle_copula_nll"] = oracle_cop_s
         metrics[f"kernel_fit/{family}/corr_mse"]     = cq_s["mse"]
         metrics[f"kernel_fit/{family}/corr_mae"]     = cq_s["mae"]
         metrics[f"kernel_fit/{family}/corr_pearson"] = cq_s["pearson"]
+
+        # Same 0=identity/1=oracle normalization as the top-level
+        # copula_improvement, but per-family — lets a single family's easy/
+        # hard intrinsic NLL scale be compared against its own oracle instead
+        # of pooled in with every other family.
+        family_improvement = cop_s / oracle_cop_s if abs(oracle_cop_s) > 1e-12 else float("nan")
+        metrics[f"kernel_fit/{family}/copula_improvement"] = family_improvement
+        if not math.isnan(family_improvement):
+            family_copula_improvement.append(family_improvement)
+        if not math.isnan(cq_s["pearson"]):
+            family_corr_pearson.append(cq_s["pearson"])
 
         # One extra corr_grid column per kernel family: its own synthetic
         # episode's oracle beside the model's prediction on it — replaces the
@@ -725,6 +910,50 @@ def validate(
                     "R_ora":  sbatch["R_star"][0, :n_s, :n_s].float().cpu().numpy(),
                     "label":  f"kfit:{family}\nN={n_s}",
                 })
+
+    # Unweighted macro-average across kernel families: a single cross-run-
+    # comparable scalar. Plain averaging over synth_kernel_batches.items()
+    # would already be unweighted per-family (each family contributes one
+    # scalar regardless of n_episodes), but is computed explicitly here so it
+    # survives family list changes/NaNs without silently reweighting.
+    metrics["kernel_fit/mean_copula_improvement"] = _macro_average(family_copula_improvement)
+    metrics["kernel_fit/mean_corr_pearson"] = _macro_average(family_corr_pearson)
+
+    # Real-ERA5 spatial-correlation probe per region (see
+    # _build_era5_val_batches / eval/spatial/sweep_core.py::build_era5_probe).
+    # There is no GP oracle for real data, so — unlike kernel_fit/<family>'s
+    # NLL gap against Sigma_star — this scores the CURRENT model's
+    # context-conditioned correlogram against the region's frozen EMPIRICAL
+    # Pearson correlation curve (rho_emp), using the same weighted
+    # shape_corr/rmse/bias/model_r2 convention
+    # eval/runners/spatial_correlation_eval.py's real-mode sweep reports.
+    region_shape_corr: list[float] = []
+    region_model_r2: list[float] = []
+    for region, probe in (era5_val_batches or {}).items():
+        out_e = model(probe["batch"])
+        Sigma_e = build_sigma(out_e, cfg, jitter=jitter, test_mask=probe["batch"]["test_mask"])
+        # Averaging the predicted correlation matrix over the probe's few
+        # fixed days before binning is equivalent to averaging the binned
+        # curve over days (binning is a per-day-identical linear reduction
+        # over (i, j) pairs, since `dist`/bin_edges don't depend on the day)
+        # — cheaper than bin_correlation_by_distance once per day.
+        R_mean = Sigma_e.float().mean(dim=0).detach().cpu().numpy()
+        rho_context = bin_correlation_by_distance(R_mean, probe["dist"], probe["bin_edges"])
+        pair_counts, rho_emp = probe["pair_counts"], probe["rho_emp"]
+        shape_corr = weighted_corr(rho_context, rho_emp, pair_counts)
+        rmse, bias = weighted_rmse_bias(rho_context, rho_emp, pair_counts)
+        model_r2 = weighted_r2(rho_context, rho_emp, pair_counts)
+        metrics[f"era5_fit/{region}/shape_corr"] = shape_corr
+        metrics[f"era5_fit/{region}/rmse"] = rmse
+        metrics[f"era5_fit/{region}/bias"] = bias
+        metrics[f"era5_fit/{region}/model_r2"] = model_r2
+        if not math.isnan(shape_corr):
+            region_shape_corr.append(shape_corr)
+        if not math.isnan(model_r2):
+            region_model_r2.append(model_r2)
+
+    metrics["era5_fit/mean_shape_corr"] = _macro_average(region_shape_corr)
+    metrics["era5_fit/mean_model_r2"] = _macro_average(region_model_r2)
 
     model.train()
 
@@ -813,15 +1042,14 @@ def load_checkpoint(
     device: str,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: GradScaler | None = None,
-) -> None:
+) -> int:
     """Restore model weights and optimizer/scaler state from a checkpoint.
 
-    The scheduler and step count are intentionally NOT restored: resuming
-    always restarts at step 0 with a fresh warmup/cosine schedule and the
-    full step budget of this run's config, rather than continuing the
-    previous run's schedule and step count. Optimizer moments (Adam/Muon)
-    and the AMP grad scaler state are restored so the run doesn't have to
-    relearn gradient statistics from scratch.
+    Optimizer moments (Adam/Muon) and the AMP grad scaler state are restored
+    so the run doesn't have to relearn gradient statistics from scratch.
+    Returns the step the checkpoint was saved at (0 for legacy checkpoints
+    without a "step" key), which the caller uses to decide where the LR
+    schedule resumes — see the `resume_reset_schedule` handling in train().
     """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")
@@ -832,6 +1060,7 @@ def load_checkpoint(
         optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
+    return int(ckpt.get("step", 0))
 
 
 def _forward_and_loss(
@@ -1106,6 +1335,7 @@ def main(cfg: DictConfig) -> None:
         config=OmegaConf.to_container(cfg, resolve=True),
     )
 
+    adaptive_kernel_weights = None  # set below only when live_generation + adaptive_kernel_sampling
     if live_generation:
         # No on-disk dataset at all: episodes are generated on the fly by
         # DataLoader worker processes (see live_dataset.py). Temporary
@@ -1116,7 +1346,7 @@ def main(cfg: DictConfig) -> None:
             f"no dataset_dir read ({t.dataset_dir!r} ignored). "
             f"ckpt_dir={t.get('ckpt_dir', None)!r}"
         )
-        train_loader = build_live_train_loader(cfg, t, device)
+        train_loader, adaptive_kernel_weights = build_live_train_loader(cfg, t, device)
         val_loader   = build_fixed_live_val_batches(cfg, t)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
     else:
@@ -1126,6 +1356,20 @@ def main(cfg: DictConfig) -> None:
         train_sampler = None
         train_batch_sampler = None
         val_batch_sampler = None
+        variable_d = False
+        loader_num_workers_override = t.get("loader_num_workers", None)
+        loader_num_workers = (
+            int(loader_num_workers_override) if loader_num_workers_override is not None else 4
+        )
+        # Batches queued ahead per worker. conf/config.yaml sets
+        # training.prefetch_factor=8 by default (see its comment for the
+        # RSS-vs-data-wait tradeoff this was tuned against); this fallback
+        # only fires if that key is missing entirely (e.g. a hand-built cfg
+        # that doesn't inherit config.yaml).
+        prefetch_factor_override = t.get("prefetch_factor", None)
+        prefetch_factor = (
+            int(prefetch_factor_override) if prefetch_factor_override is not None else 8
+        )
         if shard_files and os.path.exists(meta_path):
             shard_block_shards = int(t.get("shard_block_shards", 16))
             # Cache must hold a full active block, or each worker still thrashes
@@ -1167,6 +1411,62 @@ def main(cfg: DictConfig) -> None:
                 # is feature-homogeneous. A shard also shares one kernel/P/N/
                 # active_dims, so these batches are single-task — the accepted price
                 # of variable-d. shard_block_shards (cross-shard mixing) is moot here.
+                #
+                # full_dataset was constructed above with shard_cache_size=
+                # shard_block_shards+4 (default 20), sized for ShardBlockSampler's
+                # cross-shard blocking. ShardHomogeneousBatchSampler never blocks
+                # across shards — its own docstring guarantees "at most one shard
+                # is resident at a time" — so that 20-slot cache is dead weight
+                # here: with num_workers=4 on train + 4 on val, 20 cached shards/
+                # worker on datasets with multi-hundred-MB-to-multi-GB shards (e.g.
+                # systematic-composition-all-base, up to ~1.8GB/shard) can push
+                # aggregate resident memory into the tens-to-hundreds of GB and get
+                # a DataLoader worker SIGKILLed by the OS OOM killer. Shrink to a
+                # small constant — enough for the current shard plus one prefetch
+                # margin at a shard boundary, not shard_block_shards-worth.
+                #
+                # That alone wasn't sufficient in practice (still OOM'd a GPU node on
+                # systematic-composition-all-base with the real batch_size=32/
+                # val_episodes=500 config): DataLoader's batch_sampler round-robin
+                # hands consecutive batches to different workers, but
+                # ShardHomogeneousBatchSampler emits every batch for one shard
+                # consecutively before moving to the next — so with 4 workers, all 4
+                # end up needing the SAME shard resident at once, each holding its own
+                # independent ~1-1.8GB copy (worker processes don't share this cache;
+                # only the returned batch tensors go through shared memory). Turned out
+                # NOT to be caused by worker count, though (see the cache.clear() note
+                # below for the real culprit) — verified empirically that num_workers=4
+                # with the cache properly cleared stays bounded (~24GB peak on a 62GB
+                # test node for this dataset's largest shards, vs ~16GB at
+                # num_workers=2). If this ever needs to run on a smaller-RAM node,
+                # dropping this back to 2 is the lever to pull.
+                full_dataset._SHARD_CACHE_SIZE = min(full_dataset._SHARD_CACHE_SIZE, 2)
+                # Lowering the cap alone doesn't shrink an already-oversized cache:
+                # dataset.py's LRU only evicts one entry per one new insertion (never
+                # evicts down to the new cap in one shot), so the d_seen probe just
+                # above — which ran while the cache was still sized at
+                # shard_block_shards+4, and can have touched up to 8 distinct random
+                # shards — leaves _shard_cache stuck at ~8 resident entries forever
+                # (each future access evicts 1 and inserts 1, net size unchanged).
+                # That stale, oversized cache then gets inherited by every forked
+                # DataLoader worker. Clear it now so the new cap actually applies.
+                full_dataset._shard_cache.clear()
+                # Was dropped to 2 on this ~31GB-cgroup-capped OAR job because
+                # eager per-shard loading multiplied shard_cache_size x
+                # num_workers x full shard size into RSS. dataset.py now loads
+                # shards with mmap=True (near-zero per-shard RSS), which
+                # removed that constraint — re-verified empirically
+                # (2026-08-11, this same dataset/job): GPU duty cycle averaged
+                # ~30% at num_workers=2 vs ~60-65% at 4/6/8 (nvidia-smi dmon,
+                # 1s samples), with cgroup RSS flat (~4.9GB) across all of
+                # them — a plateau, not a monotonic win, so 4 is the practical
+                # default rather than pushing higher for no further gain.
+                # Override via training.loader_num_workers to test further.
+                loader_num_workers = (
+                    int(loader_num_workers_override)
+                    if loader_num_workers_override is not None
+                    else 4
+                )
                 print(
                     "[train] per-shard-varying d_features detected "
                     f"({sorted(d_seen)}...) → batching within single shards "
@@ -1209,15 +1509,31 @@ def main(cfg: DictConfig) -> None:
 
         print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} episodes")
 
+        # collate_fn (dataset.py) also assembles an (B, N_max, N_max) R_prior
+        # tensor for schema-complete consumers (eval/plotting scripts, per its
+        # docstring) — but no training code path reads batch["R_prior"] (only
+        # R_star/Sigma_star feed loss.py/model.py; grep-verified). On datasets
+        # with large N this is a full extra big-matrix copy per batch (equal in
+        # size to R_star/Sigma_star) purely to populate an unused key, and it's
+        # redundant besides: dataset.py derives R_prior as a clone of R_star for
+        # oracle_mode="prior" datasets (the only mode this repo writes), so it
+        # never carries information collate_fn's R_star output doesn't already
+        # have. Drop it before the shared collate_fn runs so its has_prior
+        # branch (the actual allocate+copy cost) never fires for training.
+        def _train_collate_fn(samples):
+            for s in samples:
+                s.pop("R_prior", None)
+            return collate_fn(samples)
+
         # A batch_sampler (variable-d homogeneous batching) is mutually exclusive
         # with batch_size/sampler/shuffle, so pick one construction or the other.
         train_loader = DataLoader(
             train_dataset,
-            collate_fn=collate_fn,
-            num_workers=4,
+            collate_fn=_train_collate_fn,
+            num_workers=loader_num_workers,
             pin_memory=(device == "cuda"),
             persistent_workers=True,
-            prefetch_factor=4,
+            prefetch_factor=prefetch_factor,
             **(
                 {"batch_sampler": train_batch_sampler}
                 if train_batch_sampler is not None
@@ -1230,11 +1546,11 @@ def main(cfg: DictConfig) -> None:
         )
         val_loader = DataLoader(
             val_dataset,
-            collate_fn=collate_fn,
-            num_workers=4,
+            collate_fn=_train_collate_fn,
+            num_workers=loader_num_workers,
             pin_memory=(device == "cuda"),
             persistent_workers=True,
-            prefetch_factor=4,
+            prefetch_factor=prefetch_factor,
             **(
                 {"batch_sampler": val_batch_sampler}
                 if val_batch_sampler is not None
@@ -1253,18 +1569,35 @@ def main(cfg: DictConfig) -> None:
     # which checkpoint (if any) that uses.
     pit_ckpt = _resolve_pit_ckpt(cfg)
     tabicl_val_z: dict = {}
+    # Real-ERA5 spatial-correlation probes (see _build_era5_val_batches):
+    # built here too, alongside tabicl_val_z, so the one-time PIT cost on the
+    # frozen context sample is paid before `tabicl_marginal` is discarded —
+    # not gated on pit_ckpt existing, since build_era5_probe accepts
+    # tabicl_marginal=None (naive-standardization fallback).
+    era5_val_batches: dict = {}
+    era5_on = baselines_on and bool(cfg.get("baselines", {}).get("era5_enabled", True))
     if baselines_on and pit_ckpt:
         print("[train] Loading frozen TabICL marginal for the z_train sim-to-real diagnostic...")
         tabicl_marginal = load_tabicl(pit_ckpt, device)
         pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
         tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, pit_k_folds, device)
-        del tabicl_marginal  # only z_train_tabicl (cached above) is needed from here on
+        if era5_on:
+            print("[train] Building frozen real-ERA5 spatial-correlation probes...")
+            era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)
+        del tabicl_marginal  # only the caches built above are needed from here on
         if device == "cuda":
             # gc.collect() before empty_cache() (see this repo's OOM-handler
             # gotcha): del alone doesn't free CUDA storage until any
             # reference cycles in the eval-mode forward graph are collected.
             gc.collect()
             torch.cuda.empty_cache()
+    elif era5_on:
+        print(
+            "[train] Building frozen real-ERA5 spatial-correlation probes "
+            "(no PIT checkpoint configured -- context z_train falls back to "
+            "naive standardization)..."
+        )
+        era5_val_batches = _build_era5_val_batches(cfg, None, device)
 
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
@@ -1304,19 +1637,42 @@ def main(cfg: DictConfig) -> None:
         ]
     )
     lr_min_frac = t.muon_lr_min / t.muon_lr
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda s: cosine_lr_lambda(s, t.warmup_steps, t.steps, lr_min_frac),
-    )
 
     use_amp = device == "cuda"
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
 
+    # Resume weights + optimizer/scaler state first (if requested) so we know
+    # what step the LR schedule should continue from before building the
+    # scheduler below. Default: continue the cosine schedule from the
+    # checkpoint's step, instead of re-running warmup from a from-scratch
+    # peak LR on top of already-warmed-up Adam/Muon moments — the two
+    # combined were spiking effective step size right after resume.
+    # `resume_reset_schedule=true` opts back into the old behavior, for the
+    # deliberate "warm-start a new experiment from these weights" case where
+    # a fresh warmup/cosine schedule (not a continuation) is actually wanted.
     start_step = 0
     if resume_ckpt:
-        load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
-        print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — restarting schedule at step 0")
+        ckpt_step = load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
+        if bool(t.get("resume_reset_schedule", False)):
+            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} (step {ckpt_step}) — resetting to step 0 with a fresh warmup/cosine schedule (resume_reset_schedule=true)")
+        else:
+            start_step = ckpt_step
+            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — continuing cosine schedule from step {start_step}")
+
+    if start_step > 0:
+        # LambdaLR requires 'initial_lr' on each param group to resume at a
+        # non-zero last_epoch. Rebase it to this run's configured base LR
+        # (not whatever raw 'lr' the checkpoint's optimizer state restored,
+        # which is the previous run's already-decayed value) so the cosine
+        # curve below reflects this run's schedule at start_step.
+        for group in optimizer.param_groups:
+            group["initial_lr"] = t.muon_lr
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda s: cosine_lr_lambda(s, t.warmup_steps, t.steps, lr_min_frac),
+        last_epoch=start_step - 1 if start_step > 0 else -1,
+    )
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
@@ -1665,8 +2021,29 @@ def main(cfg: DictConfig) -> None:
                 model, val_loader, cfg, device, step=step, do_plot=do_plot,
                 synth_kernel_batches=synth_kernel_batches,
                 tabicl_val_z=tabicl_val_z,
+                era5_val_batches=era5_val_batches,
             )
             log_dict = {f"val/{k}": v for k, v in metrics.items()}
+            if adaptive_kernel_weights is not None:
+                lr = float(t.get("adaptive_kernel_lr", 1.0))
+                floor = float(t.get("adaptive_kernel_floor", 0.05))
+                excluded_kernels = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
+                new_kernel_weights = _update_adaptive_kernel_weights(
+                    adaptive_kernel_weights, metrics, lr, floor, exclude=excluded_kernels
+                )
+                # In-place: adaptive_kernel_weights is the shared-memory
+                # tensor LiveGPDataset workers read from (live_dataset.py) —
+                # rebinding the name here would leave workers pointed at the
+                # old tensor instead of picking up the update.
+                adaptive_kernel_weights.copy_(new_kernel_weights)
+                # Excluded families are never in _sample_kernel_chain_structure's
+                # pool (data_gen.py::_weights_for_pool renormalizes over the
+                # post-exclude pool), so their weight is inert -- skip logging
+                # it to avoid implying it drives sampling.
+                for i, family in enumerate(_COMPOSABLE_KERNELS):
+                    if family in excluded_kernels:
+                        continue
+                    log_dict[f"val/kernel_sampling_weight/{family}"] = float(new_kernel_weights[i])
             if plot_figs:
                 log_dict["val/corr_density"] = wandb.Image(plot_figs[0])
                 if len(plot_figs) > 1:

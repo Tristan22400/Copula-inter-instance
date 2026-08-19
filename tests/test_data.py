@@ -37,7 +37,7 @@ from data_gen import (
     sigma_to_correlation,
     tabiclv2_warp_features,
 )
-from dataset import CopulaDataset, collate_fn
+from dataset import CopulaDataset, _add_derived_fields, collate_fn
 
 # ---------------------------------------------------------------------------
 # tabiclv2_warp_features tests
@@ -650,6 +650,131 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     assert len(episodes) == 20
     d_set = {ep["x_norm_train"].shape[-1] for ep in episodes}
     assert len(d_set) == 1, f"top-up round used a different d_features than round 0: {d_set}"
+
+
+def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
+    """generate_pit_dataset.py's _generate_shard_with_oom_retry splits one
+    shard's generation across multiple generate_gp_batch calls when a chunk
+    hits CUDA OOM (or a transient cusolver/cublas error) and must reuse the
+    first successful chunk's d_features on every retry chunk, the same way
+    generate_gp_batch already pins d_features across its own internal
+    top-up rounds (test_topup_round_reuses_first_round_d_features above) --
+    without the pin, each retry chunk independently samples its own d.
+
+    Regression: this exact path (not the top-up-round path already covered
+    above) left 7/140 shards in a live systematic-composition-all-base
+    dataset run with internally-mixed d_features (e.g. one shard mixing
+    d=5 and d=9), each later crashing training with collate_fn's "mixed
+    feature counts" error -- ShardHomogeneousBatchSampler assumes every
+    shard is feature-homogeneous and doesn't verify it."""
+    import generate_pit_dataset as gpd
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
+    cfg.data.d_features_lognormal_scale = 0.4
+    cfg.seed = 123
+
+    real_generate_gp_batch = dg.generate_gp_batch
+    state = {"n_calls": 0}
+
+    def oom_first_chunk(cfg, B, device="cpu", **kwargs):
+        state["n_calls"] += 1
+        if state["n_calls"] == 1:
+            raise torch.cuda.OutOfMemoryError("synthetic OOM")
+        return real_generate_gp_batch(cfg, B, device, **kwargs)
+
+    monkeypatch.setattr(gpd, "generate_gp_batch", oom_first_chunk)
+
+    episodes = gpd._generate_shard_with_oom_retry(
+        cfg, n_this=20, device="cpu", tabicl_model=None, tabicl_k_folds=10,
+    )
+    assert state["n_calls"] > 1, "test setup didn't actually trigger a retry chunk"
+    assert len(episodes) == 20
+    d_set = {ep["x_norm_train"].shape[-1] for ep in episodes}
+    assert len(d_set) == 1, f"retry chunk used a different d_features than the first chunk: {d_set}"
+
+
+def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeypatch):
+    """_generate_gp_batch_raw must catch torch.linalg.LinAlgError the same
+    way it already catches gpytorch's NotPSDError -- discard the whole
+    B-episode batch and let generate_gp_batch's top-up loop resample,
+    instead of propagating and killing the worker process.
+
+    Regression: gpytorch's add_low_rank -> root_decomposition -> _symeig
+    path can raise torch.linalg.LinAlgError (LAPACK eigh failing to
+    converge on an ill-conditioned matrix) instead of NotPSDError out of
+    the exact same call this function already wraps in a try/except --
+    only NotPSDError was caught, so this exception type killed live
+    generation workers (job 3000710, worker 2, 4 times before the worker
+    gave up for good)."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.seed = 11
+
+    real_build_likelihood = dg._build_likelihood
+    state = {"n_calls": 0}
+
+    class _PoisonedLikelihood:
+        def __init__(self, real):
+            self._real = real
+
+        def __call__(self, *args, **kwargs):
+            state["n_calls"] += 1
+            if state["n_calls"] == 1:
+                raise torch.linalg.LinAlgError(
+                    "linalg.eigh: synthetic non-convergence for test"
+                )
+            return self._real(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def poisoned_build_likelihood(cfg, kernel_name, B, device):
+        return _PoisonedLikelihood(real_build_likelihood(cfg, kernel_name, B, device))
+
+    monkeypatch.setattr(dg, "_build_likelihood", poisoned_build_likelihood)
+
+    episodes = dg.generate_gp_batch(cfg, B=6, device="cpu")
+    assert state["n_calls"] > 1, "test setup didn't actually trigger a retry"
+    assert len(episodes) == 6
+
+
+def test_is_transient_cusolver_error_covers_tabicl_contention_errors():
+    """_is_transient_cusolver_error must also flag the two RuntimeError
+    messages seen from tabicl's InferenceManager under the same
+    concurrent-GEN_WORKERS GPU contention window as the cusolver/cublas
+    races it already retries, and must NOT flag a genuine unrelated
+    RuntimeError as transient.
+
+    Regression: job 3000709, worker 2 hit "CPU memory allocation failed
+    (CUDA error: invalid argument...) and disk offload is not available"
+    from tabicl's pinned-CPU-alloc fallback, then on a later attempt
+    "Expected all tensors to be on the same device, ... cuda:0 and cpu" out
+    of tabicl's quantile_dist.cdf -- neither matched "cusolver"/"cublas",
+    so both propagated straight out of _generate_shard_with_oom_retry and
+    killed the process; the worker was still dead hours later since
+    scripts/generate_dataset.sh's outer restart budget (5 attempts) was
+    exhausted by the repeated crash."""
+    import generate_pit_dataset as gpd
+
+    assert gpd._is_transient_cusolver_error(
+        RuntimeError(
+            "CPU memory allocation failed (CUDA error: invalid argument) "
+            "and disk offload is not available."
+        )
+    )
+    assert gpd._is_transient_cusolver_error(
+        RuntimeError(
+            "Expected all tensors to be on the same device, but found at "
+            "least two devices, cuda:0 and cpu!"
+        )
+    )
+    assert not gpd._is_transient_cusolver_error(RuntimeError("index out of range"))
+    assert not gpd._is_transient_cusolver_error(torch.cuda.OutOfMemoryError("oom"))
 
 
 def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
@@ -1829,3 +1954,81 @@ def test_copula_dataset_skips_stale_nonfinite_episode(tmp_path):
         item = ds[1]
     assert torch.isfinite(item["z_train"]).all()
     assert torch.isfinite(item["y_train"]).all()
+
+
+def test_add_derived_fields_reconstructs_sigma_and_prior():
+    """R_prior/Sigma_star should be reconstructed exactly from R_star and
+    sigma_star when a shard was written without them (the dedup applied in
+    generate_pit_dataset.py to shrink on-disk shard size)."""
+    sample = _make_sample(P=6, N=4)
+    expected_R_prior = sample["R_star"].clone()
+    expected_Sigma_star = (
+        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
+    )
+    del sample["Sigma_star"]
+
+    out = _add_derived_fields(sample)
+
+    assert torch.allclose(out["R_prior"], expected_R_prior)
+    assert torch.allclose(out["Sigma_star"], expected_Sigma_star)
+
+
+def test_add_derived_fields_leaves_stored_values_untouched():
+    """If a shard DOES carry R_prior/Sigma_star (written before the dedup,
+    or with genuinely different values), _add_derived_fields must not
+    overwrite them."""
+    sample = _make_sample(P=6, N=4)
+    sample["R_prior"] = torch.full((4, 4), 0.5)
+    sample["Sigma_star"] = torch.full((4, 4), 2.0)
+
+    out = _add_derived_fields(sample)
+
+    assert torch.equal(out["R_prior"], torch.full((4, 4), 0.5))
+    assert torch.equal(out["Sigma_star"], torch.full((4, 4), 2.0))
+
+
+def test_copula_dataset_individual_reconstructs_missing_fields(tmp_path):
+    """Individual-file (task_*.pt) shards written without R_prior/Sigma_star
+    should still load with both fields present and correct."""
+    sample = _make_sample(P=6, N=4)
+    del sample["Sigma_star"]
+    torch.save(sample, tmp_path / "task_000000.pt")
+
+    ds = CopulaDataset(episode_dir=str(tmp_path))
+    item = ds[0]
+
+    assert "R_prior" in item and "Sigma_star" in item
+    assert torch.allclose(item["R_prior"], sample["R_star"])
+    expected_Sigma_star = (
+        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
+    )
+    assert torch.allclose(item["Sigma_star"], expected_Sigma_star)
+
+    # collate_fn must still work end-to-end on the reconstructed episode.
+    batch = collate_fn([item])
+    assert batch["Sigma_star"].shape == (1, 4, 4)
+    assert batch["R_prior"].shape == (1, 4, 4)
+
+
+def test_copula_dataset_sharded_reconstructs_missing_fields(tmp_path):
+    """Sharded (shard_*.pt) datasets written without R_prior/Sigma_star --
+    the new, smaller on-disk schema -- should still serve complete episodes
+    and collate identically to a dataset that stored all fields."""
+    samples = [_make_sample(P=6, N=4) for _ in range(3)]
+    for s in samples:
+        del s["Sigma_star"]
+        s.pop("R_prior", None)
+
+    torch.save(samples, tmp_path / "shard_000000.pt")
+    torch.save({"n_total": len(samples), "shard_size": len(samples)}, tmp_path / "meta.pt")
+
+    ds = CopulaDataset(episode_dir=str(tmp_path))
+    assert len(ds) == 3
+
+    item = ds[1]
+    assert "R_prior" in item and "Sigma_star" in item
+    assert torch.allclose(item["R_prior"], samples[1]["R_star"])
+
+    batch = collate_fn([ds[0], ds[1], ds[2]])
+    assert batch["Sigma_star"].shape == (3, 4, 4)
+    assert batch["R_prior"].shape == (3, 4, 4)

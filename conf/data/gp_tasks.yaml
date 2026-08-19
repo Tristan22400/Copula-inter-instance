@@ -258,9 +258,6 @@ composite_num_kernels_lognormal_scale: 1.05
 # exclude periodic chains entirely. Empty = sample from all of
 # data_gen._COMPOSABLE_KERNELS (rbf, matern12, matern32, matern52, cosine,
 # periodic, rational_quadratic, dot_product, polynomial).
-# "polynomial" is excluded here for now (like periodic/cosine/dot_product):
-# new addition, not yet validated against tests/test_dataset_corr_uniform.py
-# in long chains — remove it from this list once validated.
 composite_exclude_kernels: [cosine,periodic,dot_product,polynomial]
 
 # Extra hyperparameter priors (only used by the indicated kernels)

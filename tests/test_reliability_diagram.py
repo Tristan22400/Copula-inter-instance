@@ -1,12 +1,13 @@
 """
 test_reliability_diagram.py — Sanity checks for the quantile reliability
-diagram code in plots/generate_plots.py.
+diagram code in eval/spatial/calibration.py.
 
 compute_quantile_ece is exercised on synthetic data with a controlled
 miscalibration bias (ECE should track the injected bias, and be ~0 for a
 perfectly calibrated forecaster).
 
-plot_era5_quantile_reliability is exercised with a fake TabICLv2 regressor to
+plot_era5_quantile_reliability is exercised with a fake TabICLRegressor
+(monkeypatching eval.spatial.calibration.make_tabicl_regressor) to
 regression-test two properties that are easy to silently break:
   - context_idx locations must be excluded from the evaluated (y_true,
     y_pred_quantiles) set (querying the model at its own context points would
@@ -28,11 +29,11 @@ import pytest
 from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_PLOTS = os.path.join(os.path.dirname(_TESTS), "plots")
-if _PLOTS not in sys.path:
-    sys.path.insert(0, _PLOTS)
+_REPO_ROOT = os.path.dirname(_TESTS)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-import generate_plots as gp  # noqa: E402
+from eval.spatial import calibration as gp  # noqa: E402
 
 
 def test_compute_quantile_ece_perfect_calibration():
@@ -107,7 +108,7 @@ def test_reliability_diagram_excludes_context_and_batches_alphas(monkeypatch):
             super().__init__()
             created["reg"] = self
 
-    monkeypatch.setattr(gp, "TabICLv2_Regressor", _Tracked)
+    monkeypatch.setattr(gp, "make_tabicl_regressor", lambda checkpoint=None, device=None: _Tracked())
 
     captured = {}
 

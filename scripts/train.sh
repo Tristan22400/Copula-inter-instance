@@ -92,6 +92,12 @@ else
     export PYTHONPATH="$(pwd)"
 fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The frozen-TabICL-marginal load (z_train sim-to-real diagnostic) does a HEAD
+# request to huggingface.co to check for updates even though the checkpoint is
+# already fully cached locally; that request has been taking 60-100s+ on this
+# cluster's network. Skip it and read straight from cache. Unset/override
+# HF_HUB_OFFLINE=0 before calling this script if a checkpoint isn't cached yet.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 echo "Starting Training... (Job ID: ${OAR_JOB_ID:-local})"
 if [[ "${TRAIN_SH_DRY_RUN:-0}" == "1" ]]; then

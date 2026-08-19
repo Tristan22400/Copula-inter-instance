@@ -1265,8 +1265,32 @@ def _sample_active_dims(d_total: int, cfg) -> List[int]:
     return sorted(random.sample(range(d_total), k))
 
 
-def _resolve_kernel_name(cfg) -> str:
-    """Pick which kernel to use for one task based on config."""
+def _weights_for_pool(pool: List[str], kernel_weights: Optional[Tensor]) -> Optional[List[float]]:
+    """Map a `_COMPOSABLE_KERNELS`-ordered weight tensor onto `pool` (a
+    filtered subset/reordering of it), renormalized over just that subset.
+
+    Returns None (meaning "uniform", i.e. random.choices' own default) when
+    kernel_weights is None, so every caller's unweighted behavior is
+    reproduced exactly when adaptive sampling is off.
+    """
+    if kernel_weights is None:
+        return None
+    idx = [_COMPOSABLE_KERNELS.index(name) for name in pool]
+    sub = [float(kernel_weights[i]) for i in idx]
+    total = sum(sub)
+    if total <= 0:
+        return None
+    return [w / total for w in sub]
+
+
+def _resolve_kernel_name(cfg, kernel_weights: Optional[Tensor] = None) -> str:
+    """Pick which kernel to use for one task based on config.
+
+    kernel_weights (optional): a `_COMPOSABLE_KERNELS`-ordered tensor of
+    sampling weights (see _sample_kernel_chain_structure) — used to bias the
+    `data.kernels` pool branch below; the fixed `data.kernel` branch has
+    nothing to weight since it's a single deterministic choice.
+    """
     data = cfg.data
     if hasattr(data, "kernel") and data.kernel:
         name = str(data.kernel)
@@ -1278,11 +1302,16 @@ def _resolve_kernel_name(cfg) -> str:
         for k in pool:
             if k not in KERNEL_REGISTRY:
                 raise ValueError(f"Unknown kernel '{k}'. Choose from {ALL_KERNELS}.")
-        return random.choice(pool)
+        weights = None
+        if all(k in _COMPOSABLE_KERNELS for k in pool):
+            weights = _weights_for_pool(pool, kernel_weights)
+        return random.choices(pool, weights=weights, k=1)[0] if weights else random.choice(pool)
     return "rbf"
 
 
-def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
+def _sample_kernel_chain_structure(
+    cfg, kernel_weights: Optional[Tensor] = None
+) -> tuple[List[str], List[str], str]:
     """CauKer-style composition (github.com/ShifengXIE/CauKer): sample a
     random component COUNT m ~ round(LogNormal(composite_num_kernels_lognormal_loc,
     _scale)), clipped to [composite_num_kernels_min, composite_num_kernels_max],
@@ -1314,7 +1343,14 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
     file's module docstring) against tests/test_dataset_corr_uniform.py:
     mean +0.166->+0.264 (still inside the abs(mean)<0.30 bound), frac(R>0.7)
     0.093->0.179. Re-validate if composite_exclude_kernels or the nugget
-    prior change."""
+    prior change.
+
+    kernel_weights (optional): a `_COMPOSABLE_KERNELS`-ordered tensor of
+    per-family sampling weights (see train.py's adaptive_kernel_sampling —
+    updated from a per-family model-vs-oracle performance gap so weaker
+    families get drawn more often). Renormalized over `pool` (post-exclude)
+    via _weights_for_pool; None (the default, and every non-adaptive caller)
+    reproduces today's uniform random.choices exactly."""
     exclude = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
     pool = [k for k in _COMPOSABLE_KERNELS if k not in exclude]
     if not pool:
@@ -1327,7 +1363,7 @@ def _sample_kernel_chain_structure(cfg) -> tuple[List[str], List[str], str]:
     m_loc = float(getattr(cfg.data, "composite_num_kernels_lognormal_loc", 0.55))
     m_scale = float(getattr(cfg.data, "composite_num_kernels_lognormal_scale", 1.05))
     m = min(max(round(random.lognormvariate(m_loc, m_scale)), lo), hi)
-    names = random.choices(pool, k=m)
+    names = random.choices(pool, weights=_weights_for_pool(pool, kernel_weights), k=m)
     ops = [random.choice(("+", "*")) for _ in range(m - 1)]
     chain_name = names[0] + "".join(f"{op}{name}" for op, name in zip(ops, names[1:]))
     return names, ops, chain_name
@@ -2478,12 +2514,51 @@ def corrupt_z_train(z_train: Tensor, data_cfg) -> Tensor:
     return torch.where(apply_ep.unsqueeze(-1), z_blend, z_train)
 
 
+def _max_batch_for_context(B: int, T: int, device: str) -> int:
+    """Cap the per-call episode batch at B episodes given context length
+    T=P+N, to avoid CUDA OOM in _generate_gp_batch_raw below.
+
+    P/N (and hence T) are resampled per call from wide, independent ranges
+    (see conf/data/gp_tasks.yaml's P_max/N_max, currently up to 512/1024),
+    while B defaults to cfg.data.shard_size (256) regardless of T -- several
+    (B, T, T) float32 buffers are live at once around the K_all_raw -> L_all
+    -> K_all Cholesky/reconstruction (see _generate_gp_batch_raw), so peak
+    VRAM scales like B*T^2. Most draws keep T small, but an occasional big
+    P+N draw at the configured shard_size can exceed available memory even
+    though the vast majority of shards generate fine -- this is what
+    produced a mid-run `torch.OutOfMemoryError` in _generate_gp_batch_raw's
+    `K_all = L_all @ L_all.mT` line after ~600 successful shards.
+
+    Uses live free memory (torch.cuda.mem_get_info) rather than a static
+    threshold so it adapts to whatever else is already resident -- notably
+    the frozen TabICL marginal + its K-fold forward passes when
+    cfg.data.z_train_source="tabicl" is active, which eats a large,
+    P-dependent chunk of VRAM on top of the GP machinery here. Returning
+    less than the requested B is safe and already part of
+    _generate_gp_batch_raw's contract ("may return FEWER than B episodes");
+    generate_gp_batch's top-up loop resamples a fresh (smaller, with high
+    probability) T and tops up the shortfall.
+    """
+    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+        return B
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    # Empirical: ~6 live (B,T,T) float32 buffers at peak (K_all_raw, L_all,
+    # K_all, plus gpytorch/linear_operator's internal copies during
+    # covariance_matrix materialization and psd_safe_cholesky's jitter
+    # retries); budget only half of free memory as headroom for the
+    # TabICL marginal and allocator fragmentation.
+    bytes_per_episode = 6 * T * T * 4
+    budget = 0.5 * free_bytes
+    return max(1, min(B, int(budget // bytes_per_episode)))
+
+
 @torch.no_grad()
 def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
     d_override: Optional[int] = None,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
+    kernel_weights: Optional[Tensor] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in a single vectorised call — the
     "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
@@ -2548,6 +2623,10 @@ def _generate_gp_batch_raw(
             pipeline.
         tabicl_k_folds: K-fold count for tabicl_model's PIT, ignored when
             tabicl_model is None.
+        kernel_weights: optional `_COMPOSABLE_KERNELS`-ordered sampling-weight
+            tensor forwarded to _sample_kernel_chain_structure/
+            _resolve_kernel_name (see their docstrings) — None reproduces
+            today's uniform sampling exactly.
 
     Returns:
         list of B episode dicts ready for torch.save.
@@ -2577,12 +2656,20 @@ def _generate_gp_batch_raw(
     # must share one active_dims subset (see _build_kernel_chain).
     systematic = bool(getattr(cfg.data, "systematic_composition", False))
     if systematic:
-        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg)
+        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(
+            cfg, kernel_weights=kernel_weights
+        )
     else:
-        kernel_name = _resolve_kernel_name(cfg)
+        kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
     N = random.randint(cfg.data.N_min, cfg.data.N_max)
     T = P + N
+    # Cap B for this call so the (B, T, T) buffers below fit in free VRAM --
+    # see _max_batch_for_context's docstring. Safe to shrink B here: this
+    # function is already documented to possibly return fewer than the
+    # requested B episodes, and generate_gp_batch's top-up loop assembles
+    # the shortfall via additional calls.
+    B = _max_batch_for_context(B, T, device)
     batch_shape = torch.Size([B])
 
     # active_dims (and hence k) is sampled once per batch call and shared by
@@ -2662,7 +2749,7 @@ def _generate_gp_batch_raw(
         try:
             noisy_dist = likelihood(prior_dist)
             K_all_raw = noisy_dist.covariance_matrix  # (B, T, T), nugget already on diagonal
-        except NotPSDError:
+        except (NotPSDError, torch.linalg.LinAlgError):
             # Some composite/systematic kernel chains (esp. under sign
             # modulation — see _build_kernel_chain, or heavily-composed
             # structural warps pushing feature geometry to an extreme —
@@ -2679,11 +2766,20 @@ def _generate_gp_batch_raw(
             # (this call's kernel/hyperparameter draw) and let
             # generate_gp_batch's top-up loop resample a fresh one, rather
             # than crashing the whole run.
+            #
+            # add_low_rank's __add__ path doesn't always fail with NotPSDError
+            # though: when the intermediate LinearOperator IS symmetric but
+            # numerically ill-conditioned (near-repeated eigenvalues), gpytorch
+            # falls through to root_decomposition -> _symeig -> torch.linalg.eigh,
+            # whose LAPACK syevd/heevd routine can itself fail to converge and
+            # raises torch.linalg.LinAlgError (not NotPSDError) straight out of
+            # this same try block -- observed killing whole worker processes in
+            # production runs (job 3000710) since it wasn't caught here.
             warnings.warn(
                 f"_generate_gp_batch_raw: kernel evaluation for this "
                 f"{B}-episode batch (kernel={kernel_name!r}) raised NotPSDError "
-                f"before psd_safe_cholesky repair could run; discarding the "
-                f"whole batch and resampling.",
+                f"or LinAlgError before psd_safe_cholesky repair could run; "
+                f"discarding the whole batch and resampling.",
                 RuntimeWarning,
             )
             return []
@@ -3031,6 +3127,8 @@ def generate_gp_batch(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
+    d_override: Optional[int] = None,
+    kernel_weights: Optional[Tensor] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, discarding and regenerating any that
     turn out degenerate (see _generate_gp_batch_raw's `discard` — an
@@ -3053,6 +3151,14 @@ def generate_gp_batch(
     within one shard, which ShardHomogeneousBatchSampler/collate_fn assume
     can't happen.
 
+    d_override lets a caller that itself assembles one shard across multiple
+    generate_gp_batch calls (generate_pit_dataset.py's
+    _generate_shard_with_oom_retry, which splits into smaller chunks on CUDA
+    OOM) pin every chunk to the same d — without it, each chunk call would
+    independently sample its own d via _sample_d_features and the shard could
+    end up with the same kind of internally-mixed feature counts this
+    function already prevents across its own top-up rounds.
+
     In practice this loop almost never repeats more than once: the discard
     rate is astronomically rare (an episode has to defeat escalating jitter
     up to ~0.1 — see _psd_safe_batch/_batched_cholesky). max_rounds bounds
@@ -3062,14 +3168,20 @@ def generate_gp_batch(
     base_seed = getattr(cfg, "seed", None)
     episodes = _generate_gp_batch_raw(
         cfg, B, device, return_kernel_metadata=return_kernel_metadata,
+        d_override=d_override,
         tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+        kernel_weights=kernel_weights,
     )
-    # Pin every top-up round to the first round's d_features. Top-up rounds
-    # reseed with a different cfg.seed (below), which would otherwise
+    # Pin every top-up round to the first round's d_features (or the
+    # caller-supplied d_override, if the first round came up empty). Top-up
+    # rounds reseed with a different cfg.seed (below), which would otherwise
     # re-sample d independently (variable-d datasets, see _sample_d_features)
     # and silently mix feature counts within one shard — collate_fn cannot
     # pad across the feature axis, unlike P/N, so this must stay fixed.
-    d_fixed = int(episodes[0]["x_norm_train"].shape[-1]) if episodes else None
+    if episodes:
+        d_fixed = int(episodes[0]["x_norm_train"].shape[-1])
+    else:
+        d_fixed = d_override
     max_rounds = 20
     for round_idx in range(1, max_rounds + 1):
         if len(episodes) >= B:
@@ -3086,6 +3198,7 @@ def generate_gp_batch(
             cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata,
             d_override=d_fixed,
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+            kernel_weights=kernel_weights,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
