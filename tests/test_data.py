@@ -24,8 +24,10 @@ from data_gen import (
     ALL_KERNELS,
     _CATEGORY_OPS,
     _DEFAULT_CATEGORY_WEIGHTS,
+    _generate_gp_batch_raw,
     _kernel_needs_scalar_input,
     _sample_mean_module,
+    _sample_structural_category_mask,
     _sample_structural_ops,
     _structural_warp_column,
     _STRUCTURAL_CATEGORIES,
@@ -1226,14 +1228,25 @@ def test_structural_warp_prob_one_changes_output(small_cfg):
 def test_structural_warp_partial_gate_leaves_some_columns_unwarped(small_cfg):
     """0 < structural_warp_prob < 1 over a large-enough batch should leave at
     least one episode identical to its pre-warp input and at least one
-    changed — verifies the per-(episode, column) Bernoulli gate."""
+    changed — verifies the per-(episode, column) Bernoulli gate.
+
+    B=500 (not a smaller round number): with d_features=6 independent
+    Bernoulli(0.5) gates per episode, P(all 6 columns gate in) = 1/64, so a
+    fully-unwarped episode is a ~1/64 event -- B=64 makes "zero unwarped
+    episodes this run" plausible by chance alone (~37% at that B), which is
+    a property of the RNG draw order/count, not of the gate rate itself (see
+    apply_structural_feature_warp's docstring: the batched implementation
+    consumes the RNG in a different order/count than a naive per-column
+    loop would, by design). B=500 drives that false-negative chance below
+    1e-3 while still exercising the real gate.
+    """
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
     cfg.data.structural_warp_enabled = True
     cfg.data.structural_warp_prob = 0.5
 
     torch.manual_seed(0)
-    B = 64
+    B = 500
     x = torch.randn(B, 32, cfg.data.d_features)
     out = apply_structural_feature_warp(x.clone(), cfg, "cpu")
     n_unchanged = sum(torch.equal(out[b], x[b]) for b in range(B))
@@ -1320,6 +1333,103 @@ def test_structural_warp_num_ops_defaults_match_tempopfn(small_cfg):
     assert int(getattr(cfg.data, "structural_warp_num_ops_max", 6)) == 6
     weights = dict(getattr(cfg.data, "structural_warp_category_weights", _DEFAULT_CATEGORY_WEIGHTS))
     assert weights == _DEFAULT_CATEGORY_WEIGHTS
+
+
+def test_structural_warp_batched_category_selection_matches_per_column_marginals():
+    """_sample_structural_category_mask (the batched, vectorised category
+    selector apply_structural_feature_warp now uses) must draw from the same
+    per-category selection frequency and same [num_ops_min, num_ops_max]
+    category-count law as _sample_structural_ops (the original per-column
+    loop, still used directly by the resample_artifact fallback and exercised
+    by test_structural_warp_ops_sampled_without_replacement /
+    test_structural_warp_category_weights_zero_excludes_category above) --
+    the two are expected to differ in RNG draw order/count (see
+    apply_structural_feature_warp's docstring), but must realize the exact
+    same distribution. Compares empirical per-category selection rates over
+    many draws with a generous tolerance (this is a statistical check, not
+    an exact-count one)."""
+    torch.manual_seed(0)
+    n_draws = 20000
+    num_ops_min, num_ops_max = 2, 6
+
+    old_counts = {c: 0 for c in _STRUCTURAL_CATEGORIES}
+    old_k = []
+    for _ in range(n_draws):
+        ops = _sample_structural_ops(_DEFAULT_CATEGORY_WEIGHTS, num_ops_min, num_ops_max)
+        op_to_category = {op: cat for cat, ops_in_cat in _CATEGORY_OPS.items() for op in ops_in_cat}
+        cats = {op_to_category[op] for op in ops}
+        for c in cats:
+            old_counts[c] += 1
+        old_k.append(len(cats))
+
+    chosen_mask, eligible = _sample_structural_category_mask(
+        n_draws, _DEFAULT_CATEGORY_WEIGHTS, num_ops_min, num_ops_max, "cpu"
+    )
+    new_counts = {c: int(chosen_mask[:, i].sum()) for i, c in enumerate(eligible)}
+    new_k = chosen_mask.sum(dim=1).tolist()
+
+    for c in _STRUCTURAL_CATEGORIES:
+        old_rate = old_counts[c] / n_draws
+        new_rate = new_counts[c] / n_draws
+        assert abs(old_rate - new_rate) < 0.02, (
+            f"{c}: per-column rate={old_rate:.3f} vs batched rate={new_rate:.3f}"
+        )
+
+    old_mean_k = sum(old_k) / len(old_k)
+    new_mean_k = sum(new_k) / len(new_k)
+    assert abs(old_mean_k - new_mean_k) < 0.05, (
+        f"mean #categories selected: per-column={old_mean_k:.3f} vs batched={new_mean_k:.3f}"
+    )
+
+
+def test_structural_warp_batch_is_deterministic_given_seed():
+    """apply_structural_feature_warp must still be a pure function of
+    torch's global RNG state (same seed -> same output), even though the
+    vectorised implementation consumes that RNG in a different order/count
+    than the old per-column loop did -- this is the property
+    train.py::_compute_tabicl_z_train_gap's analytic-vs-tabicl paired-call
+    seeding contract (see _generate_gp_batch_raw's docstring) actually
+    depends on, not byte-identical output vs. the pre-vectorisation
+    implementation."""
+    cfg = OmegaConf.create({"data": {
+        "structural_warp_enabled": True, "structural_warp_prob": 0.5, "d_features": 6,
+    }})
+
+    torch.manual_seed(7)
+    x1 = torch.randn(16, 32, 6)
+    torch.manual_seed(7)
+    x2 = torch.randn(16, 32, 6)
+    assert torch.equal(x1, x2)  # sanity: the two seeds really do reproduce the same input
+
+    torch.manual_seed(123)
+    out1 = apply_structural_feature_warp(x1.clone(), cfg, "cpu")
+    torch.manual_seed(123)
+    out2 = apply_structural_feature_warp(x2.clone(), cfg, "cpu")
+    assert torch.equal(out1, out2)
+
+
+def test_generate_gp_batch_raw_structural_warp_seed_pairing_contract(small_cfg):
+    """train.py::_compute_tabicl_z_train_gap calls _generate_gp_batch_raw
+    TWICE at the identical cfg.seed -- once analytic (tabicl_model=None),
+    once with a stand-in override -- relying on both calls drawing
+    byte-identical x/kernel/hyperparameters and differing ONLY in z_train
+    (see that function's docstring). apply_structural_feature_warp runs
+    identically in both calls (it doesn't touch z_train), so this must still
+    hold now that it's vectorised: two full analytic _generate_gp_batch_raw
+    calls at the same seed, with structural warping forced on, must be
+    byte-identical to each other in every field."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 0.5
+    cfg.seed = 999
+
+    eps1 = _generate_gp_batch_raw(cfg, 8, device="cpu")
+    eps2 = _generate_gp_batch_raw(cfg, 8, device="cpu")
+    assert len(eps1) == len(eps2) and len(eps1) > 0
+    for e1, e2 in zip(eps1, eps2):
+        for key in e1:
+            assert torch.equal(e1[key], e2[key]), f"field '{key}' differs across same-seed calls"
 
 
 # Explicit (category, op) pairs, since categories have different arities.
