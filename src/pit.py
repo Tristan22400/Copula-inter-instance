@@ -229,6 +229,12 @@ def run_pit(
     y_train_batch = Y_train.permute(1, 0).contiguous()                   # (d, P)
 
     logits = tabicl(X_test_batch, y_train_batch)                         # (d, N, Q)
+    # TabICL's InferenceManager auto-batches large forward calls and, under
+    # low free GPU memory, may offload its output to CPU regardless of the
+    # input device (see inference.py's _resolve_offload_mode) -- re-sync
+    # onto `device` so quantile_dist's internal tensors never end up on a
+    # different device than y_test_flat/y_qry_flat below.
+    logits = logits.to(device)
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(d * N, Q))
 
@@ -260,6 +266,7 @@ def run_pit(
         y_ctx_batch = Y_train[ctx_idx].permute(1, 0).contiguous()          # (d, P-F)
 
         logits_fold = tabicl(X_fold_batch, y_ctx_batch)                    # (d, F, Q)
+        logits_fold = logits_fold.to(device)  # see run_pit's offload-mode comment above
         dist_fold = tabicl.quantile_dist(logits_fold.reshape(d * F, Q))
 
         y_qry_flat = Y_train[qry_idx].permute(1, 0).reshape(d * F)
@@ -336,6 +343,9 @@ def run_pit_batched(
     y_train_batch = Y_train.permute(0, 2, 1).reshape(B * d, P).contiguous()     # (B*d, P)
 
     logits = tabicl(X_test_batch, y_train_batch)                                # (B*d, N, Q)
+    # See run_pit's offload-mode comment: TabICL's InferenceManager can return
+    # its output on CPU under GPU memory pressure regardless of input device.
+    logits = logits.to(device)
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
 
@@ -373,6 +383,7 @@ def run_pit_batched(
         )
 
         logits_fold = tabicl(X_fold_batch, y_ctx_batch)                        # (B*d, F, Q)
+        logits_fold = logits_fold.to(device)  # see run_pit's offload-mode comment above
         dist_fold = tabicl.quantile_dist(logits_fold.reshape(B * d * F, Q))
 
         y_qry_flat = Y_train[:, qry_idx].permute(0, 2, 1).reshape(B * d * F)
@@ -446,6 +457,9 @@ def run_pit_calib_split_batched(
     y_calib_batch = Y_calib.permute(0, 2, 1).reshape(B * d, P_C).contiguous()  # (B*d, P_C)
 
     logits = tabicl(X_batch, y_calib_batch)                                  # (B*d, P_Q, Q)
+    # See run_pit's offload-mode comment: TabICL's InferenceManager can return
+    # its output on CPU under GPU memory pressure regardless of input device.
+    logits = logits.to(device)
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(B * d * P_Q, Q))
 
