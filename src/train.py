@@ -76,10 +76,17 @@ from eval.configs.regions import REGIONS as ERA5_REGIONS
 from eval.spatial.diagnostics import bin_correlation_by_distance
 from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
 from live_dataset import build_fixed_live_val_batches, build_live_train_loader
-from loss import _safe_cholesky, gp_oracle_y_nll, oracle_copula_nll, y_space_nll
+from loss import _safe_cholesky, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
 from muon import Muon
-from pit import DEFAULT_K_FOLDS, load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit
+from pit import (
+    DEFAULT_K_FOLDS,
+    gp_analytical_posterior,
+    load_tabicl,
+    normalize_targets,
+    resolve_pit_ckpt,
+    run_pit,
+)
 
 _MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
@@ -391,6 +398,37 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     return batches
 
 
+def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
+    """Fixed probe set for the true-Bayes-optimal-ceiling validation metrics
+    (see validate()'s oracle_gap_posterior / corr_pearson_posterior).
+
+    data_gen.py's own oracle_mode="prior" R_star/Sigma_star (what every other
+    "oracle" quantity in this file is scored against) is context-blind by
+    construction — see data_gen.py:3359-3382 — so it is NOT the Bayes-optimal
+    lower bound achievable given (x_train, y_train), only a weaker,
+    beatable one. pit.gp_analytical_posterior computes the real one (Schur
+    complement, float64, PSD-repaired), but it only runs one episode at a
+    time and needs return_kernel_metadata=True episodes (kernel name +
+    hyperparameters), which normal training/validation batches don't carry.
+    This builds a small, fixed set of such episodes once at startup —
+    unlike _build_synthetic_kernel_batches, cfg.data's own kernel mixture
+    (systematic_composition etc.) is left untouched, since the point here is
+    to measure the ceiling on the SAME kind of episode the model actually
+    trains on, not an isolated classical kernel family.
+
+    Returns {"episodes": [...] (CPU dicts, consumed by gp_analytical_posterior
+    one at a time), "batch": {...} (device-resident, collated/padded,
+    consumed by the model forward pass — same episodes, same order)}.
+    """
+    bcfg = cfg.get("baselines", {}) or {}
+    n_episodes = int(bcfg.get("posterior_probe_n_episodes", 64))
+    base_seed = int(bcfg.get("synth_seed", 20260718)) + 2  # +1 is _compute_tabicl_z_train_gap's
+    probe_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": base_seed}))
+    episodes = generate_gp_batch(probe_cfg, n_episodes, device="cpu", return_kernel_metadata=True)
+    batch = collate_fn(episodes)
+    return {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
+
+
 def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> dict[str, dict]:
     """Fixed per-region real-ERA5 probes for the ``era5_fit/<region>``
     validation metrics (see validate()) — the real-data analogue of
@@ -642,55 +680,88 @@ def _tabicl_gap_to_mix_frac(
 @torch.no_grad()
 def _build_tabicl_val_z(
     val_loader, tabicl_marginal: nn.Module, k_folds: int, device: str,
-) -> dict[int, torch.Tensor]:
-    """Precompute the frozen TabICL marginal's K-fold PIT z_train once per
-    plot episode (see pit.py::run_pit), instead of re-running it every
+) -> dict[int, dict[str, torch.Tensor]]:
+    """Precompute the frozen TabICL marginal's K-fold PIT once per plot
+    episode (see pit.py::run_pit), instead of re-running it every
     validate() call.
 
     tabicl_marginal never changes during training and val_loader's first
     _PLOT_COLLECT_BATCHES batches are fixed across every call (live mode:
     build_fixed_live_val_batches generates them once up front; disk mode:
     val_dataset + shuffle=False iterate in the same order every time) — so
-    z_train_tabicl is the same value every validate() call and only needs
-    computing once, here, before the training loop starts.
+    this is the same value every validate() call and only needs computing
+    once, here, before the training loop starts.
 
-    Returns {batch_idx: (B, P_max) tensor}, CPU, zero-padded outside each
-    episode's true train length (matching train_mask) — moved to device and
-    sliced per-episode inside validate()'s do_plot block.
+    Queries the episode's REAL x_test/y_test (not a throwaway probe), so
+    run_pit's test-side forward pass also returns a genuine TabICL marginal
+    at the test points (z_test, log_pdf_test) — the missing ingredient for
+    scoring the model's own total (marginal+copula) Y-space NLL under a
+    real, non-oracle marginal (validate()'s y_nll_total_tabicl_marginal),
+    the same way eval_checkpoint.py::_tabicl_pit does for --z_train_source=
+    tabicl. z_train alone still drives the sim-to-real correlation check
+    (validate()'s do_plot block / corr_*_tabicl_z).
 
-    y_train is z-scored per-episode via pit.normalize_targets before
-    reaching the raw TabICL module: run_pit does no target scaling of its
-    own (unlike tabicl.TabICLRegressor.fit(), which fits a fresh
-    StandardScaler before ever calling this same underlying model). Every
-    other run_pit call site in the repo
+    Returns {batch_idx: {"z_train": (B, P_max), "z_test": (B, N_max),
+    "log_pdf_test": (B, N_max)}}, CPU, zero-padded outside each episode's
+    true train/test length (matching train_mask/test_mask) — moved to
+    device and sliced per-episode inside validate().
+
+    y_train/y_test are z-scored via pit.normalize_targets (y_test scaled
+    with y_train's own mean/std, never its own — see that function's
+    docstring) before reaching the raw TabICL module: run_pit does no
+    target scaling of its own (unlike tabicl.TabICLRegressor.fit(), which
+    fits a fresh StandardScaler before ever calling this same underlying
+    model). Every other run_pit call site in the repo
     (inference/copula_inference.py::loo_pit,
-    eval_checkpoint.py::_tabicl_z_train) goes through the same helper, so
-    this conditioning input is computed identically everywhere. Episode
-    y_train's scale is not fixed — outputscale is drawn from a GammaPrior
+    eval_checkpoint.py::_tabicl_pit) goes through the same helper, so this
+    conditioning input is computed identically everywhere. Episode y's
+    scale is not fixed — outputscale is drawn from a GammaPrior
     (data_gen.py's generative process) — so an unscaled call risks
     saturating the pretrained quantile head's CDF into its extreme tail for
-    every point alike on high-outputscale episodes, collapsing z_train's
-    spread instead of reflecting the true per-point rank.
+    every point alike on high-outputscale episodes, collapsing the PIT
+    residuals' spread instead of reflecting the true per-point rank.
+
+    log_pdf_test comes back in that same normalize_targets-scaled space —
+    a Jacobian correction (log p_raw(y) = log p_scaled(y_scaled) -
+    log(std), per normalize_targets' own docstring) is applied here so
+    every caller of this cache's log_pdf_test gets raw-nats units, matching
+    the oracle's log_pdf_test (data_gen.py's z_test/log_pdf_test are always
+    raw-nats — see y_space_nll's Args).
     """
-    cache: dict[int, torch.Tensor] = {}
+    cache: dict[int, dict[str, torch.Tensor]] = {}
     for batch_idx, batch in enumerate(val_loader):
         if batch_idx >= _PLOT_COLLECT_BATCHES:
             break
         x_train = batch["x_train"].to(device)
         y_train = batch["y_train"].to(device)
+        x_test = batch["x_test"].to(device)
+        y_test = batch["y_test"].to(device)
         train_mask = batch["train_mask"].to(device)
+        test_mask = batch["test_mask"].to(device)
         B, P_max = y_train.shape
+        N_max = y_test.shape[1]
         z_tabicl = torch.zeros(B, P_max, device=device)
+        z_test_tabicl = torch.zeros(B, N_max, device=device)
+        log_pdf_test_tabicl = torch.zeros(B, N_max, device=device)
         for b in range(B):
             n = int(train_mask[b].sum())
-            if n < 2:
+            n_te = int(test_mask[b].sum())
+            if n < 2 or n_te < 1:
                 continue  # run_pit's fold split needs >=2 context points
             X_b = x_train[b, :n]
-            y_b_scaled, _, _, _ = normalize_targets(y_train[b, :n])
+            X_te = x_test[b, :n_te]
+            y_b_scaled, y_te_scaled, _, std = normalize_targets(y_train[b, :n], y_test[b, :n_te])
             Y_b = y_b_scaled.unsqueeze(-1)
-            pit_out = run_pit(tabicl_marginal, X_b, Y_b, X_b[:1], Y_b[:1], k_folds=k_folds)
+            Y_te = y_te_scaled.unsqueeze(-1)
+            pit_out = run_pit(tabicl_marginal, X_b, Y_b, X_te, Y_te, k_folds=k_folds)
             z_tabicl[b, :n] = pit_out["z_train"].squeeze(-1)
-        cache[batch_idx] = z_tabicl.cpu()
+            z_test_tabicl[b, :n_te] = pit_out["z_test"].squeeze(-1)
+            log_pdf_test_tabicl[b, :n_te] = pit_out["log_pdf_test"].squeeze(-1) - std.log()
+        cache[batch_idx] = {
+            "z_train": z_tabicl.cpu(),
+            "z_test": z_test_tabicl.cpu(),
+            "log_pdf_test": log_pdf_test_tabicl.cpu(),
+        }
     return cache
 
 
@@ -782,6 +853,7 @@ def validate(
     synth_kernel_batches: dict | None = None,
     tabicl_val_z: dict | None = None,
     era5_val_batches: dict | None = None,
+    posterior_probe: dict | None = None,
 ) -> tuple[dict, list]:
     # Do NOT call model.eval() here: TabICL's eval mode triggers _inference_forward
     # which uses InferenceManager with its own float16 autocast on CUDA, producing
@@ -789,18 +861,17 @@ def validate(
     # benefit. Use torch.no_grad() for efficiency instead.
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
 
-    tot, cop, mar, ora, ora_cop, ora_mar, ora_cop_z = [], [], [], [], [], [], []
+    tot, cop = [], []
     cop_per_task: list[float] = []
     all_W_norms: list[float] = []
     all_s_vals: list[float] = []
     all_sigma_off: list[float] = []
     all_sigma_diag: list[float] = []
-    all_off_pred_flat: list[np.ndarray] = []
-    all_off_ora_flat: list[np.ndarray] = []
     all_off_pred: list[np.ndarray] = []
     all_off_ora: list[np.ndarray] = []
     all_off_pred_tabicl: list[np.ndarray] = []
     all_off_ora_tabicl: list[np.ndarray] = []
+    all_tabicl_marginal_total: list[float] = []
     plot_episodes: list[dict] = []
 
     for batch_idx, batch in enumerate(val_loader):
@@ -815,24 +886,8 @@ def validate(
             batch["log_pdf_test"].float(),
             batch["test_mask"],
         )
-        oracle_parts = gp_oracle_y_nll(
-            batch["Sigma_star"].float(),
-            batch["mu_star"].float(),
-            batch["y_test"].float(),
-            batch["test_mask"],
-        )
-        ora_cop_z_val = oracle_copula_nll(
-            batch["R_star"].float(),
-            batch["z_test"].float(),
-            batch["test_mask"],
-        )
         tot.append(parts["total"].item())
         cop.append(parts["copula"].item())
-        mar.append(parts["marginal"].item())
-        ora.append(oracle_parts["total"].item())
-        ora_cop.append(oracle_parts["copula"].item())
-        ora_mar.append(oracle_parts["marginal"].item())
-        ora_cop_z.append(ora_cop_z_val.item())
 
         # ---- Per-task diagnostics (vectorized — no Python loop over batch) ----
         n_test_cur = batch["test_mask"].sum(-1).float()   # (B,)
@@ -874,11 +929,8 @@ def validate(
             ri_cur, ci_cur = torch.triu_indices(N_cur, N_cur, offset=1, device=Sigma.device)
             valid_off_cur = mask_2d_cur[:, ri_cur, ci_cur]  # (B, n_pairs) bool
             off_vals_cur = Sigma[:, ri_cur, ci_cur][valid_off_cur]
-            R_star_off_cur = batch["R_star"].float()[:, ri_cur, ci_cur][valid_off_cur]
             all_sigma_off.extend(off_vals_cur.cpu().tolist())
             all_sigma_diag.extend(Sigma.diagonal(dim1=-2, dim2=-1)[batch["test_mask"]].cpu().tolist())
-            all_off_pred_flat.append(off_vals_cur.cpu().numpy())
-            all_off_ora_flat.append(R_star_off_cur.cpu().numpy())
 
         # ---- Collect data for plots ----
         if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
@@ -906,7 +958,7 @@ def validate(
                     if z_cache_b is not None:
                         n_tr = int(batch["train_mask"][b].sum())
                         if n_tr >= 2:
-                            z_tabicl_b = z_cache_b[b, :n_tr].to(device).unsqueeze(0)
+                            z_tabicl_b = z_cache_b["z_train"][b, :n_tr].to(device).unsqueeze(0)
                             sub_batch = {
                                 "x_train": batch["x_train"][b : b + 1, :n_tr],
                                 "z_train": z_tabicl_b,
@@ -918,28 +970,47 @@ def validate(
                             ep_dict["R_pred_tabicl"] = R_pred_tabicl_b
                             all_off_pred_tabicl.append(R_pred_tabicl_b[ri, ci])
                             all_off_ora_tabicl.append(R_ora_b[ri, ci])
+
+                            # Genuine (non-oracle) total Y-space NLL: score
+                            # this same TabICL-conditioned Sigma against
+                            # TabICL's OWN marginal at the test points
+                            # (z_cache_b["z_test"]/["log_pdf_test"], also
+                            # from _build_tabicl_val_z), not the oracle's —
+                            # the number that actually answers "is this
+                            # checkpoint correct once a real (imperfect)
+                            # marginal replaces the oracle one," which no
+                            # z-space-only copula NLL can (see
+                            # eval_checkpoint.py's _print_total_nll_table for
+                            # why: two different marginals' z-transforms put
+                            # z-space copula NLL on different, non-additive
+                            # scales — only a same-basis Y-space total is
+                            # comparable).
+                            z_test_tabicl_b = z_cache_b["z_test"][b, :n].to(device).unsqueeze(0)
+                            log_pdf_tabicl_b = z_cache_b["log_pdf_test"][b, :n].to(device).unsqueeze(0)
+                            mask_tabicl_b = torch.ones(1, n, dtype=torch.bool, device=device)
+                            parts_tabicl_b = y_space_nll(
+                                Sigma_tabicl, z_test_tabicl_b, log_pdf_tabicl_b, mask_tabicl_b
+                            )
+                            all_tabicl_marginal_total.append(parts_tabicl_b["total"].item())
                     plot_episodes.append(ep_dict)
 
-    mean_cop       = sum(cop)     / len(cop)
-    mean_ora_cop_z = sum(ora_cop_z) / len(ora_cop_z)
+    mean_cop = sum(cop) / len(cop)
 
+    # y_nll_total/y_nll_copula are raw (not gap-normalized): trustworthy for
+    # ranking checkpoints validated on the SAME val_loader config, but not
+    # comparable in absolute nats across runs with different validation
+    # distributions (different kernel-family mixtures, N/P ranges,
+    # data.z_train_tabicl_mix_*) — use oracle_gap_posterior below for that.
+    # The old y_nll_marginal is deliberately not reported: it is
+    # -log_pdf_test, computed entirely from data_gen.py's oracle
+    # (mu_star/sigma_star, never conditioned on the model or even on
+    # x_train/y_train — see data_gen.py's oracle_mode="prior" branch), so it
+    # is identical for every checkpoint scored on the same batch and carries
+    # no information about the model.
     metrics = {
-        "y_nll_total":           sum(tot) / len(tot),
-        "y_nll_copula":          mean_cop,
-        "y_nll_marginal":        sum(mar) / len(mar),
-        "y_nll_oracle":          sum(ora) / len(ora),
-        "y_nll_oracle_copula":   sum(ora_cop) / len(ora_cop),
-        "y_nll_oracle_marginal": sum(ora_mar) / len(ora_mar),
-        "y_nll_oracle_copula_z": mean_ora_cop_z,
+        "y_nll_total":  sum(tot) / len(tot),
+        "y_nll_copula": mean_cop,
     }
-    metrics["oracle_gap"] = metrics["y_nll_total"] - metrics["y_nll_oracle"]
-    metrics["copula_gap"] = mean_cop - mean_ora_cop_z
-
-    # Copula improvement fraction: 0 = identity baseline (R=I → NLL=0), 1 = oracle.
-    # Negative means model is worse than outputting identity.
-    metrics["copula_improvement"] = (
-        mean_cop / mean_ora_cop_z if abs(mean_ora_cop_z) > 1e-12 else float("nan")
-    )
 
     # Per-task copula NLL std — high value means unstable or heterogeneous tasks
     metrics["y_nll_copula_std"] = float(np.std(cop_per_task)) if cop_per_task else float("nan")
@@ -958,18 +1029,66 @@ def validate(
     metrics["W_norm_mean"] = float(np.mean(all_W_norms)) if all_W_norms else 0.0
     metrics["s_mean"]      = float(np.mean(all_s_vals))  if all_s_vals  else 0.0
 
-    # Correlation quality vs oracle
-    if all_off_pred_flat:
-        off_p_all = np.concatenate(all_off_pred_flat)
-        off_o_all = np.concatenate(all_off_ora_flat)
-        cq = _corr_quality(off_p_all, off_o_all)
-        metrics["corr_mse"]     = cq["mse"]
-        metrics["corr_mae"]     = cq["mae"]
-        metrics["corr_pearson"] = cq["pearson"]
-        metrics["corr_bias"]    = cq["bias"]
-    else:
-        metrics["corr_mse"] = metrics["corr_mae"] = float("nan")
-        metrics["corr_pearson"] = metrics["corr_bias"] = float("nan")
+    # ---- True Bayes-optimal ceiling (pit.gp_analytical_posterior) --------
+    # Replaces the old full-val-set oracle_gap/copula_gap/copula_improvement
+    # (deleted above along with y_nll_oracle*): those were scored against
+    # data_gen.py's oracle_mode="prior" R_star/Sigma_star, which is
+    # context-blind by construction (never conditions on x_train/y_train —
+    # see data_gen.py:3359-3382) and therefore NOT the Bayes-optimal lower
+    # bound achievable given the context the model actually receives, only
+    # a weaker, beatable one — a model that legitimately exploits context
+    # could (and should) beat it, which the old "copula_improvement"
+    # (0=identity, 1=oracle) had no way to express as anything but a
+    # confusing ">1". gp_analytical_posterior computes the real Schur-
+    # complement posterior instead, so oracle_gap_posterior >= 0 in
+    # expectation is a genuine inequality (see its docstring), not a
+    # convention that can be beaten by a better model.
+    #
+    # Restricted to posterior_probe's small fixed episode set:
+    # gp_analytical_posterior runs one episode at a time (float64
+    # eigendecomposition-based PSD repair), so this is deliberately not run
+    # over the full val_loader.
+    if posterior_probe is not None:
+        pb = posterior_probe["batch"]
+        out_p = model(pb)
+        Sigma_p = build_sigma(out_p, cfg, jitter=jitter, test_mask=pb["test_mask"])
+        parts_p = y_space_nll(
+            Sigma_p, pb["z_test"].float(), pb["log_pdf_test"].float(), pb["test_mask"]
+        )
+        nll_post_per_point: list[float] = []
+        off_p_post: list[np.ndarray] = []
+        off_o_post: list[np.ndarray] = []
+        for b, ep in enumerate(posterior_probe["episodes"]):
+            n = int(ep["x_norm_test"].shape[0])
+            if n < 1:
+                continue
+            try:
+                post = gp_analytical_posterior(ep)
+            except (KeyError, NotImplementedError):
+                continue  # rare unsupported kernel schema — see gp_analytical_posterior's docstring
+            nll_post_per_point.append(post["nll_post"] / n)  # raw-sum -> nats/point, matching y_space_nll
+            if n >= 2:
+                ri_p, ci_p = np.triu_indices(n, k=1)
+                off_p_post.append(Sigma_p[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
+                off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
+        if nll_post_per_point:
+            metrics["y_nll_oracle_posterior"] = float(np.mean(nll_post_per_point))
+            metrics["oracle_gap_posterior"] = parts_p["total"].item() - metrics["y_nll_oracle_posterior"]
+        if off_p_post:
+            cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
+            metrics["corr_pearson_posterior"] = cq_p["pearson"]
+            metrics["corr_mae_posterior"] = cq_p["mae"]
+
+    # Genuine (non-oracle) total Y-space NLL under TabICL's own frozen
+    # marginal — see the do_plot loop above (all_tabicl_marginal_total),
+    # only populated when do_plot fires (same cadence as corr_*_tabicl_z).
+    # Unlike the deleted y_nll_oracle_copula_z-style z-space comparisons,
+    # this needs no reference matrix at all: total Y-space NLL is a proper
+    # scoring rule regardless of which marginal produced the z-transform,
+    # so it's directly the "does this checkpoint actually work once you
+    # plug in a real, imperfect marginal at deployment" number.
+    if all_tabicl_marginal_total:
+        metrics["y_nll_total_tabicl_marginal"] = float(np.mean(all_tabicl_marginal_total))
 
     # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
     # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
@@ -1106,11 +1225,15 @@ def validate(
             fig_den.tight_layout()
             plot_figs.append(fig_den)
 
-            # Sim-to-real gap: same plot-subset episodes, same oracle targets,
-            # but off_p_t comes from conditioning on TabICL's own K-fold PIT
-            # z_train instead of the exact one (see the do_plot block above /
-            # _build_tabicl_val_z). Compared against `mse` from the same
-            # subset (not the full-val-set corr_mse below) so the gap isn't
+            # Sim-to-real gap: same plot-subset episodes, same oracle targets
+            # (data_gen.py's context-blind R_star, not gp_analytical_
+            # posterior's R_post — this stays a RELATIVE comparison against
+            # the model's own oracle-context prediction on the identical
+            # subset, so the reference's own imperfection cancels out even
+            # though it isn't the true posterior), but off_p_t comes from
+            # conditioning on TabICL's own K-fold PIT z_train instead of the
+            # exact one (see the do_plot block above / _build_tabicl_val_z).
+            # Compared against `mse` from the same subset so the gap isn't
             # confounded by the two metrics covering different episode sets.
             if all_off_pred_tabicl:
                 off_p_t = np.concatenate(all_off_pred_tabicl)
@@ -1673,6 +1796,7 @@ def main(cfg: DictConfig) -> None:
 
     baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
     synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
+    posterior_probe = _build_posterior_probe_batches(cfg, device) if baselines_on else None
 
     # z_train sim-to-real diagnostic (see _build_tabicl_val_z / validate()'s
     # do_plot block): needs a second, frozen TabICL copy with its native
@@ -2171,6 +2295,7 @@ def main(cfg: DictConfig) -> None:
                 synth_kernel_batches=synth_kernel_batches,
                 tabicl_val_z=tabicl_val_z,
                 era5_val_batches=era5_val_batches,
+                posterior_probe=posterior_probe,
             )
             log_dict = {f"val/{k}": v for k, v in metrics.items()}
             if adaptive_kernel_weights is not None:
@@ -2200,15 +2325,23 @@ def main(cfg: DictConfig) -> None:
                 for f in plot_figs:
                     plt.close(f)
             wandb.log(log_dict, step=step)
-            pearson = metrics["corr_pearson"]
+            # Surfaces the total NLL (not copula alone — see validate()'s
+            # y_nll_marginal removal comment for why copula-only numbers
+            # under-report when comparing runs with different marginal
+            # difficulty) and the true-Bayes-optimal-ceiling gap (not the
+            # old, beatable prior-based oracle_gap) as the live-monitoring
+            # headline, plus kernel_fit's per-family (not pooled) Pearson.
+            total_nll = metrics["y_nll_total"]
+            total_str = f"{total_nll:.4f}" if math.isfinite(total_nll) else "nan"
+            gap = metrics.get("oracle_gap_posterior", float("nan"))
+            gap_str = f"{gap:.4f}" if math.isfinite(gap) else "n/a"
+            pearson = metrics.get("kernel_fit/mean_corr_pearson", float("nan"))
             pearson_str = f"{pearson:.3f}" if math.isfinite(pearson) else "n/a"
-            cop_nll = metrics["y_nll_copula"]
-            cop_str = f"{cop_nll:.4f}" if math.isfinite(cop_nll) else "nan"
             print(
                 f"[{step:6d}] VAL  "
-                f"cop={cop_str}  "
+                f"total={total_str}  "
+                f"gap_post={gap_str}  "
                 f"corr_r={pearson_str}  "
-                f"corr_mse={metrics['corr_mse']:.4f}  "
                 f"od_μ={metrics['sigma_offdiag_mean']:+.4f} od_σ={metrics['sigma_offdiag_std']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean']:.4f}  "
                 f"cop_std={metrics['y_nll_copula_std']:.4f}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
