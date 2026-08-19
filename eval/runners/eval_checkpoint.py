@@ -76,7 +76,7 @@ from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
-from pit import DEFAULT_K_FOLDS, load_tabicl, normalize_targets, run_pit  # noqa: E402
+from pit import DEFAULT_K_FOLDS, gp_analytical_posterior, load_tabicl, normalize_targets, run_pit  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
@@ -130,7 +130,7 @@ def _eval_icl_episode(
     icl_model: nn.Module,
     device: torch.device,
     z_train_override: Tensor | None = None,
-) -> tuple[dict[str, float], dict[str, Tensor], Tensor]:
+) -> tuple[dict[str, float], dict[str, Tensor], Tensor, dict[str, float]]:
     """Evaluate just the ICL model + oracle lower bound on one episode — the
     cheap, per-checkpoint part of the comparison (no fitting/training loop),
     always recomputed even when the baseline results are served from cache.
@@ -140,6 +140,14 @@ def _eval_icl_episode(
     conditioning input — everything else (z_test, R_oracle, the baselines)
     still scores/fits against the episode's true values, since only the
     model's *input* is meant to change, not what "correct" means.
+
+    Returns (nlls, R_dict, R_oracle, y_space_nlls) — y_space_nlls is a
+    separate {"prior": ..., "posterior": ...} dict (see gp_analytical_
+    posterior's docstring for why these two aren't folded into `nlls`
+    alongside icl/oracle/baselines: they're a full multivariate-normal
+    Y-space NLL, not the z-space copula-only NLL every other entry in
+    `nlls` is, so they're not in the same units/comparable via the same
+    table — nan values for both keys when unavailable).
     """
     X_train = ep["x_norm_train"].to(device)   # (P, d_x)
     z_train = (
@@ -182,7 +190,30 @@ def _eval_icl_episode(
     nlls["oracle"] = corr_nll_single(R_oracle, z_test)
     R_dict["oracle"] = R_oracle
 
-    return nlls, R_dict, R_oracle
+    # "oracle" above is the PRIOR reference (cfg.data.oracle_mode="prior" —
+    # the only mode data_gen.py's training pipeline supports): R_star = raw
+    # kernel correlation among test points, never conditioned on the
+    # realized (x_train, y_train). It is NOT a true lower bound in the sense
+    # of "the best achievable full predictive NLL" — the actual Bayes-optimal
+    # reference additionally Schur-complement-conditions on context, computed
+    # below via gp_analytical_posterior as a SEPARATE total Y-space NLL (not
+    # folded into `nlls`/`R_dict`'s z-space-copula-only comparison — see that
+    # function's docstring for why the two aren't in the same units). R_post
+    # is still stashed into R_dict purely for the correlation-grid plot (a
+    # descriptive visual of what conditioning does to the correlation
+    # structure), never scored against z_test.
+    y_space_nlls = {"prior": float("nan"), "posterior": float("nan")}
+    try:
+        post = gp_analytical_posterior(ep)
+        R_dict["oracle_posterior"] = post["R_post"].to(device)
+        y_space_nlls = {"prior": post["nll_prior"], "posterior": post["nll_post"]}
+        if post["repaired"]:
+            print(f"    [oracle_posterior] PSD repair fired (min_eig={post['min_eig']:.2e})")
+    except (KeyError, NotImplementedError) as exc:
+        R_dict["oracle_posterior"] = R_I.clone()
+        print(f"  [oracle_posterior] unavailable: {exc}")
+
+    return nlls, R_dict, R_oracle, y_space_nlls
 
 
 def _tabicl_z_train(
@@ -340,17 +371,21 @@ _METHOD_ORDER = [
     ("per_ep_transformer",  "PerEp-Transformer"),
     ("best_baseline",       "Best-of-Baselines (per-episode)"),
     ("icl",                 "ICL (pretrained)"),
-    ("oracle",              "Oracle"),
+    ("oracle",              "Oracle (prior)"),
 ]
 
 # Excluded from the "5 best baselines" ranking: independence/gp_prior_rbf
 # are trivial, no-fit reference points rather than baselines, icl/oracle
-# aren't baselines at all (icl is our model, oracle is the lower bound), and
-# best_baseline is itself derived from this same ranking (added after it's
-# computed each episode — see main()'s loop).
+# aren't baselines at all (icl is our model, oracle is a reference, not a
+# fitted candidate), and best_baseline is itself derived from this same
+# ranking (added after it's computed each episode — see main()'s loop).
 _NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle", "best_baseline"}
 
-_METHOD_LABELS = dict(_METHOD_ORDER)
+# oracle_posterior only ever appears in R_dict (the correlation-grid plot),
+# never in `nlls`/_METHOD_ORDER's z-space table — see
+# _eval_icl_episode's docstring for why its NLL isn't comparable in that
+# table's units. Kept here only so the plot panel gets a readable title.
+_METHOD_LABELS = dict(_METHOD_ORDER) | {"oracle_posterior": "Oracle (posterior)"}
 
 
 def _kernel_composition_label(ep: dict) -> str:
@@ -462,9 +497,34 @@ def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "oracle
         elif key == "icl":
             marker = "  ← our model"
         elif key == "oracle":
-            marker = "  ← lower bound"
+            marker = "  ← unconditional kernel corr. among test pts (NOT Bayes-optimal; see GP oracle Y-space NLL below)"
         print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{marker}")
     print(f"{'─' * total}\n")
+
+
+def _print_y_space_oracle(y_space_nlls: list[dict[str, float]]) -> None:
+    """Total (marginal + copula) Y-space multivariate-normal GP oracle NLL,
+    prior vs. posterior — see gp_analytical_posterior's docstring for why
+    this is a SEPARATE table from _print_table's z-space copula-only NLL
+    (different units, not just a missing row there): this one directly
+    answers "how much does conditioning on context help, in the units of a
+    real predictive log-likelihood" and posterior <= prior is a real,
+    provable guarantee here (Bayes-optimality of the posterior predictive
+    under log-loss), unlike a same-z_test z-space copula comparison.
+
+    Episodes where gp_analytical_posterior was unavailable (systematic-chain
+    kernel with whole-chain outer sign modulation, or a --dataset_dir
+    episode missing kernel metadata) contribute NaN to both columns and are
+    excluded via nanmean/nanstd, same convention as _print_table.
+    """
+    prior_vals = [d["prior"] for d in y_space_nlls]
+    post_vals  = [d["posterior"] for d in y_space_nlls]
+    n_valid = sum(1 for d in y_space_nlls if not np.isnan(d["posterior"]))
+    print(f"GP oracle total NLL (Y-space, marginal+copula) — lower is better, "
+          f"posterior <= prior is a Bayes-optimality guarantee here "
+          f"[valid for {n_valid}/{len(y_space_nlls)} episodes]")
+    print(f"  prior (unconditioned):      mean={np.nanmean(prior_vals):.4f}  std={np.nanstd(prior_vals):.4f}")
+    print(f"  posterior (Schur-conditioned): mean={np.nanmean(post_vals):.4f}  std={np.nanstd(post_vals):.4f}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +737,7 @@ def main() -> None:
 
     n_ep = args.n_episodes
     all_nlls: list[dict[str, float]] = []
+    all_y_space_nlls: list[dict[str, float]] = []
     plot_R_dict: dict[str, Tensor] | None = None
     plot_R_oracle: Tensor | None = None
     plot_best_key: str | None = None
@@ -786,9 +847,10 @@ def main() -> None:
                 print(f"  [ep {ep_i}] fewer than 2 training points — "
                       "falling back to oracle z_train for this episode")
 
-        icl_nlls, icl_R, R_oracle = _eval_icl_episode(
+        icl_nlls, icl_R, R_oracle, y_space_nlls = _eval_icl_episode(
             ep=ep, icl_model=icl_model, device=device, z_train_override=z_train_override,
         )
+        all_y_space_nlls.append(y_space_nlls)
 
         nlls   = {**baseline_nlls, **icl_nlls}
         R_dict = {**baseline_R, **icl_R}
@@ -824,7 +886,9 @@ def main() -> None:
                 plot_best_R   = R_dict[mode_key]
 
         print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
-        print(f"    icl={icl_nll:.4f}  oracle={ora_nll:.4f}")
+        print(f"    icl={icl_nll:.4f}  oracle(prior, z-space copula)={ora_nll:.4f}  "
+              f"GP-oracle-y-space(prior={y_space_nlls['prior']:.4f}, "
+              f"posterior={y_space_nlls['posterior']:.4f})")
         if fold_details:
             fold_summary = ", ".join(
                 f"fold{fd['fold']}={_METHOD_LABELS.get(fd['selected'], fd['selected'])}"
@@ -848,6 +912,7 @@ def main() -> None:
         return
 
     _print_table(all_nlls, z_train_source=args.z_train_source)
+    _print_y_space_oracle(all_y_space_nlls)
 
     # ---- Correlation heatmap ----
     if plot_R_dict is not None and plot_R_oracle is not None:
