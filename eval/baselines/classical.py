@@ -839,6 +839,9 @@ def train_per_episode(
 # ---------------------------------------------------------------------------
 
 
+_NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
+
+
 def eval_baselines_episode(
     ep: dict,
     icl_rank: int,
@@ -852,7 +855,7 @@ def eval_baselines_episode(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
-) -> tuple[dict[str, float], dict[str, Tensor], dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
     """Evaluate every classical/fitted baseline (everything except the ICL
     model and the oracle) on one episode, under identical conventions.
 
@@ -866,13 +869,20 @@ def eval_baselines_episode(
         nlls        : {method_name: copula_nll_float} — z-space, common
                        oracle-standardized z_test (see corr_nll_single).
         R_dict      : {method_name: (N, N) correlation tensor} — for plotting
-        y_space_nlls: {method_name: total_y_space_nll_float} — raw y-units,
-                       each method's OWN fitted marginal (mean/Sigma for
-                       GP-MLE/DKL, empirical train mean/std for
-                       per_ep_transformer), via gp_oracle_y_nll — comparable
-                       across methods precisely because everyone supplies
-                       their own full predictive density scored at the same
-                       real y_test, unlike `nlls`' shared-marginal design.
+        y_space_nlls: {method_name: {"total", "marginal", "copula"}} — raw
+                       y-units, each method's OWN fitted marginal (mean/Sigma
+                       for GP-MLE/DKL, empirical train mean/std for
+                       per_ep_transformer), via gp_oracle_y_nll's own
+                       Sklar split — comparable across methods precisely
+                       because everyone supplies their own full predictive
+                       density scored at the same real y_test, unlike
+                       `nlls`' shared-marginal design. Note this "copula"
+                       entry is under each method's OWN fitted marginal
+                       (its own standardized residual, own correlation
+                       matrix), so it is NOT directly comparable to `nlls`'
+                       shared-ground-truth-marginal copula NLL — both are
+                       legitimate, different questions (see eval_checkpoint.py's
+                       per-episode print for both side by side).
                        independence/gp_prior_rbf are unfit references, not
                        included here (mirrors _NON_FITTED_EXCLUDED).
     """
@@ -886,13 +896,14 @@ def eval_baselines_episode(
     N = X_test.shape[0]
     nlls: dict[str, float] = {}
     R_dict: dict[str, Tensor] = {}
-    y_space_nlls: dict[str, float] = {}
+    y_space_nlls: dict[str, dict[str, float]] = {}
     test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
 
-    def _total_nll(mean: Tensor, Sigma: Tensor) -> float:
-        return gp_oracle_y_nll(
+    def _nll_parts(mean: Tensor, Sigma: Tensor) -> dict[str, float]:
+        parts = gp_oracle_y_nll(
             Sigma.unsqueeze(0), mean.unsqueeze(0), y_test.unsqueeze(0), test_mask,
-        )["total"].item()
+        )
+        return {k: v.item() for k, v in parts.items()}
 
     # --- independence ---
     R_I = torch.eye(N, dtype=X_train.dtype, device=device)
@@ -928,12 +939,12 @@ def eval_baselines_episode(
                                              n_restarts=n_restarts_mle)
                 nlls[label] = corr_nll_single(fit["R"], z_test)
                 R_dict[label] = fit["R"]
-                y_space_nlls[label] = _total_nll(fit["mean"], fit["Sigma"])
+                y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
             except Exception as exc:
                 print(f"  [{label}] failed: {exc}")
                 nlls[label] = float("nan")
                 R_dict[label] = R_I.clone()
-                y_space_nlls[label] = float("nan")
+                y_space_nlls[label] = _NAN_PARTS.copy()
 
     # --- Deep Kernel Learning (MLP + GP, jointly trained), across multiple kernels ---
     # "periodic" excluded: not PD in the fixed 16-dim latent space at any dimensionality.
@@ -954,7 +965,7 @@ def eval_baselines_episode(
                                         oracle_mode=oracle_mode, prior_cfg=prior_cfg)
             nlls[label] = corr_nll_single(fit["R"], z_test)
             R_dict[label] = fit["R"]
-            y_space_nlls[label] = _total_nll(fit["mean"], fit["Sigma"])
+            y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
         except Exception as exc:
             print(f"  [{label}] failed: {exc}")
             nlls[label] = float("nan")
@@ -981,14 +992,14 @@ def eval_baselines_episode(
         R_dict["per_ep_transformer"] = Sigma_te
         mean_tr = y_train.mean()
         std_tr = y_train.std(unbiased=True).clamp(min=1e-6)
-        y_space_nlls["per_ep_transformer"] = _total_nll(
+        y_space_nlls["per_ep_transformer"] = _nll_parts(
             mean_tr.expand(N), (std_tr ** 2) * Sigma_te,
         )
     except Exception as exc:
         print(f"  [per_ep_transformer] failed: {exc}")
         nlls["per_ep_transformer"] = float("nan")
         R_dict["per_ep_transformer"] = R_I.clone()
-        y_space_nlls["per_ep_transformer"] = float("nan")
+        y_space_nlls["per_ep_transformer"] = _NAN_PARTS.copy()
 
     return nlls, R_dict, y_space_nlls
 
