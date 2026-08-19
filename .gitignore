@@ -12,5 +12,4 @@ src/models/__pycache__/
 *.stdout
 *.pdf
 *.png
-plots/era5_real_default.nc
-eval/data/
+eval/data/cache/

@@ -9,7 +9,9 @@ Supports two on-disk layouts (auto-detected):
 The sharded layout is produced by generate_pit_dataset.py and is much faster
 on NFS because it reduces file-metadata operations by a factor of B.
 A small LRU shard cache (default 4 shards) keeps recently accessed shards
-in memory to amortise repeated random accesses within a DataLoader.
+memory-mapped (torch.load(..., mmap=True), not eagerly copied into RAM) to
+amortise repeated random accesses within a DataLoader while keeping each
+worker's RSS low.
 """
 
 from __future__ import annotations
@@ -34,6 +36,26 @@ _FINITE_CHECK_KEYS = ("z_train", "z_test", "y_train", "y_test")
 
 def _episode_is_finite(ep: dict) -> bool:
     return all(torch.isfinite(ep[k]).all() for k in _FINITE_CHECK_KEYS if k in ep)
+
+
+def _add_derived_fields(ep: dict) -> dict:
+    """Reconstruct R_prior/Sigma_star when a shard was written without them.
+
+    generate_pit_dataset.py stops persisting these two N_max x N_max fields:
+    with oracle_mode="prior" (the only supported mode) they're exact
+    functions of R_star/sigma_star, which ARE stored -- R_prior == R_star,
+    and Sigma_star == R_star * outer(sigma_star, sigma_star) (see
+    data_gen.py's oracle_mode="prior" branch). Recomputing here is lossless
+    and keeps every downstream consumer (collate_fn, train.py, loss.py)
+    unaware of which schema a given shard was written with. Shards that DO
+    carry these keys (written before this change) are left untouched.
+    """
+    if "Sigma_star" not in ep:
+        sigma = ep["sigma_star"]
+        ep["Sigma_star"] = ep["R_star"] * sigma.unsqueeze(0) * sigma.unsqueeze(1)
+    if "R_prior" not in ep:
+        ep["R_prior"] = ep["R_star"].clone()
+    return ep
 
 
 class CopulaDataset(Dataset):
@@ -130,14 +152,16 @@ class CopulaDataset(Dataset):
 
     def _get_individual(self, idx: int) -> dict:
         try:
-            return torch.load(self._files[idx], map_location="cpu", weights_only=True)
+            ep = torch.load(self._files[idx], map_location="cpu", weights_only=True, mmap=True)
         except FileNotFoundError:
             candidates = [i for i in range(len(self._files)) if i != idx]
             if not candidates:
                 raise
-            return torch.load(
-                self._files[random.choice(candidates)], map_location="cpu", weights_only=True
+            ep = torch.load(
+                self._files[random.choice(candidates)],
+                map_location="cpu", weights_only=True, mmap=True,
             )
+        return _add_derived_fields(ep)
 
     # ------------------------------------------------------------------
     # Sharded loading with LRU cache
@@ -153,16 +177,27 @@ class CopulaDataset(Dataset):
         if shard_path not in self._shard_cache:
             if len(self._shard_cache) >= self._SHARD_CACHE_SIZE:
                 self._shard_cache.popitem(last=False)   # evict LRU
-            self._shard_cache[shard_path] = torch.load(
-                shard_path, map_location="cpu", weights_only=False
-            )
+            shard = torch.load(shard_path, map_location="cpu", weights_only=False, mmap=True)
+            self._shard_cache[shard_path] = shard
         else:
             # Move to end to mark as most-recently used
             self._shard_cache.move_to_end(shard_path)
 
         shard     = self._shard_cache[shard_path]
         local_idx = min(local_idx, len(shard) - 1)   # guard for last shard
-        return shard[local_idx]
+        # Derive R_prior/Sigma_star on a shallow copy instead of caching them
+        # on the shard itself: computing eagerly for all shard_size episodes
+        # up front (and retaining them for the shard's whole time in the LRU
+        # cache) re-materializes in RAM the exact bytes generate_pit_dataset.py
+        # stopped persisting to disk (they're each an N_max x N_max float32
+        # matrix, ~2/3 of a shard's pre-fix size) -- times shard_cache_size x
+        # num_workers resident shards, this was pushing RSS to the cgroup cap
+        # on large-N_max datasets (e.g. systematic-composition-all-base).
+        # Deriving per-episode and returning a shallow copy leaves the cached
+        # shard holding only the cheap mmap-backed raw fields; the derived
+        # matrices are freed once collate_fn consumes them instead of staying
+        # pinned for the shard's entire cache lifetime.
+        return _add_derived_fields(dict(shard[local_idx]))
 
     def _get_sharded(self, idx: int) -> dict:
         # Non-finite z_train/y_train (see _episode_is_finite) shouldn't reach
@@ -172,19 +207,33 @@ class CopulaDataset(Dataset):
         # exclude" convention data_gen.py uses for its own degenerate
         # episodes, just applied at load time for shards written before that
         # fix existed.
+        #
+        # The skip must stay within idx's own shard: variable-d_features
+        # datasets store a different feature count per shard, and
+        # ShardHomogeneousBatchSampler guarantees every batch stays within one
+        # shard on the assumption that __getitem__ never crosses that
+        # boundary either. Wrapping globally (mod self._n_total) broke that
+        # guarantee whenever the non-finite episode was last in its shard —
+        # the skip would land in the next shard, silently handing back an
+        # episode with a different d_features and blowing up collate_fn with
+        # a "mixed feature counts" error much later.
+        shard_size  = self._shard_size
+        shard_start = (idx // shard_size) * shard_size
+        shard_len   = min(shard_size, self._n_total - shard_start)
         probe = idx
         for _ in range(self._MAX_INVALID_RETRIES):
             ep = self._load_shard_entry(probe)
             if _episode_is_finite(ep):
                 return ep
+            next_probe = shard_start + (probe - shard_start + 1) % shard_len
             import warnings
             warnings.warn(
                 f"CopulaDataset: episode at idx {probe} has non-finite "
                 f"z_train/y_train (stale degenerate episode); skipping to "
-                f"idx {(probe + 1) % self._n_total}.",
+                f"idx {next_probe}.",
                 RuntimeWarning,
             )
-            probe = (probe + 1) % self._n_total
+            probe = next_probe
         raise RuntimeError(
             f"CopulaDataset: {self._MAX_INVALID_RETRIES} consecutive non-finite "
             f"episodes starting at idx {idx} — dataset may need regeneration."

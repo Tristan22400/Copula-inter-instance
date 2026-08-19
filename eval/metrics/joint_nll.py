@@ -29,7 +29,7 @@ if _SRC not in sys.path:
 
 from loss import y_space_nll  # noqa: E402
 
-__all__ = ["compute_joint_nll", "compute_pit"]
+__all__ = ["compute_joint_nll", "compute_pit", "kfold_loo_pit"]
 
 
 def compute_pit(
@@ -56,6 +56,44 @@ def compute_pit(
     u_clamped = np.clip(u, eps, 1 - eps)
     z = norm.ppf(u_clamped)
     return z, log_pdf
+
+
+def kfold_loo_pit(
+    quantile_fn,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    probs: np.ndarray,
+    *,
+    k_folds: int = 10,
+    eps: float = 1e-6,
+    seed: int = 0,
+) -> np.ndarray:
+    """K-fold leave-fold-out PIT, generic over how the quantile grid for the
+    held-out fold is produced. ``quantile_fn(X_context, y_context, X_query,
+    fold_idx) -> quantile_grid`` fits/predicts on one fold split; this
+    function only owns the fold assignment and the compute_pit call, shared
+    by every regressor backend that needs the same recipe (originally
+    duplicated per-backend, see eval/tabicl_utils.py::tabicl_loo_pit and
+    eval/spatial/marginal_backends.py::loo_pit, now both thin wrappers here).
+
+    Returns:
+        Z_train: (n_train,) — Gaussianized PIT residuals
+    """
+    n = len(y_train)
+    k_folds = min(k_folds, n)
+    rng = np.random.default_rng(seed)
+    fold_id = rng.permutation(n) % k_folds
+
+    z = np.empty(n)
+    for k in range(k_folds):
+        held = fold_id == k
+        rest = ~held
+        if held.sum() == 0 or rest.sum() == 0:
+            continue
+        qgrid_held = quantile_fn(X_train[rest], y_train[rest], X_train[held], k)
+        z_held, _ = compute_pit(qgrid_held, probs, y_train[held], eps)
+        z[held] = z_held
+    return z
 
 
 def compute_joint_nll(
