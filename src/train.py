@@ -574,10 +574,16 @@ def _compute_tabicl_z_train_gap(
     This is a property of TabICL's frozen marginal-quantile approximation
     for that kernel family, not of the copula model being trained -- unlike
     train.py::_update_adaptive_kernel_weights's regret signal, which chases
-    a moving target as the model trains, this doesn't change during
-    training, so it's computed once, up front (train.py's startup
+    a moving target as the model trains, this doesn't move with the model,
+    so by default it's computed once, up front (train.py's startup
     sequence, alongside _build_tabicl_val_z, before `tabicl_marginal` is
-    freed), not re-measured every validate() call.
+    freed) and not re-measured again. data.z_train_tabicl_mix_adaptive
+    opts into periodic re-measurement anyway (see _refresh_tabicl_mix_weights,
+    called on the training.save_every cadence), e.g. to track drift in
+    TabICL's own approximation quality if the checkpoint backing it changes
+    meaning over a long run -- either way this is never called from inside
+    validate() itself, since it needs its own fresh episode generation, not
+    validate()'s fixed probe batches.
 
     Uses cfg.baselines.synth_n_episodes/synth_seed/probe_P_*/probe_N_* (the
     same fixed-probe-set knobs _build_synthetic_kernel_batches uses) offset
@@ -675,6 +681,44 @@ def _tabicl_gap_to_mix_frac(
         normalized = (gaps[family] - lo) / spread
         frac[i] = floor_frac + (max_frac - floor_frac) * normalized
     return frac
+
+
+def _refresh_tabicl_mix_weights(
+    cfg: DictConfig, pit_ckpt: str, tabicl_mix_weights: torch.Tensor, device: str,
+) -> tuple[dict[str, float], torch.Tensor]:
+    """data.z_train_tabicl_mix_adaptive's periodic analogue of the one-shot
+    startup measurement above: reloads the frozen TabICL marginal, re-runs
+    _compute_tabicl_z_train_gap / _tabicl_gap_to_mix_frac, and .copy_()'s the
+    result into tabicl_mix_weights in place (same shared-memory-tensor
+    convention as _update_adaptive_kernel_weights's own in-place update --
+    rebinding the name would leave LiveGPDataset workers pointed at the old
+    tensor).
+
+    Unlike _update_adaptive_kernel_weights, which reuses metrics validate()
+    already computed, there's no cheap reusable signal here: measuring the
+    gap needs a live TabICL forward pass, so this loads tabicl_marginal fresh
+    and frees it again around the measurement rather than keeping a second
+    frozen TabICL resident for the whole run (this repo runs close to the
+    VRAM ceiling -- see the comment above the training loop's autograd-graph
+    release). That reload + ~1k-episode remeasurement is why callers gate
+    this on training.save_every (already 10x rarer than training.val_every
+    by default) rather than every validate() call.
+    """
+    tabicl_marginal = load_tabicl(pit_ckpt, device)
+    pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
+    z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
+    floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
+    max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
+    new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
+    tabicl_mix_weights.copy_(new_mix_frac)
+    del tabicl_marginal
+    if device == "cuda":
+        # gc.collect() before empty_cache() (see this repo's OOM-handler
+        # gotcha): del alone doesn't free CUDA storage until any reference
+        # cycles in the eval-mode forward graph are collected.
+        gc.collect()
+        torch.cuda.empty_cache()
+    return z_gap, new_mix_frac
 
 
 @torch.no_grad()
@@ -2349,6 +2393,24 @@ def main(cfg: DictConfig) -> None:
 
         if step % t.save_every == 0 and step > 0:
             save_checkpoint(model, optimizer, scheduler, cfg, step, scaler=scaler)
+            if (
+                tabicl_mix_weights is not None and pit_ckpt
+                and bool(cfg.data.get("z_train_tabicl_mix_adaptive", False))
+            ):
+                z_gap, new_mix_frac = _refresh_tabicl_mix_weights(
+                    cfg, pit_ckpt, tabicl_mix_weights, device
+                )
+                print(f"[train][step {step}] Re-measured z_train_tabicl_mix_* (adaptive):")
+                save_log = {}
+                for i, family in enumerate(_COMPOSABLE_KERNELS):
+                    if family in z_gap:
+                        save_log[f"val/z_train_tabicl_gap/{family}"] = z_gap[family]
+                        print(
+                            f"[train]   {family}: z_train_tabicl_gap={z_gap[family]:.3f} "
+                            f"-> mix_frac={float(new_mix_frac[i]):.3f}"
+                        )
+                    save_log[f"val/tabicl_mix_frac/{family}"] = float(new_mix_frac[i])
+                wandb.log(save_log, step=step)
 
     save_checkpoint(model, optimizer, scheduler, cfg, t.steps, scaler=scaler)
     wandb.finish()

@@ -398,17 +398,20 @@ z_train_split_calib_frac: 1.0
 # worst.
 #
 # The per-family fraction is set ONCE at training startup (train.py::
-# _compute_tabicl_z_train_gap / _tabicl_gap_to_mix_frac), not re-adapted
-# during training like training.adaptive_kernel_sampling's kernel_weights:
-# the TabICL-vs-analytic z_train gap is a property of the frozen TabICL
-# marginal's quantile-head approximation quality for that kernel family, not
-# of the copula model being trained, so unlike adaptive_kernel_sampling's
-# regret signal (which moves as the model improves) it isn't a moving target
-# and doesn't need re-measuring every validate() call. Families with a
-# larger measured gap (harder for TabICL to approximate) get a higher
-# mixing fraction, linearly interpolated between the floor and max fractions
-# below over the observed [min_gap, max_gap] range across
-# data_gen._COMPOSABLE_KERNELS.
+# _compute_tabicl_z_train_gap / _tabicl_gap_to_mix_frac) by default, not
+# re-adapted during training like training.adaptive_kernel_sampling's
+# kernel_weights: the TabICL-vs-analytic z_train gap is a property of the
+# frozen TabICL marginal's quantile-head approximation quality for that
+# kernel family, not of the copula model being trained, so unlike
+# adaptive_kernel_sampling's regret signal (which moves as the model
+# improves) it isn't a moving target and doesn't strictly need re-measuring
+# during training -- but see z_train_tabicl_mix_adaptive below to opt into
+# periodic re-measurement anyway (e.g. if the TabICL checkpoint used for
+# this diagnostic changes meaning across a long run, or just for closer
+# monitoring). Families with a larger measured gap (harder for TabICL to
+# approximate) get a higher mixing fraction, linearly interpolated between
+# the floor and max fractions below over the observed [min_gap, max_gap]
+# range across data_gen._COMPOSABLE_KERNELS.
 #
 # Requires training.live_generation=true and a resolvable TabICL checkpoint
 # (same tabicl.ckpt/tabicl.pit_ckpt resolution as z_train_source=tabicl) and
@@ -430,6 +433,16 @@ z_train_tabicl_mix_floor_frac: 0.05
 # split is meant to concentrate that cost on the families that most need it,
 # not to approach the full z_train_source=tabicl override.
 z_train_tabicl_mix_max_frac: 0.35
+# false (default): the per-family gap/fraction above is measured once at
+# startup and frozen for the whole run. true: also re-measure it every
+# training.save_every checkpoint (train.py's _refresh_tabicl_mix_weights,
+# called from the same block as save_checkpoint) -- reuses training.save_every
+# rather than a separate cadence knob, since it's already 10x rarer than
+# training.val_every by default and each re-measurement reloads the frozen
+# TabICL marginal, regenerates data_gen._COMPOSABLE_KERNELS-worth of probe
+# episodes, and frees it again (~1k+ extra episodes and a TabICL reload per
+# refresh -- not free, hence tied to the rarer cadence and opt-in).
+z_train_tabicl_mix_adaptive: false
 
 # z_train corruption (see data_gen.py::corrupt_z_train's docstring): trains
 # the model to be robust to z_train NOT being the exact closed-form GP-LOO
