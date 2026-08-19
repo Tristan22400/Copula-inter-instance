@@ -1,7 +1,7 @@
 #!/bin/bash
 #OAR -n TabICL_Train
 #OAR -l gpu=1,walltime=36:00:00
-#OAR -p gpu_model != 'TITAN RTX' AND gpu_model != 'TitanRTX'
+#OAR -p gpu_model != 'TITAN RTX' AND gpu_model != 'TitanRTX' AND gpu_model != 'Quadro RTX 8000'
 
 
 set -euo pipefail
@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR/.."
 
-FORBIDDEN_GPU_REGEX="${FORBIDDEN_GPU_REGEX:-TITAN[[:space:]]*RTX|TitanRTX}"
+FORBIDDEN_GPU_REGEX="${FORBIDDEN_GPU_REGEX:-TITAN[[:space:]]*RTX|TitanRTX|Quadro[[:space:]]*RTX[[:space:]]*8000}"
 
 configure_cuda_devices() {
     if ! command -v nvidia-smi >/dev/null 2>&1; then
