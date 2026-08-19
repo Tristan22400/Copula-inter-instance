@@ -916,6 +916,15 @@ def main() -> None:
 
     print(f"  GP MLE: {args.n_steps_mle} steps | DKL: {args.n_steps_dkl} steps | "
           f"PerEp: {args.n_steps_per_ep} steps (patience={args.patience_per_ep})")
+    print("  [per-episode print legend] 'shared_marginal'/'shared_copula' values "
+          "score every method's own correlation matrix against the SAME "
+          "ground-truth-standardized z_test, so they rank correlation-structure "
+          "quality alone. 'own(...)'/'own_marginal' values instead use each "
+          "method's OWN fitted marginal, so its own copula/marginal split is "
+          "NOT comparable across methods (a method's own marginal can score "
+          "better OR worse than another's regardless of which has the better "
+          "overall fit) — only 'total' is a proper scoring rule comparable "
+          "across methods with different marginals.")
 
     # ---- Baseline cache: skip re-fitting GP-MLE/DKL/per_ep_transformer for
     # episodes already scored under an identical generation/fitting config ----
@@ -1060,9 +1069,17 @@ def main() -> None:
                 plot_best_R   = R_dict[mode_key]
 
         print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
-        print(f"    icl={icl_nll:.4f}  oracle(prior, z-space copula)={ora_nll:.4f}  "
-              f"GP-oracle-y-space(prior={y_space_nlls['prior']['total']:.4f}, "
-              f"posterior={y_space_nlls['posterior']['total']:.4f})")
+        # Every number on this line is per-point (nats/point) and scored
+        # against the SHARED ground-truth marginal's z_test — icl/oracle_prior
+        # here are the same z-space-copula-only quantity as nlls["icl"]/
+        # nlls["oracle"]. GP-oracle-y-space-total pulls from total_nlls (not
+        # y_space_nlls directly) so it's on that same per-point footing —
+        # y_space_nlls itself is the raw (unnormalized) sum gp_analytical_posterior
+        # returns, which _print_y_space_oracle's aggregate table prints as-is.
+        print(f"    icl(shared_marginal)={icl_nll:.4f}  "
+              f"oracle_prior(shared_marginal, z-space copula)={ora_nll:.4f}  "
+              f"GP-oracle-y-space-total(prior={total_nlls['oracle_prior']['total']:.4f}, "
+              f"posterior={total_nlls['oracle_posterior']['total']:.4f})")
         print(f"    total Y-space NLL, own marginal (total = marginal + copula): "
               f"icl=(cop={total_nlls['icl']['copula']:.4f}, "
               f"marg={total_nlls['icl']['marginal']:.4f}, "
