@@ -35,6 +35,7 @@ from eval.baselines.classical import (  # noqa: E402
     save_baseline_cache,
 )
 from eval.runners.eval_checkpoint import _eval_icl_episode  # noqa: E402
+from pit import gp_analytical_posterior  # noqa: E402
 
 _TINY_DATA_CFG = {
     "d_features": 1,
@@ -82,7 +83,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
     together" contract eval_checkpoint.py relies on."""
     n_test = tiny_episode["x_norm_test"].shape[0]
 
-    nlls, R_dict = eval_baselines_episode(
+    nlls, R_dict, y_space_nlls = eval_baselines_episode(
         ep=tiny_episode,
         icl_rank=2,
         n_steps_mle=3,
@@ -104,8 +105,12 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         "dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product",
         "per_ep_transformer",
     }
+    # y_space_nlls excludes independence/gp_prior_rbf (unfit references, no
+    # genuine marginal — see eval_baselines_episode's docstring).
+    expected_y_keys = expected_keys - {"independence", "gp_prior_rbf"}
     assert expected_keys <= nlls.keys()
     assert expected_keys <= R_dict.keys()
+    assert expected_y_keys <= y_space_nlls.keys()
 
     assert abs(nlls["independence"]) < 1e-3
     _assert_valid_correlation(R_dict["independence"], n_test)
@@ -116,19 +121,37 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
     for method in expected_keys:
         assert torch.isfinite(torch.tensor(nlls[method])), f"{method} produced a non-finite NLL"
         _assert_valid_correlation(R_dict[method], n_test)
+    for method in expected_y_keys:
+        assert torch.isfinite(torch.tensor(y_space_nlls[method])), \
+            f"{method} produced a non-finite total Y-space NLL"
 
 
 def test_eval_icl_episode_scores_against_oracle(tiny_episode):
     n_test = tiny_episode["x_norm_test"].shape[0]
     fake_model = _FakeICLModel(n_test=n_test, rank=2)
 
-    nlls, R_dict, R_oracle = _eval_icl_episode(ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"))
+    nlls, R_dict, R_oracle, y_space_nlls, icl_total_nll = _eval_icl_episode(
+        ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"),
+    )
 
     assert set(nlls.keys()) == {"icl", "oracle"}
     assert torch.isfinite(torch.tensor(nlls["icl"]))
     assert torch.isfinite(torch.tensor(nlls["oracle"]))
     _assert_valid_correlation(R_dict["icl"], n_test)
     assert torch.equal(R_oracle, tiny_episode["R_star"])
+    # No tabicl_pit given (oracle z_train mode, the default) -> no learned
+    # ICL marginal to score a total Y-space NLL against.
+    assert torch.isnan(torch.tensor(icl_total_nll))
+
+
+def test_gp_oracle_posterior_total_nll_bayes_optimal(tiny_episode):
+    """The Y-space total-NLL table's oracle_prior/oracle_posterior rows
+    (see _print_total_nll_table) are gp_analytical_posterior's own
+    nll_prior/nll_post divided by N — dividing by a positive constant N
+    can't flip the Bayes-optimality guarantee posterior <= prior
+    (see gp_analytical_posterior's docstring), so it must still hold here."""
+    post = gp_analytical_posterior(tiny_episode)
+    assert post["nll_post"] <= post["nll_prior"] + 1e-6
 
 
 def test_baseline_cache_round_trip(tiny_episode, tmp_path):
@@ -145,16 +168,20 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path):
         n_steps_dkl=3, lr_dkl=0.1, n_steps_per_ep=3, patience_per_ep=2,
     )
 
-    nlls, R_dict = eval_baselines_episode(
+    nlls, R_dict, y_space_nlls = eval_baselines_episode(
         ep=tiny_episode, icl_rank=2, n_steps_mle=3, lr_mle=0.1, n_steps_dkl=3, lr_dkl=0.1,
         n_steps_per_ep=3, patience_per_ep=2, device=torch.device("cpu"), oracle_mode="prior", n_restarts_mle=1,
     )
     key = episode_cache_key(live_generate=True, dataset_dir=None, seed=0, local_i=0, ep_i=0)
-    save_baseline_cache(cache_path, fingerprint, {key: {"nlls": nlls, "R_dict": R_dict}})
+    save_baseline_cache(
+        cache_path, fingerprint,
+        {key: {"nlls": nlls, "R_dict": R_dict, "y_nlls": y_space_nlls}},
+    )
 
     reloaded = load_baseline_cache(cache_path, fingerprint)
     assert key in reloaded
     assert reloaded[key]["nlls"] == nlls
+    assert reloaded[key]["y_nlls"] == y_space_nlls
     for method, R in R_dict.items():
         assert torch.equal(reloaded[key]["R_dict"][method], R)
 
