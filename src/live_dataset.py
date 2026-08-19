@@ -381,7 +381,7 @@ def build_live_train_loader(
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=_limit_worker_threads if num_workers > 0 else None,
-        multiprocessing_context="spawn" if tabicl_live_enabled else None,
+        multiprocessing_context="spawn" if (tabicl_live_enabled and num_workers > 0) else None,
     )
     return loader, kernel_weights, tabicl_mix_weights
 
