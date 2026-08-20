@@ -132,6 +132,18 @@ _GPU_PEAK_TFLOPS: dict[str, float] = {
 }
 _GPU_PEAK_FLOPS_DEFAULT = 100e12
 
+# GPU-memory headroom for live-generation's TabICL DataLoader workers (see
+# _reserve_gpu_headroom_for_live_tabicl below): live_dataset.py's docstring
+# measured ~120MB resident / ~1.4GB peak per worker at batch_size=32 with the
+# cheaper tabicl_split path; this run's z_train_tabicl_mix_* path additionally
+# does a K-fold rotation (default k_folds=10, several forward passes per
+# call instead of one), so budget above that measured peak rather than at it.
+_LIVE_TABICL_WORKER_HEADROOM_GB = 2.5
+# Flat allowance on top of the per-worker figure above, for each worker's own
+# CUDA context overhead (not activation memory, so it doesn't scale with
+# batch/fold count) plus a general safety margin.
+_LIVE_TABICL_FLAT_HEADROOM_GB = 1.0
+
 
 def get_gpu_peak_flops(device: int = 0) -> float:
     """Theoretical peak dense FP16/BF16 tensor-core FLOPs for the active GPU.
@@ -153,6 +165,58 @@ def get_gpu_peak_flops(device: int = 0) -> float:
         "TFLOPS. MFU numbers will be approximate."
     )
     return _GPU_PEAK_FLOPS_DEFAULT
+
+
+def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device: str) -> None:
+    """Cap this (main) process's own CUDA memory fraction when live-generation
+    will also run TabICL inference inside separate GPU DataLoader worker
+    processes on the same card (live_dataset.py's data.z_train_tabicl_mix_* /
+    data.z_train_source=tabicl* path).
+
+    Root cause this works around: each such worker holds its own CUDA
+    context, entirely separate from this process's caching allocator pool.
+    Live-generation batches vary P/N a lot (see the top-of-file
+    expandable_segments comment), so this process's own pool can ratchet up
+    to a high "reserved" watermark and never give it back -- PyTorch's
+    caching allocator only returns memory to the driver via empty_cache(),
+    which nothing here calls outside the OOM handler below. Reserved memory
+    is invisible to *other* processes even when this process isn't actively
+    using most of it, so given enough steps this process's pool can starve a
+    TabICL worker's small allocation of the little free VRAM the driver has
+    left -- and unlike this process's own OOMs, a worker's OOM was previously
+    completely uncaught (see next(train_iter) below), taking the whole run
+    down instead of costing one skipped step.
+
+    set_per_process_memory_fraction makes this process itself OOM (into the
+    already-correct, already-tested gc.collect()-before-empty_cache() handler
+    below) once it would otherwise have crowded out the workers' headroom,
+    instead of silently starving them. It only caps future growth -- it does
+    not reclaim memory already reserved -- so this must run before any
+    training-loop allocation happens.
+    """
+    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
+    tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
+    if not tabicl_live_enabled or device != "cuda":
+        return
+    num_workers = int(t.get("live_tabicl_num_workers", 2))
+    if num_workers <= 0:
+        return
+    headroom_gb = num_workers * _LIVE_TABICL_WORKER_HEADROOM_GB + _LIVE_TABICL_FLAT_HEADROOM_GB
+    total_b = torch.cuda.get_device_properties(0).total_memory
+    fraction = 1.0 - (headroom_gb * 1e9) / total_b
+    # Clamp: never below 0.5 (a misconfigured huge num_workers shouldn't starve
+    # this process instead), never above 0.97 (always leave the OOM handler's
+    # own gc.collect()/empty_cache() cycle some margin to actually help).
+    fraction = max(0.5, min(fraction, 0.97))
+    torch.cuda.set_per_process_memory_fraction(fraction, 0)
+    print(
+        f"[train] live-generation TabICL workers ({num_workers}) run their own "
+        f"CUDA context on this GPU -- capping this process's own VRAM use to "
+        f"{fraction * 100:.0f}% (~{headroom_gb:.1f} GB reserved as worker "
+        "headroom) so its allocator can't silently starve them; any excess is "
+        "handled by the existing per-step OOM-skip path."
+    )
 
 
 def _sigma_stats(Sigma: torch.Tensor, mask: torch.Tensor) -> dict:
@@ -1538,6 +1602,7 @@ def main(cfg: DictConfig) -> None:
     t = cfg.training
     live_generation = bool(t.get("live_generation", False))
     if live_generation:
+        _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         # dataset_dir is ignored entirely in this mode (see below) — naming the
         # run after it would be misleading, so summarize cfg.data.* instead.
         # Also fold in ckpt_dir's basename since it's often the only
@@ -2060,6 +2125,28 @@ def main(cfg: DictConfig) -> None:
         except StopIteration:
             train_iter = iter(train_loader)
             raw_batch = next(train_iter)
+        except torch.cuda.OutOfMemoryError as exc:
+            # Live-generation's TabICL workers run on the GPU in separate
+            # DataLoader worker processes (see live_dataset.py /
+            # _reserve_gpu_headroom_for_live_tabicl above) — an OOM raised
+            # there propagates through DataLoader's ExceptionWrapper.reraise()
+            # same as any other worker exception. Unlike an OOM inside
+            # _run_train_step below, this used to be completely uncaught here
+            # and killed the whole run instead of costing one skipped step.
+            # The dead worker's own per-process generator cannot resume after
+            # raising (Python generators don't survive an unhandled
+            # exception), so just retrying next(train_iter) would spin on a
+            # now-empty source; re-creating the iterator makes
+            # persistent_workers re-invoke LiveGPDataset.__iter__ in that
+            # worker instead (reloading its frozen TabICL copy, ~5s, but only
+            # on this rare recovery path).
+            print(f"[{step:6d}] CUDA OOM in a live-generation DataLoader worker — recreating iterator, skipping step.")
+            traceback.clear_frames(exc.__traceback__)
+            del exc
+            gc.collect()
+            torch.cuda.empty_cache()
+            train_iter = iter(train_loader)
+            continue
 
         optimizer.zero_grad(set_to_none=True)
         try:
