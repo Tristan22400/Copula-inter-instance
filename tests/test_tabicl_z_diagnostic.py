@@ -67,7 +67,10 @@ class FakeTabICL(nn.Module):
         return torch.distributions.Normal(loc, scale)
 
 
-def make_val_batch(B: int, P_max: int, d_x: int = 2, n_train: "list[int] | None" = None, seed: int = 0):
+def make_val_batch(
+    B: int, P_max: int, d_x: int = 2, n_train: "list[int] | None" = None,
+    N_max: int = 4, n_test: "list[int] | None" = None, seed: int = 0,
+):
     g = torch.Generator().manual_seed(seed)
     x_train = torch.randn(B, P_max, d_x, generator=g)
     y_train = torch.randn(B, P_max, generator=g)
@@ -75,7 +78,16 @@ def make_val_batch(B: int, P_max: int, d_x: int = 2, n_train: "list[int] | None"
     train_mask = torch.zeros(B, P_max, dtype=torch.bool)
     for b, n in enumerate(n_train):
         train_mask[b, :n] = True
-    return {"x_train": x_train, "y_train": y_train, "train_mask": train_mask}
+    x_test = torch.randn(B, N_max, d_x, generator=g)
+    y_test = torch.randn(B, N_max, generator=g)
+    n_test = n_test or [N_max] * B
+    test_mask = torch.zeros(B, N_max, dtype=torch.bool)
+    for b, n in enumerate(n_test):
+        test_mask[b, :n] = True
+    return {
+        "x_train": x_train, "y_train": y_train, "train_mask": train_mask,
+        "x_test": x_test, "y_test": y_test, "test_mask": test_mask,
+    }
 
 
 def test_cache_shape_and_padding():
@@ -84,7 +96,7 @@ def test_cache_shape_and_padding():
     cache = _build_tabicl_val_z([batch], tabicl, k_folds=3, device="cpu")
 
     assert set(cache.keys()) == {0}
-    z = cache[0]
+    z = cache[0]["z_train"]
     assert z.shape == (3, 6)
     # Padding beyond each episode's true train length stays exactly zero.
     assert torch.equal(z[1, 4:], torch.zeros(2))
@@ -95,7 +107,7 @@ def test_short_context_skipped_stays_zero():
     tabicl = FakeTabICL()
     batch = make_val_batch(B=1, P_max=5, n_train=[1])  # n_train < 2 -> skipped
     cache = _build_tabicl_val_z([batch], tabicl, k_folds=3, device="cpu")
-    assert torch.equal(cache[0], torch.zeros(1, 5))
+    assert torch.equal(cache[0]["z_train"], torch.zeros(1, 5))
 
 
 def test_deterministic_across_calls():
@@ -106,7 +118,8 @@ def test_deterministic_across_calls():
     batch = make_val_batch(B=4, P_max=8, n_train=[8, 6, 3, 8])
     cache_1 = _build_tabicl_val_z([batch], tabicl, k_folds=4, device="cpu")
     cache_2 = _build_tabicl_val_z([batch], tabicl, k_folds=4, device="cpu")
-    assert torch.equal(cache_1[0], cache_2[0])
+    for key in ("z_train", "z_test", "log_pdf_test"):
+        assert torch.equal(cache_1[0][key], cache_2[0][key])
 
 
 def _make_episode(n: int, with_tabicl: bool, label: str) -> dict:
