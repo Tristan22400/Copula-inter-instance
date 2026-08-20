@@ -873,6 +873,7 @@ def validate(
     # benefit. Use torch.no_grad() for efficiency instead.
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
 
+    cop_per_task: list[float] = []
     all_W_norms: list[float] = []
     all_s_vals: list[float] = []
     all_sigma_off: list[float] = []
@@ -893,11 +894,6 @@ def validate(
         Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
 
         # ---- Per-task diagnostics (vectorized — no Python loop over batch) ----
-        # Sigma-only statistics (offdiag/diag/W/s): these read the model's own
-        # covariance output, not batch["z_test"]/["log_pdf_test"] (the exact
-        # analytic-GP PIT this val set was generated with) — unlike the
-        # deleted y_nll_total/y_nll_copula/y_nll_copula_std, they aren't
-        # "testing the NLL with the ground truth z_test" and stay in val/.
         n_test_cur = batch["test_mask"].sum(-1).float()   # (B,)
         valid_cur = n_test_cur >= 2
 
@@ -905,6 +901,25 @@ def validate(
             mask_2d_cur = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
             n_safe_cur = n_test_cur.clamp(min=1)
             N_cur = Sigma.shape[1]
+
+            # Per-task copula NLL against batch["z_test"] (the exact
+            # analytic-GP PIT this val set was generated with) -> feeds
+            # oracle_diag/copula_nll_std below: this DOES test the trained
+            # model (Sigma is the model's own output) against ground truth,
+            # so it belongs in oracle_diag/, not among the Sigma-only stats
+            # below (which don't reference z_test at all).
+            eye_cur = torch.eye(N_cur, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
+            S_safe_cur = torch.where(mask_2d_cur, Sigma, eye_cur)
+            L_cur, info_cur = torch.linalg.cholesky_ex(S_safe_cur)
+            if info_cur.any():
+                S_safe_cur = S_safe_cur + 1e-4 * eye_cur
+                L_cur = torch.linalg.cholesky(S_safe_cur)
+            log_det_cur = 2.0 * L_cur.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)
+            z_f = batch["z_test"].float()
+            tmp_cur = torch.linalg.solve_triangular(L_cur, z_f.unsqueeze(-1), upper=False)
+            S_inv_z_cur = torch.linalg.solve_triangular(L_cur.mT, tmp_cur, upper=True).squeeze(-1)
+            cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f ** 2).sum(-1)) / n_safe_cur
+            cop_per_task.extend(cop_cur[valid_cur].cpu().tolist())
 
             # W row-norms and s means (masked mean over valid test instances).
             # "s" is absent for "tanhnorm" (see model.py's _NO_SCALAR_COLUMN /
@@ -1008,20 +1023,30 @@ def validate(
                 if ep_dict is not None:
                     plot_episodes.append(ep_dict)
 
-    # metrics starts empty: the old y_nll_total/y_nll_copula/y_nll_copula_std
-    # here scored the model against batch["z_test"]/["log_pdf_test"] — the
-    # exact analytic-GP PIT this val set was generated with, i.e. a ground-
-    # truth marginal no real deployment ever provides. All ground-truth-
-    # z_test NLL diagnostics now live under the oracle_diag/ namespace below
-    # (a sibling of val/, not nested under it — see the wandb.log prefixing
-    # in the training loop), trimmed to the few that matter (copula_nll,
-    # gap_nll) instead of mirroring every val/ metric. val/'s own headline
-    # NLL numbers (y_nll_total/y_nll_marginal/y_nll_copula, set below from
+    # metrics starts empty. The old y_nll_total/y_nll_copula here scored the
+    # model against batch["z_test"]/["log_pdf_test"] — the exact analytic-GP
+    # PIT this val set was generated with, i.e. a ground-truth marginal no
+    # real deployment ever provides — so they moved to oracle_diag/ below (a
+    # sibling of val/, not nested under it — see the wandb.log prefixing in
+    # the training loop): oracle_diag/ holds every diagnostic that runs the
+    # trained model and scores/compares its output against this ground-truth
+    # z_test/z_train, nothing else. Pure reference numbers that don't
+    # exercise the model at all (e.g. y_nll_oracle_posterior, kernel_fit's
+    # marginal_nll/oracle_posterior_total_nll — gp_analytical_posterior's
+    # ceiling and data_gen.py's oracle marginal are both independent of the
+    # model) stay in val/ instead, even though they're also ground-truth-
+    # scored, since they aren't testing the model. val/'s own headline NLL
+    # numbers (y_nll_total/y_nll_marginal/y_nll_copula, set below from
     # all_tabicl_marginal_*) are scored against TabICL's own frozen PIT
     # instead — a real, imperfect marginal, the same kind deployment would
     # actually supply — so they only populate when a PIT checkpoint is
     # configured (tabicl_val_z non-empty; see resolve_pit_ckpt in train()).
     metrics: dict = {}
+
+    # Per-task copula NLL std (against ground truth z_test) — high value
+    # means unstable or heterogeneous tasks. Tests the trained model, so
+    # lives in oracle_diag/, not val/.
+    metrics["oracle_diag/copula_nll_std"] = float(np.std(cop_per_task)) if cop_per_task else float("nan")
 
     # Sigma statistics — offdiag_mean ≈ 0 means model outputs near-identity
     if all_sigma_off:
@@ -1057,15 +1082,14 @@ def validate(
     # eigendecomposition-based PSD repair), so this is deliberately not run
     # over the full val_loader.
     #
-    # All results below are grouped under the "oracle_diag/" key prefix (see
-    # this function's return + the training loop's wandb.log call): every
-    # one of them scores the model against a ground-truth z_test/log_pdf_test
-    # (the exact analytic-GP PIT, not a real estimated marginal), so per this
-    # file's convention they don't belong in val/'s own namespace. Trimmed to
-    # the few that matter for a "how far from Bayes-optimal, on the copula
-    # alone" read: copula_nll and gap_nll (+ the two raw numbers gap_nll is a
-    # difference of, and a couple of correlation-value diagnostics) — not a
-    # mirror of every val/ metric.
+    # copula_nll/total_nll/gap_nll/corr_pearson/corr_mae below all run the
+    # model (out_p = model(pb)) and score its output against ground truth,
+    # so they're grouped under the "oracle_diag/" key prefix (see this
+    # function's return + the training loop's wandb.log call), a sibling of
+    # val/. y_nll_oracle_posterior does NOT run the model at all — it's
+    # gp_analytical_posterior's ceiling, a fixed property of the probe
+    # episodes alone — so it stays in val/ instead, right beside gap_nll's
+    # other operand (oracle_diag/total_nll) for easy side-by-side reading.
     if posterior_probe is not None:
         pb = posterior_probe["batch"]
         out_p = model(pb)
@@ -1090,19 +1114,18 @@ def validate(
                 off_p_post.append(Sigma_p[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
                 off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
         if nll_post_per_point:
-            # total_nll and oracle_posterior_nll are scored on the SAME
+            # total_nll and y_nll_oracle_posterior are scored on the SAME
             # posterior_probe episodes (unlike the old y_nll_total vs.
             # y_nll_oracle_posterior pairing, which mixed val_loader's
             # population with posterior_probe's) — gap_nll, their
             # difference, is therefore the valid same-population comparison:
             # >= 0 in expectation, and this pair can't drift apart the way
             # two different-population NLLs could.
+            oracle_posterior_nll = float(np.mean(nll_post_per_point))
             metrics["oracle_diag/copula_nll"] = parts_p["copula"].item()
             metrics["oracle_diag/total_nll"] = parts_p["total"].item()
-            metrics["oracle_diag/oracle_posterior_nll"] = float(np.mean(nll_post_per_point))
-            metrics["oracle_diag/gap_nll"] = (
-                metrics["oracle_diag/total_nll"] - metrics["oracle_diag/oracle_posterior_nll"]
-            )
+            metrics["y_nll_oracle_posterior"] = oracle_posterior_nll
+            metrics["oracle_diag/gap_nll"] = metrics["oracle_diag/total_nll"] - oracle_posterior_nll
         if off_p_post:
             cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
             metrics["oracle_diag/corr_pearson"] = cq_p["pearson"]
@@ -1134,11 +1157,11 @@ def validate(
     # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
     # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
     # so these move with training progress (unlike a fixed data-only baseline).
-    # Ground-truth-z_test-scored like the posterior_probe block above, so
-    # also grouped under oracle_diag/ and trimmed to copula_nll + gap_nll per
-    # family (marginal_nll/total_nll/oracle_posterior_total_nll are still
-    # computed to derive gap_nll, just not logged separately — they added no
-    # information beyond it for a monitoring dashboard).
+    # copula_nll/total_nll run the model and score it against ground truth ->
+    # oracle_diag/. marginal_nll (data_gen.py's oracle marginal) and
+    # oracle_posterior_total_nll (gp_analytical_posterior's ceiling) don't
+    # involve the model at all -> val/, same split as the top-level
+    # posterior_probe block above.
     for family, probe_s in (synth_kernel_batches or {}).items():
         sbatch = probe_s["batch"]
         out_s = model(sbatch)
@@ -1147,13 +1170,16 @@ def validate(
             Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
         )
         cop_s = parts_s["copula"].item()
+        mar_s = parts_s["marginal"].item()
         tot_s = parts_s["total"].item()
         metrics[f"oracle_diag/kernel_fit/{family}/copula_nll"] = cop_s
+        metrics[f"oracle_diag/kernel_fit/{family}/total_nll"]  = tot_s
+        metrics[f"kernel_fit/{family}/marginal_nll"] = mar_s
 
         # True Bayes-optimal ceiling for this family, same construction as
-        # the top-level oracle_diag/gap_nll but restricted to this family's
-        # own probe episodes (needs return_kernel_metadata=True — see
-        # _build_synthetic_kernel_batches).
+        # the top-level y_nll_oracle_posterior but restricted to this
+        # family's own probe episodes (needs return_kernel_metadata=True —
+        # see _build_synthetic_kernel_batches).
         nll_post_per_point_s: list[float] = []
         for ep in probe_s["episodes"]:
             n_s = int(ep["x_norm_test"].shape[0])
@@ -1166,6 +1192,7 @@ def validate(
             nll_post_per_point_s.append(post_s["nll_post"] / n_s)
         if nll_post_per_point_s:
             oracle_post_s = float(np.mean(nll_post_per_point_s))
+            metrics[f"kernel_fit/{family}/oracle_posterior_total_nll"] = oracle_post_s
             metrics[f"oracle_diag/kernel_fit/{family}/gap_nll"] = tot_s - oracle_post_s
 
         # One extra corr_grid column per kernel family: its own synthetic
@@ -2383,12 +2410,15 @@ def main(cfg: DictConfig) -> None:
             gap_str = f"{gap:.4f}" if math.isfinite(gap) else "n/a"
             pearson = metrics.get("oracle_diag/corr_pearson", float("nan"))
             pearson_str = f"{pearson:.3f}" if math.isfinite(pearson) else "n/a"
+            cop_std = metrics.get("oracle_diag/copula_nll_std", float("nan"))
+            cop_std_str = f"{cop_std:.4f}" if math.isfinite(cop_std) else "n/a"
             print(
                 f"[{step:6d}] VAL  "
                 f"total={total_str}  "
                 f"gap_post={gap_str}  "
                 f"corr_r={pearson_str}  "
                 f"od_μ={metrics['sigma_offdiag_mean']:+.4f} od_σ={metrics['sigma_offdiag_std']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean']:.4f}  "
+                f"cop_std={cop_std_str}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
