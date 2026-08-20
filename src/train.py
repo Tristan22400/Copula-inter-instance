@@ -76,7 +76,7 @@ from eval.configs.regions import REGIONS as ERA5_REGIONS
 from eval.spatial.diagnostics import bin_correlation_by_distance
 from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
 from live_dataset import build_fixed_live_val_batches, build_live_train_loader
-from loss import _safe_cholesky, oracle_copula_nll, y_space_nll
+from loss import _safe_cholesky, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
 from muon import Muon
 from pit import (
@@ -363,6 +363,12 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     data.P_min/P_max would each get a "frozen" probe that's fixed-per-run but
     different-across-runs, defeating the entire point of a cross-run-
     comparable benchmark.
+
+    return_kernel_metadata=True so validate() can also run
+    pit.gp_analytical_posterior per episode (kernel_fit/<family>/
+    oracle_posterior_total_nll / gap_nll) — the same true Bayes-optimal
+    ceiling used by the top-level posterior_probe, but scored per kernel
+    family instead of on the run's own composite mixture.
     """
     bcfg = cfg.get("baselines", {}) or {}
     families = list(bcfg.get("kernels") or DEFAULT_FAMILIES)
@@ -392,9 +398,9 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
                 },
             }),
         )
-        episodes = generate_gp_batch(synth_cfg, n_episodes, device="cpu")
+        episodes = generate_gp_batch(synth_cfg, n_episodes, device="cpu", return_kernel_metadata=True)
         batch = collate_fn(episodes)
-        batches[family] = {k: v.to(device) for k, v in batch.items()}
+        batches[family] = {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
     return batches
 
 
@@ -497,13 +503,20 @@ def _update_adaptive_kernel_weights(
     ordered to match data_gen._COMPOSABLE_KERNELS.
 
     Signal is the per-family excess loss (regret) already computed by
-    validate()'s kernel_fit/<family> probes: gap = copula_nll -
-    oracle_copula_nll (NLL is lower-is-better, and oracle_copula_nll is the
-    lower bound achievable by a perfect model — see loss.oracle_copula_nll —
-    so this is typically >=0, bigger when the model is further from oracle on
-    that family = more room to improve). Families with no probe (metrics
-    missing either key — e.g. not in cfg.baselines.kernels) get gap=0, i.e. no
-    update pressure, only the floor's implicit pull toward uniform.
+    validate()'s kernel_fit/<family> probes: gap_nll = total_nll -
+    oracle_posterior_total_nll (NLL is lower-is-better, and
+    oracle_posterior_total_nll is pit.gp_analytical_posterior's true
+    Schur-complement Bayes-optimal ceiling for that family's probe episodes —
+    see validate()'s kernel_fit loop — so this is typically >=0, bigger when
+    the model is further from the true posterior on that family = more room
+    to improve). Previously used copula_nll - oracle_copula_nll against
+    data_gen.py's context-blind oracle_mode="prior" R_star, a weaker, beatable
+    bound; gap_nll is also in Y-space total-NLL units, so it stays a valid
+    regret signal regardless of which marginal produced z_test, unlike a
+    z-space-only copula gap. Families with no probe (metrics missing the key
+    — e.g. not in cfg.baselines.kernels, or gp_analytical_posterior raised on
+    every episode) get gap=0, i.e. no update pressure, only the floor's
+    implicit pull toward uniform.
 
     exclude (optional): family names to hold out of the gap-driven update
     entirely (gap forced to 0), regardless of whether a kernel_fit probe
@@ -527,10 +540,9 @@ def _update_adaptive_kernel_weights(
     for i, family in enumerate(_COMPOSABLE_KERNELS):
         if family in exclude:
             continue
-        cop = metrics.get(f"kernel_fit/{family}/copula_nll")
-        ora = metrics.get(f"kernel_fit/{family}/oracle_copula_nll")
-        if cop is not None and ora is not None and math.isfinite(cop) and math.isfinite(ora):
-            gaps[i] = cop - ora
+        gap_nll = metrics.get(f"kernel_fit/{family}/gap_nll")
+        if gap_nll is not None and math.isfinite(gap_nll):
+            gaps[i] = gap_nll
     # Clamp the exponent, not the gap itself, so a single wild probe can't
     # overflow exp() into inf and NaN out every family's weight via the
     # shared normalization below.
@@ -872,6 +884,8 @@ def validate(
     all_off_pred_tabicl: list[np.ndarray] = []
     all_off_ora_tabicl: list[np.ndarray] = []
     all_tabicl_marginal_total: list[float] = []
+    all_tabicl_marginal_marginal: list[float] = []
+    all_tabicl_marginal_copula: list[float] = []
     plot_episodes: list[dict] = []
 
     for batch_idx, batch in enumerate(val_loader):
@@ -992,6 +1006,8 @@ def validate(
                                 Sigma_tabicl, z_test_tabicl_b, log_pdf_tabicl_b, mask_tabicl_b
                             )
                             all_tabicl_marginal_total.append(parts_tabicl_b["total"].item())
+                            all_tabicl_marginal_marginal.append(parts_tabicl_b["marginal"].item())
+                            all_tabicl_marginal_copula.append(parts_tabicl_b["copula"].item())
                     plot_episodes.append(ep_dict)
 
     mean_cop = sum(cop) / len(cop)
@@ -1072,8 +1088,20 @@ def validate(
                 off_p_post.append(Sigma_p[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
                 off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
         if nll_post_per_point:
+            # y_nll_total_posterior_probe is the model's total NLL on THIS
+            # SAME probe episode set (not val_loader's, which y_nll_total
+            # above comes from — a different sample, usually a different
+            # size and possibly a different N/P and kernel-family mix). Only
+            # y_nll_total_posterior_probe and y_nll_oracle_posterior, scored
+            # on identical episodes, are validly compared —
+            # oracle_gap_posterior is exactly their difference. y_nll_total
+            # can legitimately sit below y_nll_oracle_posterior (they're
+            # different populations); this pair can't drift apart that way.
+            metrics["y_nll_total_posterior_probe"] = parts_p["total"].item()
             metrics["y_nll_oracle_posterior"] = float(np.mean(nll_post_per_point))
-            metrics["oracle_gap_posterior"] = parts_p["total"].item() - metrics["y_nll_oracle_posterior"]
+            metrics["oracle_gap_posterior"] = (
+                metrics["y_nll_total_posterior_probe"] - metrics["y_nll_oracle_posterior"]
+            )
         if off_p_post:
             cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
             metrics["corr_pearson_posterior"] = cq_p["pearson"]
@@ -1089,45 +1117,67 @@ def validate(
     # plug in a real, imperfect marginal at deployment" number.
     if all_tabicl_marginal_total:
         metrics["y_nll_total_tabicl_marginal"] = float(np.mean(all_tabicl_marginal_total))
+        # Sklar split of the same TabICL-marginal total: y_nll_marginal_tabicl
+        # is TabICL's own frozen marginal NLL (moves only if the PIT
+        # checkpoint or these episodes change, not with this run's training)
+        # while y_nll_copula_tabicl is the model's copula NLL evaluated
+        # against TabICL's z_test instead of the oracle's — the piece that
+        # actually reflects whether the model's Sigma is still well-calibrated
+        # once conditioned on a real (imperfect) marginal.
+        metrics["y_nll_marginal_tabicl"] = float(np.mean(all_tabicl_marginal_marginal))
+        metrics["y_nll_copula_tabicl"] = float(np.mean(all_tabicl_marginal_copula))
 
     # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
     # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
     # so these move with training progress (unlike a fixed data-only baseline).
-    family_copula_improvement: list[float] = []
-    family_corr_pearson: list[float] = []
-    for family, sbatch in (synth_kernel_batches or {}).items():
+    #
+    # corr_mse/corr_mae/corr_pearson/copula_improvement were dropped here (and
+    # not replaced): copula_improvement's oracle_copula_nll denominator, and
+    # the correlation-value target both z-space quantities were scored
+    # against, come from data_gen.py's context-blind oracle_mode="prior"
+    # R_star — the same beatable, not-Bayes-optimal reference that motivated
+    # deleting the old top-level oracle_gap/copula_gap/copula_improvement (see
+    # the posterior_probe block above). Replaced by oracle_posterior_total_nll
+    # / gap_nll below, which use pit.gp_analytical_posterior's true
+    # Schur-complement posterior instead, same as the top-level metric.
+    for family, probe_s in (synth_kernel_batches or {}).items():
+        sbatch = probe_s["batch"]
         out_s = model(sbatch)
         Sigma_s = build_sigma(out_s, cfg, jitter=jitter, test_mask=sbatch["test_mask"])
         parts_s = y_space_nll(
             Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
         )
-        N_s = Sigma_s.shape[1]
-        ri_s, ci_s = torch.triu_indices(N_s, N_s, offset=1, device=Sigma_s.device)
-        mask2d_s = sbatch["test_mask"].unsqueeze(-1) & sbatch["test_mask"].unsqueeze(-2)
-        valid_s = mask2d_s[:, ri_s, ci_s]
-        off_p_s = Sigma_s[:, ri_s, ci_s][valid_s].cpu().numpy()
-        off_o_s = sbatch["R_star"].float()[:, ri_s, ci_s][valid_s].cpu().numpy()
-        cq_s = _corr_quality(off_p_s, off_o_s)
-        oracle_cop_s = oracle_copula_nll(
-            sbatch["R_star"].float(), sbatch["z_test"].float(), sbatch["test_mask"]
-        ).item()
         cop_s = parts_s["copula"].item()
-        metrics[f"kernel_fit/{family}/copula_nll"]        = cop_s
-        metrics[f"kernel_fit/{family}/oracle_copula_nll"] = oracle_cop_s
-        metrics[f"kernel_fit/{family}/corr_mse"]     = cq_s["mse"]
-        metrics[f"kernel_fit/{family}/corr_mae"]     = cq_s["mae"]
-        metrics[f"kernel_fit/{family}/corr_pearson"] = cq_s["pearson"]
+        mar_s = parts_s["marginal"].item()
+        tot_s = parts_s["total"].item()
+        metrics[f"kernel_fit/{family}/copula_nll"]   = cop_s
+        # marginal_nll is data_gen.py's oracle marginal (-log_pdf_test) —
+        # identical for every checkpoint scored on the same probe, same as
+        # the deleted top-level y_nll_marginal (carries no model information
+        # by itself). Reported anyway so total_nll = copula_nll + marginal_nll
+        # is self-consistent from the logged fields; copula_nll/gap_nll
+        # remain the columns that actually move with training.
+        metrics[f"kernel_fit/{family}/marginal_nll"] = mar_s
+        metrics[f"kernel_fit/{family}/total_nll"]    = tot_s
 
-        # Same 0=identity/1=oracle normalization as the top-level
-        # copula_improvement, but per-family — lets a single family's easy/
-        # hard intrinsic NLL scale be compared against its own oracle instead
-        # of pooled in with every other family.
-        family_improvement = cop_s / oracle_cop_s if abs(oracle_cop_s) > 1e-12 else float("nan")
-        metrics[f"kernel_fit/{family}/copula_improvement"] = family_improvement
-        if not math.isnan(family_improvement):
-            family_copula_improvement.append(family_improvement)
-        if not math.isnan(cq_s["pearson"]):
-            family_corr_pearson.append(cq_s["pearson"])
+        # True Bayes-optimal ceiling for this family, same construction as
+        # the top-level oracle_gap_posterior but restricted to this family's
+        # own probe episodes (needs return_kernel_metadata=True — see
+        # _build_synthetic_kernel_batches).
+        nll_post_per_point_s: list[float] = []
+        for ep in probe_s["episodes"]:
+            n_s = int(ep["x_norm_test"].shape[0])
+            if n_s < 1:
+                continue
+            try:
+                post_s = gp_analytical_posterior(ep)
+            except (KeyError, NotImplementedError):
+                continue
+            nll_post_per_point_s.append(post_s["nll_post"] / n_s)
+        if nll_post_per_point_s:
+            oracle_post_s = float(np.mean(nll_post_per_point_s))
+            metrics[f"kernel_fit/{family}/oracle_posterior_total_nll"] = oracle_post_s
+            metrics[f"kernel_fit/{family}/gap_nll"] = tot_s - oracle_post_s
 
         # One extra corr_grid column per kernel family: its own synthetic
         # episode's oracle beside the model's prediction on it — replaces the
@@ -1141,14 +1191,6 @@ def validate(
                     "R_ora":  sbatch["R_star"][0, :n_s, :n_s].float().cpu().numpy(),
                     "label":  f"kfit:{family}\nN={n_s}",
                 })
-
-    # Unweighted macro-average across kernel families: a single cross-run-
-    # comparable scalar. Plain averaging over synth_kernel_batches.items()
-    # would already be unweighted per-family (each family contributes one
-    # scalar regardless of n_episodes), but is computed explicitly here so it
-    # survives family list changes/NaNs without silently reweighting.
-    metrics["kernel_fit/mean_copula_improvement"] = _macro_average(family_copula_improvement)
-    metrics["kernel_fit/mean_corr_pearson"] = _macro_average(family_corr_pearson)
 
     # Real-ERA5 spatial-correlation probe per region (see
     # _build_era5_val_batches / eval/spatial/sweep_core.py::build_era5_probe).
@@ -1241,7 +1283,12 @@ def validate(
                 cq_t = _corr_quality(off_p_t, off_o_t)
                 metrics["corr_mse_tabicl_z"]     = cq_t["mse"]
                 metrics["corr_mae_tabicl_z"]     = cq_t["mae"]
-                metrics["corr_pearson_tabicl_z"] = cq_t["pearson"]
+                # corr_pearson_tabicl_z dropped: same "value can shift with
+                # whichever marginal produced z_test" issue as the deleted
+                # top-level pooled corr_pearson — corr_mse_tabicl_z/
+                # corr_mae_tabicl_z (and sim2real_gap, an MSE difference)
+                # aren't scale-free the same way Pearson r superficially
+                # looks like it should be, so they're kept.
                 metrics["corr_bias_tabicl_z"]    = cq_t["bias"]
                 metrics["sim2real_gap"] = cq_t["mse"] - mse
 
@@ -2330,12 +2377,16 @@ def main(cfg: DictConfig) -> None:
             # under-report when comparing runs with different marginal
             # difficulty) and the true-Bayes-optimal-ceiling gap (not the
             # old, beatable prior-based oracle_gap) as the live-monitoring
-            # headline, plus kernel_fit's per-family (not pooled) Pearson.
+            # headline, plus corr_pearson_posterior (correlation VALUES
+            # against gp_analytical_posterior's true R_post, not the old
+            # pooled kernel_fit/mean_corr_pearson against the beatable prior
+            # R_star, which no longer exists — see the kernel_fit loop's
+            # comment on why per-family corr_pearson was dropped).
             total_nll = metrics["y_nll_total"]
             total_str = f"{total_nll:.4f}" if math.isfinite(total_nll) else "nan"
             gap = metrics.get("oracle_gap_posterior", float("nan"))
             gap_str = f"{gap:.4f}" if math.isfinite(gap) else "n/a"
-            pearson = metrics.get("kernel_fit/mean_corr_pearson", float("nan"))
+            pearson = metrics.get("corr_pearson_posterior", float("nan"))
             pearson_str = f"{pearson:.3f}" if math.isfinite(pearson) else "n/a"
             print(
                 f"[{step:6d}] VAL  "
