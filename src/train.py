@@ -1225,19 +1225,25 @@ def validate(
     # lives in oracle_diag/, not val/.
     metrics["oracle_diag/copula_nll_std"] = float(np.std(cop_per_task)) if cop_per_task else float("nan")
 
-    # Sigma statistics — offdiag_mean ≈ 0 means model outputs near-identity
+    # Sigma statistics — offdiag_mean ≈ 0 means model outputs near-identity.
+    # "_analytic_z" suffix: these come from the single model(batch) forward
+    # above, which is conditioned on val_loader's own z_train — the exact
+    # analytic GP-LOO PIT (data.z_train_source="analytic" by default), NOT
+    # TabICL's K-fold PIT. Unlike y_nll_total/kernel_fit's *_tabicl metrics
+    # below, there is no TabICL-conditioned counterpart for these, so the
+    # suffix exists purely to stop them from being mistaken for one.
     if all_sigma_off:
         off_arr = np.array(all_sigma_off, dtype=np.float32)
-        metrics["sigma_offdiag_mean"] = float(off_arr.mean())
-        metrics["sigma_offdiag_std"]  = float(off_arr.std())
-        metrics["sigma_offdiag_abs_mean"] = float(np.abs(off_arr).mean())
+        metrics["sigma_offdiag_mean_analytic_z"] = float(off_arr.mean())
+        metrics["sigma_offdiag_std_analytic_z"]  = float(off_arr.std())
+        metrics["sigma_offdiag_abs_mean_analytic_z"] = float(np.abs(off_arr).mean())
     else:
-        metrics["sigma_offdiag_mean"] = metrics["sigma_offdiag_std"] = metrics["sigma_offdiag_abs_mean"] = 0.0
-    metrics["sigma_diag_mean"] = float(np.mean(all_sigma_diag)) if all_sigma_diag else 1.0
+        metrics["sigma_offdiag_mean_analytic_z"] = metrics["sigma_offdiag_std_analytic_z"] = metrics["sigma_offdiag_abs_mean_analytic_z"] = 0.0
+    metrics["sigma_diag_mean_analytic_z"] = float(np.mean(all_sigma_diag)) if all_sigma_diag else 1.0
 
-    # Model output statistics
-    metrics["W_norm_mean"] = float(np.mean(all_W_norms)) if all_W_norms else 0.0
-    metrics["s_mean"]      = float(np.mean(all_s_vals))  if all_s_vals  else 0.0
+    # Model output statistics (same analytic-z_train caveat as above)
+    metrics["W_norm_mean_analytic_z"] = float(np.mean(all_W_norms)) if all_W_norms else 0.0
+    metrics["s_mean_analytic_z"]      = float(np.mean(all_s_vals))  if all_s_vals  else 0.0
 
     # ---- True Bayes-optimal ceiling (pit.gp_analytical_posterior) --------
     # Replaces the old full-val-set oracle_gap/copula_gap/copula_improvement
@@ -2099,9 +2105,11 @@ def main(cfg: DictConfig) -> None:
     tabicl_kernel_fit_z: dict = {}
     # Real-ERA5 spatial-correlation probes (see _build_era5_val_batches):
     # built here too, alongside tabicl_val_z, so the one-time PIT cost on the
-    # frozen context sample is paid before `tabicl_marginal` is discarded —
-    # not gated on pit_ckpt existing, since build_era5_probe accepts
-    # tabicl_marginal=None (naive-standardization fallback).
+    # frozen context sample is paid before `tabicl_marginal` is discarded.
+    # Not strictly gated on pit_ckpt existing -- if pit_ckpt is None (e.g.
+    # tabicl.pretrained=false with no explicit tabicl.pit_ckpt), the elif
+    # branch below still tries tabicl.ckpt directly for era5_fit alone
+    # before falling back to build_era5_probe's naive-standardization path.
     era5_val_batches: dict = {}
     era5_on = baselines_on and bool(cfg.get("baselines", {}).get("era5_enabled", True))
     # tabicl_mix_weights is not None only when live_generation + data.
@@ -2164,12 +2172,33 @@ def main(cfg: DictConfig) -> None:
             gc.collect()
             torch.cuda.empty_cache()
     elif era5_on:
-        print(
-            "[train] Building frozen real-ERA5 spatial-correlation probes "
-            "(no PIT checkpoint configured -- context z_train falls back to "
-            "naive standardization)..."
-        )
-        era5_val_batches = _build_era5_val_batches(cfg, None, device)
+        # No general pit_ckpt (e.g. tabicl.pretrained=false with no explicit
+        # tabicl.pit_ckpt override -- see pit.py::resolve_pit_ckpt). era5_fit
+        # doesn't care whether the run's OWN backbone is pretrained; it just
+        # wants a real quantile-head marginal to PIT the ERA5 context with if
+        # one is named, so it reuses tabicl.ckpt directly here rather than
+        # going through resolve_pit_ckpt's pretrained-gated default.
+        era5_ckpt = cfg.tabicl.get("ckpt", None)
+        if era5_ckpt:
+            print(
+                f"[train] Loading frozen TabICL marginal ({era5_ckpt}) for "
+                "era5_fit only (tabicl.pretrained="
+                f"{bool(cfg.tabicl.get('pretrained', True))}, no general PIT "
+                "checkpoint configured otherwise)..."
+            )
+            era5_tabicl_marginal = load_tabicl(era5_ckpt, device)
+            era5_val_batches = _build_era5_val_batches(cfg, era5_tabicl_marginal, device)
+            del era5_tabicl_marginal
+            if device == "cuda":
+                gc.collect()
+                torch.cuda.empty_cache()
+        else:
+            print(
+                "[train] Building frozen real-ERA5 spatial-correlation probes "
+                "(no tabicl.ckpt configured -- context z_train falls back to "
+                "naive standardization)..."
+            )
+            era5_val_batches = _build_era5_val_batches(cfg, None, device)
 
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
@@ -2651,7 +2680,10 @@ def main(cfg: DictConfig) -> None:
                         continue
                     log_dict[f"val/kernel_sampling_weight/{family}"] = float(new_kernel_weights[i])
             if plot_figs:
-                log_dict["val/corr_density"] = wandb.Image(plot_figs[0])
+                # plot_figs[0] is built from all_off_pred/all_off_ora — the
+                # same analytic-z_train-conditioned Sigma as the
+                # sigma_*_analytic_z scalars above, hence the matching suffix.
+                log_dict["val/corr_density_analytic_z"] = wandb.Image(plot_figs[0])
                 if len(plot_figs) > 1:
                     log_dict["val/corr_grid"] = wandb.Image(plot_figs[1])
                 for f in plot_figs:
@@ -2678,7 +2710,7 @@ def main(cfg: DictConfig) -> None:
                 f"total={total_str}  "
                 f"gap_post={gap_str}  "
                 f"corr_r={pearson_str}  "
-                f"od_μ={metrics['sigma_offdiag_mean']:+.4f} od_σ={metrics['sigma_offdiag_std']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean']:.4f}  "
+                f"od_μ={metrics['sigma_offdiag_mean_analytic_z']:+.4f} od_σ={metrics['sigma_offdiag_std_analytic_z']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean_analytic_z']:.4f}  "
                 f"cop_std={cop_std_str}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
