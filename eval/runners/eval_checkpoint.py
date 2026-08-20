@@ -18,10 +18,13 @@ Usage
         [--lr_dkl 0.01]           # learning rate for DKL Adam
         [--n_steps_per_ep 500]    # training steps for PerEpisodeTransformer
         [--patience_per_ep 100]   # early stopping patience (steps without improvement)
-        [--z_train_source oracle] # or 'tabicl': feed the ICL model TabICL's own
-                                   # K-fold PIT estimate of z_train instead of the
-                                   # exact GP-LOO one, to measure the sim-to-real gap
+        [--z_train_source tabicl]  # (default) or 'oracle': feed the ICL model the
+                                   # exact GP-LOO z_train instead of TabICL's own
+                                   # K-fold PIT estimate, to measure the sim-to-real
+                                   # gap ('oracle' leaves the total-NLL table's icl
+                                   # row NaN — no learned marginal to score against)
         [--tabicl_ckpt ...]        # TabICL checkpoint for --z_train_source=tabicl
+                                   # (default: cfg.tabicl.ckpt from --config)
         [--tabicl_pit_k_folds 10]  # K-fold count for --z_train_source=tabicl
         [--plot_episode 0]        # local episode index to plot corr_grid for
         [--out_dir ./eval/results]  # directory to save corr_grid figure
@@ -81,6 +84,7 @@ from pit import DEFAULT_K_FOLDS, gp_analytical_posterior, load_tabicl, normalize
 
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
+    assert_shared_z_test,
     baseline_fingerprint,
     corr_nll_single,
     episode_cache_key,
@@ -174,6 +178,7 @@ def _eval_icl_episode(
     )                                            # (P,)  ICL's conditioning input — oracle LOO-PIT residual by default
     X_test  = ep["x_norm_test"].to(device)     # (N, d_x)
     z_test  = ep["z_test"].to(device)          # (N,)
+    assert_shared_z_test(z_test, ep)
     R_oracle = ep["R_star"].to(device)         # (N, N)
 
     P, N = X_train.shape[0], X_test.shape[0]
@@ -538,7 +543,7 @@ def _live_generate_alternating(gen_cfg, n_ep: int, device, seed: int) -> list[di
     return episodes
 
 
-def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "oracle") -> None:
+def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "tabicl") -> None:
     means = {k: float(np.nanmean([m.get(k, float("nan")) for m in all_nlls]))
              for k, _ in _METHOD_ORDER}
     stds  = {k: float(np.nanstd( [m.get(k, float("nan")) for m in all_nlls]))
@@ -621,8 +626,9 @@ def _print_total_nll_table(
     dict (see eval_baselines_episode/_eval_icl_episode) — the Marginal/
     Copula columns below are each method's OWN split, not comparable to
     _print_table's shared-ground-truth-marginal copula NLL (see
-    eval_baselines_episode's docstring for why those are different
-    quantities that happen to share a name).
+    eval_baselines_episode's docstring, or the "NAMING TRAP" note in
+    eval/metrics/joint_nll.py's module docstring, for why those are
+    different quantities that happen to share a name).
 
     icl's row is nan whenever z_train_source == "oracle" (--z_train_source
     default): the oracle z_test the ICL model would otherwise be scored
@@ -714,19 +720,23 @@ def main() -> None:
                         help="Training steps for PerEpisodeTransformer")
     parser.add_argument("--patience_per_ep", type=int, default=500,
                         help="Early stopping patience for PerEpisodeTransformer")
-    parser.add_argument("--z_train_source", default="oracle", choices=["oracle", "tabicl"],
+    parser.add_argument("--z_train_source", default="tabicl", choices=["oracle", "tabicl"],
                         help="What the ICL model conditions on for each episode's z_train. "
-                             "'oracle' (default): the episode's exact GP-LOO PIT residual "
+                             "'tabicl' (default): a K-fold cross-fitted PIT estimate from the "
+                             "frozen TabICL marginal (pit.py::run_pit) — the same proxy "
+                             "real-world deployment is stuck with, so this is the setting "
+                             "that makes _print_total_nll_table's icl row (the genuinely "
+                             "cross-method-comparable total marginal+copula NLL) populate; "
+                             "adds the cost of one extra frozen TabICL forward pass per fold "
+                             "per episode. 'oracle': the episode's exact GP-LOO PIT residual "
                              "(R&W Eq. 5.12) computed from the true generating kernel — "
-                             "unavailable on real data, but exact here since the kernel is "
-                             "known by construction. 'tabicl': a K-fold cross-fitted PIT "
-                             "estimate from the frozen TabICL marginal (pit.py::run_pit), "
-                             "the same proxy real-world evaluation is stuck with — use this "
-                             "to measure the sim-to-real gap between the two (icl_nll under "
-                             "each source is unaffected in every other respect: z_test, "
+                             "unavailable on real data, an idealized upper bound only; under "
+                             "this mode the icl row of _print_total_nll_table is NaN (no "
+                             "learned marginal to score a total NLL against). icl_nll under "
+                             "either source is unaffected in every other respect: z_test, "
                              "R_oracle, and every baseline still score/fit against the "
-                             "episode's true values). Adds the cost of one extra frozen "
-                             "TabICL forward pass per fold per episode.")
+                             "episode's true values — use both to measure the sim-to-real "
+                             "gap.")
     parser.add_argument("--tabicl_ckpt",  default=None,
                         help="TabICL checkpoint filename for --z_train_source=tabicl. "
                              "Default: read from --config's cfg.tabicl.ckpt.")

@@ -4,6 +4,8 @@ sourced here instead of duplicated across plots/*.py."""
 
 from __future__ import annotations
 
+import numpy as np
+
 N_CONTEXT = 30              # in-context sample size for --profile sweeps (see regions.SWEEP_PROFILES)
 N_BINS = 15                 # distance bins for correlation-vs-distance binning
 SEED = 42
@@ -13,6 +15,15 @@ MAX_DIST_PERCENTILE = 90.0  # cap the binned distance range at this percentile (
 PIT_K_FOLDS = 10            # K-fold leave-one-out PIT folds for real-context z_train estimation
 N_SYNTHETIC_DRAWS = 20      # independent GP draws averaged per synthetic-mode config
 EARTH_RADIUS_KM = 6371.0
+
+# Total (marginal+copula) joint-NLL diagnostic (eval/metrics/joint_nll.py::
+# compute_joint_nll), shared by compare_marginal_backbones.py and
+# sweep_core.py::run_real_config -- neither the per-episode NLL tables in
+# eval_checkpoint.py/run_benchmarks.py nor spatial_model_r2 (a binned
+# correlation-curve-shape diagnostic, not a proper scoring rule) cover this
+# real-ERA5 / cross-backend setting.
+N_NLL_TEST = 30             # held-out (never-in-context) points scored per task/day
+NLL_PROBS = np.linspace(0.02, 0.98, 49)  # quantile-grid probability levels for compute_joint_nll
 
 # Direct-curve-fit law names (eval.spatial.diagnostics.fit_theoretical_law's
 # THEORY_LAWS keys, as fit by the `baseline` subcommand) -- a DIFFERENT
