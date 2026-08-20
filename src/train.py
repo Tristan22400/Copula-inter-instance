@@ -799,12 +799,25 @@ def _refresh_tabicl_mix_weights(
     release). That reload + ~1k-episode remeasurement is why callers gate
     this on training.save_every (already 10x rarer than training.val_every
     by default) rather than every validate() call.
+
+    floor_frac == max_frac short-circuit: see the matching comment at this
+    function's startup-time sibling call site in main() -- when the two
+    fracs are equal, _tabicl_gap_to_mix_frac's interpolation collapses to
+    floor_frac for every family regardless of the measured gap, so the
+    reload + remeasurement below would be pure wasted work every
+    training.save_every steps for the life of the run.
     """
+    floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
+    max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
+    if math.isclose(floor_frac, max_frac, abs_tol=1e-12):
+        new_mix_frac = torch.full(
+            (len(_COMPOSABLE_KERNELS),), floor_frac, dtype=torch.float32
+        )
+        tabicl_mix_weights.copy_(new_mix_frac)
+        return {}, new_mix_frac
     tabicl_marginal = load_tabicl(pit_ckpt, device)
     pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
     z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
-    floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
-    max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
     new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
     tabicl_mix_weights.copy_(new_mix_frac)
     del tabicl_marginal
@@ -2131,36 +2144,54 @@ def main(cfg: DictConfig) -> None:
                 synth_kernel_batches, tabicl_marginal, pit_k_folds, device
             )
         if tabicl_mix_weights is not None:
-            print(
-                "[train] Measuring per-family TabICL-vs-analytic z_train gap "
-                "for data.z_train_tabicl_mix_* (this runs once, up front)..."
-            )
-            z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
             floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
             max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
-            new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
-            # In-place: tabicl_mix_weights is the shared-memory tensor
-            # LiveGPDataset workers already hold a reference to (built
-            # before the DataLoader forks/spawns -- see build_live_train_
-            # loader's docstring). Workers haven't started iterating yet at
-            # this point in train.py's startup sequence, so there's no
-            # torn-read race, but .copy_() (not rebind) is used anyway to
-            # match kernel_weights's own update convention below.
-            tabicl_mix_weights.copy_(new_mix_frac)
-            for family, gap in sorted(z_gap.items(), key=lambda kv: -kv[1]):
-                idx = _COMPOSABLE_KERNELS.index(family)
+            if math.isclose(floor_frac, max_frac, abs_tol=1e-12):
+                # _tabicl_gap_to_mix_frac(gaps, floor, max)'s interpolation
+                # frac[i] = floor + (max - floor) * normalized collapses to
+                # floor for every family whenever floor == max, independent
+                # of the measured gap -- so the gap measurement below (a full
+                # _generate_gp_batch_raw pass PER _COMPOSABLE_KERNELS family,
+                # one of the two calls running real TabICL k-fold PIT) would
+                # spend several minutes computing a value this run can never
+                # use. tabicl_mix_weights is already initialized to
+                # floor_frac uniformly by build_live_train_loader, so there's
+                # nothing left to write here either.
                 print(
-                    f"[train]   {family}: z_train_tabicl_gap={gap:.3f} "
-                    f"-> mix_frac={float(new_mix_frac[idx]):.3f}"
+                    f"[train] data.z_train_tabicl_mix_floor_frac == max_frac "
+                    f"({floor_frac:.3f}) -- mix fraction is fixed regardless "
+                    "of the TabICL-vs-analytic gap, skipping the gap "
+                    "measurement pass."
                 )
-            wandb.log(
-                {f"data/z_train_tabicl_gap/{f}": g for f, g in z_gap.items()}
-                | {
-                    f"data/tabicl_mix_frac/{family}": float(new_mix_frac[i])
-                    for i, family in enumerate(_COMPOSABLE_KERNELS)
-                },
-                step=0,
-            )
+            else:
+                print(
+                    "[train] Measuring per-family TabICL-vs-analytic z_train gap "
+                    "for data.z_train_tabicl_mix_* (this runs once, up front)..."
+                )
+                z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
+                new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
+                # In-place: tabicl_mix_weights is the shared-memory tensor
+                # LiveGPDataset workers already hold a reference to (built
+                # before the DataLoader forks/spawns -- see build_live_train_
+                # loader's docstring). Workers haven't started iterating yet at
+                # this point in train.py's startup sequence, so there's no
+                # torn-read race, but .copy_() (not rebind) is used anyway to
+                # match kernel_weights's own update convention below.
+                tabicl_mix_weights.copy_(new_mix_frac)
+                for family, gap in sorted(z_gap.items(), key=lambda kv: -kv[1]):
+                    idx = _COMPOSABLE_KERNELS.index(family)
+                    print(
+                        f"[train]   {family}: z_train_tabicl_gap={gap:.3f} "
+                        f"-> mix_frac={float(new_mix_frac[idx]):.3f}"
+                    )
+                wandb.log(
+                    {f"data/z_train_tabicl_gap/{f}": g for f, g in z_gap.items()}
+                    | {
+                        f"data/tabicl_mix_frac/{family}": float(new_mix_frac[i])
+                        for i, family in enumerate(_COMPOSABLE_KERNELS)
+                    },
+                    step=0,
+                )
         if era5_on:
             print("[train] Building frozen real-ERA5 spatial-correlation probes...")
             era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)
