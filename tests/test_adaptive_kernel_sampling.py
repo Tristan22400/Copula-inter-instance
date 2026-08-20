@@ -37,8 +37,8 @@ def _uniform_weights() -> torch.Tensor:
 def test_update_weights_sums_to_one():
     prev = _uniform_weights()
     metrics = {
-        "kernel_fit/rbf/gap_nll": 0.4,
-        "kernel_fit/matern32/gap_nll": 0.05,
+        "oracle_diag/kernel_fit/rbf/gap_nll": 0.4,
+        "oracle_diag/kernel_fit/matern32/gap_nll": 0.05,
     }
     out = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05)
     assert torch.isclose(out.sum(), torch.tensor(1.0), atol=1e-5)
@@ -49,8 +49,8 @@ def test_update_weights_biases_toward_worse_family():
     rbf should end up with strictly more weight."""
     prev = _uniform_weights()
     metrics = {
-        "kernel_fit/rbf/gap_nll": 0.45,
-        "kernel_fit/matern32/gap_nll": 0.05,
+        "oracle_diag/kernel_fit/rbf/gap_nll": 0.45,
+        "oracle_diag/kernel_fit/matern32/gap_nll": 0.05,
     }
     out = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05)
     i_rbf = _COMPOSABLE_KERNELS.index("rbf")
@@ -66,7 +66,7 @@ def test_update_weights_respects_floor():
     n = len(_COMPOSABLE_KERNELS)
     prev = _uniform_weights()
     metrics = {
-        "kernel_fit/rbf/gap_nll": 100.0,  # huge positive gap elsewhere
+        "oracle_diag/kernel_fit/rbf/gap_nll": 100.0,  # huge positive gap elsewhere
     }
     floor = 0.2
     out = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=floor)
@@ -79,7 +79,7 @@ def test_update_weights_missing_or_nan_signal_is_neutral():
     no directional pressure, only the floor's pull toward uniform."""
     prev = _uniform_weights()
     metrics = {
-        "kernel_fit/rbf/gap_nll": float("nan"),
+        "oracle_diag/kernel_fit/rbf/gap_nll": float("nan"),
     }
     out = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05)
     assert torch.isfinite(out).all()
@@ -89,7 +89,7 @@ def test_update_weights_missing_or_nan_signal_is_neutral():
 def test_update_weights_extreme_gap_does_not_overflow():
     prev = _uniform_weights()
     metrics = {
-        "kernel_fit/rbf/gap_nll": -2e9,
+        "oracle_diag/kernel_fit/rbf/gap_nll": -2e9,
     }
     out = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05)
     assert torch.isfinite(out).all()
@@ -103,8 +103,8 @@ def test_update_weights_ignores_excluded_family_gap():
     is pure noise (see composite_exclude_kernels docs in gp_tasks.yaml)."""
     prev = _uniform_weights()
     metrics = {
-        "kernel_fit/periodic/gap_nll": 100.0,
-        "kernel_fit/rbf/gap_nll": 0.4,
+        "oracle_diag/kernel_fit/periodic/gap_nll": 100.0,
+        "oracle_diag/kernel_fit/rbf/gap_nll": 0.4,
     }
     out_excluded = train._update_adaptive_kernel_weights(
         prev, metrics, lr=1.0, floor=0.05, exclude={"periodic"}
