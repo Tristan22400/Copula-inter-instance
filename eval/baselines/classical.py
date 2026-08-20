@@ -60,14 +60,24 @@ import copy
 import math
 import os
 import sys
+import warnings
 
 import gpytorch
 import torch
 import torch.nn as nn
 from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
+from linear_operator.utils.warnings import NumericalWarning
 from omegaconf import OmegaConf
 from torch import Tensor
 from torch.optim import Adam
+
+# psd_safe_cholesky (called on every mll() step below) warns every time it
+# adds jitter to recover from a near-singular K during MLE optimisation —
+# routine and already handled (it retries with escalating jitter, only
+# raising NotPSDError, caught by fit_and_eval_gpytorch's restart loop, if
+# that fails outright), so it's silenced rather than spamming stdout once
+# per restart per step.
+warnings.filterwarnings("ignore", category=NumericalWarning)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
