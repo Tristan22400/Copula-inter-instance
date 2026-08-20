@@ -97,7 +97,27 @@ __all__ = [
     "load_baseline_cache",
     "save_baseline_cache",
     "EXPECTED_BASELINE_KEYS",
+    "assert_shared_z_test",
 ]
+
+
+def assert_shared_z_test(z_test: Tensor, ep: dict) -> None:
+    """Guard the SHARED-MARGINAL `nlls` table's one load-bearing invariant:
+    every method in that table (independence/gp_prior_rbf/GP-MLE/DKL/
+    per_ep_transformer here, icl/oracle in eval_checkpoint.py's
+    _eval_icl_episode) must be scored against the literally-identical
+    `ep["z_test"]` — only R differs between methods — or corr_nll_single's
+    ranking silently stops meaning what _print_table's header claims (see
+    corr_nll_single's docstring / the "NAMING TRAP" note in
+    eval/metrics/joint_nll.py). Cheap (one tensor compare per episode); call
+    right after deriving the local `z_test` a caller is about to score with,
+    before any corr_nll_single call."""
+    ep_z_test = ep["z_test"].to(z_test.device, z_test.dtype)
+    assert torch.equal(z_test, ep_z_test), (
+        "z_test used for a shared-marginal copula-NLL score has diverged "
+        "from ep['z_test'] — this breaks _print_table's cross-method "
+        "ranking (see assert_shared_z_test's docstring)."
+    )
 
 # Every key eval_baselines_episode is supposed to populate in its returned
 # nlls/R_dict — kept in sync by hand with the method bodies below (independence
@@ -130,7 +150,10 @@ _BASELINE_ALGO_VERSION = 1
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
-    """Copula NLL for a single (N, N) correlation matrix and (N,) z-vector."""
+    """Copula NLL for a single (N, N) correlation matrix and (N,) z-vector.
+    SHARED-MARGINAL convention (z fixed across methods) — see the "NAMING
+    TRAP" note in eval/metrics/joint_nll.py's module docstring before
+    comparing this to y_space_nlls'/total_nlls' "copula" values below."""
     N = z.shape[0]
     mask = torch.ones(1, N, dtype=torch.bool, device=z.device)
     return oracle_copula_nll(R.unsqueeze(0), z.unsqueeze(0), mask).item()
@@ -901,6 +924,7 @@ def eval_baselines_episode(
     z_train_self = _standardize_y(y_train)        # (P,) z-scored y_train, used to train per_ep_transformer
     X_test = ep["x_norm_test"].to(device)         # (N, d_x)
     z_test = ep["z_test"].to(device)              # (N,)
+    assert_shared_z_test(z_test, ep)
     y_test = ep["y_test"].to(device)              # (N,)  raw target, for total Y-space NLL
 
     N = X_test.shape[0]

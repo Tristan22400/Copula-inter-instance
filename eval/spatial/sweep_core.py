@@ -19,10 +19,13 @@ import os
 import numpy as np
 import torch
 
-from eval.configs.constants import MAX_DIST_PERCENTILE, N_BINS, N_CONTEXT, N_DAYS, PIT_K_FOLDS, SEED
+from eval.configs.constants import (
+    MAX_DIST_PERCENTILE, N_BINS, N_CONTEXT, N_DAYS, N_NLL_TEST, NLL_PROBS, PIT_K_FOLDS, SEED,
+)
 from eval.configs.regions import REGIONS
 from eval.data.era5_io import haversine_distance_km, load_era5_data
 from eval.data.fetch_era5 import fetch as fetch_era5
+from eval.metrics.joint_nll import compute_joint_nll
 from eval.spatial.diagnostics import (
     bin_correlation_by_distance,
     build_synthetic_grid_task,
@@ -36,6 +39,8 @@ from eval.spatial.diagnostics import (
     load_marginal_tabicl,
     pair_counts_by_distance,
 )
+from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
+from inference.copula_inference import normalize_features
 
 __all__ = [
     "get_model", "run_real_config", "run_synthetic_config", "build_era5_probe",
@@ -43,6 +48,12 @@ __all__ = [
 ]
 
 _MODEL_CACHE: dict = {}
+# Separate from _MODEL_CACHE: a public sklearn-style TabICLRegressor used
+# ONLY for one-shot (non-K-fold) marginal quantile grids at held-out
+# joint-NLL test points in run_real_config -- a different interface from
+# `marginal` (src/pit.py::load_tabicl, K-fold PIT for context z_train), same
+# tabicl_quantiles helper eval/runners/run_benchmarks.py already uses.
+_TABICL_REGRESSOR_CACHE: dict = {}
 
 
 def get_model(ckpt: str, device: "str | None" = None):
@@ -54,6 +65,12 @@ def get_model(ckpt: str, device: "str | None" = None):
         marginal = load_marginal_tabicl(cfg, resolved_device)
         _MODEL_CACHE[ckpt] = (model, cfg, resolved_device, marginal)
     return _MODEL_CACHE[ckpt]
+
+
+def _get_tabicl_regressor(device: str):
+    if device not in _TABICL_REGRESSOR_CACHE:
+        _TABICL_REGRESSOR_CACHE[device] = make_tabicl_regressor(device=device)
+    return _TABICL_REGRESSOR_CACHE[device]
 
 
 def weighted_corr(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
@@ -87,7 +104,17 @@ def weighted_r2(pred: np.ndarray, target: np.ndarray, n: np.ndarray) -> float:
     1/sqrt(n), i.e. bin-mean SEM weighting), applied to a model curve
     instead of a fitted theoretical law, so the two R^2 numbers are directly
     comparable: how much of the ground-truth curve's own weighted variance
-    does each explain."""
+    does each explain.
+
+    CAVEAT: this is a curve-shape diagnostic on the binned, distance-averaged
+    correlation curve, NOT a proper scoring rule -- it never sees marginal
+    calibration or density sharpness, and per-bin averaging can mask
+    per-instance miscalibration. It is complementary to, and must never
+    substitute for, the likelihood-based `nll_total`
+    (eval/metrics/joint_nll.py::compute_joint_nll) for cross-method/
+    cross-checkpoint comparisons -- use this to localize *where* (which
+    distance range) a curve mismatches, and nll_total to say *how much
+    worse* the actual predictive density is."""
     mask = np.isfinite(pred) & np.isfinite(target) & (n > 0)
     if mask.sum() < 3:
         return float("nan")
@@ -137,7 +164,20 @@ def run_real_config(
     context_idx = rng.choice(D, size=n_context_eff, replace=False)
     context_coords = coords[context_idx]
 
+    # Held-out points (never in context) for the joint-NLL score below —
+    # drawn from the SAME rng stream right after context_idx, matching
+    # eval/runners/compare_marginal_backbones.py::run_task's synthetic-mode
+    # analogue. x_train_norm/x_test_norm recomputes what
+    # extract_model_context_correlation does internally per call, needed
+    # here directly for tabicl_quantiles's one-shot marginal fit.
+    remaining_idx = np.setdiff1d(np.arange(D), context_idx)
+    nll_test_idx = rng.choice(remaining_idx, size=min(N_NLL_TEST, len(remaining_idx)), replace=False)
+    x_train_norm, x_test_norm = normalize_features(context_coords, coords)
+    x_nll_test_norm = x_test_norm[nll_test_idx]
+    tabicl_reg = _get_tabicl_regressor(resolved_device)
+
     rho_context_per_day = []
+    nll_total_per_day, nll_marginal_per_day, nll_copula_per_day = [], [], []
     for d in days:
         day_values = data["t2m"][d].ravel()
         context_values = day_values[context_idx]
@@ -145,7 +185,27 @@ def run_real_config(
             model, resolved_device, marginal, context_coords, context_values, coords, k_folds=PIT_K_FOLDS,
         )
         rho_context_per_day.append(bin_correlation_by_distance(R_context, dist, bin_edges))
+
+        # Total (marginal+copula) Y-space NLL on the held-out points: a
+        # one-shot (non-K-fold — never in context) TabICL quantile grid
+        # supplies the marginal, R_context restricted to the same points
+        # supplies the copula. Neither model_r2 (a binned correlation-curve-
+        # shape diagnostic, not a proper scoring rule) nor any other real-
+        # ERA5 script in eval/ currently reports a likelihood-based number.
+        try:
+            y_nll_test = day_values[nll_test_idx]
+            qgrid = tabicl_quantiles(tabicl_reg, x_train_norm, context_values, x_nll_test_norm, NLL_PROBS)
+            R_nll = R_context[np.ix_(nll_test_idx, nll_test_idx)]
+            nll = compute_joint_nll(qgrid, NLL_PROBS, R_nll, y_nll_test)
+            nll_total_per_day.append(nll["total"])
+            nll_marginal_per_day.append(nll["marginal"])
+            nll_copula_per_day.append(nll["copula"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [day {d}] joint-NLL scoring failed: {exc}")
     rho_context_mean = np.nanmean(np.array(rho_context_per_day), axis=0)
+    nll_total = float(np.nanmean(nll_total_per_day)) if nll_total_per_day else float("nan")
+    nll_marginal = float(np.nanmean(nll_marginal_per_day)) if nll_marginal_per_day else float("nan")
+    nll_copula = float(np.nanmean(nll_copula_per_day)) if nll_copula_per_day else float("nan")
 
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_dummy = bin_correlation_by_distance(R_dummy, dist, bin_edges)
@@ -171,6 +231,9 @@ def run_real_config(
         "bias": bias,
         "fro_ratio_rms": fro_ratio,
         "model_r2": model_r2,
+        "nll_total": nll_total,
+        "nll_marginal": nll_marginal,
+        "nll_copula": nll_copula,
         "gt_matern_r2": gt_fit["r_squared"] if gt_fit else None,
         "gt_matern_L_km": gt_fit["params"]["L"] if gt_fit else None,
         "gt_matern_nu": gt_fit["params"].get("nu") if gt_fit else None,
@@ -181,7 +244,7 @@ def run_real_config(
         "rho_dummy": rho_dummy.tolist(),
     }
     print(f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
-          f"rmse={rmse:.3f} bias={bias:+.3f} model_r2={model_r2:.3f}")
+          f"rmse={rmse:.3f} bias={bias:+.3f} model_r2={model_r2:.3f} nll_total={nll_total:.3f}")
     return result
 
 

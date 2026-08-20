@@ -20,7 +20,16 @@ exaone, tabm), this script:
      eval/spatial/sweep_core.py::run_synthetic_config does (shape_corr,
      rmse, bias, model_r2) — i.e. how much a worse z_train estimate
      actually degrades the DOWNSTREAM spatial-correlation recovery task,
-     not just the z_train numbers in isolation.
+     not just the z_train numbers in isolation;
+  c) additionally scores a genuine total (marginal+copula) Y-space NLL, in
+     nats/point, on a small held-out point set that was never in context —
+     this backend's own one-shot (non-K-fold) quantile grid there supplies
+     the marginal, this task's predicted R supplies the copula, combined
+     via eval/metrics/joint_nll.py::compute_joint_nll (Sklar decomposition).
+     spatial_model_r2 (b) is a curve-shape diagnostic on BINNED, distance-
+     averaged correlations — it never sees marginal calibration and isn't a
+     proper scoring rule, so it can't answer "how many nats worse is the
+     real predictive density with this backend"; nll_total here does.
 
 TabPFN requires a one-time license acceptance + `TABPFN_TOKEN` env var (see
 eval.spatial.marginal_backends._require_tabpfn_token) — omit "tabpfn" from
@@ -50,6 +59,7 @@ for _p in (_REPO_ROOT, _SRC):
 
 from eval.configs import constants  # noqa: E402
 from eval.configs.checkpoints import resolve_checkpoint  # noqa: E402
+from eval.metrics.joint_nll import compute_joint_nll  # noqa: E402
 from eval.spatial.diagnostics import (  # noqa: E402
     _exact_gp_loo_z_train,
     _forward_correlation,
@@ -57,8 +67,8 @@ from eval.spatial.diagnostics import (  # noqa: E402
     build_synthetic_grid_task,
     load_copula_model,
 )
-from eval.spatial.marginal_backends import BACKEND_NAMES, loo_pit, make_regressor  # noqa: E402
-from eval.spatial.sweep_core import _weighted_corr, _weighted_r2, _weighted_rmse_bias  # noqa: E402
+from eval.spatial.marginal_backends import BACKEND_NAMES, loo_pit, make_regressor, quantiles  # noqa: E402
+from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias  # noqa: E402
 from inference.copula_inference import normalize_features  # noqa: E402
 
 _RESULTS_DIR = os.path.join(_REPO_ROOT, "eval", "results")
@@ -70,6 +80,11 @@ _FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")
 # under the noise floor of a 25-30-point PIT estimate without paying for
 # needless quantile-query resolution.
 PROBS = np.linspace(0.02, 0.98, 49)
+
+# Size of the held-out (never-in-context) point set the joint-NLL score (c)
+# is computed on — see eval/configs/constants.py::N_NLL_TEST (shared with
+# sweep_core.py::run_real_config's real-ERA5 analogue).
+N_NLL_TEST = constants.N_NLL_TEST
 
 
 def _z_train_gap(z_true: np.ndarray, z_hat: np.ndarray) -> dict:
@@ -90,6 +105,7 @@ def _z_train_gap(z_true: np.ndarray, z_hat: np.ndarray) -> dict:
 def run_task(
     model, cfg, device, backends: list, regressors: dict,
     kernel_name: str, grid_size: int, n_context: int, seed: int,
+    n_nll_test: int = N_NLL_TEST,
 ) -> dict:
     task = build_synthetic_grid_task(cfg, kernel_name, grid_size, n_context, constants.N_BINS, seed, min_context=4)
     coords, D = task["coords"], task["D"]
@@ -103,15 +119,38 @@ def run_task(
     z_true = task["L"] @ task["rng"].standard_normal(D)
     context_values = z_true[context_idx]
 
+    # Held-out points (never in context) for the joint-NLL score below — see
+    # N_NLL_TEST. Drawn from the SAME seeded rng as context_idx, so the task
+    # stays fully deterministic per `seed`.
+    remaining_idx = np.setdiff1d(np.arange(D), context_idx)
+    nll_test_idx = task["rng"].choice(remaining_idx, size=min(n_nll_test, len(remaining_idx)), replace=False)
+    y_nll_test = z_true[nll_test_idx]
+
     z_train_true = _exact_gp_loo_z_train(K_ff_context, context_values)
     x_train_norm, x_test_norm = normalize_features(context_coords, coords)
+    x_nll_test_norm = x_test_norm[nll_test_idx]
 
     R_pred_true = _forward_correlation(model, device, x_train_norm, z_train_true, x_test_norm)
     rho_pred_true = bin_correlation_by_distance(R_pred_true, dist, bin_edges)
 
+    # Ground-truth-marginal reference NLL (upper bound), the NLL analogue of
+    # ground_truth_spatial_model_r2 below: z_true's per-point marginal is
+    # exactly N(0, true_cov_ii) by construction (z_true = L @ N(0,I)), no
+    # fitting needed, so this isolates how much of any backend's total-NLL
+    # gap is really a copula (R_pred_true vs. R_pred) effect vs. a marginal
+    # (fitted quantile grid) effect.
+    from scipy.stats import norm as _norm
+    exact_std = np.sqrt(np.clip(np.diag(true_cov)[nll_test_idx], 1e-12, None))
+    qgrid_exact = exact_std[:, None] * _norm.ppf(PROBS)[None, :]
+    R_nll_true = R_pred_true[np.ix_(nll_test_idx, nll_test_idx)]
+    nll_true = compute_joint_nll(qgrid_exact, PROBS, R_nll_true, y_nll_test)
+
     out = {
         "kernel": kernel_name, "grid_size": grid_size, "seed": seed,
-        "ground_truth_spatial_model_r2": _weighted_r2(rho_pred_true, rho_true, pair_counts),
+        "ground_truth_spatial_model_r2": weighted_r2(rho_pred_true, rho_true, pair_counts),
+        "ground_truth_nll_total": nll_true["total"],
+        "ground_truth_nll_marginal": nll_true["marginal"],
+        "ground_truth_nll_copula": nll_true["copula"],
     }
     for name in backends:
         z_hat = loo_pit(
@@ -122,10 +161,24 @@ def run_task(
 
         R_pred = _forward_correlation(model, device, x_train_norm, z_hat, x_test_norm)
         rho_pred = bin_correlation_by_distance(R_pred, dist, bin_edges)
-        gap["spatial_model_r2"] = _weighted_r2(rho_pred, rho_true, pair_counts)
-        gap["spatial_shape_corr"] = _weighted_corr(rho_pred, rho_true, pair_counts)
-        rmse, bias = _weighted_rmse_bias(rho_pred, rho_true, pair_counts)
+        gap["spatial_model_r2"] = weighted_r2(rho_pred, rho_true, pair_counts)
+        gap["spatial_shape_corr"] = weighted_corr(rho_pred, rho_true, pair_counts)
+        rmse, bias = weighted_rmse_bias(rho_pred, rho_true, pair_counts)
         gap["spatial_rmse"], gap["spatial_bias"] = rmse, bias
+
+        # Total (marginal+copula) Y-space NLL on the held-out points: this
+        # backend's own one-shot (non-K-fold — these points were never in
+        # context) quantile grid supplies the marginal, R_pred restricted to
+        # the same points supplies the copula. See module docstring (c).
+        try:
+            qgrid = quantiles(name, regressors[name], x_train_norm, context_values, x_nll_test_norm, PROBS, seed=seed)
+            R_nll = R_pred[np.ix_(nll_test_idx, nll_test_idx)]
+            nll = compute_joint_nll(qgrid, PROBS, R_nll, y_nll_test)
+            gap["nll_total"], gap["nll_marginal"], gap["nll_copula"] = nll["total"], nll["marginal"], nll["copula"]
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [{name}] joint-NLL scoring failed: {exc}")
+            gap["nll_total"] = gap["nll_marginal"] = gap["nll_copula"] = float("nan")
+
         out[name] = gap
     return out
 
@@ -169,7 +222,9 @@ def main() -> None:
             r["config"] = config_name
             results.append(r)
             print(f"[{config_name} draw {draw}] gt_r2={r['ground_truth_spatial_model_r2']:.3f} "
-                  + " ".join(f"{b}: z_corr={r[b]['z_corr']:.3f} r2={r[b]['spatial_model_r2']:.3f}" for b in backends))
+                  f"gt_nll={r['ground_truth_nll_total']:.3f} "
+                  + " ".join(f"{b}: z_corr={r[b]['z_corr']:.3f} r2={r[b]['spatial_model_r2']:.3f} "
+                             f"nll={r[b]['nll_total']:.3f}" for b in backends))
             os.makedirs(os.path.dirname(args.out), exist_ok=True)
             with open(args.out, "w") as f:
                 json.dump(results, f, indent=2)
@@ -182,8 +237,11 @@ def main() -> None:
 def _print_summary(results: list, backends: list) -> None:
     print("\n=== Aggregate summary (mean over all tasks/draws) ===")
     gt_r2 = np.mean([r["ground_truth_spatial_model_r2"] for r in results])
+    gt_nll = np.nanmean([r["ground_truth_nll_total"] for r in results])
     print(f"Ground-truth-z_train spatial model_r2 (upper bound): {gt_r2:.3f}")
-    header = f"{'backend':10s} {'z_corr':>8s} {'z_rmse':>8s} {'z_hat_std':>10s} {'spatial_r2':>11s} {'shape_corr':>11s}"
+    print(f"Ground-truth-marginal total NLL (upper bound, nats/point): {gt_nll:.3f}")
+    header = (f"{'backend':10s} {'z_corr':>8s} {'z_rmse':>8s} {'z_hat_std':>10s} {'spatial_r2':>11s} "
+              f"{'shape_corr':>11s} {'nll_total':>10s} {'nll_marg':>10s} {'nll_cop':>10s}")
     print(header)
     for b in backends:
         z_corr = np.nanmean([r[b]["z_corr"] for r in results])
@@ -191,7 +249,11 @@ def _print_summary(results: list, backends: list) -> None:
         z_std = np.nanmean([r[b]["z_hat_std"] for r in results])
         s_r2 = np.nanmean([r[b]["spatial_model_r2"] for r in results])
         s_corr = np.nanmean([r[b]["spatial_shape_corr"] for r in results])
-        print(f"{b:10s} {z_corr:8.3f} {z_rmse:8.3f} {z_std:10.3f} {s_r2:11.3f} {s_corr:11.3f}")
+        n_tot = np.nanmean([r[b]["nll_total"] for r in results])
+        n_marg = np.nanmean([r[b]["nll_marginal"] for r in results])
+        n_cop = np.nanmean([r[b]["nll_copula"] for r in results])
+        print(f"{b:10s} {z_corr:8.3f} {z_rmse:8.3f} {z_std:10.3f} {s_r2:11.3f} {s_corr:11.3f} "
+              f"{n_tot:10.3f} {n_marg:10.3f} {n_cop:10.3f}")
 
 
 def _plot_summary(results: list, backends: list, out_path: str) -> None:
@@ -201,7 +263,11 @@ def _plot_summary(results: list, backends: list, out_path: str) -> None:
     import matplotlib.pyplot as plt
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    metrics = [("z_corr", "z_train corr vs. ground truth"), ("spatial_model_r2", "downstream spatial model_r2")]
+    metrics = [
+        ("z_corr", "z_train corr vs. ground truth"),
+        ("spatial_model_r2", "downstream spatial model_r2"),
+        ("nll_total", "total NLL (marginal+copula, nats/pt)"),
+    ]
     fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4.5))
     colors = plt.cm.tab10(np.linspace(0, 1, len(backends)))
     for ax, (key, title) in zip(axes, metrics):

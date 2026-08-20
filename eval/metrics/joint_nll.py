@@ -10,6 +10,31 @@ finite-difference PIT recipe already used in
 ``experiments/experiment_b_quantitative.py::_quantile_grid_pit`` (ported
 verbatim rather than imported, since ``experiments/`` is a script directory,
 not a stable package boundary).
+
+NAMING TRAP — two different "copula"/"marginal" conventions share the same
+key names across this codebase; grabbing one by key without checking which
+convention produced it silently mixes incomparable numbers:
+
+  1. OWN-MARGINAL (this module's ``compute_joint_nll``, ``src/loss.py::
+     y_space_nll``, ``eval/baselines/classical.py``'s ``y_space_nlls``,
+     ``eval/runners/eval_checkpoint.py``'s ``total_nlls``): each method
+     supplies its OWN fitted/estimated marginal, so its own ``z`` differs
+     method-to-method — "copula" here is that method's own PIT-residual
+     copula NLL, "total" = copula + marginal is a genuine proper-scoring-
+     rule comparison across methods (every method scored at the same real
+     y_test under its own full predictive density).
+  2. SHARED-MARGINAL (``eval/baselines/classical.py``'s ``nlls`` /
+     ``corr_nll_single``, ``eval/runners/eval_checkpoint.py``'s
+     ``_print_table``): every method is scored against the SAME
+     (typically ground-truth) ``z_test`` — only the predicted correlation
+     matrix R differs — so "copula" here ranks correlation-structure
+     quality alone, valid only because z is held fixed, and is NOT the
+     same quantity as (1)'s "copula" despite the identical key name. There
+     is no "marginal"/"total" key in this convention at all.
+
+See ``eval/runners/eval_checkpoint.py``'s ``_print_table`` vs.
+``_print_total_nll_table`` docstrings for the concrete case where both
+conventions are printed side by side.
 """
 
 from __future__ import annotations
