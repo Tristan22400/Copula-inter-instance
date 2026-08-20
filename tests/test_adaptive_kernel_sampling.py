@@ -120,6 +120,65 @@ def test_update_weights_ignores_excluded_family_gap():
 
 
 # ---------------------------------------------------------------------------
+# signal="tabicl" (training.adaptive_kernel_signal)
+# ---------------------------------------------------------------------------
+
+
+def test_signal_tabicl_uses_tabicl_gap_not_oracle_gap():
+    """With signal='tabicl', a family whose oracle gap is small but whose
+    TabICL-marginal gap is large must still gain weight -- the tabicl key,
+    not the oracle_diag one, drives the update."""
+    prev = _uniform_weights()
+    metrics = {
+        "oracle_diag/kernel_fit/rbf/gap_nll": 0.01,       # tiny under the oracle marginal
+        "kernel_fit/rbf/gap_nll_tabicl": 0.45,            # large under TabICL's real PIT
+        "oracle_diag/kernel_fit/matern32/gap_nll": 0.01,
+        "kernel_fit/matern32/gap_nll_tabicl": 0.01,
+    }
+    out = train._update_adaptive_kernel_weights(
+        prev, metrics, lr=1.0, floor=0.05, signal="tabicl"
+    )
+    i_rbf = _COMPOSABLE_KERNELS.index("rbf")
+    i_mat = _COMPOSABLE_KERNELS.index("matern32")
+    assert out[i_rbf] > out[i_mat]
+    assert out[i_rbf] > prev[i_rbf]
+
+
+def test_signal_tabicl_falls_back_to_oracle_gap_when_missing():
+    """A family with no kernel_fit/<family>/gap_nll_tabicl (e.g. no PIT
+    checkpoint configured this run) must fall back to its oracle_diag gap
+    instead of silently getting gap=0 -- signal='tabicl' shouldn't disable
+    the curriculum entirely just because the tabicl cache is empty."""
+    prev = _uniform_weights()
+    metrics_tabicl_missing = {
+        "oracle_diag/kernel_fit/rbf/gap_nll": 0.45,
+        "oracle_diag/kernel_fit/matern32/gap_nll": 0.05,
+    }
+    out_tabicl = train._update_adaptive_kernel_weights(
+        prev, metrics_tabicl_missing, lr=1.0, floor=0.05, signal="tabicl"
+    )
+    out_oracle = train._update_adaptive_kernel_weights(
+        prev, metrics_tabicl_missing, lr=1.0, floor=0.05, signal="oracle"
+    )
+    assert torch.equal(out_tabicl, out_oracle)
+
+
+def test_signal_default_is_oracle():
+    """The `signal` kwarg defaults to 'oracle' -- unchanged behavior for
+    every existing call site that doesn't pass it explicitly."""
+    prev = _uniform_weights()
+    metrics = {
+        "oracle_diag/kernel_fit/rbf/gap_nll": 0.4,
+        "kernel_fit/rbf/gap_nll_tabicl": 999.0,  # must be ignored by default
+    }
+    out_default = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05)
+    out_explicit_oracle = train._update_adaptive_kernel_weights(
+        prev, metrics, lr=1.0, floor=0.05, signal="oracle"
+    )
+    assert torch.equal(out_default, out_explicit_oracle)
+
+
+# ---------------------------------------------------------------------------
 # _sample_kernel_chain_structure weighting + no-op default
 # ---------------------------------------------------------------------------
 
