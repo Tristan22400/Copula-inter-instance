@@ -388,13 +388,37 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
     ax.set_xticks(x)
     ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
     ax.set_ylabel("model_r2 (vs. ground truth)")
-    ax.set_title(f"Spatial-correlation model_r2 by config ({mode})")
+    ax.set_title(f"Spatial-correlation model_r2 by config ({mode}) — curve-shape diagnostic, not a scoring rule")
     ax.legend(fontsize=7, ncol=2)
     plt.tight_layout()
     bar_path = os.path.join(out_dir, f"report_bar_{mode}.png")
     fig.savefig(bar_path, dpi=140)
     plt.close(fig)
     print(f"Saved {bar_path}")
+
+    # --- bar chart: total (marginal+copula) joint NLL per config, grouped by
+    # family — only present for mode="real" results (sweep_core.py::
+    # run_real_config); model_r2 above is a binned correlation-curve-shape
+    # diagnostic and not a proper scoring rule, so it can't answer "how many
+    # nats worse is the real predictive density" the way this can. ---
+    if all("nll_total" in r for r in results):
+        fig, ax = plt.subplots(figsize=(max(9, 1.6 * len(configs)), 6))
+        for i, fam in enumerate(families):
+            label, color = _family_style(fam)
+            lut = {r["config"]: r["nll_total"] for r in results if r["family"] == fam}
+            vals = [lut.get(c, np.nan) for c in configs]
+            ax.bar(x + (i - len(families) / 2 + 0.5) * width, vals, width=width, label=label, color=color)
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
+        ax.set_ylabel("total NLL (marginal+copula, nats/pt) — lower is better")
+        ax.set_title(f"Spatial total joint NLL by config ({mode})")
+        ax.legend(fontsize=7, ncol=2)
+        plt.tight_layout()
+        nll_bar_path = os.path.join(out_dir, f"report_bar_nll_{mode}.png")
+        fig.savefig(nll_bar_path, dpi=140)
+        plt.close(fig)
+        print(f"Saved {nll_bar_path}")
 
     # --- curve overlays: ground truth vs. every family's predicted curve, one figure per config ---
     gt_key = "rho_emp" if mode == "real" else "rho_true"
