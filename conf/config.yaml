@@ -55,7 +55,7 @@ training:
   dataset_dir: ./data/systematic_composition-k5/pit
   # Target validation-set size, shared by both the on-disk path (below, capped
   # at the dataset's total episode count) and live_generation (live_dataset.py)
-  # — same knob so the val plots (e.g. val/corr_density) are comparable in
+  # — same knob so the val plots (e.g. val/corr_density_analytic_z) are comparable in
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
   val_episodes: 200
