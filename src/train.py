@@ -365,10 +365,10 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
     comparable benchmark.
 
     return_kernel_metadata=True so validate() can also run
-    pit.gp_analytical_posterior per episode (kernel_fit/<family>/
-    oracle_posterior_total_nll / gap_nll) — the same true Bayes-optimal
-    ceiling used by the top-level posterior_probe, but scored per kernel
-    family instead of on the run's own composite mixture.
+    pit.gp_analytical_posterior per episode (oracle_diag/kernel_fit/<family>/
+    gap_nll) — the same true Bayes-optimal ceiling used by the top-level
+    posterior_probe, but scored per kernel family instead of on the run's
+    own composite mixture.
     """
     bcfg = cfg.get("baselines", {}) or {}
     families = list(bcfg.get("kernels") or DEFAULT_FAMILIES)
@@ -406,7 +406,7 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
 
 def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
     """Fixed probe set for the true-Bayes-optimal-ceiling validation metrics
-    (see validate()'s oracle_gap_posterior / corr_pearson_posterior).
+    (see validate()'s oracle_diag/gap_nll / oracle_diag/corr_pearson).
 
     data_gen.py's own oracle_mode="prior" R_star/Sigma_star (what every other
     "oracle" quantity in this file is scored against) is context-blind by
@@ -503,7 +503,7 @@ def _update_adaptive_kernel_weights(
     ordered to match data_gen._COMPOSABLE_KERNELS.
 
     Signal is the per-family excess loss (regret) already computed by
-    validate()'s kernel_fit/<family> probes: gap_nll = total_nll -
+    validate()'s oracle_diag/kernel_fit/<family> probes: gap_nll = total_nll -
     oracle_posterior_total_nll (NLL is lower-is-better, and
     oracle_posterior_total_nll is pit.gp_analytical_posterior's true
     Schur-complement Bayes-optimal ceiling for that family's probe episodes —
@@ -540,7 +540,7 @@ def _update_adaptive_kernel_weights(
     for i, family in enumerate(_COMPOSABLE_KERNELS):
         if family in exclude:
             continue
-        gap_nll = metrics.get(f"kernel_fit/{family}/gap_nll")
+        gap_nll = metrics.get(f"oracle_diag/kernel_fit/{family}/gap_nll")
         if gap_nll is not None and math.isfinite(gap_nll):
             gaps[i] = gap_nll
     # Clamp the exponent, not the gap itself, so a single wild probe can't
@@ -708,10 +708,10 @@ def _build_tabicl_val_z(
     run_pit's test-side forward pass also returns a genuine TabICL marginal
     at the test points (z_test, log_pdf_test) — the missing ingredient for
     scoring the model's own total (marginal+copula) Y-space NLL under a
-    real, non-oracle marginal (validate()'s y_nll_total_tabicl_marginal),
-    the same way eval_checkpoint.py::_tabicl_pit does for --z_train_source=
-    tabicl. z_train alone still drives the sim-to-real correlation check
-    (validate()'s do_plot block / corr_*_tabicl_z).
+    real, non-oracle marginal (validate()'s val/y_nll_total), the same way
+    eval_checkpoint.py::_tabicl_pit does for --z_train_source=tabicl. z_train
+    alone still drives the sim-to-real correlation check (validate()'s
+    do_plot block / corr_*_tabicl_z).
 
     Returns {batch_idx: {"z_train": (B, P_max), "z_test": (B, N_max),
     "log_pdf_test": (B, N_max)}}, CPU, zero-padded outside each episode's
@@ -873,8 +873,6 @@ def validate(
     # benefit. Use torch.no_grad() for efficiency instead.
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
 
-    tot, cop = [], []
-    cop_per_task: list[float] = []
     all_W_norms: list[float] = []
     all_s_vals: list[float] = []
     all_sigma_off: list[float] = []
@@ -894,36 +892,19 @@ def validate(
             out = model(batch)
         Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
 
-        parts = y_space_nll(
-            Sigma,
-            batch["z_test"].float(),
-            batch["log_pdf_test"].float(),
-            batch["test_mask"],
-        )
-        tot.append(parts["total"].item())
-        cop.append(parts["copula"].item())
-
         # ---- Per-task diagnostics (vectorized — no Python loop over batch) ----
+        # Sigma-only statistics (offdiag/diag/W/s): these read the model's own
+        # covariance output, not batch["z_test"]/["log_pdf_test"] (the exact
+        # analytic-GP PIT this val set was generated with) — unlike the
+        # deleted y_nll_total/y_nll_copula/y_nll_copula_std, they aren't
+        # "testing the NLL with the ground truth z_test" and stay in val/.
         n_test_cur = batch["test_mask"].sum(-1).float()   # (B,)
         valid_cur = n_test_cur >= 2
 
         if valid_cur.any():
-            N_cur = Sigma.shape[1]
             mask_2d_cur = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
-            eye_cur = torch.eye(N_cur, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
-            S_safe_cur = torch.where(mask_2d_cur, Sigma, eye_cur)
-            L_cur, info_cur = torch.linalg.cholesky_ex(S_safe_cur)
-            if info_cur.any():
-                S_safe_cur = S_safe_cur + 1e-4 * eye_cur
-                L_cur = torch.linalg.cholesky(S_safe_cur)
-
-            log_det_cur = 2.0 * L_cur.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)
-            z_f = batch["z_test"].float()
-            tmp_cur = torch.linalg.solve_triangular(L_cur, z_f.unsqueeze(-1), upper=False)
-            S_inv_z_cur = torch.linalg.solve_triangular(L_cur.mT, tmp_cur, upper=True).squeeze(-1)
             n_safe_cur = n_test_cur.clamp(min=1)
-            cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f ** 2).sum(-1)) / n_safe_cur
-            cop_per_task.extend(cop_cur[valid_cur].cpu().tolist())
+            N_cur = Sigma.shape[1]
 
             # W row-norms and s means (masked mean over valid test instances).
             # "s" is absent for "tanhnorm" (see model.py's _NO_SCALAR_COLUMN /
@@ -946,90 +927,101 @@ def validate(
             all_sigma_off.extend(off_vals_cur.cpu().tolist())
             all_sigma_diag.extend(Sigma.diagonal(dim1=-2, dim2=-1)[batch["test_mask"]].cpu().tolist())
 
-        # ---- Collect data for plots ----
-        if do_plot and batch_idx < _PLOT_COLLECT_BATCHES:
+        # ---- TabICL-marginal real (non-oracle) NLL scoring + plot collection ----
+        # Runs on the first _PLOT_COLLECT_BATCHES batches every val_every
+        # step (not just do_plot steps): this is what feeds val/y_nll_total
+        # below, so it needs to be live every validation call, not just on
+        # the sparser plot cadence. The R_star/oracle-only plotting pieces
+        # (all_off_pred/all_off_ora, plot_episodes, R_pred_tabicl overlay)
+        # stay gated on do_plot — unchanged cadence for those.
+        if batch_idx < _PLOT_COLLECT_BATCHES:
             B = Sigma.shape[0]
             z_cache_b = tabicl_val_z.get(batch_idx) if tabicl_val_z else None
+            collect_plot = do_plot
             for b in range(B):
                 n = int(batch["test_mask"][b].sum())
                 if n < 2:
                     continue
-                R_pred_b = Sigma[b, :n, :n].float().cpu().numpy()
-                R_ora_b = batch["R_star"][b, :n, :n].float().cpu().numpy()
-                ri, ci = np.triu_indices(n, k=1)
-                all_off_pred.append(R_pred_b[ri, ci])
-                all_off_ora.append(R_ora_b[ri, ci])
-                if len(plot_episodes) < _MAX_PLOT_EPISODES:
-                    ep_dict = {
-                        "R_pred": R_pred_b,
-                        "R_ora": R_ora_b,
-                        "label": f"ep{batch_idx * B + b}\nN={n}",
-                    }
-                    # Sim-to-real check: re-run the model on this SAME episode
-                    # (same x_train/x_test) but conditioned on TabICL's own
-                    # K-fold PIT z_train (precomputed once by
-                    # _build_tabicl_val_z) instead of the exact GP-LOO one.
-                    if z_cache_b is not None:
-                        n_tr = int(batch["train_mask"][b].sum())
-                        if n_tr >= 2:
-                            z_tabicl_b = z_cache_b["z_train"][b, :n_tr].to(device).unsqueeze(0)
-                            sub_batch = {
-                                "x_train": batch["x_train"][b : b + 1, :n_tr],
-                                "z_train": z_tabicl_b,
-                                "x_test":  batch["x_test"][b : b + 1, :n],
-                            }
-                            out_tabicl = model(sub_batch)
-                            Sigma_tabicl = build_sigma(out_tabicl, cfg, jitter=jitter)
+
+                ep_dict = None
+                ri = ci = None
+                R_ora_b = None
+                if collect_plot:
+                    R_pred_b = Sigma[b, :n, :n].float().cpu().numpy()
+                    R_ora_b = batch["R_star"][b, :n, :n].float().cpu().numpy()
+                    ri, ci = np.triu_indices(n, k=1)
+                    all_off_pred.append(R_pred_b[ri, ci])
+                    all_off_ora.append(R_ora_b[ri, ci])
+                    if len(plot_episodes) < _MAX_PLOT_EPISODES:
+                        ep_dict = {
+                            "R_pred": R_pred_b,
+                            "R_ora": R_ora_b,
+                            "label": f"ep{batch_idx * B + b}\nN={n}",
+                        }
+
+                # Sim-to-real check: re-run the model on this SAME episode
+                # (same x_train/x_test) but conditioned on TabICL's own
+                # K-fold PIT z_train (precomputed once by
+                # _build_tabicl_val_z) instead of the exact GP-LOO one.
+                if z_cache_b is not None:
+                    n_tr = int(batch["train_mask"][b].sum())
+                    if n_tr >= 2:
+                        z_tabicl_b = z_cache_b["z_train"][b, :n_tr].to(device).unsqueeze(0)
+                        sub_batch = {
+                            "x_train": batch["x_train"][b : b + 1, :n_tr],
+                            "z_train": z_tabicl_b,
+                            "x_test":  batch["x_test"][b : b + 1, :n],
+                        }
+                        out_tabicl = model(sub_batch)
+                        Sigma_tabicl = build_sigma(out_tabicl, cfg, jitter=jitter)
+
+                        if collect_plot and ep_dict is not None:
                             R_pred_tabicl_b = Sigma_tabicl[0].float().cpu().numpy()
                             ep_dict["R_pred_tabicl"] = R_pred_tabicl_b
                             all_off_pred_tabicl.append(R_pred_tabicl_b[ri, ci])
                             all_off_ora_tabicl.append(R_ora_b[ri, ci])
 
-                            # Genuine (non-oracle) total Y-space NLL: score
-                            # this same TabICL-conditioned Sigma against
-                            # TabICL's OWN marginal at the test points
-                            # (z_cache_b["z_test"]/["log_pdf_test"], also
-                            # from _build_tabicl_val_z), not the oracle's —
-                            # the number that actually answers "is this
-                            # checkpoint correct once a real (imperfect)
-                            # marginal replaces the oracle one," which no
-                            # z-space-only copula NLL can (see
-                            # eval_checkpoint.py's _print_total_nll_table for
-                            # why: two different marginals' z-transforms put
-                            # z-space copula NLL on different, non-additive
-                            # scales — only a same-basis Y-space total is
-                            # comparable).
-                            z_test_tabicl_b = z_cache_b["z_test"][b, :n].to(device).unsqueeze(0)
-                            log_pdf_tabicl_b = z_cache_b["log_pdf_test"][b, :n].to(device).unsqueeze(0)
-                            mask_tabicl_b = torch.ones(1, n, dtype=torch.bool, device=device)
-                            parts_tabicl_b = y_space_nll(
-                                Sigma_tabicl, z_test_tabicl_b, log_pdf_tabicl_b, mask_tabicl_b
-                            )
-                            all_tabicl_marginal_total.append(parts_tabicl_b["total"].item())
-                            all_tabicl_marginal_marginal.append(parts_tabicl_b["marginal"].item())
-                            all_tabicl_marginal_copula.append(parts_tabicl_b["copula"].item())
+                        # Genuine (non-oracle) total Y-space NLL: score this
+                        # same TabICL-conditioned Sigma against TabICL's OWN
+                        # marginal at the test points
+                        # (z_cache_b["z_test"]/["log_pdf_test"], also from
+                        # _build_tabicl_val_z), not the oracle's — the number
+                        # that actually answers "is this checkpoint correct
+                        # once a real (imperfect) marginal replaces the
+                        # oracle one," which no z-space-only copula NLL can
+                        # (see eval_checkpoint.py's _print_total_nll_table
+                        # for why: two different marginals' z-transforms put
+                        # z-space copula NLL on different, non-additive
+                        # scales — only a same-basis Y-space total is
+                        # comparable). This is what val/y_nll_total below is
+                        # built from.
+                        z_test_tabicl_b = z_cache_b["z_test"][b, :n].to(device).unsqueeze(0)
+                        log_pdf_tabicl_b = z_cache_b["log_pdf_test"][b, :n].to(device).unsqueeze(0)
+                        mask_tabicl_b = torch.ones(1, n, dtype=torch.bool, device=device)
+                        parts_tabicl_b = y_space_nll(
+                            Sigma_tabicl, z_test_tabicl_b, log_pdf_tabicl_b, mask_tabicl_b
+                        )
+                        all_tabicl_marginal_total.append(parts_tabicl_b["total"].item())
+                        all_tabicl_marginal_marginal.append(parts_tabicl_b["marginal"].item())
+                        all_tabicl_marginal_copula.append(parts_tabicl_b["copula"].item())
+
+                if ep_dict is not None:
                     plot_episodes.append(ep_dict)
 
-    mean_cop = sum(cop) / len(cop)
-
-    # y_nll_total/y_nll_copula are raw (not gap-normalized): trustworthy for
-    # ranking checkpoints validated on the SAME val_loader config, but not
-    # comparable in absolute nats across runs with different validation
-    # distributions (different kernel-family mixtures, N/P ranges,
-    # data.z_train_tabicl_mix_*) — use oracle_gap_posterior below for that.
-    # The old y_nll_marginal is deliberately not reported: it is
-    # -log_pdf_test, computed entirely from data_gen.py's oracle
-    # (mu_star/sigma_star, never conditioned on the model or even on
-    # x_train/y_train — see data_gen.py's oracle_mode="prior" branch), so it
-    # is identical for every checkpoint scored on the same batch and carries
-    # no information about the model.
-    metrics = {
-        "y_nll_total":  sum(tot) / len(tot),
-        "y_nll_copula": mean_cop,
-    }
-
-    # Per-task copula NLL std — high value means unstable or heterogeneous tasks
-    metrics["y_nll_copula_std"] = float(np.std(cop_per_task)) if cop_per_task else float("nan")
+    # metrics starts empty: the old y_nll_total/y_nll_copula/y_nll_copula_std
+    # here scored the model against batch["z_test"]/["log_pdf_test"] — the
+    # exact analytic-GP PIT this val set was generated with, i.e. a ground-
+    # truth marginal no real deployment ever provides. All ground-truth-
+    # z_test NLL diagnostics now live under the oracle_diag/ namespace below
+    # (a sibling of val/, not nested under it — see the wandb.log prefixing
+    # in the training loop), trimmed to the few that matter (copula_nll,
+    # gap_nll) instead of mirroring every val/ metric. val/'s own headline
+    # NLL numbers (y_nll_total/y_nll_marginal/y_nll_copula, set below from
+    # all_tabicl_marginal_*) are scored against TabICL's own frozen PIT
+    # instead — a real, imperfect marginal, the same kind deployment would
+    # actually supply — so they only populate when a PIT checkpoint is
+    # configured (tabicl_val_z non-empty; see resolve_pit_ckpt in train()).
+    metrics: dict = {}
 
     # Sigma statistics — offdiag_mean ≈ 0 means model outputs near-identity
     if all_sigma_off:
@@ -1064,6 +1056,16 @@ def validate(
     # gp_analytical_posterior runs one episode at a time (float64
     # eigendecomposition-based PSD repair), so this is deliberately not run
     # over the full val_loader.
+    #
+    # All results below are grouped under the "oracle_diag/" key prefix (see
+    # this function's return + the training loop's wandb.log call): every
+    # one of them scores the model against a ground-truth z_test/log_pdf_test
+    # (the exact analytic-GP PIT, not a real estimated marginal), so per this
+    # file's convention they don't belong in val/'s own namespace. Trimmed to
+    # the few that matter for a "how far from Bayes-optimal, on the copula
+    # alone" read: copula_nll and gap_nll (+ the two raw numbers gap_nll is a
+    # difference of, and a couple of correlation-value diagnostics) — not a
+    # mirror of every val/ metric.
     if posterior_probe is not None:
         pb = posterior_probe["batch"]
         out_p = model(pb)
@@ -1088,58 +1090,55 @@ def validate(
                 off_p_post.append(Sigma_p[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
                 off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
         if nll_post_per_point:
-            # y_nll_total_posterior_probe is the model's total NLL on THIS
-            # SAME probe episode set (not val_loader's, which y_nll_total
-            # above comes from — a different sample, usually a different
-            # size and possibly a different N/P and kernel-family mix). Only
-            # y_nll_total_posterior_probe and y_nll_oracle_posterior, scored
-            # on identical episodes, are validly compared —
-            # oracle_gap_posterior is exactly their difference. y_nll_total
-            # can legitimately sit below y_nll_oracle_posterior (they're
-            # different populations); this pair can't drift apart that way.
-            metrics["y_nll_total_posterior_probe"] = parts_p["total"].item()
-            metrics["y_nll_oracle_posterior"] = float(np.mean(nll_post_per_point))
-            metrics["oracle_gap_posterior"] = (
-                metrics["y_nll_total_posterior_probe"] - metrics["y_nll_oracle_posterior"]
+            # total_nll and oracle_posterior_nll are scored on the SAME
+            # posterior_probe episodes (unlike the old y_nll_total vs.
+            # y_nll_oracle_posterior pairing, which mixed val_loader's
+            # population with posterior_probe's) — gap_nll, their
+            # difference, is therefore the valid same-population comparison:
+            # >= 0 in expectation, and this pair can't drift apart the way
+            # two different-population NLLs could.
+            metrics["oracle_diag/copula_nll"] = parts_p["copula"].item()
+            metrics["oracle_diag/total_nll"] = parts_p["total"].item()
+            metrics["oracle_diag/oracle_posterior_nll"] = float(np.mean(nll_post_per_point))
+            metrics["oracle_diag/gap_nll"] = (
+                metrics["oracle_diag/total_nll"] - metrics["oracle_diag/oracle_posterior_nll"]
             )
         if off_p_post:
             cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
-            metrics["corr_pearson_posterior"] = cq_p["pearson"]
-            metrics["corr_mae_posterior"] = cq_p["mae"]
+            metrics["oracle_diag/corr_pearson"] = cq_p["pearson"]
+            metrics["oracle_diag/corr_mae"] = cq_p["mae"]
 
     # Genuine (non-oracle) total Y-space NLL under TabICL's own frozen
-    # marginal — see the do_plot loop above (all_tabicl_marginal_total),
-    # only populated when do_plot fires (same cadence as corr_*_tabicl_z).
-    # Unlike the deleted y_nll_oracle_copula_z-style z-space comparisons,
-    # this needs no reference matrix at all: total Y-space NLL is a proper
-    # scoring rule regardless of which marginal produced the z-transform,
-    # so it's directly the "does this checkpoint actually work once you
-    # plug in a real, imperfect marginal at deployment" number.
+    # marginal — see the loop above (all_tabicl_marginal_total), populated
+    # every val_every step (not gated on do_plot; only the plot-only pieces
+    # collected alongside it are). This is val/'s real headline NLL: unlike
+    # the deleted ground-truth-z_test y_nll_total, it needs no reference
+    # matrix and scores against a real, imperfect (TabICL) marginal — the
+    # "does this checkpoint actually work once you plug in a real marginal
+    # at deployment" number. Only populated when a PIT checkpoint is
+    # configured (resolve_pit_ckpt(cfg) resolves -> tabicl_val_z non-empty);
+    # otherwise val/ has no total-NLL headline, which is the honest outcome
+    # rather than falling back to a ground-truth-scored substitute.
     if all_tabicl_marginal_total:
-        metrics["y_nll_total_tabicl_marginal"] = float(np.mean(all_tabicl_marginal_total))
-        # Sklar split of the same TabICL-marginal total: y_nll_marginal_tabicl
-        # is TabICL's own frozen marginal NLL (moves only if the PIT
-        # checkpoint or these episodes change, not with this run's training)
-        # while y_nll_copula_tabicl is the model's copula NLL evaluated
-        # against TabICL's z_test instead of the oracle's — the piece that
-        # actually reflects whether the model's Sigma is still well-calibrated
-        # once conditioned on a real (imperfect) marginal.
-        metrics["y_nll_marginal_tabicl"] = float(np.mean(all_tabicl_marginal_marginal))
-        metrics["y_nll_copula_tabicl"] = float(np.mean(all_tabicl_marginal_copula))
+        metrics["y_nll_total"] = float(np.mean(all_tabicl_marginal_total))
+        # Sklar split of the same total: y_nll_marginal is TabICL's own
+        # frozen marginal NLL (moves only if the PIT checkpoint or these
+        # episodes change, not with this run's training) while y_nll_copula
+        # is the model's copula NLL evaluated against TabICL's z_test
+        # instead of the oracle's — the piece that actually reflects whether
+        # the model's Sigma is still well-calibrated once conditioned on a
+        # real (imperfect) marginal.
+        metrics["y_nll_marginal"] = float(np.mean(all_tabicl_marginal_marginal))
+        metrics["y_nll_copula"] = float(np.mean(all_tabicl_marginal_copula))
 
     # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
     # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
     # so these move with training progress (unlike a fixed data-only baseline).
-    #
-    # corr_mse/corr_mae/corr_pearson/copula_improvement were dropped here (and
-    # not replaced): copula_improvement's oracle_copula_nll denominator, and
-    # the correlation-value target both z-space quantities were scored
-    # against, come from data_gen.py's context-blind oracle_mode="prior"
-    # R_star — the same beatable, not-Bayes-optimal reference that motivated
-    # deleting the old top-level oracle_gap/copula_gap/copula_improvement (see
-    # the posterior_probe block above). Replaced by oracle_posterior_total_nll
-    # / gap_nll below, which use pit.gp_analytical_posterior's true
-    # Schur-complement posterior instead, same as the top-level metric.
+    # Ground-truth-z_test-scored like the posterior_probe block above, so
+    # also grouped under oracle_diag/ and trimmed to copula_nll + gap_nll per
+    # family (marginal_nll/total_nll/oracle_posterior_total_nll are still
+    # computed to derive gap_nll, just not logged separately — they added no
+    # information beyond it for a monitoring dashboard).
     for family, probe_s in (synth_kernel_batches or {}).items():
         sbatch = probe_s["batch"]
         out_s = model(sbatch)
@@ -1148,20 +1147,11 @@ def validate(
             Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
         )
         cop_s = parts_s["copula"].item()
-        mar_s = parts_s["marginal"].item()
         tot_s = parts_s["total"].item()
-        metrics[f"kernel_fit/{family}/copula_nll"]   = cop_s
-        # marginal_nll is data_gen.py's oracle marginal (-log_pdf_test) —
-        # identical for every checkpoint scored on the same probe, same as
-        # the deleted top-level y_nll_marginal (carries no model information
-        # by itself). Reported anyway so total_nll = copula_nll + marginal_nll
-        # is self-consistent from the logged fields; copula_nll/gap_nll
-        # remain the columns that actually move with training.
-        metrics[f"kernel_fit/{family}/marginal_nll"] = mar_s
-        metrics[f"kernel_fit/{family}/total_nll"]    = tot_s
+        metrics[f"oracle_diag/kernel_fit/{family}/copula_nll"] = cop_s
 
         # True Bayes-optimal ceiling for this family, same construction as
-        # the top-level oracle_gap_posterior but restricted to this family's
+        # the top-level oracle_diag/gap_nll but restricted to this family's
         # own probe episodes (needs return_kernel_metadata=True — see
         # _build_synthetic_kernel_batches).
         nll_post_per_point_s: list[float] = []
@@ -1176,8 +1166,7 @@ def validate(
             nll_post_per_point_s.append(post_s["nll_post"] / n_s)
         if nll_post_per_point_s:
             oracle_post_s = float(np.mean(nll_post_per_point_s))
-            metrics[f"kernel_fit/{family}/oracle_posterior_total_nll"] = oracle_post_s
-            metrics[f"kernel_fit/{family}/gap_nll"] = tot_s - oracle_post_s
+            metrics[f"oracle_diag/kernel_fit/{family}/gap_nll"] = tot_s - oracle_post_s
 
         # One extra corr_grid column per kernel family: its own synthetic
         # episode's oracle beside the model's prediction on it — replaces the
@@ -2344,7 +2333,15 @@ def main(cfg: DictConfig) -> None:
                 era5_val_batches=era5_val_batches,
                 posterior_probe=posterior_probe,
             )
-            log_dict = {f"val/{k}": v for k, v in metrics.items()}
+            # oracle_diag/* keys are already fully qualified (a sibling
+            # top-level wandb group, deliberately kept out of val/ — see
+            # validate()'s ground-truth-z_test comment above the
+            # posterior_probe block); everything else gets the usual val/
+            # prefix.
+            log_dict = {
+                (k if k.startswith("oracle_diag/") else f"val/{k}"): v
+                for k, v in metrics.items()
+            }
             if adaptive_kernel_weights is not None:
                 lr = float(t.get("adaptive_kernel_lr", 1.0))
                 floor = float(t.get("adaptive_kernel_floor", 0.05))
@@ -2372,21 +2369,19 @@ def main(cfg: DictConfig) -> None:
                 for f in plot_figs:
                     plt.close(f)
             wandb.log(log_dict, step=step)
-            # Surfaces the total NLL (not copula alone — see validate()'s
-            # y_nll_marginal removal comment for why copula-only numbers
-            # under-report when comparing runs with different marginal
-            # difficulty) and the true-Bayes-optimal-ceiling gap (not the
-            # old, beatable prior-based oracle_gap) as the live-monitoring
-            # headline, plus corr_pearson_posterior (correlation VALUES
-            # against gp_analytical_posterior's true R_post, not the old
-            # pooled kernel_fit/mean_corr_pearson against the beatable prior
-            # R_star, which no longer exists — see the kernel_fit loop's
-            # comment on why per-family corr_pearson was dropped).
-            total_nll = metrics["y_nll_total"]
-            total_str = f"{total_nll:.4f}" if math.isfinite(total_nll) else "nan"
-            gap = metrics.get("oracle_gap_posterior", float("nan"))
+            # Surfaces the real (TabICL-marginal) total NLL as the
+            # live-monitoring headline (only available once a PIT checkpoint
+            # is configured — see validate()'s y_nll_total comment; "n/a"
+            # otherwise, not a ground-truth-scored substitute) alongside
+            # oracle_diag/gap_nll (the true-Bayes-optimal-ceiling gap, same-
+            # population comparison against posterior_probe — see validate())
+            # and oracle_diag/corr_pearson (correlation VALUES against
+            # gp_analytical_posterior's true R_post).
+            total_nll = metrics.get("y_nll_total", float("nan"))
+            total_str = f"{total_nll:.4f}" if math.isfinite(total_nll) else "n/a"
+            gap = metrics.get("oracle_diag/gap_nll", float("nan"))
             gap_str = f"{gap:.4f}" if math.isfinite(gap) else "n/a"
-            pearson = metrics.get("corr_pearson_posterior", float("nan"))
+            pearson = metrics.get("oracle_diag/corr_pearson", float("nan"))
             pearson_str = f"{pearson:.3f}" if math.isfinite(pearson) else "n/a"
             print(
                 f"[{step:6d}] VAL  "
@@ -2394,7 +2389,6 @@ def main(cfg: DictConfig) -> None:
                 f"gap_post={gap_str}  "
                 f"corr_r={pearson_str}  "
                 f"od_μ={metrics['sigma_offdiag_mean']:+.4f} od_σ={metrics['sigma_offdiag_std']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean']:.4f}  "
-                f"cop_std={metrics['y_nll_copula_std']:.4f}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
