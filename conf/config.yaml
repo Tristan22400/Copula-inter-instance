@@ -147,6 +147,22 @@ training:
   # still gets occasional practice instead of being fully dropped from the
   # curriculum.
   adaptive_kernel_floor: 0.05
+  # Which per-family regret signal adaptive_kernel_sampling above chases (see
+  # train.py::_update_adaptive_kernel_weights):
+  #   "tabicl" (default) -- kernel_fit/<family>/gap_nll_tabicl: the model's
+  #     total Y-space NLL scored against TabICL's own frozen K-fold PIT (a
+  #     real, imperfect marginal), minus gp_analytical_posterior's true
+  #     Bayes-optimal ceiling for that family -- biases live-generation
+  #     sampling toward families where the model performs worst under a
+  #     realistic, non-oracle marginal (the deployment-facing signal, not the
+  #     idealized one). Only available once a PIT checkpoint is configured
+  #     (see pit.py::resolve_pit_ckpt); any family missing it (no PIT
+  #     checkpoint, or a degenerate probe) falls back to that family's own
+  #     oracle gap below rather than zeroing its signal.
+  #   "oracle" -- oracle_diag/kernel_fit/<family>/gap_nll instead: the
+  #     identical gap, but scored against the exact analytic-GP PIT rather
+  #     than TabICL's approximation of it.
+  adaptive_kernel_signal: tabicl
   # Muon optimizer (Jordan et al. 2024b / Moonlight Liu et al. 2025)
   muon_lr: 2.0e-4             # base LR; effective LR = muon_lr * 0.2 * sqrt(max(n,m))
   muon_lr_min: 1.0e-6         # cosine decay floor
