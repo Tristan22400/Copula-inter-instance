@@ -25,6 +25,17 @@ EARTH_RADIUS_KM = 6371.0
 N_NLL_TEST = 30             # held-out (never-in-context) points scored per task/day
 NLL_PROBS = np.linspace(0.02, 0.98, 49)  # quantile-grid probability levels for compute_joint_nll
 
+# Classical-GP-MLE baseline Y-space NLL on the same real-ERA5 held-out split
+# as N_NLL_TEST/nll_total above (eval/spatial/sweep_core.py::
+# _fit_gp_baseline_nll, via eval/baselines/classical.py::fit_and_eval_gpytorch
+# + src/loss.py::gp_oracle_y_nll) -- the real-ERA5 counterpart to the
+# synthetic-episode classical-GP baselines in eval_checkpoint.py. Defaults
+# match eval_checkpoint.py's own --n_steps_mle/--lr_mle/--n_restarts_mle.
+GP_BASELINE_KERNELS = ["rbf", "matern32", "rational_quadratic"]
+GP_N_STEPS_MLE = 1000
+GP_LR_MLE = 0.05
+GP_N_RESTARTS_MLE = 5
+
 # Direct-curve-fit law names (eval.spatial.diagnostics.fit_theoretical_law's
 # THEORY_LAWS keys, as fit by the `baseline` subcommand) -- a DIFFERENT
 # concept from SYNTHETIC_SWEEP_KERNELS below (data_gen.py *generating*

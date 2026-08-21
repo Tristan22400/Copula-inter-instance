@@ -242,7 +242,10 @@ def cmd_diagnose(args) -> None:
 # sweep
 # ---------------------------------------------------------------------------
 def _sweep(mode: str, profile: str, checkpoints_arg: "str | None", n_context: int, n_days: int,
-           n_draws: int, device: "str | None", seed: int, out_path: "str | None" = None) -> str:
+           n_draws: int, device: "str | None", seed: int, out_path: "str | None" = None,
+           compute_gp_baseline: bool = True, gp_kernels: "list | None" = None,
+           gp_n_steps_mle: int = constants.GP_N_STEPS_MLE, gp_lr_mle: float = constants.GP_LR_MLE,
+           gp_n_restarts_mle: int = constants.GP_N_RESTARTS_MLE) -> str:
     tokens = all_family_names() if (checkpoints_arg in (None, "all")) else \
         [t.strip() for t in checkpoints_arg.split(",") if t.strip()]
 
@@ -258,6 +261,8 @@ def _sweep(mode: str, profile: str, checkpoints_arg: "str | None", n_context: in
             if mode == "real":
                 r = run_real_config(
                     ckpt, config_name, axis_name, grid_size, n_days=n_days, device=device, seed=seed, n_context=n_context,
+                    compute_gp_baseline=compute_gp_baseline, gp_baseline_kernels=gp_kernels,
+                    gp_n_steps_mle=gp_n_steps_mle, gp_lr_mle=gp_lr_mle, gp_n_restarts_mle=gp_n_restarts_mle,
                 )
             else:
                 r = run_synthetic_config(
@@ -272,7 +277,9 @@ def _sweep(mode: str, profile: str, checkpoints_arg: "str | None", n_context: in
 
 
 def cmd_sweep(args) -> None:
-    _sweep(args.mode, args.profile, args.checkpoints, args.n_context, args.n_days, args.n_draws, args.device, args.seed, args.out)
+    _sweep(args.mode, args.profile, args.checkpoints, args.n_context, args.n_days, args.n_draws, args.device, args.seed, args.out,
+           compute_gp_baseline=not args.no_gp_baseline, gp_kernels=args.gp_kernels,
+           gp_n_steps_mle=args.gp_n_steps_mle, gp_lr_mle=args.gp_lr_mle, gp_n_restarts_mle=args.gp_n_restarts_mle)
 
 
 # ---------------------------------------------------------------------------
@@ -402,12 +409,27 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
     # diagnostic and not a proper scoring rule, so it can't answer "how many
     # nats worse is the real predictive density" the way this can. ---
     if all("nll_total" in r for r in results):
+        # GP-MLE baseline kernels present in the results (real-ERA5 mode
+        # only, sweep_core.py::run_real_config's "gp_baseline_nll" field —
+        # same value for every family/config row thanks to
+        # _fit_gp_baseline_nll's cross-checkpoint cache, so any one matching
+        # row's fit works as the lookup source).
+        gp_kernels = sorted({k for r in results for k in r.get("gp_baseline_nll", {})})
+        n_series_nll = len(families) + len(gp_kernels)
+        width_nll = 0.8 / max(n_series_nll, 1)
+        gp_lut_by_config = {r["config"]: r["gp_baseline_nll"] for r in results if r.get("gp_baseline_nll")}
+
         fig, ax = plt.subplots(figsize=(max(9, 1.6 * len(configs)), 6))
         for i, fam in enumerate(families):
             label, color = _family_style(fam)
             lut = {r["config"]: r["nll_total"] for r in results if r["family"] == fam}
             vals = [lut.get(c, np.nan) for c in configs]
-            ax.bar(x + (i - len(families) / 2 + 0.5) * width, vals, width=width, label=label, color=color)
+            ax.bar(x + (i - n_series_nll / 2 + 0.5) * width_nll, vals, width=width_nll, label=label, color=color)
+        for j, kname in enumerate(gp_kernels):
+            i = len(families) + j
+            vals = [gp_lut_by_config.get(c, {}).get(kname, {}).get("total", np.nan) for c in configs]
+            ax.bar(x + (i - n_series_nll / 2 + 0.5) * width_nll, vals, width=width_nll,
+                   label=f"GP-MLE: {kname}", hatch="//", edgecolor="black", linewidth=0.5)
         ax.axhline(0, color="black", linewidth=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
@@ -488,7 +510,8 @@ def cmd_all(args) -> None:
     )
     print("=== [all] 1/5: sweep --mode real ===")
     _sweep("real", "low_context_7config", checkpoints, constants.N_CONTEXT, constants.N_DAYS,
-           constants.N_SYNTHETIC_DRAWS, args.device, constants.SEED)
+           constants.N_SYNTHETIC_DRAWS, args.device, constants.SEED,
+           compute_gp_baseline=not args.no_gp_baseline)
     print("=== [all] 2/5: sweep --mode synthetic ===")
     _sweep("synthetic", "low_context_7config", checkpoints, constants.N_CONTEXT, constants.N_DAYS,
            constants.N_SYNTHETIC_DRAWS, args.device, constants.SEED)
@@ -542,6 +565,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     p_sweep.add_argument("--seed", type=int, default=constants.SEED)
     p_sweep.add_argument("--out", type=str, default=None, help="Default: eval/results/sweep_<mode>_<profile>.json")
+    p_sweep.add_argument("--gp-kernels", type=str, nargs="+", default=constants.GP_BASELINE_KERNELS,
+                          choices=constants.GP_BASELINE_KERNELS,
+                          help="[--mode real] Classical-GP-MLE kernels to fit as a real-ERA5 nll_total "
+                               "baseline (eval/spatial/sweep_core.py::_fit_gp_baseline_nll).")
+    p_sweep.add_argument("--gp-n-steps-mle", type=int, default=constants.GP_N_STEPS_MLE)
+    p_sweep.add_argument("--gp-lr-mle", type=float, default=constants.GP_LR_MLE)
+    p_sweep.add_argument("--gp-n-restarts-mle", type=int, default=constants.GP_N_RESTARTS_MLE)
+    p_sweep.add_argument("--no-gp-baseline", action="store_true",
+                          help="[--mode real] Skip the classical-GP-MLE baseline nll_total fit.")
     p_sweep.set_defaults(func=cmd_sweep)
 
     p_base = sub.add_parser("baseline", help="Direct (non-learned) theoretical-law curve fits against ground truth.")
@@ -570,6 +602,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--checkpoints", type=str, default=None,
                         help="'all' (default, every registered family) or a comma-separated list of "
                              "family names / 'family:step' / raw .pt paths, same as `sweep --checkpoints`.")
+    p_all.add_argument("--no-gp-baseline", action="store_true",
+                        help="Skip the real-ERA5 classical-GP-MLE baseline nll_total fit (same as "
+                             "`sweep --no-gp-baseline`).")
     p_all.set_defaults(func=cmd_all)
 
     return parser
