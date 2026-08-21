@@ -1294,6 +1294,8 @@ def validate(
             Sigma_p, pb["z_test"].float(), pb["log_pdf_test"].float(), pb["test_mask"]
         )
         nll_post_per_point: list[float] = []
+        nll_post_marginal_per_point: list[float] = []
+        nll_post_copula_per_point: list[float] = []
         off_p_post: list[np.ndarray] = []
         off_o_post: list[np.ndarray] = []
         for b, ep in enumerate(posterior_probe["episodes"]):
@@ -1305,6 +1307,10 @@ def validate(
             except (KeyError, NotImplementedError):
                 continue  # rare unsupported kernel schema — see gp_analytical_posterior's docstring
             nll_post_per_point.append(post["nll_post"] / n)  # raw-sum -> nats/point, matching y_space_nll
+            # Sklar split of the same raw sum (nll_post = nll_post_marginal + nll_post_copula,
+            # see gp_analytical_posterior's docstring) -- same /n normalization as the total above.
+            nll_post_marginal_per_point.append(post["nll_post_marginal"] / n)
+            nll_post_copula_per_point.append(post["nll_post_copula"] / n)
             if n >= 2:
                 ri_p, ci_p = np.triu_indices(n, k=1)
                 off_p_post.append(Sigma_p[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
@@ -1321,6 +1327,10 @@ def validate(
             metrics["oracle_diag/copula_nll"] = parts_p["copula"].item()
             metrics["oracle_diag/total_nll"] = parts_p["total"].item()
             metrics["y_nll_oracle_posterior"] = oracle_posterior_nll
+            # Sklar split of y_nll_oracle_posterior, for side-by-side reading against
+            # oracle_diag/copula_nll and oracle_diag/total_nll's own marginal component.
+            metrics["y_nll_oracle_posterior_marginal"] = float(np.mean(nll_post_marginal_per_point))
+            metrics["y_nll_oracle_posterior_copula"] = float(np.mean(nll_post_copula_per_point))
             metrics["oracle_diag/gap_nll"] = metrics["oracle_diag/total_nll"] - oracle_posterior_nll
         if off_p_post:
             cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
