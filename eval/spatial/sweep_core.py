@@ -19,8 +19,10 @@ import os
 import numpy as np
 import torch
 
+from eval.baselines.classical import fit_and_eval_gpytorch
 from eval.configs.constants import (
-    MAX_DIST_PERCENTILE, N_BINS, N_CONTEXT, N_DAYS, N_NLL_TEST, NLL_PROBS, PIT_K_FOLDS, SEED,
+    GP_BASELINE_KERNELS, GP_LR_MLE, GP_N_RESTARTS_MLE, GP_N_STEPS_MLE, MAX_DIST_PERCENTILE, N_BINS,
+    N_CONTEXT, N_DAYS, N_NLL_TEST, NLL_PROBS, PIT_K_FOLDS, SEED,
 )
 from eval.configs.regions import REGIONS
 from eval.data.era5_io import haversine_distance_km, load_era5_data
@@ -41,6 +43,7 @@ from eval.spatial.diagnostics import (
 )
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import normalize_features
+from loss import gp_oracle_y_nll
 
 __all__ = [
     "get_model", "run_real_config", "run_synthetic_config", "build_era5_probe",
@@ -48,6 +51,14 @@ __all__ = [
 ]
 
 _MODEL_CACHE: dict = {}
+
+# Classical-GP-baseline Y-space NLL cache, keyed on (config_name, day_index,
+# kernel_names, n_steps, lr, n_restarts) -- the GP-MLE fit is checkpoint-
+# independent (context/held-out points+values only depend on the (region,
+# grid_size, day, seed, n_context) config, never on which ICL checkpoint is
+# under test), so a `sweep --checkpoints all` loop over N checkpoints must
+# fit each classical GP once, not N times. See _fit_gp_baseline_nll.
+_GP_BASELINE_CACHE: dict = {}
 # Separate from _MODEL_CACHE: a public sklearn-style TabICLRegressor used
 # ONLY for one-shot (non-K-fold) marginal quantile grids at held-out
 # joint-NLL test points in run_real_config -- a different interface from
@@ -127,10 +138,91 @@ def weighted_r2(pred: np.ndarray, target: np.ndarray, n: np.ndarray) -> float:
     return 1.0 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot > 0 else float("nan")
 
 
+def _fit_gp_baseline_nll(
+    cache_key: tuple,
+    x_train_norm: np.ndarray,
+    context_values: np.ndarray,
+    x_test_norm: np.ndarray,
+    y_test: np.ndarray,
+    kernel_names: list,
+    n_steps: int,
+    lr: float,
+    n_restarts: int,
+    device: str,
+) -> dict:
+    """Classical-GP-MLE baseline Y-space total/marginal/copula NLL, one fit
+    per kernel in `kernel_names`, on the SAME (context, held-out) split and
+    OWN-MARGINAL Sklar convention as the model's own real-ERA5 nll_total
+    (see eval/metrics/joint_nll.py's "NAMING TRAP" note) — so the two are
+    directly comparable. Reuses eval/baselines/classical.py::
+    fit_and_eval_gpytorch (GP-MLE+MAP-prior fit) + src/loss.py::
+    gp_oracle_y_nll (closed-form Gaussian Y-space NLL), the same machinery
+    eval_checkpoint.py uses for the synthetic-episode path.
+
+    fit_and_eval_gpytorch's MAP priors (_kernel_priors/_DEFAULT_PRIOR_CFG)
+    are tuned to data_gen.py's synthetic-episode y-scale (~unit variance by
+    construction) — raw ERA5 Kelvin values are a different scale entirely,
+    so context_values is z-scored (own sample mean/std) before fitting and
+    the returned mean/Sigma are rescaled back to raw Kelvin before scoring,
+    to avoid the MAP prior biasing the fit toward a near-prior-scale
+    outputscale/noise.
+
+    oracle_mode="posterior" (not fit_and_eval_gpytorch's default "prior"):
+    we want the fitted kernel's actual GP-conditioned posterior at the
+    held-out points — a real spatial predictor, analogous to the model's
+    own context-conditioned R_context — not the unconditioned prior-only
+    structure "prior" mode returns (that mode exists to match synthetic
+    episodes' own R_star convention, which doesn't apply to real data).
+
+    Cached per cache_key (typically (config_name, day_index, seed, n_context)
+    — seed/n_context included because the module-level cache outlives any
+    single run_real_config call and must not silently reuse a fit from a
+    different context sample) — see _GP_BASELINE_CACHE's module docstring
+    for why this must be cached.
+    """
+    key = cache_key + (tuple(kernel_names), n_steps, lr, n_restarts)
+    if key in _GP_BASELINE_CACHE:
+        return _GP_BASELINE_CACHE[key]
+
+    X_train = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
+    X_test = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
+    y_test_t = torch.as_tensor(y_test, dtype=torch.float32, device=device)
+
+    mu_y = float(context_values.mean())
+    sigma_y = max(float(context_values.std(ddof=1)), 1e-6) if len(context_values) > 1 else 1.0
+    y_train_std = torch.as_tensor((context_values - mu_y) / sigma_y, dtype=torch.float32, device=device)
+
+    n = X_test.shape[0]
+    mask = torch.ones(1, n, dtype=torch.bool, device=device)
+
+    out = {}
+    for kname in kernel_names:
+        try:
+            fit = fit_and_eval_gpytorch(
+                X_train, y_train_std, X_test, kname, n_steps=n_steps, lr=lr,
+                oracle_mode="posterior", n_restarts=n_restarts,
+            )
+            mean_real = fit["mean"] * sigma_y + mu_y
+            Sigma_real = fit["Sigma"] * (sigma_y ** 2)
+            parts = gp_oracle_y_nll(
+                Sigma_real.unsqueeze(0), mean_real.unsqueeze(0), y_test_t.unsqueeze(0), mask,
+            )
+            out[kname] = {k: float(v) for k, v in parts.items()}
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [gp_baseline:{kname}] failed: {exc}")
+            out[kname] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
+
+    _GP_BASELINE_CACHE[key] = out
+    return out
+
+
 def run_real_config(
     ckpt: str, config_name: str, region_name: str, grid_size: int,
     n_days: int = N_DAYS, device: "str | None" = None, seed: int = SEED,
     n_context: int = N_CONTEXT, n_bins: int = N_BINS,
+    compute_gp_baseline: bool = True, gp_baseline_kernels: "list | None" = None,
+    gp_n_steps_mle: int = GP_N_STEPS_MLE, gp_lr_mle: float = GP_LR_MLE,
+    gp_n_restarts_mle: int = GP_N_RESTARTS_MLE,
 ) -> dict:
     """Real-ERA5 config: fetch (region_name, grid_size, n_days) from the
     on-disk-cached ARCO-ERA5 fetcher, then score the checkpoint's
@@ -176,8 +268,11 @@ def run_real_config(
     x_nll_test_norm = x_test_norm[nll_test_idx]
     tabicl_reg = _get_tabicl_regressor(resolved_device)
 
+    gp_kernels = gp_baseline_kernels if gp_baseline_kernels is not None else GP_BASELINE_KERNELS
+
     rho_context_per_day = []
     nll_total_per_day, nll_marginal_per_day, nll_copula_per_day = [], [], []
+    gp_nll_per_day: dict = {k: {"total": [], "marginal": [], "copula": []} for k in gp_kernels}
     for d in days:
         day_values = data["t2m"][d].ravel()
         context_values = day_values[context_idx]
@@ -202,10 +297,25 @@ def run_real_config(
             nll_copula_per_day.append(nll["copula"])
         except Exception as exc:  # noqa: BLE001
             print(f"  [day {d}] joint-NLL scoring failed: {exc}")
+
+        if compute_gp_baseline:
+            gp_day = _fit_gp_baseline_nll(
+                cache_key=(config_name, d, seed, n_context_eff), x_train_norm=x_train_norm,
+                context_values=context_values, x_test_norm=x_nll_test_norm, y_test=day_values[nll_test_idx],
+                kernel_names=gp_kernels, n_steps=gp_n_steps_mle, lr=gp_lr_mle, n_restarts=gp_n_restarts_mle,
+                device=resolved_device,
+            )
+            for kname, parts in gp_day.items():
+                for comp in ("total", "marginal", "copula"):
+                    gp_nll_per_day[kname][comp].append(parts[comp])
     rho_context_mean = np.nanmean(np.array(rho_context_per_day), axis=0)
     nll_total = float(np.nanmean(nll_total_per_day)) if nll_total_per_day else float("nan")
     nll_marginal = float(np.nanmean(nll_marginal_per_day)) if nll_marginal_per_day else float("nan")
     nll_copula = float(np.nanmean(nll_copula_per_day)) if nll_copula_per_day else float("nan")
+    gp_baseline_nll = {
+        kname: {comp: float(np.nanmean(vals)) if vals else float("nan") for comp, vals in parts.items()}
+        for kname, parts in gp_nll_per_day.items()
+    } if compute_gp_baseline else {}
 
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_dummy = bin_correlation_by_distance(R_dummy, dist, bin_edges)
@@ -234,6 +344,7 @@ def run_real_config(
         "nll_total": nll_total,
         "nll_marginal": nll_marginal,
         "nll_copula": nll_copula,
+        "gp_baseline_nll": gp_baseline_nll,
         "gt_matern_r2": gt_fit["r_squared"] if gt_fit else None,
         "gt_matern_L_km": gt_fit["params"]["L"] if gt_fit else None,
         "gt_matern_nu": gt_fit["params"].get("nu") if gt_fit else None,
