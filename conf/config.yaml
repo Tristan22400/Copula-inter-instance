@@ -98,11 +98,18 @@ training:
   # function's docstring), so unlike live_num_workers this isn't sized
   # against CPU core count -- it's sized against how many concurrent frozen
   # TabICL copies (~120MB resident each, ~1.4GB peak per call, measured) the
-  # training GPU can hold alongside the training job's own VRAM use. 2 is a
-  # deliberately conservative, untuned-for-your-hardware default -- raise it
-  # if profiling shows workers falling behind and VRAM allows, lower it if
-  # you see CUDA OOMs.
-  live_tabicl_num_workers: 2
+  # training GPU can hold alongside the training job's own VRAM use. null
+  # (default) auto-sizes from CURRENTLY FREE GPU memory at startup (see
+  # live_dataset.py::resolve_live_tabicl_num_workers) -- this is what keeps a
+  # shared/multi-tenant node safe: if another job is already holding VRAM on
+  # the same physical GPU, the auto-picked count shrinks accordingly instead
+  # of assuming exclusive access to the whole card, and it adapts across GPU
+  # models (e.g. a 32GB RTX 5000 Ada vs a 48GB RTX 6000 Ada) without
+  # per-node tuning. Set an explicit integer to override (e.g. to force a
+  # known-safe number by hand on a node you know will run several such jobs
+  # concurrently), or if profiling shows workers falling behind and VRAM
+  # allows, or you see CUDA OOMs from auto-sizing being too generous.
+  live_tabicl_num_workers: null
   # generate_gp_batch() call size = batch_size * live_group_multiplier. Must be
   # a multiple of batch_size: generate_gp_batch samples kernel/P/N/active_dims
   # (and, for variable-d configs, d_features itself) once per call, shared by
@@ -115,7 +122,21 @@ training:
   # call-size 32 (2026-07-23) — small call sizes are both less safe and far
   # slower. Cross-batch diversity comes from live_num_workers running
   # independently-seeded streams, the live analogue of ShardBlockSampler.
+  # Only applies to the data.z_train_source=analytic (CPU-worker) path -- see
+  # live_tabicl_group_multiplier below for the tabicl/tabicl_split path,
+  # which has its own separately-tuned default.
   live_group_multiplier: 1
+  # Same knob as live_group_multiplier above, but for the tabicl/
+  # tabicl_split GPU-worker path (ignored when data.z_train_source=analytic)
+  # -- kept separate because the two paths' throughput floors differ:
+  # live_group_multiplier's docstring found group_size=1 close to the
+  # analytic path's own ceiling, but benchmarked 2026-08-23 that batching 2
+  # training batches' worth of episodes into one generate_gp_batch call
+  # measurably helps the tabicl path amortize TabICL's own per-call cost
+  # (combined with live_tabicl_num_workers auto-sizing above, this took real
+  # in-training data-wait time from ~85ms/step average, spiking to 170ms, down
+  # to ~1ms/step average on an idle RTX 6000 Ada at z_train_tabicl_k_folds=2).
+  live_tabicl_group_multiplier: 2
   live_val_seed: 20260723  # fixed seed for the validation set (independent of the training seed stream)
   # For sharded datasets: shuffle within blocks of this many shards at a time
   # (all shuffled together, IO-cache resident) instead of one global shuffle
