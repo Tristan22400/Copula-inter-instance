@@ -210,8 +210,15 @@ class LiveERA5Dataset(IterableDataset):
 
 def _resolve_era5_cfg(cfg: DictConfig) -> dict:
     e = cfg.get("era5_live", {}) or {}
+    val_corpus_dir = e.get("val_corpus_dir", None)
     return {
         "corpus_dir": str(e.get("corpus_dir", "./eval/data/cache/era5_global")),
+        # Separate cache dir (e.g. a held-out year fetched into its own
+        # directory via fetch_era5_global.py) for the fixed validation set
+        # below. None (default) falls back to corpus_dir -- the pre-existing
+        # behavior of validating on a different random seed's slice of the
+        # SAME date range training draws from, not a temporally disjoint one.
+        "val_corpus_dir": str(val_corpus_dir) if val_corpus_dir else None,
         "grid_size_range": (int(e.get("grid_size_min", 8)), int(e.get("grid_size_max", 28))),
         "box_deg_range": (float(e.get("box_deg_min", 5.0)), float(e.get("box_deg_max", 25.0))),
         "n_context_frac_range": (float(e.get("n_context_frac_min", 0.05)), float(e.get("n_context_frac_max", 0.4))),
@@ -281,8 +288,16 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
     This is separate from — and complements — the era5_fit/<region>
     validation probes (src/train.py::_build_era5_val_batches, cfg.baselines.
     era5_*): those score a handful of fixed, curated named regions; this is
-    the live-training-loop's own held-out slice of the SAME worldwide random
+    the live-training-loop's own held-out slice of the worldwide random
     corpus distribution the model is being finetuned on.
+
+    era5_live.val_corpus_dir (None by default) points this at a SEPARATE
+    corpus directory instead of corpus_dir -- e.g. one calendar year fetched
+    into its own cache via fetch_era5_global.py, disjoint from the years the
+    training corpus covers -- so val/era5_live_* tracks genuine held-out-year
+    generalization rather than a different random seed's slice of the same
+    date range training already draws from. Falls back to corpus_dir when
+    unset (the original same-range behavior).
     """
     import numpy as np
 
@@ -296,7 +311,9 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
     k_folds = int(cfg.tabicl.get("pit_k_folds", 10))
     print(f"[era5_live_dataset] Loading frozen TabICL marginal for fixed val batches: {ckpt}")
     tabicl_model = load_tabicl(ckpt, device)
-    corpus = GlobalERA5Corpus(ecfg["corpus_dir"])
+    val_corpus_dir = ecfg["val_corpus_dir"] or ecfg["corpus_dir"]
+    print(f"[era5_live_dataset] Building fixed val batches from corpus: {val_corpus_dir}")
+    corpus = GlobalERA5Corpus(val_corpus_dir)
 
     batch_size = int(t.batch_size)
     n_val = ecfg["val_episodes"]
