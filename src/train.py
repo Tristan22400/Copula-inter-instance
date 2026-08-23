@@ -1952,6 +1952,7 @@ def main(cfg: DictConfig) -> None:
 
     adaptive_kernel_weights = None  # set below only when live_generation + adaptive_kernel_sampling
     tabicl_mix_weights = None  # set below only when live_generation + data.z_train_tabicl_mix_enabled
+    train_iter = None  # possibly kicked off early below (live_generation only) -- see there
     if live_generation:
         # No on-disk dataset at all: episodes are generated on the fly by
         # DataLoader worker processes (see live_dataset.py). Temporary
@@ -1965,6 +1966,25 @@ def main(cfg: DictConfig) -> None:
         train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
         val_loader   = build_fixed_live_val_batches(cfg, t, device)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
+        # Kick off the persistent DataLoader workers now rather than waiting
+        # until right before the training loop (the old location of this
+        # iter() call). Constructing the iterator spawns the (num_workers)
+        # worker processes and lets them start filling their prefetch queue
+        # in the background -- each worker loads its own frozen TabICL copy
+        # first (see live_dataset.py's "worker N: loading frozen TabICL
+        # marginal" print), a ~5-10s cost that was previously paid fully
+        # serially, showing up as step 0's outsized `data=` time. Everything
+        # below this (the z_train sim-to-real diagnostic, kernel_fit_z,
+        # era5 probes, model/optimizer construction) is independent of
+        # train_loader, so it now overlaps with worker startup instead.
+        # Only safe when tabicl_mix_weights is None: when data.
+        # z_train_tabicl_mix_enabled=true, the gap-measurement pass below
+        # does an in-place .copy_() into that same shared-memory tensor
+        # before any worker may safely read it (see that section's own
+        # torn-read comment) -- so in that case the kick is deferred to the
+        # original, later spot instead.
+        if tabicl_mix_weights is None:
+            train_iter = iter(train_loader)
     else:
         meta_path   = os.path.join(t.dataset_dir, "meta.pt")
         shard_files = sorted(glob(os.path.join(t.dataset_dir, "shard_*.pt")))
@@ -2390,7 +2410,8 @@ def main(cfg: DictConfig) -> None:
     # tensors in RAM. Re-creating the iterator on StopIteration instead reuses
     # the persistent workers but calls the sampler fresh each epoch, so both
     # the plain RandomSampler and ShardBlockSampler reshuffle every pass.
-    train_iter = iter(train_loader)
+    if train_iter is None:  # not already kicked off early above
+        train_iter = iter(train_loader)
     loss_ema: float | None = None
     _EMA_ALPHA = 0.98
     _triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
