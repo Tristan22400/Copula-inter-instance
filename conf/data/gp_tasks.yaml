@@ -371,11 +371,11 @@ pit_eps: 1.0e-6
 # generation batch instead of one closed-form Cholesky; "tabicl_split": 1
 # forward pass, but over a larger context) -- pilot on a small n_tasks before
 # scaling a production run up.
-z_train_source: analytic
+z_train_source: tabicl
 # K-fold count for z_train_source=tabicl's run_pit_batched call (same
 # semantics/default as pit.py::DEFAULT_K_FOLDS). Ignored unless
 # z_train_source=tabicl.
-z_train_tabicl_k_folds: 10
+z_train_tabicl_k_folds: 5
 # Calibration-pool size for z_train_source=tabicl_split's
 # run_pit_calib_split_batched call, as a fraction of P (the episode's
 # training-set size): P_C = max(1, round(z_train_split_calib_frac * P)).

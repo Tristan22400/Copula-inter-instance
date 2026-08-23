@@ -78,7 +78,7 @@ training:
   # fly via DataLoader workers (see live_dataset.py) — no disk reads/writes
   # for training data. Temporary, storage-constrained-environment mode;
   # false (default) uses the on-disk dataset_dir pipeline unchanged.
-  live_generation: false
+  live_generation: true
   # CPU-bound generation is heavier than a shard read; size to keep the GPU
   # fed. 16 (not 8) because generate_gp_batch's fixed per-call overhead means
   # aggregate worker throughput doesn't scale with batch_size on its own —
@@ -134,7 +134,7 @@ training:
   # exponentiated-gradient update on the oracle gap (regret), see
   # train.py::_update_adaptive_kernel_weights. false (default) leaves
   # sampling exactly as before this feature existed.
-  adaptive_kernel_sampling: false
+  adaptive_kernel_sampling: true
   # Exponentiated-gradient step size η applied to the per-family oracle gap
   # (copula_nll - oracle_copula_nll, typically O(0.1-1) in this codebase's
   # units — unlike the cross-entropy-scale losses DoReMi tuned η against, so
