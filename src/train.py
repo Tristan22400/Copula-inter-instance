@@ -73,6 +73,7 @@ from dataset import (
     collate_fn,
 )
 from eval.configs.regions import REGIONS as ERA5_REGIONS
+from era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
 from eval.spatial.diagnostics import bin_correlation_by_distance
 from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
 from live_dataset import (
@@ -483,12 +484,22 @@ def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
     beatable one. pit.gp_analytical_posterior computes the real one (Schur
     complement, float64, PSD-repaired), but it only runs one episode at a
     time and needs return_kernel_metadata=True episodes (kernel name +
-    hyperparameters), which normal training/validation batches don't carry.
-    This builds a small, fixed set of such episodes once at startup —
-    unlike _build_synthetic_kernel_batches, cfg.data's own kernel mixture
-    (systematic_composition etc.) is left untouched, since the point here is
-    to measure the ceiling on the SAME kind of episode the model actually
-    trains on, not an isolated classical kernel family.
+    hyperparameters), which normal training/validation batches don't carry
+    (train.py's val_loader/build_fixed_live_val_batches never pass
+    return_kernel_metadata=True). This builds a fixed set of such episodes
+    once at startup — unlike _build_synthetic_kernel_batches, cfg.data's own
+    kernel mixture (systematic_composition etc.) is left untouched, since the
+    point here is to measure the ceiling on the SAME kind of episode the
+    model actually trains on, not an isolated classical kernel family.
+
+    baselines.posterior_probe_n_episodes defaults (conf/config.yaml) to
+    ${training.val_episodes} — same episode count as val_loader, drawn fresh
+    from the same cfg.data distribution val_loader itself samples from, so
+    oracle_diag/gap_nll is a same-size, same-distribution stand-in for "gap
+    on the full validation set" (not literally the same episodes: val_loader
+    can't carry gp_analytical_posterior's required kernel metadata without
+    changing what's persisted to disk/cached, see above). Override the config
+    key directly for a different size (e.g. smaller, for faster iteration).
 
     Returns {"episodes": [...] (CPU dicts, consumed by gp_analytical_posterior
     one at a time), "batch": {...} (device-resident, collated/padded,
@@ -1312,10 +1323,13 @@ def validate(
     # expectation is a genuine inequality (see its docstring), not a
     # convention that can be beaten by a better model.
     #
-    # Restricted to posterior_probe's small fixed episode set:
-    # gp_analytical_posterior runs one episode at a time (float64
-    # eigendecomposition-based PSD repair), so this is deliberately not run
-    # over the full val_loader.
+    # Restricted to posterior_probe's own fixed episode set (default size =
+    # training.val_episodes, see _build_posterior_probe_batches): this is NOT
+    # the actual val_loader population -- gp_analytical_posterior runs one
+    # episode at a time (float64 eigendecomposition-based PSD repair) and
+    # needs return_kernel_metadata=True, which val_loader's episodes don't
+    # carry -- so this is deliberately a separate, same-size/same-distribution
+    # draw instead of a pass over val_loader itself.
     #
     # copula_nll/total_nll/gap_nll/corr_pearson/corr_mae below all run the
     # model (out_p = model(pb)) and score its output against ground truth,
@@ -1882,6 +1896,24 @@ def main(cfg: DictConfig) -> None:
 
     t = cfg.training
     live_generation = bool(t.get("live_generation", False))
+    live_source = str(t.get("live_source", "gp"))
+    if live_generation and live_source == "era5" and float(t.get("aux_mae_weight", 0.0)) > 0.0:
+        # No oracle R_star exists for real ERA5 (data_gen.py's kernel-generated
+        # ground truth has no real-data analogue) -- see era5_live_dataset.py's
+        # module docstring and _build_era5_val_batches' docstring for the same
+        # constraint on the validation-probe side.
+        print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
+        t.aux_mae_weight = 0.0
+    if live_generation and live_source == "era5" and int(t.get("plot_val_every", 0)) > 0:
+        # validate()'s do_plot path indexes batch["R_star"] (correlation
+        # scatter/heatmap plots against the oracle) unconditionally when a
+        # plot step lands -- era5_collate_fn's batches carry no R_star (no
+        # oracle exists for real data), so a plot step would KeyError. No
+        # oracle-vs-predicted plot is possible here by construction; disable
+        # rather than special-case the plotting internals for a field that
+        # can never exist under this source.
+        print("[train] live_source=era5: forcing training.plot_val_every=0 (no oracle R_star to plot against)")
+        t.plot_val_every = 0
     if live_generation:
         _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         # dataset_dir is ignored entirely in this mode (see below) — naming the
@@ -1971,10 +2003,18 @@ def main(cfg: DictConfig) -> None:
         print(
             "[train] live_generation=true — generating episodes on the fly, "
             f"no dataset_dir read ({t.dataset_dir!r} ignored). "
-            f"ckpt_dir={t.get('ckpt_dir', None)!r}"
+            f"ckpt_dir={t.get('ckpt_dir', None)!r} live_source={live_source!r}"
         )
-        train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
-        val_loader   = build_fixed_live_val_batches(cfg, t, device)
+        if live_source == "era5":
+            # Real, worldwide ARCO-ERA5 episodes (era5_live_dataset.py) instead
+            # of synthetic GP kernels — no adaptive-kernel-sampling / TabICL-
+            # z_train-mix machinery applies here (both are GP-generation-only
+            # features), so those two returns stay None.
+            train_loader = build_era5_train_loader(cfg, t, device)
+            val_loader = build_era5_fixed_val_batches(cfg, t, device)
+        else:
+            train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
+            val_loader = build_fixed_live_val_batches(cfg, t, device)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
         # Kick off the persistent DataLoader workers now rather than waiting
         # until right before the training loop (the old location of this
