@@ -371,7 +371,7 @@ pit_eps: 1.0e-6
 # generation batch instead of one closed-form Cholesky; "tabicl_split": 1
 # forward pass, but over a larger context) -- pilot on a small n_tasks before
 # scaling a production run up.
-z_train_source: analytic
+z_train_source: tabicl
 # K-fold count for z_train_source=tabicl's run_pit_batched call (same
 # semantics as pit.py::DEFAULT_K_FOLDS, but defaulted lower here -- see
 # below). Ignored unless z_train_source=tabicl. Clamped into [2, P] by
