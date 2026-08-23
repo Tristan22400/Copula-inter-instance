@@ -38,6 +38,12 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", required=True, help="Checkpoint to finetune (path saved by train.py's save_checkpoint()).")
     p.add_argument("--corpus-dir", default="./eval/data/cache/era5_global", help="Local global-ERA5 corpus dir (see eval/data/fetch_era5_global.py).")
+    p.add_argument(
+        "--val-corpus-dir", default=None,
+        help="Separate corpus dir for the fixed validation set (e.g. a held-out year fetched into its own "
+        "cache dir), disjoint from --corpus-dir's training years. Default: falls back to --corpus-dir "
+        "(validates on a different random slice of the SAME date range training draws from).",
+    )
     p.add_argument("--steps", type=int, default=10000, help="Total finetune steps (default 10000 -- short, unlike a from-scratch pretraining run).")
     p.add_argument("--warmup-steps", type=int, default=200, help="LR warmup steps for the finetune schedule (default 200).")
     p.add_argument("--muon-lr", type=float, default=4.0e-5, help="Peak Muon LR (default 4e-5 -- a finetune-scale fraction of a typical pretraining peak).")
@@ -64,6 +70,11 @@ def main() -> None:
             f"--corpus-dir {args.corpus_dir!r} is empty or missing -- fetch a corpus first:\n"
             "  python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24"
         )
+    if args.val_corpus_dir is not None and (not os.path.isdir(args.val_corpus_dir) or not os.listdir(args.val_corpus_dir)):
+        raise FileNotFoundError(
+            f"--val-corpus-dir {args.val_corpus_dir!r} is empty or missing -- fetch a held-out-year corpus first, "
+            "e.g.:\n  python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 --cache-dir <val dir>"
+        )
 
     ckpt_dir = args.ckpt_dir or os.path.join(
         "checkpoints", f"era5-finetune-{os.path.splitext(os.path.basename(args.ckpt))[0]}-{int(time.time())}",
@@ -82,6 +93,8 @@ def main() -> None:
         f"training.ckpt_dir={ckpt_dir}",
         f"era5_live.corpus_dir={args.corpus_dir}",
     ]
+    if args.val_corpus_dir is not None:
+        overrides.append(f"era5_live.val_corpus_dir={args.val_corpus_dir}")
     if args.grid_size_min is not None:
         overrides.append(f"era5_live.grid_size_min={args.grid_size_min}")
     if args.grid_size_max is not None:
