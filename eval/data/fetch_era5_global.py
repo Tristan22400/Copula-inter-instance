@@ -27,7 +27,7 @@ import calendar
 import os
 
 import numpy as np
-from scipy.io.netcdf import netcdf_file
+from scipy.io import netcdf_file
 
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "era5_global")
 _ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
