@@ -23,6 +23,7 @@ required here (unlike LiveGPDataset, where tabicl_device is optional).
 
 from __future__ import annotations
 
+import glob
 import os
 import sys
 from typing import List, Optional, Tuple
@@ -38,7 +39,8 @@ _REPO_ROOT = os.path.dirname(_HERE)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from pit import load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit
+from live_dataset import resolve_live_tabicl_num_workers
+from pit import load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
 
 from eval.data.era5_global_corpus import GlobalERA5Corpus
 
@@ -129,6 +131,44 @@ def _pit_episode(
     }
 
 
+def _pit_group(
+    x_train: torch.Tensor, y_train: torch.Tensor, x_test: torch.Tensor, y_test: torch.Tensor,
+    tabicl_model, k_folds: int,
+) -> Optional[dict]:
+    """Batched sibling of `_pit_episode`: PITs a whole *group* of B episodes
+    that all share P/N (see LiveERA5Dataset.__iter__'s grouped sampling) in
+    ONE run_pit_batched call instead of B separate run_pit calls -- mirrors
+    src/live_dataset.py::LiveGPDataset's group_size mechanism, cutting
+    TabICL's own per-call Python/CUDA-launch overhead from B*(k_folds+1)
+    invocations to k_folds+1 (see run_pit_batched's docstring).
+
+    Unlike normalize_targets (single episode, unconditional .mean()/.std()
+    reduction), each of the B episodes needs its OWN mean/std computed over
+    its own P training points -- reduce over dim=-1 with keepdim instead.
+
+    Args:
+        x_train/y_train : (B, P, p_x) / (B, P)
+        x_test/y_test   : (B, N, p_x) / (B, N)
+    Returns dict of (B, P)/(B, N)/(B, N) z_train/z_test/log_pdf_test, or
+    None if there's too little context for run_pit_batched's fold split.
+    """
+    if x_train.shape[1] < 2 or x_test.shape[1] < 1:
+        return None
+    mean = y_train.mean(dim=-1, keepdim=True)
+    std = y_train.std(dim=-1, keepdim=True).clamp(min=1e-8)
+    y_train_scaled = (y_train - mean) / std
+    y_test_scaled = (y_test - mean) / std
+    Y_train = y_train_scaled.unsqueeze(-1)
+    Y_test = y_test_scaled.unsqueeze(-1)
+    pit_out = run_pit_batched(tabicl_model, x_train, Y_train, x_test, Y_test, k_folds=k_folds)
+    return {
+        "z_train": pit_out["z_train"].squeeze(-1),
+        "z_test": pit_out["z_test"].squeeze(-1),
+        # Per-episode Jacobian correction -- see _pit_episode's docstring.
+        "log_pdf_test": pit_out["log_pdf_test"].squeeze(-1) - std.log(),
+    }
+
+
 class LiveERA5Dataset(IterableDataset):
     """Infinite stream of real-ERA5 episodes: each worker lazily loads its
     own GlobalERA5Corpus (in-RAM, see era5_global_corpus.py) and its own
@@ -138,11 +178,19 @@ class LiveERA5Dataset(IterableDataset):
     CPU-worker path here, same throughput argument live_dataset.py's
     build_live_train_loader docstring makes for data.z_train_source=tabicl).
 
-    Unlike LiveGPDataset, there is no group_size/homogeneity constraint:
-    every episode here has the same feature width d_x=2 (lon, lat) regardless
-    of region/resolution, so P/N can vary freely per episode within a batch
-    — era5_collate_fn pads exactly like dataset.collate_fn already does for
-    variable-P/N synthetic episodes.
+    Episodes are drawn in *groups* of `group_size` sharing one P/N each (see
+    __iter__): every call rolls its own grid_size/n_context once, shared by
+    the whole group, and draws region/day/box_deg independently per episode
+    within it via GlobalERA5Corpus.sample_episode_fixed_shape — the same
+    P/N-homogeneous-group, everything-else-free-to-vary trade LiveGPDataset's
+    group_size already makes for synthetic data (see its docstring), applied
+    here to amortize TabICL's per-call PIT overhead across the group via
+    run_pit_batched instead of one run_pit call per episode (benchmarked
+    ~40x fewer Python-level TabICL invocations per episode). d_x=2 (lon,
+    lat) is fixed regardless of region/resolution, so — unlike the synthetic
+    path, where group_size must also equal a multiple of d_features — P/N
+    can still vary freely *across* groups/batches; era5_collate_fn pads
+    exactly like dataset.collate_fn already does for that.
     """
 
     def __init__(
@@ -155,6 +203,7 @@ class LiveERA5Dataset(IterableDataset):
         box_deg_range: Tuple[float, float],
         n_context_frac_range: Tuple[float, float],
         base_seed: int,
+        group_size: int = 1,
     ):
         self.corpus_dir = corpus_dir
         self.tabicl_ckpt = tabicl_ckpt
@@ -164,6 +213,7 @@ class LiveERA5Dataset(IterableDataset):
         self.box_deg_range = box_deg_range
         self.n_context_frac_range = n_context_frac_range
         self.base_seed = base_seed
+        self.group_size = group_size
 
     def _seed_for(self, worker_id: int, call_idx: int) -> int:
         raw = (self.base_seed + 1) * 1_000_003 + worker_id * 1_000_000_007 + call_idx
@@ -183,27 +233,55 @@ class LiveERA5Dataset(IterableDataset):
         while True:
             rng = np.random.default_rng(self._seed_for(worker_id, call_idx))
             call_idx += 1
-            ep = corpus.sample_episode(
-                rng, self.grid_size_range, self.box_deg_range, self.n_context_frac_range,
-            )
-            if ep is None:
+
+            # Roll grid_size/n_context ONCE per group -- every episode in
+            # the group shares P/N (region/day/box_deg still vary per draw),
+            # required for the single run_pit_batched call below. See
+            # sample_episode_fixed_shape's docstring.
+            grid_size = int(rng.integers(self.grid_size_range[0], self.grid_size_range[1] + 1))
+            D = grid_size * grid_size
+            n_context_frac = float(rng.uniform(*self.n_context_frac_range))
+            n_context = int(np.clip(round(n_context_frac * D), 1, D - 1))
+
+            raw_eps: list = []
+            attempts = 0
+            max_attempts = self.group_size * 20
+            while len(raw_eps) < self.group_size and attempts < max_attempts:
+                attempts += 1
+                ep = corpus.sample_episode_fixed_shape(rng, grid_size, self.box_deg_range, n_context)
+                if ep is not None:
+                    raw_eps.append(ep)
+            if len(raw_eps) < self.group_size:
+                # Pathological draw (e.g. grid_size too large for
+                # box_deg_range to ever satisfy) -- redraw the whole group
+                # with a fresh grid_size/n_context on the next call_idx.
                 continue
-            x_train = torch.as_tensor(ep["x_norm_train"], dtype=torch.float32, device=self.tabicl_device)
-            x_test = torch.as_tensor(ep["x_norm_test"], dtype=torch.float32, device=self.tabicl_device)
-            y_train = torch.as_tensor(ep["y_train"], dtype=torch.float32, device=self.tabicl_device)
-            y_test = torch.as_tensor(ep["y_test"], dtype=torch.float32, device=self.tabicl_device)
-            pit = _pit_episode(x_train, y_train, x_test, y_test, tabicl_model, self.k_folds)
+
+            x_train = torch.as_tensor(
+                np.stack([e["x_norm_train"] for e in raw_eps]), dtype=torch.float32, device=self.tabicl_device
+            )
+            x_test = torch.as_tensor(
+                np.stack([e["x_norm_test"] for e in raw_eps]), dtype=torch.float32, device=self.tabicl_device
+            )
+            y_train = torch.as_tensor(
+                np.stack([e["y_train"] for e in raw_eps]), dtype=torch.float32, device=self.tabicl_device
+            )
+            y_test = torch.as_tensor(
+                np.stack([e["y_test"] for e in raw_eps]), dtype=torch.float32, device=self.tabicl_device
+            )
+            pit = _pit_group(x_train, y_train, x_test, y_test, tabicl_model, self.k_folds)
             if pit is None:
                 continue
-            yield {
-                "x_norm_train": x_train.cpu(),
-                "x_norm_test": x_test.cpu(),
-                "y_train": y_train.cpu(),
-                "y_test": y_test.cpu(),
-                "z_train": pit["z_train"].cpu(),
-                "z_test": pit["z_test"].cpu(),
-                "log_pdf_test": pit["log_pdf_test"].cpu(),
-            }
+            for i in range(self.group_size):
+                yield {
+                    "x_norm_train": x_train[i].cpu(),
+                    "x_norm_test": x_test[i].cpu(),
+                    "y_train": y_train[i].cpu(),
+                    "y_test": y_test[i].cpu(),
+                    "z_train": pit["z_train"][i].cpu(),
+                    "z_test": pit["z_test"][i].cpu(),
+                    "log_pdf_test": pit["log_pdf_test"][i].cpu(),
+                }
 
 
 def _resolve_era5_cfg(cfg: DictConfig) -> dict:
@@ -223,6 +301,117 @@ def _resolve_era5_cfg(cfg: DictConfig) -> dict:
         "val_episodes": int(e.get("val_episodes", 200)),
         "val_seed": int(e.get("val_seed", 20260823)),
     }
+
+
+def _corpus_bytes_on_disk(corpus_dir: str) -> int:
+    paths = glob.glob(os.path.join(corpus_dir, "era5_global_t2m_*.nc"))
+    return sum(os.path.getsize(p) for p in paths)
+
+
+def _available_system_memory_bytes() -> Optional[int]:
+    """cgroup-aware available memory, or None if it can't be determined.
+
+    Plain /proc/meminfo (what psutil.virtual_memory() reads) reports the
+    HOST's free memory, not this job's actual budget -- on a shared cluster
+    node an OAR job's memory cgroup caps it to a rented subset (e.g. 125GB of
+    a 251GB host), and free-host-memory silently overstates that. Walk
+    /proc/self/cgroup to find this process's own cgroup and read its
+    limit/usage directly (cgroup v1 memory controller, falling back to the
+    v2 unified hierarchy); if neither is readable (e.g. not running under a
+    cgroup at all), fall back to host-wide /proc/meminfo.
+    """
+    try:
+        with open("/proc/self/cgroup") as f:
+            cgroup_lines = f.readlines()
+    except OSError:
+        cgroup_lines = []
+    mem_rel, unified_rel = None, None
+    for line in cgroup_lines:
+        parts = line.strip().split(":", 2)
+        if len(parts) != 3:
+            continue
+        _hier_id, controllers, path = parts
+        if controllers == "":
+            unified_rel = path
+        elif "memory" in controllers.split(","):
+            mem_rel = path
+    if mem_rel is not None:
+        base = os.path.join("/sys/fs/cgroup/memory", mem_rel.lstrip("/"))
+        try:
+            with open(os.path.join(base, "memory.limit_in_bytes")) as f:
+                limit = int(f.read().strip())
+            with open(os.path.join(base, "memory.usage_in_bytes")) as f:
+                usage = int(f.read().strip())
+            if limit < (1 << 62):  # unset v1 limits report a huge sentinel value
+                return max(0, limit - usage)
+        except (OSError, ValueError):
+            pass
+    if unified_rel is not None:
+        base = os.path.join("/sys/fs/cgroup", unified_rel.lstrip("/"))
+        try:
+            with open(os.path.join(base, "memory.max")) as f:
+                raw = f.read().strip()
+            if raw != "max":
+                with open(os.path.join(base, "memory.current")) as f:
+                    usage = int(f.read().strip())
+                return max(0, int(raw) - usage)
+        except (OSError, ValueError):
+            pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+# Flat reserve for the main process's own footprint (val corpus, model +
+# optimizer state, CUDA/Python overhead) before dividing the remainder among
+# workers, mirroring live_dataset.py's GPU-side headroom reservation.
+_ERA5_RAM_MAIN_PROCESS_RESERVE_GB = 20.0
+_ERA5_RAM_AUTO_WORKERS_MIN = 1
+_ERA5_RAM_AUTO_WORKERS_MAX = 8
+
+
+def _resolve_era5_num_workers(t: DictConfig, device: str, corpus_dir: str) -> int:
+    """Resolve training.live_tabicl_num_workers for the era5 live loader.
+
+    Each worker loads its own full private in-RAM copy of the corpus (see
+    GlobalERA5Dataset's docstring) -- unlike live_dataset.py's synthetic-GP
+    workers, whose binding constraint is GPU VRAM (their own TabICL copy),
+    this loader's binding constraint is system RAM. Auto-detecting off free
+    VRAM alone (resolve_live_tabicl_num_workers) can pick a worker count
+    that's fine on the GPU but blows through the job's RAM budget -- e.g. 8
+    workers x 15GB corpus = 120GB against a 125GB OAR cgroup cap reliably
+    OOM-kills a worker (see era5-finetune startup crash, confirmed via
+    memory.oom_kill in the job's cgroup). So take whichever of the two
+    auto-detected counts is smaller. Explicit training.live_tabicl_num_workers
+    still wins over both, same as resolve_live_tabicl_num_workers alone.
+    """
+    configured = t.get("live_tabicl_num_workers", None)
+    if configured is not None:
+        return int(configured)
+    gpu_n = resolve_live_tabicl_num_workers(t, device)
+    corpus_bytes = _corpus_bytes_on_disk(corpus_dir)
+    available = _available_system_memory_bytes()
+    if not corpus_bytes or available is None:
+        return gpu_n
+    reserve_bytes = _ERA5_RAM_MAIN_PROCESS_RESERVE_GB * 1e9
+    budget = available - reserve_bytes
+    ram_n = int(budget // corpus_bytes) if budget > 0 else 0
+    ram_n = max(_ERA5_RAM_AUTO_WORKERS_MIN, min(ram_n, _ERA5_RAM_AUTO_WORKERS_MAX))
+    n = min(gpu_n, ram_n)
+    if n < gpu_n:
+        print(
+            f"[era5_live_dataset] capping live_tabicl_num_workers to {n} (GPU "
+            f"headroom would allow {gpu_n}) -- each worker holds its own full "
+            f"in-RAM corpus copy ({corpus_bytes / 1e9:.1f}GB) and this job's "
+            f"available system memory ({available / 1e9:.1f}GB) only supports "
+            f"{ram_n}. Set training.live_tabicl_num_workers explicitly to override."
+        )
+    return n
 
 
 def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> DataLoader:
@@ -248,6 +437,12 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
     ecfg = _resolve_era5_cfg(cfg)
     k_folds = int(cfg.tabicl.get("pit_k_folds", 10))
     base_seed = int(getattr(cfg, "seed", None) or 0)
+    # Reuse live_dataset.py's dedicated tabicl-GPU-worker group knob (default
+    # 2, benchmarked there for the synthetic-GP path) rather than adding a
+    # separate era5-specific one -- same TabICL-per-call-overhead problem,
+    # same fix. See LiveERA5Dataset's docstring for what grouping buys here.
+    group_multiplier = max(1, int(t.get("live_tabicl_group_multiplier", 2)))
+    group_size = int(t.batch_size) * group_multiplier
 
     live_ds = LiveERA5Dataset(
         corpus_dir=ecfg["corpus_dir"],
@@ -258,8 +453,9 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         box_deg_range=ecfg["box_deg_range"],
         n_context_frac_range=ecfg["n_context_frac_range"],
         base_seed=base_seed,
+        group_size=group_size,
     )
-    num_workers = int(t.get("live_tabicl_num_workers", 2))
+    num_workers = _resolve_era5_num_workers(t, device, ecfg["corpus_dir"])
     loader = DataLoader(
         live_ds,
         batch_size=t.batch_size,
