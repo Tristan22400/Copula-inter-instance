@@ -61,6 +61,7 @@ from eval.spatial.sweep_core import (  # noqa: E402
     weighted_r2,
     weighted_rmse_bias,
 )
+from loss import y_space_nll  # noqa: E402
 from model import build_copula_transformer, build_sigma  # noqa: E402
 from train import _build_era5_val_batches  # noqa: E402
 
@@ -202,6 +203,11 @@ def _tiny_era5_cfg(seed: int = 555) -> "OmegaConf":
             "era5_n_bins": _TINY_BINS,
             "era5_seed": seed,
         },
+        # _build_era5_val_batches reads tabicl.pit_k_folds (mirrors
+        # conf/model/copula_prod.yaml's real `tabicl:` section) to run
+        # TabICL's own PIT on the probe's held-out points -- see
+        # test_build_era5_val_batches_shapes' nll_test_z/log_pdf assertions.
+        "tabicl": {"pit_k_folds": 5},
     })
 
 
@@ -212,6 +218,7 @@ def test_build_era5_val_batches_shapes(tabicl_fake):
     probe = batches[_TINY_REGION]
     D = _TINY_GRID * _TINY_GRID
     n_context = min(_TINY_CONTEXT, D - 1)
+    n_nll = min(30, D - n_context)  # eval.configs.constants.N_NLL_TEST, capped
     b = probe["batch"]
     assert b["x_train"].shape == (_TINY_DAYS_PROBE, n_context, 2)
     assert b["x_test"].shape == (_TINY_DAYS_PROBE, D, 2)
@@ -223,9 +230,33 @@ def test_build_era5_val_batches_shapes(tabicl_fake):
     assert probe["rho_emp"].shape == (_TINY_BINS,)
     assert probe["pair_counts"].shape == (_TINY_BINS,)
 
+    # Real, non-oracle Y-space NLL ingredients (validate()'s
+    # era5_fit/<region>/y_nll_total/marginal/copula) -- only present when
+    # tabicl_marginal is not None (see _build_era5_val_batches' docstring).
+    assert probe["nll_test_idx"].shape == (n_nll,)
+    assert probe["nll_test_idx"].max() < D  # indices into the D-point grid
+    assert probe["nll_test_z"].shape == (_TINY_DAYS_PROBE, n_nll)
+    assert probe["nll_test_log_pdf"].shape == (_TINY_DAYS_PROBE, n_nll)
+    assert torch.isfinite(probe["nll_test_z"]).all()
+    assert torch.isfinite(probe["nll_test_log_pdf"]).all()
+
+
+def test_build_era5_val_batches_none_marginal_skips_nll():
+    """No PIT checkpoint configured -> no real predictive density to score a
+    Y-space NLL against, so the probe carries no nll_test_* keys (validate()
+    guards on this to skip era5_fit/<region>/y_nll_total for every region)."""
+    batches = _build_era5_val_batches(_tiny_era5_cfg(), None, "cpu")
+    probe = batches[_TINY_REGION]
+    assert "nll_test_z" not in probe
+    assert "nll_test_log_pdf" not in probe
+    assert "nll_test_idx" not in probe
+
 
 def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake):
-    cfg = OmegaConf.create({"baselines": {"era5_regions": ["not_a_real_region"]}})
+    cfg = OmegaConf.create({
+        "baselines": {"era5_regions": ["not_a_real_region"]},
+        "tabicl": {"pit_k_folds": 5},
+    })
     assert _build_era5_val_batches(cfg, tabicl_fake, "cpu") == {}
 
 
@@ -270,3 +301,20 @@ def test_era5_fit_scoring_with_tiny_model(small_model_cfg, tabicl_fake):
     # by the weighted_* unit tests above.
     if not math.isnan(shape_corr):
         assert -1.0 - 1e-6 <= shape_corr <= 1.0 + 1e-6
+
+    # Real, non-oracle Y-space NLL block (validate()'s
+    # era5_fit/<region>/y_nll_total/marginal/copula): reuses the SAME Sigma
+    # forward pass above, sliced to nll_test_idx, scored against the frozen
+    # TabICL PIT probe["nll_test_z"]/["nll_test_log_pdf"].
+    idx = torch.as_tensor(probe["nll_test_idx"], dtype=torch.long)
+    Sigma_nll = Sigma.index_select(1, idx).index_select(2, idx)
+    z_nll, log_pdf_nll = probe["nll_test_z"], probe["nll_test_log_pdf"]
+    mask_nll = torch.ones_like(z_nll, dtype=torch.bool)
+    parts = y_space_nll(Sigma_nll, z_nll, log_pdf_nll, mask_nll)
+
+    assert math.isfinite(parts["total"].item())
+    assert math.isfinite(parts["marginal"].item())
+    assert math.isfinite(parts["copula"].item())
+    assert parts["total"].item() == pytest.approx(
+        parts["marginal"].item() + parts["copula"].item(), abs=1e-3
+    )
