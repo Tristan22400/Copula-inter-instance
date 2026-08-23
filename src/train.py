@@ -75,7 +75,14 @@ from dataset import (
 from eval.configs.regions import REGIONS as ERA5_REGIONS
 from eval.spatial.diagnostics import bin_correlation_by_distance
 from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
-from live_dataset import build_fixed_live_val_batches, build_live_train_loader, limited_main_process_threads
+from live_dataset import (
+    _LIVE_TABICL_FLAT_HEADROOM_GB,
+    _LIVE_TABICL_WORKER_HEADROOM_GB,
+    build_fixed_live_val_batches,
+    build_live_train_loader,
+    limited_main_process_threads,
+    resolve_live_tabicl_num_workers,
+)
 from loss import _safe_cholesky, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
 from muon import Muon
@@ -120,6 +127,10 @@ _GPU_PEAK_TFLOPS: dict[str, float] = {
     "RTX A6000": 130e12,
     "RTX A5000": 111e12,          # vercors9/10
     "RTX 6000 ADA": 728e12,       # vercors14/15 — this training node's GPU
+    "RTX 5000 ADA": 522.2e12,     # not yet confirmed on a specific Grid5000 node -- derived
+                                   # from NVIDIA's official datasheet (1044.4 TFLOPS "Tensor
+                                   # Performance", footnoted as effective FP8-with-sparsity) / 2,
+                                   # matching this table's RTX 6000 ADA convention (1457.0 / 2 = 728.5)
     "L40S": 362e12,               # kinovis, vercors17 — must precede "L4"
     "L4": 121e12,                 # vercors16
     "QUADRO RTX 8000": 130.5e12,  # vercors5/8/11
@@ -131,18 +142,6 @@ _GPU_PEAK_TFLOPS: dict[str, float] = {
     "C1060": 0.933e12,            # adonis (Tesla 10-series) — no Tensor Cores: CUDA-core FP32 peak
 }
 _GPU_PEAK_FLOPS_DEFAULT = 100e12
-
-# GPU-memory headroom for live-generation's TabICL DataLoader workers (see
-# _reserve_gpu_headroom_for_live_tabicl below): live_dataset.py's docstring
-# measured ~120MB resident / ~1.4GB peak per worker at batch_size=32 with the
-# cheaper tabicl_split path; this run's z_train_tabicl_mix_* path additionally
-# does a K-fold rotation (default k_folds=10, several forward passes per
-# call instead of one), so budget above that measured peak rather than at it.
-_LIVE_TABICL_WORKER_HEADROOM_GB = 2.5
-# Flat allowance on top of the per-worker figure above, for each worker's own
-# CUDA context overhead (not activation memory, so it doesn't scale with
-# batch/fold count) plus a general safety margin.
-_LIVE_TABICL_FLAT_HEADROOM_GB = 1.0
 
 
 def get_gpu_peak_flops(device: int = 0) -> float:
@@ -199,7 +198,12 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
     if not tabicl_live_enabled or device != "cuda":
         return
-    num_workers = int(t.get("live_tabicl_num_workers", 2))
+    # Same resolution build_live_train_loader uses below (auto-sized from
+    # currently-free GPU memory when training.live_tabicl_num_workers is
+    # left unset) -- keeping both call sites on one resolver means the
+    # headroom reserved here always matches the worker count actually
+    # spawned, instead of drifting if only one of the two were updated.
+    num_workers = resolve_live_tabicl_num_workers(t, device)
     if num_workers <= 0:
         return
     headroom_gb = num_workers * _LIVE_TABICL_WORKER_HEADROOM_GB + _LIVE_TABICL_FLAT_HEADROOM_GB

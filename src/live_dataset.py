@@ -65,6 +65,86 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
         torch.set_num_threads(prev)
 
 
+# ---------------------------------------------------------------------------
+# Shared-GPU-aware sizing for live-generation's TabICL DataLoader workers
+# ---------------------------------------------------------------------------
+# Each live_tabicl_num_workers worker holds its own frozen-TabICL CUDA
+# context, entirely separate from the training process's own allocator pool
+# (see train.py::_reserve_gpu_headroom_for_live_tabicl, which imports these
+# same constants so the two stay in sync). ~120MB resident / ~1.4GB peak per
+# worker was measured at batch_size=32 on the cheaper tabicl_split path;
+# z_train_source=tabicl's K-fold rotation does several forward passes per
+# call instead of one, so budget above that measured peak rather than at it.
+_LIVE_TABICL_WORKER_HEADROOM_GB = 2.5
+# Flat allowance on top of the per-worker figure above, for each worker's own
+# CUDA context overhead (not activation memory, so it doesn't scale with
+# batch/fold count) plus a general safety margin.
+_LIVE_TABICL_FLAT_HEADROOM_GB = 1.0
+# Minimum VRAM reserved for the training process's OWN use (model, optimizer
+# state, activations) when auto-sizing live_tabicl_num_workers below -- a
+# floor, not a measurement of this run's actual footprint (unknowable before
+# the model is even built), chosen conservatively so auto-sizing doesn't
+# starve training on a small card.
+_LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB = 8.0
+# Empirically validated range for the worker-count auto-sizing below
+# (benchmarked on an RTX 6000 Ada, 2026-08-23): throughput plateaus by ~6-8
+# concurrent GPU workers (they share one physical GPU and TabICL's forward
+# pass is real compute, not just launch overhead that hides via overlap, so
+# more workers past this range cost VRAM/CPU-thread overhead for no measured
+# gain) and a single worker still gets the overlap-with-training benefit
+# num_workers=0 would forgo entirely.
+_LIVE_TABICL_AUTO_WORKERS_MIN = 1
+_LIVE_TABICL_AUTO_WORKERS_MAX = 8
+
+
+def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
+    """Resolve training.live_tabicl_num_workers, auto-detecting from
+    CURRENTLY FREE (not total) GPU memory when left unset (null in config).
+
+    Using free rather than total device memory is the important part: it's
+    what makes this safe on a node where multiple jobs (this one plus
+    others, possibly with no coordination between them) share one physical
+    GPU. A worker count tuned/hardcoded against one card's FULL VRAM would
+    either starve this run or risk OOM-ing everyone once another job is
+    already holding memory on the same device -- reading free memory at
+    call time naturally shrinks the auto-picked count when that's the case
+    (and grows it back on an idle card), without needing to know anything
+    about what else is running. It only reflects occupancy AT STARTUP,
+    though -- a second job launched on the same GPU after this one has
+    already sized itself is a real, unmitigated risk either way; explicit
+    training.live_tabicl_num_workers (set deliberately low) is the correct
+    tool for a node you know will run several such jobs concurrently.
+
+    Also naturally adapts across GPU models with different VRAM (e.g. a
+    32GB RTX 5000 Ada vs a 48GB RTX 6000 Ada) without per-node tuning, since
+    it's driven by how much memory is actually free, not a name/model
+    lookup.
+
+    Explicit training.live_tabicl_num_workers in config always wins over
+    auto-detection (e.g. to force a known-safe number by hand on a node
+    running several such jobs by agreement).
+    """
+    configured = t.get("live_tabicl_num_workers", None)
+    if configured is not None:
+        return int(configured)
+    if device != "cuda" or not torch.cuda.is_available():
+        return _LIVE_TABICL_AUTO_WORKERS_MIN
+    free_b, _total_b = torch.cuda.mem_get_info()
+    free_gb = free_b / 1e9
+    available_gb = free_gb - _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB - _LIVE_TABICL_FLAT_HEADROOM_GB
+    n = int(available_gb // _LIVE_TABICL_WORKER_HEADROOM_GB) if available_gb > 0 else 0
+    n = max(_LIVE_TABICL_AUTO_WORKERS_MIN, min(n, _LIVE_TABICL_AUTO_WORKERS_MAX))
+    print(
+        f"[live_dataset] training.live_tabicl_num_workers not set -- auto-detected "
+        f"{n} worker(s) from {free_gb:.1f}GB currently free on this GPU (reserving "
+        f"{_LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB:.0f}GB for the training process "
+        f"itself, ~{_LIVE_TABICL_WORKER_HEADROOM_GB:.1f}GB/worker). Set training."
+        "live_tabicl_num_workers explicitly to override, e.g. if this node runs "
+        "several such jobs concurrently on the same GPU."
+    )
+    return n
+
+
 class LiveGPDataset(IterableDataset):
     """Infinite stream of GP episodes generated on the fly via generate_gp_batch.
 
@@ -331,12 +411,27 @@ def build_live_train_loader(
     copy-on-write, so this still works unchanged under spawn.
     """
     batch_size = int(t.batch_size)
-    group_multiplier = max(1, int(t.get("live_group_multiplier", 1)))
-    group_size = batch_size * group_multiplier
 
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
+
+    # Dedicated group-size knob for the tabicl GPU-worker path, distinct from
+    # live_group_multiplier (which stays analytic-CPU-worker-only, unaffected
+    # by this default): benchmarked 2026-08-23 that batching 2 training
+    # batches' worth of episodes into one generate_gp_batch call meaningfully
+    # helps the tabicl path amortize TabICL's own per-call cost, while the
+    # analytic path's docstring already established group_size=1 is close to
+    # ITS OWN throughput ceiling -- bumping the shared knob would help nothing
+    # there and only add cross-batch-diversity risk (see LiveGPDataset's
+    # docstring), so this stays a separate knob rather than reusing
+    # live_group_multiplier for both paths.
+    if tabicl_live_enabled:
+        group_multiplier = max(1, int(t.get("live_tabicl_group_multiplier", 2)))
+    else:
+        group_multiplier = max(1, int(t.get("live_group_multiplier", 1)))
+    group_size = batch_size * group_multiplier
+
     if tabicl_live_enabled and device != "cuda":
         reason = (
             "data.z_train_tabicl_mix_enabled=true" if mix_enabled
@@ -353,12 +448,12 @@ def build_live_train_loader(
 
     if tabicl_live_enabled:
         # Few, fast GPU workers instead of many, slow CPU ones -- see the
-        # VRAM paragraph above. Falls back to live_num_workers if the
-        # dedicated knob isn't set, but 2 is a deliberately conservative
-        # default: unlike live_num_workers=16 (tuned against CPU core count),
-        # nothing here has tuned how many concurrent TabICL copies a given
-        # GPU can actually afford alongside the training job's own VRAM use.
-        num_workers = int(t.get("live_tabicl_num_workers", 2))
+        # VRAM paragraph above. Auto-sized from currently-free GPU memory
+        # when training.live_tabicl_num_workers is left unset (null) -- see
+        # resolve_live_tabicl_num_workers's docstring for why free (not
+        # total) memory matters on a node where this GPU might be shared
+        # with other jobs, and how it adapts across GPU models/VRAM sizes.
+        num_workers = resolve_live_tabicl_num_workers(t, device)
     else:
         num_workers = int(t.get("live_num_workers", 8))
         # live_num_workers=16 is tuned for a 44-core node (see conf/config.yaml);
