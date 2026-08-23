@@ -73,7 +73,6 @@ class GlobalERA5Corpus:
         grid_size_range: tuple[int, int],
         box_deg_range: tuple[float, float],
         n_context_frac_range: tuple[float, float],
-        n_test_max: int,
     ) -> dict | None:
         """Draw one (region, resolution, day, context/test split) episode.
 
@@ -85,6 +84,11 @@ class GlobalERA5Corpus:
         fall inside the box via evenly-spaced index decimation (simpler than
         fetch_era5.py's block-mean coarsen(), and uniform regardless of
         whether the box wraps the antimeridian).
+
+        No cap on the test set: every point not drawn into context becomes a
+        test point, so N grows with grid_size (up to grid_size_range's own
+        max squared) rather than being clipped to a fixed ceiling -- the
+        model predicts on everything the sampled resolution actually offers.
 
         Returns None on a degenerate draw (box too small/near a pole edge to
         contain >=2 native points per axis, or too few points left over for
@@ -128,11 +132,9 @@ class GlobalERA5Corpus:
         n_context = int(np.clip(round(n_context_frac * D), 1, D - 1))
         perm = rng.permutation(D)
         context_idx = perm[:n_context]
-        remaining = perm[n_context:]
-        n_test = min(len(remaining), n_test_max)
-        if n_test < 1:
+        test_idx = perm[n_context:]
+        if len(test_idx) < 1:
             return None
-        test_idx = remaining[:n_test]
 
         x_train_norm, x_test_norm = normalize_features(coords[context_idx], coords[test_idx])
         return {
