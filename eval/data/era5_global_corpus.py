@@ -16,9 +16,10 @@ import glob
 import os
 
 import numpy as np
+import torch
 from scipy.io.netcdf import netcdf_file
 
-__all__ = ["GlobalERA5Corpus"]
+__all__ = ["GlobalERA5Corpus", "load_shared_corpus_arrays"]
 
 
 def _load_month(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -36,31 +37,56 @@ class GlobalERA5Corpus:
     re-derived, per file) and exposes `sample_episode` for random-region,
     random-resolution episode draws.
 
-    Meant to be constructed once per DataLoader worker process (mirrors
-    live_dataset.py::LiveGPDataset's one-TabICL-load-per-worker pattern) —
-    loading is a one-time cost (~125MB/cached month, read into float32 RAM),
-    not repeated per episode.
+    Two construction paths:
+      - `GlobalERA5Corpus(cache_dir)`: reads from disk into a private copy.
+        Fine for a single-process use (e.g. build_era5_fixed_val_batches).
+      - `GlobalERA5Corpus.from_shared(shared)`: attaches to arrays another
+        process already loaded via `load_shared_corpus_arrays` and put in
+        shared memory -- what src/era5_live_dataset.py's DataLoader workers
+        use, so `live_tabicl_num_workers` copies of this corpus don't each
+        cost their own ~15GB of system RAM.
     """
 
-    def __init__(self, cache_dir: str):
-        paths = sorted(glob.glob(os.path.join(cache_dir, "era5_global_t2m_*.nc")))
-        if not paths:
-            raise FileNotFoundError(
-                f"No cached global ERA5 files found under {cache_dir!r} — run "
-                "`python eval/data/fetch_era5_global.py` first to populate the "
-                "worldwide finetuning corpus."
-            )
-        self.lat: np.ndarray | None = None
-        self.lon: np.ndarray | None = None
-        self._t2m_by_month: list[np.ndarray] = []
-        for p in paths:
-            t2m, lat, lon = _load_month(p)
-            if self.lat is None:
-                self.lat, self.lon = lat, lon
-            self._t2m_by_month.append(t2m)
+    def __init__(self, cache_dir: str | None = None, *, _shared: dict | None = None):
+        if _shared is not None:
+            # See from_shared()/load_shared_corpus_arrays() below -- attach
+            # to already-loaded, already-shared torch storage instead of
+            # touching disk. .numpy() on a share_memory_()'d CPU tensor is a
+            # zero-copy view over that shared storage, so every downstream
+            # numpy op in sample_episode/sample_episode_fixed_shape below
+            # works unmodified against the SAME physical memory every other
+            # attached worker reads.
+            self.lat = _shared["lat"].numpy()
+            self.lon = _shared["lon"].numpy()
+            self._t2m_by_month = [t.numpy() for t in _shared["t2m_by_month"]]
+        else:
+            paths = sorted(glob.glob(os.path.join(cache_dir, "era5_global_t2m_*.nc")))
+            if not paths:
+                raise FileNotFoundError(
+                    f"No cached global ERA5 files found under {cache_dir!r} — run "
+                    "`python eval/data/fetch_era5_global.py` first to populate the "
+                    "worldwide finetuning corpus."
+                )
+            self.lat: np.ndarray | None = None
+            self.lon: np.ndarray | None = None
+            self._t2m_by_month: list[np.ndarray] = []
+            for p in paths:
+                t2m, lat, lon = _load_month(p)
+                if self.lat is None:
+                    self.lat, self.lon = lat, lon
+                self._t2m_by_month.append(t2m)
         day_counts = [a.shape[0] for a in self._t2m_by_month]
         self.n_days_total = int(sum(day_counts))
         self._cum_days = np.cumsum([0] + day_counts)
+
+    @classmethod
+    def from_shared(cls, shared: dict) -> "GlobalERA5Corpus":
+        """Attach to a corpus already loaded (once) by load_shared_corpus_arrays
+        in the main process, instead of re-reading every era5_global_t2m_*.nc
+        file from disk into a private copy. Meant to be called inside each
+        DataLoader worker's __iter__ (see LiveERA5Dataset) -- cheap (no I/O,
+        just wrapping already-shared torch storage as numpy views)."""
+        return cls(_shared=shared)
 
     def _day_slice(self, day_global_idx: int) -> np.ndarray:
         m = int(np.searchsorted(self._cum_days, day_global_idx, side="right") - 1)
@@ -207,3 +233,32 @@ class GlobalERA5Corpus:
             "y_train": values[context_idx].astype(np.float32),
             "y_test": values[test_idx].astype(np.float32),
         }
+
+
+def load_shared_corpus_arrays(cache_dir: str) -> dict:
+    """Load `cache_dir`'s corpus from disk ONCE and move its arrays into
+    shared CPU memory (torch.Tensor.share_memory_()), so a DataLoader's
+    spawned workers can each attach to the SAME physical memory via
+    GlobalERA5Corpus.from_shared instead of every worker loading (and
+    holding, for the life of the run) its own private ~15GB copy.
+
+    Must be called in the MAIN process before the DataLoader's workers spawn
+    -- share_memory_() tensors created ahead of spawn are what let
+    torch.multiprocessing's spawn-safe pickling hand out a shared-memory
+    handle to each worker instead of serializing (copying) the full array,
+    exactly the pattern src/live_dataset.py::build_live_train_loader already
+    uses for kernel_weights/tabicl_mix_weights (see LiveGPDataset's
+    docstring) -- applied here to O(10GB) corpus data instead of a
+    handful-of-floats tensor. Removes the RAM-per-worker constraint that
+    used to force live_tabicl_num_workers down to 1 regardless of GPU
+    headroom: with one shared copy total regardless of worker count,
+    src/era5_live_dataset.py::build_era5_train_loader now sizes
+    live_tabicl_num_workers via live_dataset.py's plain GPU-only-bound
+    resolve_live_tabicl_num_workers, same as the synthetic-GP path.
+    """
+    corpus = GlobalERA5Corpus(cache_dir)
+    return {
+        "lat": torch.from_numpy(corpus.lat).share_memory_(),
+        "lon": torch.from_numpy(corpus.lon).share_memory_(),
+        "t2m_by_month": [torch.from_numpy(a).share_memory_() for a in corpus._t2m_by_month],
+    }
