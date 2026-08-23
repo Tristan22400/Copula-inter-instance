@@ -154,7 +154,6 @@ class LiveERA5Dataset(IterableDataset):
         grid_size_range: Tuple[int, int],
         box_deg_range: Tuple[float, float],
         n_context_frac_range: Tuple[float, float],
-        n_test_max: int,
         base_seed: int,
     ):
         self.corpus_dir = corpus_dir
@@ -164,7 +163,6 @@ class LiveERA5Dataset(IterableDataset):
         self.grid_size_range = grid_size_range
         self.box_deg_range = box_deg_range
         self.n_context_frac_range = n_context_frac_range
-        self.n_test_max = n_test_max
         self.base_seed = base_seed
 
     def _seed_for(self, worker_id: int, call_idx: int) -> int:
@@ -186,7 +184,7 @@ class LiveERA5Dataset(IterableDataset):
             rng = np.random.default_rng(self._seed_for(worker_id, call_idx))
             call_idx += 1
             ep = corpus.sample_episode(
-                rng, self.grid_size_range, self.box_deg_range, self.n_context_frac_range, self.n_test_max,
+                rng, self.grid_size_range, self.box_deg_range, self.n_context_frac_range,
             )
             if ep is None:
                 continue
@@ -222,7 +220,6 @@ def _resolve_era5_cfg(cfg: DictConfig) -> dict:
         "grid_size_range": (int(e.get("grid_size_min", 8)), int(e.get("grid_size_max", 28))),
         "box_deg_range": (float(e.get("box_deg_min", 5.0)), float(e.get("box_deg_max", 25.0))),
         "n_context_frac_range": (float(e.get("n_context_frac_min", 0.05)), float(e.get("n_context_frac_max", 0.4))),
-        "n_test_max": int(e.get("n_test_max", 256)),
         "val_episodes": int(e.get("val_episodes", 200)),
         "val_seed": int(e.get("val_seed", 20260823)),
     }
@@ -260,7 +257,6 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         grid_size_range=ecfg["grid_size_range"],
         box_deg_range=ecfg["box_deg_range"],
         n_context_frac_range=ecfg["n_context_frac_range"],
-        n_test_max=ecfg["n_test_max"],
         base_seed=base_seed,
     )
     num_workers = int(t.get("live_tabicl_num_workers", 2))
@@ -329,7 +325,7 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
                 attempts += 1
                 ep = corpus.sample_episode(
                     rng, ecfg["grid_size_range"], ecfg["box_deg_range"],
-                    ecfg["n_context_frac_range"], ecfg["n_test_max"],
+                    ecfg["n_context_frac_range"],
                 )
                 if ep is None:
                     continue
