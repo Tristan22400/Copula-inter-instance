@@ -75,7 +75,7 @@ from dataset import (
 from eval.configs.regions import REGIONS as ERA5_REGIONS
 from eval.spatial.diagnostics import bin_correlation_by_distance
 from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
-from live_dataset import build_fixed_live_val_batches, build_live_train_loader
+from live_dataset import build_fixed_live_val_batches, build_live_train_loader, limited_main_process_threads
 from loss import _safe_cholesky, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
 from muon import Muon
@@ -744,34 +744,40 @@ def _compute_tabicl_z_train_gap(
     probe_N_max = int(bcfg.get("probe_N_max", 1024))
 
     gaps: dict[str, float] = {}
-    for family in _COMPOSABLE_KERNELS:
-        family_seed = _name_seed(base_seed, family)
-        probe_cfg = OmegaConf.merge(
-            cfg,
-            OmegaConf.create({
-                "seed": family_seed,
-                "data": {
-                    "kernel": family,
-                    "systematic_composition": False,
-                    "P_min": probe_P_min, "P_max": probe_P_max,
-                    "N_min": probe_N_min, "N_max": probe_N_max,
-                },
-            }),
-        )
-        analytic_eps = _generate_gp_batch_raw(probe_cfg, n_episodes, device=device)
-        probe_cfg.seed = family_seed  # _generate_gp_batch_raw mutates nothing, but stay explicit
-        tabicl_eps = _generate_gp_batch_raw(
-            probe_cfg, n_episodes, device=device,
-            tabicl_model=tabicl_marginal, tabicl_k_folds=k_folds,
-        )
-        n = min(len(analytic_eps), len(tabicl_eps))
-        if n == 0:
-            continue
-        diffs = [
-            (tabicl_eps[i]["z_train"] - analytic_eps[i]["z_train"]).abs().mean().item()
-            for i in range(n)
-        ]
-        gaps[family] = float(sum(diffs) / len(diffs))
+    with limited_main_process_threads():
+        # This function is a main-process caller of _generate_gp_batch_raw
+        # (two calls per _COMPOSABLE_KERNELS family), never a DataLoader
+        # worker -- see limited_main_process_threads' docstring for why that
+        # needs an explicit thread cap here (OS-default thread count causes
+        # ~2-3x slowdown on generate_gp_batch's CPU-bound tensor ops).
+        for family in _COMPOSABLE_KERNELS:
+            family_seed = _name_seed(base_seed, family)
+            probe_cfg = OmegaConf.merge(
+                cfg,
+                OmegaConf.create({
+                    "seed": family_seed,
+                    "data": {
+                        "kernel": family,
+                        "systematic_composition": False,
+                        "P_min": probe_P_min, "P_max": probe_P_max,
+                        "N_min": probe_N_min, "N_max": probe_N_max,
+                    },
+                }),
+            )
+            analytic_eps = _generate_gp_batch_raw(probe_cfg, n_episodes, device=device)
+            probe_cfg.seed = family_seed  # _generate_gp_batch_raw mutates nothing, but stay explicit
+            tabicl_eps = _generate_gp_batch_raw(
+                probe_cfg, n_episodes, device=device,
+                tabicl_model=tabicl_marginal, tabicl_k_folds=k_folds,
+            )
+            n = min(len(analytic_eps), len(tabicl_eps))
+            if n == 0:
+                continue
+            diffs = [
+                (tabicl_eps[i]["z_train"] - analytic_eps[i]["z_train"]).abs().mean().item()
+                for i in range(n)
+            ]
+            gaps[family] = float(sum(diffs) / len(diffs))
     return gaps
 
 

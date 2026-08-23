@@ -18,6 +18,7 @@ train.py. Nothing in this module touches disk.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import os
 import warnings
@@ -30,6 +31,38 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
 from pit import load_tabicl, resolve_pit_ckpt
+
+# Thread count for generate_gp_batch calls made directly in the MAIN process
+# (build_fixed_live_val_batches below, train.py's z_train-gap diagnostic) --
+# these never go through a DataLoader's worker_init_fn, so unlike the
+# persistent training workers (_limit_worker_threads below, torch.set_
+# num_threads(1) each) they'd otherwise run at the OS-default thread count
+# (e.g. 64 on a many-core node). Benchmarked: generate_gp_batch's structural-
+# warp and final NaN/Inf-sweep code makes many small/medium CPU tensor ops
+# whose thread-pool launch overhead dominates at high thread counts -- a
+# single 12-tensor isfinite sweep measured 200ms at 64 threads vs 1.2ms at 16
+# (2026-08-23). Unlike the many-worker case, there's only one caller here, so
+# (unlike _limit_worker_threads's 1) a modest thread count is used instead of
+# fully serializing -- 8 stays comfortably inside the fast, flat region the
+# same benchmark found across 1-16 threads without needing per-node tuning.
+_MAIN_PROCESS_GEN_THREADS = 8
+
+
+@contextlib.contextmanager
+def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
+    """Temporarily cap torch's intra-op thread count, restored on exit.
+
+    Wrap any generate_gp_batch/_generate_gp_batch_raw call made directly in
+    the main training process (i.e. NOT inside a DataLoader worker, which
+    already gets _limit_worker_threads via worker_init_fn) with this --
+    see _MAIN_PROCESS_GEN_THREADS' docstring above for why.
+    """
+    prev = torch.get_num_threads()
+    torch.set_num_threads(n)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(prev)
 
 
 class LiveGPDataset(IterableDataset):
@@ -451,7 +484,7 @@ def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
         gen_device = device
 
     batches = []
-    with warnings.catch_warnings():
+    with warnings.catch_warnings(), limited_main_process_threads():
         # Same degenerate-episode discard warnings as LiveGPDataset.__iter__
         # above, silenced here too (scoped to this call, not process-global,
         # since this runs once in the main process rather than a dedicated
