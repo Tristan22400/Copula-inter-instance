@@ -250,6 +250,13 @@ era5_live:
   # (full-globe monthly grids) -- every training/val episode is a random
   # in-memory crop of whatever's cached here, no GCS traffic during training.
   corpus_dir: ./eval/data/cache/era5_global
+  # Optional SEPARATE cache dir for the fixed validation set (see
+  # era5_live_dataset.py::build_era5_fixed_val_batches) -- e.g. one calendar
+  # year fetched into its own directory via fetch_era5_global.py, disjoint
+  # from the year range corpus_dir covers, for genuine held-out-year
+  # validation instead of a different random seed's slice of the same dates
+  # training already draws from. null (default) falls back to corpus_dir.
+  val_corpus_dir: null
   # Grid resolution range (points per side of the sampled region's crop, D =
   # grid_size^2 total points) -- drawn per episode, matching the spread
   # eval/configs/regions.py's grid_resolution sweep profile already probes
