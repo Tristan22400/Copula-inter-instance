@@ -146,3 +146,64 @@ class GlobalERA5Corpus:
             "lon_bounds": (lon_c - half, lon_c + half),
             "grid_size": grid_size,
         }
+
+    def sample_episode_fixed_shape(
+        self,
+        rng: np.random.Generator,
+        grid_size: int,
+        box_deg_range: tuple[float, float],
+        n_context: int,
+    ) -> dict | None:
+        """Like `sample_episode`, but `grid_size`/`n_context` are exact
+        integers instead of ranges, and this returns None (redraw) rather
+        than silently clipping to fewer native points whenever the drawn box
+        doesn't contain a full `grid_size` x `grid_size` grid along either
+        axis. That makes every successful draw's P (`n_context`) and N
+        (`grid_size**2 - n_context`) identical, letting a caller collect a
+        whole *group* of episodes (region/day/box_deg still vary per draw)
+        that share P/N -- required for src/pit.py::run_pit_batched, which
+        can only PIT a batch of episodes in one TabICL call when they all
+        share P/N. Mirrors src/live_dataset.py::LiveGPDataset's group_size
+        mechanism (see its docstring: group_size=1 measured ~1.2s/episode of
+        TabICL PIT overhead vs ~0.03s/episode grouped).
+        """
+        box_deg = float(rng.uniform(*box_deg_range))
+        half = box_deg / 2.0
+        lat_c = float(rng.uniform(-90.0 + half, 90.0 - half))
+        lon_c = float(rng.uniform(0.0, 360.0))
+
+        lat_mask = np.abs(self.lat - lat_c) <= half
+        dlon = ((self.lon - lon_c + 180.0) % 360.0) - 180.0
+        lon_mask = np.abs(dlon) <= half
+        row_idx = np.nonzero(lat_mask)[0]
+        col_idx = np.nonzero(lon_mask)[0]
+        if len(row_idx) < grid_size or len(col_idx) < grid_size:
+            return None
+
+        row_pick = row_idx[np.linspace(0, len(row_idx) - 1, grid_size).round().astype(int)]
+        col_pick = col_idx[np.linspace(0, len(col_idx) - 1, grid_size).round().astype(int)]
+
+        day_idx = int(rng.integers(0, self.n_days_total))
+        field = self._day_slice(day_idx)
+        sub = field[np.ix_(row_pick, col_pick)]  # (grid_size, grid_size)
+
+        lon_grid, lat_grid = np.meshgrid(self.lon[col_pick], self.lat[row_pick])
+        coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()]).astype(np.float64)
+        values = sub.ravel().astype(np.float64)
+        D = coords.shape[0]  # == grid_size**2 by construction
+        if not (1 <= n_context <= D - 1):
+            return None
+
+        perm = rng.permutation(D)
+        context_idx = perm[:n_context]
+        test_idx = perm[n_context:]
+
+        from inference.copula_inference import normalize_features
+
+        x_train_norm, x_test_norm = normalize_features(coords[context_idx], coords[test_idx])
+        return {
+            "x_norm_train": x_train_norm.astype(np.float32),
+            "x_norm_test": x_test_norm.astype(np.float32),
+            "y_train": values[context_idx].astype(np.float32),
+            "y_test": values[test_idx].astype(np.float32),
+        }
