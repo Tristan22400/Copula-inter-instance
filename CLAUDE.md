@@ -12,7 +12,11 @@
   # 3b. Evaluate on real-world datasets (UCI Beijing PM2.5, California Housing)
   python eval/runners/run_benchmarks.py
 
-python src/train_on_datasets.py --config conf/config.yaml --ckpt ./checkpoints/copula-tabicl/
+  # 4. Finetune an existing checkpoint on real, worldwide ARCO-ERA5 data
+  #    (random geographic region + random grid resolution every episode,
+  #    instead of synthetic GP kernels). One-time corpus fetch first, then:
+  python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
+  python src/finetune_era5.py --ckpt ./checkpoints/copula-tabicl/step_0029999_final.pt
 
 Spatial-correlation diagnostics (real ERA5 + synthetic-kernel ground truth), one CLI:
   # One-shot: sweep every registered checkpoint (real + synthetic) -> baseline curve
