@@ -269,11 +269,11 @@ era5_live:
   # "different geographic space" is a continuous draw, not a fixed region list.
   box_deg_min: 5.0
   box_deg_max: 25.0
-  # Fraction of each episode's D grid points used as in-context (the rest,
-  # capped at n_test_max, are the held-out target/query set).
+  # Fraction of each episode's D grid points used as in-context (every
+  # remaining point, uncapped, is the held-out target/query set -- N grows
+  # with grid_size rather than being clipped to a fixed ceiling).
   n_context_frac_min: 0.05
   n_context_frac_max: 0.4
-  n_test_max: 256
   # Fixed validation set (era5_live_dataset.py::build_era5_fixed_val_batches),
   # separate from baselines.era5_regions' curated-region probes above.
   val_episodes: 200
