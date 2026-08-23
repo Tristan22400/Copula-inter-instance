@@ -206,6 +206,13 @@ baselines:
   kernels: [dot_product, rbf, matern12, matern32, matern52, rational_quadratic, periodic, polynomial]
   synth_n_episodes: 64      # fixed episodes generated once per kernel family
   synth_seed: 20260718      # fixed seed -> same probe episodes every run
+  # oracle_diag/gap_nll's episode count (train.py::_build_posterior_probe_batches),
+  # defaulted to a much smaller 64 in code. Tied to training.val_episodes so
+  # gap_nll is measured over the same number of episodes as the rest of val/'s
+  # metrics instead of a separate, noisier small sample -- gp_analytical_posterior
+  # is already called this many times per family in the kernel_fit/* loop above,
+  # so the added per-validate() cost here is small by comparison.
+  posterior_probe_n_episodes: ${training.val_episodes}
   # Context/test-set sizes for the probe, pinned independent of this run's own
   # conf/data/gp_tasks.yaml P_min/P_max/N_min/N_max (which do change between
   # runs) so kernel_fit/<family>/* stays a fixed, cross-run-comparable
