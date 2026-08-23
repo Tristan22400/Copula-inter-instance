@@ -73,6 +73,7 @@ from dataset import (
     collate_fn,
 )
 from eval.configs.regions import REGIONS as ERA5_REGIONS
+from era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
 from eval.spatial.diagnostics import bin_correlation_by_distance
 from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
 from live_dataset import build_fixed_live_val_batches, build_live_train_loader
@@ -1872,6 +1873,24 @@ def main(cfg: DictConfig) -> None:
 
     t = cfg.training
     live_generation = bool(t.get("live_generation", False))
+    live_source = str(t.get("live_source", "gp"))
+    if live_generation and live_source == "era5" and float(t.get("aux_mae_weight", 0.0)) > 0.0:
+        # No oracle R_star exists for real ERA5 (data_gen.py's kernel-generated
+        # ground truth has no real-data analogue) -- see era5_live_dataset.py's
+        # module docstring and _build_era5_val_batches' docstring for the same
+        # constraint on the validation-probe side.
+        print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
+        t.aux_mae_weight = 0.0
+    if live_generation and live_source == "era5" and int(t.get("plot_val_every", 0)) > 0:
+        # validate()'s do_plot path indexes batch["R_star"] (correlation
+        # scatter/heatmap plots against the oracle) unconditionally when a
+        # plot step lands -- era5_collate_fn's batches carry no R_star (no
+        # oracle exists for real data), so a plot step would KeyError. No
+        # oracle-vs-predicted plot is possible here by construction; disable
+        # rather than special-case the plotting internals for a field that
+        # can never exist under this source.
+        print("[train] live_source=era5: forcing training.plot_val_every=0 (no oracle R_star to plot against)")
+        t.plot_val_every = 0
     if live_generation:
         _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         # dataset_dir is ignored entirely in this mode (see below) — naming the
@@ -1960,10 +1979,18 @@ def main(cfg: DictConfig) -> None:
         print(
             "[train] live_generation=true — generating episodes on the fly, "
             f"no dataset_dir read ({t.dataset_dir!r} ignored). "
-            f"ckpt_dir={t.get('ckpt_dir', None)!r}"
+            f"ckpt_dir={t.get('ckpt_dir', None)!r} live_source={live_source!r}"
         )
-        train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
-        val_loader   = build_fixed_live_val_batches(cfg, t, device)
+        if live_source == "era5":
+            # Real, worldwide ARCO-ERA5 episodes (era5_live_dataset.py) instead
+            # of synthetic GP kernels — no adaptive-kernel-sampling / TabICL-
+            # z_train-mix machinery applies here (both are GP-generation-only
+            # features), so those two returns stay None.
+            train_loader = build_era5_train_loader(cfg, t, device)
+            val_loader = build_era5_fixed_val_batches(cfg, t, device)
+        else:
+            train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
+            val_loader = build_fixed_live_val_batches(cfg, t, device)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
     else:
         meta_path   = os.path.join(t.dataset_dir, "meta.pt")

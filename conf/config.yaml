@@ -79,6 +79,18 @@ training:
   # for training data. Temporary, storage-constrained-environment mode;
   # false (default) uses the on-disk dataset_dir pipeline unchanged.
   live_generation: false
+  # Which live_generation episode source to use, only when live_generation=
+  # true. "gp" (default): synthetic GP kernels via live_dataset.py, unchanged
+  # behavior. "era5": real, worldwide ARCO-ERA5 2m-temperature episodes via
+  # era5_live_dataset.py (see era5_live: below for its knobs) -- for
+  # finetuning a checkpoint on real spatial data across many geographic
+  # regions and grid resolutions instead of synthetic kernels. Requires a
+  # local corpus from `python eval/data/fetch_era5_global.py` first, and a
+  # resolvable TabICL checkpoint (tabicl.ckpt/tabicl.pit_ckpt) -- there is no
+  # oracle-PIT option for real data, so training.aux_mae_weight is forced to
+  # 0.0 automatically under this source (no R_star exists to regress
+  # against). See src/finetune_era5.py for a ready-made CLI wrapper.
+  live_source: gp
   # CPU-bound generation is heavier than a shard read; size to keep the GPU
   # fed. 16 (not 8) because generate_gp_batch's fixed per-call overhead means
   # aggregate worker throughput doesn't scale with batch_size on its own —
@@ -230,6 +242,35 @@ baselines:
   era5_n_context: 30        # in-context sample size (eval.configs.constants.N_CONTEXT)
   era5_n_bins: 12           # distance bins for the correlation-vs-distance curve
   era5_seed: 20260818       # fixed seed -> same context sample/probe days every run
+
+# training.live_source=era5's data knobs (src/era5_live_dataset.py). Ignored
+# unless training.live_generation=true AND training.live_source=era5.
+era5_live:
+  # Local cache directory populated by `python eval/data/fetch_era5_global.py`
+  # (full-globe monthly grids) -- every training/val episode is a random
+  # in-memory crop of whatever's cached here, no GCS traffic during training.
+  corpus_dir: ./eval/data/cache/era5_global
+  # Grid resolution range (points per side of the sampled region's crop, D =
+  # grid_size^2 total points) -- drawn per episode, matching the spread
+  # eval/configs/regions.py's grid_resolution sweep profile already probes
+  # (8..28) so finetuning covers the same resolution range validation does.
+  grid_size_min: 8
+  grid_size_max: 28
+  # Region box size (degrees lat/lon half-width doubled), drawn per episode.
+  # Box center is sampled area-uniformly over the whole globe (arcsin-of-
+  # uniform latitude, uniform longitude -- see era5_global_corpus.py), so
+  # "different geographic space" is a continuous draw, not a fixed region list.
+  box_deg_min: 5.0
+  box_deg_max: 25.0
+  # Fraction of each episode's D grid points used as in-context (the rest,
+  # capped at n_test_max, are the held-out target/query set).
+  n_context_frac_min: 0.05
+  n_context_frac_max: 0.4
+  n_test_max: 256
+  # Fixed validation set (era5_live_dataset.py::build_era5_fixed_val_batches),
+  # separate from baselines.era5_regions' curated-region probes above.
+  val_episodes: 200
+  val_seed: 20260823
 
 # LoRA fine-tuning of the TabICL backbone.
 # Override from CLI: lora.enabled=true lora.rank=16 lora.stages=[icl,row]
