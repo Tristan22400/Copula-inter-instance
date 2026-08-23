@@ -23,7 +23,6 @@ required here (unlike LiveGPDataset, where tabicl_device is optional).
 
 from __future__ import annotations
 
-import glob
 import os
 import sys
 from typing import List, Optional, Tuple
@@ -42,7 +41,7 @@ if _REPO_ROOT not in sys.path:
 from live_dataset import resolve_live_tabicl_num_workers
 from pit import load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
 
-from eval.data.era5_global_corpus import GlobalERA5Corpus
+from eval.data.era5_global_corpus import GlobalERA5Corpus, load_shared_corpus_arrays
 
 __all__ = ["build_era5_train_loader", "build_era5_fixed_val_batches", "era5_collate_fn"]
 
@@ -170,13 +169,24 @@ def _pit_group(
 
 
 class LiveERA5Dataset(IterableDataset):
-    """Infinite stream of real-ERA5 episodes: each worker lazily loads its
-    own GlobalERA5Corpus (in-RAM, see era5_global_corpus.py) and its own
-    frozen TabICL copy on `tabicl_device` the first time __iter__ runs —
-    mirrors LiveGPDataset's one-time-per-worker TabICL load, plus a one-time
-    corpus load. Requires tabicl_device="cuda" unconditionally (there is no
-    CPU-worker path here, same throughput argument live_dataset.py's
+    """Infinite stream of real-ERA5 episodes: each worker attaches to a
+    corpus another process already loaded into shared memory (see
+    `shared_corpus`/era5_global_corpus.py::load_shared_corpus_arrays) and
+    loads its own frozen TabICL copy on `tabicl_device` the first time
+    __iter__ runs — mirrors LiveGPDataset's one-time-per-worker TabICL load.
+    Requires tabicl_device="cuda" unconditionally (there is no CPU-worker
+    path here, same throughput argument live_dataset.py's
     build_live_train_loader docstring makes for data.z_train_source=tabicl).
+
+    `shared_corpus` MUST be built (load_shared_corpus_arrays) in the main
+    process before this Dataset's DataLoader spawns workers -- same
+    ordering constraint LiveGPDataset's kernel_weights/tabicl_mix_weights
+    docstring describes for its own share_memory_() tensors. Every worker
+    then attaches to that SAME physical memory (GlobalERA5Corpus.from_shared)
+    instead of each re-reading and holding its own ~15GB private copy of the
+    corpus, which is what used to force live_tabicl_num_workers down to a
+    RAM-bound 1 on a system-RAM-constrained job even when the GPU had
+    headroom for several — see build_era5_train_loader.
 
     Episodes are drawn in *groups* of `group_size` sharing one P/N each (see
     __iter__): every call rolls its own grid_size/n_context once, shared by
@@ -195,7 +205,7 @@ class LiveERA5Dataset(IterableDataset):
 
     def __init__(
         self,
-        corpus_dir: str,
+        shared_corpus: dict,
         tabicl_ckpt: str,
         tabicl_device: str,
         k_folds: int,
@@ -205,7 +215,7 @@ class LiveERA5Dataset(IterableDataset):
         base_seed: int,
         group_size: int = 1,
     ):
-        self.corpus_dir = corpus_dir
+        self.shared_corpus = shared_corpus
         self.tabicl_ckpt = tabicl_ckpt
         self.tabicl_device = tabicl_device
         self.k_folds = k_folds
@@ -224,8 +234,8 @@ class LiveERA5Dataset(IterableDataset):
 
         info = get_worker_info()
         worker_id = info.id if info is not None else 0
-        print(f"[era5_live_dataset] worker {worker_id}: loading global ERA5 corpus from {self.corpus_dir}")
-        corpus = GlobalERA5Corpus(self.corpus_dir)
+        print(f"[era5_live_dataset] worker {worker_id}: attaching to shared global ERA5 corpus")
+        corpus = GlobalERA5Corpus.from_shared(self.shared_corpus)
         print(f"[era5_live_dataset] worker {worker_id}: loading frozen TabICL marginal: {self.tabicl_ckpt}")
         tabicl_model = load_tabicl(self.tabicl_ckpt, self.tabicl_device)
 
@@ -303,123 +313,18 @@ def _resolve_era5_cfg(cfg: DictConfig) -> dict:
     }
 
 
-def _corpus_bytes_on_disk(corpus_dir: str) -> int:
-    paths = glob.glob(os.path.join(corpus_dir, "era5_global_t2m_*.nc"))
-    return sum(os.path.getsize(p) for p in paths)
-
-
-def _available_system_memory_bytes() -> Optional[int]:
-    """cgroup-aware available memory, or None if it can't be determined.
-
-    Plain /proc/meminfo (what psutil.virtual_memory() reads) reports the
-    HOST's free memory, not this job's actual budget -- on a shared cluster
-    node an OAR job's memory cgroup caps it to a rented subset (e.g. 125GB of
-    a 251GB host), and free-host-memory silently overstates that. Walk
-    /proc/self/cgroup to find this process's own cgroup and read its
-    limit/usage directly (cgroup v1 memory controller, falling back to the
-    v2 unified hierarchy); if neither is readable (e.g. not running under a
-    cgroup at all), fall back to host-wide /proc/meminfo.
-    """
-    try:
-        with open("/proc/self/cgroup") as f:
-            cgroup_lines = f.readlines()
-    except OSError:
-        cgroup_lines = []
-    mem_rel, unified_rel = None, None
-    for line in cgroup_lines:
-        parts = line.strip().split(":", 2)
-        if len(parts) != 3:
-            continue
-        _hier_id, controllers, path = parts
-        if controllers == "":
-            unified_rel = path
-        elif "memory" in controllers.split(","):
-            mem_rel = path
-    if mem_rel is not None:
-        base = os.path.join("/sys/fs/cgroup/memory", mem_rel.lstrip("/"))
-        try:
-            with open(os.path.join(base, "memory.limit_in_bytes")) as f:
-                limit = int(f.read().strip())
-            with open(os.path.join(base, "memory.usage_in_bytes")) as f:
-                usage = int(f.read().strip())
-            if limit < (1 << 62):  # unset v1 limits report a huge sentinel value
-                return max(0, limit - usage)
-        except (OSError, ValueError):
-            pass
-    if unified_rel is not None:
-        base = os.path.join("/sys/fs/cgroup", unified_rel.lstrip("/"))
-        try:
-            with open(os.path.join(base, "memory.max")) as f:
-                raw = f.read().strip()
-            if raw != "max":
-                with open(os.path.join(base, "memory.current")) as f:
-                    usage = int(f.read().strip())
-                return max(0, int(raw) - usage)
-        except (OSError, ValueError):
-            pass
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    return None
-
-
-# Flat reserve for the main process's own footprint (val corpus, model +
-# optimizer state, CUDA/Python overhead) before dividing the remainder among
-# workers, mirroring live_dataset.py's GPU-side headroom reservation.
-_ERA5_RAM_MAIN_PROCESS_RESERVE_GB = 20.0
-_ERA5_RAM_AUTO_WORKERS_MIN = 1
-_ERA5_RAM_AUTO_WORKERS_MAX = 8
-
-
-def _resolve_era5_num_workers(t: DictConfig, device: str, corpus_dir: str) -> int:
-    """Resolve training.live_tabicl_num_workers for the era5 live loader.
-
-    Each worker loads its own full private in-RAM copy of the corpus (see
-    GlobalERA5Dataset's docstring) -- unlike live_dataset.py's synthetic-GP
-    workers, whose binding constraint is GPU VRAM (their own TabICL copy),
-    this loader's binding constraint is system RAM. Auto-detecting off free
-    VRAM alone (resolve_live_tabicl_num_workers) can pick a worker count
-    that's fine on the GPU but blows through the job's RAM budget -- e.g. 8
-    workers x 15GB corpus = 120GB against a 125GB OAR cgroup cap reliably
-    OOM-kills a worker (see era5-finetune startup crash, confirmed via
-    memory.oom_kill in the job's cgroup). So take whichever of the two
-    auto-detected counts is smaller. Explicit training.live_tabicl_num_workers
-    still wins over both, same as resolve_live_tabicl_num_workers alone.
-    """
-    configured = t.get("live_tabicl_num_workers", None)
-    if configured is not None:
-        return int(configured)
-    gpu_n = resolve_live_tabicl_num_workers(t, device)
-    corpus_bytes = _corpus_bytes_on_disk(corpus_dir)
-    available = _available_system_memory_bytes()
-    if not corpus_bytes or available is None:
-        return gpu_n
-    reserve_bytes = _ERA5_RAM_MAIN_PROCESS_RESERVE_GB * 1e9
-    budget = available - reserve_bytes
-    ram_n = int(budget // corpus_bytes) if budget > 0 else 0
-    ram_n = max(_ERA5_RAM_AUTO_WORKERS_MIN, min(ram_n, _ERA5_RAM_AUTO_WORKERS_MAX))
-    n = min(gpu_n, ram_n)
-    if n < gpu_n:
-        print(
-            f"[era5_live_dataset] capping live_tabicl_num_workers to {n} (GPU "
-            f"headroom would allow {gpu_n}) -- each worker holds its own full "
-            f"in-RAM corpus copy ({corpus_bytes / 1e9:.1f}GB) and this job's "
-            f"available system memory ({available / 1e9:.1f}GB) only supports "
-            f"{ram_n}. Set training.live_tabicl_num_workers explicitly to override."
-        )
-    return n
-
-
 def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> DataLoader:
     """Training DataLoader backed by LiveERA5Dataset. Mirrors
     live_dataset.py::build_live_train_loader's tabicl-worker path exactly
-    (spawn context, few GPU workers, per-worker thread pinning) — this
-    source has no CPU-only path at all, so there's no analyticGP-style
-    branch to pick between.
+    (spawn context, few GPU workers, per-worker thread pinning, GPU-headroom
+    -bound worker count via resolve_live_tabicl_num_workers) — this source
+    has no CPU-only path at all, so there's no analyticGP-style branch to
+    pick between. Unlike that function's OWN docstring caveat for the
+    synthetic-GP path (no on-disk corpus there), era5 DOES have one; loading
+    it once here into shared memory (load_shared_corpus_arrays) BEFORE the
+    DataLoader spawns workers is what makes it safe to size num_workers off
+    GPU headroom alone instead of a separate system-RAM-aware cap — see
+    LiveERA5Dataset's docstring.
     """
     if device != "cuda":
         raise ValueError(
@@ -444,8 +349,14 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
     group_multiplier = max(1, int(t.get("live_tabicl_group_multiplier", 2)))
     group_size = int(t.batch_size) * group_multiplier
 
+    # Load once, HERE in the main process, before the DataLoader below spawns
+    # any workers -- see LiveERA5Dataset's docstring for why this is what
+    # lets every worker attach to one shared copy instead of holding its own.
+    print(f"[era5_live_dataset] loading global ERA5 corpus into shared memory from {ecfg['corpus_dir']}")
+    shared_corpus = load_shared_corpus_arrays(ecfg["corpus_dir"])
+
     live_ds = LiveERA5Dataset(
-        corpus_dir=ecfg["corpus_dir"],
+        shared_corpus=shared_corpus,
         tabicl_ckpt=ckpt,
         tabicl_device=device,
         k_folds=k_folds,
@@ -455,7 +366,10 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         base_seed=base_seed,
         group_size=group_size,
     )
-    num_workers = _resolve_era5_num_workers(t, device, ecfg["corpus_dir"])
+    # GPU-headroom-bound only, same as the synthetic-GP tabicl path -- no
+    # longer separately RAM-capped, since every worker shares one corpus
+    # copy instead of holding its own (see LiveERA5Dataset's docstring).
+    num_workers = resolve_live_tabicl_num_workers(t, device)
     loader = DataLoader(
         live_ds,
         batch_size=t.batch_size,
