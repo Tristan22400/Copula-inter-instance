@@ -518,7 +518,19 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
 
     `tabicl_marginal` may be None (no PIT checkpoint configured): falls back
     to naive per-context standardization, same as
-    eval.spatial.diagnostics.extract_model_context_correlation.
+    eval.spatial.diagnostics.extract_model_context_correlation. In that case
+    there is no real predictive density to score a Y-space NLL against, so
+    the returned probe carries no "nll_test_z"/"nll_test_log_pdf" and
+    validate()'s era5_fit/<region>/y_nll_total block is skipped for every
+    region.
+
+    When `tabicl_marginal` IS given, this also runs TabICL's own PIT
+    (_tabicl_pit_batch) once on the probe's held-out (never-in-context)
+    points (build_era5_probe's nll_test_idx/context_values_per_day/
+    nll_test_values_per_day) — the same real-marginal z_test/log_pdf_test
+    val/y_nll_total is scored against for the general val set, just frozen
+    here alongside z_train since tabicl_marginal doesn't change during
+    training either.
     """
     ecfg = cfg.get("baselines", {}) or {}
     region_names = list(ecfg.get("era5_regions") or list(ERA5_REGIONS.keys()))
@@ -528,6 +540,7 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
     n_context = int(ecfg.get("era5_n_context", 30))
     n_bins = int(ecfg.get("era5_n_bins", 12))
     base_seed = int(ecfg.get("era5_seed", 20260818))
+    pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
 
     batches: dict[str, dict] = {}
     for region_name in region_names:
@@ -548,13 +561,29 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
             "z_train": z_train,
             "test_mask": torch.ones(n_days_p, probe["D"], dtype=torch.bool, device=device),
         }
-        batches[region_name] = {
+        region_batch = {
             "batch": model_batch,
             "dist": probe["dist"],
             "bin_edges": probe["bin_edges"],
             "pair_counts": probe["pair_counts"],
             "rho_emp": probe["rho_emp"],
         }
+        if tabicl_marginal is not None:
+            n_nll = probe["x_nll_test_norm"].shape[0]
+            x_nll_test = torch.as_tensor(probe["x_nll_test_norm"], dtype=torch.float32, device=device)
+            nll_pit_batch = {
+                "x_train": model_batch["x_train"],
+                "y_train": torch.as_tensor(probe["context_values_per_day"], dtype=torch.float32, device=device),
+                "train_mask": torch.ones(n_days_p, probe["n_context"], dtype=torch.bool, device=device),
+                "x_test": x_nll_test.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
+                "y_test": torch.as_tensor(probe["nll_test_values_per_day"], dtype=torch.float32, device=device),
+                "test_mask": torch.ones(n_days_p, n_nll, dtype=torch.bool, device=device),
+            }
+            nll_pit = _tabicl_pit_batch(nll_pit_batch, tabicl_marginal, pit_k_folds, device)
+            region_batch["nll_test_idx"] = probe["nll_test_idx"]
+            region_batch["nll_test_z"] = nll_pit["z_test"].to(device)
+            region_batch["nll_test_log_pdf"] = nll_pit["log_pdf_test"].to(device)
+        batches[region_name] = region_batch
     return batches
 
 
@@ -1473,6 +1502,9 @@ def validate(
     # eval/runners/spatial_correlation_eval.py's real-mode sweep reports.
     region_shape_corr: list[float] = []
     region_model_r2: list[float] = []
+    region_y_nll_total: list[float] = []
+    region_y_nll_marginal: list[float] = []
+    region_y_nll_copula: list[float] = []
     for region, probe in (era5_val_batches or {}).items():
         out_e = model(probe["batch"])
         Sigma_e = build_sigma(out_e, cfg, jitter=jitter, test_mask=probe["batch"]["test_mask"])
@@ -1496,8 +1528,37 @@ def validate(
         if not math.isnan(model_r2):
             region_model_r2.append(model_r2)
 
+        # Real, non-oracle Y-space NLL on this region's held-out
+        # (never-in-context) points — the era5_fit analogue of
+        # kernel_fit/<family>'s *_tabicl block, minus the gap (no GP oracle
+        # for real data to gap against; see build_era5_probe's docstring).
+        # Reuses the SAME Sigma_e forward pass above (it already covers the
+        # full D-point grid, which nll_test_idx indexes into), just scored
+        # against TabICL's own frozen PIT (nll_test_z/nll_test_log_pdf,
+        # precomputed once in _build_era5_val_batches) instead of rho_emp —
+        # only present when a PIT checkpoint was configured for the probe.
+        if "nll_test_z" in probe:
+            idx = torch.as_tensor(probe["nll_test_idx"], dtype=torch.long, device=Sigma_e.device)
+            Sigma_nll = Sigma_e.index_select(1, idx).index_select(2, idx)
+            z_nll, log_pdf_nll = probe["nll_test_z"], probe["nll_test_log_pdf"]
+            mask_nll = torch.ones_like(z_nll, dtype=torch.bool)
+            parts_e = y_space_nll(Sigma_nll, z_nll, log_pdf_nll, mask_nll)
+            y_nll_total = parts_e["total"].item()
+            y_nll_marginal = parts_e["marginal"].item()
+            y_nll_copula = parts_e["copula"].item()
+            metrics[f"era5_fit/{region}/y_nll_total"] = y_nll_total
+            metrics[f"era5_fit/{region}/y_nll_marginal"] = y_nll_marginal
+            metrics[f"era5_fit/{region}/y_nll_copula"] = y_nll_copula
+            if not math.isnan(y_nll_total):
+                region_y_nll_total.append(y_nll_total)
+                region_y_nll_marginal.append(y_nll_marginal)
+                region_y_nll_copula.append(y_nll_copula)
+
     metrics["era5_fit/mean_shape_corr"] = _macro_average(region_shape_corr)
     metrics["era5_fit/mean_model_r2"] = _macro_average(region_model_r2)
+    metrics["era5_fit/mean_y_nll_total"] = _macro_average(region_y_nll_total)
+    metrics["era5_fit/mean_y_nll_marginal"] = _macro_average(region_y_nll_marginal)
+    metrics["era5_fit/mean_y_nll_copula"] = _macro_average(region_y_nll_copula)
 
     model.train()
 

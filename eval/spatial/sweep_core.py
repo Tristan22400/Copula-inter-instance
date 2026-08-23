@@ -420,22 +420,31 @@ def build_era5_probe(
     ONCE (see src/train.py::_build_era5_val_batches), not per validate() call.
 
     Unlike a GP-generated episode, real ERA5 has no known oracle Sigma_star /
-    R_star, so what's frozen here is the ground-truth EMPIRICAL correlogram
+    R_star, so there is no NLL-GAP metric here (nothing to subtract a model
+    score from). What IS frozen: the ground-truth EMPIRICAL correlogram
     (rho_emp, from Pearson correlation across days — same as run_real_config's
-    R_emp) plus the PIT z_train for a fixed context sample on a handful of
-    fixed days. Everything downstream that depends on the (still-training,
+    R_emp), the PIT z_train for a fixed context sample, and a held-out
+    (never-in-context) point set's RAW values on the same fixed days — the
+    ingredients for a real, non-oracle Y-space NLL (train.py::validate()'s
+    era5_fit/<region>/y_nll_total etc., same TabICL-marginal-conditioned
+    Sklar split as val/y_nll_total, just scored on this region's own probe
+    instead of the general val set — mirrors kernel_fit/<family>'s
+    gap_nll_tabicl block, minus the gap since there's no oracle to gap
+    against). Everything downstream that depends on the (still-training,
     changing every call) copula model — the context-conditioned forward pass
-    and its scoring against rho_emp — is deliberately NOT done here; that
-    happens in train.py::validate() every call, on the cheap frozen inputs
-    this function returns.
+    and its scoring against rho_emp / the held-out values — is deliberately
+    NOT done here; that happens in train.py::validate() every call, on the
+    cheap frozen inputs this function returns.
 
-    z_train is computed via eval.spatial.diagnostics.compute_context_z_train —
-    the same K-fold LOO PIT step extract_model_context_correlation's
-    real-context z_train always uses, but only once per probe day here
-    instead of once per validate() call — `tabicl_marginal` never changes
-    during training, so re-running PIT on the same (context_coords,
-    context_values) every call would just recompute an identical result
-    (mirrors train.py::_build_tabicl_val_z's same precompute-once rationale).
+    z_train (context) and the held-out z_test/log_pdf_test (via
+    train.py::_tabicl_pit_batch, built from this function's
+    nll_test_idx/context_values_per_day/nll_test_values_per_day) both go
+    through the same PIT machinery — eval.spatial.diagnostics.
+    compute_context_z_train / src/pit.py::run_pit — but only once per probe
+    day here instead of once per validate() call: `tabicl_marginal` never
+    changes during training, so re-running PIT on the same (context, values)
+    every call would just recompute an identical result (mirrors
+    train.py::_build_tabicl_val_z's same precompute-once rationale).
     """
     from inference.copula_inference import normalize_features
 
@@ -467,7 +476,19 @@ def build_era5_probe(
 
     x_train_norm, x_test_norm = normalize_features(context_coords, coords)
 
+    # Held-out (never-in-context) points for the real, non-oracle Y-space
+    # NLL probe below -- same construction as run_real_config's
+    # nll_test_idx, so validate()'s era5_fit/<region>/y_nll_total ends up on
+    # the same convention as `sweep --mode real`'s nll_total (comparable
+    # numbers, different call sites: this one is frozen once up front for
+    # the training loop's hot path instead of recomputed per config).
+    remaining_idx = np.setdiff1d(np.arange(D), context_idx)
+    nll_test_idx = rng.choice(remaining_idx, size=min(N_NLL_TEST, len(remaining_idx)), replace=False)
+    x_nll_test_norm = x_test_norm[nll_test_idx]
+
     z_train_per_day = []
+    context_values_per_day = []
+    nll_test_values_per_day = []
     for d in days:
         day_values = data["t2m"][d].ravel()
         context_values = day_values[context_idx]
@@ -475,12 +496,18 @@ def build_era5_probe(
             x_train_norm, context_values, tabicl_marginal, device, k_folds=PIT_K_FOLDS,
         )
         z_train_per_day.append(z_train)
+        context_values_per_day.append(context_values)
+        nll_test_values_per_day.append(day_values[nll_test_idx])
 
     return {
         "region": region_name,
         "x_train_norm": x_train_norm,                       # (P, 2)
         "x_test_norm": x_test_norm,                          # (D, 2)
         "z_train_per_day": np.stack(z_train_per_day, axis=0),  # (n_days_probe, P)
+        "x_nll_test_norm": x_nll_test_norm,                    # (n_nll_test, 2)
+        "nll_test_idx": nll_test_idx,                          # (n_nll_test,) indices into x_test_norm/coords
+        "context_values_per_day": np.stack(context_values_per_day, axis=0),    # (n_days_probe, P) raw t2m
+        "nll_test_values_per_day": np.stack(nll_test_values_per_day, axis=0),  # (n_days_probe, n_nll_test) raw t2m
         "dist": dist,                                        # (D, D)
         "bin_edges": bin_edges,
         "dist_centers": dist_centers,
