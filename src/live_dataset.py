@@ -514,7 +514,9 @@ def build_live_train_loader(
     return loader, kernel_weights, tabicl_mix_weights
 
 
-def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig, device: str = "cpu") -> List[dict]:
+def build_fixed_live_val_batches(
+    cfg: DictConfig, t: DictConfig, device: str = "cpu",
+) -> Tuple[List[dict], List[List[dict]]]:
     """Fixed, once-generated validation set for live-generation training.
 
     Generated once here with fixed, deterministic seeds (distinct from the
@@ -542,6 +544,25 @@ def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
     (different purpose/lifetime) rather than a shared instance, trading one
     extra ~5s startup load for not threading a loaded model through an
     unrelated code path.
+
+    Requests return_kernel_metadata=True from every generate_gp_batch call
+    (cheap: extra per-episode fields + the _L_ff/_alpha Cholesky factors
+    already computed as a byproduct of sampling y_train, not new compute) so
+    validate() can run pit.gp_analytical_posterior directly on these SAME
+    episodes instead of needing a separately-drawn probe
+    (train.py::_build_posterior_probe_batches, still used as the disk-mode
+    fallback since CopulaDataset's on-disk shards never carry this metadata).
+    _L_ff/_alpha are moved to CPU before being cached here regardless of
+    gen_device, mirroring _build_posterior_probe_batches's own
+    always-device="cpu" choice — these episodes live for the entire training
+    run, so any risk of them pinning persistent VRAM (when
+    z_train_source=tabicl/tabicl_split puts gen_device="cuda") is worth
+    avoiding even though the tensors themselves are small.
+
+    Returns (batches, episodes_by_batch): batches is the plain list of
+    collated CPU batch dicts (unchanged contract, see below);
+    episodes_by_batch[i] is the raw per-episode list (kernel metadata intact)
+    for batches[i], same order, for validate()'s oracle-posterior scoring.
 
     Returned as a plain list (not a DataLoader): validate() only ever does
     ``for batch_idx, batch in enumerate(val_loader)`` and moves each batch to
@@ -579,6 +600,7 @@ def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
         gen_device = device
 
     batches = []
+    episodes_by_batch: List[List[dict]] = []
     with warnings.catch_warnings(), limited_main_process_threads():
         # Same degenerate-episode discard warnings as LiveGPDataset.__iter__
         # above, silenced here too (scoped to this call, not process-global,
@@ -592,8 +614,14 @@ def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
                 val_cfg, batch_size, device=gen_device,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
+                return_kernel_metadata=True,
             )
+            if gen_device == "cuda":
+                for ep in episodes:
+                    ep["_L_ff"] = ep["_L_ff"].cpu()
+                    ep["_alpha"] = ep["_alpha"].cpu()
             batches.append(collate_fn(episodes))
+            episodes_by_batch.append(episodes)
 
     if tabicl_model is not None:
         del tabicl_model
@@ -601,4 +629,4 @@ def build_fixed_live_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
             import gc
             gc.collect()
             torch.cuda.empty_cache()
-    return batches
+    return batches, episodes_by_batch
