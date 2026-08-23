@@ -373,23 +373,28 @@ pit_eps: 1.0e-6
 # scaling a production run up.
 z_train_source: tabicl
 # K-fold count for z_train_source=tabicl's run_pit_batched call (same
-# semantics as pit.py::DEFAULT_K_FOLDS, but defaulted lower here -- see
-# below). Ignored unless z_train_source=tabicl. Clamped into [2, P] by
-# run_pit_batched regardless of this value.
+# semantics/default as pit.py::DEFAULT_K_FOLDS). Ignored unless
+# z_train_source=tabicl. Clamped into [2, P] by run_pit_batched regardless
+# of this value.
 #
-# 2 (the floor) rather than pit.py's own DEFAULT_K_FOLDS=10: each extra fold
-# is a full extra TabICL forward pass (K+1 total per shard-generation batch),
-# and that cost turned out to be the dominant term in live-generation's
-# per-step data latency -- benchmarked 2026-08-23 on an RTX 6000 Ada,
-# K=5 cost ~85ms/step average (spiking to 170ms) of real in-training data
-# wait vs K=2's ~1ms/step average (measured together with
+# Each extra fold is a full extra TabICL forward pass (K+1 total per
+# shard-generation batch), which looked like it'd force a quality/speed
+# tradeoff -- but benchmarked 2026-08-23 on an RTX 6000 Ada, once
 # training.live_tabicl_group_multiplier=2 and live_tabicl_num_workers
-# auto-sizing -- see conf/config.yaml). The tradeoff: K=2 means each fold
-# holds out ~P/2 points and scores them against the other ~P/2, a coarser
-# leave-one-out estimate than K=10's ~P/10-out folds. Raise this back toward
-# 10 if that coarseness turns out to matter more than the throughput win for
-# a given run.
-z_train_tabicl_k_folds: 2
+# auto-sizing (see conf/config.yaml) are in place, K barely affects
+# real in-training data-wait at all: K=2/5/10 all measured ~1ms/step
+# steady-state (vs the untuned baseline's ~85ms/step average, spiking to
+# 170ms, at K=5 with live_tabicl_num_workers=2/live_tabicl_group_
+# multiplier=1). With speed no longer a real constraint, K=10 wins on
+# quality too: mean |z_tabicl - z_analytic| against the exact analytic
+# GP-LOO residual (train.py::_compute_tabicl_z_train_gap) measured 0.534 at
+# K=10 vs 0.557 at K=5 vs 0.657 at K=2 -- diminishing but still real
+# returns to more folds (each fold holds out ~P/K points and scores them
+# against the rest; K=10 is the closest of these to a true leave-one-out
+# estimate). Lower this only if profiling on your own hardware shows
+# workers falling behind (data= consistently above budget in train.py's
+# perf: log line), not preemptively.
+z_train_tabicl_k_folds: 10
 # Calibration-pool size for z_train_source=tabicl_split's
 # run_pit_calib_split_batched call, as a fraction of P (the episode's
 # training-set size): P_C = max(1, round(z_train_split_calib_frac * P)).
