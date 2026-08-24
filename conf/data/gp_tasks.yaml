@@ -336,8 +336,22 @@ pit_eps: 1.0e-6
 #             z_train_corruption's docstring below. Checkpoint comes from
 #             cfg.tabicl.ckpt/cfg.tabicl.pit_ckpt (train.py::_resolve_pit_ckpt's
 #             resolution order -- see conf/model/copula_prod.yaml), not a separate key
-#             here. z_test/log_pdf_test are untouched (still the oracle
-#             values); only the ICL conditioning input z_train changes.
+#             here. z_test/log_pdf_test are ALSO replaced with TabICL's own
+#             PIT at the real x_norm_test/y_test (not just the ICL
+#             conditioning input z_train) -- training's target matches what
+#             train.py::validate's sim-to-real diagnostic (val/y_nll_copula)
+#             later scores it against, the same way era5_live_dataset.py
+#             already has to for real ERA5 data (no oracle exists there).
+#             This was NOT always true: before 2026-08-24, only z_train
+#             changed and z_test/log_pdf_test stayed the exact analytic-GP
+#             oracle -- training against that clean target while
+#             conditioning on noisy TabICL z_train taught an overconfident
+#             Sigma that scored badly (positive, worse-than-independence
+#             copula NLL) once validated against TabICL's own noisier
+#             z_test. Confirmed via an A/B copula_nano run: val/y_nll_copula
+#             went from persistently +0.09..+0.31 to persistently
+#             ~-0.001..-0.009 across every validation checkpoint after this
+#             change.
 #   tabicl_split: same frozen TabICL marginal as "tabicl", but replaces the
 #             K-fold rotation with a single forward pass
 #             (pit.py::run_pit_calib_split_batched): an extra
@@ -403,29 +417,6 @@ z_train_tabicl_k_folds: 10
 # gap noted above, at the cost of extra (cheap) GP-sampling work per episode.
 # Ignored unless z_train_source=tabicl_split.
 z_train_split_calib_frac: 1.0
-
-# When z_train_source=tabicl (plain K-fold branch only, NOT tabicl_split):
-# also replace z_test/log_pdf_test with TabICL's own PIT at the real
-# x_norm_test/y_test, instead of leaving them at the exact analytic-GP
-# oracle values (the default, false). False reproduces the original
-# documented "only z_train changes" behavior above.
-#
-# Why this exists (2026-08-24 investigation): with this off, training
-# supervises Sigma against the EXACT oracle z_test while conditioning on a
-# noisy TabICL z_train -- the model learns an overconfident Sigma that's
-# well-calibrated for the oracle target but scores badly (positive,
-# worse-than-independence copula NLL) once train.py::validate's sim-to-real
-# diagnostic (val/y_nll_copula) scores that same Sigma against TabICL's OWN
-# (noisier) PIT z_test instead, which is what any real deployment actually
-# supplies. era5_live_dataset.py has no oracle to fall back on for real
-# ERA5 data, so it always PITs z_train AND z_test through the same TabICL
-# call (see its _pit_group) -- and ERA5-finetuned checkpoints are the only
-# ones observed with negative (well-calibrated) val/y_nll_copula, while
-# every GP-synthetic z_train_source=tabicl run (this flag off) trends
-# strongly positive. Setting this true makes the GP-synthetic "tabicl"
-# training target match what it's later validated against, the same way
-# ERA5 finetuning already does.
-z_train_matched_test: false
 
 # Adaptive real-TabICL z_train mixing for LIVE generation training only
 # (live_dataset.py -- ignored by the on-disk generate_pit_dataset.py path,

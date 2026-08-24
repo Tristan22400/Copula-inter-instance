@@ -3505,15 +3505,6 @@ def _generate_gp_batch_raw(
     else:
         apply_tabicl = tabicl_model is not None
 
-    # See conf/data/gp_tasks.yaml's z_train_matched_test docstring. Only
-    # affects the plain "tabicl" (K-fold) branch below, not tabicl_split.
-    # getattr, not cfg.data.get(...) -- matches corrupt_z_train's access
-    # pattern above so this also works with the plain (non-OmegaConf)
-    # dataclass cfg objects some tests/scripts pass to generate_gp_task/
-    # generate_gp_batch (e.g. diag_kernels.py::DataCfg), not just Hydra's
-    # DictConfig.
-    z_train_matched_test = bool(getattr(cfg.data, "z_train_matched_test", False))
-
     if apply_tabicl and tabicl_split_calib_frac > 0:
         # "tabicl_split": one forward pass, x_norm_calib/y_calib (P_C points,
         # never part of the official P-point train set) as TabICL's context
@@ -3534,49 +3525,45 @@ def _generate_gp_batch_raw(
         )
         z_train = split_pit["z_train"].squeeze(-1)                    # (B, P)
     elif apply_tabicl:
-        # "tabicl": K-fold PIT (pit.py::run_pit_batched).
+        # "tabicl": K-fold PIT (pit.py::run_pit_batched), scored against the
+        # episode's REAL x_norm_test/y_test -- z_train AND z_test/
+        # log_pdf_test all come from TabICL's own PIT, not just z_train.
         #
-        # z_train_matched_test (default False, see conf/data/gp_tasks.yaml)
-        # controls whether X_test/Y_test is a dummy 1-point slice (legacy
-        # behaviour: z_test/log_pdf_test stay the oracle values already
-        # computed above) or the episode's REAL x_norm_test/y_test, in which
-        # case z_test/log_pdf_test are also overridden with TabICL's own
-        # PIT at the test points. Root cause of the val/y_nll_copula
-        # positive-NLL investigation (2026-08-24): training against the
-        # exact oracle z_test while conditioning on noisy TabICL z_train
-        # teaches the model an overconfident Sigma that's well-calibrated
-        # for the oracle target but poorly calibrated once scored against
-        # TabICL's own (noisier) PIT at validation time -- exactly the
-        # train/val marginal mismatch era5_live_dataset.py's _pit_group
-        # avoids by PIT-ing z_train AND z_test through the same TabICL call
-        # (there's no oracle for real ERA5 data, so it has no other choice)
-        # -- and ERA5-finetuned checkpoints are the only ones observed with
-        # negative (well-calibrated) val/y_nll_copula.
+        # Root cause of the val/y_nll_copula positive-NLL investigation
+        # (2026-08-24): an earlier version of this branch passed a dummy
+        # 1-point X_test/Y_test slice here and kept z_test/log_pdf_test at
+        # the oracle values computed above -- training against the exact
+        # oracle z_test while conditioning on noisy TabICL z_train taught
+        # the model an overconfident Sigma that was well-calibrated for the
+        # oracle target but poorly calibrated once scored against TabICL's
+        # own (noisier) PIT at validation time. era5_live_dataset.py never
+        # had this problem: there's no oracle for real ERA5 data, so it has
+        # always PIT-ed z_train AND z_test through the same TabICL call --
+        # and ERA5-finetuned checkpoints were the only ones observed with
+        # negative (well-calibrated) val/y_nll_copula, confirmed via an A/B
+        # copula_nano run (val/y_nll_copula: persistently +0.09..+0.31 with
+        # the dummy-test-slice version, vs. persistently ~-0.001..-0.009
+        # with this real-test-points version, at every validation
+        # checkpoint). Unconditional now (previously gated behind a
+        # data.z_train_matched_test flag defaulting to False, which would
+        # have reproduced the bug for anyone who forgot to opt in).
         from pit import run_pit_batched  # local: pit.py imports from this module
 
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)   # (B, P, 1)
-        if z_train_matched_test:
-            y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)  # (B, N, 1)
-            tabicl_pit = run_pit_batched(
-                tabicl_model, x_norm_train, y_train_scaled,
-                x_norm_test, y_test_scaled,
-                k_folds=tabicl_k_folds,
-            )
-            z_train = tabicl_pit["z_train"].squeeze(-1)                # (B, P)
-            z_test = tabicl_pit["z_test"].squeeze(-1)                  # (B, N)
-            # Jacobian correction back to raw-y-space nats (log p_raw =
-            # log p_scaled - log(std)) -- same convention as
-            # era5_live_dataset.py::_pit_episode/_pit_group.
-            log_pdf_test = tabicl_pit["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast
-        else:
-            tabicl_pit = run_pit_batched(
-                tabicl_model, x_norm_train, y_train_scaled,
-                x_norm_train[:, :1], y_train_scaled[:, :1],
-                k_folds=tabicl_k_folds,
-            )
-            z_train = tabicl_pit["z_train"].squeeze(-1)                # (B, P)
+        y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)     # (B, N, 1)
+        tabicl_pit = run_pit_batched(
+            tabicl_model, x_norm_train, y_train_scaled,
+            x_norm_test, y_test_scaled,
+            k_folds=tabicl_k_folds,
+        )
+        z_train = tabicl_pit["z_train"].squeeze(-1)                   # (B, P)
+        z_test = tabicl_pit["z_test"].squeeze(-1)                     # (B, N)
+        # Jacobian correction back to raw-y-space nats (log p_raw =
+        # log p_scaled - log(std)) -- same convention as
+        # era5_live_dataset.py::_pit_episode/_pit_group.
+        log_pdf_test = tabicl_pit["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast
 
     # Robustness augmentation (opt-in, off by default -- see corrupt_z_train's
     # docstring above): applied AFTER the degenerate-episode z_std check above
