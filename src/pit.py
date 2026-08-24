@@ -801,6 +801,31 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     around 110 nats/point in training logs -- an artifact of this repair, not
     a real property of the posterior).
 
+    The effective floor is actually max(eig_floor * scale, nugget), not the
+    relative term alone. Reason: y_test = f_test + eps with eps ~ iid
+    N(0, nugget) independent of training (see generate_gp_batch's K_all =
+    K_full + likelihood.noise * I, the same nugget this function reads off
+    the task below) -- so Sigma_post = Cov(f_test | train) + nugget*I, and
+    since Cov(f_test | train) is itself PSD, EVERY eigenvalue of the true
+    Sigma_post is provably >= nugget. This is a hard lower bound, not a
+    heuristic, and it catches a failure mode the scale-relative term alone
+    misses: a composite/chain kernel whose Sigma_post has small overall
+    scale (so eig_floor*scale is tiny) can still develop a numerically
+    near-zero or slightly negative eigenvalue from Schur-complement
+    cancellation (K_ss - V.T @ V, two O(1)-ish quantities subtracted) even
+    though the true eigenvalue can't be below nugget -- flooring only to
+    eig_floor*scale there reintroduces the exact same
+    residual^2/(2*eigenvalue) blowup this repair exists to prevent, just at
+    a smaller absolute scale. Motivated by a z_train_source=tabicl
+    live-generation run whose fixed 208-episode val set scored
+    val/y_nll_oracle_posterior ~68 nats/point (oracle_diag/gap_nll ~-67,
+    almost entirely in the copula term) even with the scale-relative-only
+    floor in place -- the exact offending episode wasn't recovered (CUDA's
+    RNG stream isn't reproducible process-to-process, see
+    live_dataset.py's fixed-val-set seeding), so this fix is the
+    mathematical guarantee above applied proactively rather than a
+    confirmed root cause for that specific run.
+
     Returns dict with mu_post (N,), Sigma_post (N,N), R_post (N,N) — all
     float32 — plus min_eig (float, pre-repair, for diagnostics), repaired
     (bool, whether the eigenvalue floor actually fired), and nll_prior/
@@ -864,9 +889,14 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     # a non-stationary kernel whose K_ss diagonal legitimately spans many
     # orders of magnitude (e.g. "polynomial") gets floored to a fixed 1e-6
     # regardless of scale, which manufactures an enormous, meaningless
-    # nll_post once any residual falls along that floored direction.
+    # nll_post once any residual falls along that floored direction. Also
+    # floored at `nugget` itself (see the docstring's PSD-decomposition
+    # argument: Sigma_post = Cov(f_test|train) + nugget*I with the first
+    # term PSD, so nugget is a hard, non-heuristic lower bound on every
+    # eigenvalue) -- catches small-overall-scale composite kernels where
+    # eig_floor*scale alone would floor below that hard bound.
     scale = Sigma_post.diagonal().abs().max().clamp(min=1e-12).item()
-    eig_floor_eff = eig_floor * scale
+    eig_floor_eff = max(eig_floor * scale, nugget)
     eigvals = torch.linalg.eigvalsh(Sigma_post)
     min_eig = eigvals.min().item()
     repaired = min_eig < eig_floor_eff
