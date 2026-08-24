@@ -31,7 +31,7 @@ NLL_PROBS = np.linspace(0.02, 0.98, 49)  # quantile-grid probability levels for 
 # + src/loss.py::gp_oracle_y_nll) -- the real-ERA5 counterpart to the
 # synthetic-episode classical-GP baselines in eval_checkpoint.py. Defaults
 # match eval_checkpoint.py's own --n_steps_mle/--lr_mle/--n_restarts_mle.
-GP_BASELINE_KERNELS = ["rbf", "matern32", "rational_quadratic"]
+GP_BASELINE_KERNELS = ["rbf", "matern12", "matern32", "matern52", "rational_quadratic"]
 GP_N_STEPS_MLE = 1000
 GP_LR_MLE = 0.05
 GP_N_RESTARTS_MLE = 5

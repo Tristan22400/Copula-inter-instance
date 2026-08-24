@@ -202,6 +202,13 @@ def _tiny_era5_cfg(seed: int = 555) -> "OmegaConf":
             "era5_n_context": _TINY_CONTEXT,
             "era5_n_bins": _TINY_BINS,
             "era5_seed": seed,
+            # Off by default here: these tests only care about probe
+            # shapes/PIT wiring, and era5_gp_baseline=True (the real
+            # production default) would add a real classical-GP-MLE fit to
+            # every one of them for no benefit -- see
+            # test_build_era5_val_batches_gp_baseline below for the
+            # dedicated (deliberately tiny) coverage of that block.
+            "era5_gp_baseline": False,
         },
         # _build_era5_val_batches reads tabicl.pit_k_folds (mirrors
         # conf/model/copula_prod.yaml's real `tabicl:` section) to run
@@ -250,6 +257,59 @@ def test_build_era5_val_batches_none_marginal_skips_nll():
     assert "nll_test_z" not in probe
     assert "nll_test_log_pdf" not in probe
     assert "nll_test_idx" not in probe
+
+
+def test_build_era5_val_batches_gp_baseline(tabicl_fake):
+    """era5_gp_baseline=True (the production default) fits a classical
+    GP-MLE baseline per configured kernel on the probe's frozen context/
+    held-out split (see _build_era5_val_batches' docstring on why this is a
+    one-time, not per-validate()-call, cost) -- validate() logs it as
+    era5_fit/<region>/gp_baseline_<kernel>_nll_{total,marginal,copula}
+    alongside the model's own y_nll_total for a live comparison. Kernel
+    list/step/restart counts are overridden to the smallest workable values
+    here purely for test speed; production defaults (era5_gp_n_steps_mle=
+    300, era5_gp_n_restarts_mle=1, all of GP_BASELINE_KERNELS) are exercised
+    by the timing benchmark this feature was sized against, not by this
+    shape/wiring check."""
+    cfg = _tiny_era5_cfg()
+    cfg.baselines.era5_gp_baseline = True
+    cfg.baselines.era5_gp_baseline_kernels = ["rbf"]
+    cfg.baselines.era5_gp_n_steps_mle = 20
+    cfg.baselines.era5_gp_n_restarts_mle = 1
+    cfg.baselines.era5_gp_baseline_n_days = 1
+
+    batches = _build_era5_val_batches(cfg, tabicl_fake, "cpu")
+    probe = batches[_TINY_REGION]
+    assert "gp_baseline_nll" in probe
+    assert set(probe["gp_baseline_nll"].keys()) == {"rbf"}
+    parts = probe["gp_baseline_nll"]["rbf"]
+    assert set(parts.keys()) == {"total", "marginal", "copula"}
+    for v in parts.values():
+        assert math.isfinite(v)
+    assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
+
+
+def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake):
+    """era5_gp_baseline defaults to True when the cfg key is absent
+    entirely (not just when explicitly set) -- _tiny_era5_cfg sets it to
+    False purely for the other tests' speed, so this checks the real
+    default independently with a minimal (fast) kernel/step override."""
+    cfg = OmegaConf.create({
+        "baselines": {
+            "era5_regions": [_TINY_REGION],
+            "era5_grid_size": _TINY_GRID,
+            "era5_n_days_fetch": _TINY_DAYS_FETCH,
+            "era5_n_days_probe": _TINY_DAYS_PROBE,
+            "era5_n_context": _TINY_CONTEXT,
+            "era5_n_bins": _TINY_BINS,
+            "era5_gp_baseline_kernels": ["rbf"],
+            "era5_gp_n_steps_mle": 20,
+            "era5_gp_n_restarts_mle": 1,
+        },
+        "tabicl": {"pit_k_folds": 5},
+    })
+    batches = _build_era5_val_batches(cfg, tabicl_fake, "cpu")
+    assert "gp_baseline_nll" in batches[_TINY_REGION]
 
 
 def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake):
