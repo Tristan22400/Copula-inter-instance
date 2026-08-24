@@ -260,6 +260,47 @@ def test_gp_analytical_posterior_eig_floor_scale_invariant():
     assert post["nll_post"] / n < 50.0
 
 
+def test_gp_analytical_posterior_eig_floor_nugget_bound():
+    """Regression test for a second training incident, found after the
+    scale-relative eig_floor fix above landed: a z_train_source=tabicl
+    live-generation run's fixed 208-episode val set still scored
+    val/y_nll_oracle_posterior ~68 nats/point (oracle_diag/gap_nll ~-67,
+    almost entirely in the copula term) with that fix in place.
+
+    Root cause: the scale-relative floor alone (eig_floor * Sigma_post's
+    own max diagonal) can float BELOW nugget whenever Sigma_post's overall
+    scale is small -- but nugget is a hard, non-heuristic lower bound on
+    every eigenvalue of the true Sigma_post (y_test = f_test + iid
+    N(0, nugget) noise independent of training, and Cov(f_test | train) is
+    PSD, so Sigma_post - nugget*I is PSD too -- see
+    gp_analytical_posterior's docstring). Any measured eigenvalue below
+    nugget is therefore always a numerical artifact (Schur-complement
+    cancellation), never a true property of the posterior, regardless of
+    Sigma_post's overall scale.
+
+    _near_duplicate_rbf_task(alpha2=1e-2) is a clean minimal case of this:
+    Sigma_post's own scale is tiny (~8.9e-3), so the scale-relative floor
+    alone (eig_floor * scale ~ 8.9e-9) sits far below nugget (1e-4) and
+    would silently accept a measured min_eig (~9.999983e-05) that is
+    mathematically impossible (just barely below nugget) without any
+    repair. The fix takes eig_floor_eff = max(eig_floor * scale, nugget),
+    closing that gap regardless of how small Sigma_post's own scale is."""
+    task = _near_duplicate_rbf_task(alpha2=1e-2)
+    post = gp_analytical_posterior(task)
+
+    assert post["min_eig"] < 1e-4, (
+        "test construction should produce a measured eigenvalue below the "
+        "mathematically-guaranteed nugget floor (a numerical artifact)"
+    )
+    assert post["repaired"], "nugget floor should have fired even though Sigma_post's own scale is tiny"
+
+    Sigma_post = post["Sigma_post"].double()
+    repaired_min_eig = torch.linalg.eigvalsh(Sigma_post).min().item()
+    assert repaired_min_eig >= 1e-4 - 1e-9, (
+        "post-repair eigenvalues must respect the nugget lower bound"
+    )
+
+
 def test_baseline_cache_round_trip(tiny_episode, tmp_path):
     """save_baseline_cache/load_baseline_cache should reproduce exactly what
     was written when the fingerprint matches, and miss cleanly when it
