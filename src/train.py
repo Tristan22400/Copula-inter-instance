@@ -79,6 +79,7 @@ from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2
 from live_dataset import (
     _LIVE_TABICL_FLAT_HEADROOM_GB,
     _LIVE_TABICL_WORKER_HEADROOM_GB,
+    _validate_z_train_source,
     build_fixed_live_val_batches,
     build_live_train_loader,
     limited_main_process_threads,
@@ -195,6 +196,7 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     training-loop allocation happens.
     """
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
     if not tabicl_live_enabled or device != "cuda":

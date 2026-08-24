@@ -237,3 +237,152 @@ def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg):
                     "z_test", "log_pdf_test", "R_star", "Sigma_star",
                     "mu_star", "sigma_star"):
             assert torch.allclose(ep_a[key], ep_t[key], atol=1e-6), key
+
+
+# ---------------------------------------------------------------------------
+# data.z_train_matched_test (see conf/data/gp_tasks.yaml): when True, the
+# plain "tabicl" K-fold branch above also overrides z_test/log_pdf_test with
+# TabICL's own PIT at the real x_norm_test/y_test, instead of leaving them
+# at the oracle values the "leave everything else exactly as the analytic
+# pipeline computed them" assertion above checks for. Root-caused
+# 2026-08-24: training against the oracle z_test while conditioning on
+# TabICL's noisy z_train teaches an overconfident Sigma that scores badly
+# (positive copula NLL) once actually validated against TabICL's own,
+# noisier z_test -- exactly the train/val marginal mismatch this flag
+# closes, matching how era5_live_dataset.py already has to PIT both z_train
+# AND z_test through TabICL (no oracle exists for real ERA5 data).
+# ---------------------------------------------------------------------------
+
+
+def test_generate_gp_batch_raw_tabicl_matched_test_overrides_z_test(small_cfg):
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.z_train_matched_test = True
+    cfg.seed = 43
+
+    tabicl = RowIndependentFakeTabICL()
+
+    analytic = _generate_gp_batch_raw(cfg, B=6, device="cpu")
+    matched = _generate_gp_batch_raw(
+        cfg, B=6, device="cpu", tabicl_model=tabicl, tabicl_k_folds=3,
+    )
+
+    assert len(analytic) == len(matched)
+    for ep_a, ep_m in zip(analytic, matched):
+        # z_train changes, same as the plain override...
+        assert not torch.allclose(ep_a["z_train"], ep_m["z_train"])
+        # ...but now z_test/log_pdf_test change too -- the whole point of
+        # this flag: the training target now comes from TabICL's own PIT at
+        # the real test points, not the oracle.
+        assert ep_m["z_test"].shape == ep_a["z_test"].shape
+        assert not torch.allclose(ep_a["z_test"], ep_m["z_test"])
+        assert not torch.allclose(ep_a["log_pdf_test"], ep_m["log_pdf_test"])
+        assert torch.isfinite(ep_m["z_test"]).all()
+        assert torch.isfinite(ep_m["log_pdf_test"]).all()
+        # Every field that's purely a property of the underlying GP episode
+        # (not the PIT target) must still be untouched.
+        for key in ("x_norm_train", "x_norm_test", "y_train", "y_test",
+                    "R_star", "Sigma_star", "mu_star", "sigma_star"):
+            assert torch.allclose(ep_a[key], ep_m[key], atol=1e-6), key
+
+
+def test_generate_gp_batch_raw_tabicl_matched_test_default_false_is_legacy_behaviour(small_cfg):
+    """z_train_matched_test defaults to False when unset -- must reproduce
+    the pre-existing "only z_train changes" override exactly."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.seed = 44
+
+    tabicl = RowIndependentFakeTabICL()
+
+    unset = _generate_gp_batch_raw(cfg, B=4, device="cpu", tabicl_model=tabicl, tabicl_k_folds=3)
+    cfg.seed = 44
+    cfg.data.z_train_matched_test = False
+    explicit_false = _generate_gp_batch_raw(cfg, B=4, device="cpu", tabicl_model=tabicl, tabicl_k_folds=3)
+
+    assert len(unset) == len(explicit_false)
+    for ep_u, ep_f in zip(unset, explicit_false):
+        for key in ("z_train", "z_test", "log_pdf_test"):
+            assert torch.allclose(ep_u[key], ep_f[key], atol=1e-6), key
+
+
+def test_generate_gp_batch_raw_tabicl_matched_test_matches_direct_run_pit_batched(small_cfg):
+    """The matched-test override's z_test/log_pdf_test must equal calling
+    run_pit_batched directly on the episode's own (oracle-computed)
+    x_norm_train/y_train/x_norm_test/y_test with the same train-only
+    y_mean/y_std scaling and Jacobian correction -- pins down the exact
+    formula, not just "it changed something."."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.z_train_matched_test = True
+    cfg.seed = 45
+
+    tabicl = RowIndependentFakeTabICL()
+    matched = _generate_gp_batch_raw(cfg, B=3, device="cpu", tabicl_model=tabicl, tabicl_k_folds=3)
+    assert len(matched) > 0
+
+    for ep in matched:
+        x_train = ep["x_norm_train"].unsqueeze(0)
+        x_test = ep["x_norm_test"].unsqueeze(0)
+        y_train = ep["y_train"].unsqueeze(0)
+        y_test = ep["y_test"].unsqueeze(0)
+
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)
+        y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)
+
+        expected = run_pit_batched(
+            tabicl, x_train, y_train_scaled, x_test, y_test_scaled, k_folds=3,
+        )
+        expected_log_pdf = expected["log_pdf_test"].squeeze(-1) - y_std.log()
+
+        assert torch.allclose(ep["z_test"], expected["z_test"].squeeze(0).squeeze(-1), atol=1e-5)
+        assert torch.allclose(ep["log_pdf_test"], expected_log_pdf.squeeze(0), atol=1e-5)
+
+
+def test_generate_gp_batch_raw_tabicl_matched_test_noop_without_tabicl_model(small_cfg):
+    """z_train_matched_test=True with tabicl_model=None must not do
+    anything -- apply_tabicl still gates on tabicl_model being given
+    first, same as the plain override."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.z_train_matched_test = True
+    cfg.seed = 46
+
+    plain = _generate_gp_batch_raw(cfg, B=4, device="cpu")
+    cfg.seed = 46
+    matched_no_model = _generate_gp_batch_raw(cfg, B=4, device="cpu")
+
+    assert len(plain) == len(matched_no_model)
+    for ep_p, ep_m in zip(plain, matched_no_model):
+        for key in ("z_train", "z_test", "log_pdf_test"):
+            assert torch.allclose(ep_p[key], ep_m[key], atol=1e-6), key
+
+
+def test_generate_gp_batch_raw_tabicl_matched_test_ignored_for_tabicl_split(small_cfg):
+    """z_train_matched_test only affects the plain "tabicl" K-fold branch --
+    tabicl_split_calib_frac > 0 must keep the legacy oracle z_test/
+    log_pdf_test regardless of this flag."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.z_train_matched_test = True
+    cfg.seed = 47
+
+    tabicl = RowIndependentFakeTabICL()
+    analytic = _generate_gp_batch_raw(cfg, B=4, device="cpu", tabicl_split_calib_frac=1.0)
+    cfg.seed = 47
+    split = _generate_gp_batch_raw(
+        cfg, B=4, device="cpu", tabicl_model=tabicl, tabicl_split_calib_frac=1.0,
+    )
+
+    assert len(analytic) == len(split)
+    for ep_a, ep_s in zip(analytic, split):
+        assert not torch.allclose(ep_a["z_train"], ep_s["z_train"])
+        for key in ("z_test", "log_pdf_test"):
+            assert torch.allclose(ep_a[key], ep_s[key], atol=1e-6), key
