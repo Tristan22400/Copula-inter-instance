@@ -98,30 +98,53 @@ def _validate_z_train_source(z_train_source: str) -> None:
 # Each live_tabicl_num_workers worker holds its own frozen-TabICL CUDA
 # context, entirely separate from the training process's own allocator pool
 # (see train.py::_reserve_gpu_headroom_for_live_tabicl, which imports these
-# same constants so the two stay in sync). ~120MB resident / ~1.4GB peak per
-# worker was measured at batch_size=32 on the cheaper tabicl_split path;
-# z_train_source=tabicl's K-fold rotation does several forward passes per
-# call instead of one, so budget above that measured peak rather than at it.
-_LIVE_TABICL_WORKER_HEADROOM_GB = 2.5
+# same constants so the two stay in sync). Directly measured (standalone
+# build_live_train_loader benchmark, RTX A5000 24GB / 8 CPU cores,
+# 2026-08-24, data.z_train_tabicl_k_folds=5, training.batch_size=16,
+# training.live_tabicl_group_multiplier=2 -- this repo's actual defaults,
+# not the cheaper tabicl_split path): steady, ~flat ~0.9-1.3GB/worker
+# regardless of worker count (2 workers -> 2.5GB total, 6 -> 6.1GB, 12 ->
+# 11.3GB, 16 -> 14.9GB). Budget above that measured figure rather than at
+# it, since live_tabicl_group_multiplier/k_folds can be raised per-run (same
+# sweep measured a single worker climbing to ~1.9GB/call at
+# group_multiplier=8) and this constant has no per-call visibility into
+# either knob.
+_LIVE_TABICL_WORKER_HEADROOM_GB = 1.4
 # Flat allowance on top of the per-worker figure above, for each worker's own
 # CUDA context overhead (not activation memory, so it doesn't scale with
 # batch/fold count) plus a general safety margin.
 _LIVE_TABICL_FLAT_HEADROOM_GB = 1.0
-# Minimum VRAM reserved for the training process's OWN use (model, optimizer
+# Default VRAM reserved for the training process's OWN use (model, optimizer
 # state, activations) when auto-sizing live_tabicl_num_workers below -- a
-# floor, not a measurement of this run's actual footprint (unknowable before
-# the model is even built), chosen conservatively so auto-sizing doesn't
-# starve training on a small card.
+# floor, not a measurement of any specific run's actual footprint (unknowable
+# before the model is even built), chosen conservatively so auto-sizing
+# doesn't starve training on a small card. Overridable via
+# training.live_tabicl_main_process_reserve_gb (see conf/config.yaml) --
+# e.g. conf/model/copula_nano.yaml sets it much lower, since the frozen
+# TabICL loaded by each WORKER is the same fixed checkpoint regardless of
+# which copula-transformer preset is being trained (so
+# _LIVE_TABICL_WORKER_HEADROOM_GB above must stay model-agnostic), but the
+# MAIN process's own footprint (the model actually being trained) scales
+# with the preset -- nano's few-hundred-K-param backbone needs nowhere near
+# 8GB, so the flat default starves it of workers it could safely have.
 _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB = 8.0
 # Empirically validated range for the worker-count auto-sizing below
-# (benchmarked on an RTX 6000 Ada, 2026-08-23): throughput plateaus by ~6-8
-# concurrent GPU workers (they share one physical GPU and TabICL's forward
-# pass is real compute, not just launch overhead that hides via overlap, so
-# more workers past this range cost VRAM/CPU-thread overhead for no measured
-# gain) and a single worker still gets the overlap-with-training benefit
-# num_workers=0 would forgo entirely.
+# (standalone build_live_train_loader throughput benchmark, RTX A5000 24GB /
+# 8 CPU cores, 2026-08-24, data.z_train_tabicl_k_folds=5,
+# training.live_tabicl_group_multiplier=2): batches/s barely moves (2.8-3.6)
+# across 2-10 concurrent workers -- this GPU's TabICL compute, not worker
+# count, was the binding constraint in that range -- then jumps to a clear
+# peak at 12 workers (4.3 batches/s, mean per-batch wait 234ms vs ~295ms at
+# 6-10 workers) before 14/16 fall back into the 2-10 range's noise band and
+# 20 outright crashes (a DataLoader worker gets OOM-killed -- this node only
+# has 8 CPU cores, so 20 spawned worker processes oversubscribes it 2.5x).
+# 12 is therefore both the measured throughput optimum AND comfortably under
+# the CPU-oversubscription failure mode observed at 20; unlike the old
+# RTX-6000-Ada-benchmarked figure this replaces, treat 12 as tied to an
+# 8-core node -- a node with substantially more CPU cores might sustain
+# higher without the oversubscription risk, but this hasn't been measured.
 _LIVE_TABICL_AUTO_WORKERS_MIN = 1
-_LIVE_TABICL_AUTO_WORKERS_MAX = 8
+_LIVE_TABICL_AUTO_WORKERS_MAX = 12
 
 
 def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
@@ -150,21 +173,31 @@ def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
     Explicit training.live_tabicl_num_workers in config always wins over
     auto-detection (e.g. to force a known-safe number by hand on a node
     running several such jobs by agreement).
+
+    training.live_tabicl_main_process_reserve_gb (default
+    _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB) overrides how much VRAM is set
+    aside for the main process's own use -- see that constant's docstring
+    for why a smaller model preset (e.g. copula_nano) should lower this to
+    unlock more auto-sized workers instead of being capped by a reserve
+    sized for the largest preset.
     """
     configured = t.get("live_tabicl_num_workers", None)
     if configured is not None:
         return int(configured)
     if device != "cuda" or not torch.cuda.is_available():
         return _LIVE_TABICL_AUTO_WORKERS_MIN
+    main_process_reserve_gb = float(
+        t.get("live_tabicl_main_process_reserve_gb", _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB)
+    )
     free_b, _total_b = torch.cuda.mem_get_info()
     free_gb = free_b / 1e9
-    available_gb = free_gb - _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB - _LIVE_TABICL_FLAT_HEADROOM_GB
+    available_gb = free_gb - main_process_reserve_gb - _LIVE_TABICL_FLAT_HEADROOM_GB
     n = int(available_gb // _LIVE_TABICL_WORKER_HEADROOM_GB) if available_gb > 0 else 0
     n = max(_LIVE_TABICL_AUTO_WORKERS_MIN, min(n, _LIVE_TABICL_AUTO_WORKERS_MAX))
     print(
         f"[live_dataset] training.live_tabicl_num_workers not set -- auto-detected "
         f"{n} worker(s) from {free_gb:.1f}GB currently free on this GPU (reserving "
-        f"{_LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB:.0f}GB for the training process "
+        f"{main_process_reserve_gb:.1f}GB for the training process "
         f"itself, ~{_LIVE_TABICL_WORKER_HEADROOM_GB:.1f}GB/worker). Set training."
         "live_tabicl_num_workers explicitly to override, e.g. if this node runs "
         "several such jobs concurrently on the same GPU."

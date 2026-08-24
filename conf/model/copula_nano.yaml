@@ -35,6 +35,33 @@ model:
   # sparse_covnorm. Override from CLI, e.g. model.correlation_parametrization=cossim.
   correlation_parametrization: covnorm
 
+training:
+  # training.live_generation's live_tabicl_num_workers auto-sizing (see
+  # conf/config.yaml / live_dataset.py::resolve_live_tabicl_num_workers)
+  # reserves this much VRAM for the main training process before handing the
+  # rest to GPU-resident TabICL DataLoader workers. The default (8GB) is
+  # sized for the largest presets; copula_nano's few-hundred-K-param
+  # backbone measured a ~3.9GB peak on a 24GB card (RTX A5000, 2026-08-24,
+  # under training.batch_size=16), so reserving 8GB here just leaves VRAM
+  # idle instead of workers -- lowering it lets auto-sizing reach ~12
+  # workers (this repo's measured throughput optimum, see
+  # live_dataset.py::_LIVE_TABICL_AUTO_WORKERS_MAX) instead of topping out
+  # around 6. Only takes effect when training.live_tabicl_num_workers is
+  # left null (the default) -- irrelevant for on-disk (non-live) training.
+  live_tabicl_main_process_reserve_gb: 4.5
+  # Standalone build_live_train_loader throughput benchmark (RTX A5000, 8 CPU
+  # cores, 2026-08-24, at the 12-worker optimum above): group_multiplier=1
+  # gave 3.0 batches/s, =2 (the repo default) gave 3.4, =3 gave 3.7 with a
+  # much cleaner p90 (33ms vs 1.0s at =2 -- fewer, not just shorter, stalls)
+  # and 16.4GB VRAM (workers only, doesn't yet include the main process's own
+  # use) -- comfortably under the 24GB card. =4 nudged throughput a little
+  # further (3.7) but pushed VRAM to 18.9GB, too little headroom left for
+  # the training process itself; =6 and above OOM outright at 12 workers.
+  # 3 is the best throughput/VRAM/tail-latency balance measured, so it's
+  # worth overriding the repo default here even though live_generation isn't
+  # nano-specific.
+  live_tabicl_group_multiplier: 3
+
 tabicl:
   pretrained: false
   recompute: false

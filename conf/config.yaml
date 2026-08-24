@@ -1,11 +1,25 @@
 defaults:
+  # _self_ FIRST: this file's own body (below) is merged before the model/
+  # data groups, not after -- so a model preset (e.g. conf/model/
+  # copula_nano.yaml) CAN override a training.*/wandb.* default set below
+  # (e.g. training.live_tabicl_group_multiplier) by setting the same key
+  # itself. Getting this backwards (the more common Hydra default) would
+  # make this file's own body always win, silently no-op-ing any such
+  # override in a model/data preset -- confirmed happening in practice
+  # 2026-08-24 before this reorder (copula_nano.yaml's
+  # live_tabicl_main_process_reserve_gb/live_tabicl_group_multiplier
+  # overrides were composed then clobbered straight back to this file's
+  # defaults). CLI overrides (python src/train.py training.foo=bar) always
+  # win regardless of this order -- Hydra applies those last, after the
+  # whole defaults list.
+  #
   # Each conf/model/*.yaml is the single file for one experiment: it uses
   # `# @package _global_` to set both `model.*` (the copula head) and
   # `tabicl.*` (the backbone) in one place, so switching experiments is one
   # `model=...` override instead of coordinating a separate `tabicl:` group.
+  - _self_
   - model: copula_prod
   - data: gp_tasks
-  - _self_
 
 seed: 42
 
@@ -109,7 +123,9 @@ training:
   # TabICL inference was benchmarked and rejected as far too slow, see that
   # function's docstring), so unlike live_num_workers this isn't sized
   # against CPU core count -- it's sized against how many concurrent frozen
-  # TabICL copies (~120MB resident each, ~1.4GB peak per call, measured) the
+  # TabICL copies (~1.0GB/worker steady-state at this repo's default
+  # batch_size/live_tabicl_group_multiplier/z_train_tabicl_k_folds, measured
+  # 2026-08-24 -- see live_dataset.py::_LIVE_TABICL_WORKER_HEADROOM_GB) the
   # training GPU can hold alongside the training job's own VRAM use. null
   # (default) auto-sizes from CURRENTLY FREE GPU memory at startup (see
   # live_dataset.py::resolve_live_tabicl_num_workers) -- this is what keeps a
@@ -120,8 +136,22 @@ training:
   # per-node tuning. Set an explicit integer to override (e.g. to force a
   # known-safe number by hand on a node you know will run several such jobs
   # concurrently), or if profiling shows workers falling behind and VRAM
-  # allows, or you see CUDA OOMs from auto-sizing being too generous.
+  # allows, or you see CUDA OOMs from auto-sizing being too generous. Capped
+  # at 12 regardless of free VRAM -- benchmarked 2026-08-24 (RTX A5000, 8 CPU
+  # cores): throughput plateaus (even regresses) past that, and 20 workers
+  # crashed outright (a DataLoader worker OOM-killed by the OS -- this
+  # node's 8 CPU cores, not VRAM, was the failure mode).
   live_tabicl_num_workers: null
+  # How much VRAM live_tabicl_num_workers auto-sizing (above) reserves for
+  # the training process's OWN use (model/optimizer/activations) before
+  # handing the rest to workers -- ignored when live_tabicl_num_workers is
+  # set explicitly. 8.0 (default) is a conservative floor sized for the
+  # largest model presets; a much smaller preset (e.g. copula_nano, a few
+  # hundred K params) needs nowhere near that, so its own model config
+  # overrides this lower to unlock more auto-sized workers instead of
+  # leaving VRAM idle. Raise this yourself if profiling shows the training
+  # process itself OOMing/skipping steps under auto-sizing.
+  live_tabicl_main_process_reserve_gb: 8.0
   # generate_gp_batch() call size = batch_size * live_group_multiplier. Must be
   # a multiple of batch_size: generate_gp_batch samples kernel/P/N/active_dims
   # (and, for variable-d configs, d_features itself) once per call, shared by
