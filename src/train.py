@@ -2972,6 +2972,15 @@ def main(cfg: DictConfig) -> None:
             pearson_str = f"{pearson:.3f}" if math.isfinite(pearson) else "n/a"
             cop_std = metrics.get("oracle_diag/copula_nll_std", float("nan"))
             cop_std_str = f"{cop_std:.4f}" if math.isfinite(cop_std) else "n/a"
+            # TabICL-conditioned copula NLL (y_nll_copula, see its comment
+            # above in validate()): the Sklar split of y_nll_total's copula
+            # component, scored against TabICL's own z_test instead of the
+            # oracle/analytic PIT used by oracle_diag/*. Side-by-side with
+            # gap_post (oracle-PIT-conditioned) this isolates whether a
+            # mismatch traces to the model's Sigma or to the oracle-vs-TabICL
+            # PIT gap.
+            cop_tabicl = metrics.get("y_nll_copula", float("nan"))
+            cop_tabicl_str = f"{cop_tabicl:.4f}" if math.isfinite(cop_tabicl) else "n/a"
             print(
                 f"[{step:6d}] VAL  "
                 f"total={total_str}  "
@@ -2979,6 +2988,7 @@ def main(cfg: DictConfig) -> None:
                 f"corr_r={pearson_str}  "
                 f"od_μ={metrics['sigma_offdiag_mean_analytic_z']:+.4f} od_σ={metrics['sigma_offdiag_std_analytic_z']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean_analytic_z']:.4f}  "
                 f"cop_std={cop_std_str}  "
+                f"cop_tabicl={cop_tabicl_str}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
