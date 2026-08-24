@@ -65,6 +65,33 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
         torch.set_num_threads(prev)
 
 
+# data.z_train_source's only recognized values (see conf/data/gp_tasks.yaml).
+_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split")
+
+
+def _validate_z_train_source(z_train_source: str) -> None:
+    """Fail loud on an unrecognized data.z_train_source instead of letting
+    every `z_train_source in ("tabicl", "tabicl_split")` gate in this module
+    (and train.py::_reserve_gpu_headroom_for_live_tabicl) silently evaluate
+    False and fall back to plain analytic generation.
+
+    Root-caused 2026-08-24: a data.z_train_source=tabicl-split (hyphen) typo
+    doesn't match any of those checks, which all test for "tabicl_split"
+    (underscore) -- so tabicl_live_enabled comes out False, no TabICL model
+    is ever loaded, and the run silently trains as pure analytic with no
+    warning or error. Confirmed via a bit-identical train/loss_ema
+    trajectory, from step 0, between a real data.z_train_source=analytic run
+    and one launched with the "tabicl-split" typo. generate_pit_dataset.py's
+    on-disk pipeline already validates this (see its own z_train_source
+    parsing); this brings the live-generation path to parity.
+    """
+    if z_train_source not in _VALID_Z_TRAIN_SOURCES:
+        raise ValueError(
+            f"Unknown data.z_train_source {z_train_source!r}; expected "
+            f"{', '.join(repr(v) for v in _VALID_Z_TRAIN_SOURCES)}."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Shared-GPU-aware sizing for live-generation's TabICL DataLoader workers
 # ---------------------------------------------------------------------------
@@ -271,6 +298,7 @@ class LiveGPDataset(IterableDataset):
         # thread through every call" pattern, just scoped to a worker process
         # instead of the whole run.
         z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+        _validate_z_train_source(z_train_source)
         tabicl_model = None
         gen_device = "cpu"
         tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
@@ -413,6 +441,7 @@ def build_live_train_loader(
     batch_size = int(t.batch_size)
 
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
 
@@ -575,6 +604,7 @@ def build_fixed_live_val_batches(
     n_batches = max(1, (n_val + batch_size - 1) // batch_size)
 
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    _validate_z_train_source(z_train_source)
     tabicl_live_enabled = z_train_source in ("tabicl", "tabicl_split")
     if tabicl_live_enabled and device != "cuda":
         raise ValueError(
