@@ -182,6 +182,8 @@ class CopulaTabICL(nn.Module):
         #    factor, the others also need one trailing scalar column.
         head_out_dim = rank if correlation_parametrization in _NO_SCALAR_COLUMN else rank + 1
         self.copula_head = nn.Sequential(nn.Linear(in_features, in_features * 2), nn.GELU(), nn.Linear(in_features * 2, head_out_dim))
+        nn.init.normal_(self.copula_head[0].weight, std=0.02)
+        nn.init.zeros_(self.copula_head[0].bias)
         nn.init.normal_(self.copula_head[-1].weight, std=0.02)
         nn.init.zeros_(self.copula_head[-1].bias)
 
