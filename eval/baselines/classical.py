@@ -167,9 +167,15 @@ def corr_nll_single(R: Tensor, z: Tensor) -> float:
 # nn.Parameters) just fine — no hand-rolled kernel math or NaN-safe distance
 # helpers needed.
 
+# Same nu convention as src/classical_kernels.py's _MATERN_NU / src/data_gen.py's
+# _BASE_GPYTORCH_KERNEL_CLS matern12/32/52 entries.
+_MATERN_NU = {"matern12": 0.5, "matern32": 1.5, "matern52": 2.5}
+
 _ARD_ELIGIBLE = {
     "rbf": True,
+    "matern12": True,
     "matern32": True,
+    "matern52": True,
     # gpytorch.kernels.PeriodicKernel sums per-dimension sin^2 terms inside a
     # single exp() (a product of per-dimension periodic kernels), which is
     # PSD for any ard_num_dims.
@@ -354,8 +360,10 @@ class _ExactGPModel(gpytorch.models.ExactGP):
 
         if kernel_name == "rbf":
             base = gpytorch.kernels.RBFKernel(lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
-        elif kernel_name == "matern32":
-            base = gpytorch.kernels.MaternKernel(nu=1.5, lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
+        elif kernel_name in _MATERN_NU:
+            base = gpytorch.kernels.MaternKernel(
+                nu=_MATERN_NU[kernel_name], lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw,
+            )
         elif kernel_name == "periodic":
             base = gpytorch.kernels.PeriodicKernel(
                 lengthscale_prior=kp.get("lengthscale_prior"),

@@ -72,10 +72,10 @@ from dataset import (
     ShardHomogeneousBatchSampler,
     collate_fn,
 )
+from eval.configs.constants import GP_LR_MLE
 from eval.configs.regions import REGIONS as ERA5_REGIONS
 from era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
-from eval.spatial.diagnostics import bin_correlation_by_distance
-from eval.spatial.sweep_core import build_era5_probe, weighted_corr, weighted_r2, weighted_rmse_bias
+from eval.spatial.sweep_core import _fit_gp_baseline_nll, build_era5_probe
 from live_dataset import (
     _LIVE_TABICL_FLAT_HEADROOM_GB,
     _LIVE_TABICL_WORKER_HEADROOM_GB,
@@ -555,6 +555,14 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
     val/y_nll_total is scored against for the general val set, just frozen
     here alongside z_train since tabicl_marginal doesn't change during
     training either.
+
+    Also fits a classical-GP-MLE baseline (region_batch["gp_baseline_nll"],
+    scored by validate() alongside the model's own era5_fit/<region>/
+    y_nll_total for a live comparison) via eval.spatial.sweep_core::
+    _fit_gp_baseline_nll, independent of tabicl_marginal — same
+    fit-once-here-not-per-validate()-call rationale, at deliberately lighter
+    settings than that module's own rigor defaults (see the era5_gp_* cfg
+    reads below for why).
     """
     ecfg = cfg.get("baselines", {}) or {}
     region_names = list(ecfg.get("era5_regions") or list(ERA5_REGIONS.keys()))
@@ -565,6 +573,30 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
     n_bins = int(ecfg.get("era5_n_bins", 12))
     base_seed = int(ecfg.get("era5_seed", 20260818))
     pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
+
+    # Classical-GP-MLE baseline (era5_fit/<region>/gp_baseline_<kernel>_nll_*
+    # in validate()) -- a training-time-affordable version of
+    # spatial_correlation_eval.py real-mode sweep's own GP_BASELINE_KERNELS
+    # fit (eval/spatial/sweep_core.py::_fit_gp_baseline_nll), reused here
+    # directly rather than duplicated. That sweep's rigor defaults (all of
+    # GP_BASELINE_KERNELS, GP_N_STEPS_MLE=1000, GP_N_RESTARTS_MLE=5) are NOT
+    # reused as-is: measured ~17s/kernel/restart/1000-steps on CPU, ~8s on
+    # GPU, so 5 kernels x 5 restarts x era5_n_days_probe(3) days x 5 regions
+    # would add 30-100+ minutes to every train.py startup. Only 2 of
+    # GP_BASELINE_KERNELS by default (matern32 -- this codebase's other
+    # standard default kernel -- + rational_quadratic), 1 of the probe's
+    # frozen days, 1 restart, and 300 steps keeps this to roughly 20-30s
+    # total (still a one-time cost paid here, not on validate()'s hot path
+    # -- same precompute-once rationale as the PIT/fetch cost above). Bump
+    # era5_gp_baseline_kernels/era5_gp_n_restarts_mle/era5_gp_n_steps_mle
+    # back up via cfg for a rarer, higher-fidelity run if the extra startup
+    # time is worth it.
+    gp_baseline_enabled = bool(ecfg.get("era5_gp_baseline", True))
+    gp_baseline_kernels = list(ecfg.get("era5_gp_baseline_kernels") or ["matern32", "rational_quadratic"])
+    gp_baseline_n_days = int(ecfg.get("era5_gp_baseline_n_days", 1))
+    gp_n_steps_mle = int(ecfg.get("era5_gp_n_steps_mle", 300))
+    gp_lr_mle = float(ecfg.get("era5_gp_lr_mle", GP_LR_MLE))
+    gp_n_restarts_mle = int(ecfg.get("era5_gp_n_restarts_mle", 1))
 
     batches: dict[str, dict] = {}
     for region_name in region_names:
@@ -607,6 +639,28 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
             region_batch["nll_test_idx"] = probe["nll_test_idx"]
             region_batch["nll_test_z"] = nll_pit["z_test"].to(device)
             region_batch["nll_test_log_pdf"] = nll_pit["log_pdf_test"].to(device)
+
+        if gp_baseline_enabled:
+            n_gp_days = max(1, min(gp_baseline_n_days, n_days_p))
+            gp_nll_per_day: dict = {k: {"total": [], "marginal": [], "copula": []} for k in gp_baseline_kernels}
+            for d in range(n_gp_days):
+                gp_day = _fit_gp_baseline_nll(
+                    cache_key=(region_name, d, region_seed, n_context),
+                    x_train_norm=probe["x_train_norm"],
+                    context_values=probe["context_values_per_day"][d],
+                    x_test_norm=probe["x_nll_test_norm"],
+                    y_test=probe["nll_test_values_per_day"][d],
+                    kernel_names=gp_baseline_kernels,
+                    n_steps=gp_n_steps_mle, lr=gp_lr_mle, n_restarts=gp_n_restarts_mle,
+                    device=device,
+                )
+                for kname, parts in gp_day.items():
+                    for comp in ("total", "marginal", "copula"):
+                        gp_nll_per_day[kname][comp].append(parts[comp])
+            region_batch["gp_baseline_nll"] = {
+                kname: {comp: float(np.nanmean(vals)) for comp, vals in parts.items()}
+                for kname, parts in gp_nll_per_day.items()
+            }
         batches[region_name] = region_batch
     return batches
 
@@ -1594,37 +1648,18 @@ def validate(
     # _build_era5_val_batches / eval/spatial/sweep_core.py::build_era5_probe).
     # There is no GP oracle for real data, so — unlike kernel_fit/<family>'s
     # NLL gap against Sigma_star — this scores the CURRENT model's
-    # context-conditioned correlogram against the region's frozen EMPIRICAL
-    # Pearson correlation curve (rho_emp), using the same weighted
-    # shape_corr/rmse/bias/model_r2 convention
-    # eval/runners/spatial_correlation_eval.py's real-mode sweep reports.
-    region_shape_corr: list[float] = []
-    region_model_r2: list[float] = []
+    # real, non-oracle Y-space NLL against the region's frozen held-out
+    # points (see below); the shape_corr/rmse/bias/model_r2 curve-shape
+    # comparison against rho_emp eval/runners/spatial_correlation_eval.py's
+    # real-mode sweep reports was dropped from the training-time loop —
+    # too noisy at the loop's small per-region day count to track.
     region_y_nll_total: list[float] = []
     region_y_nll_marginal: list[float] = []
     region_y_nll_copula: list[float] = []
+    region_gp_baseline_total: dict[str, list[float]] = {}
     for region, probe in (era5_val_batches or {}).items():
         out_e = model(probe["batch"])
         Sigma_e = build_sigma(out_e, cfg, jitter=jitter, test_mask=probe["batch"]["test_mask"])
-        # Averaging the predicted correlation matrix over the probe's few
-        # fixed days before binning is equivalent to averaging the binned
-        # curve over days (binning is a per-day-identical linear reduction
-        # over (i, j) pairs, since `dist`/bin_edges don't depend on the day)
-        # — cheaper than bin_correlation_by_distance once per day.
-        R_mean = Sigma_e.float().mean(dim=0).detach().cpu().numpy()
-        rho_context = bin_correlation_by_distance(R_mean, probe["dist"], probe["bin_edges"])
-        pair_counts, rho_emp = probe["pair_counts"], probe["rho_emp"]
-        shape_corr = weighted_corr(rho_context, rho_emp, pair_counts)
-        rmse, bias = weighted_rmse_bias(rho_context, rho_emp, pair_counts)
-        model_r2 = weighted_r2(rho_context, rho_emp, pair_counts)
-        metrics[f"era5_fit/{region}/shape_corr"] = shape_corr
-        metrics[f"era5_fit/{region}/rmse"] = rmse
-        metrics[f"era5_fit/{region}/bias"] = bias
-        metrics[f"era5_fit/{region}/model_r2"] = model_r2
-        if not math.isnan(shape_corr):
-            region_shape_corr.append(shape_corr)
-        if not math.isnan(model_r2):
-            region_model_r2.append(model_r2)
 
         # Real, non-oracle Y-space NLL on this region's held-out
         # (never-in-context) points — the era5_fit analogue of
@@ -1633,8 +1668,8 @@ def validate(
         # Reuses the SAME Sigma_e forward pass above (it already covers the
         # full D-point grid, which nll_test_idx indexes into), just scored
         # against TabICL's own frozen PIT (nll_test_z/nll_test_log_pdf,
-        # precomputed once in _build_era5_val_batches) instead of rho_emp —
-        # only present when a PIT checkpoint was configured for the probe.
+        # precomputed once in _build_era5_val_batches) — only present when a
+        # PIT checkpoint was configured for the probe.
         if "nll_test_z" in probe:
             idx = torch.as_tensor(probe["nll_test_idx"], dtype=torch.long, device=Sigma_e.device)
             Sigma_nll = Sigma_e.index_select(1, idx).index_select(2, idx)
@@ -1652,11 +1687,24 @@ def validate(
                 region_y_nll_marginal.append(y_nll_marginal)
                 region_y_nll_copula.append(y_nll_copula)
 
-    metrics["era5_fit/mean_shape_corr"] = _macro_average(region_shape_corr)
-    metrics["era5_fit/mean_model_r2"] = _macro_average(region_model_r2)
+        # Classical-GP-MLE baseline, frozen once per region in
+        # _build_era5_val_batches (see its docstring for why it's not
+        # refit here) — logged alongside y_nll_total/marginal/copula above
+        # for a live "is the model beating a classical spatial GP on this
+        # region" comparison during training.
+        if "gp_baseline_nll" in probe:
+            for kname, parts in probe["gp_baseline_nll"].items():
+                metrics[f"era5_fit/{region}/gp_baseline_{kname}_nll_total"] = parts["total"]
+                metrics[f"era5_fit/{region}/gp_baseline_{kname}_nll_marginal"] = parts["marginal"]
+                metrics[f"era5_fit/{region}/gp_baseline_{kname}_nll_copula"] = parts["copula"]
+                if not math.isnan(parts["total"]):
+                    region_gp_baseline_total.setdefault(kname, []).append(parts["total"])
+
     metrics["era5_fit/mean_y_nll_total"] = _macro_average(region_y_nll_total)
     metrics["era5_fit/mean_y_nll_marginal"] = _macro_average(region_y_nll_marginal)
     metrics["era5_fit/mean_y_nll_copula"] = _macro_average(region_y_nll_copula)
+    for kname, vals in region_gp_baseline_total.items():
+        metrics[f"era5_fit/mean_gp_baseline_{kname}_nll_total"] = _macro_average(vals)
 
     model.train()
 
@@ -1712,14 +1760,13 @@ def validate(
                 off_o_t = np.concatenate(all_off_ora_tabicl)
                 cq_t = _corr_quality(off_p_t, off_o_t)
                 metrics["corr_mse_tabicl_z"]     = cq_t["mse"]
-                metrics["corr_mae_tabicl_z"]     = cq_t["mae"]
                 # corr_pearson_tabicl_z dropped: same "value can shift with
                 # whichever marginal produced z_test" issue as the deleted
-                # top-level pooled corr_pearson — corr_mse_tabicl_z/
-                # corr_mae_tabicl_z (and sim2real_gap, an MSE difference)
-                # aren't scale-free the same way Pearson r superficially
-                # looks like it should be, so they're kept.
-                metrics["corr_bias_tabicl_z"]    = cq_t["bias"]
+                # top-level pooled corr_pearson — corr_mse_tabicl_z (and
+                # sim2real_gap, an MSE difference) isn't scale-free the same
+                # way Pearson r superficially looks like it should be, so
+                # it's kept; corr_mae_tabicl_z/corr_bias_tabicl_z were
+                # dropped as redundant with it.
                 metrics["sim2real_gap"] = cq_t["mse"] - mse
 
         # — Oracle vs predicted correlation matrix grid —
