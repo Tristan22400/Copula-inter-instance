@@ -789,6 +789,18 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     converting to a correlation matrix, since an eval script wants a number
     for every episode, not a silently dropped one.
 
+    eig_floor is RELATIVE to Sigma_post's own diagonal scale, not an
+    absolute eigenvalue cutoff -- see the repair below. Non-stationary
+    kernels (e.g. "polynomial", k = alpha2*(x1.x2+c)^d) can put K_ss's
+    diagonal anywhere from O(1e3) to O(1e11) within a single episode; an
+    absolute floor of 1e-6 -- fine for an O(1)-scale RBF/Matern posterior --
+    is an absurdly overconfident "we know this to 1e-6 out of 1e11" claim
+    once the repair fires on such an episode, and blows the Gaussian NLL's
+    residual^2/(2*eigenvalue) term up by many orders of magnitude (this is
+    what was producing oracle_diag/gap_nll around -109 / y_nll_oracle_posterior
+    around 110 nats/point in training logs -- an artifact of this repair, not
+    a real property of the posterior).
+
     Returns dict with mu_post (N,), Sigma_post (N,N), R_post (N,N) — all
     float32 — plus min_eig (float, pre-repair, for diagnostics), repaired
     (bool, whether the eigenvalue floor actually fired), and nll_prior/
@@ -847,12 +859,20 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     mean_test = task["mu_star"].to(ref_device).double()
     mu_post = mean_test + K_sf @ alpha
 
+    # eig_floor scales with Sigma_post's own diagonal magnitude (see the
+    # docstring) rather than acting as a fixed absolute cutoff -- otherwise
+    # a non-stationary kernel whose K_ss diagonal legitimately spans many
+    # orders of magnitude (e.g. "polynomial") gets floored to a fixed 1e-6
+    # regardless of scale, which manufactures an enormous, meaningless
+    # nll_post once any residual falls along that floored direction.
+    scale = Sigma_post.diagonal().abs().max().clamp(min=1e-12).item()
+    eig_floor_eff = eig_floor * scale
     eigvals = torch.linalg.eigvalsh(Sigma_post)
     min_eig = eigvals.min().item()
-    repaired = min_eig < eig_floor
+    repaired = min_eig < eig_floor_eff
     if repaired:
         eigvals_c, eigvecs = torch.linalg.eigh(Sigma_post)
-        Sigma_post = eigvecs @ torch.diag(eigvals_c.clamp(min=eig_floor)) @ eigvecs.T
+        Sigma_post = eigvecs @ torch.diag(eigvals_c.clamp(min=eig_floor_eff)) @ eigvecs.T
         Sigma_post = 0.5 * (Sigma_post + Sigma_post.T)
 
     R_post, _ = sigma_to_correlation(Sigma_post.float())
