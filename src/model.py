@@ -182,7 +182,16 @@ class CopulaTabICL(nn.Module):
         #    factor, the others also need one trailing scalar column.
         head_out_dim = rank if correlation_parametrization in _NO_SCALAR_COLUMN else rank + 1
         self.copula_head = nn.Sequential(nn.Linear(in_features, in_features * 2), nn.GELU(), nn.Linear(in_features * 2, head_out_dim))
-        nn.init.normal_(self.copula_head[0].weight, std=0.02)
+        # Only the OUTPUT layer needs a small init — that's what keeps the raw
+        # W/s logits (and hence Sigma) near-identity at step 0 for numerical
+        # safety. The hidden layer is a feature transform, not an output; it
+        # keeps PyTorch's default Kaiming-uniform init (fan_in-scaled, ~0.088
+        # here) so it doesn't attenuate. Previously both layers were forced to
+        # std=0.02 (to "match" the output layer) — that shrinks the hidden
+        # layer's output ~5x and the gradient reaching it ~5x (~57x at the
+        # output layer, compounding through GELU), which was starving the
+        # copula head of a usable gradient signal from step 0 and made the
+        # correlation term take forever to move off its near-independence init.
         nn.init.zeros_(self.copula_head[0].bias)
         nn.init.normal_(self.copula_head[-1].weight, std=0.02)
         nn.init.zeros_(self.copula_head[-1].bias)
