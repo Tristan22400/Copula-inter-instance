@@ -1760,14 +1760,35 @@ def load_checkpoint(
     Returns the step the checkpoint was saved at (0 for legacy checkpoints
     without a "step" key), which the caller uses to decide where the LR
     schedule resumes — see the `resume_reset_schedule` handling in train().
+
+    If the checkpoint predates an architecture change (e.g. a head gaining
+    extra layers), its state_dict keys won't match the live model 1:1. We
+    load non-strict in that case (matching tensors restored, new ones keep
+    their random init) and skip restoring optimizer state entirely — Muon/
+    Adam match state to params by position in the flattened param list, and
+    an inserted/removed tensor shifts every param after it, which would
+    silently apply the wrong param's moments downstream of the changed layer.
     """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
     raw = getattr(model, "_orig_mod", model)
-    raw.load_state_dict(ckpt["state_dict"])
-    if optimizer is not None and ckpt.get("optimizer") is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
+    ckpt_state = ckpt["state_dict"]
+    model_keys = set(raw.state_dict().keys())
+    ckpt_keys = set(ckpt_state.keys())
+    if model_keys != ckpt_keys:
+        missing, unexpected = sorted(model_keys - ckpt_keys), sorted(ckpt_keys - model_keys)
+        print(
+            f"[load_checkpoint] {ckpt_path} was saved by a different model architecture: "
+            f"missing key(s) (kept at random init) {missing}; unexpected key(s) (dropped) {unexpected}. "
+            f"Loading weights non-strict and skipping optimizer state restore (param positions "
+            f"downstream of the changed layer would otherwise be misaligned)."
+        )
+        raw.load_state_dict(ckpt_state, strict=False)
+    else:
+        raw.load_state_dict(ckpt_state)
+        if optimizer is not None and ckpt.get("optimizer") is not None:
+            optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
     return int(ckpt.get("step", 0))
