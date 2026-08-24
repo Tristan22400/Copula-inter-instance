@@ -394,7 +394,7 @@ z_train_source: tabicl
 # estimate). Lower this only if profiling on your own hardware shows
 # workers falling behind (data= consistently above budget in train.py's
 # perf: log line), not preemptively.
-z_train_tabicl_k_folds: 10
+z_train_tabicl_k_folds: 5
 # Calibration-pool size for z_train_source=tabicl_split's
 # run_pit_calib_split_batched call, as a fraction of P (the episode's
 # training-set size): P_C = max(1, round(z_train_split_calib_frac * P)).
