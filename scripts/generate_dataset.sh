@@ -3,6 +3,7 @@
 #OAR -l gpu=1,walltime=48:00:00
 #OAR -O logs/generate_%jobid%.out
 #OAR -E logs/generate_%jobid%.err
+#OAR -q p1
 #
 # Generate the PIT episode dataset for the Copula Transformer.
 #

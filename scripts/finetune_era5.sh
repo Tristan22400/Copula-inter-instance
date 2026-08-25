@@ -3,6 +3,7 @@
 #OAR -l gpu=1,walltime=24:00:00
 #OAR -O logs/finetune_era5_%jobid%.out
 #OAR -E logs/finetune_era5_%jobid%.err
+#OAR -q p1
 #
 # Finetune an existing copula-model checkpoint on real, worldwide ARCO-ERA5
 # data (src/finetune_era5.py -> src/train.py training.live_source=era5).
