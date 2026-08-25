@@ -22,6 +22,12 @@ of the fixed 500-episode one. First step happens in seconds, most of that
 being CUDA context init + (if data.z_train_source=tabicl, the default) one
 frozen-TabICL load.
 
+The debug val set's z_test always comes from real TabICL K-fold PIT,
+unconditionally, regardless of what data.z_train_source/z_train_tabicl_mix_*
+the TRAINING steps use (matches eval_checkpoint.py's own default of scoring
+against the real deployment signal) -- so it needs a resolvable TabICL
+checkpoint even when training itself is pure data.z_train_source=analytic.
+
 Not a replacement for train.py — no wandb logging, no baselines/era5
 validation metrics. Checkpointing (training.ckpt_dir/training.resume_ckpt)
 uses train.py's own save_checkpoint/load_checkpoint, so a checkpoint saved
@@ -33,7 +39,7 @@ Usage (same Hydra override syntax as train.py):
     python scripts/train_fast.py
     python scripts/train_fast.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
     python scripts/train_fast.py model=copula_nano training.steps=200
-    python scripts/train_fast.py data.z_train_source=analytic   # skip TabICL PIT entirely -- fastest possible start
+    python scripts/train_fast.py data.z_train_source=analytic   # train on the analytic oracle -- val z_test still always uses real TabICL
     python scripts/train_fast.py training.batch_size=8 data.N_max=64  # shrink episodes for an even faster loop
     # Alternate per-episode between the analytic z_train and real-TabICL PIT
     # z_train at a fixed 50/50 rate (every kernel family, no adaptive gap
@@ -98,11 +104,18 @@ DEBUG_VAL_N_BATCHES = 2
 
 
 def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_device: str,
-                            tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float,
-                            tabicl_mix_weights=None):
+                            tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float):
     """The first `DEBUG_VAL_N_BATCHES` batches of train.py's own fixed
     live-generation validation set (see live_dataset.py::
     build_fixed_live_val_batches) -- NOT an independent sample.
+
+    `tabicl_model` here is ALWAYS applied unconditionally (this function
+    never receives a tabicl_mix_weights -- see the call site in main(),
+    which passes a val-only TabICL load decoupled from whatever
+    data.z_train_source/z_train_tabicl_mix_* the training loop itself uses).
+    So z_test (and hence z_train) in every val batch comes from real TabICL
+    K-fold PIT, always -- scoring against the same approximate marginal real
+    deployment data would produce, regardless of what the model trained on.
 
     generate_gp_batch fully reseeds python/numpy/torch RNGs from cfg.seed on
     every call (see data_gen.py's module docstring), so batch i there is a
@@ -143,7 +156,6 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
             val_cfg, batch_size, device=gen_device,
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             tabicl_split_calib_frac=tabicl_split_calib_frac,
-            tabicl_mix_weights=tabicl_mix_weights,
             return_kernel_metadata=True,
         )
         n_episodes += len(episodes)
@@ -258,10 +270,35 @@ def main(cfg: DictConfig) -> None:
         f"z_train_source={z_train_source}{mix_desc} device={device}"
     )
 
+    # Debug val set's z_test (and hence z_train too -- data_gen.py couples
+    # them, see generate_gp_batch's z_train-source-override comment) always
+    # comes from real-TabICL PIT, unconditionally -- decoupled from whatever
+    # z_train_source/z_train_tabicl_mix_* the TRAINING steps above use. This
+    # matches eval_checkpoint.py's own --z_train_source tabicl default ("the
+    # real deployment" signal): you can train cheaply on the analytic oracle
+    # (or a mix) while still validating against the actual approximate
+    # TabICL marginal the model will see once deployed. Reuses tabicl_model
+    # if training already loaded one (z_train_source=tabicl/tabicl_split or
+    # mixing enabled); otherwise loads a second copy just for val.
+    if tabicl_model is not None:
+        val_tabicl_model, val_gen_device = tabicl_model, gen_device
+    else:
+        ckpt = resolve_pit_ckpt(cfg)
+        if ckpt is None:
+            raise ValueError(
+                "train_fast.py's debug val set always scores z_test through real TabICL "
+                "PIT, which requires a resolvable TabICL checkpoint (tabicl.ckpt with "
+                "tabicl.pretrained=true, or tabicl.pit_ckpt)."
+            )
+        print(f"[train_fast] Loading frozen TabICL marginal for val z_test: {ckpt}")
+        t_pit0 = time.perf_counter()
+        val_tabicl_model = load_tabicl(ckpt, device)
+        val_gen_device = device
+        print(f"[train_fast] TabICL marginal loaded in {time.perf_counter() - t_pit0:.1f}s")
+
     t_val0 = time.perf_counter()
     n_val_debug, val_seed, val_batch_size, val_batches, oracle_copula_nll = _build_debug_val_batch(
-        cfg, t, device, gen_device, tabicl_model, tabicl_k_folds, tabicl_split_calib_frac,
-        tabicl_mix_weights,
+        cfg, t, device, val_gen_device, val_tabicl_model, tabicl_k_folds, tabicl_split_calib_frac,
     )
     print(
         f"[train_fast] Built val set: first {n_val_debug} episodes "
