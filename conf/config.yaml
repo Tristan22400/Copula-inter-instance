@@ -72,7 +72,7 @@ training:
   # — same knob so the val plots (e.g. val/corr_density_analytic_z) are comparable in
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
-  val_episodes: 200
+  val_episodes: 500
   # Override for the on-disk dataset DataLoader worker count (train.py's
   # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
   # variable-d) — set explicitly to tune, e.g. now that dataset.py loads

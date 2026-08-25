@@ -3,6 +3,7 @@
 #OAR -l gpu=1,walltime=1:00:00
 #OAR -O logs/validate_live_nano_%jobid%.out
 #OAR -E logs/validate_live_nano_%jobid%.err
+#OAR -q p1
 #
 # Smoke-test training.live_generation=true against the nano model preset
 # (conf/model/copula_nano.yaml) across every model.correlation_parametrization
