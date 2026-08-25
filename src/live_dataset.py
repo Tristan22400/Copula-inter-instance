@@ -98,18 +98,44 @@ def _validate_z_train_source(z_train_source: str) -> None:
 # Each live_tabicl_num_workers worker holds its own frozen-TabICL CUDA
 # context, entirely separate from the training process's own allocator pool
 # (see train.py::_reserve_gpu_headroom_for_live_tabicl, which imports these
-# same constants so the two stay in sync). Directly measured (standalone
-# build_live_train_loader benchmark, RTX A5000 24GB / 8 CPU cores,
-# 2026-08-24, data.z_train_tabicl_k_folds=5, training.batch_size=16,
-# training.live_tabicl_group_multiplier=2 -- this repo's actual defaults,
-# not the cheaper tabicl_split path): steady, ~flat ~0.9-1.3GB/worker
-# regardless of worker count (2 workers -> 2.5GB total, 6 -> 6.1GB, 12 ->
-# 11.3GB, 16 -> 14.9GB). Budget above that measured figure rather than at
-# it, since live_tabicl_group_multiplier/k_folds can be raised per-run (same
-# sweep measured a single worker climbing to ~1.9GB/call at
-# group_multiplier=8) and this constant has no per-call visibility into
-# either knob.
-_LIVE_TABICL_WORKER_HEADROOM_GB = 1.4
+# same constants so the two stay in sync). A worker's per-call VRAM scales
+# with group_size = batch_size * live_tabicl_group_multiplier (that many
+# episodes go through TabICL K-fold PIT in one generate_gp_batch call) -- NOT
+# a flat per-worker figure, confirmed by directly measuring per-worker VRAM
+# (standalone build_live_train_loader benchmark, RTX A5000 24GB / 8 CPU
+# cores, 2026-08-25, data.z_train_tabicl_k_folds=5,
+# training.live_tabicl_group_multiplier=3, workers=2 held fixed) across
+# batch_size: 16 (group_size=48) -> 1.3GB/worker, 64 (group_size=192) ->
+# 3.4GB/worker, 128 (group_size=384) -> 7.0GB/worker -- an almost 5.5x swing
+# entirely from batch_size, at fixed worker count. The old flat
+# _LIVE_TABICL_WORKER_HEADROOM_GB=1.4 (calibrated only at the then-fixed
+# batch_size=16) would silently under-reserve by that much if batch_size
+# were ever raised -- kept as a group_size-aware formula (rather than
+# reverted to flat) since it's strictly more correct at the repo's actual
+# default (batch_size=16, group_size=48) too: fixed=0.5 + 0.02*48=0.96 ~=
+# 1.46GB/worker, matching the old flat constant almost exactly.
+#
+# batch_size=32 (2x the default) was investigated 2026-08-25 as an
+# auto-sizing candidate and reverted (see conf/model/copula_nano.yaml) after
+# real end-to-end runs at that group_size crashed 3 times with "DataLoader
+# worker ... is killed by signal: Aborted" -- a hard OS-level kill (not a
+# catchable torch.cuda.OutOfMemoryError, so train.py's per-step OOM-skip
+# path can't recover from it) from multiple workers loading their own
+# frozen-TabICL checkpoint CONCURRENTLY at startup, at the same time
+# train.py's own main process is ALSO loading its own frozen-TabICL copies
+# for the z_train diagnostic/kernel_fit cache/era5 probes (deliberately
+# overlapped for wall-clock -- see train.py::main). This transient startup
+# spike is NOT the same as the steady-state generation cost the per-episode
+# formula above models, and padding the reserve alone did not reliably fix
+# it across three attempts (only reducing group_multiplier did) -- so the
+# constants below are calibrated for the repo's actual default group_size
+# (48, batch_size=16) only. Raising batch_size/group_multiplier well beyond
+# that is NOT proven safe by this formula alone; re-validate with a real
+# end-to-end run (not just this module's isolated worker-VRAM benchmark,
+# which has no competing main-process load and didn't catch this) before
+# relying on it.
+_LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB = 0.5
+_LIVE_TABICL_WORKER_PER_EPISODE_GB = 0.02
 # Flat allowance on top of the per-worker figure above, for each worker's own
 # CUDA context overhead (not activation memory, so it doesn't scale with
 # batch/fold count) plus a general safety margin.
@@ -179,7 +205,10 @@ def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
     aside for the main process's own use -- see that constant's docstring
     for why a smaller model preset (e.g. copula_nano) should lower this to
     unlock more auto-sized workers instead of being capped by a reserve
-    sized for the largest preset.
+    sized for the largest preset. Read AFTER train.py::resolve_batch_size has
+    already resolved training.batch_size (main() calls that first), so the
+    per-worker cost below reflects the batch_size actually used this run, not
+    a stale config default.
     """
     configured = t.get("live_tabicl_num_workers", None)
     if configured is not None:
@@ -189,18 +218,22 @@ def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
     main_process_reserve_gb = float(
         t.get("live_tabicl_main_process_reserve_gb", _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB)
     )
+    group_multiplier = max(1, int(t.get("live_tabicl_group_multiplier", 2)))
+    group_size = int(t.batch_size) * group_multiplier
+    per_worker_gb = _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB + _LIVE_TABICL_WORKER_PER_EPISODE_GB * group_size
     free_b, _total_b = torch.cuda.mem_get_info()
     free_gb = free_b / 1e9
     available_gb = free_gb - main_process_reserve_gb - _LIVE_TABICL_FLAT_HEADROOM_GB
-    n = int(available_gb // _LIVE_TABICL_WORKER_HEADROOM_GB) if available_gb > 0 else 0
+    n = int(available_gb // per_worker_gb) if available_gb > 0 else 0
     n = max(_LIVE_TABICL_AUTO_WORKERS_MIN, min(n, _LIVE_TABICL_AUTO_WORKERS_MAX))
     print(
         f"[live_dataset] training.live_tabicl_num_workers not set -- auto-detected "
         f"{n} worker(s) from {free_gb:.1f}GB currently free on this GPU (reserving "
-        f"{main_process_reserve_gb:.1f}GB for the training process "
-        f"itself, ~{_LIVE_TABICL_WORKER_HEADROOM_GB:.1f}GB/worker). Set training."
-        "live_tabicl_num_workers explicitly to override, e.g. if this node runs "
-        "several such jobs concurrently on the same GPU."
+        f"{main_process_reserve_gb:.1f}GB for the training process itself, "
+        f"~{per_worker_gb:.2f}GB/worker at batch_size={int(t.batch_size)} x "
+        f"group_multiplier={group_multiplier} = {group_size} episodes/call). Set "
+        "training.live_tabicl_num_workers explicitly to override, e.g. if this node "
+        "runs several such jobs concurrently on the same GPU."
     )
     return n
 
