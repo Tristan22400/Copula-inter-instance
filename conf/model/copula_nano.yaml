@@ -48,6 +48,26 @@ training:
   # live_dataset.py::_LIVE_TABICL_AUTO_WORKERS_MAX) instead of topping out
   # around 6. Only takes effect when training.live_tabicl_num_workers is
   # left null (the default) -- irrelevant for on-disk (non-live) training.
+  #
+  # Raising training.batch_size itself (e.g. via auto-sizing off currently-
+  # free VRAM, mirroring the worker auto-sizing above) was investigated
+  # 2026-08-25 and reverted: batch_size=32 raised real end-to-end step time
+  # ~296ms->~540ms (data= wait got WORSE, ~108ms->~195ms average) despite a
+  # much more VRAM/compute-efficient isolated model step (245->406
+  # samples/s in a standalone _run_train_step-only benchmark) -- doubling
+  # batch_size also doubles group_size = batch_size * live_tabicl_
+  # group_multiplier (how many episodes each TabICL worker generates per
+  # call), and the worker pool doesn't scale favorably enough to compensate.
+  # It also crashed real training 3 times ("DataLoader worker ... is killed
+  # by signal: Aborted", a hard SIGABRT the per-step OOM-skip path can't
+  # catch) before group_multiplier=1 stabilized it -- train.py deliberately
+  # overlaps ALL live-generation workers' concurrent TabICL-checkpoint loads
+  # at startup with the main process's own concurrent TabICL diagnostic
+  # loads (z_train gap check, kernel_fit cache, era5 probes) to save
+  # wall-clock, and that startup burst turned out far more sensitive to
+  # group_size than steady-state generation VRAM alone predicted. Net: not
+  # worth the added complexity/risk for ~10% real throughput. If revisited,
+  # start from the group_multiplier interaction, not just a VRAM budget.
   live_tabicl_main_process_reserve_gb: 4.5
   # Standalone build_live_train_loader throughput benchmark (RTX A5000, 8 CPU
   # cores, 2026-08-24, at the 12-worker optimum above): group_multiplier=1

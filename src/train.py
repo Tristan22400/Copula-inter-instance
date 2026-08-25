@@ -83,7 +83,8 @@ from eval.viz.correlation_plots import plot_residual_grid
 from inference.copula_inference import normalize_features
 from live_dataset import (
     _LIVE_TABICL_FLAT_HEADROOM_GB,
-    _LIVE_TABICL_WORKER_HEADROOM_GB,
+    _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB,
+    _LIVE_TABICL_WORKER_PER_EPISODE_GB,
     _validate_z_train_source,
     build_fixed_live_val_batches,
     build_live_train_loader,
@@ -212,7 +213,10 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     num_workers = resolve_live_tabicl_num_workers(t, device)
     if num_workers <= 0:
         return
-    headroom_gb = num_workers * _LIVE_TABICL_WORKER_HEADROOM_GB + _LIVE_TABICL_FLAT_HEADROOM_GB
+    group_multiplier = max(1, int(t.get("live_tabicl_group_multiplier", 2)))
+    group_size = int(t.batch_size) * group_multiplier
+    per_worker_gb = _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB + _LIVE_TABICL_WORKER_PER_EPISODE_GB * group_size
+    headroom_gb = num_workers * per_worker_gb + _LIVE_TABICL_FLAT_HEADROOM_GB
     total_b = torch.cuda.get_device_properties(0).total_memory
     fraction = 1.0 - (headroom_gb * 1e9) / total_b
     # Clamp: never below 0.5 (a misconfigured huge num_workers shouldn't starve
