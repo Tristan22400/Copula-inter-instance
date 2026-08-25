@@ -75,7 +75,12 @@ from dataset import (
 from eval.configs.constants import GP_LR_MLE
 from eval.configs.regions import REGIONS as ERA5_REGIONS
 from era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
+from eval.data.era5_io import load_era5_data, safe_cholesky
+from eval.data.fetch_era5 import fetch as fetch_era5
+from eval.spatial.diagnostics import compute_context_z_train
 from eval.spatial.sweep_core import _fit_gp_baseline_nll, build_era5_probe
+from eval.viz.correlation_plots import plot_residual_grid
+from inference.copula_inference import normalize_features
 from live_dataset import (
     _LIVE_TABICL_FLAT_HEADROOM_GB,
     _LIVE_TABICL_WORKER_HEADROOM_GB,
@@ -97,9 +102,7 @@ from pit import (
     run_pit,
 )
 
-_MAX_PLOT_EPISODES = 8
 _PLOT_COLLECT_BATCHES = 5
-_CORR_GRID_N_WRAP = 3  # stack corr_grid episodes across this many bands
 
 # Peak dense FP16/BF16 tensor-core throughput (TFLOPS) per NVIDIA datasheets.
 # torch has no API to query this, so match torch.cuda.get_device_name() against
@@ -269,136 +272,6 @@ def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
     std_p, std_o = off_pred.std(), off_ora.std()
     pearson = float(np.corrcoef(off_pred, off_ora)[0, 1]) if (std_p > 1e-12 and std_o > 1e-12) else 0.0
     return {"mse": mse, "mae": mae, "pearson": pearson, "bias": bias}
-
-
-def _oracle_diagonal_order(R_ora: np.ndarray) -> np.ndarray:
-    """Permutation that reorders R_ora's rows/cols so strongly-correlated test
-    points sit next to each other, concentrating high |correlation| along the
-    diagonal instead of scattered uniformly across the heatmap.
-
-    Hierarchical-clustering seriation (average-linkage, optimal leaf ordering)
-    on the distance ``1 - |R_ora|`` — points the oracle says are strongly
-    (anti-)correlated get small distance and land close together in the
-    leaf order. N < 3 has no meaningful ordering.
-    """
-    n = R_ora.shape[0]
-    if n < 3:
-        return np.arange(n)
-    from scipy.cluster.hierarchy import leaves_list, linkage
-    from scipy.spatial.distance import squareform
-
-    dist = 1.0 - np.abs(R_ora)
-    np.fill_diagonal(dist, 0.0)
-    dist = 0.5 * (dist + dist.T)  # guard against float32 asymmetry
-    link = linkage(squareform(dist, checks=False), method="average", optimal_ordering=True)
-    return np.asarray(leaves_list(link))
-
-
-def _corr_grid_fig(plot_episodes: list[dict], step: int) -> plt.Figure:
-    """Correlation-matrix grid: each estimator paired side-by-side with the oracle.
-
-    One row per estimator — the model Pred. Each episode occupies *two adjacent
-    columns*: the oracle ``R_star`` on the left and that row's prediction on the
-    right, so every estimate sits right next to the ground truth it is compared
-    against (no scanning to a distant oracle row). Each prediction cell is
-    annotated with its per-episode upper-triangle MSE against the oracle.
-    Episodes are wrapped across ``_CORR_GRID_N_WRAP`` stacked bands instead of
-    one very wide row, so the figure stays a reasonable aspect ratio on screen.
-
-    Rows/cols of both oracle and prediction are reordered per episode by
-    ``_oracle_diagonal_order`` (derived from the oracle alone, then reused for
-    the prediction) so the oracle's correlation structure is as diagonal-heavy
-    as possible and the two panels stay directly comparable.
-
-    A second row, "Pred (z_tabicl)", is added when any episode carries an
-    "R_pred_tabicl" key — the same model forward pass, but conditioned on
-    TabICL's own K-fold PIT z_train instead of the exact GP-LOO one (see
-    _build_tabicl_val_z / the do_plot block in validate()). This is the
-    sim-to-real check: does the model's correlation prediction hold up when
-    fed the imperfect PIT it will actually get at real-data deployment time,
-    not just the closed-form oracle one it's trained on almost everywhere
-    else. Episodes without that key (e.g. the kernel_fit probes appended
-    below) simply leave that row blank for that column.
-    """
-    n_ep = len(plot_episodes)
-
-    # (row_label, lookup) for each *estimator*: Pred is a top-level episode key.
-    # The oracle is no longer a row — it is the left cell of every episode pair.
-    rows: list[tuple[str, str]] = [("Pred (z_exact)", "R_pred")]
-    if any("R_pred_tabicl" in ep for ep in plot_episodes):
-        rows.append(("Pred (z_tabicl)", "R_pred_tabicl"))
-    n_est = len(rows)
-
-    n_wrap = max(1, min(_CORR_GRID_N_WRAP, n_ep))
-    per_line = math.ceil(n_ep / n_wrap)
-    n_col = 2 * per_line
-    n_row = n_est * n_wrap
-
-    fig, axes = plt.subplots(
-        n_row, n_col, figsize=(max(n_col * 1.1, 4), max(n_row * 1.5, 4)),
-        squeeze=False, constrained_layout=True,
-    )
-    cmap = plt.get_cmap("RdBu_r").copy()
-    cmap.set_bad(color="lightgrey")
-
-    def _draw(ax, mat):
-        m = mat.copy()
-        d = np.arange(m.shape[0])
-        m[d, d] = np.nan  # blank diagonal so it doesn't dominate the colour scale
-        return ax.imshow(m, cmap=cmap, vmin=-1, vmax=1,
-                         interpolation="nearest", aspect="auto")
-
-    im = None
-    for idx, ep in enumerate(plot_episodes):
-        line, col = divmod(idx, per_line)
-        order = _oracle_diagonal_order(ep["R_ora"])
-        R_ora = ep["R_ora"][order][:, order]
-        ri, ci = np.triu_indices(R_ora.shape[0], k=1)
-        c_ora, c_est = 2 * col, 2 * col + 1
-
-        for row_idx, (row_label, key) in enumerate(rows):
-            row = line * n_est + row_idx
-            mat = ep.get(key)  # top-level key: R_pred
-            if mat is not None:
-                mat = mat[order][:, order]  # same permutation as the oracle, for a fair comparison
-
-            # Left cell: the oracle, redrawn beside every estimator as its reference.
-            ax_o = axes[row, c_ora]
-            im = _draw(ax_o, R_ora)
-            ax_o.set_xticks([])
-            ax_o.set_yticks([])
-            if col == 0:
-                ax_o.set_ylabel(row_label, fontsize=7)
-            if row_idx == 0:
-                ax_o.set_title(f"{ep['label']}\noracle", fontsize=6)
-
-            # Right cell: this row's prediction, annotated with its MSE vs oracle.
-            ax_e = axes[row, c_est]
-            ax_e.set_xticks([])
-            ax_e.set_yticks([])
-            if row_idx == 0:
-                ax_e.set_title("\nest", fontsize=6)
-            if mat is None:
-                ax_e.axis("off")
-                continue
-            im = _draw(ax_e, mat)
-            mse = float(np.mean((mat[ri, ci] - R_ora[ri, ci]) ** 2))
-            ax_e.set_xlabel(f"MSE={mse:.3f}", fontsize=6)
-
-    # Blank out the trailing unused slots in the last (possibly partial) band.
-    for idx in range(n_ep, per_line * n_wrap):
-        line, col = divmod(idx, per_line)
-        for row_idx in range(n_est):
-            row = line * n_est + row_idx
-            axes[row, 2 * col].axis("off")
-            axes[row, 2 * col + 1].axis("off")
-
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.4, aspect=40, pad=0.02)
-    fig.suptitle(
-        f"step {step} — oracle (left) vs prediction (right), per episode", fontsize=8
-    )
-    return fig
 
 
 def _name_seed(base_seed: int, name: str) -> int:
@@ -663,6 +536,163 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
             }
         batches[region_name] = region_batch
     return batches
+
+
+def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dict | None":
+    """Fixed sparse-context real-ERA5 probe for the qualitative
+    ``val/era5_predictions`` figure in validate()'s do_plot block --
+    replaces the old val/corr_density_analytic_z + val/corr_grid
+    correlation-matrix-vs-oracle plots (see this repo's
+    feedback_no_raw_correlation_vs_oracle_comparison note: comparing the
+    model's Sigma directly against the GP's exact R_star isn't a valid
+    diagnostic once TabICL's PIT is in the loop, since Sigma lives in
+    TabICL's own approximate z-space, not the GP's exact one) with
+    something directly interpretable: the model's predicted temperature
+    field against the real ground truth, on a handful of frozen days, from
+    a context sparse enough (< baselines.era5_viz_context_frac, default
+    5%, of the grid) to be a genuine spatial-extrapolation test rather than
+    near-complete coverage.
+
+    Unlike _build_era5_val_batches (era5_fit/<region>'s NLL probe, which
+    uses a denser ~5% context tuned for a stable NLL estimate, not a
+    strictly-below-5% one), this picks ONE region and keeps the grid/days/
+    context sample fixed across every do_plot call -- only the model's
+    forward pass changes step to step, so the figure is directly
+    comparable across training.
+
+    Splits precompute (here, once) from live (validate()'s do_plot block,
+    every call) the same way _build_era5_val_batches does: the context
+    sample, its PIT z_train, and each day's TabICL marginal quantile
+    function are all independent of the (still-training) copula model, so
+    they're computed once. The marginal quantile function in particular
+    (TabICL's QuantileDistribution) is a pure function of its own stored
+    tensors once built -- see tabicl's quantile_dist.py:icdf -- so caching
+    the `dist` object per day here means validate() never needs to keep
+    the (VRAM-heavy) tabicl_marginal net resident, or re-run its forward
+    pass, for the rest of training; it only reruns the copula model's own
+    forward pass plus a cheap Cholesky sample + icdf lookup.
+    """
+    ecfg = cfg.get("baselines", {}) or {}
+    region_pool = list(ecfg.get("era5_regions") or ERA5_REGIONS.keys())
+    if not region_pool:
+        return None
+    region_name = str(ecfg.get("era5_viz_region") or region_pool[0])
+    if region_name not in ERA5_REGIONS:
+        return None
+    grid_size = int(ecfg.get("era5_viz_grid_size", 24))
+    n_days_fetch = int(ecfg.get("era5_n_days_fetch", 60))
+    n_days_viz = int(ecfg.get("era5_viz_n_days", 4))
+    context_frac = float(ecfg.get("era5_viz_context_frac", 0.05))
+    seed = int(ecfg.get("era5_viz_seed", 20260825))
+    pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
+
+    lat_bounds, lon_bounds = ERA5_REGIONS[region_name]
+    nc_path = fetch_era5(region_name, lat_bounds, lon_bounds, grid_size, n_days_fetch)
+    data = load_era5_data(nc_path)
+    lat, lon = data["latitude"], data["longitude"]
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
+    D = coords.shape[0]
+
+    rng = np.random.default_rng(seed)
+    n_time = data["t2m"].shape[0]
+    n_pick = min(n_days_viz, n_time)
+    days = sorted(set(np.linspace(0, n_time - 1, n_pick).round().astype(int).tolist()))
+
+    # int() truncates (not rounds), so this can never land ON the 5%
+    # boundary the way a round() could -- strictly < context_frac of D.
+    n_context = max(1, min(int(context_frac * D), D - 1))
+    context_idx = rng.choice(D, size=n_context, replace=False)
+    context_coords = coords[context_idx]
+    x_train_norm, x_test_norm = normalize_features(context_coords, coords)
+    x_full = np.concatenate([x_train_norm, x_test_norm], axis=0)
+    x_batch = torch.as_tensor(x_full, dtype=torch.float32, device=device).unsqueeze(0)
+
+    true_fields, z_train_per_day = [], []
+    dists_per_day, y_mean_per_day, y_std_per_day = [], [], []
+    for d in days:
+        frame = data["t2m"][d]
+        true_fields.append(frame)
+        context_values = frame.ravel()[context_idx]
+        z_train_per_day.append(
+            compute_context_z_train(x_train_norm, context_values, tabicl_marginal, device, k_folds=pit_k_folds)
+        )
+        context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
+        context_values_scaled_t, _, y_mean_t, y_std_t = normalize_targets(context_values_t)
+        y_mean_per_day.append(y_mean_t.double())
+        y_std_per_day.append(y_std_t.double())
+        if tabicl_marginal is None:
+            dists_per_day.append(None)
+            continue
+        with torch.no_grad():
+            logits = tabicl_marginal(x_batch, context_values_scaled_t.unsqueeze(0))  # (1, D, Q)
+            dists_per_day.append(tabicl_marginal.quantile_dist(logits.reshape(D, -1)))
+
+    return {
+        "region": region_name, "lat": lat, "lon": lon, "grid_shape": data["t2m"][days[0]].shape,
+        "days": days, "true_fields": true_fields, "coords": coords,
+        "context_coords": context_coords, "D": D, "n_context": n_context,
+        "x_train_norm": x_train_norm, "x_test_norm": x_test_norm,
+        "z_train_per_day": z_train_per_day,
+        "dists_per_day": dists_per_day, "y_mean_per_day": y_mean_per_day, "y_std_per_day": y_std_per_day,
+        "seed": seed,
+    }
+
+
+def _era5_viz_field(Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.Tensor, z_shared: np.ndarray, device: str) -> np.ndarray:
+    """One joint draw (D,) from the copula model's implied field for one
+    ERA5 viz day: inject the CURRENT model correlation matrix `Sigma` into
+    the shared latent Gaussian vector `z_shared` via Cholesky, then map
+    through the frozen per-day marginal quantile function `dist` (see
+    _build_era5_viz_batch) -- i.e. y = F_hat^{-1}(Phi(z)), the same
+    construction as eval.spatial.diagnostics.predict_copula_residual_field,
+    just split so only this (cheap) step reruns every do_plot call instead
+    of also repeating the (expensive) TabICL forward pass that built `dist`.
+    Falls back to a naive Gaussian(mean, std) marginal if `dist` is None
+    (no PIT checkpoint configured -- see _build_era5_viz_batch).
+    """
+    from scipy.stats import norm
+
+    L = safe_cholesky(Sigma)
+    z_copula = L @ z_shared
+    if dist is None:
+        return y_mean.cpu().numpy() + y_std.cpu().numpy() * z_copula
+    u_copula = np.clip(norm.cdf(z_copula), 1e-6, 1.0 - 1e-6)
+    u_t = torch.as_tensor(u_copula, dtype=torch.float32, device=device).unsqueeze(-1)
+    with torch.no_grad():
+        y_pred_scaled = dist.icdf(u_t).squeeze(-1).double()
+    return (y_mean + y_std * y_pred_scaled).cpu().numpy()
+
+
+def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str) -> "plt.Figure | None":
+    """Builds the ``val/era5_predictions`` figure from a frozen
+    _build_era5_viz_batch probe: reruns the CURRENT model's forward pass
+    (the only per-step-changing input) to get Sigma for each of the probe's
+    few frozen days, samples one field from it via _era5_viz_field, and
+    renders ground-truth vs. predicted (vs. independent, copula switched
+    off) small multiples via eval.viz.correlation_plots.plot_residual_grid.
+    Returns None if the probe's grid was degenerate (e.g. 0 valid days).
+    """
+    if not vb["days"]:
+        return None
+    x_train_v = torch.as_tensor(vb["x_train_norm"], dtype=torch.float32, device=device).unsqueeze(0)
+    x_test_v = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
+    rng_v = np.random.default_rng(vb["seed"])
+    R_indep = np.eye(vb["D"])
+    predicted_fields, independent_fields = [], []
+    for i in range(len(vb["days"])):
+        z_train_v = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
+        out_v = model({"x_train": x_train_v, "z_train": z_train_v, "x_test": x_test_v})
+        Sigma_v = build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
+        z_shared = rng_v.standard_normal(vb["D"])
+        dist_i, y_mean_i, y_std_i = vb["dists_per_day"][i], vb["y_mean_per_day"][i], vb["y_std_per_day"][i]
+        predicted_fields.append(_era5_viz_field(Sigma_v, dist_i, y_mean_i, y_std_i, z_shared, device))
+        independent_fields.append(_era5_viz_field(R_indep, dist_i, y_mean_i, y_std_i, z_shared, device))
+    data_like = {"latitude": vb["lat"], "longitude": vb["lon"], "t2m": dict(zip(vb["days"], vb["true_fields"]))}
+    return plot_residual_grid(
+        data_like, vb["days"], predicted_fields, output_path=None,
+        context_coords=vb["context_coords"], independent_fields=independent_fields, target="raw",
+    )
 
 
 def _update_adaptive_kernel_weights(
@@ -1174,6 +1204,7 @@ def validate(
     tabicl_val_z: dict | None = None,
     tabicl_kernel_fit_z: dict | None = None,
     era5_val_batches: dict | None = None,
+    era5_viz_batch: dict | None = None,
     posterior_probe: dict | None = None,
     val_episodes_meta: dict[int, list[dict]] | None = None,
 ) -> tuple[dict, list]:
@@ -1188,14 +1219,9 @@ def validate(
     all_s_vals: list[float] = []
     all_sigma_off: list[float] = []
     all_sigma_diag: list[float] = []
-    all_off_pred: list[np.ndarray] = []
-    all_off_ora: list[np.ndarray] = []
-    all_off_pred_tabicl: list[np.ndarray] = []
-    all_off_ora_tabicl: list[np.ndarray] = []
     all_tabicl_marginal_total: list[float] = []
     all_tabicl_marginal_marginal: list[float] = []
     all_tabicl_marginal_copula: list[float] = []
-    plot_episodes: list[dict] = []
 
     # ---- True Bayes-optimal ceiling accumulators (pit.gp_analytical_posterior) ----
     # Filled either inline below (val_episodes_meta present -- live-generation
@@ -1284,45 +1310,18 @@ def validate(
             all_sigma_off.extend(off_vals_cur.cpu().tolist())
             all_sigma_diag.extend(Sigma.diagonal(dim1=-2, dim2=-1)[batch["test_mask"]].cpu().tolist())
 
-        # ---- TabICL-marginal real (non-oracle) NLL scoring + plot collection ----
-        # Runs on EVERY val_loader batch every val_every step (not just
-        # do_plot steps): this is what feeds val/y_nll_total below, which is
-        # meant to be sized like the rest of val/'s metrics (training.
-        # val_episodes), not a small plot-sized sub-sample — tabicl_val_z now
-        # has an entry for every batch (see _build_tabicl_val_z). The
-        # R_star/oracle-only plotting pieces (all_off_pred/all_off_ora,
-        # corr_mse_tabicl_z/sim2real_gap, plot_episodes, R_pred_tabicl
-        # overlay) only ever run on do_plot steps (sparser cadence), but
-        # otherwise now cover the full val_loader too — no longer capped at
-        # _PLOT_COLLECT_BATCHES batches, which was a small (~80-episode)
-        # sub-sample for no reason tied to the plots themselves (the hexbin
-        # density plot and corr_mse_tabicl_z/sim2real_gap's MSE comparison
-        # are both fine, and more accurate, over the full val set; only
-        # plot_episodes' individual grid subplots stay small, via their own
-        # _MAX_PLOT_EPISODES cap below).
+        # ---- TabICL-marginal real (non-oracle) NLL scoring ----
+        # Runs on EVERY val_loader batch every val_every step: this is what
+        # feeds val/y_nll_total below, which is meant to be sized like the
+        # rest of val/'s metrics (training.val_episodes), not a small
+        # plot-sized sub-sample — tabicl_val_z now has an entry for every
+        # batch (see _build_tabicl_val_z).
         B = Sigma.shape[0]
         z_cache_b = tabicl_val_z.get(batch_idx) if tabicl_val_z else None
-        collect_plot = do_plot
         for b in range(B):
             n = int(batch["test_mask"][b].sum())
             if n < 2:
                 continue
-
-            ep_dict = None
-            ri = ci = None
-            R_ora_b = None
-            if collect_plot:
-                R_pred_b = Sigma[b, :n, :n].float().cpu().numpy()
-                R_ora_b = batch["R_star"][b, :n, :n].float().cpu().numpy()
-                ri, ci = np.triu_indices(n, k=1)
-                all_off_pred.append(R_pred_b[ri, ci])
-                all_off_ora.append(R_ora_b[ri, ci])
-                if len(plot_episodes) < _MAX_PLOT_EPISODES:
-                    ep_dict = {
-                        "R_pred": R_pred_b,
-                        "R_ora": R_ora_b,
-                        "label": f"ep{batch_idx * B + b}\nN={n}",
-                    }
 
             # Sim-to-real check: re-run the model on this SAME episode
             # (same x_train/x_test) but conditioned on TabICL's own
@@ -1339,12 +1338,6 @@ def validate(
                     }
                     out_tabicl = model(sub_batch)
                     Sigma_tabicl = build_sigma(out_tabicl, cfg, jitter=jitter)
-
-                    if collect_plot and ep_dict is not None:
-                        R_pred_tabicl_b = Sigma_tabicl[0].float().cpu().numpy()
-                        ep_dict["R_pred_tabicl"] = R_pred_tabicl_b
-                        all_off_pred_tabicl.append(R_pred_tabicl_b[ri, ci])
-                        all_off_ora_tabicl.append(R_ora_b[ri, ci])
 
                     # Genuine (non-oracle) total Y-space NLL: score this
                     # same TabICL-conditioned Sigma against TabICL's OWN
@@ -1387,9 +1380,6 @@ def validate(
                     ri_p, ci_p = np.triu_indices(n, k=1)
                     off_p_post.append(Sigma[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
                     off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
-
-            if ep_dict is not None:
-                plot_episodes.append(ep_dict)
 
     # metrics starts empty. The old y_nll_total/y_nll_copula here scored the
     # model against batch["z_test"]/["log_pdf_test"] — the exact analytic-GP
@@ -1631,19 +1621,6 @@ def validate(
                 if oracle_post_s is not None:
                     metrics[f"kernel_fit/{family}/gap_nll_tabicl"] = tot_s_tabicl - oracle_post_s
 
-        # One extra corr_grid column per kernel family: its own synthetic
-        # episode's oracle beside the model's prediction on it — replaces the
-        # old classical-kernel baseline rows (which used the real episodes'
-        # oracle instead of a kernel-specific one).
-        if do_plot:
-            n_s = int(sbatch["test_mask"][0].sum())
-            if n_s >= 2:
-                plot_episodes.append({
-                    "R_pred": Sigma_s[0, :n_s, :n_s].float().cpu().numpy(),
-                    "R_ora":  sbatch["R_star"][0, :n_s, :n_s].float().cpu().numpy(),
-                    "label":  f"kfit:{family}\nN={n_s}",
-                })
-
     # Real-ERA5 spatial-correlation probe per region (see
     # _build_era5_val_batches / eval/spatial/sweep_core.py::build_era5_probe).
     # There is no GP oracle for real data, so — unlike kernel_fit/<family>'s
@@ -1709,69 +1686,22 @@ def validate(
     model.train()
 
     plot_figs: list = []
-    if do_plot:
-        # — 2D hexbin density of off-diagonal correlations —
-        if all_off_pred:
-            off_p = np.concatenate(all_off_pred)
-            off_o = np.concatenate(all_off_ora)
-            lo = min(float(off_o.min()), float(off_p.min()))
-            hi = max(float(off_o.max()), float(off_p.max()))
-            mse = float(np.mean((off_p - off_o) ** 2))
-            neg_frac = float(np.mean(off_o < 0))
-            fig_den, ax_den = plt.subplots(figsize=(5, 5))
-            hb = ax_den.hexbin(off_o, off_p, gridsize=60, cmap="YlOrRd", mincnt=1, bins="log")
-            fig_den.colorbar(hb, ax=ax_den, label="log10(count)")
-            ax_den.plot([lo, hi], [lo, hi], "b--", lw=1)
-
-            # Median predicted corr per oracle-corr bin.
-            n_bins = 40
-            bin_edges = np.linspace(lo, hi, n_bins + 1)
-            bin_idx = np.clip(np.digitize(off_o, bin_edges) - 1, 0, n_bins - 1)
-            bin_centers, bin_medians = [], []
-            for b in range(n_bins):
-                sel = bin_idx == b
-                if sel.any():
-                    bin_centers.append(0.5 * (bin_edges[b] + bin_edges[b + 1]))
-                    bin_medians.append(float(np.median(off_p[sel])))
-            ax_den.plot(bin_centers, bin_medians, "g-", lw=1.5, label="median pred")
-            ax_den.legend(loc="upper left", fontsize=8)
-
-            ax_den.set_xlabel("Oracle off-diag corr")
-            ax_den.set_ylabel("Predicted off-diag corr")
-            ax_den.set_title(
-                f"step {step} — density ({len(off_p):,} values)  "
-                f"MSE={mse:.4f}  neg%={100 * neg_frac:.1f}"
-            )
-            fig_den.tight_layout()
-            plot_figs.append(fig_den)
-
-            # Sim-to-real gap: same plot-subset episodes, same oracle targets
-            # (data_gen.py's context-blind R_star, not gp_analytical_
-            # posterior's R_post — this stays a RELATIVE comparison against
-            # the model's own oracle-context prediction on the identical
-            # subset, so the reference's own imperfection cancels out even
-            # though it isn't the true posterior), but off_p_t comes from
-            # conditioning on TabICL's own K-fold PIT z_train instead of the
-            # exact one (see the do_plot block above / _build_tabicl_val_z).
-            # Compared against `mse` from the same subset so the gap isn't
-            # confounded by the two metrics covering different episode sets.
-            if all_off_pred_tabicl:
-                off_p_t = np.concatenate(all_off_pred_tabicl)
-                off_o_t = np.concatenate(all_off_ora_tabicl)
-                cq_t = _corr_quality(off_p_t, off_o_t)
-                metrics["corr_mse_tabicl_z"]     = cq_t["mse"]
-                # corr_pearson_tabicl_z dropped: same "value can shift with
-                # whichever marginal produced z_test" issue as the deleted
-                # top-level pooled corr_pearson — corr_mse_tabicl_z (and
-                # sim2real_gap, an MSE difference) isn't scale-free the same
-                # way Pearson r superficially looks like it should be, so
-                # it's kept; corr_mae_tabicl_z/corr_bias_tabicl_z were
-                # dropped as redundant with it.
-                metrics["sim2real_gap"] = cq_t["mse"] - mse
-
-        # — Oracle vs predicted correlation matrix grid —
-        if plot_episodes:
-            plot_figs.append(_corr_grid_fig(plot_episodes, step))
+    if do_plot and era5_viz_batch is not None:
+        # Real-ERA5 predicted-vs-ground-truth temperature field, sparse
+        # context (< baselines.era5_viz_context_frac, default 5%, of the
+        # grid — see _build_era5_viz_batch) on a handful of frozen days.
+        # Replaces the old val/corr_density_analytic_z (hexbin of predicted
+        # vs. oracle off-diagonal correlation) and val/corr_grid (oracle vs.
+        # predicted correlation-matrix heatmaps): both compared the model's
+        # Sigma directly against the GP's exact R_star, which this repo's
+        # feedback_no_raw_correlation_vs_oracle_comparison note rules out as
+        # a diagnostic once TabICL's PIT is in the loop (Sigma lives in
+        # TabICL's own approximate z-space, not the GP's exact one) — an
+        # ERA5 field reconstruction has no such mismatch: it's judged (by
+        # eye) in the same real Y-space the model is actually deployed in.
+        fig_era5 = _era5_viz_fig(model, cfg, era5_viz_batch, jitter, device)
+        if fig_era5 is not None:
+            plot_figs.append(fig_era5)
 
     return metrics, plot_figs
 
@@ -2046,16 +1976,6 @@ def main(cfg: DictConfig) -> None:
         # constraint on the validation-probe side.
         print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
         t.aux_mae_weight = 0.0
-    if live_generation and live_source == "era5" and int(t.get("plot_val_every", 0)) > 0:
-        # validate()'s do_plot path indexes batch["R_star"] (correlation
-        # scatter/heatmap plots against the oracle) unconditionally when a
-        # plot step lands -- era5_collate_fn's batches carry no R_star (no
-        # oracle exists for real data), so a plot step would KeyError. No
-        # oracle-vs-predicted plot is possible here by construction; disable
-        # rather than special-case the plotting internals for a field that
-        # can never exist under this source.
-        print("[train] live_source=era5: forcing training.plot_val_every=0 (no oracle R_star to plot against)")
-        t.plot_val_every = 0
     if live_generation:
         _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         # dataset_dir is ignored entirely in this mode (see below) — naming the
@@ -2426,7 +2346,12 @@ def main(cfg: DictConfig) -> None:
     # branch below still tries tabicl.ckpt directly for era5_fit alone
     # before falling back to build_era5_probe's naive-standardization path.
     era5_val_batches: dict = {}
+    era5_viz_batch: "dict | None" = None
     era5_on = baselines_on and bool(cfg.get("baselines", {}).get("era5_enabled", True))
+    # Only worth the fetch+PIT cost (paid once, here) if do_plot will ever
+    # actually fire and consume it -- see validate()'s do_plot block /
+    # _build_era5_viz_batch.
+    era5_viz_on = era5_on and int(t.get("plot_val_every", 5000)) > 0
     # tabicl_mix_weights is not None only when live_generation + data.
     # z_train_tabicl_mix_enabled=true (see build_live_train_loader) -- needs
     # tabicl_marginal loaded below regardless of baselines_on, since the
@@ -2497,6 +2422,9 @@ def main(cfg: DictConfig) -> None:
         if era5_on:
             print("[train] Building frozen real-ERA5 spatial-correlation probes...")
             era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)
+        if era5_viz_on:
+            print("[train] Building frozen real-ERA5 prediction-viz probe...")
+            era5_viz_batch = _build_era5_viz_batch(cfg, tabicl_marginal, device)
         del tabicl_marginal  # only the caches built above are needed from here on
         if device == "cuda":
             # gc.collect() before empty_cache() (see this repo's OOM-handler
@@ -2521,6 +2449,8 @@ def main(cfg: DictConfig) -> None:
             )
             era5_tabicl_marginal = load_tabicl(era5_ckpt, device)
             era5_val_batches = _build_era5_val_batches(cfg, era5_tabicl_marginal, device)
+            if era5_viz_on:
+                era5_viz_batch = _build_era5_viz_batch(cfg, era5_tabicl_marginal, device)
             del era5_tabicl_marginal
             if device == "cuda":
                 gc.collect()
@@ -2532,6 +2462,8 @@ def main(cfg: DictConfig) -> None:
                 "naive standardization)..."
             )
             era5_val_batches = _build_era5_val_batches(cfg, None, device)
+            if era5_viz_on:
+                era5_viz_batch = _build_era5_viz_batch(cfg, None, device)
 
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
@@ -2980,6 +2912,7 @@ def main(cfg: DictConfig) -> None:
                 tabicl_val_z=tabicl_val_z,
                 tabicl_kernel_fit_z=tabicl_kernel_fit_z,
                 era5_val_batches=era5_val_batches,
+                era5_viz_batch=era5_viz_batch,
                 posterior_probe=posterior_probe,
                 val_episodes_meta=val_episodes_meta,
             )
@@ -3015,12 +2948,9 @@ def main(cfg: DictConfig) -> None:
                         continue
                     log_dict[f"val/kernel_sampling_weight/{family}"] = float(new_kernel_weights[i])
             if plot_figs:
-                # plot_figs[0] is built from all_off_pred/all_off_ora — the
-                # same analytic-z_train-conditioned Sigma as the
-                # sigma_*_analytic_z scalars above, hence the matching suffix.
-                log_dict["val/corr_density_analytic_z"] = wandb.Image(plot_figs[0])
-                if len(plot_figs) > 1:
-                    log_dict["val/corr_grid"] = wandb.Image(plot_figs[1])
+                # The real-ERA5 predicted-vs-ground-truth field figure (see
+                # validate()'s do_plot block / _build_era5_viz_batch).
+                log_dict["val/era5_predictions"] = wandb.Image(plot_figs[0])
                 for f in plot_figs:
                     plt.close(f)
             wandb.log(log_dict, step=step)
