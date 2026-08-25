@@ -69,7 +69,7 @@ from data_gen import generate_gp_batch
 from dataset import collate_fn
 from model import build_copula_transformer
 from muon import Muon
-from pit import load_tabicl, resolve_pit_ckpt
+from pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
 from train import (
     _forward_and_loss,
     _run_train_step,
@@ -109,6 +109,16 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
     different validation distribution. That equivalence breaks the moment
     training.batch_size, training.live_val_seed, the data.* config, or the
     resolved TabICL checkpoint differ from the run you're comparing against.
+
+    Also computes the copula gap's fixed operand here, once: pit.
+    gp_analytical_posterior's exact Schur-complement GP posterior per raw
+    episode (return_kernel_metadata=True gives it the kernel metadata it
+    needs), Sklar-split via its own nll_post_copula -- the same
+    per-point-normalized quantity train.py::validate() averages into
+    oracle_diag/copula_nll. This is a property of the fixed episodes alone,
+    independent of the model being trained, so it's computed once here
+    rather than every validation call (mirrors train.py's own
+    posterior_probe/val_episodes_meta split).
     """
     # Each batch is kept SEPARATELY collated, exactly like
     # build_fixed_live_val_batches's own `batches: List[dict]` -- d_features
@@ -120,17 +130,33 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
     batch_size = int(t.batch_size)
     batches = []
     n_episodes = 0
+    oracle_copula_per_point: list[float] = []
     for i in range(DEBUG_VAL_N_BATCHES):
         val_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": val_seed + i * 104_729}))
         episodes = generate_gp_batch(
             val_cfg, batch_size, device=gen_device,
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             tabicl_split_calib_frac=tabicl_split_calib_frac,
+            return_kernel_metadata=True,
         )
         n_episodes += len(episodes)
+        for ep in episodes:
+            try:
+                post = gp_analytical_posterior(ep)
+            except (NotImplementedError, KeyError):
+                # Rare unsupported kernel schema (see gp_analytical_posterior's
+                # docstring) -- skip this one episode's oracle rather than
+                # crash the whole debug run over it.
+                continue
+            n_test_ep = int(ep["x_norm_test"].shape[0])
+            oracle_copula_per_point.append(float(post["nll_post_copula"]) / n_test_ep)
         batch = {k: v.to(device, non_blocking=True) for k, v in collate_fn(episodes).items()}
         batches.append(batch)
-    return n_episodes, val_seed, batch_size, batches
+    oracle_copula_nll = (
+        sum(oracle_copula_per_point) / len(oracle_copula_per_point)
+        if oracle_copula_per_point else float("nan")
+    )
+    return n_episodes, val_seed, batch_size, batches, oracle_copula_nll
 
 
 def _build_episode_batch(cfg: DictConfig, n: int, seed: int, device: str,
@@ -196,7 +222,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     t_val0 = time.perf_counter()
-    n_val_debug, val_seed, val_batch_size, val_batches = _build_debug_val_batch(
+    n_val_debug, val_seed, val_batch_size, val_batches, oracle_copula_nll = _build_debug_val_batch(
         cfg, t, device, gen_device, tabicl_model, tabicl_k_folds, tabicl_split_calib_frac,
     )
     print(
@@ -207,6 +233,7 @@ def main(cfg: DictConfig) -> None:
         "training.batch_size/training.live_val_seed/data.*/the resolved TabICL "
         "checkpoint match the run you're comparing against."
     )
+    print(f"[train_fast] Oracle (exact GP posterior) copula NLL on this val set: {oracle_copula_nll:.4f} -- the copula_gap below is the model's copula NLL minus this.")
 
     t_model0 = time.perf_counter()
     model = build_copula_transformer(cfg).to(device)
@@ -310,9 +337,12 @@ def main(cfg: DictConfig) -> None:
                     copulas.append(val_parts["copula"].item())
                     marginals.append(val_parts["marginal"].item())
             model.train()
+            model_copula_nll = sum(copulas) / len(copulas)
+            copula_gap = model_copula_nll - oracle_copula_nll
             print(
                 f"          -- val({n_val_debug}) total={sum(totals) / len(totals):.4f} "
-                f"copula={sum(copulas) / len(copulas):.4f} marginal={sum(marginals) / len(marginals):.4f}"
+                f"copula={model_copula_nll:.4f} marginal={sum(marginals) / len(marginals):.4f} "
+                f"| copula_gap={copula_gap:+.4f} (vs. oracle {oracle_copula_nll:.4f} -- lower is better, 0 = Bayes-optimal)"
             )
 
     if t.get("ckpt_dir", None):
