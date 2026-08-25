@@ -301,6 +301,22 @@ baselines:
   era5_n_bins: 12           # distance bins for the correlation-vs-distance curve
   era5_seed: 20260818       # fixed seed -> same context sample/probe days every run
 
+  # val/era5_predictions figure (see train.py::_build_era5_viz_batch): a
+  # small-multiples ground-truth-vs-predicted temperature field on a
+  # handful of frozen ERA5 days, replacing the old val/corr_density_
+  # analytic_z + val/corr_grid correlation-vs-oracle plots (see
+  # feedback_no_raw_correlation_vs_oracle_comparison for why those weren't
+  # a valid diagnostic once TabICL's PIT is in the loop). Deliberately
+  # sparser than era5_grid_size/era5_n_context above (~5% context, not
+  # strictly below it) -- this is meant as a genuine spatial-extrapolation
+  # demo, not a stable NLL estimate. Only built (fetch/PIT cost paid once,
+  # at startup) when era5_enabled and training.plot_val_every > 0.
+  era5_viz_region: null          # null -> era5_regions[0]
+  era5_viz_grid_size: 24
+  era5_viz_n_days: 4              # "a few specific days"
+  era5_viz_context_frac: 0.05     # context size is floor(context_frac * grid_size^2) -- strictly < 5%
+  era5_viz_seed: 20260825
+
 # training.live_source=era5's data knobs (src/era5_live_dataset.py). Ignored
 # unless training.live_generation=true AND training.live_source=era5.
 era5_live:

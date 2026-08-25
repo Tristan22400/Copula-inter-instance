@@ -182,7 +182,7 @@ def plot_corr_grid(
 
 def _plot_field_grid(
     lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, true_fields: list, col_titles: list,
-    output_path: str, row0_label: str, suptitle: str,
+    output_path: "str | None", row0_label: str, suptitle: str,
     predicted_fields: "list[np.ndarray] | None" = None,
     predicted_fields_2: "list[np.ndarray] | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
@@ -193,14 +193,19 @@ def _plot_field_grid(
     indep_row_label: str = "Independent\n(no copula)\nLatitude",
     oracle_row_label: str = "Oracle correlation\n+ marginal\nLatitude",
     xlabel: str = "Longitude", cbar_label: str = "Residual (deg C)",
-) -> None:
+):
     """Shared small-multiples renderer behind both plot_residual_grid (real
     ERA5 days) and plot_synthetic_residual_grid (synthetic GP draws): top row
     `true_fields`, then an optional oracle-correlation row, then optional
     predicted/predicted_2/independent rows below (flat (D,) arrays, reshaped
     to grid_shape here). `oracle_fields`/`predicted_fields_2` are only ever
     passed by plot_synthetic_residual_grid. All rows share one color scale
-    and a Moran's I annotation (see eval.spatial.diagnostics.morans_i)."""
+    and a Moran's I annotation (see eval.spatial.diagnostics.morans_i).
+
+    `output_path=None` skips the save-to-disk step and returns the open
+    Figure instead (e.g. for src/train.py's live wandb.Image logging, which
+    has no use for an on-disk copy) -- otherwise behaves exactly as before:
+    saves, closes, prints, returns None."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -269,18 +274,21 @@ def _plot_field_grid(
     fig.suptitle(suptitle)
     plt.tight_layout(rect=(0.0, 0.0, 0.93, 0.96))
     fig.colorbar(mesh, ax=axes.ravel().tolist(), shrink=0.85, label=cbar_label)
+    if output_path is None:
+        return fig
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {output_path}")
+    return None
 
 
 def plot_residual_grid(
-    data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: str,
+    data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: "str | None",
     context_coords: "np.ndarray | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
     target: str = "raw",
-) -> None:
+):
     """Small-multiples panel of the `target` field (raw temperature Z_t by
     default, or the 24h persistence residual E_t = Z_t - Z_{t-24}) on the
     lat/lon grid, one column per day in `days`: top row is the ground-truth
@@ -294,9 +302,18 @@ def plot_residual_grid(
     marginal. If `context_coords` is given, the real-context locations that
     condition both predicted rows are overlaid as black markers on those
     rows only.
+
+    `data["t2m"]` may be either the full (n_time, H, W) array `load_era5_data`
+    returns (`days` then indexes positionally into it) or a plain
+    ``{day: (H, W) frame}`` dict covering just `days` (src/train.py's
+    validate() builds one of these instead of retaining every fetched day) --
+    both support the same `data["t2m"][d]` lookup this function relies on.
+
+    `output_path=None` returns the open Figure instead of saving it to disk
+    (see `_plot_field_grid`); otherwise returns None as before.
     """
     lat, lon = data["latitude"], data["longitude"]
-    grid_shape = data["t2m"][0].shape
+    grid_shape = data["t2m"][days[0]].shape
     if target == "residual":
         true_fields = [data["t2m"][d] - data["t2m"][d - 1] for d in days]
         col_titles = [f"day {d}: $E_t = Z_{{{d}}} - Z_{{{d - 1}}}$" for d in days]
@@ -313,7 +330,7 @@ def plot_residual_grid(
             else "Raw Temperature Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
         )
         cbar_label = "Temperature (deg C)"
-    _plot_field_grid(
+    return _plot_field_grid(
         lat, lon, grid_shape, true_fields, col_titles, output_path,
         row0_label="Ground truth\nLatitude", suptitle=suptitle,
         predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
