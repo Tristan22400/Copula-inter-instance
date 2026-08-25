@@ -205,10 +205,7 @@ def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
     aside for the main process's own use -- see that constant's docstring
     for why a smaller model preset (e.g. copula_nano) should lower this to
     unlock more auto-sized workers instead of being capped by a reserve
-    sized for the largest preset. Read AFTER train.py::resolve_batch_size has
-    already resolved training.batch_size (main() calls that first), so the
-    per-worker cost below reflects the batch_size actually used this run, not
-    a stale config default.
+    sized for the largest preset.
     """
     configured = t.get("live_tabicl_num_workers", None)
     if configured is not None:
