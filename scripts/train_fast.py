@@ -35,6 +35,11 @@ Usage (same Hydra override syntax as train.py):
     python scripts/train_fast.py model=copula_nano training.steps=200
     python scripts/train_fast.py data.z_train_source=analytic   # skip TabICL PIT entirely -- fastest possible start
     python scripts/train_fast.py training.batch_size=8 data.N_max=64  # shrink episodes for an even faster loop
+    # Alternate per-episode between the analytic z_train and real-TabICL PIT
+    # z_train at a fixed 50/50 rate (every kernel family, no adaptive gap
+    # measurement -- see the z_train_tabicl_mix_enabled block below):
+    python scripts/train_fast.py data.z_train_tabicl_mix_enabled=true \
+        data.z_train_tabicl_mix_floor_frac=0.5 data.z_train_tabicl_mix_max_frac=0.5
 """
 
 from __future__ import annotations
@@ -65,7 +70,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 
-from data_gen import generate_gp_batch
+from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
 from model import build_copula_transformer
 from muon import Muon
@@ -93,7 +98,8 @@ DEBUG_VAL_N_BATCHES = 2
 
 
 def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_device: str,
-                            tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float):
+                            tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float,
+                            tabicl_mix_weights=None):
     """The first `DEBUG_VAL_N_BATCHES` batches of train.py's own fixed
     live-generation validation set (see live_dataset.py::
     build_fixed_live_val_batches) -- NOT an independent sample.
@@ -137,6 +143,7 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
             val_cfg, batch_size, device=gen_device,
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             tabicl_split_calib_frac=tabicl_split_calib_frac,
+            tabicl_mix_weights=tabicl_mix_weights,
             return_kernel_metadata=True,
         )
         n_episodes += len(episodes)
@@ -161,12 +168,14 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
 
 def _build_episode_batch(cfg: DictConfig, n: int, seed: int, device: str,
                           tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float,
-                          gen_device: str, return_kernel_metadata: bool = False):
+                          gen_device: str, return_kernel_metadata: bool = False,
+                          tabicl_mix_weights=None):
     call_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": seed}))
     episodes = generate_gp_batch(
         call_cfg, n, device=gen_device,
         tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
         tabicl_split_calib_frac=tabicl_split_calib_frac,
+        tabicl_mix_weights=tabicl_mix_weights,
         return_kernel_metadata=return_kernel_metadata,
     )
     batch = {k: v.to(device, non_blocking=True) for k, v in collate_fn(episodes).items()}
@@ -200,13 +209,40 @@ def main(cfg: DictConfig) -> None:
         float(cfg.data.get("z_train_split_calib_frac", 1.0))
         if z_train_source == "tabicl_split" else 0.0
     )
-    if z_train_source in ("tabicl", "tabicl_split"):
+
+    # Fixed-fraction z_train mixing (alternate per-episode between the
+    # analytic residual and real-TabICL PIT instead of committing the whole
+    # run to one source). Reuses train.py's data.z_train_tabicl_mix_enabled/
+    # _floor_frac/_max_frac knobs (see conf/data/gp_tasks.yaml) rather than
+    # inventing new ones, but train_fast.py only supports the FIXED-fraction
+    # case (floor_frac == max_frac): train.py's floor != max path measures a
+    # real per-kernel-family TabICL-vs-analytic gap via
+    # train.py::_compute_tabicl_z_train_gap first, which runs its own
+    # synthetic-kernel probes -- exactly the slow startup this script exists
+    # to skip. Use train.py directly if you need that adaptive weighting.
+    mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
+    tabicl_mix_weights = None
+    if mix_enabled:
+        floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
+        max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
+        if floor_frac != max_frac:
+            raise ValueError(
+                f"data.z_train_tabicl_mix_enabled=true with floor_frac={floor_frac} != "
+                f"max_frac={max_frac} needs the adaptive per-kernel-family gap "
+                "measurement train_fast.py deliberately skips -- set both to the same "
+                "fixed mixing fraction (e.g. 0.5 for a 50/50 alternation), or run "
+                "src/train.py directly for the adaptive version."
+            )
+        tabicl_mix_weights = torch.full((len(_COMPOSABLE_KERNELS),), floor_frac, dtype=torch.float32)
+
+    if z_train_source in ("tabicl", "tabicl_split") or mix_enabled:
         ckpt = resolve_pit_ckpt(cfg)
         if ckpt is None:
             raise ValueError(
-                f"data.z_train_source={z_train_source} requires a resolvable TabICL "
-                "checkpoint (tabicl.ckpt with tabicl.pretrained=true, or tabicl.pit_ckpt) "
-                "-- or pass data.z_train_source=analytic to skip PIT entirely."
+                f"data.z_train_source={z_train_source} (or data.z_train_tabicl_mix_enabled=true) "
+                "requires a resolvable TabICL checkpoint (tabicl.ckpt with tabicl.pretrained=true, "
+                "or tabicl.pit_ckpt) -- or pass data.z_train_source=analytic and "
+                "data.z_train_tabicl_mix_enabled=false to skip PIT entirely."
             )
         print(f"[train_fast] Loading frozen TabICL marginal for PIT: {ckpt}")
         t_pit0 = time.perf_counter()
@@ -214,16 +250,18 @@ def main(cfg: DictConfig) -> None:
         gen_device = device
         print(f"[train_fast] TabICL marginal loaded in {time.perf_counter() - t_pit0:.1f}s")
 
+    mix_desc = f" mix_frac={float(tabicl_mix_weights[0]):.2f}" if tabicl_mix_weights is not None else ""
     print(
         f"[train_fast] model={cfg.model.get('rank')}rank/"
         f"{cfg.model.get('correlation_parametrization', 'covnorm')} "
         f"data=P[{cfg.data.P_min}..{cfg.data.P_max}] N[{cfg.data.N_min}..{cfg.data.N_max}] "
-        f"z_train_source={z_train_source} device={device}"
+        f"z_train_source={z_train_source}{mix_desc} device={device}"
     )
 
     t_val0 = time.perf_counter()
     n_val_debug, val_seed, val_batch_size, val_batches, oracle_copula_nll = _build_debug_val_batch(
         cfg, t, device, gen_device, tabicl_model, tabicl_k_folds, tabicl_split_calib_frac,
+        tabicl_mix_weights,
     )
     print(
         f"[train_fast] Built val set: first {n_val_debug} episodes "
@@ -299,6 +337,7 @@ def main(cfg: DictConfig) -> None:
             cfg, int(t.batch_size), seed=int(cfg.seed) + step * 104_729, device=device,
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             tabicl_split_calib_frac=tabicl_split_calib_frac, gen_device=gen_device,
+            tabicl_mix_weights=tabicl_mix_weights,
         )
         data_ms = (time.perf_counter() - step_t0) * 1000.0
 
