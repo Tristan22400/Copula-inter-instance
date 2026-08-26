@@ -17,7 +17,7 @@ N_SYNTHETIC_DRAWS = 20      # independent GP draws averaged per synthetic-mode c
 EARTH_RADIUS_KM = 6371.0
 
 # Total (marginal+copula) joint-NLL diagnostic (eval/metrics/joint_nll.py::
-# compute_joint_nll), shared by compare_marginal_backbones.py and
+# compute_joint_nll), shared by debug/stages/s7_backbone.py and
 # sweep_core.py::run_real_config -- neither the per-episode NLL tables in
 # eval_checkpoint.py/run_benchmarks.py nor spatial_model_r2 (a binned
 # correlation-curve-shape diagnostic, not a proper scoring rule) cover this

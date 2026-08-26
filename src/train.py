@@ -1493,6 +1493,11 @@ def validate(
     if all_oracle_total:
         metrics["oracle_diag/copula_nll"] = float(np.mean(all_oracle_copula))
         metrics["oracle_diag/total_nll"] = float(np.mean(all_oracle_total))
+        # y_space_nll's "total" is copula+marginal exactly (loss.py:729-730),
+        # and that identity survives averaging by linearity, so this is a
+        # subtraction of two quantities already computed above, not new
+        # compute — no separate all_oracle_marginal accumulator needed.
+        metrics["oracle_diag/marginal_nll"] = metrics["oracle_diag/total_nll"] - metrics["oracle_diag/copula_nll"]
     if nll_post_per_point:
         # total_nll and y_nll_oracle_posterior are scored on the SAME
         # episode population (whichever source supplied it above) — gap_nll,
@@ -1507,6 +1512,14 @@ def validate(
         metrics["y_nll_oracle_posterior_copula"] = float(np.mean(nll_post_copula_per_point))
         if "oracle_diag/total_nll" in metrics:
             metrics["oracle_diag/gap_nll"] = metrics["oracle_diag/total_nll"] - oracle_posterior_nll
+            # gap_nll mixes a copula term the model can improve with a
+            # marginal term it can't (log_pdf_test comes from a separate
+            # frozen TabICL, see data_gen.py's z_train_source=tabicl
+            # override) -- split it so the two are separately actionable
+            # instead of only visible as one combined headline number. See
+            # debug/README.md for the debugging workflow this feeds.
+            metrics["oracle_diag/copula_gap_nll"] = metrics["oracle_diag/copula_nll"] - metrics["y_nll_oracle_posterior_copula"]
+            metrics["oracle_diag/marginal_gap_nll"] = metrics["oracle_diag/marginal_nll"] - metrics["y_nll_oracle_posterior_marginal"]
     if off_p_post:
         cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
         metrics["oracle_diag/corr_pearson"] = cq_p["pearson"]
