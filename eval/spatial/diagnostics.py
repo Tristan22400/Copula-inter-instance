@@ -373,7 +373,7 @@ def build_synthetic_grid_task(
     (average many draws' predicted correlation, as
     sweep_core.py::run_synthetic_config does; or compare a single draw's
     exact-GP z_train against several marginal backends' K-fold PIT estimate
-    of it, as compare_marginal_backbones.py::run_task does) — previously
+    of it, as debug/stages/s7_backbone.py::run_task does) — previously
     duplicated between those two call sites.
 
     The returned ``rng`` has already drawn `context_idx`; callers that need

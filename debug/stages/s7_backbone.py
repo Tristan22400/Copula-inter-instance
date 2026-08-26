@@ -1,5 +1,10 @@
-"""compare_marginal_backbones.py — z_train gap comparison across tabular
-foundation models, on top of the SAME trained copula head.
+"""s7_backbone.py — z_train gap comparison across tabular foundation models,
+on top of the SAME trained copula head. Debug pipeline stage S7(a); see
+debug/README.md. Moved from eval/runners/compare_marginal_backbones.py
+(2026-08-26) — nothing outside this file imports it, only doc comments
+referenced its old path (eval/spatial/marginal_backends.py,
+eval/spatial/diagnostics.py, eval/spatial/sweep_core.py,
+eval/configs/constants.py, all updated to point here).
 
 Per synthetic (kernel, grid_size) task (constants.SYNTHETIC_SWEEP_PROFILES,
 same profile spatial_correlation_eval.py's `sweep --mode synthetic` uses),
@@ -36,7 +41,7 @@ eval.spatial.marginal_backends._require_tabpfn_token) — omit "tabpfn" from
 --backends to skip it without that.
 
 Usage:
-    python eval/runners/compare_marginal_backbones.py \
+    python debug/stages/s7_backbone.py \
         --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone,tabm
 """
 

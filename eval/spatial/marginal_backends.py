@@ -1,6 +1,6 @@
 """marginal_backends.py — pluggable tabular-foundation-model backends for
 K-fold PIT z_train estimation, so the "z_train gap vs. ground truth"
-comparison (eval/runners/compare_marginal_backbones.py) can swap TabICLv2
+comparison (debug/stages/s7_backbone.py) can swap TabICLv2
 for other tabular foundation models without touching the real-ERA5
 pipeline (eval/spatial/diagnostics.py::extract_model_context_correlation,
 sweep_core.py), which stays on TabICL only.
