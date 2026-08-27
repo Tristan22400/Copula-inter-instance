@@ -75,10 +75,16 @@ def _tabicl_pit_batch(tabicl_model, episodes: list[dict], k_folds: int, device: 
     return z_train, z_test, log_pdf_test
 
 
-def _tabpfn_pit_episode(regressor, ep: dict, k_folds: int, probs_n: int, seed: int):
-    """Per-episode TabPFN PIT via eval/spatial/marginal_backends.{quantiles,
-    loo_pit} + eval/metrics/joint_nll.compute_pit -- reused, not
-    reimplemented. Same y-scaling convention as data_gen.py's tabicl branch."""
+def _generic_pit_episode(backend: str, regressor, ep: dict, k_folds: int, probs_n: int, seed: int):
+    """Per-episode PIT for any eval/spatial/marginal_backends backend other
+    than "tabicl" (which gets its own batched path above) via that module's
+    shared {quantiles, loo_pit} contract + eval/metrics/joint_nll.compute_pit
+    -- reused, not reimplemented. Originally tabpfn-only (hence the name this
+    replaced, _tabpfn_pit_episode); generalized so "exaone"/"tabfm"/"tabm"
+    plug in the same way -- they already implement the same
+    (X_context, y_context, X_query, probs) -> quantile_grid contract, so
+    nothing backend-specific belongs in this function. Same y-scaling
+    convention as data_gen.py's tabicl branch."""
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.marginal_backends import loo_pit, quantiles
 
@@ -90,15 +96,15 @@ def _tabpfn_pit_episode(regressor, ep: dict, k_folds: int, probs_n: int, seed: i
     y_train_s, y_test_s = (y_train - y_mean) / y_std, (y_test - y_mean) / y_std
 
     probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
-    z_train = loo_pit("tabpfn", regressor, x_train, y_train_s, probs, k_folds=k_folds, seed=seed)
-    q_test = quantiles("tabpfn", regressor, x_train, y_train_s, x_test, probs, seed=seed)
+    z_train = loo_pit(backend, regressor, x_train, y_train_s, probs, k_folds=k_folds, seed=seed)
+    q_test = quantiles(backend, regressor, x_train, y_train_s, x_test, probs, seed=seed)
     z_test, log_pdf = compute_pit(q_test, probs, y_test_s)
     log_pdf = log_pdf - np.log(y_std)  # Jacobian back to raw-y nats, same convention as data_gen.py
     return torch.from_numpy(z_train).float(), torch.from_numpy(z_test).float(), torch.from_numpy(log_pdf).float()
 
 
 def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offset: int, tabicl_model=None,
-                              tabpfn_regressor=None, k_folds: int = 5, probs_n: int = DEFAULT_PROBS_N):
+                              regressor=None, k_folds: int = 5, probs_n: int = DEFAULT_PROBS_N):
     from dataset import collate_fn
 
     episodes = common.generate_episodes(dcfg, n, tabicl_model=None, seed_offset=seed_offset)
@@ -106,12 +112,14 @@ def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offse
         z_train, z_test, log_pdf_test = _tabicl_pit_batch(tabicl_model, episodes, k_folds, dcfg.device)
         for i, ep in enumerate(episodes):
             ep["z_train"], ep["z_test"], ep["log_pdf_test"] = z_train[i], z_test[i], log_pdf_test[i]
-    elif backend == "tabpfn":
-        for i, ep in enumerate(episodes):
-            zt, zte, lp = _tabpfn_pit_episode(tabpfn_regressor, ep, k_folds, probs_n, seed=seed_offset + i)
-            ep["z_train"], ep["z_test"], ep["log_pdf_test"] = zt, zte, lp
     else:
-        raise ValueError(f"unknown backend {backend!r}")
+        # Any other eval/spatial/marginal_backends entry (tabpfn, exaone,
+        # tabfm, tabm) -- one .fit()+.predict() (or K of them, for K-fold
+        # z_train) per episode, not a single batched GPU forward like
+        # tabicl's, so this loop is the real per-backend cost driver.
+        for i, ep in enumerate(episodes):
+            zt, zte, lp = _generic_pit_episode(backend, regressor, ep, k_folds, probs_n, seed=seed_offset + i)
+            ep["z_train"], ep["z_test"], ep["log_pdf_test"] = zt, zte, lp
     return {k: v.to(dcfg.device) for k, v in collate_fn(episodes).items()}
 
 
@@ -127,17 +135,21 @@ def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: 
     parametrization = str(dcfg.cfg.model.get("correlation_parametrization", "covnorm"))
 
     tabicl_model = common.load_frozen_tabicl(dcfg) if backend == "tabicl" else None
-    tabpfn_regressor = None
-    if backend == "tabpfn":
+    regressor = None
+    if backend != "tabicl":
         from eval.spatial.marginal_backends import make_regressor
 
-        tabpfn_regressor = make_regressor("tabpfn", device=dcfg.device)
+        # One instance reused across every fold/episode/step, same rationale
+        # as tabicl_model above -- "tabm" is the one backend where this is a
+        # no-op (make_regressor returns None: no pretrained weights to
+        # reuse, see marginal_backends.py).
+        regressor = make_regressor(backend, device=dcfg.device)
 
     # Fixed eval set: same episodes across both backends and every checkpoint
     # (seed_offset far from the training stream), re-PIT'd per backend.
     eval_batch = _build_batch_for_backend(
         dcfg, backend, n_eval, seed_offset=9_999_999, tabicl_model=tabicl_model,
-        tabpfn_regressor=tabpfn_regressor, k_folds=k_folds, probs_n=probs_n,
+        regressor=regressor, k_folds=k_folds, probs_n=probs_n,
     )
 
     history = []
@@ -145,7 +157,7 @@ def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: 
     for step in range(1, steps + 1):
         batch = _build_batch_for_backend(
             dcfg, backend, batch_size, seed_offset=step * 104_729, tabicl_model=tabicl_model,
-            tabpfn_regressor=tabpfn_regressor, k_folds=k_folds, probs_n=probs_n,
+            regressor=regressor, k_folds=k_folds, probs_n=probs_n,
         )
         out = model(batch)
         Sigma = build_sigma(out, dcfg.cfg, jitter=jitter, test_mask=batch["test_mask"])

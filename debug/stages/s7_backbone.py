@@ -15,7 +15,7 @@ computable in closed form and used as a fixed reference point:
   2. the true spatial correlation matrix R_true.
 
 For each marginal backend (eval.spatial.marginal_backends: tabicl, tabpfn,
-exaone, tabm), this script:
+exaone, tabfm, tabm), this script:
   a) estimates z_train via that backend's own K-fold leave-fold-out PIT on
      the SAME context points, and scores the gap against the exact z_train
      (Pearson corr / RMSE / MAE / calibration mean+std);
@@ -42,7 +42,7 @@ eval.spatial.marginal_backends._require_tabpfn_token) — omit "tabpfn" from
 
 Usage:
     python debug/stages/s7_backbone.py \
-        --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone,tabm
+        --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone,tabfm,tabm
 """
 
 from __future__ import annotations
