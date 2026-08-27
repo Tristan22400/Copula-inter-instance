@@ -22,11 +22,35 @@ Registered backends:
                programmatic way around this, it's PriorLabs' own license
                gate, not a bug here.
   - "exaone" : LG AI Research EXAONE-Tabular (pip `exaonetabular`),
-               pretrained. Point-prediction API ONLY (no native quantiles)
-               -- approximated via homoscedastic split-conformal residual
-               std per K-fold (see _exaone_quantiles): a held-out
-               calibration slice of each fold's context estimates one
-               constant sigma, reused for every query point in that fold.
+               pretrained. `.predict()`'s PUBLIC surface is point-estimate
+               only, but the model itself has a genuine native quantile head
+               underneath: every forward pass produces a
+               (ensemble_count, n_query, quantile_count) bank
+               (quantile_count=999, evenly spaced -- see LG's own model
+               card), which regressor.py::_collapse_members immediately
+               reduces to one scalar (median or trimmed-mean) per row before
+               .predict() ever returns. _exaone_quantiles below recovers
+               that bank instead of approximating a distribution from
+               residuals -- see its docstring for how (a monkeypatch on
+               _collapse_members, not a private reimplementation of the
+               forward pass).
+  - "tabfm"  : Google Research TabFM (pip `tabfm[pytorch]`), pretrained,
+               released 2026-06-30. Unlike "exaone", genuinely has NO native
+               quantile function for regression: confirmed against tabfm
+               1.0.1's own source (classifier_and_regressor.py::
+               _check_regressor_output_dim asserts the model's output last
+               axis is exactly 1 -- "produces scalar regression outputs" --
+               immediately squeezed away). What it does have is a real
+               32-member ensemble (`n_estimators`) whose UNAVERAGED
+               per-member point predictions are exposed via the private
+               `_predict_internal` (the same call `.predict()` itself
+               makes before averaging over members) -- _tabfm_quantiles
+               below takes the empirical quantile grid over that ensemble
+               axis, the same idea "tabm" uses below (real per-query
+               disagreement across members), not an invented constant-sigma
+               spread. CPU by default (small fold contexts here, ~20-30
+               rows; not forced like exaone's SDPA constraint below, just
+               untested on GPU).
   - "tabm"   : Yandex Research TabM (pip `tabm`) -- NOT a pretrained
                foundation model (no downloadable weights, see its own
                README); trained from scratch on each fold's context with a
@@ -38,13 +62,14 @@ Registered backends:
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import numpy as np
 
 __all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
 
-BACKEND_NAMES = ["tabicl", "tabpfn", "exaone", "tabm"]
+BACKEND_NAMES = ["tabicl", "tabpfn", "exaone", "tabfm", "tabm"]
 
 
 # ---------------------------------------------------------------------------
@@ -66,17 +91,39 @@ def make_regressor(name: str, device: "str | None" = None):
     if name == "exaone":
         from exaonetabular import EXAONETabularRegressor
 
-        # Always CPU, regardless of the requested device: exaonetabular's own
-        # attention.py hardcodes a single SDPA backend per call (flash or
-        # mem-efficient, chosen by _select_sdpa_backend) with NO math
-        # fallback -- on GPUs below sm80 (e.g. an older Titan RTX/sm75 node
-        # this shared cluster can reassign a job to mid-run) neither kernel
-        # is available and F.scaled_dot_product_attention raises "No
-        # available kernel" outright. Off-CUDA, _select_sdpa_backend always
-        # returns FLASH_ATTENTION, which PyTorch's CPU build always has, so
-        # CPU is the only device this library is guaranteed to run on
-        # everywhere -- and fine here since fold contexts are ~20-30 rows.
-        return EXAONETabularRegressor.from_pretrained(device="cpu")
+        # exaonetabular's own attention.py hardcodes a single SDPA backend
+        # per call (flash or mem-efficient, chosen by _select_sdpa_backend)
+        # with NO math fallback -- on a CUDA device below sm80 (e.g. an
+        # older Titan RTX/sm75 node this shared cluster can reassign a job
+        # to mid-run) neither kernel is available and
+        # F.scaled_dot_product_attention raises "No available kernel"
+        # outright. Measured on an actual sm86 GPU (RTX A5000): CUDA is
+        # ~120x faster than CPU (1.8s vs 219s for one fit+predict call, tiny
+        # ~30-row context) -- CPU-only was leaving two orders of magnitude
+        # on the table, not a conservative-but-harmless default. Falls back
+        # to CPU (PyTorch's CPU build always has FLASH_ATTENTION available,
+        # see _select_sdpa_backend) only when CUDA is unavailable or the
+        # actual device is below sm80.
+        import torch
+
+        use_cuda = (
+            (device or "").startswith("cuda")
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(device)[0] >= 8
+        )
+        return EXAONETabularRegressor.from_pretrained(device="cuda" if use_cuda else "cpu")
+    if name == "tabfm":
+        from tabfm import TabFMRegressor, tabfm_v1_0_0_pytorch as tabfm_v1_0_0
+
+        # tabfm_v1_0_0.load's own `device` kwarg defaults to "cpu" (see its
+        # docstring); no sm80 constraint here like exaone above (a plain
+        # torch.nn.Module forward, no hardcoded SDPA backend selection), so
+        # just pass the requested device straight through when CUDA is
+        # actually available.
+        import torch
+
+        load_device = device if (device and torch.cuda.is_available()) else "cpu"
+        return TabFMRegressor(model=tabfm_v1_0_0.load(model_type="regression", device=load_device))
     if name == "tabm":
         return None
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
@@ -111,50 +158,111 @@ def quantiles(
         return np.asarray(out).T  # (n_quantiles, n_query) -> (n_query, n_quantiles)
     if name == "exaone":
         return _exaone_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
+    if name == "tabfm":
+        return _tabfm_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
     if name == "tabm":
         return _tabm_quantiles(X_context, y_context, X_query, probs, seed=seed)
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
 
 
+@contextlib.contextmanager
+def _exaone_capture_quantile_bank():
+    """Temporarily disables EXAONETabularRegressor._collapse_members'
+    reduction to a single point estimate, so .predict() returns the full
+    (n_query, quantile_count) bank instead of one number per row.
+
+    This is the only place regressor.py throws the model's real
+    (ensemble_count, n_query, quantile_count) forward output away in favor
+    of a single trimmed-mean/median scalar per row (see its docstring) --
+    every other real step .fit()/.predict() run (preprocessing, SVD/ensemble
+    passes, de-standardization, member weighting) is left exactly as
+    production runs it; only that one reduction is skipped, replaced by a
+    per-member sort (guards tau-crossing, same as the real "trimmed" branch)
+    so the bank stays a valid quantile function per member before
+    .predict()'s own member-averaging combines them.
+
+    NOT valid when EXAONE's NNLS member-weighting is active: predict()'s
+    weighted-combine step assumes a 2D (members, rows) tensor and would
+    silently mis-broadcast against the 3D (members, rows, quantiles) bank
+    this produces instead. Guarded by a RuntimeError in _exaone_quantiles
+    below rather than raised here, since it only matters above
+    nnls_min_validation_rows=2000 support rows -- never true for the small
+    (~20-30 row) K-fold contexts this pipeline uses.
+    """
+    import torch
+    from exaonetabular.regressor import EXAONETabularRegressor
+
+    original = EXAONETabularRegressor._collapse_members
+
+    def _passthrough(self, output, query_count):
+        expected = (self.manifest.runtime.ensemble_count, query_count, self.manifest.output_width)
+        if not isinstance(output, torch.Tensor) or tuple(output.shape) != expected or not bool(torch.isfinite(output).all()):
+            raise RuntimeError("model returned invalid regression quantiles")
+        return torch.sort(output.float(), dim=-1).values
+
+    EXAONETabularRegressor._collapse_members = _passthrough
+    try:
+        yield
+    finally:
+        EXAONETabularRegressor._collapse_members = original
+
+
 def _exaone_quantiles(
     regressor, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray,
-    probs: np.ndarray, *, seed: int, calib_frac: float = 0.3, min_calib: int = 3,
+    probs: np.ndarray, *, seed: int,
 ) -> np.ndarray:
-    """Homoscedastic split-conformal quantile grid: EXAONETabularRegressor
-    exposes .predict() as a point estimate only (no quantile/distribution
-    API, confirmed against exaonetabular 1.0.0's public surface), so
-    uncertainty has to come from held-out residuals instead. Splits off a
-    calibration slice of the context, fits on the remainder, and uses the
-    calibration residuals' std as one constant sigma for every X_query point
-    in this fold -- a real approximation (no heteroscedasticity across
-    X_query), acceptable here because the point of this comparison is
-    exposing exactly this kind of backend-specific quality gap, not hiding
-    it behind a more sophisticated calibration scheme.
+    """EXAONETabularRegressor's REAL native quantile grid (999 evenly spaced
+    levels, fixed by the released checkpoint -- not the caller's `probs`),
+    recovered via _exaone_capture_quantile_bank above and linearly
+    interpolated onto whatever `probs` the caller asked for. `seed` is
+    unused (EXAONE's forward pass is deterministic given its fitted state,
+    unlike tabm's from-scratch training loop below) but kept for a uniform
+    call signature across every backend's quantiles() dispatch.
     """
-    from scipy.stats import norm
+    regressor.fit(X_context, y_context)
+    if regressor._fitted_state.get("member_weights") is not None:
+        raise RuntimeError(
+            "EXAONE NNLS member-weighting is active; native quantile capture "
+            "assumes uniform member averaging (see _exaone_capture_quantile_bank)."
+        )
+    quantile_count = regressor.manifest.regression.quantile_count
+    native_probs = np.linspace(1.0 / (quantile_count + 1), quantile_count / (quantile_count + 1), quantile_count)
+    with _exaone_capture_quantile_bank():
+        bank = np.asarray(regressor.predict(X_query))  # (n_query, quantile_count), raw y-units
 
-    rng = np.random.default_rng(seed)
-    n = len(y_context)
-    n_calib = max(min_calib, int(round(calib_frac * n)))
-    n_calib = min(n_calib, n - 1) if n > 1 else 0
+    out = np.empty((bank.shape[0], len(probs)))
+    for i in range(bank.shape[0]):
+        out[i] = np.interp(probs, native_probs, bank[i])
+    return out
 
-    if n_calib == 0:
-        regressor.fit(X_context, y_context)
-        mu = np.asarray(regressor.predict(X_query))
-        sigma = max(float(y_context.std()), 1e-6)
-    else:
-        perm = rng.permutation(n)
-        calib_idx, fit_idx = perm[:n_calib], perm[n_calib:]
-        regressor.fit(X_context[fit_idx], y_context[fit_idx])
-        calib_pred = np.asarray(regressor.predict(X_context[calib_idx]))
-        sigma = max(float((y_context[calib_idx] - calib_pred).std()), 1e-6)
-        # Refit on the full fold context so the query prediction itself
-        # isn't left worse-off than it needs to be by the calibration split.
-        regressor.fit(X_context, y_context)
-        mu = np.asarray(regressor.predict(X_query))
 
-    z = norm.ppf(np.clip(probs, 1e-6, 1.0 - 1e-6))
-    return mu[:, None] + sigma * z[None, :]
+def _tabfm_quantiles(
+    regressor, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray,
+    probs: np.ndarray, *, seed: int,
+) -> np.ndarray:
+    """Empirical quantile grid from TabFMRegressor's own ensemble members
+    (default n_estimators=32), the same idea _tabm_quantiles below uses --
+    NOT split-conformal, because unlike "exaone" there is no per-row quantile
+    function to recover: confirmed against tabfm 1.0.1's own source
+    (classifier_and_regressor.py::_check_regressor_output_dim asserts the
+    model's regression output is a single scalar per row, per member --
+    "produces scalar regression outputs"). What TabFM DOES have is real
+    cross-member disagreement: `_predict_internal` (the same call
+    `.predict()` itself makes, before averaging) exposes each of the 32
+    members' UNAVERAGED point prediction. Each member is inverse-transformed
+    individually (mirroring `_combine_predictions`'s own NNLS branch) before
+    taking the empirical quantile over the member axis -- heteroscedastic
+    across X_query for free, unlike a constant-sigma approximation.
+    `seed` is unused (TabFM's ensemble diversity comes from its own fixed
+    per-member preprocessing views, not a call-time RNG) but kept for a
+    uniform call signature across every backend's quantiles() dispatch.
+    """
+    regressor.fit(X_context, y_context)
+    member_preds_scaled = np.asarray(regressor._predict_internal(X_query))  # (n_estimators, n_query), scaled
+    member_preds = np.stack(
+        [regressor._inverse_transform_y(row) for row in member_preds_scaled], axis=0
+    )  # (n_estimators, n_query), raw y-units
+    return np.quantile(member_preds, probs, axis=0).T  # (n_query, Q)
 
 
 def _tabm_quantiles(
