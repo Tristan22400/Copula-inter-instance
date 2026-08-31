@@ -3524,23 +3524,50 @@ def _generate_gp_batch_raw(
     else:
         apply_tabicl = tabicl_model is not None
 
-    if marginal_backend not in (None, "tabicl"):
-        # Generic per-episode K-fold PIT for any eval/spatial/marginal_backends
-        # entry other than "tabicl" (currently "exaone"/"tabpfn", see
-        # data.z_train_source in conf/data/gp_tasks.yaml). Unlike
-        # run_pit_batched below, none of these backends' public APIs expose a
-        # single B*d-batched GPU forward -- they're per-task sklearn-style
-        # fit()/predict() calls (see marginal_backends.py's module docstring),
-        # so this is a Python loop over the B episodes in THIS call, each
-        # costing (k_folds+1) fit/predict calls, in place of tabicl_model's
-        # one batched forward. Reuses debug/stages/s7b_backend_train.py's
-        # validated _generic_pit_episode recipe (loo_pit for z_train,
-        # quantiles+compute_pit for z_test/log_pdf_test), inlined here so
-        # every generate_gp_batch caller (not just that debug comparison
-        # trainer) can reach it via data.z_train_source. Orders of magnitude
-        # slower per episode than the tabicl branch below -- see
-        # live_dataset.py's LiveGPDataset docstring for measured numbers
-        # before using this for a full-scale run.
+    if marginal_backend in ("exaone", "tabpfn"):
+        # Genuine multi-episode BATCHED PIT -- the whole B-episode call
+        # becomes (k_folds+1) fused forwards total, not B*(k_folds+1)
+        # separate ones (see eval/spatial/exaone_batched.py /
+        # tabpfn_batched.py's module docstrings for how each backend exposes
+        # a batchable forward, and how this was verified equivalent to the
+        # per-episode fallback below). y_train/y_test are z-scored per
+        # episode first, same reasoning as the tabicl branch below.
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_s = ((y_train - y_mean) / y_std).detach().cpu().numpy()
+        y_test_s = ((y_test - y_mean) / y_std).detach().cpu().numpy()
+        x_train_np = x_norm_train.detach().cpu().numpy()
+        x_test_np = x_norm_test.detach().cpu().numpy()
+        base_seed = int(getattr(cfg, "seed", None) or 0)
+        if marginal_backend == "exaone":
+            from eval.spatial.exaone_batched import exaone_run_pit_batched as _run_batched
+        else:
+            from eval.spatial.tabpfn_batched import tabpfn_run_pit_batched as _run_batched
+        out = _run_batched(
+            marginal_regressor, x_train_np, y_train_s, x_test_np, y_test_s,
+            k_folds=tabicl_k_folds, probs_n=marginal_probs_n, seed=base_seed,
+        )
+        z_train = torch.from_numpy(out["z_train"]).to(device=device)
+        z_test = torch.from_numpy(out["z_test"]).to(device=device)
+        # Jacobian correction back to raw-y-space nats, same convention as
+        # the tabicl branch below.
+        log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
+    elif marginal_backend not in (None, "tabicl"):
+        # Generic per-episode K-fold PIT fallback for any
+        # eval/spatial/marginal_backends entry with no dedicated batched
+        # module above (currently "tabfm"/"tabm" -- neither exposes a
+        # batchable multi-dataset forward the way exaone/tabpfn do, see
+        # their marginal_backends.py docstrings). Unlike the batched branch
+        # above, this is a Python loop over the B episodes in THIS call,
+        # each costing (k_folds+1) fit/predict calls. Reuses
+        # debug/stages/s7b_backend_train.py's validated _generic_pit_episode
+        # recipe (loo_pit for z_train, quantiles+compute_pit for
+        # z_test/log_pdf_test), inlined here so every generate_gp_batch
+        # caller (not just that debug comparison trainer) can reach it via
+        # data.z_train_source. Orders of magnitude slower per episode than
+        # either batched branch -- see live_dataset.py's LiveGPDataset
+        # docstring for measured numbers before using this for a full-scale
+        # run.
         from eval.metrics.joint_nll import compute_pit
         from eval.spatial.marginal_backends import loo_pit as _backend_loo_pit
         from eval.spatial.marginal_backends import quantiles as _backend_quantiles
