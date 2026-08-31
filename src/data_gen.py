@@ -2999,6 +2999,9 @@ def _generate_gp_batch_raw(
     tabicl_split_calib_frac: float = 0.0,
     kernel_weights: Optional[Tensor] = None,
     tabicl_mix_weights: Optional[Tensor] = None,
+    marginal_backend: Optional[str] = None,
+    marginal_regressor=None,
+    marginal_probs_n: int = 99,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in a single vectorised call — the
     "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
@@ -3102,6 +3105,22 @@ def _generate_gp_batch_raw(
             unconditionally substituting tabicl_model's PIT whenever it's
             given. None (default) preserves the legacy always-on behavior of
             tabicl_model/tabicl_split_calib_frac above exactly.
+        marginal_backend: if given (and not "tabicl"), overrides z_train
+            AND z_test/log_pdf_test using eval/spatial/marginal_backends.py's
+            generic {loo_pit, quantiles} contract instead of tabicl_model's
+            batched pit.py path -- currently "exaone"/"tabpfn" (see
+            data.z_train_source in conf/data/gp_tasks.yaml). Mutually
+            exclusive with tabicl_model/tabicl_split_calib_frac (callers set
+            at most one of the two override mechanisms). None (default)
+            preserves the exact analytic pipeline.
+        marginal_regressor: the backend's fitted-per-call regressor object
+            (eval/spatial/marginal_backends.py::make_regressor(marginal_backend,
+            device=...)), reused across every episode/fold in this call —
+            ignored unless marginal_backend is given.
+        marginal_probs_n: quantile grid size for marginal_backend's PIT
+            (ignored for "tabicl"/None, which always use TabICL's own native
+            999-level grid). Default 99 matches
+            debug/stages/s7b_backend_train.py's DEFAULT_PROBS_N.
 
     Returns:
         list of B episode dicts ready for torch.save.
@@ -3505,7 +3524,59 @@ def _generate_gp_batch_raw(
     else:
         apply_tabicl = tabicl_model is not None
 
-    if apply_tabicl and tabicl_split_calib_frac > 0:
+    if marginal_backend not in (None, "tabicl"):
+        # Generic per-episode K-fold PIT for any eval/spatial/marginal_backends
+        # entry other than "tabicl" (currently "exaone"/"tabpfn", see
+        # data.z_train_source in conf/data/gp_tasks.yaml). Unlike
+        # run_pit_batched below, none of these backends' public APIs expose a
+        # single B*d-batched GPU forward -- they're per-task sklearn-style
+        # fit()/predict() calls (see marginal_backends.py's module docstring),
+        # so this is a Python loop over the B episodes in THIS call, each
+        # costing (k_folds+1) fit/predict calls, in place of tabicl_model's
+        # one batched forward. Reuses debug/stages/s7b_backend_train.py's
+        # validated _generic_pit_episode recipe (loo_pit for z_train,
+        # quantiles+compute_pit for z_test/log_pdf_test), inlined here so
+        # every generate_gp_batch caller (not just that debug comparison
+        # trainer) can reach it via data.z_train_source. Orders of magnitude
+        # slower per episode than the tabicl branch below -- see
+        # live_dataset.py's LiveGPDataset docstring for measured numbers
+        # before using this for a full-scale run.
+        from eval.metrics.joint_nll import compute_pit
+        from eval.spatial.marginal_backends import loo_pit as _backend_loo_pit
+        from eval.spatial.marginal_backends import quantiles as _backend_quantiles
+
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        probs = np.linspace(
+            1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
+        )
+        base_seed = int(getattr(cfg, "seed", None) or 0)
+        z_train_np = np.empty((B, P), dtype=np.float32)
+        z_test_np = np.empty((B, N), dtype=np.float32)
+        log_pdf_np = np.empty((B, N), dtype=np.float32)
+        for b in range(B):
+            xc = x_norm_train[b].detach().cpu().numpy()
+            xq = x_norm_test[b].detach().cpu().numpy()
+            y_std_b = float(y_std[b])
+            yc = ((y_train[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
+            yq = ((y_test[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
+            seed_b = (base_seed + b) % (2**31)
+            z_train_np[b] = _backend_loo_pit(
+                marginal_backend, marginal_regressor, xc, yc, probs,
+                k_folds=tabicl_k_folds, seed=seed_b,
+            )
+            q_test = _backend_quantiles(
+                marginal_backend, marginal_regressor, xc, yc, xq, probs, seed=seed_b
+            )
+            z_test_b, log_pdf_b = compute_pit(q_test, probs, yq)
+            z_test_np[b] = z_test_b
+            # Jacobian correction back to raw-y-space nats, same convention as
+            # the tabicl branch below.
+            log_pdf_np[b] = log_pdf_b - math.log(y_std_b)
+        z_train = torch.from_numpy(z_train_np).to(device=device)
+        z_test = torch.from_numpy(z_test_np).to(device=device)
+        log_pdf_test = torch.from_numpy(log_pdf_np).to(device=device)
+    elif apply_tabicl and tabicl_split_calib_frac > 0:
         # "tabicl_split": one forward pass, x_norm_calib/y_calib (P_C points,
         # never part of the official P-point train set) as TabICL's context
         # -- see pit.py::run_pit_calib_split_batched's docstring. Scaled with
@@ -3709,6 +3780,9 @@ def generate_gp_batch(
     d_override: Optional[int] = None,
     kernel_weights: Optional[Tensor] = None,
     tabicl_mix_weights: Optional[Tensor] = None,
+    marginal_backend: Optional[str] = None,
+    marginal_regressor=None,
+    marginal_probs_n: int = 99,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, discarding and regenerating any that
     turn out degenerate (see _generate_gp_batch_raw's `discard` — an
@@ -3752,6 +3826,8 @@ def generate_gp_batch(
         tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
         tabicl_split_calib_frac=tabicl_split_calib_frac,
         kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
+        marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
+        marginal_probs_n=marginal_probs_n,
     )
     # Pin every top-up round to the first round's d_features (or the
     # caller-supplied d_override, if the first round came up empty). Top-up
@@ -3781,6 +3857,8 @@ def generate_gp_batch(
             tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
             tabicl_split_calib_frac=tabicl_split_calib_frac,
             kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
+            marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
+            marginal_probs_n=marginal_probs_n,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])

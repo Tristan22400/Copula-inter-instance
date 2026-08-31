@@ -198,6 +198,18 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     instead of silently starving them. It only caps future growth -- it does
     not reclaim memory already reserved -- so this must run before any
     training-loop allocation happens.
+
+    KNOWN GAP: data.z_train_source=exaone/tabpfn (live_dataset.py's
+    _GENERIC_MARGINAL_BACKENDS) can ALSO run their per-worker regressor on
+    CUDA (see build_live_train_loader's marginal_device), which holds its
+    own CUDA context exactly like a tabicl worker does -- but this function
+    only guards tabicl_live_enabled, so no memory-fraction cap is applied for
+    that case. Not yet a problem in practice at the small default worker
+    count (training.live_marginal_num_workers=2, see conf/config.yaml) and
+    these backends' modest per-call footprint, but the same starvation this
+    function exists to prevent could in principle recur there under a larger
+    worker count -- generalize this guard before raising
+    live_marginal_num_workers substantially.
     """
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
     _validate_z_train_source(z_train_source)
