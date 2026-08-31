@@ -20,15 +20,14 @@ data_gen.py's per-call P/N/feature-count homogeneity (generate_gp_batch's
 module docstring), the same assumption pit.py::run_pit_batched already
 relies on for TabICL.
 
-NOT execution-verified in this repo's own environment: TabPFN v3 is gated
-behind a one-time PriorLabs license acceptance + TABPFN_TOKEN env var (see
-marginal_backends.py::_require_tabpfn_token), which was not set when this
-module was written -- unlike exaone_batched.py (verified bit-identical to
-the per-episode path on CPU, see tests/test_exaone_batched.py), this module
-has ONLY been checked against predict_batched's own public docstring
-contract, not run end-to-end. Run tests/test_tabpfn_batched.py (skipped
-without TABPFN_TOKEN) once you have a token, before relying on this for a
-real training run.
+Execution-verified: tests/test_tabpfn_batched.py passed end-to-end against a
+real TabPFN v3 API call (TABPFN_TOKEN set), matching the per-episode
+quantiles()/loo_pit() reference to the same tolerances used for
+exaone_batched.py -- no fold-assignment or shape bug surfaced on the first
+real run, unlike exaone_batched.py's internal-API path. Requires a
+PriorLabs-issued TABPFN_TOKEN env var (see
+marginal_backends.py::_require_tabpfn_token); the token itself must never be
+committed to the repo -- export it as a shell/CI secret only.
 """
 
 from __future__ import annotations

@@ -85,6 +85,27 @@ def make_regressor(name: str, device: "str | None" = None):
         return make_tabicl_regressor(device=device)
     if name == "tabpfn":
         _require_tabpfn_token()
+        # tabpfn 8.3.0's own model_loading.load_model() keeps an in-memory
+        # LRU of *built* models (architecture + loaded state dict), keyed by
+        # checkpoint path+identity, but only consults it when
+        # TABPFN_MODEL_CACHE_SIZE > 0 (env-gated, defaults to 0 = off) AND
+        # cache_trainset_representation is False -- true for every fit_mode
+        # we use ("fit_preprocessors", set by predict_batched and by
+        # loo_pit's per-episode path alike). Without this, EVERY .fit() call
+        # rebuilds the whole transformer from scratch (kaiming/uniform-init
+        # ~2500 Linear layers, then immediately overwrites them via
+        # load_state_dict) before running a single forward pass -- profiled
+        # at ~660ms of a ~700ms .fit() call, i.e. the rebuild *is* the cost,
+        # not preprocessing or the model forward. Setting this once (as
+        # setdefault, so an operator's own value always wins) cut measured
+        # batched-PIT throughput from ~5.0s/episode to ~1.0s/episode
+        # (B=16,P=32,N=16,K=5, RTX A5000) -- pure caching, same weights,
+        # bit-for-bit identical predictions, verified against
+        # tests/test_tabpfn_batched.py. Size 2 is headroom, not a
+        # requirement: this process only ever resolves one model_path
+        # ("auto"), and the cache holds a reference to the already-loaded
+        # nn.Module (no extra GPU memory per cache slot), not a copy.
+        os.environ.setdefault("TABPFN_MODEL_CACHE_SIZE", "2")
         from tabpfn import TabPFNRegressor
 
         return TabPFNRegressor(device=device or "cpu")
