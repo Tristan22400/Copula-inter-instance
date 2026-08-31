@@ -2008,7 +2008,6 @@ def main(cfg: DictConfig) -> None:
         print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
         t.aux_mae_weight = 0.0
     if live_generation:
-        _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         # dataset_dir is ignored entirely in this mode (see below) — naming the
         # run after it would be misleading, so summarize cfg.data.* instead.
         # Also fold in ckpt_dir's basename since it's often the only
@@ -2119,6 +2118,20 @@ def main(cfg: DictConfig) -> None:
             train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
             val_loader, val_episodes_by_batch = build_fixed_live_val_batches(cfg, t, device)
             val_episodes_meta = dict(enumerate(val_episodes_by_batch))
+        # Reserve worker headroom only now, after build_fixed_live_val_batches'
+        # own (uncapped-need) marginal-backend forward passes have already run
+        # and freed their temporary model copy (see that function's docstring)
+        # — capping this process's own VRAM fraction any earlier (the previous
+        # location, right at live_generation's top) starved that one-time
+        # setup call itself instead of protecting it: exaone/tabpfn's batched
+        # forward at real (non-toy) P/N easily needs more than half the GPU
+        # for a single call, well past this formula's own 0.5 floor, so the
+        # main process was OOMing on its OWN val-batch construction before a
+        # single worker even existed to protect (see git history for the
+        # observed traceback). No iter(train_loader) call — the only thing
+        # that actually spawns the persistent GPU workers this guards against
+        # — happens before this point in any live_generation branch.
+        _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
         # Kick off the persistent DataLoader workers now rather than waiting
         # until right before the training loop (the old location of this
