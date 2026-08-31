@@ -388,28 +388,39 @@ pit_eps: 1.0e-6
 #
 # "exaone"/"tabpfn": same idea as "tabicl" -- override z_train AND
 # z_test/log_pdf_test with a real (non-oracle) tabular foundation model's own
-# K-fold PIT -- but routed through eval/spatial/marginal_backends.py's
-# generic {loo_pit, quantiles} contract instead of pit.py's TabICL-only
-# batched path (see data_gen.py::_generate_gp_batch_raw's marginal_backend
-# arg). "exaone" recovers LG AI Research EXAONE-Tabular's real native
-# 999-level quantile head (see marginal_backends.py's module docstring for
-# how); "tabpfn" is PriorLabs TabPFN v3 and needs a one-time license
-# acceptance + `TABPFN_TOKEN` env var (see _require_tabpfn_token in that
-# module). SUBSTANTIALLY slower than "tabicl" per episode, NOT comparable
-# despite similar model size: TabICL's speed comes from batching every
-# episode in a shard-generation call into ONE forward pass
-# (run_pit_batched), while exaone/tabpfn only expose a per-task sklearn-style
-# fit()/predict() API -- z_train_tabicl_k_folds+1 separate calls PER EPISODE,
-# looped in Python (data_gen.py's marginal_backend branch), instead of one
-# batched call for the whole group. Measured on an RTX A5000 (sm86): a
-# single exaone fit()+predict() call on a ~30-row context is ~1.8s on CUDA
-# (vs ~219s on CPU -- see eval/spatial/marginal_backends.py::make_regressor's
-# "exaone" branch for the sm80 floor this needs), so a k_folds=5 episode
-# costs ~6 such calls, ~11s -- against TabICL's ~6ms/episode. Pilot with a
-# small batch_size/z_train_tabicl_k_folds/z_train_marginal_probs_n and
-# training.live_marginal_num_workers before scaling up; see
-# src/live_dataset.py's _GENERIC_MARGINAL_BACKENDS for the live-generation
-# worker/device knobs this uses.
+# K-fold PIT -- genuinely BATCHED across every episode in a shard-generation
+# call, same shape of speedup as "tabicl"'s pit.py::run_pit_batched, via
+# eval/spatial/exaone_batched.py / tabpfn_batched.py (see data_gen.py::
+# _generate_gp_batch_raw's marginal_backend arg). "exaone" recovers LG AI
+# Research EXAONE-Tabular's real native 999-level quantile head, fused into
+# ONE forward per k-fold across the whole batch by concatenating every
+# episode's own ensemble-member tensors along EXAONE's own internal batch
+# axis (see exaone_batched.py's module docstring for why this is safe --
+# verified bit-identical to the unbatched per-episode path on CPU,
+# tests/test_exaone_batched.py); "tabpfn" is PriorLabs TabPFN v3 (needs a
+# one-time license acceptance + `TABPFN_TOKEN` env var, see
+# _require_tabpfn_token in marginal_backends.py) and uses its own PUBLIC
+# TabPFNRegressor.predict_batched method for the same fusion, lower-risk
+# than exaone's approach since it needs no internal-API reverse-engineering
+# -- NOT execution-verified in this repo's environment (no TABPFN_TOKEN set
+# when tabpfn_batched.py was written; tests/test_tabpfn_batched.py is
+# skipped without one).
+#
+# Still meaningfully slower than "tabicl" per episode (measured on an RTX
+# A5000: ~740ms/episode for exaone at B=16,P=32,k_folds=5, vs TabICL's
+# ~6ms/episode -- about 6x faster than the old per-episode loop at that
+# scale, but not TabICL-parity), and requires device='cuda' for
+# live-generation (CPU EXAONE is ~120x slower per call, see
+# eval/spatial/marginal_backends.py::make_regressor's "exaone" branch) --
+# training.live_generation with z_train_source=exaone/tabpfn raises if
+# device isn't 'cuda' (live_dataset.py::build_live_train_loader). Any
+# backend eval/spatial/marginal_backends.py registers with no dedicated
+# _batched module (currently "tabfm"/"tabm") falls back to the slow
+# per-episode Python loop instead -- see data_gen.py's marginal_backend
+# branch. Shares training.live_tabicl_num_workers/
+# live_tabicl_group_multiplier with "tabicl" (see conf/config.yaml) -- pilot
+# with a small batch_size/z_train_tabicl_k_folds/z_train_marginal_probs_n
+# before scaling up.
 z_train_source: tabicl
 # Quantile grid size for z_train_source=exaone/tabpfn's PIT (ignored for
 # every other z_train_source, which use their own native grid -- TabICL's is
