@@ -66,7 +66,21 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
 
 
 # data.z_train_source's only recognized values (see conf/data/gp_tasks.yaml).
-_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split")
+# "exaone"/"tabpfn" route through eval/spatial/marginal_backends.py's generic
+# per-episode {loo_pit, quantiles} contract (data_gen.py's marginal_backend
+# override) instead of tabicl_model's batched pit.py path -- see
+# _GENERIC_MARGINAL_BACKENDS and _resolve_generic_marginal_device below for
+# the speed tradeoff this brings.
+_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", "exaone", "tabpfn")
+_GENERIC_MARGINAL_BACKENDS = ("exaone", "tabpfn")
+# Small, deliberately conservative default worker count for the generic
+# marginal-backend live-generation path: unlike _LIVE_TABICL_AUTO_WORKERS_*
+# above, this has NOT been VRAM/throughput-benchmarked per backend (exaone's
+# and tabpfn's per-call memory/compute profile differs from TabICL's and from
+# each other), so auto-sizing from free GPU memory the way TabICL's path does
+# would be an unvalidated guess. Override via
+# training.live_marginal_num_workers once you've measured your own node/model.
+_LIVE_MARGINAL_DEFAULT_NUM_WORKERS = 2
 
 
 def _validate_z_train_source(z_train_source: str) -> None:
@@ -289,6 +303,9 @@ class LiveGPDataset(IterableDataset):
         kernel_weights: Optional[torch.Tensor] = None,
         tabicl_device: Optional[str] = None,
         tabicl_mix_weights: Optional[torch.Tensor] = None,
+        marginal_backend: Optional[str] = None,
+        marginal_device: Optional[str] = None,
+        marginal_probs_n: int = 99,
     ):
         # Deep-copy so mutating .seed per call never touches the caller's cfg
         # (and so pickling this Dataset to worker processes doesn't drag along
@@ -330,6 +347,16 @@ class LiveGPDataset(IterableDataset):
         # None (default) reproduces pre-feature behavior exactly (see
         # _tabicl_mix_prob_for_kernel's docstring in data_gen.py).
         self.tabicl_mix_weights = tabicl_mix_weights
+        # "exaone"/"tabpfn" (see _GENERIC_MARGINAL_BACKENDS): each worker
+        # builds its own eval/spatial/marginal_backends.make_regressor(...)
+        # instance lazily on first __iter__, exactly mirroring tabicl_model's
+        # per-worker-copy pattern above -- same reasoning (a loaded CUDA
+        # model can't cross a process boundary via fork/spawn cheaply, so
+        # each worker pays its own one-time load). None (default) leaves
+        # z_train_source=analytic/tabicl/tabicl_split behavior untouched.
+        self.marginal_backend = marginal_backend
+        self.marginal_device = marginal_device
+        self.marginal_probs_n = marginal_probs_n
 
     def _seed_for(self, worker_id: int, call_idx: int) -> int:
         # Not a cryptographic mix — just enough spread that (worker_id, call_idx)
@@ -399,6 +426,16 @@ class LiveGPDataset(IterableDataset):
             # so this is a net win, not just a requirement.
             gen_device = self.tabicl_device
 
+        marginal_regressor = None
+        if self.marginal_backend is not None:
+            from eval.spatial.marginal_backends import make_regressor
+
+            print(
+                f"[live_dataset] worker {worker_id}: loading {self.marginal_backend} marginal "
+                f"for data.z_train_source={self.marginal_backend} on {self.marginal_device}"
+            )
+            marginal_regressor = make_regressor(self.marginal_backend, device=self.marginal_device)
+
         while True:
             cfg.seed = self._seed_for(worker_id, call_idx)
             call_idx += 1
@@ -407,6 +444,8 @@ class LiveGPDataset(IterableDataset):
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 tabicl_mix_weights=self.tabicl_mix_weights,
+                marginal_backend=self.marginal_backend, marginal_regressor=marginal_regressor,
+                marginal_probs_n=self.marginal_probs_n,
             )
             for ep in episodes:
                 yield ep
@@ -507,6 +546,16 @@ def build_live_train_loader(
     _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
+    # "exaone"/"tabpfn": eval/spatial/marginal_backends.py's generic
+    # per-episode path (data_gen.py's marginal_backend override) -- see
+    # _GENERIC_MARGINAL_BACKENDS' docstring above for why this gets its own,
+    # separately-tuned worker/device handling rather than reusing
+    # tabicl_live_enabled's auto-sizing (calibrated for TabICL's own VRAM
+    # footprint, not these backends'). Mutually exclusive with
+    # tabicl_live_enabled by construction (_VALID_Z_TRAIN_SOURCES is a single
+    # string, and mix_enabled's data.z_train_tabicl_mix_* config is
+    # documented as tabicl-only).
+    generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS
 
     # Dedicated group-size knob for the tabicl GPU-worker path, distinct from
     # live_group_multiplier (which stays analytic-CPU-worker-only, unaffected
@@ -537,6 +586,13 @@ def build_live_train_loader(
             "data.z_train_tabicl_mix_enabled=false for CPU-only runs."
         )
     tabicl_device = device if tabicl_live_enabled else None
+    # eval/spatial/marginal_backends.py::make_regressor resolves its own
+    # CPU/CUDA choice per backend (exaone requires capability>=8 for its
+    # hardcoded SDPA kernel, see that module's docstring) -- passing `device`
+    # straight through here lets it make that call rather than duplicating
+    # the capability check in this module too. Falls back to CPU when this
+    # training run itself isn't on CUDA, same as tabicl_device above.
+    marginal_device = device if generic_marginal_enabled else None
 
     if tabicl_live_enabled:
         # Few, fast GPU workers instead of many, slow CPU ones -- see the
@@ -546,6 +602,17 @@ def build_live_train_loader(
         # total) memory matters on a node where this GPU might be shared
         # with other jobs, and how it adapts across GPU models/VRAM sizes.
         num_workers = resolve_live_tabicl_num_workers(t, device)
+    elif generic_marginal_enabled:
+        # NOT auto-sized like the tabicl path above (no per-backend VRAM/
+        # throughput benchmark exists yet for exaone/tabpfn -- see
+        # _LIVE_MARGINAL_DEFAULT_NUM_WORKERS' docstring). These backends'
+        # per-episode cost (a Python loop of k_folds+1 fit/predict calls,
+        # see data_gen.py's marginal_backend branch) is also 1-2 orders of
+        # magnitude higher than tabicl's single batched forward per call, so
+        # keep this small and let the user raise
+        # training.live_marginal_num_workers deliberately once they've
+        # measured their own node/model/context-size combination.
+        num_workers = int(t.get("live_marginal_num_workers", _LIVE_MARGINAL_DEFAULT_NUM_WORKERS))
     else:
         num_workers = int(t.get("live_num_workers", 8))
         # live_num_workers=16 is tuned for a 44-core node (see conf/config.yaml);
@@ -588,10 +655,20 @@ def build_live_train_loader(
         # gap-measurement pass).
         floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
         tabicl_mix_weights = torch.full((n,), floor_frac, dtype=torch.float32).share_memory_()
+    marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     live_ds = LiveGPDataset(
         cfg, group_size=group_size, kernel_weights=kernel_weights, tabicl_device=tabicl_device,
         tabicl_mix_weights=tabicl_mix_weights,
+        marginal_backend=z_train_source if generic_marginal_enabled else None,
+        marginal_device=marginal_device, marginal_probs_n=marginal_probs_n,
     )
+    # Spawn (not fork) is required for ANY CUDA-resident per-worker model --
+    # not tabicl-specific, see build_live_train_loader's docstring above for
+    # why fork can't be reused across a CUDA context. generic_marginal_enabled
+    # only needs it when marginal_device is actually "cuda"; when this
+    # training run itself isn't on CUDA (marginal_device=="cpu"), the default
+    # fork context is fine, same as the plain analytic path.
+    needs_spawn = tabicl_live_enabled or (generic_marginal_enabled and marginal_device == "cuda")
     loader = DataLoader(
         live_ds,
         batch_size=t.batch_size,
@@ -601,7 +678,7 @@ def build_live_train_loader(
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=_limit_worker_threads if num_workers > 0 else None,
-        multiprocessing_context="spawn" if (tabicl_live_enabled and num_workers > 0) else None,
+        multiprocessing_context="spawn" if (needs_spawn and num_workers > 0) else None,
     )
     return loader, kernel_weights, tabicl_mix_weights
 
@@ -669,6 +746,7 @@ def build_fixed_live_val_batches(
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
     _validate_z_train_source(z_train_source)
     tabicl_live_enabled = z_train_source in ("tabicl", "tabicl_split")
+    generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS
     if tabicl_live_enabled and device != "cuda":
         raise ValueError(
             f"training.live_generation with data.z_train_source={z_train_source} "
@@ -692,6 +770,21 @@ def build_fixed_live_val_batches(
         tabicl_model = load_tabicl(ckpt, device)
         gen_device = device
 
+    # "exaone"/"tabpfn" (see _GENERIC_MARGINAL_BACKENDS): built once here in
+    # the main process, same as tabicl_model above -- this is a bounded
+    # number of calls (n_batches), not the persistent training-stream
+    # workers, so it needs none of build_live_train_loader's spawn/worker-
+    # count handling. gen_device stays "cpu" (GP synthesis itself never runs
+    # on the regressor's device, see LiveGPDataset.__iter__'s equivalent
+    # branch); only marginal_regressor's own forward pass uses marginal_device.
+    marginal_regressor = None
+    marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
+    if generic_marginal_enabled:
+        from eval.spatial.marginal_backends import make_regressor
+
+        print(f"[live_dataset] Loading {z_train_source} marginal for fixed val batches on {device}")
+        marginal_regressor = make_regressor(z_train_source, device=device)
+
     batches = []
     episodes_by_batch: List[List[dict]] = []
     with warnings.catch_warnings(), limited_main_process_threads():
@@ -708,6 +801,8 @@ def build_fixed_live_val_batches(
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 return_kernel_metadata=True,
+                marginal_backend=z_train_source if generic_marginal_enabled else None,
+                marginal_regressor=marginal_regressor, marginal_probs_n=marginal_probs_n,
             )
             if gen_device == "cuda":
                 for ep in episodes:
@@ -716,8 +811,8 @@ def build_fixed_live_val_batches(
             batches.append(collate_fn(episodes))
             episodes_by_batch.append(episodes)
 
-    if tabicl_model is not None:
-        del tabicl_model
+    if tabicl_model is not None or marginal_regressor is not None:
+        del tabicl_model, marginal_regressor
         if device == "cuda":
             import gc
             gc.collect()

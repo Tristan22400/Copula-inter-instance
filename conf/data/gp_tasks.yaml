@@ -385,7 +385,39 @@ pit_eps: 1.0e-6
 # generation batch instead of one closed-form Cholesky; "tabicl_split": 1
 # forward pass, but over a larger context) -- pilot on a small n_tasks before
 # scaling a production run up.
+#
+# "exaone"/"tabpfn": same idea as "tabicl" -- override z_train AND
+# z_test/log_pdf_test with a real (non-oracle) tabular foundation model's own
+# K-fold PIT -- but routed through eval/spatial/marginal_backends.py's
+# generic {loo_pit, quantiles} contract instead of pit.py's TabICL-only
+# batched path (see data_gen.py::_generate_gp_batch_raw's marginal_backend
+# arg). "exaone" recovers LG AI Research EXAONE-Tabular's real native
+# 999-level quantile head (see marginal_backends.py's module docstring for
+# how); "tabpfn" is PriorLabs TabPFN v3 and needs a one-time license
+# acceptance + `TABPFN_TOKEN` env var (see _require_tabpfn_token in that
+# module). SUBSTANTIALLY slower than "tabicl" per episode, NOT comparable
+# despite similar model size: TabICL's speed comes from batching every
+# episode in a shard-generation call into ONE forward pass
+# (run_pit_batched), while exaone/tabpfn only expose a per-task sklearn-style
+# fit()/predict() API -- z_train_tabicl_k_folds+1 separate calls PER EPISODE,
+# looped in Python (data_gen.py's marginal_backend branch), instead of one
+# batched call for the whole group. Measured on an RTX A5000 (sm86): a
+# single exaone fit()+predict() call on a ~30-row context is ~1.8s on CUDA
+# (vs ~219s on CPU -- see eval/spatial/marginal_backends.py::make_regressor's
+# "exaone" branch for the sm80 floor this needs), so a k_folds=5 episode
+# costs ~6 such calls, ~11s -- against TabICL's ~6ms/episode. Pilot with a
+# small batch_size/z_train_tabicl_k_folds/z_train_marginal_probs_n and
+# training.live_marginal_num_workers before scaling up; see
+# src/live_dataset.py's _GENERIC_MARGINAL_BACKENDS for the live-generation
+# worker/device knobs this uses.
 z_train_source: tabicl
+# Quantile grid size for z_train_source=exaone/tabpfn's PIT (ignored for
+# every other z_train_source, which use their own native grid -- TabICL's is
+# always 999-level). Default 99 matches
+# debug/stages/s7b_backend_train.py's DEFAULT_PROBS_N; raise for closer
+# density estimates at the cost of one interp/finite-difference pass per
+# extra probs point.
+z_train_marginal_probs_n: 99
 # K-fold count for z_train_source=tabicl's run_pit_batched call (same
 # semantics/default as pit.py::DEFAULT_K_FOLDS). Ignored unless
 # z_train_source=tabicl. Clamped into [2, P] by run_pit_batched regardless

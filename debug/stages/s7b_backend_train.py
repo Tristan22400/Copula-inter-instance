@@ -6,19 +6,17 @@ different marginal backends from scratch, to see whether the plateau is
 specific to TabICL's own PIT or shows up with any real (non-oracle)
 marginal.
 
-Scoped as a debug-local comparison trainer, not a src/data_gen.py
-production knob: TabPFN's API is per-task sklearn fit/predict (K-fold PIT
-means K separate .fit()+.predict() calls per episode, see
-eval/spatial/marginal_backends.py::quantiles), not a single batched GPU
-forward like TabICL's -- wiring that into the production live-generation
-path (train.py, live_dataset.py, era5_live_dataset.py, generate_pit_dataset.py
-all call generate_gp_batch) would need a much larger refactor across every
-caller for a backend that's fundamentally 10-100x slower per episode. This
-stage instead runs a smaller, reduced-scale comparison good enough to read
-gap TRAJECTORIES off, not to produce a checkpoint worth shipping. If the
-comparison looks informative, promoting "tabicl"/"tabpfn" to a real
-data.marginal_backend config knob (mirroring cfg.data.z_train_source) is
-the natural next step -- deliberately not done here.
+Originally scoped as a debug-local comparison trainer rather than a
+src/data_gen.py production knob, since TabPFN/EXAONE's API is per-task
+sklearn fit/predict (K-fold PIT means K separate .fit()+.predict() calls per
+episode, see eval/spatial/marginal_backends.py::quantiles), not a single
+batched GPU forward like TabICL's. That promotion has since happened:
+cfg.data.z_train_source now accepts "exaone"/"tabpfn" directly in
+src/train.py/live_dataset.py/data_gen.py (see data_gen.py::
+_generate_gp_batch_raw's marginal_backend arg and conf/data/gp_tasks.yaml),
+10-100x slower per episode and all -- this stage remains useful as a
+smaller, reduced-scale, single-process comparison good enough to read gap
+TRAJECTORIES off quickly, without needing a DataLoader/worker-pool spun up.
 
 Both backends' models start from the SAME initialization (torch.manual_seed
 reset before each build_copula_transformer call) for a fair comparison. The
