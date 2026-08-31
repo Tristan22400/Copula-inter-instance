@@ -179,6 +179,20 @@ training:
   # in-training data-wait time from ~85ms/step average, spiking to 170ms, down
   # to ~1ms/step average on an idle RTX 6000 Ada at z_train_tabicl_k_folds=2).
   live_tabicl_group_multiplier: 2
+  # Worker count for data.z_train_source=exaone/tabpfn's live-generation path
+  # (src/live_dataset.py's _GENERIC_MARGINAL_BACKENDS) -- ignored for every
+  # other z_train_source. NOT auto-sized from free VRAM like
+  # live_tabicl_num_workers above: exaone/tabpfn haven't been VRAM/throughput-
+  # benchmarked per node/model the way TabICL was, so this stays a small,
+  # explicit default (2) rather than an unvalidated formula. Each worker
+  # holds its own eval/spatial/marginal_backends.make_regressor(...) instance
+  # and, unlike the tabicl path, pays a per-episode cost that's 1-2 orders of
+  # magnitude higher (a Python loop of z_train_tabicl_k_folds+1 fit/predict
+  # calls instead of one batched forward -- see data.z_train_source's
+  # docstring in conf/data/gp_tasks.yaml for measured numbers). Raise only
+  # after measuring your own node's throughput/VRAM at the batch_size/
+  # z_train_tabicl_k_folds you actually plan to train with.
+  live_marginal_num_workers: 2
   live_val_seed: 20260723  # fixed seed for the validation set (independent of the training seed stream)
   # For sharded datasets: shuffle within blocks of this many shards at a time
   # (all shuffled together, IO-cache resident) instead of one global shuffle
