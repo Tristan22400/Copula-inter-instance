@@ -149,7 +149,23 @@ def make_regressor(name: str, device: "str | None" = None):
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability(device)[0] >= 8
         )
-        return EXAONETabularRegressor.from_pretrained(device="cuda" if use_cuda else "cpu")
+        # ensemble_count=1: the exact same "diversity nobody reads" case as
+        # TabPFN's n_estimators=1 above. from_pretrained's default manifest
+        # pins runtime.ensemble_count=8 -- predict() runs 8 member views of
+        # the SAME fitted dataset through the model and mean-pools them
+        # (exaone_batched.py's own docstring/_quantile_bank_batched: "the
+        # same pooling predict() does when member_weights is None"), for a
+        # spread this pipeline never reads (a single pooled quantile bank,
+        # same as tabpfn's case). ensemble_count is a real override kwarg
+        # (see EXAONETabularClassifier.from_pretrained's docstring: "...
+        # override the matching runtime knobs"), and exaone_batched.py reads
+        # manifest.runtime.ensemble_count dynamically for both its
+        # EnsemblePlan construction and its expected-shape check, so this
+        # needs no shape-side change. Cuts the forward/preprocessing cost
+        # (fit() ensemble expansion + _forward_chunked) by ~8x.
+        return EXAONETabularRegressor.from_pretrained(
+            device="cuda" if use_cuda else "cpu", ensemble_count=1
+        )
     if name == "tabfm":
         from tabfm import TabFMRegressor, tabfm_v1_0_0_pytorch as tabfm_v1_0_0
 
