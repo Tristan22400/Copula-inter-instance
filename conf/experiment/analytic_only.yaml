@@ -59,6 +59,13 @@ baselines:
   # (baselines.synth_seed), so it is low-variance across steps but is only as
   # representative of each kernel family as its sample size. 64 is tuned for a
   # cheap default; a long run generalizing from the curriculum wants more.
-  # Affordable here because validate() now caches gp_analytical_posterior's
-  # ceiling per probe episode instead of recomputing it every val_every.
+  #
+  # Affordable only because validate() now reads a cached
+  # gp_analytical_posterior ceiling per probe episode instead of recomputing
+  # it every val_every -- without that, 256 episodes x 8 families of O(N^3)
+  # float64 eigendecomposition PER VALIDATION would dominate the run entirely.
+  # The cost is now a one-time ~5-6 min startup at these probe sizes
+  # (probe_N up to 1024), measured on a CPU builder: negligible for a
+  # multi-day run, but drop this back toward 64 for short debug runs where
+  # startup is the thing you're trying to avoid.
   synth_n_episodes: 256
