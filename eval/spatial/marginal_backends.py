@@ -108,7 +108,24 @@ def make_regressor(name: str, device: "str | None" = None):
         os.environ.setdefault("TABPFN_MODEL_CACHE_SIZE", "2")
         from tabpfn import TabPFNRegressor
 
-        return TabPFNRegressor(device=device or "cpu")
+        # n_estimators=1: explicit, not "auto". TabPFN's ensemble diversity
+        # (default n_estimators="auto" -> DEFAULT_N_ESTIMATORS, further
+        # raised by scale_n_estimators_for_feature_coverage) comes from
+        # running several independently-preprocessed "views" of the same
+        # context (feature-index rotation, per-member power-transform/
+        # outlier-removal variants) and averaging their predictions --
+        # useful for point-prediction accuracy, but for this repo's
+        # marginal-quantile role it multiplies both the preprocessing cost
+        # (a full sklearn Pipeline.fit_transform per member, see
+        # tabpfn_batched.py's docstring) and the model forward cost by
+        # n_estimators, for a diversity benefit this pipeline doesn't use
+        # (quantiles() below reads a single quantile grid, not an ensemble
+        # spread). Fixing n_estimators=1 removes that multiplier outright
+        # -- a direct, uncapped lever on top of the model-rebuild-cache fix
+        # above -- with no batching-shape change (predict_batched's
+        # (ensemble_count, n_query, quantile_count) output collapses to
+        # ensemble_count=1).
+        return TabPFNRegressor(device=device or "cpu", n_estimators=1)
     if name == "exaone":
         from exaonetabular import EXAONETabularRegressor
 
