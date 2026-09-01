@@ -22,11 +22,18 @@ of the fixed 500-episode one. First step happens in seconds, most of that
 being CUDA context init + (if data.z_train_source=tabicl, the default) one
 frozen-TabICL load.
 
-The debug val set's z_test always comes from real TabICL K-fold PIT,
-unconditionally, regardless of what data.z_train_source/z_train_tabicl_mix_*
-the TRAINING steps use (matches eval_checkpoint.py's own default of scoring
-against the real deployment signal) -- so it needs a resolvable TabICL
-checkpoint even when training itself is pure data.z_train_source=analytic.
+The debug val set's z_test comes from real TabICL K-fold PIT by default,
+regardless of what data.z_train_source/z_train_tabicl_mix_* the TRAINING steps
+use (matches eval_checkpoint.py's own default of scoring against the real
+deployment signal) -- so it needs a resolvable TabICL checkpoint even when
+training itself is pure data.z_train_source=analytic. Pass
+`+experiment=analytic_only` to score against the EXACT analytic GP marginal
+instead: no TabICL is loaded at all, and no checkpoint is required.
+
+The val line reports the gap on the TOTAL NLL, not the copula term alone --
+the model's copula term and the oracle's are Sklar-split under different
+marginals (prior vs. posterior sigma), so only the totals are comparable.
+See _build_debug_val_batch's docstring.
 
 Not a replacement for train.py — no wandb logging, no baselines/era5
 validation metrics. Checkpointing (training.ckpt_dir/training.resume_ckpt)
@@ -39,7 +46,8 @@ Usage (same Hydra override syntax as train.py):
     python scripts/train_fast.py
     python scripts/train_fast.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
     python scripts/train_fast.py model=copula_nano training.steps=200
-    python scripts/train_fast.py data.z_train_source=analytic   # train on the analytic oracle -- val z_test still always uses real TabICL
+    python scripts/train_fast.py data.z_train_source=analytic   # train on the analytic oracle -- val z_test still uses real TabICL
+    python scripts/train_fast.py +experiment=analytic_only      # analytic on BOTH sides; loads no TabICL, needs no checkpoint
     python scripts/train_fast.py training.batch_size=8 data.N_max=64  # shrink episodes for an even faster loop
     # Alternate per-episode between the analytic z_train and real-TabICL PIT
     # z_train at a fixed 50/50 rate (every kernel family, no adaptive gap
@@ -80,7 +88,8 @@ from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
 from model import build_copula_transformer
 from muon import Muon
-from pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
+from live_dataset import validate_analytic_only
+from pit import episode_posterior_ceiling, load_tabicl, resolve_pit_ckpt
 from train import (
     _forward_and_loss,
     _run_train_step,
@@ -109,13 +118,21 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
     live-generation validation set (see live_dataset.py::
     build_fixed_live_val_batches) -- NOT an independent sample.
 
-    `tabicl_model` here is ALWAYS applied unconditionally (this function
-    never receives a tabicl_mix_weights -- see the call site in main(),
-    which passes a val-only TabICL load decoupled from whatever
+    `tabicl_model` here is applied unconditionally when it is not None (this
+    function never receives a tabicl_mix_weights -- see the call site in
+    main(), which passes a val-only TabICL load decoupled from whatever
     data.z_train_source/z_train_tabicl_mix_* the training loop itself uses).
-    So z_test (and hence z_train) in every val batch comes from real TabICL
-    K-fold PIT, always -- scoring against the same approximate marginal real
-    deployment data would produce, regardless of what the model trained on.
+    So by default z_test (and hence z_train) in every val batch comes from
+    real TabICL K-fold PIT, regardless of what the model trained on --
+    scoring against the same approximate marginal real deployment data would
+    produce.
+
+    Under training.val_analytic_only (e.g. `+experiment=analytic_only`) main()
+    passes tabicl_model=None instead, and the val batches are generated with
+    the exact analytic GP-LOO residual and exact Gaussian log-density. That is
+    the whole point of that mode -- isolating the copula head's error from the
+    frozen marginal's approximation error -- and it also means this script
+    needs no TabICL checkpoint at all there.
 
     generate_gp_batch fully reseeds python/numpy/torch RNGs from cfg.seed on
     every call (see data_gen.py's module docstring), so batch i there is a
@@ -129,15 +146,25 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
     training.batch_size, training.live_val_seed, the data.* config, or the
     resolved TabICL checkpoint differ from the run you're comparing against.
 
-    Also computes the copula gap's fixed operand here, once: pit.
-    gp_analytical_posterior's exact Schur-complement GP posterior per raw
-    episode (return_kernel_metadata=True gives it the kernel metadata it
-    needs), Sklar-split via its own nll_post_copula -- the same
-    per-point-normalized quantity train.py::validate() averages into
-    oracle_diag/copula_nll. This is a property of the fixed episodes alone,
-    independent of the model being trained, so it's computed once here
-    rather than every validation call (mirrors train.py's own
-    posterior_probe/val_episodes_meta split).
+    Also computes the gap's fixed operand here, once, via
+    pit.episode_posterior_ceiling: the exact Schur-complement GP posterior per
+    raw episode (return_kernel_metadata=True gives it the kernel metadata it
+    needs), per-point-normalized. This is a property of the fixed episodes
+    alone, independent of the model being trained, so it's computed once here
+    rather than every validation call -- the same caching train.py's builders
+    now do.
+
+    The gap reported below is on the TOTAL (marginal + copula), not the copula
+    term alone. That's deliberate, and it is a fix rather than a preference:
+    the model's z_test is standardized under the GP PRIOR's (mu_star,
+    sigma_star), while gp_analytical_posterior's nll_post_copula is the Sklar
+    split of the POSTERIOR (see pit.py's "Deliberately NOT scored via
+    corr_nll_single" comment). The two copula terms are therefore split under
+    different marginals and are not like-for-like -- their difference is not a
+    meaningful quantity. The totals are: both are ordinary Y-space log
+    densities evaluated at the same y_test, so total - nll_post is a valid
+    gap with a provable >= 0 expectation. nll_post_copula is still returned,
+    labelled, for eyeballing where a gap sits, but it is not the headline.
     """
     # Each batch is kept SEPARATELY collated, exactly like
     # build_fixed_live_val_batches's own `batches: List[dict]` -- d_features
@@ -149,6 +176,7 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
     batch_size = int(t.batch_size)
     batches = []
     n_episodes = 0
+    oracle_total_per_point: list[float] = []
     oracle_copula_per_point: list[float] = []
     for i in range(DEBUG_VAL_N_BATCHES):
         val_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": val_seed + i * 104_729}))
@@ -160,22 +188,24 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
         )
         n_episodes += len(episodes)
         for ep in episodes:
-            try:
-                post = gp_analytical_posterior(ep)
-            except (NotImplementedError, KeyError):
-                # Rare unsupported kernel schema (see gp_analytical_posterior's
-                # docstring) -- skip this one episode's oracle rather than
-                # crash the whole debug run over it.
+            # Returns None on a kernel schema with no analytic posterior --
+            # skip that one episode's ceiling rather than crash the run.
+            ceil_ep = episode_posterior_ceiling(ep)
+            if ceil_ep is None:
                 continue
-            n_test_ep = int(ep["x_norm_test"].shape[0])
-            oracle_copula_per_point.append(float(post["nll_post_copula"]) / n_test_ep)
+            oracle_total_per_point.append(ceil_ep["nll_post"])
+            oracle_copula_per_point.append(ceil_ep["nll_post_copula"])
         batch = {k: v.to(device, non_blocking=True) for k, v in collate_fn(episodes).items()}
         batches.append(batch)
+    oracle_total_nll = (
+        sum(oracle_total_per_point) / len(oracle_total_per_point)
+        if oracle_total_per_point else float("nan")
+    )
     oracle_copula_nll = (
         sum(oracle_copula_per_point) / len(oracle_copula_per_point)
         if oracle_copula_per_point else float("nan")
     )
-    return n_episodes, val_seed, batch_size, batches, oracle_copula_nll
+    return n_episodes, val_seed, batch_size, batches, oracle_total_nll, oracle_copula_nll
 
 
 def _build_episode_batch(cfg: DictConfig, n: int, seed: int, device: str,
@@ -271,7 +301,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Debug val set's z_test (and hence z_train too -- data_gen.py couples
-    # them, see generate_gp_batch's z_train-source-override comment) always
+    # them, see generate_gp_batch's z_train-source-override comment) normally
     # comes from real-TabICL PIT, unconditionally -- decoupled from whatever
     # z_train_source/z_train_tabicl_mix_* the TRAINING steps above use. This
     # matches eval_checkpoint.py's own --z_train_source tabicl default ("the
@@ -280,15 +310,30 @@ def main(cfg: DictConfig) -> None:
     # TabICL marginal the model will see once deployed. Reuses tabicl_model
     # if training already loaded one (z_train_source=tabicl/tabicl_split or
     # mixing enabled); otherwise loads a second copy just for val.
-    if tabicl_model is not None:
+    #
+    # training.val_analytic_only (`+experiment=analytic_only`) is the explicit
+    # opt-out: score against the exact analytic marginal instead, load no
+    # TabICL at all, and consequently need no checkpoint to exist. Validated
+    # against data.z_train_source/z_train_corruption_enabled by
+    # validate_analytic_only, same as in train.py.
+    analytic_only = validate_analytic_only(cfg)
+    if analytic_only:
+        val_tabicl_model, val_gen_device = None, "cpu"
+        print(
+            "[train_fast] training.val_analytic_only=true -- debug val set uses the "
+            "EXACT analytic GP marginal (no TabICL PIT, no checkpoint needed)."
+        )
+    elif tabicl_model is not None:
         val_tabicl_model, val_gen_device = tabicl_model, gen_device
     else:
         ckpt = resolve_pit_ckpt(cfg)
         if ckpt is None:
             raise ValueError(
-                "train_fast.py's debug val set always scores z_test through real TabICL "
+                "train_fast.py's debug val set scores z_test through real TabICL "
                 "PIT, which requires a resolvable TabICL checkpoint (tabicl.ckpt with "
-                "tabicl.pretrained=true, or tabicl.pit_ckpt)."
+                "tabicl.pretrained=true, or tabicl.pit_ckpt) -- or pass "
+                "+experiment=analytic_only to score against the exact analytic "
+                "marginal instead, which needs no checkpoint."
             )
         print(f"[train_fast] Loading frozen TabICL marginal for val z_test: {ckpt}")
         t_pit0 = time.perf_counter()
@@ -297,7 +342,8 @@ def main(cfg: DictConfig) -> None:
         print(f"[train_fast] TabICL marginal loaded in {time.perf_counter() - t_pit0:.1f}s")
 
     t_val0 = time.perf_counter()
-    n_val_debug, val_seed, val_batch_size, val_batches, oracle_copula_nll = _build_debug_val_batch(
+    (n_val_debug, val_seed, val_batch_size, val_batches,
+     oracle_total_nll, oracle_copula_nll) = _build_debug_val_batch(
         cfg, t, device, val_gen_device, val_tabicl_model, tabicl_k_folds, tabicl_split_calib_frac,
     )
     print(
@@ -308,7 +354,15 @@ def main(cfg: DictConfig) -> None:
         "training.batch_size/training.live_val_seed/data.*/the resolved TabICL "
         "checkpoint match the run you're comparing against."
     )
-    print(f"[train_fast] Oracle (exact GP posterior) copula NLL on this val set: {oracle_copula_nll:.4f} -- the copula_gap below is the model's copula NLL minus this.")
+    print(
+        f"[train_fast] Oracle (exact GP posterior) TOTAL NLL on this val set: "
+        f"{oracle_total_nll:.4f} nats/pt -- the gap below is the model's total NLL "
+        f"minus this, and 0 is Bayes-optimal. (Its copula component is "
+        f"{oracle_copula_nll:.4f}, shown for reference only: it is the Sklar split of "
+        "the POSTERIOR while the model's copula term is split under the PRIOR's "
+        "sigma_star, so the two copula numbers are not directly comparable -- only "
+        "the totals are.)"
+    )
 
     t_model0 = time.perf_counter()
     model = build_copula_transformer(cfg).to(device)
@@ -413,12 +467,19 @@ def main(cfg: DictConfig) -> None:
                     copulas.append(val_parts["copula"].item())
                     marginals.append(val_parts["marginal"].item())
             model.train()
+            model_total_nll = sum(totals) / len(totals)
             model_copula_nll = sum(copulas) / len(copulas)
-            copula_gap = model_copula_nll - oracle_copula_nll
+            # TOTAL gap, not the copula gap this used to print. Both operands
+            # here are ordinary Y-space log densities at the same y_test, so
+            # this difference is a real quantity with a provable >= 0
+            # expectation. The old copula_gap subtracted two copula terms that
+            # are Sklar-split under DIFFERENT marginals (model: the prior's
+            # sigma_star; oracle: the posterior) -- see _build_debug_val_batch.
+            gap = model_total_nll - oracle_total_nll
             print(
-                f"          -- val({n_val_debug}) total={sum(totals) / len(totals):.4f} "
+                f"          -- val({n_val_debug}) total={model_total_nll:.4f} "
                 f"copula={model_copula_nll:.4f} marginal={sum(marginals) / len(marginals):.4f} "
-                f"| copula_gap={copula_gap:+.4f} (vs. oracle {oracle_copula_nll:.4f} -- lower is better, 0 = Bayes-optimal)"
+                f"| gap={gap:+.4f} (vs. oracle total {oracle_total_nll:.4f} -- lower is better, 0 = Bayes-optimal)"
             )
 
     if t.get("ckpt_dir", None):

@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
-from pit import load_tabicl, resolve_pit_ckpt
+from pit import episode_posterior_ceiling, load_tabicl, resolve_pit_ckpt
 
 # Thread count for generate_gp_batch calls made directly in the MAIN process
 # (build_fixed_live_val_batches below, train.py's z_train-gap diagnostic) --
@@ -90,6 +90,67 @@ def _validate_z_train_source(z_train_source: str) -> None:
             f"Unknown data.z_train_source {z_train_source!r}; expected "
             f"{', '.join(repr(v) for v in _VALID_Z_TRAIN_SOURCES)}."
         )
+
+
+def validate_analytic_only(cfg) -> bool:
+    """Resolve training.val_analytic_only, failing loud if it's set alongside
+    a data config that would make "analytic" a lie.
+
+    training.val_analytic_only=true means every validation number is scored
+    against the EXACT analytic GP marginal -- z_test standardized by the
+    episode's own (mu_star, sigma_star) and log_pdf_test its exact Gaussian
+    log-density, straight out of data_gen.py -- with no TabICL PIT anywhere
+    in the loop. Two data.* knobs can silently break that guarantee, so both
+    are checked here rather than discovered later in a wandb panel:
+
+    - data.z_train_source != "analytic": the val episodes themselves would be
+      built through TabICL's K-fold PIT (build_fixed_live_val_batches below
+      reads this same key), so "analytic" validation would be scoring a
+      TabICL-PIT'd z_test.
+    - data.z_train_corruption_enabled=true: corrupt_z_train perturbs z_train
+      on validation and kernel-probe batches too (see conf/data/
+      gp_tasks.yaml's z_train_corruption_* block), so the model would be
+      conditioned on a deliberately noised context while the metrics claim
+      an exact-oracle setting.
+
+    Same fail-loud rationale as _validate_z_train_source above: a validation
+    mode whose whole point is "no approximate marginal is involved" must not
+    be satisfiable by a config that quietly reintroduces one.
+
+    Returns the resolved boolean so callers can use it as a plain flag.
+    """
+    analytic_only = bool(cfg.get("training", {}).get("val_analytic_only", False))
+    if not analytic_only:
+        return False
+    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    if z_train_source != "analytic":
+        raise ValueError(
+            "training.val_analytic_only=true requires data.z_train_source='analytic' "
+            f"(got {z_train_source!r}): validation episodes are built from "
+            "data.z_train_source, so any TabICL setting would put a PIT-estimated "
+            "marginal in a loop whose metrics claim to use the exact analytic one. "
+            "Use +experiment=analytic_only, or set val_analytic_only=false to score "
+            "against the real (TabICL) deployment marginal."
+        )
+    if bool(cfg.data.get("z_train_corruption_enabled", False)):
+        raise ValueError(
+            "training.val_analytic_only=true requires data.z_train_corruption_enabled"
+            "=false: corrupt_z_train also perturbs validation and kernel-probe "
+            "batches, so the model would be conditioned on deliberately noised "
+            "z_train while the metrics report an exact-oracle setting."
+        )
+    # Real ERA5 has no analytic GP ground truth of any kind: era5_live_dataset.py
+    # builds BOTH its train and val z from real TabICL PIT unconditionally, and
+    # data.z_train_source doesn't even apply there. An analytic-only run on that
+    # source isn't a stricter validation, it's an impossible one.
+    if str(cfg.get("training", {}).get("live_source", "gp")) == "era5":
+        raise ValueError(
+            "training.val_analytic_only=true is incompatible with "
+            "training.live_source='era5': real ERA5 episodes have no analytic GP "
+            "marginal, so era5_live_dataset.py always builds z_train/z_test from "
+            "TabICL PIT. Use live_source='gp' for analytic-only validation."
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +716,10 @@ def build_fixed_live_val_batches(
     collated CPU batch dicts (unchanged contract, see below);
     episodes_by_batch[i] is the raw per-episode list (kernel metadata intact)
     for batches[i], same order, for validate()'s oracle-posterior scoring.
+    Each of those episodes also carries a cached "_oracle_ceiling"
+    (pit.episode_posterior_ceiling, or None where no analytic posterior
+    exists) computed once here — validate() reads it instead of recomputing
+    the Schur-complement posterior on every call.
 
     Returned as a plain list (not a DataLoader): validate() only ever does
     ``for batch_idx, batch in enumerate(val_loader)`` and moves each batch to
@@ -714,6 +779,15 @@ def build_fixed_live_val_batches(
                     ep["_L_ff"] = ep["_L_ff"].cpu()
                     ep["_alpha"] = ep["_alpha"].cpu()
             batches.append(collate_fn(episodes))
+            # Cache each episode's Bayes-optimal ceiling once, here, rather
+            # than recomputing it in every validate() call: these episodes are
+            # frozen for the whole run, and the ceiling depends only on them,
+            # never on the model. Attached AFTER collate_fn (it's a plain dict,
+            # not a tensor) under the same underscore side-channel convention
+            # as _L_ff/_alpha above. See pit.episode_posterior_ceiling and
+            # train.py::_attach_oracle_ceilings for the full rationale.
+            for ep in episodes:
+                ep["_oracle_ceiling"] = episode_posterior_ceiling(ep)
             episodes_by_batch.append(episodes)
 
     if tabicl_model is not None:

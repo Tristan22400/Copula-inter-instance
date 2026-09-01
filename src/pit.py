@@ -951,3 +951,60 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
         "nll_post_marginal":  post_parts["marginal"],
         "nll_post_copula":    post_parts["copula"],
     }
+
+
+@torch.no_grad()
+def episode_posterior_ceiling(task: dict, eig_floor: float = 1e-6) -> "dict | None":
+    """gp_analytical_posterior reduced to the handful of numbers a validation
+    loop actually consumes, per-point-normalized, computed ONCE per episode.
+
+    Why this exists: the Bayes-optimal ceiling is a property of the EPISODE
+    alone -- it never touches the model -- yet train.py::validate() used to
+    call gp_analytical_posterior on every episode of a FIXED probe/val set on
+    every single validate() call. Those episodes are generated once
+    (build_fixed_live_val_batches' live_val_seed, _build_synthetic_kernel_
+    batches' synth_seed), so every call after the first recomputed a constant:
+    an O(N^3) float64 eigendecomposition per episode per family per
+    validation. scripts/train_fast.py already made exactly this argument for
+    its own debug loop ("a property of the fixed episodes alone, independent
+    of the model being trained, so it's computed once here rather than every
+    validation call"); this brings the real training loop to parity.
+
+    Callers precompute a list of these alongside the episodes and hand them to
+    validate(), which then just averages floats. That in turn makes raising
+    baselines.synth_n_episodes / training.val_episodes cheap: it costs a
+    one-time startup pass instead of scaling the per-validation cost.
+
+    Returns None -- rather than raising -- for the two cases the callers all
+    already treat as "ceiling unavailable for this episode": a kernel schema
+    gp_analytical_posterior doesn't support (NotImplementedError, e.g.
+    whole-chain outer sign modulation) or an episode missing the metadata it
+    needs (KeyError, e.g. loaded from an on-disk shard written without
+    return_kernel_metadata=True). One skipped episode must never take down a
+    whole validation pass.
+
+    All three NLL fields are divided by this episode's own n_test, matching
+    loss.y_space_nll's per-point convention, so they can be averaged directly
+    against the model's own totals. off_R_post is the strict upper triangle of
+    the true posterior correlation matrix R_post, the operand for the
+    predicted-vs-oracle correlation diagnostics; None when n_test < 2 (no
+    off-diagonal pairs exist).
+    """
+    try:
+        post = gp_analytical_posterior(task, eig_floor=eig_floor)
+    except (KeyError, NotImplementedError):
+        return None
+    n = int(task["x_norm_test"].shape[0])
+    if n < 1:
+        return None
+    off_R_post = None
+    if n >= 2:
+        ri, ci = torch.triu_indices(n, n, offset=1)
+        off_R_post = post["R_post"][ri, ci].cpu().numpy()
+    return {
+        "n_test": n,
+        "nll_post": post["nll_post"] / n,
+        "nll_post_marginal": post["nll_post_marginal"] / n,
+        "nll_post_copula": post["nll_post_copula"] / n,
+        "off_R_post": off_R_post,
+    }

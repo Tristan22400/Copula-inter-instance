@@ -146,11 +146,26 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode):
     assert torch.isfinite(torch.tensor(nlls["oracle"]))
     _assert_valid_correlation(R_dict["icl"], n_test)
     assert torch.equal(R_oracle, tiny_episode["R_star"])
-    # No tabicl_pit given (oracle z_train mode, the default) -> no learned
-    # ICL marginal to score a total Y-space NLL against.
+    # No tabicl_pit given (oracle z_train mode, the default): icl_y_parts is
+    # scored with the episode's EXACT analytic marginal (ep["log_pdf_test"]),
+    # not left NaN as it was before 2026-09. It is an oracle-marginal upper
+    # bound -- _print_total_nll_table labels it "ICL (oracle marginal)" and
+    # footnotes that it is not comparable against the own-marginal baseline
+    # rows -- but it is a real, finite, Sklar-consistent number, and it is the
+    # only total-NLL figure available in the perfect-marginal-access setting
+    # (training.val_analytic_only / +experiment=analytic_only).
     assert set(icl_y_parts.keys()) == {"total", "marginal", "copula"}
     for val in icl_y_parts.values():
-        assert torch.isnan(torch.tensor(val))
+        assert torch.isfinite(torch.tensor(val))
+    assert icl_y_parts["total"] == pytest.approx(
+        icl_y_parts["marginal"] + icl_y_parts["copula"], abs=1e-3,
+    )
+    # The marginal term is the episode's own exact analytic marginal, so it
+    # must equal -mean(log_pdf_test) exactly -- this is what distinguishes the
+    # oracle-marginal row from the TabICL-marginal one.
+    assert icl_y_parts["marginal"] == pytest.approx(
+        float(-tiny_episode["log_pdf_test"].sum() / n_test), abs=1e-4,
+    )
     # gp_analytical_posterior's prior/posterior are always available for this
     # (elementary-kernel) tiny episode -- both come back as a genuine
     # total/marginal/copula split, exactly consistent by construction.

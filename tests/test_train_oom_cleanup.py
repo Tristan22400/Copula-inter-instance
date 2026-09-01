@@ -127,7 +127,17 @@ def test_reserve_headroom_noop_when_zero_workers(monkeypatch):
 
 
 def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
-    """2 workers * 2.5GB + 1.0GB flat = 6GB headroom on a 24GB card -> 75%."""
+    """2 workers * 2.5GB + 1.0GB flat = 6GB headroom on a 24GB card -> 75%.
+
+    The 2.5GB per worker is _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB (0.5) +
+    _LIVE_TABICL_WORKER_PER_EPISODE_GB (0.02) * group_size, where
+    group_size = training.batch_size * training.live_tabicl_group_multiplier
+    (see train.py::_reserve_gpu_headroom_for_live_tabicl) -- so batch_size=50
+    at the group_multiplier default of 2 gives group_size=100 -> 0.5 + 2.0.
+    batch_size is REQUIRED in this fixture: the headroom formula started
+    scaling with it when live_tabicl worker auto-sizing landed, and omitting
+    it raises ConfigAttributeError rather than falling back to a default.
+    """
     captured = {}
     monkeypatch.setattr(
         torch.cuda, "set_per_process_memory_fraction",
@@ -135,7 +145,7 @@ def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
     cfg = OmegaConf.create({"data": {"z_train_tabicl_mix_enabled": True}})
-    t = OmegaConf.create({"live_tabicl_num_workers": 2})
+    t = OmegaConf.create({"live_tabicl_num_workers": 2, "batch_size": 50})
     train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert captured["device"] == 0
     assert captured["fraction"] == pytest.approx(0.75)
@@ -150,6 +160,6 @@ def test_reserve_headroom_clamps_fraction_floor(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
     cfg = OmegaConf.create({"data": {"z_train_source": "tabicl_split"}})
-    t = OmegaConf.create({"live_tabicl_num_workers": 50})
+    t = OmegaConf.create({"live_tabicl_num_workers": 50, "batch_size": 50})
     train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert captured["fraction"] == pytest.approx(0.5)

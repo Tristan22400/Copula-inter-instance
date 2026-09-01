@@ -156,9 +156,13 @@ def _eval_icl_episode(
     tabicl_pit's "z_test"/"log_pdf_test" keys additionally provide a
     genuine (non-oracle) marginal for the ICL model itself, letting it be
     scored on total (marginal+copula) Y-space NLL the same way the
-    GP-MLE/DKL baselines now are (see eval_baselines_episode) — this is
-    only possible in --z_train_source=tabicl mode, since the default oracle
-    z_test IS the ground truth (nothing to score a "marginal" against).
+    GP-MLE/DKL baselines now are (see eval_baselines_episode).
+
+    In --z_train_source=oracle mode icl_y_parts is now also populated, using
+    the episode's own EXACT analytic marginal instead — an oracle-marginal
+    upper bound on the model rather than a deployment-realistic number, and
+    NOT comparable against the own-marginal baseline rows. See the else-branch
+    below and _print_total_nll_table's row labelling.
 
     Returns (nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts) —
     y_space_nlls is a separate {"prior": {"total","marginal","copula"},
@@ -167,9 +171,11 @@ def _eval_icl_episode(
     they're a full multivariate-normal Y-space NLL, not the z-space
     copula-only NLL every other entry in `nlls` is, so they're not in the
     same units/comparable via the same table — all-nan dicts when
-    unavailable). icl_y_parts is {"total","marginal","copula"}, all-nan
-    whenever tabicl_pit is None (oracle z_train mode) — same per-episode
-    Sklar split now exposed for every baseline via eval_baselines_episode.
+    unavailable). icl_y_parts is {"total","marginal","copula"} — the same
+    per-episode Sklar split exposed for every baseline via
+    eval_baselines_episode, computed under TabICL's estimated marginal when
+    tabicl_pit is given and under the exact analytic one otherwise (it stays
+    all-nan only if the ICL forward pass itself failed).
     """
     X_train = ep["x_norm_train"].to(device)   # (P, d_x)
     z_train = (
@@ -206,15 +212,43 @@ def _eval_icl_episode(
         R_icl = Sigma_icl[0, :N, :N]
         nlls["icl"] = corr_nll_single(R_icl, z_test)
         R_dict["icl"] = R_icl
+        test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
         if tabicl_pit is not None:
-            test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
             icl_parts = y_space_nll(
                 Sigma_icl[:, :N, :N],
                 tabicl_pit["z_test"].to(device).unsqueeze(0),
                 tabicl_pit["log_pdf_test"].to(device).unsqueeze(0),
                 test_mask,
             )
-            icl_y_parts = {k: v.item() for k, v in icl_parts.items()}
+        else:
+            # Oracle z_train mode: score the model's own Sigma against the
+            # episode's EXACT analytic marginal (z_test standardized by
+            # (mu_star, sigma_star); log_pdf_test its exact Gaussian
+            # log-density, both straight from data_gen.py). This used to be
+            # left as NaN on the grounds that oracle mode has "no learned
+            # marginal to score a total NLL against" -- true, but it made the
+            # perfect-marginal-access setting (training.val_analytic_only /
+            # +experiment=analytic_only) the one regime with no total-NLL
+            # number at all, which is exactly the regime where the copula head
+            # is being studied in isolation.
+            #
+            # What it is: the model's copula term plus a PERFECT marginal, so
+            # it is an oracle-marginal UPPER BOUND on the model, not a
+            # deployment number. Crucially it is NOT comparable against the
+            # GP-MLE/DKL/per-episode-transformer rows in the same table, which
+            # each fit their own marginal -- handing one method the true
+            # marginal and making the others estimate theirs is not a fair
+            # comparison. _print_total_nll_table labels the row accordingly.
+            # The fair comparison in this mode is _print_table's copula-only
+            # table, where every method is given the same ground-truth
+            # marginal and differs only in its correlation matrix.
+            icl_parts = y_space_nll(
+                Sigma_icl[:, :N, :N],
+                z_test.unsqueeze(0),
+                ep["log_pdf_test"].to(device).unsqueeze(0),
+                test_mask,
+            )
+        icl_y_parts = {k: v.item() for k, v in icl_parts.items()}
     except Exception as exc:
         print(f"  [icl] failed: {exc}")
         nlls["icl"] = float("nan")
@@ -630,10 +664,16 @@ def _print_total_nll_table(
     eval/metrics/joint_nll.py's module docstring, for why those are
     different quantities that happen to share a name).
 
-    icl's row is nan whenever z_train_source == "oracle" (--z_train_source
-    default): the oracle z_test the ICL model would otherwise be scored
-    against IS the ground truth, so there is no learned marginal to score a
-    total NLL against — --z_train_source=tabicl is required to populate it.
+    Under z_train_source == "oracle" the icl row is scored with the episode's
+    EXACT analytic marginal rather than a learned one, and is labelled and
+    footnoted as such. It is then an oracle-marginal UPPER BOUND on the model
+    and is NOT comparable against the GP-MLE/DKL/PerEp rows in the same table,
+    which each fit their own marginal — giving one method the true marginal
+    while the others must estimate theirs measures the marginal, not the
+    method. The fair comparison in that mode is _print_table's copula-only
+    table, where every method shares one ground-truth marginal and differs
+    only in its correlation matrix. Use --z_train_source=tabicl for a row that
+    is comparable against the fitted baselines.
 
     oracle_prior/oracle_posterior here are gp_analytical_posterior's own
     nll_prior/nll_post (and their marginal/copula split), divided by N for
@@ -660,18 +700,33 @@ def _print_total_nll_table(
     print(f"\n{'─' * total}")
     print(f"Total NLL (Y-space, marginal+copula, own marginal per method) — "
           f"lower is better  [N={len(all_total_nlls)} episodes]")
+    oracle_marginal = z_train_source == "oracle"
     print(f"ICL z_train source: {z_train_source}"
-          + ("  (icl row n/a — oracle mode has no learned ICL marginal to score)"
-             if z_train_source == "oracle" else "  (TabICL K-fold PIT estimate)"))
+          + ("  (icl row uses the EXACT analytic marginal — an upper bound, NOT "
+             "comparable to the own-marginal rows below)"
+             if oracle_marginal else "  (TabICL K-fold PIT estimate)"))
     print(f"{'─' * total}")
     print(f"{'Method':<{col}}{'Mean Total':>12}{'Std Total':>12}{'Mean Marg.':>12}{'Mean Cop.':>12}")
     print(f"{'─' * col}{'─' * 12}{'─' * 12}{'─' * 12}{'─' * 12}")
     for key, label in _TOTAL_NLL_ORDER:
         m, s = means_total.get(key, float("nan")), stds_total.get(key, float("nan"))
         mm, mc = means_marginal.get(key, float("nan")), means_copula.get(key, float("nan"))
-        marker = "  ← our model" if key == "icl" else ""
+        if key == "icl":
+            label = "ICL (oracle marginal)" if oracle_marginal else label
+            marker = "  ← our model" + ("  [upper bound, see note]" if oracle_marginal else "")
+        else:
+            marker = ""
         print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{mm:>12.4f}{mc:>12.4f}{marker}")
-    print(f"{'─' * total}\n")
+    print(f"{'─' * total}")
+    if oracle_marginal:
+        print(
+            "note: the icl row was given the episode's true analytic marginal, while every\n"
+            "      GP-MLE/DKL/PerEp row fits its own — that difference measures the marginal,\n"
+            "      not the method, so do NOT rank them against each other here. For a fair\n"
+            "      same-marginal comparison use the copula-only table above; for an icl row\n"
+            "      comparable to the fitted baselines, rerun with --z_train_source tabicl."
+        )
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -731,8 +786,11 @@ def main() -> None:
                              "per episode. 'oracle': the episode's exact GP-LOO PIT residual "
                              "(R&W Eq. 5.12) computed from the true generating kernel — "
                              "unavailable on real data, an idealized upper bound only; under "
-                             "this mode the icl row of _print_total_nll_table is NaN (no "
-                             "learned marginal to score a total NLL against). icl_nll under "
+                             "this mode the icl row of _print_total_nll_table is scored with "
+                             "the exact analytic marginal and labelled 'ICL (oracle marginal)', "
+                             "which is NOT comparable against the own-marginal baseline rows "
+                             "(use the copula-only table for a fair same-marginal comparison, "
+                             "or --z_train_source tabicl). icl_nll under "
                              "either source is unaffected in every other respect: z_test, "
                              "R_oracle, and every baseline still score/fit against the "
                              "episode's true values — use both to measure the sim-to-real "
@@ -795,11 +853,15 @@ def main() -> None:
                              "episode sizes are fixed by the pre-built dataset and can't be "
                              "regenerated, so episodes below this floor are skipped instead.")
     parser.add_argument("--oracle_mode",  default=None, choices=["prior", "posterior"],
-                        help="How R_star was built for this dataset. Determines whether "
-                             "GP-MLE/DKL score the fitted kernel's posterior (conditioned "
-                             "on X_train) or its raw prior covariance at X_test. Default: "
-                             "read from the checkpoint's own saved training config "
-                             "(cfg.data.oracle_mode), falling back to 'prior' if absent.")
+                        help="Whether GP-MLE/DKL score their fitted kernel's posterior "
+                             "(conditioned on the X_train they just fit on) or its raw prior "
+                             "covariance at X_test. Default 'posterior': the prior readout "
+                             "never lets the baseline use its own context, making it a weak "
+                             "opponent that is easy to beat for the wrong reason. This is "
+                             "gpytorch's own exact conditioning and is unrelated to "
+                             "data_gen.py's removed oracle_mode='posterior' GENERATION branch "
+                             "— R_star itself is always the prior. Pass 'prior' to reproduce "
+                             "pre-2026-09 numbers.")
     parser.add_argument("--baseline_cache", default="./baseline_cache.pt",
                         help="Path to a cache file storing every classical baseline's fitted "
                              "NLL/correlation results, keyed per-episode. These are the "
@@ -871,7 +933,18 @@ def main() -> None:
     # (this repo's current datasets all use oracle_mode=prior, unlike
     # data_gen.py's own historical "posterior" default for dataset
     # *generation*).
-    oracle_mode = args.oracle_mode or OmegaConf.select(cfg, "data.oracle_mode", default="prior")
+    #
+    # Default flipped to "posterior" (2026-09): the "prior" readout scores
+    # GP-MLE/DKL on their fitted kernel's UNCONDITIONED covariance at X_test,
+    # i.e. it never lets the baseline use the context it just fit on. That is
+    # a weak opponent — beating it says very little — and unlike data_gen.py's
+    # own oracle_mode="posterior" generation branch (removed 2026-07-29 for a
+    # PSD bug), this readout has nothing to do with that branch: it is
+    # gpytorch's own exact conditioning on the real (X_fit, y_fit)
+    # (classical.py's `likelihood(model(X_test))` vs `model.forward(X_test)`),
+    # scored against the same real z_test either way. Pass --oracle_mode prior
+    # to reproduce older numbers.
+    oracle_mode = args.oracle_mode or "posterior"
     print(f"Oracle mode: {oracle_mode}")
 
     # GP-MLE/DKL hyperpriors: read the exact LogNormal/Gamma constants these

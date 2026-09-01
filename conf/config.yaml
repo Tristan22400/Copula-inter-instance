@@ -73,6 +73,32 @@ training:
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
   val_episodes: 500
+  # "Perfect marginal access" validation: score every validation metric against
+  # the EXACT analytic GP marginal only, with no TabICL PIT anywhere in the
+  # loop. Isolates the copula/correlation head's error from the frozen TabICL
+  # marginal's approximation error, which the default (false) deliberately
+  # conflates because that conflation IS the deployment-realistic number.
+  #
+  # true skips, at runtime (the code stays intact so the same checkpoint can
+  # still be scored both ways -- that A/B is the whole point):
+  #   - val/y_nll_{total,marginal,copula}: the TabICL-conditioned sim-to-real
+  #     re-forward (train.py::validate's z_cache_b block). Note this fires on
+  #     pit.py::resolve_pit_ckpt resolving, NOT on data.z_train_source -- which
+  #     is exactly why this separate flag exists: data.z_train_source=analytic
+  #     alone still leaves a TabICL-scored headline in place.
+  #   - kernel_fit/<family>/*_tabicl (and hence training.adaptive_kernel_signal
+  #     ="tabicl"; use "oracle" instead, see below).
+  #   - every era5_fit/<region>/* probe and the val/era5_predictions figure:
+  #     real data has no analytic GP ground truth at all.
+  # and restores val/corr_{density,grid}_analytic_z, the predicted-vs-oracle
+  # correlation plots removed when TabICL's PIT entered the loop (see
+  # baselines.era5_viz_* below) -- valid again precisely because there is no
+  # PIT z-space warp here.
+  #
+  # Requires data.z_train_source=analytic and data.z_train_corruption_enabled
+  # =false; raises ValueError otherwise (live_dataset.py::validate_analytic_only).
+  # Set the whole recipe at once with `+experiment=analytic_only`.
+  val_analytic_only: false
   # Override for the on-disk dataset DataLoader worker count (train.py's
   # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
   # variable-d) — set explicitly to tune, e.g. now that dataset.py loads

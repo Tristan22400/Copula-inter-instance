@@ -1,0 +1,64 @@
+# @package _global_
+#
+# "Perfect marginal access": train AND validate entirely on the exact analytic
+# GP-LOO residuals and exact Gaussian marginal log-densities, with no TabICL
+# PIT anywhere in the run.
+#
+# Use with `+experiment=analytic_only` (the leading `+` is required -- this is
+# an optional group with no entry in conf/config.yaml's defaults list).
+#
+# What this buys, versus the default recipe:
+#   - The copula head's error is isolated from the frozen TabICL marginal's
+#     approximation error. Under TabICL PIT the two are inseparable, which is
+#     why feedback_no_raw_correlation_vs_oracle_comparison rules out every
+#     correlation-value diagnostic there and leaves only the joint Y-space NLL.
+#   - z-space IS the GP's own exact z-space, so predicted-Sigma-vs-true-R
+#     comparisons become valid again (val/corr_density_analytic_z,
+#     val/corr_grid_analytic_z, oracle_diag/corr_{pearson,mae,rmse,bias}).
+#   - No frozen TabICL is ever loaded: generation runs on the CPU worker path
+#     (training.live_num_workers), not the GPU-resident TabICL worker pool, so
+#     startup drops from ~7 min to seconds and the whole live-TabICL VRAM
+#     contention problem (train.py::_reserve_gpu_headroom_for_live_tabicl)
+#     doesn't arise -- it returns early once no TabICL path is enabled.
+#
+# What it costs: these are IDEALIZED numbers. Real deployment never has the
+# analytic marginal, so a paper reporting these must report the
+# `--z_train_source tabicl` column beside them. Nothing here is deleted, only
+# skipped, so the same checkpoint can be scored both ways.
+
+data:
+  # The exact GP-LOO residual (R&W Eq. 5.12), not TabICL's K-fold PIT estimate.
+  # Drives BOTH the training stream and build_fixed_live_val_batches' fixed
+  # validation set -- but not the sim-to-real headline, which is why
+  # training.val_analytic_only below is needed as well.
+  z_train_source: analytic
+  # Per-episode analytic/TabICL alternation would reintroduce the PIT this
+  # experiment exists to remove.
+  z_train_tabicl_mix_enabled: false
+  # corrupt_z_train perturbs validation and kernel-probe batches too, so it
+  # would make "exact analytic" untrue on the metric side, not just the
+  # training side. Enforced by live_dataset.py::validate_analytic_only.
+  z_train_corruption_enabled: false
+
+training:
+  val_analytic_only: true
+  # The per-family curriculum signal must not route through TabICL either.
+  # "oracle" reads oracle_diag/kernel_fit/<family>/gap_nll (model total Y-space
+  # NLL minus gp_analytical_posterior's exact Schur-complement ceiling) --
+  # pure analytic, and the only signal still populated once val_analytic_only
+  # skips the *_tabicl metrics. Leaving the "tabicl" default would silently
+  # fall back per-family with no warning (train.py::_update_adaptive_kernel_weights).
+  adaptive_kernel_signal: oracle
+
+baselines:
+  # Real ERA5 has no analytic GP ground truth, so every era5_fit/<region>/*
+  # metric is out of scope here. val_analytic_only already skips the probes;
+  # this also skips paying their one-time fetch/PIT cost at startup.
+  era5_enabled: false
+  # The adaptive-sampling signal is measured on a FIXED per-family probe set
+  # (baselines.synth_seed), so it is low-variance across steps but is only as
+  # representative of each kernel family as its sample size. 64 is tuned for a
+  # cheap default; a long run generalizing from the curriculum wants more.
+  # Affordable here because validate() now caches gp_analytical_posterior's
+  # ceiling per probe episode instead of recomputing it every val_every.
+  synth_n_episodes: 256
