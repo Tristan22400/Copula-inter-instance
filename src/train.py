@@ -289,6 +289,75 @@ def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
     return {"mse": mse, "rmse": float(np.sqrt(mse)), "mae": mae, "pearson": pearson, "bias": bias}
 
 
+def _probe_forward_chunks(model: nn.Module, cfg: DictConfig, batch: dict, jitter: float, chunk_size: int):
+    """Yield (start_index, sub_batch, Sigma) over a collated probe batch,
+    forwarding at most `chunk_size` episodes at a time.
+
+    The kernel_fit/<family> and posterior_probe batches are collated as ONE
+    batch of baselines.synth_n_episodes / baselines.posterior_probe_n_episodes
+    episodes, which is convenient for the builders but makes a single
+    model(batch) call whose activation footprint scales with that config knob
+    -- with probe_N_max=1024 test points per episode, a few hundred episodes
+    is tens of GB in the TabICL column encoder alone. That turned
+    "how many probe episodes do I want for a stable curriculum signal?" into a
+    question about VRAM, and OOM'd a 24GB card at synth_n_episodes=256 while
+    passing on a 48GB one -- a config that silently depends on which GPU the
+    scheduler happens to hand you.
+
+    Chunking decouples the two: peak memory is set by chunk_size (defaulting
+    to training.batch_size, a shape the training loop already sustains every
+    step), while the episode count only costs time. Aggregation is exact --
+    see _chunked_probe_nll -- so this changes no reported number.
+    """
+    B = batch["x_train"].shape[0]
+    step = max(1, int(chunk_size))
+    for start in range(0, B, step):
+        sub = {k: v[start:start + step] for k, v in batch.items()}
+        out = model(sub)
+        yield start, sub, build_sigma(out, cfg, jitter=jitter, test_mask=sub["test_mask"])
+
+
+def _chunked_probe_nll(model: nn.Module, cfg: DictConfig, batch: dict, jitter: float, chunk_size: int) -> dict:
+    """y_space_nll over a probe batch, forwarded in chunks (see
+    _probe_forward_chunks), as plain floats.
+
+    Exactly equal to the un-chunked y_space_nll on the whole batch, not an
+    approximation of it: y_space_nll returns the mean over episodes with at
+    least one test point, so weighting each chunk's mean by that same valid
+    count and dividing by the total reconstructs the overall mean exactly (up
+    to float summation order).
+    """
+    totals = {"total": 0.0, "copula": 0.0, "marginal": 0.0}
+    n_valid_total = 0
+    for _, sub, Sigma in _probe_forward_chunks(model, cfg, batch, jitter, chunk_size):
+        n_valid = int((sub["test_mask"].sum(-1) > 0).sum())
+        if n_valid == 0:
+            continue
+        parts = y_space_nll(
+            Sigma, sub["z_test"].float(), sub["log_pdf_test"].float(), sub["test_mask"]
+        )
+        for key in totals:
+            totals[key] += parts[key].item() * n_valid
+        n_valid_total += n_valid
+    if n_valid_total == 0:
+        return {key: float("nan") for key in totals}
+    return {key: val / n_valid_total for key, val in totals.items()}
+
+
+def _resolve_probe_chunk_size(cfg: DictConfig) -> int:
+    """baselines.probe_chunk_size, defaulting to training.batch_size.
+
+    That default is the point: the training loop already forwards batch_size
+    episodes every step on this GPU, so a probe chunk of the same size is
+    known to fit by construction, whatever card the job landed on.
+    """
+    bcfg = cfg.get("baselines", {}) or {}
+    explicit = bcfg.get("probe_chunk_size", None)
+    if explicit:
+        return max(1, int(explicit))
+    return max(1, int(cfg.training.get("batch_size", 16)))
+
+
 _ORACLE_CEILING_KEY = "_oracle_ceiling"
 
 
@@ -1412,6 +1481,11 @@ def validate(
     # NaN for certain inputs. There is no dropout in this model so eval mode has no
     # benefit. Use torch.no_grad() for efficiency instead.
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
+    # Episodes per forward pass over the kernel_fit/<family> and
+    # posterior_probe batches, which are collated whole and would otherwise
+    # make peak VRAM scale with baselines.synth_n_episodes /
+    # posterior_probe_n_episodes. See _probe_forward_chunks.
+    probe_chunk_size = _resolve_probe_chunk_size(cfg)
     if analytic_only:
         # Belt-and-braces: main() already skips building these under
         # val_analytic_only, but a stale caller passing them would silently
@@ -1440,6 +1514,7 @@ def validate(
     # further down.
     all_oracle_total: list[float] = []
     all_oracle_copula: list[float] = []
+    all_oracle_marginal: list[float] = []
     nll_post_per_point: list[float] = []
     nll_post_marginal_per_point: list[float] = []
     nll_post_copula_per_point: list[float] = []
@@ -1483,6 +1558,7 @@ def validate(
             )
             all_oracle_total.append(parts_o["total"].item())
             all_oracle_copula.append(parts_o["copula"].item())
+            all_oracle_marginal.append(parts_o["marginal"].item())
 
         # ---- Per-task diagnostics (vectorized — no Python loop over batch) ----
         n_test_cur = batch["test_mask"].sum(-1).float()   # (B,)
@@ -1708,35 +1784,77 @@ def validate(
     # side-by-side reading.
     if posterior_probe is not None and val_episodes_meta is None:
         pb = posterior_probe["batch"]
-        out_p = model(pb)
-        Sigma_p = build_sigma(out_p, cfg, jitter=jitter, test_mask=pb["test_mask"])
-        parts_p = y_space_nll(
-            Sigma_p, pb["z_test"].float(), pb["log_pdf_test"].float(), pb["test_mask"]
-        )
-        all_oracle_total.append(parts_p["total"].item())
-        all_oracle_copula.append(parts_p["copula"].item())
-        # Same cached-ceiling read as the main loop above
-        # (_build_posterior_probe_batches attaches _oracle_ceiling once at
-        # startup), not a fresh gp_analytical_posterior call per validation.
-        for b, ep in enumerate(posterior_probe["episodes"]):
-            n = int(ep["x_norm_test"].shape[0])
-            ceil_p = ep.get(_ORACLE_CEILING_KEY)
-            if n < 1 or ceil_p is None:
-                continue  # unsupported kernel schema / no analytic posterior
-            # Already per-point (nll_post = nll_post_marginal + nll_post_copula
-            # in raw-sum units, each divided by this episode's own n_test --
-            # see pit.episode_posterior_ceiling), matching y_space_nll.
-            nll_post_per_point.append(ceil_p["nll_post"])
-            nll_post_marginal_per_point.append(ceil_p["nll_post_marginal"])
-            nll_post_copula_per_point.append(ceil_p["nll_post_copula"])
-            if ceil_p["off_R_post"] is not None:
-                ri_p, ci_p = np.triu_indices(n, k=1)
-                off_p_post.append(Sigma_p[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
-                off_o_post.append(ceil_p["off_R_post"])
+        # Chunked for the same reason as the kernel_fit probe below --
+        # baselines.posterior_probe_n_episodes defaults to
+        # ${training.val_episodes} (500), so this was the largest single
+        # forward in the whole function.
+        # One chunked pass doing both jobs: the NLL accumulation AND the
+        # per-episode ceiling/off-diagonal pairing, which needs this chunk's
+        # own Sigma slice. Kept together so Sigma is never held for more than
+        # chunk_size episodes at a time -- the whole point of chunking here.
+        probe_eps = posterior_probe["episodes"]
+        totals_p = {"total": 0.0, "copula": 0.0, "marginal": 0.0}
+        n_valid_p = 0
+        for start, sub, Sigma_p in _probe_forward_chunks(model, cfg, pb, jitter, probe_chunk_size):
+            n_valid = int((sub["test_mask"].sum(-1) > 0).sum())
+            if n_valid:
+                parts_c = y_space_nll(
+                    Sigma_p, sub["z_test"].float(), sub["log_pdf_test"].float(), sub["test_mask"]
+                )
+                totals_p["total"] += parts_c["total"].item() * n_valid
+                totals_p["copula"] += parts_c["copula"].item() * n_valid
+                totals_p["marginal"] += parts_c["marginal"].item() * n_valid
+                n_valid_p += n_valid
+            # Same cached-ceiling read as the main loop above
+            # (_build_posterior_probe_batches attaches _oracle_ceiling once at
+            # startup), not a fresh gp_analytical_posterior call per validation.
+            for b_local in range(sub["x_train"].shape[0]):
+                ep = probe_eps[start + b_local]
+                n = int(ep["x_norm_test"].shape[0])
+                ceil_p = ep.get(_ORACLE_CEILING_KEY)
+                if n < 1 or ceil_p is None:
+                    continue  # unsupported kernel schema / no analytic posterior
+                # Already per-point (nll_post = nll_post_marginal +
+                # nll_post_copula in raw-sum units, each divided by this
+                # episode's own n_test -- see pit.episode_posterior_ceiling),
+                # matching y_space_nll.
+                nll_post_per_point.append(ceil_p["nll_post"])
+                nll_post_marginal_per_point.append(ceil_p["nll_post_marginal"])
+                nll_post_copula_per_point.append(ceil_p["nll_post_copula"])
+                if ceil_p["off_R_post"] is not None:
+                    ri_p, ci_p = np.triu_indices(n, k=1)
+                    off_p_post.append(Sigma_p[b_local, :n, :n].float().cpu().numpy()[ri_p, ci_p])
+                    off_o_post.append(ceil_p["off_R_post"])
+        if n_valid_p:
+            all_oracle_total.append(totals_p["total"] / n_valid_p)
+            all_oracle_copula.append(totals_p["copula"] / n_valid_p)
+            all_oracle_marginal.append(totals_p["marginal"] / n_valid_p)
 
     if all_oracle_total:
         metrics["oracle_diag/copula_nll"] = float(np.mean(all_oracle_copula))
         metrics["oracle_diag/total_nll"] = float(np.mean(all_oracle_total))
+        metrics["oracle_diag/marginal_nll"] = float(np.mean(all_oracle_marginal))
+        if analytic_only:
+            # Same three numbers, mirrored into val/ so the model's own Sklar
+            # decomposition (total = copula + marginal, Y-space nats/point) is
+            # visible in the val/ wandb panel group -- which would otherwise
+            # be nearly empty in this mode, since its usual headline
+            # (y_nll_total, scored under TabICL's marginal) is exactly what
+            # analytic_only skips. That makes a multi-day run awkward to watch.
+            #
+            # The "_analytic_z" suffix follows the same convention as
+            # sigma_offdiag_*_analytic_z above and exists for the same reason:
+            # these are scored against the exact analytic marginal, NOT
+            # TabICL's, so they must never be overlaid on or compared against
+            # a default-recipe run's val/y_nll_* on the same wandb panel. The
+            # suffix keeps them in separate panels by construction. Emitted
+            # only under analytic_only, where the config guard
+            # (live_dataset.validate_analytic_only) makes "analytic" provably
+            # true -- in the default recipe val_loader's own z_test is
+            # TabICL-PIT'd, so the name would be a lie.
+            metrics["y_nll_total_analytic_z"] = metrics["oracle_diag/total_nll"]
+            metrics["y_nll_copula_analytic_z"] = metrics["oracle_diag/copula_nll"]
+            metrics["y_nll_marginal_analytic_z"] = metrics["oracle_diag/marginal_nll"]
     if nll_post_per_point:
         # total_nll and y_nll_oracle_posterior are scored on the SAME
         # episode population (whichever source supplied it above) — gap_nll,
@@ -1810,14 +1928,14 @@ def validate(
     # posterior_probe block above.
     for family, probe_s in (synth_kernel_batches or {}).items():
         sbatch = probe_s["batch"]
-        out_s = model(sbatch)
-        Sigma_s = build_sigma(out_s, cfg, jitter=jitter, test_mask=sbatch["test_mask"])
-        parts_s = y_space_nll(
-            Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
-        )
-        cop_s = parts_s["copula"].item()
-        mar_s = parts_s["marginal"].item()
-        tot_s = parts_s["total"].item()
+        # Chunked, not one forward over all baselines.synth_n_episodes: the
+        # probe batch is collated whole, so a single model(sbatch) call scaled
+        # its activation memory with that config knob and OOM'd a 24GB card at
+        # synth_n_episodes=256. Numerically identical -- see _chunked_probe_nll.
+        parts_s = _chunked_probe_nll(model, cfg, sbatch, jitter, probe_chunk_size)
+        cop_s = parts_s["copula"]
+        mar_s = parts_s["marginal"]
+        tot_s = parts_s["total"]
         metrics[f"oracle_diag/kernel_fit/{family}/copula_nll"] = cop_s
         metrics[f"oracle_diag/kernel_fit/{family}/total_nll"]  = tot_s
         metrics[f"kernel_fit/{family}/marginal_nll"] = mar_s
@@ -3326,8 +3444,14 @@ def main(cfg: DictConfig) -> None:
                 gap_p90_str = f"{gap_p90:.4f}" if math.isfinite(gap_p90) else "n/a"
                 ceiling = metrics.get("y_nll_oracle_posterior", float("nan"))
                 ceiling_str = f"{ceiling:.4f}" if math.isfinite(ceiling) else "n/a"
+                # The model's own total Y-space NLL under the exact analytic
+                # marginal -- gap_post's other operand, and the same number
+                # now logged as val/y_nll_total_analytic_z.
+                tot_a = metrics.get("oracle_diag/total_nll", float("nan"))
+                tot_a_str = f"{tot_a:.4f}" if math.isfinite(tot_a) else "n/a"
                 print(
                     f"[{step:6d}] VAL(analytic)  "
+                    f"total={tot_a_str}  "
                     f"gap_post={gap_str} (p90={gap_p90_str})  "
                     f"corr_r={pearson_str}  "
                     f"{od_str}  "

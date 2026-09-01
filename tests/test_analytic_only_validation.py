@@ -108,8 +108,16 @@ def test_analytic_only_rejects_era5_live_source():
 class _FakeCopula(nn.Module):
     """Stand-in for CopulaTabICL: returns a low-rank (W, s) of the right shape.
 
-    Deliberately not a real model -- this test is about which metrics
-    validate() emits, not about their values.
+    Deliberately not a real model -- these tests are about which metrics
+    validate() emits and how they aggregate, not about their values.
+
+    W is a deterministic function of each episode's OWN x_test, never of a
+    per-call RNG. That matters for the chunking tests: a fake that reseeded a
+    generator per forward would produce a different W for
+    model(batch[0:2]) than for model(batch)[0:2], making chunked and
+    un-chunked results differ for a reason that has nothing to do with the
+    code under test. Any real model is slice-consistent in this sense (each
+    episode's output depends only on that episode), so the fake must be too.
     """
 
     def __init__(self, rank: int = 2):
@@ -119,11 +127,13 @@ class _FakeCopula(nn.Module):
         self.scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, batch):
-        n_test = batch["x_test"].shape[1]
-        b = batch["x_test"].shape[0]
-        g = torch.Generator().manual_seed(0)
-        W = torch.randn(b, n_test, self.rank, generator=g) * self.scale
-        s = torch.ones(b, n_test) * self.scale
+        x_test = batch["x_test"]                      # (B, N, d)
+        b, n_test = x_test.shape[0], x_test.shape[1]
+        # (B, N, 1) -> (B, N, rank) via a fixed per-column multiplier: bounded,
+        # varies across points and episodes, and depends on nothing else.
+        freqs = torch.arange(1, self.rank + 1, dtype=x_test.dtype, device=x_test.device)
+        W = torch.tanh(x_test[..., :1] * freqs) * self.scale
+        s = torch.ones(b, n_test, dtype=x_test.dtype, device=x_test.device) * self.scale
         return {"W": W, "s": s}
 
 
@@ -194,6 +204,19 @@ def test_validate_analytic_only_emits_oracle_diag_and_no_tabicl_keys(analytic_va
         or k.startswith("era5_fit/")
     ]
     assert forbidden == [], f"analytic-only run emitted non-analytic metrics: {forbidden}"
+
+    # The model's own Sklar decomposition is mirrored into val/ (these get a
+    # "val/" prefix in the training loop's wandb.log), so the val panel group
+    # isn't left empty in this mode. Suffixed to keep them off the same panel
+    # as a default-recipe run's TabICL-marginal val/y_nll_*.
+    for key in ("y_nll_total_analytic_z", "y_nll_copula_analytic_z", "y_nll_marginal_analytic_z"):
+        assert key in metrics, f"analytic-only run is missing {key}"
+        assert np.isfinite(metrics[key])
+    # Same numbers as oracle_diag/*, and Sklar-consistent.
+    assert metrics["y_nll_total_analytic_z"] == pytest.approx(metrics["oracle_diag/total_nll"])
+    assert metrics["y_nll_total_analytic_z"] == pytest.approx(
+        metrics["y_nll_copula_analytic_z"] + metrics["y_nll_marginal_analytic_z"], abs=1e-5,
+    )
 
 
 def test_validate_analytic_only_ignores_stale_tabicl_caches(analytic_val_setup):
@@ -292,6 +315,84 @@ def test_episode_posterior_ceiling_matches_gp_analytical_posterior(analytic_val_
     np.testing.assert_allclose(
         cached["off_R_post"], direct["R_post"].cpu().numpy()[ri, ci], rtol=1e-6,
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. Probe forward-pass chunking
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_probe_nll_equals_unchunked(analytic_val_setup):
+    """Chunking the probe forward pass must be a pure memory optimization.
+
+    The kernel_fit/<family> and posterior_probe batches are collated whole, so
+    a single model(batch) call made peak validation VRAM scale with
+    baselines.synth_n_episodes -- which OOM'd a 24GB card at 256 episodes
+    while passing on a 48GB one. _chunked_probe_nll reconstructs the exact
+    same mean by weighting each chunk by its valid-episode count (y_space_nll
+    averages over episodes with >= 1 test point), so every chunk size must
+    agree with the un-chunked value to float precision. If this drifts, the
+    curriculum signal drifts with it.
+    """
+    from train import _chunked_probe_nll
+    from loss import y_space_nll
+    from model import build_sigma
+
+    cfg, val_batches, _ = analytic_val_setup
+    model = _FakeCopula()
+    batch = val_batches[0]
+    n_episodes = batch["x_train"].shape[0]
+
+    with torch.no_grad():
+        out = model(batch)
+        Sigma = build_sigma(out, cfg, jitter=1e-4, test_mask=batch["test_mask"])
+        reference = y_space_nll(
+            Sigma, batch["z_test"].float(), batch["log_pdf_test"].float(), batch["test_mask"]
+        )
+
+    # Includes a chunk size that doesn't divide the batch evenly (3 into 4),
+    # the degenerate one-episode-at-a-time case, and one larger than the batch.
+    for chunk in (1, 2, 3, n_episodes, n_episodes + 5):
+        with torch.no_grad():
+            got = _chunked_probe_nll(model, cfg, batch, jitter=1e-4, chunk_size=chunk)
+        for key in ("total", "copula", "marginal"):
+            assert got[key] == pytest.approx(float(reference[key]), abs=1e-5), (
+                f"chunk_size={chunk} changed {key}: {got[key]} vs {float(reference[key])}"
+            )
+
+
+def test_probe_chunk_size_defaults_to_batch_size():
+    """The default has to be training.batch_size, not a fixed constant: that
+    is the one shape the training loop is already known to sustain on
+    whatever GPU the job landed on, so the probe fits by construction."""
+    from train import _resolve_probe_chunk_size
+
+    cfg = OmegaConf.create({"training": {"batch_size": 24}, "baselines": {"probe_chunk_size": None}})
+    assert _resolve_probe_chunk_size(cfg) == 24
+    cfg.baselines.probe_chunk_size = 4
+    assert _resolve_probe_chunk_size(cfg) == 4
+    # Absent baselines block at all (ad-hoc cfgs in tests//scripts).
+    assert _resolve_probe_chunk_size(OmegaConf.create({"training": {"batch_size": 8}})) == 8
+
+
+def test_probe_forward_chunks_covers_every_episode_once(analytic_val_setup):
+    """Off-by-one in the chunk offsets would silently pair a Sigma slice with
+    the wrong episode's cached ceiling in the posterior_probe block, producing
+    plausible-looking but meaningless correlation diagnostics."""
+    from train import _probe_forward_chunks
+
+    cfg, val_batches, _ = analytic_val_setup
+    model = _FakeCopula()
+    batch = val_batches[0]
+    n_episodes = batch["x_train"].shape[0]
+
+    for chunk in (1, 3, n_episodes + 5):
+        seen = []
+        with torch.no_grad():
+            for start, sub, Sigma in _probe_forward_chunks(model, cfg, batch, 1e-4, chunk):
+                assert Sigma.shape[0] == sub["x_train"].shape[0]
+                seen.extend(range(start, start + sub["x_train"].shape[0]))
+        assert seen == list(range(n_episodes)), f"chunk_size={chunk} gave indices {seen}"
 
 
 def test_episode_posterior_ceiling_returns_none_without_kernel_metadata(analytic_val_setup):

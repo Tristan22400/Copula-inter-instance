@@ -302,6 +302,19 @@ baselines:
   # is already called this many times per family in the kernel_fit/* loop above,
   # so the added per-validate() cost here is small by comparison.
   posterior_probe_n_episodes: ${training.val_episodes}
+  # Episodes per forward pass when validate() scores the kernel_fit/<family>
+  # and posterior_probe batches. Those are collated as ONE batch of
+  # synth_n_episodes / posterior_probe_n_episodes episodes, so before this
+  # existed a single model(batch) call made peak validation VRAM scale with
+  # those knobs -- at probe_N_max=1024 test points per episode, 256 episodes
+  # OOM'd a 24GB card while fitting on a 48GB one, i.e. the config silently
+  # depended on which GPU the scheduler handed you. null (default) uses
+  # training.batch_size: a shape the training loop already sustains every
+  # step on this GPU, so it fits by construction. Aggregation across chunks
+  # is exact (see train.py::_chunked_probe_nll), so this only trades a little
+  # wall time for memory -- it changes no reported number. Lower it only if
+  # validation still OOMs; raising it above batch_size buys almost nothing.
+  probe_chunk_size: null
   # Context/test-set sizes for the probe, pinned independent of this run's own
   # conf/data/gp_tasks.yaml P_min/P_max/N_min/N_max (which do change between
   # runs) so kernel_fit/<family>/* stays a fixed, cross-run-comparable

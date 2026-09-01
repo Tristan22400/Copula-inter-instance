@@ -55,6 +55,32 @@ baselines:
   # metric is out of scope here. val_analytic_only already skips the probes;
   # this also skips paying their one-time fetch/PIT cost at startup.
   era5_enabled: false
+
+  # Fixed context/test sizes for the per-family probes, matching the training
+  # distribution's own P_min=P_max=32 / N_min=N_max=256 exactly.
+  #
+  # conf/config.yaml's defaults span RANGES (probe_P 32..512, probe_N 8..1024).
+  # Each family draws one (P, N) from those ranges, fixed by synth_seed, so
+  # each family's curve is already stable across steps -- but the families
+  # differ from each other, and per-point NLL depends strongly on N. That made
+  # oracle_diag/kernel_fit/<family>/gap_nll non-comparable ACROSS families,
+  # which is a problem here specifically because those gaps are what
+  # training.adaptive_kernel_sampling reweights on: a family would get sampled
+  # more for having drawn a larger N, not for being harder. Pinning all
+  # families to one shape makes the curriculum compare like with like.
+  #
+  # It also makes validation memory deterministic. probe_N_max=1024 with
+  # synth_n_episodes=256 is what OOM'd a 24GB card before the probe forward
+  # was chunked (baselines.probe_chunk_size); pinning N removes the remaining
+  # run-to-run variance in validation peak memory entirely.
+  #
+  # Hardcoded, NOT interpolated from cfg.data: the probes are meant to stay a
+  # fixed cross-run benchmark even when the training data config changes (see
+  # conf/config.yaml's probe_* comment). They happen to coincide today.
+  probe_P_min: 32
+  probe_P_max: 32
+  probe_N_min: 256
+  probe_N_max: 256
   # The adaptive-sampling signal is measured on a FIXED per-family probe set
   # (baselines.synth_seed), so it is low-variance across steps but is only as
   # representative of each kernel family as its sample size. 64 is tuned for a
