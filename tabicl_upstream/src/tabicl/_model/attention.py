@@ -18,6 +18,18 @@ except ImportError:
 
 _use_flash_attn3 = True
 
+# CUDA caps the grid dimension that both the mem-efficient/math SDPA kernels
+# and FlashAttention-3's varlen kernel map the flattened batch onto at 65535
+# (a hardware limit, not a PyTorch one). Beyond that, F.scaled_dot_product_
+# attention/flash_attn3 fail with `cudaErrorInvalidConfiguration` instead of a
+# helpful Python-level error. sdpa_with_flattened_batch flattens arbitrary
+# leading batch dims (e.g. (num_tables, num_rows) for row-wise attention) into
+# one, so that flattened size can exceed the limit even when neither original
+# dim looks large on its own (e.g. 512 tables * 128 rows = 65536). Chunk along
+# the flattened batch dim to stay under it — each chunk is an independent
+# batch of attention problems, so this is exactly equivalent to one big call.
+_MAX_SDPA_FLAT_BATCH = 65535
+
 
 @contextmanager
 def flash_attn3_toggle(enabled: bool):
@@ -95,6 +107,33 @@ def sdpa_with_flattened_batch(
         src_len = k.size(-2)
         q = ssmax_layer(q, src_len)
 
+    flat_bs = q.shape[0]
+    if flat_bs > _MAX_SDPA_FLAT_BATCH:
+        outs = []
+        for start in range(0, flat_bs, _MAX_SDPA_FLAT_BATCH):
+            end = min(start + _MAX_SDPA_FLAT_BATCH, flat_bs)
+            outs.append(
+                _sdpa_flat_batch_chunk(
+                    q[start:end],
+                    k[start:end],
+                    v[start:end],
+                    None if attn_mask is None else attn_mask[start:end],
+                    dropout_p,
+                )
+            )
+        out = torch.cat(outs, dim=0)
+    else:
+        out = _sdpa_flat_batch_chunk(q, k, v, attn_mask, dropout_p)
+
+    return out.view(q_shape)
+
+
+def _sdpa_flat_batch_chunk(
+    q: Tensor, k: Tensor, v: Tensor, attn_mask: Optional[Tensor], dropout_p: float
+) -> Tensor:
+    """Runs FlashAttention-3 (if eligible) or ``F.scaled_dot_product_attention``
+    on a single chunk whose flattened batch dim is already <= _MAX_SDPA_FLAT_BATCH."""
+
     # FlashAttn3 doesn't support dropout and custom attention mask
     if HAS_FLASH_ATTN3 and _use_flash_attn3 and q.is_cuda and attn_mask is None and dropout_p == 0.0:
         # FlashAttention only supports fp16, bf16, and fp8_e4m3
@@ -117,7 +156,7 @@ def sdpa_with_flattened_batch(
     else:
         out = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p)
 
-    return out.view(q_shape)
+    return out
 
 
 def multi_head_attention_forward(

@@ -1,7 +1,8 @@
 #!/bin/bash
 #OAR -n TabICL_Train
 #OAR -l gpu=1,walltime=36:00:00
-#OAR -p gpu_model != 'TITAN RTX' AND gpu_model != 'TitanRTX'
+#OAR -p gpu_model != 'TITAN RTX' AND gpu_model != 'TitanRTX' AND gpu_model != 'Quadro RTX 8000' AND gpu_model != 'L4' AND gpu_model != 'NVIDIA L4'
+#OAR -q p1
 
 
 set -euo pipefail
@@ -10,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR/.."
 
-FORBIDDEN_GPU_REGEX="${FORBIDDEN_GPU_REGEX:-TITAN[[:space:]]*RTX|TitanRTX}"
+FORBIDDEN_GPU_REGEX="${FORBIDDEN_GPU_REGEX:-TITAN[[:space:]]*RTX|TitanRTX|Quadro[[:space:]]*RTX[[:space:]]*8000|(^|[^0-9A-Za-z])L4($|[^0-9A-Za-z])}"
 
 configure_cuda_devices() {
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -92,6 +93,12 @@ else
     export PYTHONPATH="$(pwd)"
 fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The frozen-TabICL-marginal load (z_train sim-to-real diagnostic) does a HEAD
+# request to huggingface.co to check for updates even though the checkpoint is
+# already fully cached locally; that request has been taking 60-100s+ on this
+# cluster's network. Skip it and read straight from cache. Unset/override
+# HF_HUB_OFFLINE=0 before calling this script if a checkpoint isn't cached yet.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 echo "Starting Training... (Job ID: ${OAR_JOB_ID:-local})"
 if [[ "${TRAIN_SH_DRY_RUN:-0}" == "1" ]]; then

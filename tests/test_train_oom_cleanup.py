@@ -8,6 +8,7 @@ import weakref
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch import nn
 
 import train
@@ -39,7 +40,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
     }
     graph_ref = {}
 
-    def fake_correlation(W, _s, _mask, jitter):
+    def fake_correlation(W, _s, _mask, jitter, **_kwargs):
         graph_ref["tensor"] = weakref.ref(W)
         return W[..., :1] @ W[..., :1].transpose(-1, -2)
 
@@ -86,3 +87,69 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
     optimizer.zero_grad(set_to_none=True)
     gc.collect()
     assert graph_ref["tensor"]() is None
+
+
+def _fake_device_properties(total_gb: float):
+    class _Props:
+        total_memory = total_gb * 1e9
+
+    return lambda _device: _Props()
+
+
+def test_reserve_headroom_noop_when_tabicl_not_live(monkeypatch):
+    """No live-generation TabICL workers -> nothing should cap this process."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
+    cfg = OmegaConf.create({"data": {"z_train_source": "analytic", "z_train_tabicl_mix_enabled": False}})
+    t = OmegaConf.create({"live_tabicl_num_workers": 2})
+    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    assert calls == []
+
+
+def test_reserve_headroom_noop_on_cpu(monkeypatch):
+    """TabICL mix enabled but device=cpu (no GPU workers to protect) -> no-op."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
+    cfg = OmegaConf.create({"data": {"z_train_tabicl_mix_enabled": True}})
+    t = OmegaConf.create({"live_tabicl_num_workers": 2})
+    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cpu")
+    assert calls == []
+
+
+def test_reserve_headroom_noop_when_zero_workers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
+    cfg = OmegaConf.create({"data": {"z_train_source": "tabicl"}})
+    t = OmegaConf.create({"live_tabicl_num_workers": 0})
+    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    assert calls == []
+
+
+def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
+    """2 workers * 2.5GB + 1.0GB flat = 6GB headroom on a 24GB card -> 75%."""
+    captured = {}
+    monkeypatch.setattr(
+        torch.cuda, "set_per_process_memory_fraction",
+        lambda frac, dev: captured.update(fraction=frac, device=dev),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
+    cfg = OmegaConf.create({"data": {"z_train_tabicl_mix_enabled": True}})
+    t = OmegaConf.create({"live_tabicl_num_workers": 2})
+    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    assert captured["device"] == 0
+    assert captured["fraction"] == pytest.approx(0.75)
+
+
+def test_reserve_headroom_clamps_fraction_floor(monkeypatch):
+    """A huge worker count shouldn't starve this process itself below 50%."""
+    captured = {}
+    monkeypatch.setattr(
+        torch.cuda, "set_per_process_memory_fraction",
+        lambda frac, dev: captured.update(fraction=frac, device=dev),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
+    cfg = OmegaConf.create({"data": {"z_train_source": "tabicl_split"}})
+    t = OmegaConf.create({"live_tabicl_num_workers": 50})
+    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    assert captured["fraction"] == pytest.approx(0.5)

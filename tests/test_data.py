@@ -12,7 +12,9 @@ Tests verify:
 
 from __future__ import annotations
 
+import math
 import random
+import warnings
 
 import pytest
 import torch
@@ -22,8 +24,10 @@ from data_gen import (
     ALL_KERNELS,
     _CATEGORY_OPS,
     _DEFAULT_CATEGORY_WEIGHTS,
+    _generate_gp_batch_raw,
     _kernel_needs_scalar_input,
     _sample_mean_module,
+    _sample_structural_category_mask,
     _sample_structural_ops,
     _structural_warp_column,
     _STRUCTURAL_CATEGORIES,
@@ -36,7 +40,7 @@ from data_gen import (
     sigma_to_correlation,
     tabiclv2_warp_features,
 )
-from dataset import CopulaDataset, collate_fn
+from dataset import CopulaDataset, _add_derived_fields, collate_fn
 
 # ---------------------------------------------------------------------------
 # tabiclv2_warp_features tests
@@ -283,6 +287,76 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
         f"{kernel_name}: degenerate/trivial, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
+
+
+@pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
+def test_periodic_and_cosine_period_recoverable_in_r_star(small_cfg, kernel_name):
+    """R_star for a bare periodic/cosine episode must equal the exact
+    analytic kernel formula reconstructed from the episode's own recorded
+    active column, l/period, alpha2 and nugget -- not merely "some" valid
+    correlation matrix. This is the regression net for a wrong active-
+    column index or a recorded l/period that doesn't actually match what
+    was baked into the gpytorch kernel R_star was drawn from.
+
+    Formulas (gpytorch v1.15.2; ScaleKernel(base) with outputscale=alpha2):
+      periodic: base(x1, x2) = exp(-2 sin^2(pi (x1-x2) / period) / l)
+      cosine:   base(x1, x2) = cos(pi (x1 - x2) / period_length)
+                (period_length is stored under the "l" schema key for
+                cosine -- see _kernel_prior_spec's lengthscale_attr; cosine
+                has no separate "period" entry at all)
+    Sigma_star = K_ss carries the likelihood's +nugget on its diagonal only
+    (GaussianLikelihood adds noise to the diagonal, not off-diagonal), so
+    R_star's off-diagonal is the bare kernel value scaled by
+    alpha2 / (alpha2 + nugget) relative to the diagonal.
+    """
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+
+    torch.manual_seed(abs(hash(kernel_name)) % (2**31))
+    for i in range(10):
+        cfg.seed = i
+        task = generate_gp_task(cfg)
+
+        col = task["kernel_feature_indices"][0].item()
+        x = task["x_norm_test"][:, col]
+        diff = x.unsqueeze(0) - x.unsqueeze(1)  # (N, N)
+
+        alpha2 = task["alpha2"].item()
+        nugget = task["nugget"].item()
+
+        if kernel_name == "periodic":
+            l = task["l"].item()
+            period = task["period"].item()
+            base = torch.exp(-2.0 * torch.sin(math.pi * diff / period) ** 2 / l)
+        else:  # cosine: "l" holds period_length (see _kernel_prior_spec)
+            period = task["l"].item()
+            base = torch.cos(math.pi * diff / period)
+
+        R_theory = base * (alpha2 / (alpha2 + nugget))
+        R_theory.fill_diagonal_(1.0)
+
+        max_diff = (R_theory - task["R_star"]).abs().max().item()
+        assert torch.allclose(R_theory, task["R_star"], atol=1e-4), (
+            f"{kernel_name}: R_star doesn't match the analytic kernel formula "
+            f"reconstructed from the recorded active column/l/period/alpha2/"
+            f"nugget (max abs diff={max_diff:.6g})"
+        )
+
+        # Sanity check the test itself isn't vacuous: a deliberately wrong
+        # period must NOT reproduce R_star, so an active-column/period bug
+        # would actually be caught by the assertion above.
+        wrong_period = period * 1.7 + 0.3
+        if kernel_name == "periodic":
+            wrong_base = torch.exp(-2.0 * torch.sin(math.pi * diff / wrong_period) ** 2 / l)
+        else:
+            wrong_base = torch.cos(math.pi * diff / wrong_period)
+        wrong_R = wrong_base * (alpha2 / (alpha2 + nugget))
+        wrong_R.fill_diagonal_(1.0)
+        assert not torch.allclose(wrong_R, task["R_star"], atol=1e-4), (
+            f"{kernel_name}: test is vacuous -- a wrong period still matches R_star"
+        )
 
 
 def test_kernel_needs_scalar_input_handles_n_way_chains():
@@ -565,10 +639,8 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     real_raw = dg._generate_gp_batch_raw
     state = {"n_calls": 0}
 
-    def truncating_raw(cfg, B, device="cpu", *, return_kernel_metadata=False, d_override=None):
-        episodes = real_raw(
-            cfg, B, device, return_kernel_metadata=return_kernel_metadata, d_override=d_override
-        )
+    def truncating_raw(cfg, B, device="cpu", **kwargs):
+        episodes = real_raw(cfg, B, device, **kwargs)
         state["n_calls"] += 1
         if state["n_calls"] == 1:
             episodes = episodes[:-5]  # force a shortfall so top-up fires
@@ -581,6 +653,130 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     assert len(episodes) == 20
     d_set = {ep["x_norm_train"].shape[-1] for ep in episodes}
     assert len(d_set) == 1, f"top-up round used a different d_features than round 0: {d_set}"
+
+
+def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
+    """generate_pit_dataset.py's _generate_shard_with_oom_retry splits one
+    shard's generation across multiple generate_gp_batch calls when a chunk
+    hits CUDA OOM (or a transient cusolver/cublas error) and must reuse the
+    first successful chunk's d_features on every retry chunk, the same way
+    generate_gp_batch already pins d_features across its own internal
+    top-up rounds (test_topup_round_reuses_first_round_d_features above) --
+    without the pin, each retry chunk independently samples its own d.
+
+    Regression: this exact path (not the top-up-round path already covered
+    above) left 7/140 shards in a live systematic-composition-all-base
+    dataset run with internally-mixed d_features (e.g. one shard mixing
+    d=5 and d=9), each later crashing training with collate_fn's "mixed
+    feature counts" error -- ShardHomogeneousBatchSampler assumes every
+    shard is feature-homogeneous and doesn't verify it."""
+    import generate_pit_dataset as gpd
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
+    cfg.data.d_features_lognormal_scale = 0.4
+    cfg.seed = 123
+
+    real_generate_gp_batch = dg.generate_gp_batch
+    state = {"n_calls": 0}
+
+    def oom_first_chunk(cfg, B, device="cpu", **kwargs):
+        state["n_calls"] += 1
+        if state["n_calls"] == 1:
+            raise torch.cuda.OutOfMemoryError("synthetic OOM")
+        return real_generate_gp_batch(cfg, B, device, **kwargs)
+
+    monkeypatch.setattr(gpd, "generate_gp_batch", oom_first_chunk)
+
+    episodes = gpd._generate_shard_with_oom_retry(
+        cfg, n_this=20, device="cpu", tabicl_model=None, tabicl_k_folds=10,
+    )
+    assert state["n_calls"] > 1, "test setup didn't actually trigger a retry chunk"
+    assert len(episodes) == 20
+    d_set = {ep["x_norm_train"].shape[-1] for ep in episodes}
+    assert len(d_set) == 1, f"retry chunk used a different d_features than the first chunk: {d_set}"
+
+
+def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeypatch):
+    """_generate_gp_batch_raw must catch torch.linalg.LinAlgError the same
+    way it already catches gpytorch's NotPSDError -- discard the whole
+    B-episode batch and let generate_gp_batch's top-up loop resample,
+    instead of propagating and killing the worker process.
+
+    Regression: gpytorch's add_low_rank -> root_decomposition -> _symeig
+    path could raise torch.linalg.LinAlgError (LAPACK eigh failing to
+    converge on an ill-conditioned matrix) instead of NotPSDError out of
+    kernel evaluation -- only NotPSDError was caught, so this exception type
+    killed live generation workers (job 3000710, worker 2, 4 times before
+    the worker gave up for good).
+
+    _build_kernel_chain/_sample_episode_kernel now combine composite kernels
+    via _DenseComposedKernel (dense tensor +/*, not gpytorch's
+    Kernel.__add__/__mul__), which structurally prevents add_low_rank's
+    RootLinearOperator trigger from ever firing -- so this specific
+    non-convergence can no longer be produced for real. The exception
+    handling around kernel evaluation (_evaluate_kernel_dense, called from
+    _generate_gp_batch_raw) is kept as defence in depth regardless, and this
+    test poisons that seam directly rather than relying on triggering a
+    genuine LAPACK failure."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.seed = 11
+
+    real_evaluate_kernel_dense = dg._evaluate_kernel_dense
+    state = {"n_calls": 0}
+
+    def poisoned_evaluate_kernel_dense(kernel_obj, x_norm):
+        state["n_calls"] += 1
+        if state["n_calls"] == 1:
+            raise torch.linalg.LinAlgError(
+                "linalg.eigh: synthetic non-convergence for test"
+            )
+        return real_evaluate_kernel_dense(kernel_obj, x_norm)
+
+    monkeypatch.setattr(dg, "_evaluate_kernel_dense", poisoned_evaluate_kernel_dense)
+
+    episodes = dg.generate_gp_batch(cfg, B=6, device="cpu")
+    assert state["n_calls"] > 1, "test setup didn't actually trigger a retry"
+    assert len(episodes) == 6
+
+
+def test_is_transient_cusolver_error_covers_tabicl_contention_errors():
+    """_is_transient_cusolver_error must also flag the two RuntimeError
+    messages seen from tabicl's InferenceManager under the same
+    concurrent-GEN_WORKERS GPU contention window as the cusolver/cublas
+    races it already retries, and must NOT flag a genuine unrelated
+    RuntimeError as transient.
+
+    Regression: job 3000709, worker 2 hit "CPU memory allocation failed
+    (CUDA error: invalid argument...) and disk offload is not available"
+    from tabicl's pinned-CPU-alloc fallback, then on a later attempt
+    "Expected all tensors to be on the same device, ... cuda:0 and cpu" out
+    of tabicl's quantile_dist.cdf -- neither matched "cusolver"/"cublas",
+    so both propagated straight out of _generate_shard_with_oom_retry and
+    killed the process; the worker was still dead hours later since
+    scripts/generate_dataset.sh's outer restart budget (5 attempts) was
+    exhausted by the repeated crash."""
+    import generate_pit_dataset as gpd
+
+    assert gpd._is_transient_cusolver_error(
+        RuntimeError(
+            "CPU memory allocation failed (CUDA error: invalid argument) "
+            "and disk offload is not available."
+        )
+    )
+    assert gpd._is_transient_cusolver_error(
+        RuntimeError(
+            "Expected all tensors to be on the same device, but found at "
+            "least two devices, cuda:0 and cpu!"
+        )
+    )
+    assert not gpd._is_transient_cusolver_error(RuntimeError("index out of range"))
+    assert not gpd._is_transient_cusolver_error(torch.cuda.OutOfMemoryError("oom"))
 
 
 def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
@@ -628,6 +824,145 @@ def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
     for ep in episodes:
         assert torch.isfinite(ep["z_train"]).all()
         assert torch.isfinite(ep["y_train"]).all()
+
+
+@pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
+def test_degenerate_active_kernel_column_is_discarded_not_leaked(small_cfg, kernel_name, monkeypatch):
+    """periodic/cosine are always capped to a single active dim (k=1, see
+    generate_gp_batch's kernel_cols selection), so if that one column ever
+    collapses to a near-constant value -- observed via more than one
+    independent upstream cause: a structural-warp "censor" quantile-index
+    collision (now guarded directly in _structural_warp_column) and
+    mlp_mixing's ReLU/sigmoid saturating a unit to one value for every point
+    (ordinary "dead ReLU" behaviour, not itself a bug) -- the kernel's r=0
+    for every pair and R_star silently becomes a constant, uninformative
+    correlation matrix that still passes the existing PSD/Cholesky/LOO-z
+    discard checks (a constant matrix plus nugget is perfectly well-behaved
+    numerically). Same discard-and-regenerate pattern as
+    test_degenerate_loo_z_is_discarded_not_leaked, but poisoning
+    tabiclv2_warp_features directly (collapsing every column of one episode)
+    instead of relying on any single op's failure probability, so this stays
+    a regression net regardless of which upstream stage is the cause."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.systematic_composition = False
+    cfg.seed = 3
+
+    real_tabiclv2 = dg.tabiclv2_warp_features
+    state = {"poisoned": False}
+
+    def poisoning_tabiclv2(x, seed=None):
+        out = real_tabiclv2(x, seed=seed)
+        if not state["poisoned"]:
+            state["poisoned"] = True
+            out = out.clone()
+            out[0, :, :] = 0.0  # collapse every column of episode 0 to a constant
+        return out
+
+    monkeypatch.setattr(dg, "tabiclv2_warp_features", poisoning_tabiclv2)
+
+    with pytest.warns(RuntimeWarning, match="degenerate .*active kernel column"):
+        episodes = dg.generate_gp_batch(cfg, B=8, device="cpu", return_kernel_metadata=True)
+
+    assert state["poisoned"], "test setup didn't actually poison an episode's feature columns"
+    assert len(episodes) == 8
+    for ep in episodes:
+        col = int(ep["kernel_feature_indices"][0])
+        x = torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)
+        assert float(x[:, col].std()) > 1e-4, (
+            f"{kernel_name}: a degenerate active kernel column reached the returned episodes"
+        )
+
+
+def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeypatch):
+    """Generalisation of test_degenerate_active_kernel_column_is_discarded_not_leaked
+    to kernels with k>1 active dims (e.g. rbf): if EVERY active column
+    collapses to a near-constant value, the kernel has no dimension left to
+    vary on and R_star degenerates the same way the k=1 (periodic/cosine)
+    case does, so this must still be caught and discarded. Forces a fixed
+    3-of-4 active-dims subset via monkeypatching _sample_active_dims (rather
+    than relying on the random inactive_frac draw), then poisons all three
+    active columns of episode 0 to a constant."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+    cfg.seed = 3
+
+    monkeypatch.setattr(dg, "_sample_active_dims", lambda d_total, cfg: [0, 1, 2])
+
+    real_tabiclv2 = dg.tabiclv2_warp_features
+    state = {"poisoned": False}
+
+    def poisoning_tabiclv2(x, seed=None):
+        out = real_tabiclv2(x, seed=seed)
+        if not state["poisoned"]:
+            state["poisoned"] = True
+            out = out.clone()
+            out[0, :, [0, 1, 2]] = 0.0  # collapse every active column of episode 0
+        return out
+
+    monkeypatch.setattr(dg, "tabiclv2_warp_features", poisoning_tabiclv2)
+
+    with pytest.warns(RuntimeWarning, match="degenerate .*active kernel column"):
+        episodes = dg.generate_gp_batch(cfg, B=8, device="cpu", return_kernel_metadata=True)
+
+    assert state["poisoned"], "test setup didn't actually poison an episode's feature columns"
+    assert len(episodes) == 8
+    for ep in episodes:
+        cols = ep["kernel_feature_indices"].tolist()
+        x = torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)
+        assert max(float(x[:, c].std()) for c in cols) > 1e-4, (
+            "rbf: an episode with every active column collapsed reached the returned episodes"
+        )
+
+
+def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch):
+    """Mirror of test_multi_dim_active_kernel_fully_collapsed_is_discarded:
+    collapsing only ONE of several active columns (others still vary) is
+    reduced effective dimensionality, not a broken episode -- rbf/matern-style
+    kernels still produce a non-constant R_star through their remaining
+    active dims. This must NOT be discarded, unlike the fully-collapsed case
+    above and the k=1 periodic/cosine case."""
+    import data_gen as dg
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = "rbf"
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+    cfg.seed = 3
+
+    monkeypatch.setattr(dg, "_sample_active_dims", lambda d_total, cfg: [0, 1, 2])
+
+    real_tabiclv2 = dg.tabiclv2_warp_features
+    state = {"poisoned": False}
+
+    def poisoning_tabiclv2(x, seed=None):
+        out = real_tabiclv2(x, seed=seed)
+        if not state["poisoned"]:
+            state["poisoned"] = True
+            out = out.clone()
+            out[0, :, 0] = 0.0  # collapse only ONE of the three active columns
+        return out
+
+    monkeypatch.setattr(dg, "tabiclv2_warp_features", poisoning_tabiclv2)
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        episodes = dg.generate_gp_batch(cfg, B=8, device="cpu", return_kernel_metadata=True)
+    degen_warns = [str(w.message) for w in rec if "active kernel column" in str(w.message)]
+
+    assert state["poisoned"], "test setup didn't actually poison an episode's feature columns"
+    assert not degen_warns, f"partial collapse should not be discarded, got: {degen_warns}"
+    assert len(episodes) == 8
+    stds = [float(torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)[:, 0].std()) for ep in episodes]
+    assert min(stds) < 1e-4, (
+        "the partially-collapsed episode should have been kept, not discarded/regenerated away"
+    )
 
 
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
@@ -1118,14 +1453,25 @@ def test_structural_warp_prob_one_changes_output(small_cfg):
 def test_structural_warp_partial_gate_leaves_some_columns_unwarped(small_cfg):
     """0 < structural_warp_prob < 1 over a large-enough batch should leave at
     least one episode identical to its pre-warp input and at least one
-    changed — verifies the per-(episode, column) Bernoulli gate."""
+    changed — verifies the per-(episode, column) Bernoulli gate.
+
+    B=500 (not a smaller round number): with d_features=6 independent
+    Bernoulli(0.5) gates per episode, P(all 6 columns gate in) = 1/64, so a
+    fully-unwarped episode is a ~1/64 event -- B=64 makes "zero unwarped
+    episodes this run" plausible by chance alone (~37% at that B), which is
+    a property of the RNG draw order/count, not of the gate rate itself (see
+    apply_structural_feature_warp's docstring: the batched implementation
+    consumes the RNG in a different order/count than a naive per-column
+    loop would, by design). B=500 drives that false-negative chance below
+    1e-3 while still exercising the real gate.
+    """
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
     cfg.data.structural_warp_enabled = True
     cfg.data.structural_warp_prob = 0.5
 
     torch.manual_seed(0)
-    B = 64
+    B = 500
     x = torch.randn(B, 32, cfg.data.d_features)
     out = apply_structural_feature_warp(x.clone(), cfg, "cpu")
     n_unchanged = sum(torch.equal(out[b], x[b]) for b in range(B))
@@ -1214,6 +1560,103 @@ def test_structural_warp_num_ops_defaults_match_tempopfn(small_cfg):
     assert weights == _DEFAULT_CATEGORY_WEIGHTS
 
 
+def test_structural_warp_batched_category_selection_matches_per_column_marginals():
+    """_sample_structural_category_mask (the batched, vectorised category
+    selector apply_structural_feature_warp now uses) must draw from the same
+    per-category selection frequency and same [num_ops_min, num_ops_max]
+    category-count law as _sample_structural_ops (the original per-column
+    loop, still used directly by the resample_artifact fallback and exercised
+    by test_structural_warp_ops_sampled_without_replacement /
+    test_structural_warp_category_weights_zero_excludes_category above) --
+    the two are expected to differ in RNG draw order/count (see
+    apply_structural_feature_warp's docstring), but must realize the exact
+    same distribution. Compares empirical per-category selection rates over
+    many draws with a generous tolerance (this is a statistical check, not
+    an exact-count one)."""
+    torch.manual_seed(0)
+    n_draws = 20000
+    num_ops_min, num_ops_max = 2, 6
+
+    old_counts = {c: 0 for c in _STRUCTURAL_CATEGORIES}
+    old_k = []
+    for _ in range(n_draws):
+        ops = _sample_structural_ops(_DEFAULT_CATEGORY_WEIGHTS, num_ops_min, num_ops_max)
+        op_to_category = {op: cat for cat, ops_in_cat in _CATEGORY_OPS.items() for op in ops_in_cat}
+        cats = {op_to_category[op] for op in ops}
+        for c in cats:
+            old_counts[c] += 1
+        old_k.append(len(cats))
+
+    chosen_mask, eligible = _sample_structural_category_mask(
+        n_draws, _DEFAULT_CATEGORY_WEIGHTS, num_ops_min, num_ops_max, "cpu"
+    )
+    new_counts = {c: int(chosen_mask[:, i].sum()) for i, c in enumerate(eligible)}
+    new_k = chosen_mask.sum(dim=1).tolist()
+
+    for c in _STRUCTURAL_CATEGORIES:
+        old_rate = old_counts[c] / n_draws
+        new_rate = new_counts[c] / n_draws
+        assert abs(old_rate - new_rate) < 0.02, (
+            f"{c}: per-column rate={old_rate:.3f} vs batched rate={new_rate:.3f}"
+        )
+
+    old_mean_k = sum(old_k) / len(old_k)
+    new_mean_k = sum(new_k) / len(new_k)
+    assert abs(old_mean_k - new_mean_k) < 0.05, (
+        f"mean #categories selected: per-column={old_mean_k:.3f} vs batched={new_mean_k:.3f}"
+    )
+
+
+def test_structural_warp_batch_is_deterministic_given_seed():
+    """apply_structural_feature_warp must still be a pure function of
+    torch's global RNG state (same seed -> same output), even though the
+    vectorised implementation consumes that RNG in a different order/count
+    than the old per-column loop did -- this is the property
+    train.py::_compute_tabicl_z_train_gap's analytic-vs-tabicl paired-call
+    seeding contract (see _generate_gp_batch_raw's docstring) actually
+    depends on, not byte-identical output vs. the pre-vectorisation
+    implementation."""
+    cfg = OmegaConf.create({"data": {
+        "structural_warp_enabled": True, "structural_warp_prob": 0.5, "d_features": 6,
+    }})
+
+    torch.manual_seed(7)
+    x1 = torch.randn(16, 32, 6)
+    torch.manual_seed(7)
+    x2 = torch.randn(16, 32, 6)
+    assert torch.equal(x1, x2)  # sanity: the two seeds really do reproduce the same input
+
+    torch.manual_seed(123)
+    out1 = apply_structural_feature_warp(x1.clone(), cfg, "cpu")
+    torch.manual_seed(123)
+    out2 = apply_structural_feature_warp(x2.clone(), cfg, "cpu")
+    assert torch.equal(out1, out2)
+
+
+def test_generate_gp_batch_raw_structural_warp_seed_pairing_contract(small_cfg):
+    """train.py::_compute_tabicl_z_train_gap calls _generate_gp_batch_raw
+    TWICE at the identical cfg.seed -- once analytic (tabicl_model=None),
+    once with a stand-in override -- relying on both calls drawing
+    byte-identical x/kernel/hyperparameters and differing ONLY in z_train
+    (see that function's docstring). apply_structural_feature_warp runs
+    identically in both calls (it doesn't touch z_train), so this must still
+    hold now that it's vectorised: two full analytic _generate_gp_batch_raw
+    calls at the same seed, with structural warping forced on, must be
+    byte-identical to each other in every field."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 6
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 0.5
+    cfg.seed = 999
+
+    eps1 = _generate_gp_batch_raw(cfg, 8, device="cpu")
+    eps2 = _generate_gp_batch_raw(cfg, 8, device="cpu")
+    assert len(eps1) == len(eps2) and len(eps1) > 0
+    for e1, e2 in zip(eps1, eps2):
+        for key in e1:
+            assert torch.equal(e1[key], e2[key]), f"field '{key}' differs across same-seed calls"
+
+
 # Explicit (category, op) pairs, since categories have different arities.
 _ALL_OPS = [(cat, op) for cat, ops in _CATEGORY_OPS.items() for op in ops]
 
@@ -1232,6 +1675,105 @@ def test_structural_warp_op_preserves_shape_and_finite_direct(category, op, use_
     assert out.shape == col.shape
     assert out.dtype == col.dtype
     assert torch.isfinite(out).all()
+
+
+def test_structural_warp_censor_never_collapses_whole_column():
+    """censor picks two random quantile FRACTIONS but indexes into a
+    discrete sorted array (int(q * (T-1))) -- for small T, many distinct
+    (q_low, q_high) pairs round to the very same index, so lo == hi and
+    clamp(min=lo, max=hi) used to flatten the ENTIRE column to one constant
+    instead of just clipping its tails. Regression for the missing guard
+    (quantize already has the equivalent lo==hi check just below this)."""
+    torch.manual_seed(0)
+    n_collapsed = 0
+    n_trials = 0
+    for T in (4, 8, 16, 32, 64):
+        for _ in range(500):
+            col = torch.randn(T)
+            out = _structural_warp_column(col.clone(), "censor")
+            n_trials += 1
+            if float(out.std()) < 1e-9:
+                n_collapsed += 1
+    assert n_collapsed == 0, (
+        f"{n_collapsed}/{n_trials} censor calls collapsed the whole column to a constant"
+    )
+
+
+def test_structural_warp_differential_flat_derivative_does_not_collapse_column(monkeypatch):
+    """differential's rescale step ((raw - r_min) / clamp(denom, 1e-8) * range + s_min)
+    divides a numerically-zero numerator by a floor-clamped denominator whenever the
+    derivative signal (`raw`) comes out perfectly flat -- the same "whole column
+    flattens to one constant" failure shape as the censor lo==hi bug this mirrors,
+    just triggered by a flat derivative instead of a quantile-index collision. An
+    empirical sweep (20k+ trials over continuous, linear-ramp, and heavily-quantized
+    columns) never produced a flat `raw` through this op's normal random dispatch, so
+    unlike censor this isn't reachable through everyday random input -- it's forced
+    here directly by patching the derivative convolution to return a constant tensor,
+    confirming the op no-ops (returns the column unchanged) instead of collapsing a
+    column that has genuine variance."""
+    torch.manual_seed(0)
+    col = torch.randn(64)  # T=64 -> k = max(3, 64 // 32) = 3
+
+    real_conv1d = torch.nn.functional.conv1d
+    calls = {"n": 0}
+
+    def patched_conv1d(inp, weight, *args, **kwargs):
+        calls["n"] += 1
+        out = real_conv1d(inp, weight, *args, **kwargs)
+        # Call #1 is the box-smoothing conv (must stay real, or `raw` never even
+        # reaches the derivative kernel below); call #2 is the derivative kernel
+        # conv (sk) for whichever of sub_op in {1, 2} gets chosen -- forcing that
+        # one flat reproduces "differentiating an already-flat/linear signal".
+        if calls["n"] == 2:
+            return torch.zeros_like(out)
+        return out
+
+    monkeypatch.setattr(torch.nn.functional, "conv1d", patched_conv1d)
+    monkeypatch.setattr(torch, "randint", lambda *a, **k: torch.tensor([2]))  # force sub_op=2
+
+    out = _structural_warp_column(col.clone(), "differential")
+    assert calls["n"] == 2, "test setup didn't reach the derivative conv -- sub_op wasn't forced"
+    assert torch.isfinite(out).all()
+    assert torch.equal(out, col), (
+        "a flat derivative signal should leave a genuinely-varying column unchanged, "
+        "not collapse it to a single constant"
+    )
+
+
+@pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
+def test_no_degenerate_active_kernel_column_with_structural_warp(small_cfg, kernel_name):
+    """End-to-end regression net for the censor-collapse bug: periodic and
+    cosine are always capped to a single active dim (generate_gp_batch's
+    kernel_cols, k=1 -- see "periodic ... also capped to k=1" comment there),
+    so if structural warping ever collapses THAT ONE column to a constant,
+    the kernel's r=0 for every pair and the whole episode's R_star silently
+    becomes a constant/degenerate correlation structure instead of a valid
+    periodic/cosine covariance -- unlike kernels with k>1 active dims, which
+    only lose one dimension's contribution. Forces every category (including
+    "discrete", which contains censor) into every gated column and disables
+    mlp_mixing so the raw single-column pathway is exercised directly, then
+    checks the actual sampled active column (x_norm_train ++ x_norm_test, at
+    kernel_feature_indices) never degenerates to near-zero variance."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.kernel = kernel_name
+    cfg.data.systematic_composition = False
+    cfg.data.d_features = 4
+    cfg.data.mlp_mixing_enabled = False
+    cfg.data.structural_warp_enabled = True
+    cfg.data.structural_warp_prob = 1.0
+    cfg.data.structural_warp_num_ops_min = 6
+    cfg.data.structural_warp_num_ops_max = 6
+    cfg.seed = abs(hash("no_degenerate_active_col_" + kernel_name)) % (2**31)
+
+    episodes = generate_gp_batch(cfg, B=500, device="cpu", return_kernel_metadata=True)
+    assert len(episodes) == 500
+    for ep in episodes:
+        col = int(ep["kernel_feature_indices"][0])
+        x = torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)[:, col]
+        assert float(x.std()) > 1e-6, (
+            f"{kernel_name}: active kernel column (idx {col}) collapsed to a "
+            f"near-constant value -- degenerate covariance structure"
+        )
 
 
 def test_structural_warp_quantize_snaps_to_few_unique_levels():
@@ -1477,21 +2019,19 @@ def test_mean_fn_diversifies_mu_star(small_cfg, family_probs):
 
 
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-@pytest.mark.parametrize("oracle_mode", ["prior", "posterior"])
-def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs, oracle_mode):
+def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs):
     """R_star must stay a valid, PSD, non-trivial correlation matrix under
-    every mean family and both oracle modes -- the mean-invariance argument
-    (GP posterior covariance never depends on the mean function) must hold
-    in practice, not just in theory."""
+    every mean family -- the mean-invariance argument (GP covariance never
+    depends on the mean function) must hold in practice, not just in theory."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
     cfg.data.kernel = "rbf"
-    cfg.data.oracle_mode = oracle_mode
+    cfg.data.oracle_mode = "prior"
     cfg.data.mean_fn_enabled = True
     cfg.data.mean_fn_prob = 1.0
     cfg.data.mean_fn_family_probs = family_probs
 
-    torch.manual_seed(abs(hash(("mean_fn_psd", tuple(family_probs), oracle_mode))) % (2**31))
+    torch.manual_seed(abs(hash(("mean_fn_psd", tuple(family_probs)))) % (2**31))
     off_diag_abs = []
     for _ in range(20):
         task = generate_gp_task(cfg)
@@ -1514,6 +2054,84 @@ def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs, oracle_mode):
     assert mean_abs_r < _DEGENERATE_THRESHOLD, (
         f"family {family_probs}: mean bank degenerate, mean|r*_offdiag|={mean_abs_r:.4f}"
     )
+
+
+@pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+def test_mean_fn_z_train_stays_calibrated(small_cfg, family_probs):
+    """z_train is a leave-one-out PIT (R&W Eq. 5.12), which is derived for a
+    zero-mean joint Gaussian: the LOO alpha must be K_ff^-1 @ (y_train -
+    mean_module(x_train)), not K_ff^-1 @ y_train. Forcing every episode to
+    carry a large mean (each family in turn) is exactly the regime that
+    would expose a missing mean-subtraction as inflated z_train variance."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.P_min = cfg.data.P_max = 40
+    cfg.data.kernel = "rbf"
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = family_probs
+    cfg.data.mean_fn_linear_prob = 1.0
+    cfg.data.mean_fn_weight_std = 1.0
+    cfg.data.mean_fn_bias_std = 1.0
+
+    torch.manual_seed(abs(hash(("mean_fn_z_train", tuple(family_probs)))) % (2**31))
+    episodes = generate_gp_batch(cfg, B=300, device="cpu")
+    z_train = torch.cat([ep["z_train"] for ep in episodes])
+
+    assert z_train.mean().abs().item() < 0.15, (
+        f"family {family_probs}: z_train mean={z_train.mean():.4f} (expected ~0)"
+    )
+    assert abs(z_train.std().item() - 1.0) < 0.15, (
+        f"family {family_probs}: z_train std={z_train.std():.4f} (expected ~1 -- "
+        f"a large deviation indicates the mean bank's contribution is leaking "
+        f"into the LOO residual uncancelled)"
+    )
+
+
+def test_oracle_mode_posterior_unsupported(small_cfg):
+    """oracle_mode='posterior' was removed (its float64-then-float32 Schur
+    complement could still leave R_star's min eigenvalue below the
+    well-conditioned/PSD floors for composite kernels, and nothing caught it
+    before saving -- see tests/test_dataset_corr_uniform.py::test_r_star_well_conditioned).
+    Only 'prior' is supported now; requesting 'posterior' must fail loudly
+    rather than silently falling back."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 3
+    cfg.data.P_min = cfg.data.P_max = 40
+    cfg.data.N_min = cfg.data.N_max = 20
+    cfg.data.kernel = "rbf"
+    cfg.data.oracle_mode = "posterior"
+
+    torch.manual_seed(0)
+    with pytest.raises(ValueError, match="oracle_mode"):
+        generate_gp_batch(cfg, B=4, device="cpu")
+
+
+@pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg, family_probs):
+    """gp_analytical_pit's disk-reconstruction fallback (no cached _L_ff/_alpha)
+    must match the cached path's z_train for every mean family, not just
+    linear -- guards data_gen._sample_mean_module's exp/anomaly params
+    actually round-tripping through the saved task dict and pit._mean_train_from_task
+    reconstructing the same mean_module(x_train) used at generation time."""
+    from pit import gp_analytical_pit
+
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.d_features = 4
+    cfg.data.kernel = "rbf"
+    cfg.data.mean_fn_enabled = True
+    cfg.data.mean_fn_prob = 1.0
+    cfg.data.mean_fn_family_probs = family_probs
+    cfg.data.mean_fn_anomaly_frac = 0.5
+
+    torch.manual_seed(abs(hash(("mean_fn_pit_reconstruct", tuple(family_probs)))) % (2**31))
+    for _ in range(10):
+        task = generate_gp_task(cfg)
+        cached = gp_analytical_pit(task)
+        reconstructed_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}
+        reconstructed = gp_analytical_pit(reconstructed_task)
+        assert torch.allclose(cached["z_train"], reconstructed["z_train"], atol=1e-3)
+        assert torch.allclose(cached["z_test"], reconstructed["z_test"], atol=1e-3)
 
 
 def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg):
@@ -1670,3 +2288,81 @@ def test_copula_dataset_skips_stale_nonfinite_episode(tmp_path):
         item = ds[1]
     assert torch.isfinite(item["z_train"]).all()
     assert torch.isfinite(item["y_train"]).all()
+
+
+def test_add_derived_fields_reconstructs_sigma_and_prior():
+    """R_prior/Sigma_star should be reconstructed exactly from R_star and
+    sigma_star when a shard was written without them (the dedup applied in
+    generate_pit_dataset.py to shrink on-disk shard size)."""
+    sample = _make_sample(P=6, N=4)
+    expected_R_prior = sample["R_star"].clone()
+    expected_Sigma_star = (
+        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
+    )
+    del sample["Sigma_star"]
+
+    out = _add_derived_fields(sample)
+
+    assert torch.allclose(out["R_prior"], expected_R_prior)
+    assert torch.allclose(out["Sigma_star"], expected_Sigma_star)
+
+
+def test_add_derived_fields_leaves_stored_values_untouched():
+    """If a shard DOES carry R_prior/Sigma_star (written before the dedup,
+    or with genuinely different values), _add_derived_fields must not
+    overwrite them."""
+    sample = _make_sample(P=6, N=4)
+    sample["R_prior"] = torch.full((4, 4), 0.5)
+    sample["Sigma_star"] = torch.full((4, 4), 2.0)
+
+    out = _add_derived_fields(sample)
+
+    assert torch.equal(out["R_prior"], torch.full((4, 4), 0.5))
+    assert torch.equal(out["Sigma_star"], torch.full((4, 4), 2.0))
+
+
+def test_copula_dataset_individual_reconstructs_missing_fields(tmp_path):
+    """Individual-file (task_*.pt) shards written without R_prior/Sigma_star
+    should still load with both fields present and correct."""
+    sample = _make_sample(P=6, N=4)
+    del sample["Sigma_star"]
+    torch.save(sample, tmp_path / "task_000000.pt")
+
+    ds = CopulaDataset(episode_dir=str(tmp_path))
+    item = ds[0]
+
+    assert "R_prior" in item and "Sigma_star" in item
+    assert torch.allclose(item["R_prior"], sample["R_star"])
+    expected_Sigma_star = (
+        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
+    )
+    assert torch.allclose(item["Sigma_star"], expected_Sigma_star)
+
+    # collate_fn must still work end-to-end on the reconstructed episode.
+    batch = collate_fn([item])
+    assert batch["Sigma_star"].shape == (1, 4, 4)
+    assert batch["R_prior"].shape == (1, 4, 4)
+
+
+def test_copula_dataset_sharded_reconstructs_missing_fields(tmp_path):
+    """Sharded (shard_*.pt) datasets written without R_prior/Sigma_star --
+    the new, smaller on-disk schema -- should still serve complete episodes
+    and collate identically to a dataset that stored all fields."""
+    samples = [_make_sample(P=6, N=4) for _ in range(3)]
+    for s in samples:
+        del s["Sigma_star"]
+        s.pop("R_prior", None)
+
+    torch.save(samples, tmp_path / "shard_000000.pt")
+    torch.save({"n_total": len(samples), "shard_size": len(samples)}, tmp_path / "meta.pt")
+
+    ds = CopulaDataset(episode_dir=str(tmp_path))
+    assert len(ds) == 3
+
+    item = ds[1]
+    assert "R_prior" in item and "Sigma_star" in item
+    assert torch.allclose(item["R_prior"], samples[1]["R_star"])
+
+    batch = collate_fn([ds[0], ds[1], ds[2]])
+    assert batch["Sigma_star"].shape == (3, 4, 4)
+    assert batch["R_prior"].shape == (3, 4, 4)

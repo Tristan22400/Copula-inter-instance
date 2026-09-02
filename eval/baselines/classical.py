@@ -21,6 +21,13 @@ Methods
   gp_mle_ard_rq      : Rational Quadratic with ARD lengthscales
   gp_mle_dot_product : GP posterior with MLE-fitted linear/dot-product kernel
                        (variance + noise term fitted), fit in raw y-space
+  gp_mle_polynomial  : GP posterior with MLE-fitted Polynomial kernel,
+                       k(x1,x2) = alpha2 * (x1^Tx2 + c)^d — degree d searched
+                       over every value in [poly_power_min, poly_power_max]
+                       (gpytorch.kernels.PolynomialKernel takes it as a plain
+                       int, not a differentiable parameter, so each candidate
+                       is a separate fit; see _poly_degree_candidates), offset
+                       c + outputscale + noise fitted, fit in raw y-space
   dkl_rbf/matern32/rq/dot_product :
                        Deep Kernel Learning — MLP(d_x->32->16) feature extractor
                        feeding a GP layer (chosen kernel), fit in raw y-space,
@@ -53,14 +60,24 @@ import copy
 import math
 import os
 import sys
+import warnings
 
 import gpytorch
 import torch
 import torch.nn as nn
 from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
+from linear_operator.utils.warnings import NumericalWarning
 from omegaconf import OmegaConf
 from torch import Tensor
 from torch.optim import Adam
+
+# psd_safe_cholesky (called on every mll() step below) warns every time it
+# adds jitter to recover from a near-singular K during MLE optimisation —
+# routine and already handled (it retries with escalating jitter, only
+# raising NotPSDError, caught by fit_and_eval_gpytorch's restart loop, if
+# that fails outright), so it's silenced rather than spamming stdout once
+# per restart per step.
+warnings.filterwarnings("ignore", category=NumericalWarning)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -68,7 +85,7 @@ _SRC = os.path.join(_REPO_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from loss import oracle_copula_nll  # noqa: E402
+from loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
 
 __all__ = [
@@ -79,11 +96,64 @@ __all__ = [
     "episode_cache_key",
     "load_baseline_cache",
     "save_baseline_cache",
+    "EXPECTED_BASELINE_KEYS",
+    "assert_shared_z_test",
 ]
 
 
+def assert_shared_z_test(z_test: Tensor, ep: dict) -> None:
+    """Guard the SHARED-MARGINAL `nlls` table's one load-bearing invariant:
+    every method in that table (independence/gp_prior_rbf/GP-MLE/DKL/
+    per_ep_transformer here, icl/oracle in eval_checkpoint.py's
+    _eval_icl_episode) must be scored against the literally-identical
+    `ep["z_test"]` — only R differs between methods — or corr_nll_single's
+    ranking silently stops meaning what _print_table's header claims (see
+    corr_nll_single's docstring / the "NAMING TRAP" note in
+    eval/metrics/joint_nll.py). Cheap (one tensor compare per episode); call
+    right after deriving the local `z_test` a caller is about to score with,
+    before any corr_nll_single call."""
+    ep_z_test = ep["z_test"].to(z_test.device, z_test.dtype)
+    assert torch.equal(z_test, ep_z_test), (
+        "z_test used for a shared-marginal copula-NLL score has diverged "
+        "from ep['z_test'] — this breaks _print_table's cross-method "
+        "ranking (see assert_shared_z_test's docstring)."
+    )
+
+# Every key eval_baselines_episode is supposed to populate in its returned
+# nlls/R_dict — kept in sync by hand with the method bodies below (independence
+# + gp_prior_rbf + every _LABEL_MAP/_DKL_LABEL_MAP value + per_ep_transformer).
+# eval_checkpoint.py compares a cached episode's keys against this set: a
+# cache built before a new baseline (e.g. gp_mle_polynomial) was added here
+# would otherwise be missing that key forever (same episode/fingerprint, so
+# it looks "valid") and silently mean() to NaN instead of getting computed.
+EXPECTED_BASELINE_KEYS = frozenset(
+    {"independence", "gp_prior_rbf", "per_ep_transformer"}
+    | {
+        "gp_mle_rbf", "gp_mle_ard_rbf",
+        "gp_mle_matern32", "gp_mle_ard_matern32",
+        "gp_mle_periodic", "gp_mle_ard_periodic",
+        "gp_mle_rq", "gp_mle_ard_rq",
+        "gp_mle_dot_product", "gp_mle_polynomial",
+    }
+    | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
+)
+
+# Bump whenever a baseline's *fitting algorithm* changes in a way that
+# baseline_fingerprint's other inputs (gen_cfg.data, oracle_mode, step
+# counts, ...) wouldn't otherwise detect — e.g. gp_mle_polynomial switching
+# from a single fixed degree to searching every degree in
+# [poly_power_min, poly_power_max] (see _poly_degree_candidates) uses the
+# exact same gen_cfg.data as before, so without this the fingerprint would
+# match an old cache built under the old fixed-degree fit and silently keep
+# serving it as if it were still correct.
+_BASELINE_ALGO_VERSION = 1
+
+
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
-    """Copula NLL for a single (N, N) correlation matrix and (N,) z-vector."""
+    """Copula NLL for a single (N, N) correlation matrix and (N,) z-vector.
+    SHARED-MARGINAL convention (z fixed across methods) — see the "NAMING
+    TRAP" note in eval/metrics/joint_nll.py's module docstring before
+    comparing this to y_space_nlls'/total_nlls' "copula" values below."""
     N = z.shape[0]
     mask = torch.ones(1, N, dtype=torch.bool, device=z.device)
     return oracle_copula_nll(R.unsqueeze(0), z.unsqueeze(0), mask).item()
@@ -97,16 +167,56 @@ def corr_nll_single(R: Tensor, z: Tensor) -> float:
 # nn.Parameters) just fine — no hand-rolled kernel math or NaN-safe distance
 # helpers needed.
 
+# Same nu convention as src/classical_kernels.py's _MATERN_NU / src/data_gen.py's
+# _BASE_GPYTORCH_KERNEL_CLS matern12/32/52 entries.
+_MATERN_NU = {"matern12": 0.5, "matern32": 1.5, "matern52": 2.5}
+
 _ARD_ELIGIBLE = {
     "rbf": True,
+    "matern12": True,
     "matern32": True,
+    "matern52": True,
     # gpytorch.kernels.PeriodicKernel sums per-dimension sin^2 terms inside a
     # single exp() (a product of per-dimension periodic kernels), which is
     # PSD for any ard_num_dims.
     "periodic": True,
     "rational_quadratic": True,
     "dot_product": False,
+    # PolynomialKernel has no lengthscale at all (geometry comes from the raw
+    # dot product, same as dot_product) — no per-dimension axis to assign ARD
+    # lengthscales to.
+    "polynomial": False,
 }
+
+# Fallback degree for the gp_mle_polynomial baseline, used only when a caller
+# builds an _ExactGPModel(kernel_name="polynomial") without specifying
+# poly_power explicitly. gpytorch.kernels.PolynomialKernel takes `power` as a
+# plain Python int baked into forward()'s .pow(self.power) call, not a
+# registered (constrained) Parameter — so unlike offset/outputscale/noise it
+# cannot be optimised by Adam and must be fixed ahead of fitting. 2 mirrors
+# data_gen.py's poly_power_min default (the low end of the
+# episode-generating poly_power_min/poly_power_max range). The actual
+# gp_mle_polynomial baseline below no longer uses this fallback: it searches
+# every degree in that same [poly_power_min, poly_power_max] range instead of
+# guessing one fixed degree — see _poly_degree_candidates.
+_POLY_BASELINE_POWER = 2
+
+
+def _poly_degree_candidates(prior_cfg: dict) -> list[int]:
+    """Every integer degree data_gen.py's generative process can sample for a
+    polynomial-kernel episode: Uniform{poly_power_min, ..., poly_power_max}
+    (see data_gen.py's `if name == "polynomial":` branch). A real baseline
+    never has oracle access to which degree generated a given episode, so
+    gp_mle_polynomial fits one GP per candidate degree here (each with its
+    own n_restarts restarts — see fit_and_eval_gpytorch) and keeps whichever
+    reaches the best training loss, instead of assuming a single fixed
+    degree and being systematically misspecified whenever the true episode
+    used a different one.
+    """
+    power_min = int(prior_cfg.get("poly_power_min", 2))
+    power_max = int(prior_cfg.get("poly_power_max", 4))
+    return list(range(power_min, power_max + 1))
+
 
 # Default hyperprior constants, mirroring data_gen.py's _kernel_prior_spec /
 # _nugget_prior fallback defaults (the actual per-dataset values live in the
@@ -121,6 +231,8 @@ _DEFAULT_PRIOR_CFG: dict[str, float] = {
     "period_lognormal_scale": 0.4,
     "rq_alpha_gamma_concentration": 2.0,
     "rq_alpha_gamma_rate": 1.0,
+    "poly_offset_gamma_concentration": 2.0,
+    "poly_offset_gamma_rate": 1.0,
     "nugget_lognormal_loc": -4.63,
     "nugget_lognormal_scale": 0.5,
 }
@@ -150,6 +262,15 @@ def _kernel_priors(prior_cfg: dict, kernel_name: str, ard: bool = False) -> dict
     cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
     if kernel_name == "dot_product":
         return {"variance_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"])}
+    if kernel_name == "polynomial":
+        # Unlike dot_product, PolynomialKernel is still wrapped in a
+        # ScaleKernel (it has no built-in variance of its own — see
+        # _ExactGPModel), so it keeps the usual outputscale_prior on top of
+        # its own offset_prior.
+        return {
+            "outputscale_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"]),
+            "offset_prior": GammaPrior(cfg["poly_offset_gamma_concentration"], cfg["poly_offset_gamma_rate"]),
+        }
     priors: dict[str, Prior] = {
         "outputscale_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"]),
     }
@@ -203,6 +324,8 @@ def _randomize_init(
         base.period_length = kernel_priors["period_length_prior"].sample(base.period_length.shape).to(device)
     if "alpha_prior" in kernel_priors:
         base.alpha = kernel_priors["alpha_prior"].sample(base.alpha.shape).to(device)
+    if "offset_prior" in kernel_priors:
+        base.offset = kernel_priors["offset_prior"].sample(base.offset.shape).to(device)
     if "variance_prior" in kernel_priors:
         model.covar_module.variance = kernel_priors["variance_prior"].sample(model.covar_module.variance.shape).to(device)
     if "outputscale_prior" in kernel_priors:
@@ -210,7 +333,7 @@ def _randomize_init(
 
 
 class _ExactGPModel(gpytorch.models.ExactGP):
-    """ExactGP wrapper over one of the five baseline kernels, optionally
+    """ExactGP wrapper over one of the baseline kernels, optionally
     preceded by a learned feature extractor (Deep Kernel Learning)."""
 
     def __init__(
@@ -222,6 +345,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         ard_num_dims: int | None = None,
         feature_extractor: nn.Module | None = None,
         kernel_priors: dict[str, Prior] | None = None,
+        poly_power: int = _POLY_BASELINE_POWER,
     ) -> None:
         super().__init__(X_train, y_train, likelihood)
         self.feature_extractor = feature_extractor
@@ -236,8 +360,10 @@ class _ExactGPModel(gpytorch.models.ExactGP):
 
         if kernel_name == "rbf":
             base = gpytorch.kernels.RBFKernel(lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
-        elif kernel_name == "matern32":
-            base = gpytorch.kernels.MaternKernel(nu=1.5, lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
+        elif kernel_name in _MATERN_NU:
+            base = gpytorch.kernels.MaternKernel(
+                nu=_MATERN_NU[kernel_name], lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw,
+            )
         elif kernel_name == "periodic":
             base = gpytorch.kernels.PeriodicKernel(
                 lengthscale_prior=kp.get("lengthscale_prior"),
@@ -248,12 +374,16 @@ class _ExactGPModel(gpytorch.models.ExactGP):
             base = gpytorch.kernels.RQKernel(lengthscale_prior=kp.get("lengthscale_prior"), alpha_prior=kp.get("alpha_prior"), **ard_kw)
         elif kernel_name == "dot_product":
             base = gpytorch.kernels.LinearKernel(variance_prior=kp.get("variance_prior"))
+        elif kernel_name == "polynomial":
+            base = gpytorch.kernels.PolynomialKernel(power=poly_power, offset_prior=kp.get("offset_prior"))
         else:
             raise ValueError(f"Unknown kernel: {kernel_name}")
 
         # LinearKernel already has its own learnable `variance` scale;
         # wrapping it in ScaleKernel on top would just be a redundant,
-        # unidentifiable second scale factor.
+        # unidentifiable second scale factor. PolynomialKernel has no such
+        # built-in scale, so (unlike dot_product) it does get the ScaleKernel
+        # wrapper below.
         self.covar_module = (
             base if kernel_name == "dot_product"
             else gpytorch.kernels.ScaleKernel(base, outputscale_prior=kp.get("outputscale_prior"))
@@ -278,11 +408,16 @@ def fit_and_eval_gpytorch(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts: int = 1,
-) -> Tensor:
+) -> dict[str, Tensor]:
     """Fit a GP (optionally over a learned feature extractor, i.e. DKL) on the
     raw y-space target by maximising the exact marginal log-likelihood, and
-    return the correlation matrix at X_test to compare against the episode's
-    oracle R_star.
+    return {"R": correlation matrix, "mean": predictive mean, "Sigma":
+    predictive covariance} at X_test — R to compare against the episode's
+    oracle R_star (copula-only NLL), mean/Sigma (both raw y-units, the GP's
+    own fitted marginal) to score this baseline's total (marginal+copula)
+    Y-space NLL via gp_oracle_y_nll, the same way the ICL model can be
+    scored once it has a real (non-oracle) marginal (see
+    eval_checkpoint.py's --z_train_source=tabicl / _tabicl_pit).
 
     Fits against y_train (not the PIT-transformed z_train) because z_train is
     itself derived from the true generating kernel's own Cholesky factor —
@@ -290,10 +425,11 @@ def fit_and_eval_gpytorch(
     kernel information a real baseline never has access to, and would fit
     against a variable already whitened to unit variance, at odds with the
     alpha2/nugget hyperpriors below (which mirror data_gen.py's own *y-space*
-    generative kernel-hyperparameter priors). The resulting covariance is
-    converted to a correlation matrix (sigma_to_correlation), which is
-    coordinate-free, so scoring against z_test downstream is unaffected by
-    y_train's absolute scale/mean.
+    generative kernel-hyperparameter priors). The correlation matrix
+    (sigma_to_correlation) is coordinate-free, so scoring it against z_test
+    downstream is unaffected by y_train's absolute scale/mean — but mean/
+    Sigma are returned in that same raw y-scale on purpose, since the total
+    Y-space NLL needs real units, not a coordinate-free quantity.
 
     oracle_mode must match how the episode's own R_star was built (see
     data_gen.py's oracle_mode branch):
@@ -323,6 +459,16 @@ def fit_and_eval_gpytorch(
     MLE into MAP, and repeats the fit from n_restarts independent random
     inits (each sampled from those same priors — see _randomize_init),
     keeping whichever restart reaches the best final training loss.
+
+    kernel_name="polynomial" additionally loops over every integer degree in
+    prior_cfg's [poly_power_min, poly_power_max] range (see
+    _poly_degree_candidates) — the one hyperparameter PolynomialKernel can't
+    expose to Adam — running the full n_restarts fit at each candidate degree
+    and keeping the overall best (degree, restart) combination. This makes
+    gp_mle_polynomial a spectrum-wide model-selection baseline covering the
+    same degree range the episodes are actually generated from, rather than
+    being systematically misspecified whenever an episode's true degree
+    differs from one hardcoded guess.
 
     When feature_extractor is given (DKL), training instead holds out a 20%
     validation split of X_train/y_train and keeps whichever training step's
@@ -375,75 +521,99 @@ def fit_and_eval_gpytorch(
     else:
         X_fit, y_fit = X_train, y_train
 
+    # Only "polynomial" has a degree to search: every other kernel_name gets
+    # a single-element list so the loop below is a no-op restructuring for
+    # them (poly_power is simply ignored by _ExactGPModel in that case).
+    poly_powers = _poly_degree_candidates(prior_cfg or {}) if kernel_name == "polynomial" else [_POLY_BASELINE_POWER]
+
     best_loss: float | None = None
     best_model: _ExactGPModel | None = None
     best_likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
 
-    for _ in range(max(1, n_restarts)):
-        # Mirrors the previous hand-rolled code's log_noise clamp range
-        # (exp(-8)..exp(2)) — keeps optimisation stable / prevents noise
-        # collapsing to (near-)zero. Built fresh every restart: gpytorch's
-        # Interval holds its bounds as plain (non-parameter) tensors, so
-        # reusing one Interval instance across multiple GaussianLikelihoods
-        # in this loop means the *next* likelihood constructed from it
-        # inherits whatever device the *previous* iteration's `.to(device)`
-        # left those bounds on, in-place — a shared-mutable-state footgun
-        # that surfaces as a CPU/CUDA device-mismatch on restart 2+.
-        noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
-        likelihood = gpytorch.likelihoods.GaussianLikelihood(
-            noise_constraint=noise_constraint, noise_prior=noise_prior,
+    for poly_power in poly_powers:
+        for _ in range(max(1, n_restarts)):
+          try:
+            # Mirrors the previous hand-rolled code's log_noise clamp range
+            # (exp(-8)..exp(2)) — keeps optimisation stable / prevents noise
+            # collapsing to (near-)zero. Built fresh every restart: gpytorch's
+            # Interval holds its bounds as plain (non-parameter) tensors, so
+            # reusing one Interval instance across multiple GaussianLikelihoods
+            # in this loop means the *next* likelihood constructed from it
+            # inherits whatever device the *previous* iteration's `.to(device)`
+            # left those bounds on, in-place — a shared-mutable-state footgun
+            # that surfaces as a CPU/CUDA device-mismatch on restart 2+.
+            noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
+            likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=noise_constraint, noise_prior=noise_prior,
+            )
+            # Sampled (not fixed at 0.1) so restarts are actually independent —
+            # clamped strictly inside noise_constraint's open interval.
+            likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(X_train.device).clamp(
+                min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
+            )
+
+            model = _ExactGPModel(
+                X_fit, y_fit, likelihood, kernel_name,
+                ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
+                kernel_priors=kernel_priors, poly_power=poly_power,
+            ).to(X_train.device)
+            _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
+
+            model.train()
+            likelihood.train()
+            opt = Adam(model.parameters(), lr=lr)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+            best_step_val: float = float("inf")
+            best_step_state: tuple[dict, dict] | None = None
+            loss = None
+            for step in range(n_steps):
+                opt.zero_grad()
+                loss = -mll(model(X_fit), y_fit)
+                loss.backward()
+                opt.step()
+
+                if use_val and (step % val_every == 0 or step == n_steps - 1):
+                    model.eval()
+                    likelihood.eval()
+                    with torch.no_grad():
+                        val_nll = -likelihood(model(X_val)).log_prob(y_val).item() / X_val.shape[0]
+                    model.train()
+                    likelihood.train()
+                    if val_nll < best_step_val:
+                        best_step_val = val_nll
+                        best_step_state = (
+                            copy.deepcopy(model.state_dict()),
+                            copy.deepcopy(likelihood.state_dict()),
+                        )
+
+            if use_val:
+                model.load_state_dict(best_step_state[0])
+                likelihood.load_state_dict(best_step_state[1])
+                final_loss = best_step_val
+            else:
+                final_loss = loss.item()
+
+            if best_loss is None or final_loss < best_loss:
+                best_loss, best_model, best_likelihood = final_loss, model, likelihood
+          except Exception as exc:
+            # Higher polynomial degrees raise the raw dot-product to a larger
+            # power, which can blow up K_ff's conditioning far more easily
+            # than degree 2 ever did (this loop previously only ever tried
+            # degree 2, so a NotPSDError here is a real consequence of now
+            # searching the full [poly_power_min, poly_power_max] range, not
+            # a pre-existing failure mode). One bad (degree, restart)
+            # combination shouldn't discard every other candidate that fit
+            # fine — skip it and keep searching; only actually failing every
+            # single one raises (via best_model still being None below).
+            print(f"  [gp_mle_polynomial power={poly_power}] restart failed: {exc}")
+            continue
+
+    if best_model is None:
+        raise RuntimeError(
+            f"fit_and_eval_gpytorch(kernel_name={kernel_name!r}): every candidate degree/restart "
+            f"combination in {poly_powers} failed (see printed exceptions above)."
         )
-        # Sampled (not fixed at 0.1) so restarts are actually independent —
-        # clamped strictly inside noise_constraint's open interval.
-        likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(X_train.device).clamp(
-            min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
-        )
-
-        model = _ExactGPModel(
-            X_fit, y_fit, likelihood, kernel_name,
-            ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
-            kernel_priors=kernel_priors,
-        ).to(X_train.device)
-        _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
-
-        model.train()
-        likelihood.train()
-        opt = Adam(model.parameters(), lr=lr)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-
-        best_step_val: float = float("inf")
-        best_step_state: tuple[dict, dict] | None = None
-        loss = None
-        for step in range(n_steps):
-            opt.zero_grad()
-            loss = -mll(model(X_fit), y_fit)
-            loss.backward()
-            opt.step()
-
-            if use_val and (step % val_every == 0 or step == n_steps - 1):
-                model.eval()
-                likelihood.eval()
-                with torch.no_grad():
-                    val_nll = -likelihood(model(X_val)).log_prob(y_val).item() / X_val.shape[0]
-                model.train()
-                likelihood.train()
-                if val_nll < best_step_val:
-                    best_step_val = val_nll
-                    best_step_state = (
-                        copy.deepcopy(model.state_dict()),
-                        copy.deepcopy(likelihood.state_dict()),
-                    )
-
-        if use_val:
-            model.load_state_dict(best_step_state[0])
-            likelihood.load_state_dict(best_step_state[1])
-            final_loss = best_step_val
-        else:
-            final_loss = loss.item()
-
-        if best_loss is None or final_loss < best_loss:
-            best_loss, best_model, best_likelihood = final_loss, model, likelihood
-
     model, likelihood = best_model, best_likelihood
     if use_val:
         # The val split only mattered for picking which training step's
@@ -458,6 +628,7 @@ def fit_and_eval_gpytorch(
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         pred = likelihood(model.forward(X_test)) if oracle_mode == "prior" else likelihood(model(X_test))
+        mean_post = pred.mean
         Sigma_post = pred.covariance_matrix
         N = X_test.shape[0]
         Sigma_post = 0.5 * (Sigma_post + Sigma_post.T) + jitter * torch.eye(
@@ -467,7 +638,7 @@ def fit_and_eval_gpytorch(
     from data_gen import sigma_to_correlation  # noqa: E402  (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
 
     R, _ = sigma_to_correlation(Sigma_post)
-    return R
+    return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
 
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
@@ -709,6 +880,9 @@ def train_per_episode(
 # ---------------------------------------------------------------------------
 
 
+_NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
+
+
 def eval_baselines_episode(
     ep: dict,
     icl_rank: int,
@@ -722,7 +896,7 @@ def eval_baselines_episode(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
-) -> tuple[dict[str, float], dict[str, Tensor]]:
+) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
     """Evaluate every classical/fitted baseline (everything except the ICL
     model and the oracle) on one episode, under identical conventions.
 
@@ -733,18 +907,45 @@ def eval_baselines_episode(
     load_baseline_cache / save_baseline_cache below.
 
     Returns:
-        nlls      : {method_name: copula_nll_float}
-        R_dict    : {method_name: (N, N) correlation tensor} — for plotting
+        nlls        : {method_name: copula_nll_float} — z-space, common
+                       oracle-standardized z_test (see corr_nll_single).
+        R_dict      : {method_name: (N, N) correlation tensor} — for plotting
+        y_space_nlls: {method_name: {"total", "marginal", "copula"}} — raw
+                       y-units, each method's OWN fitted marginal (mean/Sigma
+                       for GP-MLE/DKL, empirical train mean/std for
+                       per_ep_transformer), via gp_oracle_y_nll's own
+                       Sklar split — comparable across methods precisely
+                       because everyone supplies their own full predictive
+                       density scored at the same real y_test, unlike
+                       `nlls`' shared-marginal design. Note this "copula"
+                       entry is under each method's OWN fitted marginal
+                       (its own standardized residual, own correlation
+                       matrix), so it is NOT directly comparable to `nlls`'
+                       shared-ground-truth-marginal copula NLL — both are
+                       legitimate, different questions (see eval_checkpoint.py's
+                       per-episode print for both side by side).
+                       independence/gp_prior_rbf are unfit references, not
+                       included here (mirrors _NON_FITTED_EXCLUDED).
     """
     X_train = ep["x_norm_train"].to(device)      # (P, d_x)
     y_train = ep["y_train"].to(device)            # (P,)  raw target, used to fit the GP-MLE/DKL baselines
     z_train_self = _standardize_y(y_train)        # (P,) z-scored y_train, used to train per_ep_transformer
     X_test = ep["x_norm_test"].to(device)         # (N, d_x)
     z_test = ep["z_test"].to(device)              # (N,)
+    assert_shared_z_test(z_test, ep)
+    y_test = ep["y_test"].to(device)              # (N,)  raw target, for total Y-space NLL
 
     N = X_test.shape[0]
     nlls: dict[str, float] = {}
     R_dict: dict[str, Tensor] = {}
+    y_space_nlls: dict[str, dict[str, float]] = {}
+    test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
+
+    def _nll_parts(mean: Tensor, Sigma: Tensor) -> dict[str, float]:
+        parts = gp_oracle_y_nll(
+            Sigma.unsqueeze(0), mean.unsqueeze(0), y_test.unsqueeze(0), test_mask,
+        )
+        return {k: v.item() for k, v in parts.items()}
 
     # --- independence ---
     R_I = torch.eye(N, dtype=X_train.dtype, device=device)
@@ -757,7 +958,7 @@ def eval_baselines_episode(
     R_dict["gp_prior_rbf"] = R_prior
 
     # --- GP MLE baselines (plain + ARD for lengthscale kernels) ---
-    _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic", "dot_product"]
+    _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic", "dot_product", "polynomial"]
     _LABEL_MAP = {
         ("rbf", False):                "gp_mle_rbf",
         ("rbf", True):                 "gp_mle_ard_rbf",
@@ -768,21 +969,24 @@ def eval_baselines_episode(
         ("rational_quadratic", False): "gp_mle_rq",
         ("rational_quadratic", True):  "gp_mle_ard_rq",
         ("dot_product", False):        "gp_mle_dot_product",
+        ("polynomial", False):         "gp_mle_polynomial",
     }
     for kname in _GP_KERNELS:
         for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
             label = _LABEL_MAP[(kname, ard)]
             try:
-                R_gp = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
+                fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                              n_steps=n_steps_mle, lr=lr_mle, ard=ard,
                                              oracle_mode=oracle_mode, prior_cfg=prior_cfg,
                                              n_restarts=n_restarts_mle)
-                nlls[label] = corr_nll_single(R_gp, z_test)
-                R_dict[label] = R_gp
+                nlls[label] = corr_nll_single(fit["R"], z_test)
+                R_dict[label] = fit["R"]
+                y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
             except Exception as exc:
                 print(f"  [{label}] failed: {exc}")
                 nlls[label] = float("nan")
                 R_dict[label] = R_I.clone()
+                y_space_nlls[label] = _NAN_PARTS.copy()
 
     # --- Deep Kernel Learning (MLP + GP, jointly trained), across multiple kernels ---
     # "periodic" excluded: not PD in the fixed 16-dim latent space at any dimensionality.
@@ -797,21 +1001,26 @@ def eval_baselines_episode(
         label = _DKL_LABEL_MAP[kname]
         try:
             mlp = DKLFeatureExtractor(X_train.shape[1], hidden=32, out_dim=16, dropout=0.0).to(device)
-            R_dkl = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
-                                          n_steps=n_steps_dkl, lr=lr_dkl,
-                                          ard=False, feature_extractor=mlp,
-                                          oracle_mode=oracle_mode, prior_cfg=prior_cfg)
-            nlls[label] = corr_nll_single(R_dkl, z_test)
-            R_dict[label] = R_dkl
+            fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
+                                        n_steps=n_steps_dkl, lr=lr_dkl,
+                                        ard=False, feature_extractor=mlp,
+                                        oracle_mode=oracle_mode, prior_cfg=prior_cfg)
+            nlls[label] = corr_nll_single(fit["R"], z_test)
+            R_dict[label] = fit["R"]
+            y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
         except Exception as exc:
             print(f"  [{label}] failed: {exc}")
             nlls[label] = float("nan")
             R_dict[label] = R_I.clone()
+            y_space_nlls[label] = float("nan")
 
     # --- per-episode transformer ---
     # Trained/queried against z_train_self (z-scored from y_train), not the
     # oracle z_train — see _standardize_y's docstring. Scored against z_test
-    # (oracle) below, same as every other baseline.
+    # (oracle) below, same as every other baseline. Its total Y-space NLL
+    # reuses that same empirical-Gaussian marginal (train mean/std,
+    # _standardize_y's own convention) rather than the oracle's — a crude
+    # but genuine (non-oracle) marginal, unlike gp_prior_rbf/independence.
     try:
         per_ep_model = train_per_episode(
             X_train, z_train_self, r=icl_rank,
@@ -823,12 +1032,18 @@ def eval_baselines_episode(
             Sigma_te = low_rank_correlation(W_te.unsqueeze(0), s_te.unsqueeze(0)).squeeze(0)
         nlls["per_ep_transformer"] = corr_nll_single(Sigma_te, z_test)
         R_dict["per_ep_transformer"] = Sigma_te
+        mean_tr = y_train.mean()
+        std_tr = y_train.std(unbiased=True).clamp(min=1e-6)
+        y_space_nlls["per_ep_transformer"] = _nll_parts(
+            mean_tr.expand(N), (std_tr ** 2) * Sigma_te,
+        )
     except Exception as exc:
         print(f"  [per_ep_transformer] failed: {exc}")
         nlls["per_ep_transformer"] = float("nan")
         R_dict["per_ep_transformer"] = R_I.clone()
+        y_space_nlls["per_ep_transformer"] = _NAN_PARTS.copy()
 
-    return nlls, R_dict
+    return nlls, R_dict, y_space_nlls
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +1094,7 @@ def baseline_fingerprint(
     """
     data_cfg = OmegaConf.select(gen_cfg, "data", default=None)
     return {
+        "algo_version": _BASELINE_ALGO_VERSION,
         "data_cfg": OmegaConf.to_container(data_cfg) if data_cfg is not None else {},
         "icl_rank": icl_rank,
         "live_generate": live_generate,
