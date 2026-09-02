@@ -41,6 +41,12 @@ tabicl:
   # (x_train, y_train) the same way real (non-GP) data would be, so the
   # model's correlation prediction can be checked against that approximate
   # z_train, not just the exact GP-LOO one. Matches pit.py's DEFAULT_K_FOLDS.
+  # Fold count for the places the fold count is a free choice: the
+  # kernel_fit/<family> probes and the z_train_tabicl_mix gap measurement.
+  # It does NOT set the fold count val/y_nll_* is scored at when
+  # data.z_train_source is "tabicl"/"tabicl_split" -- that follows
+  # data.z_train_tabicl_k_folds, so the val marginal matches the one the
+  # model was actually conditioned on (see train()'s val_pit_k_folds).
   pit_k_folds: 10
   # Architecture params — only used when pretrained=false.
   # Defaults match the released tabicl-regressor-v2 checkpoint.
