@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# gp_tasks_marginal — the GP prior as Phase-A marginal fine-tuning
+# (src/finetune_marginal.py) draws it. Inherits conf/data/gp_tasks.yaml
+# wholesale and changes exactly two things.
+#
+# Why a separate group file rather than a `data:` block in
+# conf/finetune_marginal.yaml's own body: that file follows conf/config.yaml's
+# `defaults: [_self_, ...]` ordering (see the long comment there and the
+# 2026-08-24 bug it records), under which the composed `data:` group WINS over
+# the including file's body. An inline override would therefore be silently
+# clobbered by gp_tasks — exactly the failure that comment exists to warn
+# about. Inheriting inside the group puts the override on the winning side and
+# needs no reordering.
+#
+# Why not edit conf/data/gp_tasks.yaml directly: it is the copula runs' prior
+# too. Widening P there would silently change what every copula run trains on.
+# ---------------------------------------------------------------------------
+
+defaults:
+  - gp_tasks
+  - _self_
+
+# Wide context range, against gp_tasks.yaml's fixed P_min = P_max = 32.
+#
+# This is the single most important data change for Phase A, and it follows
+# from what the objective is: a marginal is "correct" only if its posterior
+# CONTRACTS at the right rate as context accumulates. A model trained at one
+# context size can memorize that size's average sharpness and score well
+# without ever representing the contraction, and it is then wrong everywhere
+# else. It also matters for the K-fold regime the marginal is actually deployed
+# in, where the effective context is P*(K-1)/K, not P — a model that only ever
+# saw P=32 sees 28.8 at serve time and has no reason to handle it.
+P_min: 8
+P_max: 256
+
+# Fewer query rows per episode than gp_tasks.yaml's 256. Phase A scores every
+# query row independently (there is no NxN copula term here), so N is a pure
+# batch-size knob, and the analytic target costs an extra O(P^2 N); 128 keeps a
+# P=256 batch comfortably inside one GPU while still giving ~1000 scored rows
+# per step at batch_size=8.
+N_min: 128
+N_max: 128

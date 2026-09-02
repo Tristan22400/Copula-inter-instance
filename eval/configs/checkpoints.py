@@ -86,3 +86,54 @@ def all_family_names() -> list[str]:
     """Every registered family name, in registry order -- what `--checkpoints
     all` (the default for `sweep`) auto-discovers."""
     return list(CHECKPOINT_FAMILIES)
+
+
+# ---------------------------------------------------------------------------
+# Marginal (Phase A) checkpoints — a SEPARATE registry, on purpose
+# ---------------------------------------------------------------------------
+#
+# These are plain TabICL checkpoints ({"config", "state_dict"}) produced by
+# src/finetune_marginal.py and consumed by pit.load_tabicl. CHECKPOINT_FAMILIES
+# above holds COPULA checkpoints, consumed by builders that construct a
+# CopulaTabICL and load a copula state dict into it. Putting a marginal entry in
+# that dict would make `sweep --checkpoints all` (which iterates
+# all_family_names()) try to load a TabICL state dict into a copula model and
+# fail -- so the two kinds get two registries and two resolvers rather than one
+# dict with a type tag nothing checks.
+#
+# `dir` is under checkpoints/; `default_step` picks the step_*.pt file for a
+# bare family name. `tabicl.pit_ckpt` in a copula run takes the resolved path.
+MARGINAL_FAMILIES: dict[str, dict] = {
+    # The frozen pretrained marginal every copula run has used so far -- the
+    # baseline row in eval/runners/marginal_calibration_eval.py, and the thing
+    # a Phase-A run has to beat. Not a local path: pit.load_tabicl resolves a
+    # bare name through the jingang/TabICL HF repo.
+    "pretrained": {
+        "hf_name": "tabicl-regressor-v2-20260212.ckpt",
+        "label": "TabICL v2 pretrained (frozen baseline)",
+    },
+}
+
+
+def resolve_marginal_checkpoint(name_or_path: str) -> str:
+    """Resolve a marginal-checkpoint token to something ``pit.load_tabicl`` takes.
+
+    Accepts, in order:
+      - a raw path that exists on disk (returned unchanged)
+      - a MARGINAL_FAMILIES name with an ``hf_name`` -> that HF filename
+      - "family" / "family:step" -> that family's dir + step under checkpoints/
+      - anything else -> returned unchanged, so a bare HF filename still works
+        without needing a registry entry (load_tabicl treats a non-path as an
+        HF filename anyway, and failing here would be a worse error than the
+        one the HF hub gives).
+    """
+    if os.path.exists(name_or_path):
+        return name_or_path
+    family, _, step_str = name_or_path.partition(":")
+    entry = MARGINAL_FAMILIES.get(family)
+    if entry is None:
+        return name_or_path
+    if "hf_name" in entry:
+        return entry["hf_name"]
+    step = int(step_str) if step_str else entry["default_step"]
+    return os.path.join(_CHECKPOINTS_ROOT, entry["dir"], f"step_{step:07d}.pt")
