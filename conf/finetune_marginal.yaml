@@ -1,0 +1,156 @@
+# ---------------------------------------------------------------------------
+# Phase A — fine-tune a standalone TabICL so its marginal posterior predictive
+# is CORRECT for the GP prior the copula is trained on.
+#
+#   python src/finetune_marginal.py                       # tier 0, defaults
+#   python src/finetune_marginal.py marginal.tier=1 training.lr=2e-5
+#
+# Output: a checkpoint in TabICL's own {"config", "state_dict"} schema, so it is
+# a drop-in for the copula run's marginal:
+#
+#   python src/train.py tabicl.pit_ckpt=<that path>
+#
+# This trains NOTHING jointly with the copula. src/model.py is untouched and
+# conf/config.yaml is untouched; the two phases meet only at that file path.
+# ---------------------------------------------------------------------------
+
+defaults:
+  # _self_ FIRST, mirroring conf/config.yaml's ordering and for the same
+  # reason (see the long comment there): a composed group can override this
+  # file's body, and CLI overrides win over everything regardless.
+  - _self_
+  - data: gp_tasks_marginal
+
+seed: 42
+
+wandb:
+  # A SEPARATE project from the copula runs (conf/config.yaml's
+  # copula-inter-instance). Phase-A runs report marginal-only metrics on a
+  # different objective; mixing them into the copula sweep's history would make
+  # both run tables unreadable and invite comparing numbers that are not
+  # comparable.
+  project: copula-inter-marginal
+  entity: null
+  mode: online          # "disabled" for a local smoke run
+
+marginal:
+  # Starting point. Any name in the jingang/TabICL HF repo, or a local path
+  # (pit.load_tabicl accepts both) — so a Phase-A run can also resume from an
+  # earlier Phase-A output.
+  ckpt: tabicl-regressor-v2-20260212.ckpt
+
+  # Tier ladder — see marginal_finetune.TIER_SPECS for what each selects and
+  # why. 0 = label path + ICL norms + decoder (~1.6M, 5.5%). Escalate to 1 only
+  # if val_marginal/gp/nll_gap_to_oracle plateaus above zero: tier 0 can rescale
+  # and remap what the trunk computes but cannot change how much context row j
+  # influences query row i, which is what posterior contraction needs.
+  tier: 0
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_target: qkvo
+
+  # Fold geometry. k_folds MUST match what deployment uses
+  # (conf/model/copula_prod.yaml's tabicl.pit_k_folds, and pit.DEFAULT_K_FOLDS)
+  # or Phase A optimizes a conditioning that never occurs at serve time.
+  k_folds: 10
+  # How many of those K folds to score per step. Phase A never needs a complete
+  # z_train (it scores each query row's own predictive density, not its PIT
+  # residual), so a random subset is an unbiased estimate of the same objective
+  # with the fold geometry untouched — at 1/K the forward cost. null = all K.
+  folds_per_step: 2
+
+  # Probit clamp, threaded through to pit._probit's `eps`. Interpolated from
+  # the data group rather than re-declared: conf/data/gp_tasks.yaml has carried
+  # a `pit_eps` key that NOTHING read since it was added, so it silently could
+  # not do what it says. This gives it a reader, and keeps the clamp a property
+  # of the prior config it was always written next to.
+  pit_eps: ${data.pit_eps}
+
+  loss:
+    # Distillation against the analytic quantiles: mu_i + sigma_i*Phi^-1(alpha_k).
+    # Variance reduction, not a second objective — the analytic quantiles ARE
+    # the proper scores' population minimizer's quantiles.
+    distill: 1.0
+    # The strictly proper terms. These are what actually guarantee calibration:
+    # their population minimizer over predictive laws is the true conditional.
+    nll: 1.0
+    crps: 0.1
+    # Anti-forgetting pull toward the pretrained weights. Off by default —
+    # tier topology + low LR + the ERA5 mixture are the first-line guards, and
+    # this one costs a full extra parameter copy. Turn it on if
+    # run_benchmarks.py regresses on UCI/California.
+    anchor: 0.0
+    huber_delta: 1.0
+    # w_k ∝ (alpha_k(1-alpha_k))^tail_power, normalized to mean 1. Downweights
+    # the extreme levels, whose |Phi^-1| is largest and which feed
+    # QuantileDistribution's parametric tail fit rather than being read off
+    # directly. 0.0 = uniform.
+    tail_power: 0.5
+
+  era5:
+    # Real-data mixture fraction. The GP prior has GAUSSIAN marginals; TabICL's
+    # value is NON-Gaussian tabular marginals. Training on GP episodes alone
+    # invites collapsing the head to "always Gaussian" and destroying exactly
+    # the transfer that makes a TabICL marginal worth having. These batches get
+    # the proper scores only (no analytic target exists, and none is needed).
+    mix_frac: 0.2
+    # 2013-01 .. 2022-12. Disjoint from era5_global_val/ (2023) by construction;
+    # tests/test_marginal_finetune.py asserts it.
+    corpus_dir: ./eval/data/cache/era5_global_train
+    # Cap on months loaded into RAM. The full 120-month corpus is ~15GB; a 20%
+    # mixture does not need ten years of it, and Phase A runs the marginal in
+    # the MAIN process (no shared-memory worker trick to amortize it).
+    max_months: 12
+    grid_size: 16
+    n_context: 60
+    box_deg_min: 5.0
+    box_deg_max: 40.0
+
+training:
+  device: auto
+  # Enables TensorFloat-32 tensor cores for float32 matmuls on Ampere+ GPUs.
+  # Cholesky/analytic targets remain explicit float64; this only affects the
+  # neural network and retains float32 storage/output.
+  matmul_precision: high
+  batch_size: 8
+  steps: 20000
+  # 4e-5: finetune_era5.py's empirical precedent, ~20x below the pretraining
+  # default. AdamW rather than Muon deliberately — src/muon.py:64-65 warns it
+  # "may not work well for finetuning pretrained models", and Phase A is
+  # exactly that.
+  lr: 4.0e-5
+  warmup_steps: 200
+  lr_min_frac: 0.1
+  weight_decay: 0.01
+  clip_grad_norm: 1.0
+  # Synchronized component timings for the first N steps. After these probes,
+  # the hot loop runs without timing synchronizations.
+  profile_steps: 10
+  log_every: 50
+  val_every: 500
+  save_every: 2000
+  ckpt_dir: ./checkpoints/marginal_finetune
+  resume_ckpt: null
+
+validation:
+  # The copula run's own ERA5 validation geometry, reused verbatim
+  # (conf/config.yaml's baselines.era5_* block) so Phase-A numbers land on the
+  # same points. These probes come from eval/data/fetch_era5.py, whose
+  # start_date defaults to 2023-01-01 — the held-out year, disjoint from the
+  # 2013-2022 training months above.
+  era5_regions:
+    - western_europe
+    - north_atlantic_ocean
+    - sahara_desert
+    - himalaya_tibetan_plateau
+    - amazon_basin
+  era5_grid_size: 24
+  era5_n_days_fetch: 60
+  era5_n_days_probe: 3
+  era5_n_context: 30
+  era5_seed: 20260818
+  # Fixed synthetic-GP val set for the analytic-headroom metric
+  # (val_marginal/gp/nll_gap_to_oracle). Regenerated never — one fixed seed.
+  gp_n_batches: 8
+  gp_batch_size: 8
+  gp_seed: 20260902

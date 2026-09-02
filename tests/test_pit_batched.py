@@ -25,6 +25,13 @@ Tests verify:
      "tabicl_split" path) overrides z_train only -- z_test/log_pdf_test stay
      the oracle values, unlike the plain "tabicl" path in (3) -- same
      never-perturbs-n_train guarantee as tabicl_k_folds's override.
+  6. run_pit_batched_grad (the Phase-A marginal-finetuning entry point, see
+     src/marginal_finetune.py) is numerically identical to run_pit_batched --
+     they share one private body precisely so they cannot drift, and this is
+     what proves the sharing actually holds.
+  7. return_quantiles=True is purely additive: it does not perturb z_train/
+     z_test/log_pdf_test, and the quantiles it returns are the same tensors
+     the returned CDF values were computed from.
 """
 
 from __future__ import annotations
@@ -34,7 +41,13 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 from data_gen import _generate_gp_batch_raw
-from pit import run_pit, run_pit_batched, run_pit_calib_split_batched
+from pit import (
+    _run_pit_batched_impl,
+    run_pit,
+    run_pit_batched,
+    run_pit_batched_grad,
+    run_pit_calib_split_batched,
+)
 
 
 class RowIndependentFakeTabICL(nn.Module):
@@ -336,3 +349,140 @@ def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg):
         assert not torch.allclose(ep_a["z_train"], ep_s["z_train"])
         for key in ("z_test", "log_pdf_test"):
             assert torch.allclose(ep_a[key], ep_s[key], atol=1e-6), key
+
+
+# ---------------------------------------------------------------------------
+# 6-7. Grad-enabled variant and the quantile extras
+# ---------------------------------------------------------------------------
+
+
+def _pit_inputs(B=2, P=9, N=4, seed=0):
+    torch.manual_seed(seed)
+    return (
+        torch.randn(B, P, 3), torch.randn(B, P, 1),
+        torch.randn(B, N, 3), torch.randn(B, N, 1),
+    )
+
+
+def test_run_pit_batched_grad_matches_the_no_grad_version():
+    """The two entry points exist only to differ in gradient policy. Any
+    numerical difference means the shared _run_pit_batched_impl stopped being
+    shared -- which would silently let Phase A optimize a slightly different
+    PIT than the one deployment runs."""
+    tabicl = RowIndependentFakeTabICL()
+    Xtr, Ytr, Xte, Yte = _pit_inputs()
+
+    ref = run_pit_batched(tabicl, Xtr, Ytr, Xte, Yte, k_folds=3)
+    got = run_pit_batched_grad(tabicl, Xtr, Ytr, Xte, Yte, k_folds=3, return_quantiles=False)
+
+    for key in ("z_train", "z_test", "log_pdf_test"):
+        assert torch.allclose(ref[key], got[key], atol=0), key
+
+
+class GradProbeFakeTabICL(nn.Module):
+    """A differentiable fake that records the grad-enabled state and the
+    train/eval mode it was called under.
+
+    RowIndependentFakeTabICL above builds its output with a torch.Generator and
+    torch.empty, so nothing downstream of it can require grad no matter what
+    policy the caller set -- it cannot distinguish the two entry points. This
+    one produces its output from an actual Parameter, so requires_grad on the
+    result is a real signal.
+    """
+
+    def __init__(self, q: int = 3):
+        super().__init__()
+        self.q = q
+        self.w = nn.Parameter(torch.randn(q))
+        self.saw_grad_enabled: list[bool] = []
+        self.saw_training: list[bool] = []
+
+    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        self.saw_grad_enabled.append(torch.is_grad_enabled())
+        self.saw_training.append(self.training)
+        batch, T, _ = X.shape
+        n = T - y.shape[1]
+        base = X[:, -n:, :1].mean(-1, keepdim=True)          # (batch, n, 1)
+        return base + self.w.view(1, 1, self.q)
+
+    def quantile_dist(self, logits_flat: torch.Tensor):
+        loc = logits_flat[:, 0]
+        scale = torch.nn.functional.softplus(logits_flat[:, 1]) + 1e-3
+        return torch.distributions.Normal(loc, scale)
+
+
+def test_run_pit_batched_grad_builds_a_graph_and_the_public_one_does_not():
+    """The whole point of the split: run_pit_batched is hard-decorated
+    @torch.no_grad() for its (many) inference callers, so a shared flag would
+    have silently made every one of them build an autograd graph."""
+    Xtr, Ytr, Xte, Yte = _pit_inputs()
+
+    frozen = GradProbeFakeTabICL()
+    out_nograd = run_pit_batched(frozen, Xtr, Ytr, Xte, Yte, k_folds=3)
+    assert not out_nograd["z_test"].requires_grad
+    assert not any(frozen.saw_grad_enabled)
+
+    live = GradProbeFakeTabICL()
+    out_grad = run_pit_batched_grad(live, Xtr, Ytr, Xte, Yte, k_folds=3, return_quantiles=False)
+    assert out_grad["z_test"].requires_grad
+    assert out_grad["log_pdf_test"].requires_grad
+    assert all(live.saw_grad_enabled)
+    out_grad["log_pdf_test"].mean().backward()
+    assert live.w.grad is not None and torch.isfinite(live.w.grad).all()
+
+
+def test_grad_pit_forces_train_mode_and_restores_it():
+    """TabICL's .eval() routes into _inference_forward/InferenceManager, whose
+    own fp16 autocast produces NaN for this codebase's inputs -- the documented
+    reason train.py::validate() never calls model.eval(). The grad path must
+    therefore force train mode, and must put it back so it is not a hidden
+    side effect on the caller's module."""
+    Xtr, Ytr, Xte, Yte = _pit_inputs()
+    probe = GradProbeFakeTabICL()
+    probe.eval()
+
+    run_pit_batched_grad(probe, Xtr, Ytr, Xte, Yte, k_folds=3, return_quantiles=False)
+
+    assert all(probe.saw_training), "grad path must call the module in train mode"
+    assert not probe.training, "grad path must restore the caller's original mode"
+
+
+def test_return_quantiles_is_additive_and_self_consistent():
+    tabicl = RowIndependentFakeTabICL(q=7)
+    Xtr, Ytr, Xte, Yte = _pit_inputs(seed=3)
+
+    plain = run_pit_batched(tabicl, Xtr, Ytr, Xte, Yte, k_folds=3)
+    extra = run_pit_batched(tabicl, Xtr, Ytr, Xte, Yte, k_folds=3, return_quantiles=True)
+
+    for key in ("z_train", "z_test", "log_pdf_test"):
+        assert torch.allclose(plain[key], extra[key], atol=0), key
+
+    B, P, _ = Ytr.shape
+    N = Yte.shape[1]
+    assert extra["q_train"].shape == (B, P, 1, 7)
+    assert extra["q_test"].shape == (B, N, 1, 7)
+    # u_test is the CDF the returned quantiles imply, so probit(u) must be the
+    # z_test that came back alongside them.
+    from pit import _probit
+
+    assert torch.allclose(_probit(extra["u_test"], 1e-6), extra["z_test"], atol=0)
+    assert torch.allclose(_probit(extra["u_train"], 1e-6), extra["z_train"], atol=0)
+
+
+def test_fold_subset_scores_only_the_requested_folds():
+    """Phase A never needs a complete z_train, so it subsets the fold rotation
+    to cut the per-step forward cost by ~K. The rows it does score must be
+    bit-identical to those rows of a full pass -- otherwise the fold geometry
+    changed and the training conditioning no longer matches deployment's."""
+    tabicl = RowIndependentFakeTabICL()
+    Xtr, Ytr, Xte, Yte = _pit_inputs(B=2, P=12, N=3, seed=5)
+    K = 4
+
+    full = run_pit_batched(tabicl, Xtr, Ytr, Xte, Yte, k_folds=K)
+    for subset in ([0], [1, 2], [0, 1, 2, 3]):
+        sub = _run_pit_batched_impl(tabicl, Xtr, Ytr, Xte, Yte, K, 1e-6, fold_subset=subset)
+        rows = sub["train_query_idx"]
+        assert rows.numel() == sum(
+            min((k + 1) * 3, 12) - k * 3 for k in subset
+        ), subset
+        assert torch.allclose(sub["z_train"], full["z_train"][:, rows, :], atol=0), subset
