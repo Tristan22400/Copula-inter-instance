@@ -1,23 +1,50 @@
 """
-overfit_single.py — Overfit on K synthetic realizations from one episode's R*.
+s4_overfit.py — Overfit on K synthetic realizations from one episode's
+correlation target (R* the prior, or R_post the exact GP posterior).
+Debug pipeline stage S4; see debug/README.md. Moved from
+src/overfit_single.py (2026-08-26) — nothing outside this file imports it.
 
 To recover the correlation matrix from NLL alone you need multiple z_test samples
-from N(0, R*) — a single sample gives the rank-1 MLE z*z^T, not R*.
+from N(0, R) — a single sample gives the rank-1 MLE z*z^T, not R.
 
 This script:
-  1. Loads one .pt episode and extracts its R* and fixed context (x_train, z_train, x_test).
-  2. Draws K synthetic z_test ~ N(0, R*) while keeping the context fixed.
-  3. Trains on those K realizations (cycling), so the expected gradient pushes R̂ → R*.
-  4. Tracks convergence via ||R̂ - R*||_F and copula NLL vs oracle.
+  1. Loads one .pt episode (or draws a fresh one via --kernel) and picks a
+     correlation target: R* (--target prior, the default, unconditioned
+     kernel correlation) or R_post (--target posterior, the exact
+     Schur-complement GP posterior conditioned on the realized context --
+     see pit.py::gp_analytical_posterior; requires --kernel, since
+     gp_analytical_posterior needs kernel metadata not guaranteed to be
+     saved in an arbitrary on-disk episode).
+  2. Draws K synthetic z_test realizations, either exactly from N(0, R)
+     (--z-source oracle, default) or by drawing K y_test ~ N(mu_post,
+     Sigma_post) and PIT-ing each through a frozen TabICL (--z-source
+     tabicl, --target posterior only) -- reusing
+     debug.stages.s3_pit_floor.sample_and_pit so a realization here carries
+     the SAME PIT distortion S3 measures, rather than an idealized
+     synthetic Gaussian.
+  3. Trains on those K realizations (cycling), so the expected gradient
+     pushes R̂ toward R (or, under z-source=tabicl, toward whatever
+     correlation TabICL's own PIT distortion lets the model see).
+  4. Tracks convergence via ||R̂ - R||_F and copula NLL vs three references:
+     the full-rank oracle (R itself), debug.stages.s1_rank_ceiling's exact
+     rank-r ceiling on R (cfg.model.rank), and -- for --z-source tabicl --
+     a pointer to debug/stages/s3_pit_floor.py for the PIT-distorted floor
+     (not recomputed here to avoid duplicating its Ledoit-Wolf shrinkage
+     logic; run it directly on the same episode for that number).
 
-Healthy run: copula_gap → 0 and ||R̂ - R*||_F → 0.
+Healthy run: copula_gap (vs. the full-rank oracle) -> 0 and ||R̂ - R||_F -> 0
+IF cfg.model.rank is not the binding constraint -- if S1 showed rank IS
+binding, the achievable gap here is the rank-r ceiling, not 0; compare
+against that reference instead.
 
 Usage:
-    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt
-    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --task-idx 3
-    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --k-realizations 500 --steps 5000 --lr 1e-3
-    python src/overfit_single.py --episode data/pit_episodes/shard_000000.pt --freeze-backbone
-    python src/overfit_single.py --kernel rbf   # fresh episode, no dataset needed
+    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt
+    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt --task-idx 3
+    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt --k-realizations 500 --steps 5000 --lr 1e-3
+    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt --freeze-backbone
+    python debug/stages/s4_overfit.py --kernel rbf   # fresh episode, no dataset needed
+    python debug/stages/s4_overfit.py --kernel rbf --target posterior              # overfit to R_post instead of R*
+    python debug/stages/s4_overfit.py --kernel rbf --target posterior --z-source tabicl  # + real PIT distortion
 """
 
 from __future__ import annotations
@@ -35,14 +62,21 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, TensorDataset
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-sys.path.insert(0, _HERE)
-sys.path.insert(0, os.path.join(_ROOT, "tabicl_upstream", "src"))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+_SRC = os.path.join(_REPO_ROOT, "src")
+_ROOT = _REPO_ROOT  # kept for the --model/config path joins below
+for _p in (_SRC, os.path.join(_REPO_ROOT, "tabicl_upstream", "src"), os.path.join(_REPO_ROOT, "debug")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from data_gen import generate_gp_batch
 from dataset import collate_fn
 from loss import _safe_cholesky, oracle_copula_nll, y_space_nll
 from model import build_copula_transformer, build_sigma
+
+import common  # noqa: E402 -- debug/common.py, added to sys.path above
+from stages.s1_rank_ceiling import fit_rank_ceiling  # noqa: E402
+from stages.s3_pit_floor import sample_and_pit  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,6 +130,22 @@ def parse_args() -> argparse.Namespace:
         "the --model preset sets, normally 'covnorm'). One of covnorm, cossim, "
         "tanhnorm, sparse_covnorm — see src/correlation_factory.py.",
     )
+    p.add_argument(
+        "--target", choices=["prior", "posterior"], default="prior",
+        help="Correlation to overfit to: R* (prior, unconditioned kernel "
+        "correlation -- original behaviour) or R_post (exact GP posterior "
+        "conditioned on the context, pit.py::gp_analytical_posterior). "
+        "--target posterior requires --kernel (fresh episode with kernel "
+        "metadata attached), not --episode.",
+    )
+    p.add_argument(
+        "--z-source", choices=["oracle", "tabicl"], default="oracle",
+        help="How the K realizations' z_test are drawn. 'oracle': exact "
+        "z ~ N(0, R) synthetic draws (original behaviour). 'tabicl': draw "
+        "y_test ~ N(mu_post, Sigma_post) and PIT each through a frozen "
+        "TabICL (debug.stages.s3_pit_floor.sample_and_pit) -- bakes in the "
+        "same PIT distortion S3 measures. Requires --target posterior.",
+    )
     return p.parse_args()
 
 
@@ -143,17 +193,42 @@ def build_synthetic_dataset(episode: dict, K: int) -> list[dict]:
     """Generate K synthetic episodes from the same task by sampling z_test ~ N(0, R*)."""
     n_test = int(episode["n_test"].item())
     R_star = episode["R_star"][:n_test, :n_test].float()
+    return build_synthetic_dataset_from_R(episode, R_star, K)
 
-    # Cholesky-sample K vectors from N(0, R*)
-    L = _safe_cholesky(R_star)
-    eps = torch.randn(n_test, K)          # (n_test, K)
-    z_samples = (L @ eps).T               # (K, n_test)
+
+def build_synthetic_dataset_from_R(episode: dict, R: torch.Tensor, K: int) -> list[dict]:
+    """Generalizes build_synthetic_dataset to an arbitrary unit-diagonal
+    correlation target R (e.g. R_post under --target posterior) by exact
+    Cholesky sampling of K synthetic z_test vectors from N(0, R)."""
+    n_test = R.shape[0]
+    L = _safe_cholesky(R)
+    eps = torch.randn(n_test, K, device=R.device, dtype=L.dtype)  # (n_test, K)
+    z_samples = (L @ eps).T.cpu()         # (K, n_test) -- realizations are stored/cloned as CPU episode dicts
 
     realizations = []
     for k in range(K):
-        ep = {key: val.clone() for key, val in episode.items()}
+        ep = {key: (val.clone() if torch.is_tensor(val) else val) for key, val in episode.items()}
         ep["z_test"] = z_samples[k]
         # Marginal log_pdf_test is set to 0 — we only care about the copula term.
+        ep["log_pdf_test"] = torch.zeros(n_test)
+        realizations.append(ep)
+    return realizations
+
+
+def build_tabicl_dataset(episode: dict, post: dict, K: int, tabicl_model, device: str) -> list[dict]:
+    """--z-source tabicl: K realizations whose z_test comes from PIT-ing K
+    draws of y_test ~ N(mu_post, Sigma_post) through a frozen TabICL, via
+    debug.stages.s3_pit_floor.sample_and_pit (reused, not reimplemented) --
+    the same procedure S3 uses to measure the attainable PIT floor. Unlike
+    build_synthetic_dataset_from_R, these z_test carry real TabICL marginal
+    distortion instead of an idealized synthetic Gaussian draw."""
+    n_test = int(episode["n_test"].item())
+    z_samples = sample_and_pit(tabicl_model, episode, post, K, device).cpu()  # (n_test, K)
+
+    realizations = []
+    for k in range(K):
+        ep = {key: (val.clone() if torch.is_tensor(val) else val) for key, val in episode.items()}
+        ep["z_test"] = z_samples[:, k]
         ep["log_pdf_test"] = torch.zeros(n_test)
         realizations.append(ep)
     return realizations
@@ -180,6 +255,15 @@ def main() -> None:
     if args.parametrization is not None:
         cfg.model.correlation_parametrization = args.parametrization
 
+    if args.z_source == "tabicl" and args.target != "posterior":
+        raise SystemExit("--z-source tabicl requires --target posterior.")
+    if args.target == "posterior" and args.episode is not None:
+        raise SystemExit(
+            "--target posterior requires --kernel (a fresh episode carries the "
+            "kernel metadata gp_analytical_posterior needs); an on-disk "
+            "--episode file is not guaranteed to have it."
+        )
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
@@ -188,7 +272,7 @@ def main() -> None:
     if args.kernel is not None:
         cfg.data.kernel = args.kernel
         cfg.data.kernels = []
-        episode = generate_gp_batch(cfg, 1, device)[0]
+        episode = generate_gp_batch(cfg, 1, device, return_kernel_metadata=(args.target == "posterior"))[0]
         print(f"Episode : fresh draw ({args.kernel})")
     elif args.episode is not None:
         loaded = torch.load(args.episode, map_location="cpu", weights_only=True)
@@ -207,10 +291,30 @@ def main() -> None:
     n_train = int(episode["n_train"].item())
     n_test = int(episode["n_test"].item())
     print(f"  n_train={n_train}  n_test={n_test}  d_x={episode['x_norm_train'].shape[-1]}")
-    print(f"  K realizations from N(0, R*): {args.k_realizations}")
+    print(f"  target={args.target}  z-source={args.z_source}  K realizations: {args.k_realizations}")
 
-    # Synthetic dataset: K different z_test from the same R*.
-    realizations = build_synthetic_dataset(episode, args.k_realizations)
+    # Pick the correlation target and build the K realizations from it.
+    post = None
+    if args.target == "prior":
+        R_target = episode["R_star"][:n_test, :n_test].float()
+        realizations = build_synthetic_dataset_from_R(episode, R_target, args.k_realizations)
+    else:
+        post = common.posterior_oracle(episode)
+        if post is None:
+            raise SystemExit(
+                "gp_analytical_posterior could not score this episode's kernel "
+                "(rare unsupported schema -- whole-chain outer sign modulation). "
+                "Try a different --kernel or re-run (a fresh draw resamples hyperparameters)."
+            )
+        R_target = post["R_post"].float()
+        if args.z_source == "oracle":
+            realizations = build_synthetic_dataset_from_R(episode, R_target, args.k_realizations)
+        else:
+            tabicl_model = common.load_frozen_tabicl(
+                common.DebugConfig(cfg=cfg, device=device)
+            )
+            realizations = build_tabicl_dataset(episode, post, args.k_realizations, tabicl_model, device)
+    R_target = R_target.to(device)
 
     # Build model.
     model = build_copula_transformer(cfg).to(device)
@@ -226,23 +330,36 @@ def main() -> None:
         weight_decay=0.0,
     )
 
-    # Oracle NLL (true R*, averaged over the K synthetic z_test vectors).
+    # Full-rank oracle NLL (true R_target, averaged over the K realizations'
+    # own z_test -- NOT the batch's collated "R_star" field, which under
+    # --target posterior would still hold the prior R*, not the R_post the
+    # realizations were actually drawn from).
     oracle_nll_vals = []
     for i in range(0, args.k_realizations, args.batch_size):
         chunk = realizations[i : i + args.batch_size]
         b = collate_fn(chunk)
         b = {k: v.to(device) for k, v in b.items()}
         with torch.no_grad():
+            R_batch = R_target.unsqueeze(0).expand(b["z_test"].shape[0], -1, -1)
             oracle_nll_vals.append(
-                oracle_copula_nll(
-                    b["R_star"].float(), b["z_test"].float(), b["test_mask"]
-                ).item()
+                oracle_copula_nll(R_batch, b["z_test"].float(), b["test_mask"]).item()
             )
     oracle_nll = sum(oracle_nll_vals) / len(oracle_nll_vals)
 
-    R_star = episode["R_star"][:n_test, :n_test].float().to(device)
+    # S1's exact rank-r ceiling on the SAME R_target -- the achievable floor
+    # if cfg.model.rank (not optimization) is the binding constraint.
+    rank = int(cfg.model.get("rank", 32))
+    ceiling_per_ep, _ = fit_rank_ceiling(
+        R_target.unsqueeze(0).float(), min(rank, n_test - 1), jitter=jitter, device=device,
+    )
+    rank_ceiling_nll = float(ceiling_per_ep.item())
 
-    print(f"\nOracle copula NLL = {oracle_nll:.6f}  (expected ≈ 0 for R* ≈ I, negative for structured R*)")
+    R_star = R_target  # kept for the unchanged plotting/printing code below
+
+    print(f"\nFull-rank oracle copula NLL ({args.target}) = {oracle_nll:.6f}")
+    print(f"Rank-{rank} ceiling on the same target       = {rank_ceiling_nll:.6f}  (S1's exact fit, see debug/stages/s1_rank_ceiling.py)")
+    if args.z_source == "tabicl":
+        print("(z-source=tabicl: run debug/stages/s3_pit_floor.py on the same episode for the PIT-distorted attainable floor)")
     header = (
         f"{'step':>6}  {'cop_nll':>10}  {'oracle':>10}  {'gap':>10}"
         f"  {'||R-R*||_F':>12}  {'||R-R*||_F/N²':>15}"
@@ -312,8 +429,10 @@ def main() -> None:
 
     final_frob = (R_hat_final - R_star).norm().item()
     final_gap = parts["copula"].item() - oracle_nll
-    print(f"\nFinal ||R̂ - R*||_F = {final_frob:.4f}")
-    print(f"Final copula gap   = {final_gap:.4f}")
+    final_gap_vs_ceiling = parts["copula"].item() - rank_ceiling_nll
+    print(f"\nFinal ||R̂ - R||_F              = {final_frob:.4f}")
+    print(f"Final copula gap (vs full-rank) = {final_gap:.4f}")
+    print(f"Final copula gap (vs rank-{rank})  = {final_gap_vs_ceiling:.4f}  (0 here means rank isn't limiting convergence)")
 
     plot_correlation_comparison(R_star, R_hat_final, final_frob, final_gap, args.plot)
 
