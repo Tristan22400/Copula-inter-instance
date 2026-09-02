@@ -4,10 +4,12 @@ test_analytic_only_validation.py — pins training.val_analytic_only, the
 
 The mode's whole claim is that NO approximate marginal is anywhere in the
 validation loop: every metric is scored against the exact analytic GP marginal
-(z_test standardized by the episode's own (mu_star, sigma_star), log_pdf_test
-its exact Gaussian log-density), so the copula head's error is isolated from
-the frozen TabICL marginal's approximation error. Three things have to hold
-for that claim to be true, and each is easy to break silently:
+(z_test standardized by the episode's exact POSTERIOR marginal -- see
+pit.gp_analytical_pit and test_analytic_pit_posterior, which pins that
+specifically -- and log_pdf_test its exact Gaussian log-density), so the copula
+head's error is isolated from the frozen TabICL marginal's approximation error.
+Four things have to hold for that claim to be true, and each is easy to break
+silently:
 
   1. The config coupling guard (live_dataset.validate_analytic_only). Setting
      val_analytic_only=true next to a data config that reintroduces a PIT --
@@ -22,7 +24,14 @@ for that claim to be true, and each is easy to break silently:
      non-analytic run would have built. This is the executable form of
      "bypass the pretrained quantile head".
 
-  3. oracle_diag/gap_nll must be >= 0 up to numerical tolerance on a
+  3. oracle_diag/copula_gap must be >= 0, and equal to gap_nll up to the
+     marginal residual. Both sides of that subtraction are now split at the
+     SAME exact posterior marginal, so the marginal cancels and the copula
+     terms become directly comparable -- which they were NOT while the analytic
+     PIT emitted prior marginals. oracle_diag/marginal_gap is the residual and
+     must be ~0.
+
+  4. oracle_diag/gap_nll must be >= 0 up to numerical tolerance on a
      well-conditioned probe. It is the model's total Y-space NLL minus
      gp_analytical_posterior's exact Schur-complement posterior NLL, and the
      Bayes-optimality of the posterior predictive under log loss makes that a
@@ -191,6 +200,10 @@ def test_validate_analytic_only_emits_oracle_diag_and_no_tabicl_keys(analytic_va
         "oracle_diag/corr_mae",
         "oracle_diag/corr_rmse",
         "oracle_diag/corr_bias",
+        "oracle_diag/copula_gap",
+        "oracle_diag/copula_headroom",
+        "oracle_diag/marginal_gap",
+        "oracle_diag/corr_kl",
         "y_nll_oracle_posterior",
     ):
         assert key in metrics, f"analytic-only run is missing {key}"
@@ -217,6 +230,23 @@ def test_validate_analytic_only_emits_oracle_diag_and_no_tabicl_keys(analytic_va
     assert metrics["y_nll_total_analytic_z"] == pytest.approx(
         metrics["y_nll_copula_analytic_z"] + metrics["y_nll_marginal_analytic_z"], abs=1e-5,
     )
+
+    # The marginal is the exact posterior marginal on BOTH sides -- the model
+    # never predicts one -- so it must cancel. This is what makes copula_gap a
+    # like-for-like comparison, and it is the guard that fails first if the
+    # analytic PIT regresses to prior marginals.
+    assert metrics["oracle_diag/marginal_gap"] == pytest.approx(0.0, abs=1e-4), (
+        f"marginal_gap={metrics['oracle_diag/marginal_gap']:.6f} should be ~0: the "
+        "model's marginal term and the oracle ceiling's marginal term are the same "
+        "exact posterior marginal. A non-zero value means they are split at "
+        "different marginals, which invalidates oracle_diag/copula_gap."
+    )
+    # ...and therefore the copula gap and the total gap are the same number.
+    assert metrics["oracle_diag/copula_gap"] == pytest.approx(
+        metrics["oracle_diag/gap_nll"], abs=1e-4,
+    )
+    # The headroom is -E[copula NLL at the optimum] = -0.5*log|R_post|/n >= 0.
+    assert metrics["oracle_diag/copula_headroom"] >= -1e-9
 
 
 def test_validate_analytic_only_ignores_stale_tabicl_caches(analytic_val_setup):

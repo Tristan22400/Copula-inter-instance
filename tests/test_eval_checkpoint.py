@@ -30,6 +30,7 @@ from data_gen import generate_gp_batch  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
     baseline_fingerprint,
+    corr_nll_single,
     episode_cache_key,
     eval_baselines_episode,
     load_baseline_cache,
@@ -141,11 +142,21 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode):
         ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"),
     )
 
-    assert set(nlls.keys()) == {"icl", "oracle"}
-    assert torch.isfinite(torch.tensor(nlls["icl"]))
-    assert torch.isfinite(torch.tensor(nlls["oracle"]))
+    # "oracle" is R_star (the unconditional prior correlation, descriptive);
+    # "oracle_posterior" is R_post, the Bayes-optimal reference now that
+    # z_test is standardized by the posterior predictive marginals, so it
+    # belongs in this z-space copula table alongside every other row rather
+    # than only in R_dict for the plot.
+    assert set(nlls.keys()) == {"icl", "oracle", "oracle_posterior"}
+    for key in ("icl", "oracle", "oracle_posterior"):
+        assert torch.isfinite(torch.tensor(nlls[key])), key
     _assert_valid_correlation(R_dict["icl"], n_test)
     assert torch.equal(R_oracle, tiny_episode["R_star"])
+    # The scored matrix is the one stashed for the plot -- one quantity, not
+    # two -- and it is scored on the shared z_test like every other row.
+    assert nlls["oracle_posterior"] == pytest.approx(
+        corr_nll_single(R_dict["oracle_posterior"], tiny_episode["z_test"]), abs=1e-6,
+    )
     # No tabicl_pit given (oracle z_train mode, the default): icl_y_parts is
     # scored with the episode's EXACT analytic marginal (ep["log_pdf_test"]),
     # not left NaN as it was before 2026-09. It is an oracle-marginal upper

@@ -98,6 +98,7 @@ from muon import Muon
 from pit import (
     DEFAULT_K_FOLDS,
     episode_posterior_ceiling,
+    gaussian_corr_kl,
     gp_analytical_posterior,
     load_tabicl,
     normalize_targets,
@@ -1525,6 +1526,12 @@ def validate(
     # between a batch-of-means and a mean-of-episodes; the point of keeping it
     # per-episode is the tail, which a mean cannot show.
     gap_per_episode: list[float] = []
+    # KL(N(0,R_post) || N(0,Sigma_theta)) per point, per episode. Unlike
+    # gap_nll -- a Monte-Carlo estimate from the single realized y_test --
+    # this is a functional of the two correlation matrices alone, so it has
+    # no sampling noise and is exactly 0 iff the predicted correlation IS the
+    # posterior correlation. See pit.gaussian_corr_kl.
+    corr_kl_per_episode: list[float] = []
 
     # First val batch's episodes + Sigma, kept only to build
     # val/corr_grid_analytic_z after the loop (analytic_only + do_plot).
@@ -1703,6 +1710,10 @@ def validate(
                     ri_p, ci_p = np.triu_indices(n, k=1)
                     off_p_post.append(Sigma[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
                     off_o_post.append(ceil_b["off_R_post"])
+                if ceil_b.get("R_post") is not None and ceil_b["n_test"] == n:
+                    corr_kl_per_episode.append(
+                        gaussian_corr_kl(Sigma[b, :n, :n].cpu(), ceil_b["R_post"])
+                    )
 
     # metrics starts empty. The old y_nll_total/y_nll_copula here scored the
     # model against batch["z_test"]/["log_pdf_test"] — the exact analytic-GP
@@ -1825,6 +1836,10 @@ def validate(
                     ri_p, ci_p = np.triu_indices(n, k=1)
                     off_p_post.append(Sigma_p[b_local, :n, :n].float().cpu().numpy()[ri_p, ci_p])
                     off_o_post.append(ceil_p["off_R_post"])
+                if ceil_p.get("R_post") is not None:
+                    corr_kl_per_episode.append(
+                        gaussian_corr_kl(Sigma_p[b_local, :n, :n].cpu(), ceil_p["R_post"])
+                    )
         if n_valid_p:
             all_oracle_total.append(totals_p["total"] / n_valid_p)
             all_oracle_copula.append(totals_p["copula"] / n_valid_p)
@@ -1852,6 +1867,15 @@ def validate(
             # (live_dataset.validate_analytic_only) makes "analytic" provably
             # true -- in the default recipe val_loader's own z_test is
             # TabICL-PIT'd, so the name would be a lie.
+            #
+            # The marginal term here is the EXACT posterior marginal (see
+            # pit.gp_analytical_pit) and the model does not predict it, so
+            # y_nll_marginal_analytic_z is a constant across training: it must
+            # equal y_nll_oracle_posterior_marginal below, and
+            # oracle_diag/marginal_gap tracks exactly that. A drift means
+            # something non-analytic is feeding log_pdf_test. Because the two
+            # marginal terms cancel, oracle_diag/gap_nll and
+            # oracle_diag/copula_gap are the same number up to that residual.
             metrics["y_nll_total_analytic_z"] = metrics["oracle_diag/total_nll"]
             metrics["y_nll_copula_analytic_z"] = metrics["oracle_diag/copula_nll"]
             metrics["y_nll_marginal_analytic_z"] = metrics["oracle_diag/marginal_nll"]
@@ -1869,6 +1893,34 @@ def validate(
         metrics["y_nll_oracle_posterior_copula"] = float(np.mean(nll_post_copula_per_point))
         if "oracle_diag/total_nll" in metrics:
             metrics["oracle_diag/gap_nll"] = metrics["oracle_diag/total_nll"] - oracle_posterior_nll
+        if "oracle_diag/copula_nll" in metrics:
+            # The copula-only gap. Valid as a like-for-like comparison ONLY
+            # because both terms are now split at the SAME marginals: the
+            # model's z_test is standardized by the exact posterior marginal
+            # (pit.gp_analytical_pit) and nll_post_copula splits
+            # N(mu_post, Sigma_post) at its own posterior marginal, so the
+            # marginal cancels and this is >= 0 in expectation. It was NOT
+            # comparable while gp_analytical_pit emitted PRIOR marginals --
+            # the model appeared to beat the ceiling by ~0.1 nats/pt purely
+            # because the two splits were taken in different z-spaces.
+            metrics["oracle_diag/copula_gap"] = (
+                metrics["oracle_diag/copula_nll"] - metrics["y_nll_oracle_posterior_copula"]
+            )
+            # The interpretive scale for copula_gap. At the copula optimum the
+            # expected copula NLL is 0.5*log|R_post|/n = -I(z)/n, the negative
+            # multi-information -- so this is the total number of nats/point
+            # the copula head can win versus predicting independence, and it
+            # shrinks fast as the context grows (conditioning decorrelates).
+            # copula_gap exceeding it means the model is worse than R = I.
+            metrics["oracle_diag/copula_headroom"] = -metrics["y_nll_oracle_posterior_copula"]
+        if "oracle_diag/marginal_nll" in metrics:
+            # Must be ~0 and flat: the model never predicts a marginal, and
+            # under analytic_only both sides are the same exact posterior
+            # marginal. Non-zero means the two paths disagree about the
+            # marginal, which invalidates copula_gap above.
+            metrics["oracle_diag/marginal_gap"] = (
+                metrics["oracle_diag/marginal_nll"] - metrics["y_nll_oracle_posterior_marginal"]
+            )
     if gap_per_episode:
         # Tail of the per-episode gap distribution. gap_nll's mean can look
         # healthy while a handful of episodes are catastrophically
@@ -1882,6 +1934,20 @@ def validate(
         # superhuman.
         metrics["oracle_diag/gap_nll_p90"] = float(np.percentile(gap_per_episode, 90))
         metrics["oracle_diag/gap_nll_std"] = float(np.std(gap_per_episode))
+    if corr_kl_per_episode:
+        # Correlation-only divergence, KL(N(0,R_post) || N(0,Sigma_theta))/n.
+        # Exactly 0 iff the predicted correlation IS the posterior
+        # correlation, with no Monte-Carlo noise (it never touches y_test), so
+        # unlike gap_nll a single episode's value is already meaningful and
+        # the floor is a hard 0 rather than 0-in-expectation. inf entries
+        # (a non-PD Sigma even after jitter) are dropped rather than allowed
+        # to poison the mean -- and counted, since a rising count is itself
+        # the signal that the head is producing degenerate correlations.
+        finite_kl = [v for v in corr_kl_per_episode if np.isfinite(v)]
+        metrics["oracle_diag/corr_kl_nonfinite"] = len(corr_kl_per_episode) - len(finite_kl)
+        if finite_kl:
+            metrics["oracle_diag/corr_kl"] = float(np.mean(finite_kl))
+            metrics["oracle_diag/corr_kl_p90"] = float(np.percentile(finite_kl, 90))
     if off_p_post:
         cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
         metrics["oracle_diag/corr_pearson"] = cq_p["pearson"]
@@ -3449,9 +3515,23 @@ def main(cfg: DictConfig) -> None:
                 # now logged as val/y_nll_total_analytic_z.
                 tot_a = metrics.get("oracle_diag/total_nll", float("nan"))
                 tot_a_str = f"{tot_a:.4f}" if math.isfinite(tot_a) else "n/a"
+                # cop_gap is the copula-only gap and, with both sides split at
+                # the same exact posterior marginal, is the headline number in
+                # this mode; head is oracle_diag/copula_headroom, the nats/pt
+                # available versus R = I, so cop_gap > head means the model is
+                # worse than predicting independence. corr_kl is the noise-free
+                # correlation distance, exactly 0 at R_post.
+                cg = metrics.get("oracle_diag/copula_gap", float("nan"))
+                cg_str = f"{cg:.4f}" if math.isfinite(cg) else "n/a"
+                head = metrics.get("oracle_diag/copula_headroom", float("nan"))
+                head_str = f"{head:.4f}" if math.isfinite(head) else "n/a"
+                ckl = metrics.get("oracle_diag/corr_kl", float("nan"))
+                ckl_str = f"{ckl:.4f}" if math.isfinite(ckl) else "n/a"
                 print(
                     f"[{step:6d}] VAL(analytic)  "
                     f"total={tot_a_str}  "
+                    f"cop_gap={cg_str}/{head_str}  "
+                    f"corr_kl={ckl_str}  "
                     f"gap_post={gap_str} (p90={gap_p90_str})  "
                     f"corr_r={pearson_str}  "
                     f"{od_str}  "

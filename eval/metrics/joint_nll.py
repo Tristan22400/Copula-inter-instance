@@ -32,6 +32,25 @@ convention produced it silently mixes incomparable numbers:
      same quantity as (1)'s "copula" despite the identical key name. There
      is no "marginal"/"total" key in this convention at all.
 
+A THIRD trap, orthogonal to those two: a Sklar split is taken at the
+marginals of whichever density is being split, so two splits are comparable
+only when both are taken at the SAME marginals. Writing total = marg + cop for
+a model q and the truth p,
+
+    cop_q - cop_p = (total_q - total_p) - (marg_q - marg_p)
+
+Bayes-optimality bounds the FIRST bracket (KL >= 0) and Gibbs bounds the second
+per coordinate, so their difference has no determined sign: a model can post a
+lower "copula" number than the Bayes-optimal one without beating it at
+anything. This bit in practice -- ``val/y_nll_copula_analytic_z`` came out
+below ``val/y_nll_oracle_posterior_copula`` because the model's z was
+standardized by the GP PRIOR marginals while ``nll_post_copula`` splits
+N(mu_post, Sigma_post) at its own POSTERIOR marginals. Fixed at the source
+(pit.gp_analytical_pit now emits posterior marginals, matching what run_pit's
+TabICL call supplies), which makes the marginals cancel and
+``oracle_diag/copula_gap`` a valid >= 0 comparison; ``oracle_diag/marginal_gap``
+is the residual that must stay ~0 for it to remain valid.
+
 See ``eval/runners/eval_checkpoint.py``'s ``_print_table`` vs.
 ``_print_total_nll_table`` docstrings for the concrete case where both
 conventions are printed side by side.
