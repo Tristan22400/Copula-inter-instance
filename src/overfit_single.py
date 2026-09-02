@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.join(_ROOT, "tabicl_upstream", "src"))
 from data_gen import generate_gp_batch
 from dataset import collate_fn
 from loss import _safe_cholesky, oracle_copula_nll, y_space_nll
-from model import build_copula_transformer, low_rank_correlation
+from model import build_copula_transformer, build_sigma
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +83,18 @@ def parse_args() -> argparse.Namespace:
         "--freeze-backbone",
         action="store_true",
         help="Freeze TabICL backbone (faster but may converge slower)",
+    )
+    p.add_argument(
+        "--model",
+        default="copula_prod",
+        help="conf/model/<name>.yaml preset to load (default: copula_prod)",
+    )
+    p.add_argument(
+        "--parametrization",
+        default=None,
+        help="Override cfg.model.correlation_parametrization (default: whatever "
+        "the --model preset sets, normally 'covnorm'). One of covnorm, cossim, "
+        "tanhnorm, sparse_covnorm — see src/correlation_factory.py.",
     )
     return p.parse_args()
 
@@ -153,13 +165,20 @@ def main() -> None:
     # Build config from yaml files without Hydra.
     base_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "config.yaml"))
     model_cfg = OmegaConf.load(
-        os.path.join(_ROOT, "conf", "model", "copula_transformer.yaml")
+        os.path.join(_ROOT, "conf", "model", f"{args.model}.yaml")
     )
     data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
-    cfg = OmegaConf.merge(base_cfg, OmegaConf.create({"model": model_cfg, "data": data_cfg}))
+    # copula_prod.yaml/copula_nano.yaml use Hydra `# @package _global_`
+    # packaging, so they already have top-level `model:`/`tabicl:` keys —
+    # merge directly instead of nesting under `model:` a second time (which
+    # would have left cfg.tabicl missing, since this loader bypasses Hydra's
+    # defaults composition entirely).
+    cfg = OmegaConf.merge(base_cfg, model_cfg, OmegaConf.create({"data": data_cfg}))
     if args.freeze_backbone:
         cfg.model.unfreeze_backbone = False
+    if args.parametrization is not None:
+        cfg.model.correlation_parametrization = args.parametrization
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -244,9 +263,7 @@ def main() -> None:
             batch = {k: v.to(device) for k, v in batch.items()}
 
             out = model(batch)
-            Sigma = low_rank_correlation(
-                out["W"].float(), out["s"].float(), batch["test_mask"], jitter=jitter
-            )
+            Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
             parts = y_space_nll(
                 Sigma,
                 batch["z_test"].float(),
@@ -268,12 +285,7 @@ def main() -> None:
                     eval_batch = collate_fn([realizations[0]])
                     eval_batch = {k: v.to(device) for k, v in eval_batch.items()}
                     out_eval = model(eval_batch)
-                    Sigma_eval = low_rank_correlation(
-                        out_eval["W"].float(),
-                        out_eval["s"].float(),
-                        eval_batch["test_mask"],
-                        jitter=jitter,
-                    )
+                    Sigma_eval = build_sigma(out_eval, cfg, jitter=jitter, test_mask=eval_batch["test_mask"])
                     R_hat = Sigma_eval[0, :n_test, :n_test]
                     frob = (R_hat - R_star).norm().item()
                     frob_per_n2 = frob / (n_test ** 2)
@@ -289,12 +301,7 @@ def main() -> None:
         eval_batch = collate_fn([realizations[0]])
         eval_batch = {k: v.to(device) for k, v in eval_batch.items()}
         out_final = model(eval_batch)
-        Sigma_final = low_rank_correlation(
-            out_final["W"].float(),
-            out_final["s"].float(),
-            eval_batch["test_mask"],
-            jitter=jitter,
-        )
+        Sigma_final = build_sigma(out_final, cfg, jitter=jitter, test_mask=eval_batch["test_mask"])
         R_hat_final = Sigma_final[0, :n_test, :n_test]
 
     show = min(n_test, 5)

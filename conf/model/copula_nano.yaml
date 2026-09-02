@@ -1,0 +1,106 @@
+# @package _global_
+# Fast dev-loop preset (single file: backbone + head) — from-scratch, narrow
+# AND shallow TabICL backbone (small-rank head to match) for quick iteration.
+# NOT a production model — see conf/model/copula_prod.yaml for that.
+# `model=copula_nano` alone fully configures a fast run — no separate
+# backbone config needed.
+#
+# vs. the pretrained tabicl-regressor-v2 checkpoint's architecture (see the
+# commented `arch:` template in conf/model/copula_prod.yaml):
+#   embed_dim        32 vs 128  (width)
+#   col_num_blocks    1 vs 3    (depth)
+#   row_num_blocks    1 vs 3    (depth)
+#   icl_num_blocks    2 vs 12   (depth)
+# heads/inducing points/CLS tokens/ff_factor unchanged. Attention cost per
+# ICL block is O(T^2*d) vs O(T*d^2) for the QKV/FFN projections (T=P+N,
+# d=embed_dim), so shrinking episode size via CLI overrides (e.g.
+# data.P_max=64 data.N_max=32) still matters for wall-clock speed on top of
+# this width+depth cut.
+#
+# NOTE: previously held a dead d_model/n_heads/n_layers_s1/s2/s3/n_inducing/
+# n_cls/p_max/d_max schema that build_copula_transformer (src/model.py) never
+# read — orphaned since the repo's initial commit.
+#
+# Usage:
+#   python src/train.py model=copula_nano \
+#     data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \
+#     training.live_generation=true training.ckpt_dir=./checkpoints/copula_nano
+model:
+  rank: 8                  # vs. 32 in copula_prod.yaml
+  sigma_jitter: 1.0e-4
+  unfreeze_backbone: true
+  # Which src/correlation_factory.py builder turns the copula head's raw
+  # output into a valid low-rank correlation matrix: covnorm (default,
+  # matches the original hard-coded implementation) | cossim | tanhnorm |
+  # sparse_covnorm. Override from CLI, e.g. model.correlation_parametrization=cossim.
+  correlation_parametrization: covnorm
+
+training:
+  # training.live_generation's live_tabicl_num_workers auto-sizing (see
+  # conf/config.yaml / live_dataset.py::resolve_live_tabicl_num_workers)
+  # reserves this much VRAM for the main training process before handing the
+  # rest to GPU-resident TabICL DataLoader workers. The default (8GB) is
+  # sized for the largest presets; copula_nano's few-hundred-K-param
+  # backbone measured a ~3.9GB peak on a 24GB card (RTX A5000, 2026-08-24,
+  # under training.batch_size=16), so reserving 8GB here just leaves VRAM
+  # idle instead of workers -- lowering it lets auto-sizing reach ~12
+  # workers (this repo's measured throughput optimum, see
+  # live_dataset.py::_LIVE_TABICL_AUTO_WORKERS_MAX) instead of topping out
+  # around 6. Only takes effect when training.live_tabicl_num_workers is
+  # left null (the default) -- irrelevant for on-disk (non-live) training.
+  #
+  # Raising training.batch_size itself (e.g. via auto-sizing off currently-
+  # free VRAM, mirroring the worker auto-sizing above) was investigated
+  # 2026-08-25 and reverted: batch_size=32 raised real end-to-end step time
+  # ~296ms->~540ms (data= wait got WORSE, ~108ms->~195ms average) despite a
+  # much more VRAM/compute-efficient isolated model step (245->406
+  # samples/s in a standalone _run_train_step-only benchmark) -- doubling
+  # batch_size also doubles group_size = batch_size * live_tabicl_
+  # group_multiplier (how many episodes each TabICL worker generates per
+  # call), and the worker pool doesn't scale favorably enough to compensate.
+  # It also crashed real training 3 times ("DataLoader worker ... is killed
+  # by signal: Aborted", a hard SIGABRT the per-step OOM-skip path can't
+  # catch) before group_multiplier=1 stabilized it -- train.py deliberately
+  # overlaps ALL live-generation workers' concurrent TabICL-checkpoint loads
+  # at startup with the main process's own concurrent TabICL diagnostic
+  # loads (z_train gap check, kernel_fit cache, era5 probes) to save
+  # wall-clock, and that startup burst turned out far more sensitive to
+  # group_size than steady-state generation VRAM alone predicted. Net: not
+  # worth the added complexity/risk for ~10% real throughput. If revisited,
+  # start from the group_multiplier interaction, not just a VRAM budget.
+  live_tabicl_main_process_reserve_gb: 4.5
+  # Standalone build_live_train_loader throughput benchmark (RTX A5000, 8 CPU
+  # cores, 2026-08-24, at the 12-worker optimum above): group_multiplier=1
+  # gave 3.0 batches/s, =2 (the repo default) gave 3.4, =3 gave 3.7 with a
+  # much cleaner p90 (33ms vs 1.0s at =2 -- fewer, not just shorter, stalls)
+  # and 16.4GB VRAM (workers only, doesn't yet include the main process's own
+  # use) -- comfortably under the 24GB card. =4 nudged throughput a little
+  # further (3.7) but pushed VRAM to 18.9GB, too little headroom left for
+  # the training process itself; =6 and above OOM outright at 12 workers.
+  # 3 is the best throughput/VRAM/tail-latency balance measured, so it's
+  # worth overriding the repo default here even though live_generation isn't
+  # nano-specific.
+  live_tabicl_group_multiplier: 3
+
+tabicl:
+  pretrained: false
+  recompute: false
+  # z_train sim-to-real diagnostic (src/train.py::_build_tabicl_val_z) needs
+  # a frozen TabICL copy with its pretrained quantile head to PIT val
+  # episodes — independent of this run's own from-scratch backbone above, so
+  # it's set here explicitly rather than inherited from `pretrained: false`.
+  # Same checkpoint copula_prod.yaml's backbone loads; only ever used frozen,
+  # for validation, never trained.
+  pit_ckpt: tabicl-regressor-v2-20260212.ckpt
+  arch:
+    embed_dim: 32       # vs. 128 in the pretrained checkpoint
+    col_num_blocks: 1   # vs. 3 in the pretrained checkpoint
+    col_nhead: 8         # matches pretrained
+    col_num_inds: 128    # matches pretrained
+    row_num_blocks: 1    # vs. 3 in the pretrained checkpoint
+    row_nhead: 8         # matches pretrained
+    row_num_cls: 4       # matches pretrained
+    icl_num_blocks: 2   # vs. 12 in the pretrained checkpoint
+    icl_nhead: 8         # matches pretrained
+    ff_factor: 2
+    dropout: 0.0

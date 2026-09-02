@@ -34,7 +34,7 @@ for _p in (_REPO_ROOT, _SRC):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from pit import run_pit  # noqa: E402
+from pit import normalize_targets, run_pit  # noqa: E402
 
 from experiments.experiment_b_quantitative import _compute_r_true, _sample_one_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402
@@ -67,12 +67,20 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
     X_train_norm_t = torch.as_tensor(X_train_norm, dtype=X_train_t.dtype)
     X_test_norm_t = torch.as_tensor(X_test_norm, dtype=X_test_t.dtype)
 
+    # y is z-scored via pit.normalize_targets before reaching the raw TabICL
+    # module -- the same helper every other run_pit/raw-TabICL call site in
+    # the repo uses -- or this GP draw's random outputscale saturates the
+    # pretrained quantile head's CDF into its extreme tail, collapsing
+    # Z_train's spread instead of reflecting the true per-point rank.
     tabicl_device = next(tabicl_model.parameters()).device
     with torch.no_grad():
+        y_train_scaled, y_test_scaled, _, _ = normalize_targets(
+            y_train_t.to(tabicl_device), y_test_t.to(tabicl_device)
+        )
         pit_out = run_pit(
             tabicl_model,
-            X_train_norm_t.to(tabicl_device), y_train_t.to(tabicl_device).unsqueeze(-1),
-            X_test_norm_t.to(tabicl_device), y_test_t.to(tabicl_device).unsqueeze(-1),
+            X_train_norm_t.to(tabicl_device), y_train_scaled.unsqueeze(-1),
+            X_test_norm_t.to(tabicl_device), y_test_scaled.unsqueeze(-1),
             k_folds=min(10, len(X_train)),
         )
         Z_train = pit_out["z_train"].squeeze(-1).cpu().numpy()

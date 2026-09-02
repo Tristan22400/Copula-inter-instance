@@ -18,6 +18,14 @@ Usage
         [--lr_dkl 0.01]           # learning rate for DKL Adam
         [--n_steps_per_ep 500]    # training steps for PerEpisodeTransformer
         [--patience_per_ep 100]   # early stopping patience (steps without improvement)
+        [--z_train_source tabicl]  # (default) or 'oracle': feed the ICL model the
+                                   # exact GP-LOO z_train instead of TabICL's own
+                                   # K-fold PIT estimate, to measure the sim-to-real
+                                   # gap ('oracle' leaves the total-NLL table's icl
+                                   # row NaN — no learned marginal to score against)
+        [--tabicl_ckpt ...]        # TabICL checkpoint for --z_train_source=tabicl
+                                   # (default: cfg.tabicl.ckpt from --config)
+        [--tabicl_pit_k_folds 10]  # K-fold count for --z_train_source=tabicl
         [--plot_episode 0]        # local episode index to plot corr_grid for
         [--out_dir ./eval/results]  # directory to save corr_grid figure
         [--device auto]
@@ -50,6 +58,7 @@ import copy
 import os
 import random
 import sys
+from collections import Counter
 
 import hydra
 import numpy as np
@@ -69,9 +78,13 @@ for _p in (_REPO_ROOT, _SRC):
 from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
+from loss import y_space_nll  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
+from pit import DEFAULT_K_FOLDS, gp_analytical_posterior, load_tabicl, normalize_targets, run_pit  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
+    EXPECTED_BASELINE_KEYS,
+    assert_shared_z_test,
     baseline_fingerprint,
     corr_nll_single,
     episode_cache_key,
@@ -116,26 +129,63 @@ def _load_full_config(config_path: str) -> OmegaConf:
 # ICL model + oracle evaluation (the cheap, per-checkpoint part)
 # ---------------------------------------------------------------------------
 
+# Shared all-nan {"total", "marginal", "copula"} placeholder — same shape as
+# eval_baselines_episode's y_space_nlls entries (classical.py's _NAN_PARTS),
+# duplicated here rather than imported since it's a plain literal, not
+# shared state.
+_NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
+
 
 def _eval_icl_episode(
     ep: dict,
     icl_model: nn.Module,
     device: torch.device,
-) -> tuple[dict[str, float], dict[str, Tensor], Tensor]:
+    tabicl_pit: dict[str, Tensor] | None = None,
+) -> tuple[dict[str, float], dict[str, Tensor], Tensor, dict[str, dict[str, float]], dict[str, float]]:
     """Evaluate just the ICL model + oracle lower bound on one episode — the
     cheap, per-checkpoint part of the comparison (no fitting/training loop),
     always recomputed even when the baseline results are served from cache.
+
+    tabicl_pit, when given (see --z_train_source=tabicl in main(), built by
+    _tabicl_pit), replaces the episode's own exact GP-LOO z_train as the ICL
+    model's conditioning input via its "z_train" key — everything else
+    (z_test, R_oracle, the baselines) still scores/fits against the
+    episode's true values, since only the model's *input* is meant to
+    change, not what "correct" means for the copula-only `nlls` table.
+
+    tabicl_pit's "z_test"/"log_pdf_test" keys additionally provide a
+    genuine (non-oracle) marginal for the ICL model itself, letting it be
+    scored on total (marginal+copula) Y-space NLL the same way the
+    GP-MLE/DKL baselines now are (see eval_baselines_episode) — this is
+    only possible in --z_train_source=tabicl mode, since the default oracle
+    z_test IS the ground truth (nothing to score a "marginal" against).
+
+    Returns (nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts) —
+    y_space_nlls is a separate {"prior": {"total","marginal","copula"},
+    "posterior": {...}} dict (see gp_analytical_posterior's docstring for
+    why these two aren't folded into `nlls` alongside icl/oracle/baselines:
+    they're a full multivariate-normal Y-space NLL, not the z-space
+    copula-only NLL every other entry in `nlls` is, so they're not in the
+    same units/comparable via the same table — all-nan dicts when
+    unavailable). icl_y_parts is {"total","marginal","copula"}, all-nan
+    whenever tabicl_pit is None (oracle z_train mode) — same per-episode
+    Sklar split now exposed for every baseline via eval_baselines_episode.
     """
     X_train = ep["x_norm_train"].to(device)   # (P, d_x)
-    z_train = ep["z_train"].to(device)         # (P,)  oracle LOO-PIT residual, used to train icl only
+    z_train = (
+        tabicl_pit["z_train"].to(device) if tabicl_pit is not None
+        else ep["z_train"].to(device)
+    )                                            # (P,)  ICL's conditioning input — oracle LOO-PIT residual by default
     X_test  = ep["x_norm_test"].to(device)     # (N, d_x)
     z_test  = ep["z_test"].to(device)          # (N,)
+    assert_shared_z_test(z_test, ep)
     R_oracle = ep["R_star"].to(device)         # (N, N)
 
     P, N = X_train.shape[0], X_test.shape[0]
     nlls: dict[str, float] = {}
     R_dict: dict[str, Tensor] = {}
     R_I = torch.eye(N, dtype=X_train.dtype, device=device)
+    icl_y_parts = _NAN_PARTS.copy()
 
     try:
         train_mask = torch.ones(1, P, dtype=torch.bool, device=device)
@@ -147,10 +197,24 @@ def _eval_icl_episode(
         }
         with torch.no_grad():
             out = icl_model(batch)
-            Sigma_icl = low_rank_correlation(out["W"], out["s"])  # (1, N, N)
+            Sigma_icl = low_rank_correlation(
+                out["W"],
+                out.get("s"),
+                parametrization=getattr(icl_model, "correlation_parametrization", "covnorm"),
+                lam=out.get("lam"),
+            )  # (1, N, N)
         R_icl = Sigma_icl[0, :N, :N]
         nlls["icl"] = corr_nll_single(R_icl, z_test)
         R_dict["icl"] = R_icl
+        if tabicl_pit is not None:
+            test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
+            icl_parts = y_space_nll(
+                Sigma_icl[:, :N, :N],
+                tabicl_pit["z_test"].to(device).unsqueeze(0),
+                tabicl_pit["log_pdf_test"].to(device).unsqueeze(0),
+                test_mask,
+            )
+            icl_y_parts = {k: v.item() for k, v in icl_parts.items()}
     except Exception as exc:
         print(f"  [icl] failed: {exc}")
         nlls["icl"] = float("nan")
@@ -159,7 +223,199 @@ def _eval_icl_episode(
     nlls["oracle"] = corr_nll_single(R_oracle, z_test)
     R_dict["oracle"] = R_oracle
 
-    return nlls, R_dict, R_oracle
+    # "oracle" above is the PRIOR reference (cfg.data.oracle_mode="prior" —
+    # the only mode data_gen.py's training pipeline supports): R_star = raw
+    # kernel correlation among test points, never conditioned on the
+    # realized (x_train, y_train). It is NOT a true lower bound in the sense
+    # of "the best achievable full predictive NLL" — the actual Bayes-optimal
+    # reference additionally Schur-complement-conditions on context, computed
+    # below via gp_analytical_posterior as a SEPARATE total Y-space NLL (not
+    # folded into `nlls`/`R_dict`'s z-space-copula-only comparison — see that
+    # function's docstring for why the two aren't in the same units). R_post
+    # is still stashed into R_dict purely for the correlation-grid plot (a
+    # descriptive visual of what conditioning does to the correlation
+    # structure), never scored against z_test.
+    y_space_nlls = {"prior": _NAN_PARTS.copy(), "posterior": _NAN_PARTS.copy()}
+    try:
+        post = gp_analytical_posterior(ep)
+        R_dict["oracle_posterior"] = post["R_post"].to(device)
+        y_space_nlls = {
+            "prior": {
+                "total": post["nll_prior"],
+                "marginal": post["nll_prior_marginal"],
+                "copula": post["nll_prior_copula"],
+            },
+            "posterior": {
+                "total": post["nll_post"],
+                "marginal": post["nll_post_marginal"],
+                "copula": post["nll_post_copula"],
+            },
+        }
+        if post["repaired"]:
+            print(f"    [oracle_posterior] PSD repair fired (min_eig={post['min_eig']:.2e})")
+    except (KeyError, NotImplementedError) as exc:
+        R_dict["oracle_posterior"] = R_I.clone()
+        print(f"  [oracle_posterior] unavailable: {exc}")
+
+    return nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts
+
+
+def _tabicl_pit(
+    ep: dict,
+    tabicl_marginal: nn.Module,
+    k_folds: int,
+    device: torch.device,
+) -> dict[str, Tensor] | None:
+    """K-fold PIT from the frozen TabICL marginal (pit.py::run_pit), in
+    place of the episode's exact GP-LOO/posterior PIT — the same "does the
+    model's correlation prediction hold up against TabICL's own estimated
+    marginals instead of the oracle ones" check src/train.py's
+    _build_tabicl_val_z runs during training, used here at eval time via
+    --z_train_source=tabicl.
+
+    Unlike this function's predecessor (_tabicl_z_train, which queried
+    X_train[:1]/Y_train[:1] as a throwaway probe since it only needed
+    z_train), this queries the episode's REAL X_test/Y_test, so run_pit's
+    single test-side forward pass also returns a genuine TabICL marginal at
+    the test points (z_test, log_pdf_test) — the missing ingredient for
+    scoring the ICL model's own total (marginal+copula) Y-space NLL,
+    instead of only the copula-only NLL scored against the oracle's
+    ground-truth-standardized z_test.
+
+    Returns None (caller falls back to the oracle z_train/z_test) when the
+    episode has fewer than 2 training points, since run_pit's fold split
+    needs at least that many.
+
+    y_train/y_test are z-scored via pit.normalize_targets (y_test scaled
+    with y_train's own mean/std, never its own — see that function's
+    docstring) before reaching the raw TabICL module: run_pit does no
+    target scaling of its own (unlike tabicl.TabICLRegressor.fit(), which
+    fits a fresh StandardScaler before ever calling this same underlying
+    model). Every other run_pit call site in the repo
+    (inference/copula_inference.py::loo_pit, train.py::_build_tabicl_val_z)
+    goes through the same helper, so this conditioning input is computed
+    identically everywhere. Episode y's scale is not fixed — outputscale is
+    drawn from a GammaPrior (data_gen.py's generative process) — so an
+    unscaled call risks saturating the pretrained quantile head's CDF into
+    its extreme tail for every point alike on high-outputscale episodes,
+    collapsing the PIT residuals' spread instead of reflecting the true
+    per-point rank.
+
+    log_pdf_test comes back in that same normalize_targets-scaled space, so
+    it is NOT directly comparable in raw nats to the GP-MLE/DKL baselines'
+    mvn_nll (computed in raw y-units) or the oracle's nll_prior/nll_post
+    (also raw-scale) — a Jacobian correction (log p_raw(y) = log
+    p_scaled(y_scaled) - log(std), per normalize_targets' own docstring) is
+    applied here before returning, so every caller of this function's
+    log_pdf_test gets raw-nats units without needing to know about the
+    internal scaling.
+    """
+    X_train = ep["x_norm_train"].to(device)   # (P, d_x)
+    y_train = ep["y_train"].to(device)         # (P,)
+    X_test  = ep["x_norm_test"].to(device)     # (N, d_x)
+    y_test  = ep["y_test"].to(device)          # (N,)
+    P = X_train.shape[0]
+    if P < 2:
+        return None
+    y_train_scaled, y_test_scaled, _, std = normalize_targets(y_train, y_test)
+    Y_train = y_train_scaled.unsqueeze(-1)      # (P, 1)
+    Y_test  = y_test_scaled.unsqueeze(-1)       # (N, 1)
+    pit_out = run_pit(
+        tabicl_marginal, X_train, Y_train, X_test, Y_test, k_folds=k_folds,
+    )
+    return {
+        "z_train":      pit_out["z_train"].squeeze(-1),                    # (P,)
+        "z_test":       pit_out["z_test"].squeeze(-1),                     # (N,)
+        "log_pdf_test": pit_out["log_pdf_test"].squeeze(-1) - std.log(),   # (N,) raw-nats
+    }
+
+
+def _make_folds(n: int, k: int, seed: int) -> list[Tensor]:
+    """Deterministic, per-episode partition of the n test-point indices into
+    k disjoint folds of near-equal size (sizes differ by at most 1) —
+    independent of the global RNG (a fresh CPU-seeded Generator), so it
+    doesn't perturb the GP-MLE/DKL restarts' own randomness elsewhere in the
+    run.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=gen)
+    base, extra = divmod(n, k)
+    folds: list[Tensor] = []
+    start = 0
+    for i in range(k):
+        size = base + (1 if i < extra else 0)
+        folds.append(perm[start:start + size])
+        start += size
+    return folds
+
+
+def _select_best_baseline_cv(
+    baseline_R: dict[str, Tensor], z_test: Tensor, n_folds: int, min_fold_size: int, seed: int,
+) -> tuple[float, str | None, list[dict]]:
+    """Pick the per-episode best *fitted* baseline honestly via nested
+    (leave-one-fold-out) cross-validation over the n test points, instead of
+    argmin-ing directly over the same z_test the winner is then scored on
+    (a selection-bias/winner's-curse leak — see Cawley & Talbot 2010, "On
+    Over-fitting in Model Selection and Subsequent Selection Bias in
+    Performance Evaluation") and instead of a single fixed val/test split
+    (this function's predecessor, _select_best_baseline_holdout), which
+    permanently sacrifices a fraction of the points to selection alone —
+    wasteful and noisy at this repo's small N (N_min=8).
+
+    For each of K folds: rank candidates by NLL on the other K-1 folds
+    (val), then score the winner's NLL on the held-out fold (test) — every
+    point plays val in K-1 folds and test in exactly 1, so no point is ever
+    used to both select and score the same baseline.
+
+    R_star being a valid (N, N) correlation matrix means any principal
+    submatrix R[idx][:, idx] is too, so this needs no refit — the same NxN
+    correlation each baseline already produced at fit time is just scored
+    against different index subsets.
+
+    K = min(n_folds, n // min_fold_size), so no fold — nor its (K-1)-fold
+    val complement, which is always >= one fold's own size — ever scores a
+    candidate on fewer than min_fold_size points. Returns (nan, None, [])
+    when there are no fitted candidates or this leaves K < 2 (no CV
+    possible, n_test too small): with min_fold_size=20 and this repo's
+    N_min=8/N_max=128 (uniform), that's true for about a quarter of
+    episodes (N < 40) — those simply contribute no best_baseline value
+    rather than a noisy one (see _print_table's valid-count note).
+
+    The pooled NLL returned is the size-weighted average of the K held-out
+    fold NLLs (each already normalized by its own fold size in
+    corr_nll_single) — i.e. the total unnormalized NLL summed across the K
+    independent fold-blocks, divided by n. fold_details records each fold's
+    selection/scores for diagnostics (console printing).
+    """
+    keys = [k for k in baseline_R if k not in _NON_FITTED_EXCLUDED]
+    n = z_test.shape[0]
+    if not keys or n // min_fold_size < 2:
+        return float("nan"), None, []
+
+    k_folds = min(n_folds, n // min_fold_size)
+    folds = [f.to(z_test.device) for f in _make_folds(n, k_folds, seed)]
+
+    def _sub_nll(key: str, idx: Tensor) -> float:
+        R = baseline_R[key]
+        R_sub = R.index_select(0, idx).index_select(1, idx)
+        return corr_nll_single(R_sub, z_test.index_select(0, idx))
+
+    fold_details: list[dict] = []
+    weighted_sum = 0.0
+    for i, test_idx in enumerate(folds):
+        val_idx = torch.cat([f for j, f in enumerate(folds) if j != i])
+        val_nll = {key: _sub_nll(key, val_idx) for key in keys}
+        selected = min(val_nll, key=val_nll.get)
+        test_nll = _sub_nll(selected, test_idx)
+        weighted_sum += test_idx.numel() * test_nll
+        fold_details.append({
+            "fold": i, "size": test_idx.numel(), "selected": selected,
+            "val_nll": val_nll[selected], "test_nll": test_nll,
+        })
+
+    pooled_nll = weighted_sum / n
+    mode_key = Counter(fd["selected"] for fd in fold_details).most_common(1)[0][0]
+    return pooled_nll, mode_key, fold_details
 
 
 # ---------------------------------------------------------------------------
@@ -178,21 +434,29 @@ _METHOD_ORDER = [
     ("gp_mle_rq",           "GP-MLE-RQ"),
     ("gp_mle_ard_rq",       "GP-MLE-ARD-RQ"),
     ("gp_mle_dot_product",  "GP-MLE-DotProduct"),
+    ("gp_mle_polynomial",   "GP-MLE-Polynomial"),
     ("dkl_rbf",             "Deep Kernel Learning (RBF)"),
     ("dkl_matern32",        "Deep Kernel Learning (Matern32)"),
     ("dkl_rq",              "Deep Kernel Learning (RQ)"),
     ("dkl_dot_product",     "Deep Kernel Learning (DotProduct)"),
     ("per_ep_transformer",  "PerEp-Transformer"),
+    ("best_baseline",       "Best-of-Baselines (per-episode)"),
     ("icl",                 "ICL (pretrained)"),
-    ("oracle",              "Oracle"),
+    ("oracle",              "Oracle (prior)"),
 ]
 
 # Excluded from the "5 best baselines" ranking: independence/gp_prior_rbf
-# are trivial, no-fit reference points rather than baselines, and icl/oracle
-# aren't baselines at all (icl is our model, oracle is the lower bound).
-_NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle"}
+# are trivial, no-fit reference points rather than baselines, icl/oracle
+# aren't baselines at all (icl is our model, oracle is a reference, not a
+# fitted candidate), and best_baseline is itself derived from this same
+# ranking (added after it's computed each episode — see main()'s loop).
+_NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle", "best_baseline"}
 
-_METHOD_LABELS = dict(_METHOD_ORDER)
+# oracle_posterior only ever appears in R_dict (the correlation-grid plot),
+# never in `nlls`/_METHOD_ORDER's z-space table — see
+# _eval_icl_episode's docstring for why its NLL isn't comparable in that
+# table's units. Kept here only so the plot panel gets a readable title.
+_METHOD_LABELS = dict(_METHOD_ORDER) | {"oracle_posterior": "Oracle (posterior)"}
 
 
 def _kernel_composition_label(ep: dict) -> str:
@@ -279,7 +543,7 @@ def _live_generate_alternating(gen_cfg, n_ep: int, device, seed: int) -> list[di
     return episodes
 
 
-def _print_table(all_nlls: list[dict[str, float]]) -> None:
+def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "tabicl") -> None:
     means = {k: float(np.nanmean([m.get(k, float("nan")) for m in all_nlls]))
              for k, _ in _METHOD_ORDER}
     stds  = {k: float(np.nanstd( [m.get(k, float("nan")) for m in all_nlls]))
@@ -289,17 +553,124 @@ def _print_table(all_nlls: list[dict[str, float]]) -> None:
     total = col + 2 * 12
     print(f"\n{'─' * total}")
     print(f"Inter-instance copula NLL (z-space) — lower is better  [N={len(all_nlls)} episodes]")
+    print(f"ICL z_train source: {z_train_source}"
+          + ("  (exact GP-LOO PIT)" if z_train_source == "oracle" else "  (TabICL K-fold PIT estimate)"))
     print(f"{'─' * total}")
     print(f"{'Method':<{col}}{'Mean NLL':>12}{'Std NLL':>12}")
     print(f"{'─' * col}{'─' * 12}{'─' * 12}")
     for key, label in _METHOD_ORDER:
         m, s = means.get(key, float("nan")), stds.get(key, float("nan"))
         marker = ""
-        if key == "icl":
+        if key == "best_baseline":
+            n_valid = sum(1 for ep_m in all_nlls if not np.isnan(ep_m.get(key, float("nan"))))
+            marker = (f"  ← per-episode best baseline (nested CV; "
+                      f"valid for {n_valid}/{len(all_nlls)} episodes)")
+        elif key == "icl":
             marker = "  ← our model"
         elif key == "oracle":
-            marker = "  ← lower bound"
+            marker = "  ← unconditional kernel corr. among test pts (NOT Bayes-optimal; see GP oracle Y-space NLL below)"
         print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{marker}")
+    print(f"{'─' * total}\n")
+
+
+def _print_y_space_oracle(y_space_nlls: list[dict[str, dict[str, float]]]) -> None:
+    """Total (marginal + copula) Y-space multivariate-normal GP oracle NLL,
+    prior vs. posterior — see gp_analytical_posterior's docstring for why
+    this is a SEPARATE table from _print_table's z-space copula-only NLL
+    (different units, not just a missing row there): this one directly
+    answers "how much does conditioning on context help, in the units of a
+    real predictive log-likelihood" and posterior <= prior is a real,
+    provable guarantee here (Bayes-optimality of the posterior predictive
+    under log-loss), unlike a same-z_test z-space copula comparison.
+
+    Episodes where gp_analytical_posterior was unavailable (systematic-chain
+    kernel with whole-chain outer sign modulation, or a --dataset_dir
+    episode missing kernel metadata) contribute NaN to both columns and are
+    excluded via nanmean/nanstd, same convention as _print_table.
+    """
+    prior_vals = [d["prior"]["total"] for d in y_space_nlls]
+    post_vals  = [d["posterior"]["total"] for d in y_space_nlls]
+    n_valid = sum(1 for d in y_space_nlls if not np.isnan(d["posterior"]["total"]))
+    print(f"GP oracle total NLL (Y-space, marginal+copula) — lower is better, "
+          f"posterior <= prior is a Bayes-optimality guarantee here "
+          f"[valid for {n_valid}/{len(y_space_nlls)} episodes]")
+    print(f"  prior (unconditioned):      mean={np.nanmean(prior_vals):.4f}  std={np.nanstd(prior_vals):.4f}")
+    print(f"  posterior (Schur-conditioned): mean={np.nanmean(post_vals):.4f}  std={np.nanstd(post_vals):.4f}\n")
+
+
+# Row order for _print_total_nll_table: every method with a genuine (own)
+# marginal — independence/gp_prior_rbf/best_baseline are excluded, same
+# reasons as _NON_FITTED_EXCLUDED (no real fit, or derived after the fact).
+_TOTAL_NLL_ORDER = [
+    (k, label) for k, label in _METHOD_ORDER
+    if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle")
+] + [
+    ("oracle_prior", "Oracle (prior, unconditioned)"),
+    ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
+]
+
+
+def _print_total_nll_table(
+    all_total_nlls: list[dict[str, dict[str, float]]], z_train_source: str,
+) -> None:
+    """Total (marginal + copula) Y-space NLL, EVERY method's own fitted/
+    estimated marginal, all divided by that episode's own N (per-point,
+    nats/point) — the genuinely cross-method-comparable counterpart to
+    _print_table's shared-ground-truth-marginal copula-only table (see
+    eval_baselines_episode's and _eval_icl_episode's docstrings for why
+    each method supplying its own predictive density, scored at the same
+    real y_test, is always a valid proper-scoring-rule comparison,
+    regardless of how different the marginals are).
+
+    Each `all_total_nlls[i][method]` is a {"total", "marginal", "copula"}
+    dict (see eval_baselines_episode/_eval_icl_episode) — the Marginal/
+    Copula columns below are each method's OWN split, not comparable to
+    _print_table's shared-ground-truth-marginal copula NLL (see
+    eval_baselines_episode's docstring, or the "NAMING TRAP" note in
+    eval/metrics/joint_nll.py's module docstring, for why those are
+    different quantities that happen to share a name).
+
+    icl's row is nan whenever z_train_source == "oracle" (--z_train_source
+    default): the oracle z_test the ICL model would otherwise be scored
+    against IS the ground truth, so there is no learned marginal to score a
+    total NLL against — --z_train_source=tabicl is required to populate it.
+
+    oracle_prior/oracle_posterior here are gp_analytical_posterior's own
+    nll_prior/nll_post (and their marginal/copula split), divided by N for
+    this table only — the existing _print_y_space_oracle table's own
+    numbers are NOT changed by this (kept unnormalized there for backward
+    compatibility with any previously tracked output).
+    """
+    def _col(part: str) -> dict[str, float]:
+        return {
+            k: float(np.nanmean([m.get(k, _NAN_PARTS).get(part, float("nan")) for m in all_total_nlls]))
+            for k, _ in _TOTAL_NLL_ORDER
+        }
+
+    means_total = _col("total")
+    stds_total = {
+        k: float(np.nanstd([m.get(k, _NAN_PARTS).get("total", float("nan")) for m in all_total_nlls]))
+        for k, _ in _TOTAL_NLL_ORDER
+    }
+    means_marginal = _col("marginal")
+    means_copula = _col("copula")
+
+    col = max(22, max(len(label) for _, label in _TOTAL_NLL_ORDER) + 2)
+    total = col + 4 * 12
+    print(f"\n{'─' * total}")
+    print(f"Total NLL (Y-space, marginal+copula, own marginal per method) — "
+          f"lower is better  [N={len(all_total_nlls)} episodes]")
+    print(f"ICL z_train source: {z_train_source}"
+          + ("  (icl row n/a — oracle mode has no learned ICL marginal to score)"
+             if z_train_source == "oracle" else "  (TabICL K-fold PIT estimate)"))
+    print(f"{'─' * total}")
+    print(f"{'Method':<{col}}{'Mean Total':>12}{'Std Total':>12}{'Mean Marg.':>12}{'Mean Cop.':>12}")
+    print(f"{'─' * col}{'─' * 12}{'─' * 12}{'─' * 12}{'─' * 12}")
+    for key, label in _TOTAL_NLL_ORDER:
+        m, s = means_total.get(key, float("nan")), stds_total.get(key, float("nan"))
+        mm, mc = means_marginal.get(key, float("nan")), means_copula.get(key, float("nan"))
+        marker = "  ← our model" if key == "icl" else ""
+        print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{mm:>12.4f}{mc:>12.4f}{marker}")
     print(f"{'─' * total}\n")
 
 
@@ -349,12 +720,80 @@ def main() -> None:
                         help="Training steps for PerEpisodeTransformer")
     parser.add_argument("--patience_per_ep", type=int, default=500,
                         help="Early stopping patience for PerEpisodeTransformer")
+    parser.add_argument("--z_train_source", default="tabicl", choices=["oracle", "tabicl"],
+                        help="What the ICL model conditions on for each episode's z_train. "
+                             "'tabicl' (default): a K-fold cross-fitted PIT estimate from the "
+                             "frozen TabICL marginal (pit.py::run_pit) — the same proxy "
+                             "real-world deployment is stuck with, so this is the setting "
+                             "that makes _print_total_nll_table's icl row (the genuinely "
+                             "cross-method-comparable total marginal+copula NLL) populate; "
+                             "adds the cost of one extra frozen TabICL forward pass per fold "
+                             "per episode. 'oracle': the episode's exact GP-LOO PIT residual "
+                             "(R&W Eq. 5.12) computed from the true generating kernel — "
+                             "unavailable on real data, an idealized upper bound only; under "
+                             "this mode the icl row of _print_total_nll_table is NaN (no "
+                             "learned marginal to score a total NLL against). icl_nll under "
+                             "either source is unaffected in every other respect: z_test, "
+                             "R_oracle, and every baseline still score/fit against the "
+                             "episode's true values — use both to measure the sim-to-real "
+                             "gap.")
+    parser.add_argument("--tabicl_ckpt",  default=None,
+                        help="TabICL checkpoint filename for --z_train_source=tabicl. "
+                             "Default: read from --config's cfg.tabicl.ckpt.")
+    parser.add_argument("--tabicl_pit_k_folds", type=int, default=None,
+                        help="K-fold count for --z_train_source=tabicl's run_pit call. "
+                             f"Default: cfg.tabicl.pit_k_folds, falling back to "
+                             f"pit.DEFAULT_K_FOLDS ({DEFAULT_K_FOLDS}).")
     parser.add_argument("--plot_episode", type=int,   default=0,
                         help="Local episode index to generate the corr_grid plot for")
     parser.add_argument("--out_dir",      default=os.path.join(_REPO_ROOT, "eval", "results"),
                         help="Directory for saved corr_grid figure")
     parser.add_argument("--device",       default="auto")
     parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--n_folds",      type=int,   default=5,
+                        help="Number of folds for nested (leave-one-fold-out) "
+                             "cross-validation of the per-episode best_baseline pick: "
+                             "each fold's held-out NLL is scored using a baseline "
+                             "selected (argmin NLL) on the other K-1 folds only, and "
+                             "the K fold NLLs are pooled — instead of argmin-ing "
+                             "directly over z_test, which lets the winner peek at the "
+                             "very data it's scored on (see _select_best_baseline_cv). "
+                             "Actual K is capped at n_test // 3 per episode, so small-N "
+                             "episodes automatically use fewer folds. The fold split is "
+                             "deterministic per episode (seeded from --seed + episode "
+                             "index) and never touches icl/oracle or any individual "
+                             "baseline's own diagnostic row, which keep scoring against "
+                             "the full test set as before.")
+    parser.add_argument("--min_fold_size", type=int, default=20,
+                        help="Minimum points required on both sides of every "
+                             "leave-one-fold-out split (a fold's own size, and its "
+                             "(K-1)-fold val complement) before a candidate baseline's "
+                             "NLL there is trusted enough to base a selection on. Below "
+                             "this, ranking ~12 candidate kernels by NLL on a handful of "
+                             "points is closer to a coin flip than a real comparison, and "
+                             "an occasional spurious pick of a blow-up-prone candidate "
+                             "(e.g. dot_product/polynomial kernels, whose NLL is "
+                             "unbounded above when misspecified) can drag the averaged "
+                             "best_baseline mean above even a single steady fixed kernel "
+                             "used for every episode. Effective K per episode is "
+                             "min(--n_folds, n_test // min_fold_size); episodes where "
+                             "that's < 2 report best_baseline=nan (excluded from its "
+                             "mean/std, not silently zero) instead of forcing a low-"
+                             "confidence selection.")
+    parser.add_argument("--min_test_points", type=int, default=None,
+                        help="Floor on eval episodes' test-point count N, so every episode "
+                             "is valid for the nested-CV best_baseline selection (see "
+                             "--min_fold_size: _select_best_baseline_cv needs n_test // "
+                             "min_fold_size >= 2 folds, i.e. n_test >= 2 * min_fold_size, "
+                             "or it reports best_baseline=nan for that episode — silently "
+                             "excluding it from the summary table's best_baseline mean while "
+                             "every other row's mean still includes it). Default: "
+                             "2 * --min_fold_size (40 under the argparse defaults). For "
+                             "--live_generate (the default), this raises cfg.data.N_min for "
+                             "this run only — conf/data/gp_tasks.yaml's own N_min=8, and "
+                             "hence training's distribution, is untouched. For --dataset_dir, "
+                             "episode sizes are fixed by the pre-built dataset and can't be "
+                             "regenerated, so episodes below this floor are skipped instead.")
     parser.add_argument("--oracle_mode",  default=None, choices=["prior", "posterior"],
                         help="How R_star was built for this dataset. Determines whether "
                              "GP-MLE/DKL score the fitted kernel's posterior (conditioned "
@@ -405,6 +844,25 @@ def main() -> None:
     n_params = sum(p.numel() for p in icl_model.parameters())
     print(f"ICL model parameters: {n_params:,}  rank={icl_rank}")
 
+    # ---- Optionally load a second, frozen TabICL marginal purely to
+    # K-fold-PIT each episode's z_train (see --z_train_source's help text) ----
+    tabicl_marginal: nn.Module | None = None
+    tabicl_pit_k_folds = DEFAULT_K_FOLDS
+    if args.z_train_source == "tabicl":
+        tabicl_ckpt = args.tabicl_ckpt or OmegaConf.select(cfg, "tabicl.ckpt", default=None)
+        if not tabicl_ckpt:
+            raise ValueError(
+                "--z_train_source=tabicl requires a TabICL checkpoint: pass --tabicl_ckpt "
+                "or set cfg.tabicl.ckpt in --config."
+            )
+        tabicl_pit_k_folds = args.tabicl_pit_k_folds or int(
+            OmegaConf.select(cfg, "tabicl.pit_k_folds", default=DEFAULT_K_FOLDS)
+        )
+        print(f"\nLoading frozen TabICL marginal for --z_train_source=tabicl: {tabicl_ckpt} "
+              f"(k_folds={tabicl_pit_k_folds})")
+        tabicl_marginal = load_tabicl(tabicl_ckpt, str(device))
+    print(f"z_train source (ICL conditioning input): {args.z_train_source}")
+
     # GP-MLE/DKL must score against the same convention used to build this
     # run's R_star ("prior" ignores training conditioning entirely,
     # "posterior" conditions on X_train) — see classical.fit_and_eval_gpytorch's
@@ -430,8 +888,17 @@ def main() -> None:
 
     n_ep = args.n_episodes
     all_nlls: list[dict[str, float]] = []
+    all_y_space_nlls: list[dict[str, dict[str, float]]] = []
+    all_total_nlls: list[dict[str, dict[str, float]]] = []
     plot_R_dict: dict[str, Tensor] | None = None
     plot_R_oracle: Tensor | None = None
+    plot_best_key: str | None = None
+    plot_best_R: Tensor | None = None
+
+    # Eval-only floor on episodes' test-point count N (see --min_test_points'
+    # help text) — 2 * --min_fold_size by default, the minimum n_test
+    # _select_best_baseline_cv needs for >=2 CV folds.
+    min_test_points = args.min_test_points if args.min_test_points is not None else 2 * args.min_fold_size
 
     if live_generate:
         # cfg (the fixed eval-generating config, not icl_cfg) drives live
@@ -439,6 +906,13 @@ def main() -> None:
         # every checkpoint evaluated against this --config gets identical
         # episodes for a given seed, regardless of what that checkpoint was
         # itself trained on.
+        if cfg.data.N_min < min_test_points:
+            print(f"Raising eval episode N_min {cfg.data.N_min} -> {min_test_points} "
+                  f"(--min_test_points) for this run only — training's own "
+                  "conf/data/gp_tasks.yaml N_min is untouched")
+            cfg.data.N_min = min_test_points
+            if cfg.data.N_max < cfg.data.N_min:
+                cfg.data.N_max = cfg.data.N_min
         print(f"\nLive-generating {n_ep} episodes via generate_gp_batch "
               f"(return_kernel_metadata=True), seed={args.seed}, "
               "alternating every-other episode to a non-composite kernel")
@@ -452,6 +926,15 @@ def main() -> None:
 
     print(f"  GP MLE: {args.n_steps_mle} steps | DKL: {args.n_steps_dkl} steps | "
           f"PerEp: {args.n_steps_per_ep} steps (patience={args.patience_per_ep})")
+    print("  [per-episode print legend] 'shared_marginal'/'shared_copula' values "
+          "score every method's own correlation matrix against the SAME "
+          "ground-truth-standardized z_test, so they rank correlation-structure "
+          "quality alone. 'own(...)'/'own_marginal' values instead use each "
+          "method's OWN fitted marginal, so its own copula/marginal split is "
+          "NOT comparable across methods (a method's own marginal can score "
+          "better OR worse than another's regardless of which has the better "
+          "overall fit) — only 'total' is a proper scoring rule comparable "
+          "across methods with different marginals.")
 
     # ---- Baseline cache: skip re-fitting GP-MLE/DKL/per_ep_transformer for
     # episodes already scored under an identical generation/fitting config ----
@@ -474,14 +957,45 @@ def main() -> None:
                 print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")
                 continue
             ep = dataset[ep_i]
+            n_test = ep["z_test"].shape[0]
+            if n_test < min_test_points:
+                print(f"  [ep {ep_i}] only {n_test} test points (< --min_test_points="
+                      f"{min_test_points}), skipping — best_baseline needs enough for "
+                      ">=2 nested-CV folds")
+                continue
 
         cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, local_i, ep_i)
         cached = cache_entries.get(cache_key) if (use_cache and not args.refresh_baselines) else None
+        if cached is not None and not EXPECTED_BASELINE_KEYS.issubset(cached["nlls"].keys()):
+            # Same episode/fingerprint, but this entry predates a baseline
+            # that was added to eval_baselines_episode since it was cached
+            # (e.g. gp_mle_polynomial) — refit everything for this episode
+            # rather than silently serving a result with that key missing.
+            missing = EXPECTED_BASELINE_KEYS - cached["nlls"].keys()
+            print(f"  [ep {ep_i}] cached baselines missing {sorted(missing)} — refitting")
+            cached = None
+        if cached is not None and "y_nlls" not in cached:
+            # Same episode/fingerprint, but this entry predates the total
+            # Y-space NLL addition to eval_baselines_episode — refit rather
+            # than silently leaving the new total-NLL table's baseline rows
+            # as nan for this episode.
+            print(f"  [ep {ep_i}] cached entry predates total-NLL tracking — refitting")
+            cached = None
+        if cached is not None and any(
+            not isinstance(v, dict) for v in cached["y_nlls"].values()
+        ):
+            # Same episode/fingerprint, but this entry predates the
+            # marginal/copula split of y_nlls (each value used to be a bare
+            # total float) — refit rather than crashing on `own["copula"]`
+            # in the per-episode top-5 print below.
+            print(f"  [ep {ep_i}] cached y_nlls predates marginal/copula split — refitting")
+            cached = None
         if cached is not None:
-            baseline_nlls = cached["nlls"]
-            baseline_R    = {k: v.to(device) for k, v in cached["R_dict"].items()}
+            baseline_nlls   = cached["nlls"]
+            baseline_R      = {k: v.to(device) for k, v in cached["R_dict"].items()}
+            baseline_y_nlls = cached["y_nlls"]
         else:
-            baseline_nlls, baseline_R = eval_baselines_episode(
+            baseline_nlls, baseline_R, baseline_y_nlls = eval_baselines_episode(
                 ep=ep,
                 icl_rank=icl_rank,
                 n_steps_mle=args.n_steps_mle,
@@ -499,30 +1013,114 @@ def main() -> None:
                 cache_entries[cache_key] = {
                     "nlls": baseline_nlls,
                     "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
+                    "y_nlls": baseline_y_nlls,
                 }
                 cache_dirty = True
 
-        icl_nlls, icl_R, R_oracle = _eval_icl_episode(ep=ep, icl_model=icl_model, device=device)
+        tabicl_pit = None
+        if tabicl_marginal is not None:
+            tabicl_pit = _tabicl_pit(
+                ep=ep, tabicl_marginal=tabicl_marginal, k_folds=tabicl_pit_k_folds, device=device,
+            )
+            if tabicl_pit is None:
+                print(f"  [ep {ep_i}] fewer than 2 training points — "
+                      "falling back to oracle z_train for this episode")
+
+        icl_nlls, icl_R, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
+            ep=ep, icl_model=icl_model, device=device, tabicl_pit=tabicl_pit,
+        )
+        all_y_space_nlls.append(y_space_nlls)
+
+        n_test = ep["z_test"].shape[0]
+        # oracle_prior/oracle_posterior: gp_analytical_posterior's raw-sum
+        # {"total","marginal","copula"} dicts, divided by n_test here to put
+        # them on the same per-point footing as every other row (baseline_y_nlls
+        # and icl_y_parts are already per-point via gp_oracle_y_nll/y_space_nll)
+        # — this table only, _print_y_space_oracle's own numbers stay raw.
+        total_nlls = {
+            **baseline_y_nlls,
+            "icl": icl_y_parts,
+            "oracle_prior": {k: v / n_test for k, v in y_space_nlls["prior"].items()},
+            "oracle_posterior": {k: v / n_test for k, v in y_space_nlls["posterior"].items()},
+        }
+        all_total_nlls.append(total_nlls)
 
         nlls   = {**baseline_nlls, **icl_nlls}
         R_dict = {**baseline_R, **icl_R}
+
+        icl_nll = nlls.get("icl", float("nan"))
+        ora_nll = nlls.get("oracle", float("nan"))
+        ranked_baselines = sorted(
+            ((k, v) for k, v in nlls.items() if k not in _NON_FITTED_EXCLUDED),
+            key=lambda kv: kv[1],
+        )
+        top5 = ranked_baselines[:5]
+        # Per-episode best fitted baseline's NLL, selected via nested
+        # (leave-one-fold-out) CV over this episode's test points (see
+        # _select_best_baseline_cv) — averaging this across episodes (see
+        # _print_table's "Best-of-Baselines" row) is a tighter,
+        # per-episode-optimal reference than any single baseline's own
+        # average, so its gap to ICL's mean is the real "how much is ICL
+        # leaving on the table vs. always picking the best baseline" number,
+        # without the winner having been picked by peeking at the same
+        # z_test it's scored on.
+        holdout_seed = (args.seed * 1_000_003 + ep_i) % (2 ** 31 - 1)
+        best_nll, mode_key, fold_details = _select_best_baseline_cv(
+            baseline_R, ep["z_test"].to(device), args.n_folds, args.min_fold_size, holdout_seed,
+        )
+        nlls["best_baseline"] = best_nll
         all_nlls.append(nlls)
 
         if local_i == args.plot_episode:
             plot_R_dict   = R_dict
             plot_R_oracle = R_oracle
+            if mode_key is not None:
+                plot_best_key = mode_key
+                plot_best_R   = R_dict[mode_key]
 
-        icl_nll = nlls.get("icl", float("nan"))
-        ora_nll = nlls.get("oracle", float("nan"))
-        top5 = sorted(
-            ((k, v) for k, v in nlls.items() if k not in _NON_FITTED_EXCLUDED),
-            key=lambda kv: kv[1],
-        )[:5]
         print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
-        print(f"    icl={icl_nll:.4f}  oracle={ora_nll:.4f}")
-        print("    top-5 baselines (lowest NLL, fitted only):")
+        # Every number on this line is per-point (nats/point) and scored
+        # against the SHARED ground-truth marginal's z_test — icl/oracle_prior
+        # here are the same z-space-copula-only quantity as nlls["icl"]/
+        # nlls["oracle"]. GP-oracle-y-space-total pulls from total_nlls (not
+        # y_space_nlls directly) so it's on that same per-point footing —
+        # y_space_nlls itself is the raw (unnormalized) sum gp_analytical_posterior
+        # returns, which _print_y_space_oracle's aggregate table prints as-is.
+        print(f"    icl(shared_marginal)={icl_nll:.4f}  "
+              f"oracle_prior(shared_marginal, z-space copula)={ora_nll:.4f}  "
+              f"GP-oracle-y-space-total(prior={total_nlls['oracle_prior']['total']:.4f}, "
+              f"posterior={total_nlls['oracle_posterior']['total']:.4f})")
+        print(f"    total Y-space NLL, own marginal (total = marginal + copula): "
+              f"icl=(cop={total_nlls['icl']['copula']:.4f}, "
+              f"marg={total_nlls['icl']['marginal']:.4f}, "
+              f"tot={total_nlls['icl']['total']:.4f})  "
+              f"oracle_prior=(cop={total_nlls['oracle_prior']['copula']:.4f}, "
+              f"marg={total_nlls['oracle_prior']['marginal']:.4f}, "
+              f"tot={total_nlls['oracle_prior']['total']:.4f})  "
+              f"oracle_posterior=(cop={total_nlls['oracle_posterior']['copula']:.4f}, "
+              f"marg={total_nlls['oracle_posterior']['marginal']:.4f}, "
+              f"tot={total_nlls['oracle_posterior']['total']:.4f})")
+        if fold_details:
+            fold_summary = ", ".join(
+                f"fold{fd['fold']}={_METHOD_LABELS.get(fd['selected'], fd['selected'])}"
+                for fd in fold_details
+            )
+            print(f"    best_baseline (nested {len(fold_details)}-fold CV, "
+                  f"pooled test NLL)={best_nll:.4f}")
+            print(f"      per-fold picks: {fold_summary}")
+        else:
+            print("    best_baseline: unavailable (too few test points for nested CV)")
+        print("    top-5 baselines (ranked by shared-ground-truth-marginal copula "
+              "NLL, diagnostic only — not the selection used for best_baseline "
+              "above; 'own' columns are this baseline's OWN fitted marginal, "
+              "NOT the same copula quantity as the ranking column — see "
+              "eval_baselines_episode's docstring):")
         for key, val in top5:
-            print(f"      {_METHOD_LABELS.get(key, key):<28}{val:.4f}")
+            own = total_nlls.get(key, _NAN_PARTS)
+            print(f"      {_METHOD_LABELS.get(key, key):<28}"
+                  f"shared_copula={val:.4f}  "
+                  f"own(cop={own['copula']:.4f}, marg={own['marginal']:.4f}, "
+                  f"tot={own['total']:.4f})")
 
     if use_cache and cache_dirty:
         save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
@@ -531,7 +1129,9 @@ def main() -> None:
         print("No episodes evaluated successfully.")
         return
 
-    _print_table(all_nlls)
+    _print_table(all_nlls, z_train_source=args.z_train_source)
+    _print_y_space_oracle(all_y_space_nlls)
+    _print_total_nll_table(all_total_nlls, z_train_source=args.z_train_source)
 
     # ---- Correlation heatmap ----
     if plot_R_dict is not None and plot_R_oracle is not None:
@@ -539,8 +1139,20 @@ def main() -> None:
         matplotlib.use("Agg")
 
         os.makedirs(args.out_dir, exist_ok=True)
-        # Exclude oracle from estimators dict (it's passed separately)
+        # Exclude oracle from estimators dict (it's passed separately). Move
+        # icl to the end and insert the best-performing fitted baseline for
+        # this episode (lowest NLL, excluding icl/oracle/independence/
+        # gp_prior_rbf — same ranking as the "top-5 baselines" console print
+        # above) right before it, so oracle / best-baseline / icl sit next to
+        # each other for a quick visual comparison instead of having to scan
+        # all the individual baseline panels.
         estimators = {k: v for k, v in plot_R_dict.items() if k != "oracle"}
+        icl_panel = estimators.pop("icl", None)
+        if plot_best_key is not None:
+            best_label = f"best_baseline ({_METHOD_LABELS.get(plot_best_key, plot_best_key)})"
+            estimators[best_label] = plot_best_R
+        if icl_panel is not None:
+            estimators["icl"] = icl_panel
         fig = plot_corr_grid(
             estimators=estimators,
             oracle_R=plot_R_oracle,

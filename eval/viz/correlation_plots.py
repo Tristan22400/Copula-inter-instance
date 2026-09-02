@@ -13,6 +13,8 @@ __all__ = [
     "plot_correlation_vs_distance",
     "plot_correlation_heatmaps",
     "plot_corr_grid",
+    "plot_residual_grid",
+    "plot_synthetic_residual_grid",
 ]
 
 
@@ -176,3 +178,196 @@ def plot_corr_grid(
         fig.suptitle(title, fontsize=11, y=1.01)
     plt.tight_layout()
     return fig
+
+
+def _plot_field_grid(
+    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, true_fields: list, col_titles: list,
+    output_path: "str | None", row0_label: str, suptitle: str,
+    predicted_fields: "list[np.ndarray] | None" = None,
+    predicted_fields_2: "list[np.ndarray] | None" = None,
+    independent_fields: "list[np.ndarray] | None" = None,
+    oracle_fields: "list[np.ndarray] | None" = None,
+    context_coords: "np.ndarray | None" = None,
+    pred_row_label: str = "Copula model\n(predicted)\n +marginal\nLatitude",
+    pred2_row_label: str = "Copula model\n(2nd variant)\nLatitude",
+    indep_row_label: str = "Independent\n(no copula)\nLatitude",
+    oracle_row_label: str = "Oracle correlation\n+ marginal\nLatitude",
+    xlabel: str = "Longitude", cbar_label: str = "Residual (deg C)",
+):
+    """Shared small-multiples renderer behind both plot_residual_grid (real
+    ERA5 days) and plot_synthetic_residual_grid (synthetic GP draws): top row
+    `true_fields`, then an optional oracle-correlation row, then optional
+    predicted/predicted_2/independent rows below (flat (D,) arrays, reshaped
+    to grid_shape here). `oracle_fields`/`predicted_fields_2` are only ever
+    passed by plot_synthetic_residual_grid. All rows share one color scale
+    and a Moran's I annotation (see eval.spatial.diagnostics.morans_i).
+
+    `output_path=None` skips the save-to-disk step and returns the open
+    Figure instead (e.g. for src/train.py's live wandb.Image logging, which
+    has no use for an on-disk copy) -- otherwise behaves exactly as before:
+    saves, closes, prints, returns None."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from eval.spatial.diagnostics import morans_i
+
+    has_pred = predicted_fields is not None
+    has_pred2 = predicted_fields_2 is not None
+    has_indep = independent_fields is not None
+    has_oracle = oracle_fields is not None
+    pred_grids = [f.reshape(grid_shape) for f in predicted_fields] if has_pred else []
+    pred2_grids = [f.reshape(grid_shape) for f in predicted_fields_2] if has_pred2 else []
+    indep_grids = [f.reshape(grid_shape) for f in independent_fields] if has_indep else []
+    oracle_grids = [f.reshape(grid_shape) for f in oracle_fields] if has_oracle else []
+
+    vmax = float(np.max(np.abs(true_fields + pred_grids + pred2_grids + indep_grids + oracle_grids)))
+
+    def _annotate_morans_i(ax, field):
+        ax.text(
+            0.97, 0.95, f"$I$={morans_i(field):.2f}", transform=ax.transAxes,
+            ha="right", va="top", fontsize=7,
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.7, edgecolor="none"),
+        )
+
+    n_cols = len(true_fields)
+    n_rows = 1 + int(has_oracle) + int(has_pred) + int(has_pred2) + int(has_indep)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False)
+    mesh = None
+    for j, (title, field) in enumerate(zip(col_titles, true_fields)):
+        mesh = axes[0][j].pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+        axes[0][j].set_title(title, fontsize=9)
+        _annotate_morans_i(axes[0][j], field)
+    axes[0][0].set_ylabel(row0_label)
+
+    def _plot_row(row_idx, grids, ylabel):
+        for j, field in enumerate(grids):
+            mesh_local = axes[row_idx][j].pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+            _annotate_morans_i(axes[row_idx][j], field)
+            if context_coords is not None:
+                axes[row_idx][j].scatter(
+                    context_coords[:, 0], context_coords[:, 1],
+                    c="black", s=8, marker="o", linewidths=0.4, edgecolors="white",
+                    label="Context points" if j == 0 else None,
+                )
+        axes[row_idx][0].set_ylabel(ylabel)
+        if context_coords is not None:
+            axes[row_idx][0].legend(loc="upper left", fontsize=6, framealpha=0.7)
+        return mesh_local
+
+    row = 1
+    if has_oracle:
+        mesh = _plot_row(row, oracle_grids, oracle_row_label)
+        row += 1
+    if has_pred:
+        mesh = _plot_row(row, pred_grids, pred_row_label)
+        row += 1
+    if has_pred2:
+        mesh = _plot_row(row, pred2_grids, pred2_row_label)
+        row += 1
+    if has_indep:
+        mesh = _plot_row(row, indep_grids, indep_row_label)
+
+    for j in range(n_cols):
+        axes[-1][j].set_xlabel(xlabel)
+    fig.suptitle(suptitle)
+    plt.tight_layout(rect=(0.0, 0.0, 0.93, 0.96))
+    fig.colorbar(mesh, ax=axes.ravel().tolist(), shrink=0.85, label=cbar_label)
+    if output_path is None:
+        return fig
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {output_path}")
+    return None
+
+
+def plot_residual_grid(
+    data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: "str | None",
+    context_coords: "np.ndarray | None" = None,
+    independent_fields: "list[np.ndarray] | None" = None,
+    target: str = "raw",
+):
+    """Small-multiples panel of the `target` field (raw temperature Z_t by
+    default, or the 24h persistence residual E_t = Z_t - Z_{t-24}) on the
+    lat/lon grid, one column per day in `days`: top row is the ground-truth
+    field; if `predicted_fields` is given, the next row is the copula
+    model's predicted field for that SAME day (see
+    eval.spatial.diagnostics.predict_copula_residual_field); if
+    `independent_fields` is also given, a third row shows the SAME
+    marginal-per-point prediction with the copula's cross-location
+    correlation switched off (R replaced by the identity), isolating what
+    the learned correlation structure itself adds on top of the per-point
+    marginal. If `context_coords` is given, the real-context locations that
+    condition both predicted rows are overlaid as black markers on those
+    rows only.
+
+    `data["t2m"]` may be either the full (n_time, H, W) array `load_era5_data`
+    returns (`days` then indexes positionally into it) or a plain
+    ``{day: (H, W) frame}`` dict covering just `days` (src/train.py's
+    validate() builds one of these instead of retaining every fetched day) --
+    both support the same `data["t2m"][d]` lookup this function relies on.
+
+    `output_path=None` returns the open Figure instead of saving it to disk
+    (see `_plot_field_grid`); otherwise returns None as before.
+    """
+    lat, lon = data["latitude"], data["longitude"]
+    grid_shape = data["t2m"][days[0]].shape
+    if target == "residual":
+        true_fields = [data["t2m"][d] - data["t2m"][d - 1] for d in days]
+        col_titles = [f"day {d}: $E_t = Z_{{{d}}} - Z_{{{d - 1}}}$" for d in days]
+        suptitle = (
+            "24h Persistence Residual Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
+            else "24h Persistence Residual Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
+        )
+        cbar_label = "Residual (deg C)"
+    else:
+        true_fields = [data["t2m"][d] for d in days]
+        col_titles = [f"day {d}: $Z_{{{d}}}$ (raw)" for d in days]
+        suptitle = (
+            "Raw Temperature Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
+            else "Raw Temperature Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
+        )
+        cbar_label = "Temperature (deg C)"
+    return _plot_field_grid(
+        lat, lon, grid_shape, true_fields, col_titles, output_path,
+        row0_label="Ground truth\nLatitude", suptitle=suptitle,
+        predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
+        cbar_label=cbar_label,
+    )
+
+
+def plot_synthetic_residual_grid(
+    grid_y: np.ndarray, grid_x: np.ndarray, grid_shape: tuple,
+    true_fields: list, predicted_fields_true_z: list, predicted_fields_tabicl_z: list,
+    independent_fields: list,
+    output_path: str, context_coords: "np.ndarray | None" = None,
+    oracle_fields: "list[np.ndarray] | None" = None,
+) -> None:
+    """Synthetic-mode analogue of plot_residual_grid: one column per
+    independent GP draw from the sampled ground-truth kernel instead of one
+    column per real ERA5 day, with the SAME five rows (ground truth /
+    oracle-correlation+marginal / copula-predicted-with-true-z_train /
+    copula-predicted-with-TabICLv2-estimated-z_train / independent) and
+    shared color scale / Moran's I annotation, via the same _plot_field_grid
+    renderer plot_residual_grid uses. `oracle_fields` reuses the TabICLv2
+    marginal from the predicted rows but with the TRUE kernel correlation
+    matrix instead of the model's R_pred, isolating correlation-estimation
+    error from marginal-estimation error. `predicted_fields_true_z` and
+    `predicted_fields_tabicl_z` are the SAME copula-model forward pass,
+    differing only in whether z_train is the exact GP leave-one-out value or
+    TabICLv2's practical K-fold PIT estimate of it."""
+    col_titles = [f"draw {i + 1}" for i in range(len(true_fields))]
+    _plot_field_grid(
+        grid_y, grid_x, grid_shape, true_fields, col_titles, output_path,
+        row0_label="Ground truth\n(synthetic kernel)\ny", suptitle="Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
+        predicted_fields=predicted_fields_true_z, predicted_fields_2=predicted_fields_tabicl_z,
+        independent_fields=independent_fields, context_coords=context_coords,
+        oracle_fields=oracle_fields,
+        pred_row_label="Copula model\n(true z_train)\ny",
+        pred2_row_label="Copula model\n(TabICLv2 z_train)\ny",
+        indep_row_label="Independent\n(no copula)\ny",
+        oracle_row_label="Oracle correlation\n+ TabICLv2 marginal\ny",
+        xlabel="x", cbar_label="Field value",
+    )

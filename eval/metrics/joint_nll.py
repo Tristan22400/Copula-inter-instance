@@ -10,6 +10,31 @@ finite-difference PIT recipe already used in
 ``experiments/experiment_b_quantitative.py::_quantile_grid_pit`` (ported
 verbatim rather than imported, since ``experiments/`` is a script directory,
 not a stable package boundary).
+
+NAMING TRAP — two different "copula"/"marginal" conventions share the same
+key names across this codebase; grabbing one by key without checking which
+convention produced it silently mixes incomparable numbers:
+
+  1. OWN-MARGINAL (this module's ``compute_joint_nll``, ``src/loss.py::
+     y_space_nll``, ``eval/baselines/classical.py``'s ``y_space_nlls``,
+     ``eval/runners/eval_checkpoint.py``'s ``total_nlls``): each method
+     supplies its OWN fitted/estimated marginal, so its own ``z`` differs
+     method-to-method — "copula" here is that method's own PIT-residual
+     copula NLL, "total" = copula + marginal is a genuine proper-scoring-
+     rule comparison across methods (every method scored at the same real
+     y_test under its own full predictive density).
+  2. SHARED-MARGINAL (``eval/baselines/classical.py``'s ``nlls`` /
+     ``corr_nll_single``, ``eval/runners/eval_checkpoint.py``'s
+     ``_print_table``): every method is scored against the SAME
+     (typically ground-truth) ``z_test`` — only the predicted correlation
+     matrix R differs — so "copula" here ranks correlation-structure
+     quality alone, valid only because z is held fixed, and is NOT the
+     same quantity as (1)'s "copula" despite the identical key name. There
+     is no "marginal"/"total" key in this convention at all.
+
+See ``eval/runners/eval_checkpoint.py``'s ``_print_table`` vs.
+``_print_total_nll_table`` docstrings for the concrete case where both
+conventions are printed side by side.
 """
 
 from __future__ import annotations
@@ -29,7 +54,7 @@ if _SRC not in sys.path:
 
 from loss import y_space_nll  # noqa: E402
 
-__all__ = ["compute_joint_nll", "compute_pit"]
+__all__ = ["compute_joint_nll", "compute_pit", "kfold_loo_pit"]
 
 
 def compute_pit(
@@ -56,6 +81,44 @@ def compute_pit(
     u_clamped = np.clip(u, eps, 1 - eps)
     z = norm.ppf(u_clamped)
     return z, log_pdf
+
+
+def kfold_loo_pit(
+    quantile_fn,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    probs: np.ndarray,
+    *,
+    k_folds: int = 10,
+    eps: float = 1e-6,
+    seed: int = 0,
+) -> np.ndarray:
+    """K-fold leave-fold-out PIT, generic over how the quantile grid for the
+    held-out fold is produced. ``quantile_fn(X_context, y_context, X_query,
+    fold_idx) -> quantile_grid`` fits/predicts on one fold split; this
+    function only owns the fold assignment and the compute_pit call, shared
+    by every regressor backend that needs the same recipe (originally
+    duplicated per-backend, see eval/tabicl_utils.py::tabicl_loo_pit and
+    eval/spatial/marginal_backends.py::loo_pit, now both thin wrappers here).
+
+    Returns:
+        Z_train: (n_train,) — Gaussianized PIT residuals
+    """
+    n = len(y_train)
+    k_folds = min(k_folds, n)
+    rng = np.random.default_rng(seed)
+    fold_id = rng.permutation(n) % k_folds
+
+    z = np.empty(n)
+    for k in range(k_folds):
+        held = fold_id == k
+        rest = ~held
+        if held.sum() == 0 or rest.sum() == 0:
+            continue
+        qgrid_held = quantile_fn(X_train[rest], y_train[rest], X_train[held], k)
+        z_held, _ = compute_pit(qgrid_held, probs, y_train[held], eps)
+        z[held] = z_held
+    return z
 
 
 def compute_joint_nll(

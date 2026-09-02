@@ -1,39 +1,32 @@
-"""
-run_era5_eval.py — Real-ERA5 driver for the multivariate spatial calibration
-diagnostics defined in plots/generate_plots.py (calc_kendall_pit,
-calc_mahalanobis_distances, calc_exceedance_probs, calc_spatial_coverage and
-their plot_* counterparts).
+"""era5_calibration_eval.py — real-ERA5 driver for the independence-copula
+multivariate spatial calibration diagnostics in eval/spatial/calibration.py
+(calc_kendall_pit, calc_mahalanobis_distances, calc_exceedance_probs,
+calc_spatial_coverage and their plot_* counterparts). Promoted from
+plots/run_era5_eval.py.
 
-Unlike plots/generate_plots.py (which falls back to a synthetic GP field when
-no ERA5 download is available), this script requires a genuine ERA5 NetCDF
-file loaded via xarray, with:
-  - a real `datetime64` "time" coordinate (used for the CosDay/SinDay/
-    CosHour/SinHour features -- the bundled synthetic
-    plots/era5_temperature.nc has integer day indices, not real timestamps,
-    and is not usable here),
-  - a "latitude"/"lat" and "longitude"/"lon" coordinate,
-  - a temperature variable (any of _TEMP_VAR_CANDIDATES),
-  - optionally a static elevation/geopotential variable (any of
-    _ELEV_VAR_CANDIDATES); elevation defaults to 0 if absent.
+All four calibration metrics are, by their own docstrings, testing whether
+TabICL's MARGINALS ALONE (ignoring spatial correlation — the independence
+copula) are calibrated: they only need real per-cell marginal quantile
+predictions, not the correlation/copula model. So the promotion from
+plots/run_era5_eval.py's placeholder `MockTabICLv2` to a real model is a
+contained swap of the quantile source — via eval/tabicl_utils.py's
+make_tabicl_regressor + tabicl_quantiles (the same helpers
+eval/runners/run_benchmarks.py already uses) — not new inference logic.
 
 For each timestamp, an in-context-learning episode is built with
-`sample_icl_task_from_era5`: a dense target patch inside a lat/lon box, and a
-global context of `n_ctx` points from the rest of the grid at that same
-timestamp. Model inference is currently a dummy/mock (`MockTabICLv2`) that
-returns independent per-target-cell quantiles fit from the context labels
-only, matching the real TabICLv2 regressor's call contract
-(`.fit(X, y)` / `.predict(X_test, output_type="quantiles", alphas=...)`, see
-plots/generate_plots.py:TabICLv2_Regressor) so it is a drop-in swap once a
-real model is available.
+`sample_icl_task_from_era5`: a dense target patch inside a lat/lon box, and
+a global context of `n_ctx` points from the rest of the grid at that same
+timestamp.
 
 Usage:
-    python plots/run_era5_eval.py --nc-path /path/to/era5_temperature.nc \\
+    python eval/runners/era5_calibration_eval.py \\
+        --nc-path /path/to/era5_temperature.nc \\
         --target-lat-bounds 45 50 --target-lon-bounds 0 5
 
 If --nc-path is omitted, a small real ERA5 sample (Western Europe, 10 daily
 snapshots from Jan 2023) is auto-downloaded from the public no-auth
-ARCO-ERA5 Zarr archive on GCS and cached to `plots/era5_real_default.nc`, so
-the script produces real results out of the box with no arguments.
+ARCO-ERA5 Zarr archive on GCS and cached under eval/data/cache/, so the
+script produces real results out of the box with no arguments.
 """
 
 from __future__ import annotations
@@ -52,41 +45,57 @@ import xarray as xr
 from scipy.stats import norm
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-import generate_plots as gp  # noqa: E402
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+_SRC = os.path.join(_REPO_ROOT, "src")
+for _p in (_REPO_ROOT, _SRC):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from eval.spatial import calibration as cal  # noqa: E402
+from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles  # noqa: E402
 
 _G = 9.80665  # m/s^2, for geopotential (m^2/s^2) -> elevation (m)
 _TEMP_VAR_CANDIDATES = ("t2m", "2m_temperature", "temperature", "temp")
 _ELEV_VAR_CANDIDATES = (
-    "z",
-    "geopotential",
-    "geopotential_at_surface",
-    "surface_geopotential",
-    "orography",
-    "elevation",
-    "altitude",
+    "z", "geopotential", "geopotential_at_surface", "surface_geopotential",
+    "orography", "elevation", "altitude",
 )
 
 # Public, no-auth ARCO-ERA5 archive used to auto-fetch a default real-data
 # sample when --nc-path is omitted (see reference memory: no CDS API key
-# needed, unlike plots/generate_plots.py's download_era5).
+# needed).
 _ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
-_DEFAULT_CACHE_NC = os.path.join(_HERE, "era5_real_default.nc")
+_CACHE_DIR = os.path.join(_REPO_ROOT, "eval", "data", "cache")
+_DEFAULT_CACHE_NC = os.path.join(_CACHE_DIR, "era5_calibration_default.nc")
 _DEFAULT_TARGET_LAT_BOUNDS = (45.0, 50.0)  # Northern France / Belgium
 _DEFAULT_TARGET_LON_BOUNDS = (0.0, 5.0)
 _DEFAULT_FETCH_LAT_BOUNDS = (25.0, 72.0)  # Europe-ish context box
 _DEFAULT_FETCH_LON_BOUNDS = (0.0, 40.0)  # kept in [0, 360) to match ARCO-ERA5's longitude convention
 _DEFAULT_FETCH_TIME_RANGE = ("2023-01-01", "2023-01-10")  # 10 daily (00:00 UTC) snapshots
+_DEFAULT_FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")
+
+# Quantile levels TabICL is queried at for every ICL episode. Dense enough
+# to (a) fit a Gaussian mean/std per target cell via least squares, (b)
+# invert the quantile function at an arbitrary threshold by linear
+# interpolation, and (c) read off arbitrary alpha/2, 1-alpha/2 central-
+# interval bounds for the coverage curve.
+ALPHA_GRID = np.round(np.linspace(0.01, 0.99, 99), 2)
 
 
 def _fetch_default_era5_subset(cache_path: str = _DEFAULT_CACHE_NC) -> str:
     """Download a small real ERA5 sample (2m temperature + surface
     geopotential, Europe box, 10 daily snapshots from Jan 2023) from the
     public no-auth ARCO-ERA5 Zarr archive and cache it as a local NetCDF
-    file, so this only runs once. Returns `cache_path`."""
+    file, so this only runs once. Returns `cache_path`.
+
+    A separate fetch routine from eval/data/fetch_era5.py: this needs a
+    real datetime64 'time' coordinate and elevation, which that
+    diagnostics-focused fetcher's minimal (t2m/lat/lon/integer-day-index)
+    NetCDF3-classic schema deliberately doesn't carry.
+    """
     if os.path.exists(cache_path):
         return cache_path
+    os.makedirs(_CACHE_DIR, exist_ok=True)
     print(f"No --nc-path given; downloading a small real ERA5 sample to {cache_path} ...")
     ds = xr.open_zarr(_ARCO_ERA5_URL, chunks={"time": 24}, storage_options={"token": "anon"}, consolidated=True)
     lat_lo, lat_hi = _DEFAULT_FETCH_LAT_BOUNDS
@@ -102,16 +111,9 @@ def _fetch_default_era5_subset(cache_path: str = _DEFAULT_CACHE_NC) -> str:
     print(f"Saved {cache_path}")
     return cache_path
 
-# Quantile levels TabICLv2 (real or mock) is queried at for every ICL
-# episode. Dense enough to (a) fit a Gaussian mean/std per target cell via
-# least squares, (b) invert the quantile function at an arbitrary threshold
-# by linear interpolation, and (c) read off arbitrary alpha/2, 1-alpha/2
-# central-interval bounds for the coverage curve.
-ALPHA_GRID = np.round(np.linspace(0.01, 0.99, 99), 2)
-
 
 # ---------------------------------------------------------------------------
-# Part 2.1: ERA5 -> ICL episode
+# ERA5 -> ICL episode
 # ---------------------------------------------------------------------------
 def _find_var(ds: xr.Dataset, candidates: Sequence[str]) -> Optional[str]:
     for name in candidates:
@@ -140,9 +142,7 @@ def _time_features(ds: xr.Dataset, time_idx: int) -> Tuple[float, float, float, 
     if not np.issubdtype(t.dtype, np.datetime64):
         raise ValueError(
             "sample_icl_task_from_era5 requires a real datetime64 'time' coordinate "
-            f"(as provided by an actual ERA5 download); got dtype {t.dtype}. The bundled "
-            "plots/era5_temperature.nc synthetic fallback uses integer day indices and is "
-            "not usable here."
+            f"(as provided by an actual ERA5 download); got dtype {t.dtype}."
         )
     day_of_year = float(t.dt.dayofyear.values)
     hour = float(t.dt.hour.values) + float(t.dt.minute.values) / 60.0
@@ -163,9 +163,8 @@ def sample_icl_task_from_era5(
     Build one in-context-learning episode from `ds` at a single timestamp:
     a dense target patch inside the given lat/lon box (the D-dimensional
     joint target), and a global context of up to `n_ctx` points sampled from
-    the rest of the grid at the SAME timestamp (capturing the synoptic
-    weather state) -- excluding the target box itself, so context and target
-    never overlap.
+    the rest of the grid at the SAME timestamp — excluding the target box
+    itself, so context and target never overlap.
 
     Args:
         ds: xarray.Dataset with dims (time, latitude, longitude), a real
@@ -206,13 +205,8 @@ def sample_icl_task_from_era5(
         n = int(mask.sum())
         return np.column_stack(
             [
-                lat_grid[mask],
-                lon_grid[mask],
-                elev_field[mask],
-                np.full(n, cos_day),
-                np.full(n, sin_day),
-                np.full(n, cos_hour),
-                np.full(n, sin_hour),
+                lat_grid[mask], lon_grid[mask], elev_field[mask],
+                np.full(n, cos_day), np.full(n, sin_day), np.full(n, cos_hour), np.full(n, sin_hour),
             ]
         )
 
@@ -241,34 +235,7 @@ def sample_icl_task_from_era5(
 
 
 # ---------------------------------------------------------------------------
-# Part 2.2: Dummy/mock TabICLv2 inference
-# ---------------------------------------------------------------------------
-class MockTabICLv2:
-    """
-    Placeholder for TabICLv2, matching the real regressor's call contract
-    (see plots/generate_plots.py:TabICLv2_Regressor/TabICLv2_Quantile:
-    `.fit(X, y)` then `.predict(X_test, output_type="quantiles", alphas=...)`
-    -> (n_test, n_alphas)) so it is a drop-in swap once a real model is
-    available. Ignores the feature columns entirely and returns the same
-    Gaussian-quantile forecast (fit from the context labels only) for every
-    target row -- i.e. a deliberately independent, spatially-blind baseline.
-    """
-
-    def fit(self, X, y):
-        y = np.asarray(y, dtype=np.float64)
-        self._mu = float(y.mean())
-        self._sigma = max(float(y.std()), 1e-6)
-        return self
-
-    def predict(self, X_test, output_type: str = "quantiles", alphas=None):
-        assert output_type == "quantiles"
-        alphas = np.asarray(alphas, dtype=np.float64)
-        q = norm.ppf(alphas, loc=self._mu, scale=self._sigma)
-        return np.broadcast_to(q, (np.asarray(X_test).shape[0], len(alphas))).copy()
-
-
-# ---------------------------------------------------------------------------
-# Part 2.3: Quantile-grid adapters (shared by all 4 calibration metrics)
+# Quantile-grid adapters (shared by all 4 calibration metrics)
 # ---------------------------------------------------------------------------
 def _invert_quantile_cdf(y_values: np.ndarray, quantile_values: np.ndarray, alpha_grid: np.ndarray) -> np.ndarray:
     """Per-row inverse of a piecewise-linear quantile function: row i's
@@ -283,8 +250,7 @@ def _invert_quantile_cdf(y_values: np.ndarray, quantile_values: np.ndarray, alph
 
 def _quantile_at_alpha(alpha: float, quantile_values: np.ndarray, alpha_grid: np.ndarray) -> np.ndarray:
     """Forward evaluation Q_i(alpha) for every row i, via linear interpolation
-    along the (shared) alpha_grid -- vectorized since alpha_grid is common to
-    every row."""
+    along the (shared) alpha_grid."""
     idx = np.clip(np.searchsorted(alpha_grid, alpha), 1, len(alpha_grid) - 1)
     a0, a1 = alpha_grid[idx - 1], alpha_grid[idx]
     q0, q1 = quantile_values[:, idx - 1], quantile_values[:, idx]
@@ -294,8 +260,7 @@ def _quantile_at_alpha(alpha: float, quantile_values: np.ndarray, alpha_grid: np
 
 def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray):
     """Per-row Gaussian (mu, sigma^2) fit by least squares against the
-    standard-normal z-scores of alpha_grid: q_i(alpha) ~= mu_i + sigma_i * z(alpha).
-    Vectorized across all rows via a single pseudo-inverse solve."""
+    standard-normal z-scores of alpha_grid: q_i(alpha) ~= mu_i + sigma_i * z(alpha)."""
     z = norm.ppf(alpha_grid)
     design = np.column_stack([np.ones_like(z), z])  # (K, 2)
     coefs = np.linalg.pinv(design) @ quantile_values.T  # (2, n_rows)
@@ -305,19 +270,22 @@ def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray)
 
 
 # ---------------------------------------------------------------------------
-# Part 2.4: Evaluation loop + figure
+# Evaluation loop + figure
 # ---------------------------------------------------------------------------
 def run_era5_eval(
     nc_path: str,
     target_lat_bounds: Tuple[float, float],
     target_lon_bounds: Tuple[float, float],
+    tabicl_ckpt: Optional[str] = None,
+    device: Optional[str] = None,
     n_ctx: int = 1000,
     n_timestamps: Optional[int] = None,
     seed: int = 0,
 ):
     """
-    Loop over the first `n_timestamps` (default: all) timestamps in `nc_path`,
-    running one ICL episode + dummy TabICLv2 inference per timestamp.
+    Loop over the first `n_timestamps` (default: all) timestamps in
+    `nc_path`, running one ICL episode + real TabICL marginal inference per
+    timestamp.
 
     Returns:
         (y_true, all_quantiles): y_true is (N, D); all_quantiles is
@@ -327,15 +295,18 @@ def run_era5_eval(
     rng = np.random.default_rng(seed)
     n_times = ds.sizes["time"] if n_timestamps is None else min(n_timestamps, ds.sizes["time"])
 
+    print(f"Loading TabICL marginal model (TabICLRegressor): {tabicl_ckpt or '(default checkpoint)'}")
+    regressor = make_tabicl_regressor(checkpoint=tabicl_ckpt, device=device)
+
     y_true_chunks, quantile_chunks = [], []
     for t in range(n_times):
         X_ctx, Y_ctx, X_target, Y_target = sample_icl_task_from_era5(
             ds, t, target_lat_bounds, target_lon_bounds, n_ctx=n_ctx, rng=rng
         )
-        model = MockTabICLv2().fit(X_ctx, Y_ctx)
-        preds = model.predict(X_target, output_type="quantiles", alphas=ALPHA_GRID)  # (D, K)
+        preds = tabicl_quantiles(regressor, X_ctx, Y_ctx, X_target, ALPHA_GRID)  # (D, K)
         y_true_chunks.append(Y_target)
         quantile_chunks.append(preds)
+        print(f"  timestamp {t + 1}/{n_times} done", flush=True)
     ds.close()
 
     y_true = np.stack(y_true_chunks, axis=0)  # (N, D)
@@ -359,16 +330,16 @@ def build_calibration_figure(
     means, variances = means_flat.reshape(N, D), variances_flat.reshape(N, D)
 
     cdf_at_y = _invert_quantile_cdf(y_true.ravel(), flat_q, alpha_grid).reshape(N, D)
-    z_kendall = gp.calc_kendall_pit(cdf_at_y)
+    z_kendall = cal.calc_kendall_pit(cdf_at_y)
 
-    distances = gp.calc_mahalanobis_distances(y_true, means, variances)
+    distances = cal.calc_mahalanobis_distances(y_true, means, variances)
 
     def cdf_func(tau):
         return _invert_quantile_cdf(np.full(N * D, tau), flat_q, alpha_grid).reshape(N, D)
 
     if exceedance_thresholds is None:
         exceedance_thresholds = np.quantile(y_true, [0.5, 0.75, 0.9, 0.95, 0.99])
-    predicted_probs, true_events = gp.calc_exceedance_probs(y_true, cdf_func, exceedance_thresholds)
+    predicted_probs, true_events = cal.calc_exceedance_probs(y_true, cdf_func, exceedance_thresholds)
 
     def quantile_func(alpha):
         lo = _quantile_at_alpha(alpha / 2, flat_q, alpha_grid).reshape(N, D)
@@ -379,61 +350,52 @@ def build_calibration_figure(
         nominal_coverages = np.array([0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 10))
-    gp.plot_kendall_pit(z_kendall, axes[0, 0])
-    gp.plot_mahalanobis_pp(distances, D, axes[0, 1])
-    gp.plot_spatial_reliability(predicted_probs, true_events, num_bins=10, ax=axes[1, 0])
-    gp.plot_spatial_coverage_curve(y_true, quantile_func, nominal_coverages, axes[1, 1])
-    fig.suptitle("TabICLv2 Multivariate Spatial Calibration on ERA5")
+    cal.plot_kendall_pit(z_kendall, axes[0, 0])
+    cal.plot_mahalanobis_pp(distances, D, axes[0, 1])
+    cal.plot_spatial_reliability(predicted_probs, true_events, num_bins=10, ax=axes[1, 0])
+    cal.plot_spatial_coverage_curve(y_true, quantile_func, nominal_coverages, axes[1, 1])
+    fig.suptitle("TabICL Multivariate Spatial Calibration on ERA5 (independence copula)")
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {output_path}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--nc-path",
-        type=str,
-        default=None,
+        "--nc-path", type=str, default=None,
         help="Path to a real ERA5 temperature NetCDF file. If omitted, a small real "
         f"sample is auto-downloaded and cached to {_DEFAULT_CACHE_NC}.",
     )
     parser.add_argument(
-        "--target-lat-bounds",
-        type=float,
-        nargs=2,
-        default=list(_DEFAULT_TARGET_LAT_BOUNDS),
+        "--target-lat-bounds", type=float, nargs=2, default=list(_DEFAULT_TARGET_LAT_BOUNDS),
         metavar=("LAT_MIN", "LAT_MAX"),
     )
     parser.add_argument(
-        "--target-lon-bounds",
-        type=float,
-        nargs=2,
-        default=list(_DEFAULT_TARGET_LON_BOUNDS),
+        "--target-lon-bounds", type=float, nargs=2, default=list(_DEFAULT_TARGET_LON_BOUNDS),
         metavar=("LON_MIN", "LON_MAX"),
     )
-    parser.add_argument("--n-ctx", type=int, default=1000, help="Global context points sampled per timestamp.")
     parser.add_argument(
-        "--n-timestamps", type=int, default=None, help="Number of timestamps to evaluate (default: all)."
+        "--tabicl-ckpt", type=str, default=None,
+        help="TabICLRegressor checkpoint_version (default: the library's own default checkpoint).",
     )
+    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
+    parser.add_argument("--n-ctx", type=int, default=1000, help="Global context points sampled per timestamp.")
+    parser.add_argument("--n-timestamps", type=int, default=None, help="Number of timestamps to evaluate (default: all).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--output",
-        type=str,
-        default=os.path.join(gp.PLOTS_DIR, "era5_multivariate_calibration.pdf"),
+        "--output", type=str, default=os.path.join(_DEFAULT_FIGURES_DIR, "era5_multivariate_calibration.pdf"),
     )
     args = parser.parse_args()
 
     nc_path = args.nc_path if args.nc_path is not None else _fetch_default_era5_subset()
 
     y_true, all_quantiles = run_era5_eval(
-        nc_path,
-        tuple(args.target_lat_bounds),
-        tuple(args.target_lon_bounds),
-        n_ctx=args.n_ctx,
-        n_timestamps=args.n_timestamps,
-        seed=args.seed,
+        nc_path, tuple(args.target_lat_bounds), tuple(args.target_lon_bounds),
+        tabicl_ckpt=args.tabicl_ckpt, device=args.device,
+        n_ctx=args.n_ctx, n_timestamps=args.n_timestamps, seed=args.seed,
     )
     print(f"Evaluated {y_true.shape[0]} timestamps x {y_true.shape[1]} target grid cells.")
     build_calibration_figure(y_true, all_quantiles, ALPHA_GRID, args.output)
