@@ -148,6 +148,47 @@ def _gp_cfg(cfg: DictConfig) -> DictConfig:
     )
 
 
+def _generate_phase_a_gp_batch(
+    gp_cfg: DictConfig, batch_size: int, device: str, *, max_rounds: int = 20
+) -> list[dict]:
+    """Generate a shape-homogeneous batch even when GP episodes are discarded.
+
+    ``generate_gp_batch`` guarantees the requested count, but its numerical-
+    failure top-ups intentionally resample P/N because its usual consumers pad
+    rows in a DataLoader. Phase A stacks directly for one batched TabICL call,
+    so after the first returned shape is chosen, retries must pin P, N and d.
+    """
+    episodes = generate_gp_batch(
+        gp_cfg, batch_size, device, return_kernel_metadata=True
+    )
+    P = int(episodes[0]["x_norm_train"].shape[0])
+    N = int(episodes[0]["x_norm_test"].shape[0])
+    d = int(episodes[0]["x_norm_train"].shape[1])
+    out = [
+        ep for ep in episodes
+        if ep["x_norm_train"].shape == (P, d) and ep["x_norm_test"].shape == (N, d)
+    ]
+    if len(out) == batch_size:
+        return out
+
+    fixed = OmegaConf.create(OmegaConf.to_container(gp_cfg, resolve=True))
+    fixed.data.P_min = fixed.data.P_max = P
+    fixed.data.N_min = fixed.data.N_max = N
+    base_seed = int(gp_cfg.seed)
+    for round_idx in range(1, max_rounds + 1):
+        fixed.seed = base_seed + round_idx * 1_000_003
+        out.extend(generate_gp_batch(
+            fixed, batch_size - len(out), device,
+            return_kernel_metadata=True, d_override=d,
+        ))
+        if len(out) >= batch_size:
+            return out[:batch_size]
+    raise RuntimeError(
+        f"Phase-A GP generator produced only {len(out)}/{batch_size} episodes "
+        f"with fixed shape P={P}, N={N}, d={d} after {max_rounds} retries."
+    )
+
+
 def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
     """A FIXED synthetic-GP validation set, drawn once with its own seed.
 
@@ -161,9 +202,8 @@ def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
     for i in range(int(cfg.validation.gp_n_batches)):
         gp_cfg.seed = int(cfg.validation.gp_seed) + i
         batches.append(
-            generate_gp_batch(
+            _generate_phase_a_gp_batch(
                 gp_cfg, int(cfg.validation.gp_batch_size), device,
-                return_kernel_metadata=True,
             )
         )
     return batches
@@ -177,6 +217,7 @@ def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
 @hydra.main(config_path="../conf", config_name="finetune_marginal", version_base=None)
 def main(cfg: DictConfig) -> None:
     device = _resolve_device(str(cfg.training.device))
+    torch.set_float32_matmul_precision(str(cfg.training.matmul_precision))
     _seed_everything(int(cfg.seed))
     print(OmegaConf.to_yaml(cfg))
 
@@ -293,12 +334,16 @@ def main(cfg: DictConfig) -> None:
 
     def _validate(step: int) -> None:
         t0 = time.time()
+        t_era5 = time.time()
         metrics = validate_era5_marginal(tabicl, era5_val, eps=eps)
+        metrics["val_marginal/era5_seconds"] = time.time() - t_era5
+        t_gp = time.time()
         metrics.update(
             validate_synthetic_marginal(
                 tabicl, gp_val, k_folds=k_folds, eps=eps, device=device
             )
         )
+        metrics["val_marginal/gp_seconds"] = time.time() - t_gp
         metrics["val_marginal/seconds"] = time.time() - t0
         _log(metrics, step)
         print(
@@ -308,7 +353,10 @@ def main(cfg: DictConfig) -> None:
             f"ks={metrics.get('val_marginal/mean_ks', float('nan')):.4f} | "
             f"gp nll={metrics.get('val_marginal/gp/nll', float('nan')):.4f} "
             f"oracle={metrics.get('val_marginal/gp/nll_oracle', float('nan')):.4f} "
-            f"gap={metrics.get('val_marginal/gp/nll_gap_to_oracle', float('nan')):.4f}"
+            f"gap={metrics.get('val_marginal/gp/nll_gap_to_oracle', float('nan')):.4f} | "
+            f"{metrics['val_marginal/seconds']:.2f}s "
+            f"(era5 {metrics['val_marginal/era5_seconds']:.2f}s, "
+            f"gp {metrics['val_marginal/gp_seconds']:.2f}s)"
         )
 
     def _save(step: int, tag: str = "") -> str | None:
@@ -330,8 +378,15 @@ def main(cfg: DictConfig) -> None:
     gen = torch.Generator().manual_seed(int(cfg.seed) + 13)
     B = int(cfg.training.batch_size)
     t_last = time.time()
+    profile_steps = int(cfg.training.get("profile_steps", 0))
+    profile_totals: dict[str, float] = {}
 
     for step in range(1, total_steps + 1):
+        profiling = step <= profile_steps
+        if profiling and device.startswith("cuda"):
+            torch.cuda.synchronize(device)
+        step_started = time.perf_counter()
+        data_started = step_started
         use_era5 = era5_sampler is not None and rng.random() < mix_frac
         if use_era5:
             episodes = era5_sampler.batch(B)
@@ -341,15 +396,18 @@ def main(cfg: DictConfig) -> None:
             w = era5_weights
         else:
             gp_cfg.seed = int(cfg.seed) * 1_000_003 + step
-            episodes = generate_gp_batch(
-                gp_cfg, B, device, return_kernel_metadata=True
-            )
+            episodes = _generate_phase_a_gp_batch(gp_cfg, B, device)
             w = weights
+        if profiling and device.startswith("cuda"):
+            torch.cuda.synchronize(device)
+        data_seconds = time.perf_counter() - data_started
 
+        part_timings: dict[str, float] | None = {} if profiling else None
         res = phase_a_batch_loss(
             tabicl, episodes, w,
             k_folds=k_folds, folds_per_step=folds_per_step,
             generator=gen, device=device, eps=eps,
+            timings=part_timings,
         )
         loss = res["loss"]
         anchor_val = 0.0
@@ -358,13 +416,41 @@ def main(cfg: DictConfig) -> None:
             loss = loss + weights.anchor * a
             anchor_val = float(a)
 
+        backward_started = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(
             params, float(cfg.training.clip_grad_norm)
         )
+        if profiling and device.startswith("cuda"):
+            torch.cuda.synchronize(device)
+        backward_seconds = time.perf_counter() - backward_started
+        optimizer_started = time.perf_counter()
         opt.step()
         sched.step()
+        if profiling and device.startswith("cuda"):
+            torch.cuda.synchronize(device)
+        optimizer_seconds = time.perf_counter() - optimizer_started
+
+        if profiling:
+            measured = {
+                "data": data_seconds,
+                **(part_timings or {}),
+                "backward_and_clip": backward_seconds,
+                "optimizer": optimizer_seconds,
+                "total": time.perf_counter() - step_started,
+            }
+            for key, value in measured.items():
+                profile_totals[key] = profile_totals.get(key, 0.0) + value
+            print("[profile step %d] %s" % (
+                step, " ".join(f"{key}={value:.4f}s" for key, value in measured.items())
+            ))
+            if step == profile_steps:
+                means = {key: value / profile_steps for key, value in profile_totals.items()}
+                print("[profile mean] " + " ".join(
+                    f"{key}={value:.4f}s" for key, value in means.items()
+                ))
+                _log({f"profile/{key}_seconds": value for key, value in means.items()}, step)
 
         if step % int(cfg.training.log_every) == 0:
             dt = (time.time() - t_last) / int(cfg.training.log_every)
@@ -393,12 +479,16 @@ def main(cfg: DictConfig) -> None:
                 + ("  [era5]" if use_era5 else "")
             )
 
+        hooks_started = time.time()
         if step % int(cfg.training.val_every) == 0:
             _validate(step)
         if step % int(cfg.training.save_every) == 0:
             _save(step)
+        # Do not charge validation/checkpoint I/O to the next sec_per_step window.
+        t_last += time.time() - hooks_started
 
-    _validate(total_steps)
+    if total_steps % int(cfg.training.val_every) != 0:
+        _validate(total_steps)
     final = _save(total_steps, tag="_final")
     if final:
         print(

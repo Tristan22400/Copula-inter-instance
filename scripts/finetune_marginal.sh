@@ -47,14 +47,44 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # check even when fully cached. Skip it once cached.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
+# Reuse one large ERA5 cache across linked worktrees instead of requiring a
+# second 15 GB copy (or silently fetching validation files again). OAR_O_WORKDIR
+# can itself be another worktree, so a directory existing there is not enough:
+# accept a candidate only when it contains actual global-corpus files, then
+# fall back to the primary checkout next to Git's common .git directory.
+EXTRA_OVERRIDES=()
+has_global_corpus() {
+    compgen -G "$1/era5_global_train/era5_global_t2m_*.nc" >/dev/null
+}
+
+if [[ -z "${ERA5_CACHE_DIR:-}" ]]; then
+    GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+    PRIMARY_CHECKOUT="$(dirname "$GIT_COMMON_DIR")"
+    CACHE_CANDIDATES=(
+        "${OAR_O_WORKDIR:-}/eval/data/cache"
+        "$PRIMARY_CHECKOUT/eval/data/cache"
+    )
+    for candidate in "${CACHE_CANDIDATES[@]}"; do
+        if [[ -n "$candidate" ]] && has_global_corpus "$candidate"; then
+            export ERA5_CACHE_DIR="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -n "${ERA5_CACHE_DIR:-}" ]] && has_global_corpus "$ERA5_CACHE_DIR"; then
+    EXTRA_OVERRIDES+=("marginal.era5.corpus_dir=$ERA5_CACHE_DIR/era5_global_train")
+fi
+
 mkdir -p logs
 
 echo "[$(date +%H:%M:%S)] OAR job ${OAR_JOB_ID:-local} — host: $(hostname)"
 echo "[$(date +%H:%M:%S)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
+echo "[$(date +%H:%M:%S)] ERA5 cache: ${ERA5_CACHE_DIR:-not found}"
 echo "[$(date +%H:%M:%S)] Phase A: marginal fine-tuning..."
 echo "    overrides: $*"
 
-python src/finetune_marginal.py "$@"
+python src/finetune_marginal.py "${EXTRA_OVERRIDES[@]}" "$@"
 
 echo "[$(date +%H:%M:%S)] Phase A complete."
 echo "Next:"

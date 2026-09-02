@@ -73,17 +73,20 @@ def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
     if not bool(task.get("mean_nonzero", torch.tensor(False)).item()):
         return zero
 
+    def _on_x(name: str) -> torch.Tensor:
+        return task[name].to(device=x.device, dtype=x.dtype)
+
     family = int(task["mean_family"].item())
     if family == 0:  # linear (incl. constant-only, when mean_weight is all-zero)
-        return (x * task["mean_weight"]).sum(-1) + task["mean_bias"]
+        return (x * _on_x("mean_weight")).sum(-1) + _on_x("mean_bias")
     elif family == 1:  # exponential
-        proj = (x * task["mean_exp_direction"]).sum(-1)
-        exponent = torch.clamp(task["mean_exp_rate"] * proj, min=-10.0, max=10.0)
-        return task["mean_exp_scale"] * torch.exp(exponent)
+        proj = (x * _on_x("mean_exp_direction")).sum(-1)
+        exponent = torch.clamp(_on_x("mean_exp_rate") * proj, min=-10.0, max=10.0)
+        return _on_x("mean_exp_scale") * torch.exp(exponent)
     elif family == 2:  # sparse anomaly
-        proj = (x * task["mean_anomaly_direction"]).sum(-1)
-        hit = (proj > task["mean_anomaly_threshold"]).to(x.dtype)
-        return hit * task["mean_anomaly_magnitude"]
+        proj = (x * _on_x("mean_anomaly_direction")).sum(-1)
+        hit = (proj > _on_x("mean_anomaly_threshold")).to(x.dtype)
+        return hit * _on_x("mean_anomaly_magnitude")
     raise ValueError(f"Unknown mean_family {family}; expected 0, 1, or 2.")
 
 
@@ -372,6 +375,8 @@ def _run_pit_batched_impl(
     *,
     return_quantiles: bool = False,
     fold_subset: "Sequence[int] | None" = None,
+    compute_pit: bool = True,
+    fuse_folds: bool = False,
 ) -> dict:
     """Shared body of ``run_pit_batched`` / ``run_pit_batched_grad``.
 
@@ -401,6 +406,9 @@ def _run_pit_batched_impl(
     second forward pass; the saturation fractions are the silent-failure
     counters the marginal calibration runner reports.
     """
+    if not compute_pit and not return_quantiles:
+        raise ValueError("compute_pit=False requires return_quantiles=True")
+
     device = X_train.device
     B, P, p_x = X_train.shape
     N = X_test.shape[1]
@@ -422,11 +430,13 @@ def _run_pit_batched_impl(
     # its output on CPU under GPU memory pressure regardless of input device.
     logits = logits.to(device)
     Q = logits.shape[-1]
-    dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
-
-    y_test_flat = Y_test.permute(0, 2, 1).reshape(B * d * N)
-    u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)            # (B, N, d)
-    log_pdf_test = dist.log_prob(y_test_flat).reshape(B, d, N).permute(0, 2, 1)  # (B, N, d)
+    if compute_pit:
+        dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
+        y_test_flat = Y_test.permute(0, 2, 1).reshape(B * d * N)
+        u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)       # (B, N, d)
+        log_pdf_test = dist.log_prob(y_test_flat).reshape(B, d, N).permute(0, 2, 1)
+    else:
+        u_test = log_pdf_test = None
 
     q_test = None
     if return_quantiles:
@@ -442,6 +452,7 @@ def _run_pit_batched_impl(
     indices = torch.arange(P, device=device)
     wanted_folds = range(K) if fold_subset is None else sorted(set(int(k) for k in fold_subset))
 
+    fold_specs = []
     for k in wanted_folds:
         start = k * fold_size
         end = min(start + fold_size, P)
@@ -457,33 +468,53 @@ def _run_pit_batched_impl(
         ctx_idx = indices[ctx_mask]
         F = qry_idx.numel()
 
-        X_fold = torch.cat([X_train[:, ctx_idx], X_train[:, qry_idx]], dim=1)   # (B, P-F+F, p_x)
-        X_fold_batch = (
-            X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x)
-            .reshape(B * d, X_fold.shape[1], p_x).contiguous()
-        )
-        y_ctx_batch = (
-            Y_train[:, ctx_idx].permute(0, 2, 1).reshape(B * d, P - F).contiguous()
-        )
+        fold_specs.append((qry_idx, ctx_idx, F))
 
-        logits_fold = tabicl(X_fold_batch, y_ctx_batch)                        # (B*d, F, Q)
-        logits_fold = logits_fold.to(device)  # see run_pit's offload-mode comment above
-        dist_fold = tabicl.quantile_dist(logits_fold.reshape(B * d * F, Q))
+    # Folds with equal query size also have equal context/input shapes.  Phase
+    # A can therefore concatenate them into TabICL's table-batch axis and pay
+    # one better-utilized launch rather than one small launch per fold.  Keep
+    # the default unfused for historical inference callers, where a full
+    # K-fold pass could otherwise multiply peak memory by K.
+    fold_groups: list[list[tuple[torch.Tensor, torch.Tensor, int]]] = []
+    if fuse_folds:
+        by_size: dict[int, list[tuple[torch.Tensor, torch.Tensor, int]]] = {}
+        for spec in fold_specs:
+            by_size.setdefault(spec[2], []).append(spec)
+        fold_groups.extend(by_size.values())
+    else:
+        fold_groups.extend([[spec] for spec in fold_specs])
 
-        y_qry_flat = Y_train[:, qry_idx].permute(0, 2, 1).reshape(B * d * F)
-        u_fold = dist_fold.cdf(y_qry_flat).reshape(B, d, F).permute(0, 2, 1)   # (B, F, d)
-        # Accumulate then reorder once below rather than writing each fold into
-        # a preallocated buffer: index_put_ into a shared buffer is an
-        # autograd-hostile pattern (every fold's write extends one in-place
-        # chain), and the folds are disjoint, so a concat + argsort reproduces
-        # the same (B, P, d) layout for free and stays a pure functional graph.
-        u_train_parts.append((qry_idx, u_fold))
-        if return_quantiles:
-            q_train_parts.append(
-                (qry_idx, logits_fold.reshape(B, d, F, Q).permute(0, 2, 1, 3))  # (B, F, d, Q)
+    for group in fold_groups:
+        x_group = []
+        y_group = []
+        for qry_idx, ctx_idx, F in group:
+            X_fold = torch.cat([X_train[:, ctx_idx], X_train[:, qry_idx]], dim=1)
+            x_group.append(
+                X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x)
+                .reshape(B * d, X_fold.shape[1], p_x).contiguous()
+            )
+            y_group.append(
+                Y_train[:, ctx_idx].permute(0, 2, 1).reshape(B * d, P - F).contiguous()
             )
 
-    if not u_train_parts:
+        logits_group = tabicl(torch.cat(x_group, dim=0), torch.cat(y_group, dim=0))
+        logits_group = logits_group.to(device)
+
+        for group_idx, (qry_idx, _ctx_idx, F) in enumerate(group):
+            logits_fold = logits_group[group_idx * B * d:(group_idx + 1) * B * d]
+
+            if compute_pit:
+                dist_fold = tabicl.quantile_dist(logits_fold.reshape(B * d * F, Q))
+                y_qry_flat = Y_train[:, qry_idx].permute(0, 2, 1).reshape(B * d * F)
+                u_fold = dist_fold.cdf(y_qry_flat).reshape(B, d, F).permute(0, 2, 1)
+                u_train_parts.append((qry_idx, u_fold))
+            if return_quantiles:
+                q_train_parts.append(
+                    (qry_idx, logits_fold.reshape(B, d, F, Q).permute(0, 2, 1, 3))
+                )
+
+    no_fold_outputs = not (q_train_parts if return_quantiles else u_train_parts)
+    if no_fold_outputs:
         if fold_subset is None or len(list(fold_subset)) > 0:
             raise ValueError(
                 f"run_pit_batched: no folds were scored (K={K}, P={P}, "
@@ -495,16 +526,19 @@ def _run_pit_batched_impl(
         # construction (never in context) so no leakage-avoiding fold rotation
         # is needed -- going through this function anyway keeps that pass on
         # the exact same forward/CDF/log_prob code the training path uses.
-        out = {"z_test": _probit(u_test, eps), "log_pdf_test": log_pdf_test,
-               "train_query_idx": torch.empty(0, dtype=torch.long, device=device)}
+        out = {"train_query_idx": torch.empty(0, dtype=torch.long, device=device)}
+        if compute_pit:
+            out.update({"z_test": _probit(u_test, eps), "log_pdf_test": log_pdf_test})
         if return_quantiles:
             out.update(
                 {
                     "q_test": q_test,
-                    "u_test": u_test,
-                    "clamp_frac_test": (
-                        (u_test <= eps) | (u_test >= 1.0 - eps)
-                    ).float().mean().detach(),
+                    **({
+                        "u_test": u_test,
+                        "clamp_frac_test": (
+                            (u_test <= eps) | (u_test >= 1.0 - eps)
+                        ).float().mean().detach(),
+                    } if compute_pit else {}),
                 }
             )
             levels = _alpha_levels_of(tabicl, device)
@@ -512,26 +546,28 @@ def _run_pit_batched_impl(
                 out["alpha_levels"] = levels                                   # (Q,)
         return out
 
-    order = torch.cat([qi for qi, _ in u_train_parts], dim=0)                  # (P',)
-    u_train = torch.cat([uf for _, uf in u_train_parts], dim=1)                # (B, P', d)
+    parts_for_order = q_train_parts if return_quantiles else u_train_parts
+    order = torch.cat([qi for qi, _ in parts_for_order], dim=0)                # (P',)
+    if compute_pit:
+        u_train = torch.cat([uf for _, uf in u_train_parts], dim=1)            # (B, P', d)
     if fold_subset is None:
         # Full pass: the scored rows are all P of them, so restore the
         # caller's row order (folds are contiguous blocks, concatenated in
         # fold order, which is already sorted -- argsort makes that explicit
         # and independent of the loop's iteration order).
         inv = torch.argsort(order)
-        u_train = u_train[:, inv, :]
+        if compute_pit:
+            u_train = u_train[:, inv, :]
     else:
         inv = None
 
-    z_train = _probit(u_train, eps)
-    z_test = _probit(u_test, eps)
-
-    out = {
-        "z_train": z_train,
-        "z_test": z_test,
-        "log_pdf_test": log_pdf_test,
-    }
+    out = {}
+    if compute_pit:
+        out.update({
+            "z_train": _probit(u_train, eps),
+            "z_test": _probit(u_test, eps),
+            "log_pdf_test": log_pdf_test,
+        })
     if fold_subset is not None:
         out["train_query_idx"] = order
     if return_quantiles:
@@ -542,17 +578,17 @@ def _run_pit_batched_impl(
             {
                 "q_train": q_train,                                            # (B, P', d, Q)
                 "q_test": q_test,                                              # (B, N, d, Q)
-                "u_train": u_train,
-                "u_test": u_test,
-                # Silent-failure counters: _probit hard-caps |z| at 4.7534 for
-                # eps=1e-6, so a nonzero fraction here means the marginal put
-                # the observed y outside its own resolvable range.
-                "clamp_frac_train": (
-                    (u_train <= eps) | (u_train >= 1.0 - eps)
-                ).float().mean().detach(),
-                "clamp_frac_test": (
-                    (u_test <= eps) | (u_test >= 1.0 - eps)
-                ).float().mean().detach(),
+                **({
+                    "u_train": u_train,
+                    "u_test": u_test,
+                    # Silent-failure counters: _probit hard-caps |z| at 4.7534.
+                    "clamp_frac_train": (
+                        (u_train <= eps) | (u_train >= 1.0 - eps)
+                    ).float().mean().detach(),
+                    "clamp_frac_test": (
+                        (u_test <= eps) | (u_test >= 1.0 - eps)
+                    ).float().mean().detach(),
+                } if compute_pit else {}),
             }
         )
         levels = _alpha_levels_of(tabicl, device)
@@ -619,6 +655,8 @@ def run_pit_batched_grad(
     eps: float = 1e-6,
     return_quantiles: bool = True,
     fold_subset: "Sequence[int] | None" = None,
+    compute_pit: bool = True,
+    fuse_folds: bool = False,
 ) -> dict:
     """Gradient-carrying ``run_pit_batched`` -- same body, no ``no_grad``.
 
@@ -638,6 +676,7 @@ def run_pit_batched_grad(
         return _run_pit_batched_impl(
             tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
             return_quantiles=return_quantiles, fold_subset=fold_subset,
+            compute_pit=compute_pit, fuse_folds=fuse_folds,
         )
 
 

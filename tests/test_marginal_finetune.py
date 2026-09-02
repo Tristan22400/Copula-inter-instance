@@ -43,6 +43,7 @@ import torch
 import torch.nn as nn
 
 from data_gen import build_kernel_fn, gp_posterior
+from finetune_marginal import _generate_phase_a_gp_batch
 from lora import merged_base_state_dict
 from marginal_finetune import (
     TIER0_PATTERNS,
@@ -65,6 +66,30 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch):
+    import finetune_marginal as entrypoint
+    from omegaconf import OmegaConf
+
+    calls = []
+
+    def episode(P, N=3, d=2):
+        return {"x_norm_train": torch.zeros(P, d), "x_norm_test": torch.zeros(N, d)}
+
+    def fake_generate(cfg, B, device, **kwargs):
+        calls.append((B, int(cfg.data.P_min), int(cfg.data.P_max), kwargs.get("d_override")))
+        if len(calls) == 1:
+            return [episode(4), episode(4), episode(7)]
+        assert B == 1
+        return [episode(4)]
+
+    monkeypatch.setattr(entrypoint, "generate_gp_batch", fake_generate)
+    cfg = OmegaConf.create({"seed": 9, "data": {"P_min": 2, "P_max": 8,
+                                                  "N_min": 3, "N_max": 3}})
+    got = _generate_phase_a_gp_batch(cfg, 3, "cpu")
+    assert [ep["x_norm_train"].shape[0] for ep in got] == [4, 4, 4]
+    assert calls[1][1:] == (4, 4, 2)
 
 
 def _tiny_tabicl(num_quantiles: int = 33) -> nn.Module:
@@ -279,6 +304,26 @@ def test_analytic_target_contracts_with_more_context():
     assert (s_big <= s_small + 1e-6).all(), (s_small, s_big)
 
 
+def _with_cached_full_factors(task: dict) -> dict:
+    task = dict(task)
+    kfn = build_kernel_fn("rbf", 0.7, 1.3, active_dims=[0, 1])
+    x, y = task["x_norm_train"], task["y_train"]
+    K = kfn(x, x).double() + float(task["nugget"]) * torch.eye(len(x), dtype=torch.float64)
+    L = torch.linalg.cholesky(K)
+    task["_L_ff"] = L
+    task["_alpha"] = torch.cholesky_solve(y.double().unsqueeze(-1), L).squeeze(-1)
+    return task
+
+
+def test_cached_full_context_target_matches_direct_recomputation():
+    task = _with_cached_full_factors(_rbf_task(P=18, N=7, seed=31))
+    args = (task, task["x_norm_train"], task["y_train"], task["x_norm_test"])
+    direct = analytic_marginal_targets(*args)
+    cached = analytic_marginal_targets(*args, use_cached_full_context=True)
+    assert torch.allclose(cached[0], direct[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(cached[1], direct[1], atol=1e-5, rtol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # 4. Fold conditioning agreement between target and model
 # ---------------------------------------------------------------------------
@@ -303,6 +348,17 @@ def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K):
         mu_i, sig_i = analytic_marginal_targets(task, x[ctx], y[ctx], x[i:i + 1])
         assert torch.allclose(mu[i], mu_i[0], atol=1e-4), i
         assert torch.allclose(sigma[i], sig_i[0], atol=1e-4), i
+
+
+@pytest.mark.parametrize("K", [3, 5, 10])
+def test_cached_precision_fold_targets_match_direct_conditioning(K):
+    task = _with_cached_full_factors(_rbf_task(P=17, N=2, seed=32 + K))
+    idx = torch.tensor([0, 1, 5, 8, 12, 16])
+    direct_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}
+    direct = episode_fold_targets(direct_task, idx, K)
+    cached = episode_fold_targets(task, idx, K)
+    assert torch.allclose(cached[0], direct[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(cached[1], direct[1], atol=1e-5, rtol=1e-5)
 
 
 def test_fold_subset_rows_match_a_full_pit_pass():
@@ -346,6 +402,46 @@ def test_fold_subset_empty_returns_test_only():
     assert "z_train" not in only
     assert torch.allclose(only["z_test"], full["z_test"], atol=0)
     assert only["q_test"].shape[:3] == (1, 3, 1)
+
+
+def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output():
+    from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
+    from pit import _run_pit_batched_impl
+
+    torch.manual_seed(0)
+    tab = RowIndependentFakeTabICL(q=7)
+    Xtr, Ytr = torch.randn(2, 9, 2), torch.randn(2, 9, 1)
+    Xte, Yte = torch.randn(2, 4, 2), torch.randn(2, 4, 1)
+    full = _run_pit_batched_impl(
+        tab, Xtr, Ytr, Xte, Yte, 3, 1e-6,
+        return_quantiles=True, fold_subset=[0, 2],
+    )
+    fast = _run_pit_batched_impl(
+        tab, Xtr, Ytr, Xte, Yte, 3, 1e-6,
+        return_quantiles=True, fold_subset=[0, 2], compute_pit=False,
+    )
+    assert torch.equal(fast["train_query_idx"], full["train_query_idx"])
+    assert torch.equal(fast["q_train"], full["q_train"])
+    assert torch.equal(fast["q_test"], full["q_test"])
+    assert not ({"z_train", "z_test", "log_pdf_test", "u_train", "u_test"} & fast.keys())
+
+
+def test_fused_fold_forward_matches_separate_forwards():
+    from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
+    from pit import _run_pit_batched_impl
+
+    torch.manual_seed(0)
+    tab = RowIndependentFakeTabICL(q=7)
+    Xtr, Ytr = torch.randn(2, 17, 2), torch.randn(2, 17, 1)
+    Xte, Yte = torch.randn(2, 4, 2), torch.randn(2, 4, 1)
+    kwargs = dict(return_quantiles=True, fold_subset=[0, 2, 4], compute_pit=False)
+    separate = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, 5, 1e-6, **kwargs)
+    fused = _run_pit_batched_impl(
+        tab, Xtr, Ytr, Xte, Yte, 5, 1e-6, fuse_folds=True, **kwargs
+    )
+    assert torch.equal(fused["train_query_idx"], separate["train_query_idx"])
+    assert torch.equal(fused["q_train"], separate["q_train"])
+    assert torch.equal(fused["q_test"], separate["q_test"])
 
 
 # ---------------------------------------------------------------------------

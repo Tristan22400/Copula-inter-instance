@@ -108,6 +108,10 @@ marginal:
 
 training:
   device: auto
+  # Enables TensorFloat-32 tensor cores for float32 matmuls on Ampere+ GPUs.
+  # Cholesky/analytic targets remain explicit float64; this only affects the
+  # neural network and retains float32 storage/output.
+  matmul_precision: high
   batch_size: 8
   steps: 20000
   # 4e-5: finetune_era5.py's empirical precedent, ~20x below the pretraining
@@ -119,6 +123,9 @@ training:
   lr_min_frac: 0.1
   weight_decay: 0.01
   clip_grad_norm: 1.0
+  # Synchronized component timings for the first N steps. After these probes,
+  # the hot loop runs without timing synchronizations.
+  profile_steps: 10
   log_every: 50
   val_every: 500
   save_every: 2000

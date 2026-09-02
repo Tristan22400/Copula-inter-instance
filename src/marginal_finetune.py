@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 import zlib
 from typing import Callable, Optional, Sequence
 
@@ -231,6 +232,7 @@ def analytic_marginal_targets(
     *,
     kernel_fn: Optional[Callable] = None,
     nugget: Optional[float] = None,
+    use_cached_full_context: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact ``N(mu_i, sigma_i^2)`` for the OBSERVABLE target at ``x_qry``,
     conditioned on ``(x_ctx, y_ctx)``.
@@ -276,11 +278,18 @@ def analytic_marginal_targets(
     y_ctx = y_ctx.to(device)
     P_c = x_ctx.shape[0]
 
-    K_ff = (kernel_fn(x_ctx, x_ctx) + nugget * torch.eye(P_c, device=device)).double()
-    L_ff = _safe_cholesky(K_ff, max_attempts=12)
-
-    mean_ctx = _mean_train_from_task(task, x_ctx).double()
-    alpha = torch.cholesky_solve((y_ctx.double() - mean_ctx).unsqueeze(-1), L_ff).squeeze(-1)
+    if use_cached_full_context and "_L_ff" in task and "_alpha" in task:
+        if P_c != task["x_norm_train"].shape[0]:
+            raise ValueError("cached full-context factors require the complete training context")
+        L_ff = task["_L_ff"].to(device=device, dtype=torch.float64)
+        alpha = task["_alpha"].to(device=device, dtype=torch.float64)
+    else:
+        K_ff = (kernel_fn(x_ctx, x_ctx) + nugget * torch.eye(P_c, device=device)).double()
+        L_ff = _safe_cholesky(K_ff, max_attempts=12)
+        mean_ctx = _mean_train_from_task(task, x_ctx).double()
+        alpha = torch.cholesky_solve(
+            (y_ctx.double() - mean_ctx).unsqueeze(-1), L_ff
+        ).squeeze(-1)
 
     K_sf = kernel_fn(x_qry, x_ctx).double()                       # (M, P_c)
     mean_qry = _mean_train_from_task(task, x_qry).double()
@@ -320,26 +329,48 @@ def episode_fold_targets(
     K = max(2, min(int(k_folds), P))
     fold_size = math.ceil(P / K)
 
-    kernel_fn, nugget = _kernel_fn_from_task(task)
-
     query_idx = query_idx.to(device)
     mu_out = torch.empty(query_idx.numel(), device=device)
     sig_out = torch.empty(query_idx.numel(), device=device)
 
     fold_of = (query_idx // fold_size)
+    cached = "_L_ff" in task and "_alpha" in task
+    if cached:
+        L_full = task["_L_ff"].to(device=device, dtype=torch.float64)
+        alpha_full = task["_alpha"].to(device=device, dtype=torch.float64)
+    else:
+        kernel_fn, nugget = _kernel_fn_from_task(task)
     for k in fold_of.unique().tolist():
         sel = (fold_of == k).nonzero(as_tuple=True)[0]           # positions in query_idx
         qry_rows = query_idx[sel]
         start, end = k * fold_size, min((k + 1) * fold_size, P)
-        ctx_mask = torch.ones(P, dtype=torch.bool, device=device)
-        ctx_mask[start:end] = False
-        ctx_rows = ctx_mask.nonzero(as_tuple=True)[0]
-        mu_k, sig_k = analytic_marginal_targets(
-            task, x_train[ctx_rows], y_train[ctx_rows], x_train[qry_rows],
-            kernel_fn=kernel_fn, nugget=nugget,
-        )
-        mu_out[sel] = mu_k
-        sig_out[sel] = sig_k
+        if cached:
+            # For a joint Gaussian with full precision Lambda and
+            # alpha=Lambda@(y-mean), conditioning q on the complement gives
+            # precision Lambda_qq and mean y_q-Lambda_qq^-1 alpha_q.
+            fold_rows = torch.arange(start, end, device=device)
+            eye_q = torch.zeros(P, fold_rows.numel(), dtype=torch.float64, device=device)
+            eye_q[fold_rows, torch.arange(fold_rows.numel(), device=device)] = 1.0
+            precision_cols = torch.cholesky_solve(eye_q, L_full)
+            precision_qq = precision_cols[fold_rows]
+            L_qq = _safe_cholesky(precision_qq, max_attempts=12)
+            correction = torch.cholesky_solve(
+                alpha_full[fold_rows].unsqueeze(-1), L_qq
+            ).squeeze(-1)
+            covariance_qq = torch.cholesky_inverse(L_qq)
+            positions = qry_rows - start
+            mu_k = (y_train[fold_rows].double() - correction)[positions]
+            sig_k = covariance_qq.diagonal().clamp(min=1e-12).sqrt()[positions]
+        else:
+            ctx_mask = torch.ones(P, dtype=torch.bool, device=device)
+            ctx_mask[start:end] = False
+            ctx_rows = ctx_mask.nonzero(as_tuple=True)[0]
+            mu_k, sig_k = analytic_marginal_targets(
+                task, x_train[ctx_rows], y_train[ctx_rows], x_train[qry_rows],
+                kernel_fn=kernel_fn, nugget=nugget,
+            )
+        mu_out[sel] = mu_k.to(mu_out.dtype)
+        sig_out[sel] = sig_k.to(sig_out.dtype)
     return mu_out, sig_out
 
 
@@ -669,6 +700,7 @@ def phase_a_batch_loss(
     generator: Optional[torch.Generator] = None,
     device: str | torch.device = "cuda",
     eps: float = 1e-6,
+    timings: Optional[dict[str, float]] = None,
 ) -> dict:
     """One Phase-A training step's forward + loss on a batch of GP episodes.
 
@@ -692,8 +724,21 @@ def phase_a_batch_loss(
     no distillation target, rather than crashing the run — the precedent
     ``gp_analytical_posterior``'s callers already set.
     """
+    def _mark(name: str, started: float) -> float:
+        if timings is not None:
+            if torch.cuda.is_available() and str(device).startswith("cuda"):
+                torch.cuda.synchronize(device)
+            now = time.perf_counter()
+            timings[name] = timings.get(name, 0.0) + now - started
+            return now
+        return time.perf_counter()
+
+    if timings is not None and torch.cuda.is_available() and str(device).startswith("cuda"):
+        torch.cuda.synchronize(device)
+    t_part = time.perf_counter()
     B = len(episodes)
     batch = stack_episodes(episodes, device)
+    t_part = _mark("collate", t_part)
     P = batch["x_train"].shape[1]
     K = max(2, min(int(k_folds), P))
 
@@ -722,7 +767,10 @@ def phase_a_batch_loss(
         eps=eps,
         return_quantiles=True,
         fold_subset=fold_subset,
+        compute_pit=False,
+        fuse_folds=True,
     )
+    t_part = _mark("tabicl_forward", t_part)
 
     q_test = out["q_test"].squeeze(2)                                # (B, N, Q)
     q_train = out["q_train"].squeeze(2)                              # (B, P', Q)
@@ -737,22 +785,28 @@ def phase_a_batch_loss(
     sig_all = torch.ones(B, M, device=q_test.device)
     mask_all = torch.zeros(B, M, dtype=torch.bool, device=q_test.device)
     n_ok = 0
-    for b, ep in enumerate(episodes):
-        try:
-            kernel_fn, nugget = _kernel_fn_from_task(ep)
-            mu_te, sig_te = analytic_marginal_targets(
-                ep,
-                batch["x_train"][b], batch["y_train_raw"][b], batch["x_test"][b],
-                kernel_fn=kernel_fn, nugget=nugget,
-            )
-            mu_tr, sig_tr = episode_fold_targets(ep, train_idx, K, device=device)
-        except (NotImplementedError, KeyError):
-            continue  # see docstring: proper scores still apply, target does not
-        n_ok += 1
-        m, sd = batch["y_mean"][b], batch["y_std"][b]
-        mu_all[b] = torch.cat([(mu_te - m) / sd, (mu_tr - m) / sd])
-        sig_all[b] = torch.cat([sig_te / sd, sig_tr / sd])
-        mask_all[b] = True
+    # These are fixed supervision targets, never trainable quantities. gpytorch
+    # kernel objects own requires-grad parameters by default, so without this
+    # guard autograd retains and traverses their entire Cholesky/solve graph
+    # even though those ephemeral parameters are absent from the optimizer.
+    with torch.no_grad():
+        for b, ep in enumerate(episodes):
+            try:
+                kernel_fn, nugget = _kernel_fn_from_task(ep)
+                mu_te, sig_te = analytic_marginal_targets(
+                    ep,
+                    batch["x_train"][b], batch["y_train_raw"][b], batch["x_test"][b],
+                    kernel_fn=kernel_fn, nugget=nugget, use_cached_full_context=True,
+                )
+                mu_tr, sig_tr = episode_fold_targets(ep, train_idx, K, device=device)
+            except (NotImplementedError, KeyError):
+                continue  # see docstring: proper scores still apply, target does not
+            n_ok += 1
+            m, sd = batch["y_mean"][b], batch["y_std"][b]
+            mu_all[b] = torch.cat([(mu_te - m) / sd, (mu_tr - m) / sd])
+            sig_all[b] = torch.cat([sig_te / sd, sig_tr / sd])
+            mask_all[b] = True
+    t_part = _mark("analytic_targets", t_part)
 
     q_all = torch.cat([q_test, q_train], dim=1)                       # (B, N+P', Q)
     y_all = torch.cat(
@@ -770,6 +824,7 @@ def phase_a_batch_loss(
         q_flat, y_flat, tabicl.quantile_dist, weights,
         mu=mu_flat, sigma=sig_flat, target_mask=mask_flat,
     )
+    _mark("objective", t_part)
     res["n_episodes_with_target"] = n_ok
     res["oracle_nll"] = (
         oracle_marginal_nll(y_flat[mask_flat], mu_flat[mask_flat], sig_flat[mask_flat])
@@ -892,6 +947,7 @@ def validate_era5_marginal(
             tabicl, b["x_train"], y_tr_s.unsqueeze(-1),
             b["x_test"], y_te_s.unsqueeze(-1),
             k_folds=2, eps=eps, return_quantiles=True, fold_subset=[],
+            compute_pit=False,
         )
         q = out["q_test"].squeeze(2)                                  # (days, N, Q)
         # Per-day std, broadcast over that day's query rows, so the raw-nats
