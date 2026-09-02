@@ -3361,6 +3361,18 @@ def _generate_gp_batch_raw(
         # Prior oracle: ignore training conditioning — R_star reflects the raw
         # kernel structure among test points; mu_star is the GP prior mean (0).
         # No conditioning needed.
+        #
+        # IMPORTANT: R_star is the PRIOR correlation and is NOT the copula
+        # head's target. The target is the CONDITIONAL correlation R_post
+        # (pit.gp_analytical_posterior), because z_test is standardized by the
+        # exact posterior marginals -- see the "Posterior PIT for z_test" block
+        # below for the derivation, and pit.gp_analytical_pit's docstring for
+        # why deployment parity with TabICL requires it. Any diagnostic that
+        # compares a predicted Sigma against ground truth must use R_post, not
+        # R_star; R_star is retained because Sigma_star/R_prior are built from
+        # it, gp_analytical_posterior reads mu_star as its prior mean term, and
+        # the aux_mae head (cfg.training.aux_mae_weight, default 0.0) consumes
+        # it -- turning that weight on would train against the wrong matrix.
         # Sigma_star = K_ss is already guaranteed PSD here: K_ss is a
         # principal submatrix of K_all, which is constructed above as
         # L_all @ L_all.mT (PSD by construction, via psd_safe_cholesky) —
@@ -3412,8 +3424,54 @@ def _generate_gp_batch_raw(
     z_train    = alpha * K_inv_diag.rsqrt()                                       # (B, P)
 
     # --- Posterior PIT for z_test ---
-    sig_c        = sigma_star.clamp(min=1e-8)
-    z_test       = (y_test - mu_star) / sig_c                                      # (B, N)
+    # The test-side marginals MUST be the GP POSTERIOR marginals N(mu_post_i,
+    # (Sigma_post)_ii), NOT the prior (mu_star, sigma_star) pair computed in
+    # the oracle_mode branch above. Two independent reasons:
+    #
+    #   1. Deployment parity. This is the exact-GP stand-in for what a frozen
+    #      TabICL supplies, and pit.py::run_pit calls TabICL WITH the episode's
+    #      context labels in-context (`tabicl(X_test_batch, y_train_batch)`),
+    #      so its `dist` -- hence u_test/log_pdf_test -- is a POSTERIOR
+    #      PREDICTIVE marginal. The z_train_source="tabicl" branch below
+    #      overwrites z_test/log_pdf_test with exactly those. If the analytic
+    #      path standardized by the prior instead, the two z_train_source
+    #      settings would not be two estimates of the same z at all, and the
+    #      "analytic = idealized upper bound on tabicl" comparison the whole
+    #      marginal-source ablation rests on would be comparing two different
+    #      problems.
+    #
+    #   2. It changes what the copula head is trained to predict. The copula
+    #      objective's optimum is the conditional second moment
+    #      M_c = E[z z^T | context]. Standardizing by the prior leaves a
+    #      non-zero mean shift m_c = D_pr^-1 (mu_post - mu_pr) inside z, so
+    #      M_c = D_pr^-1 Sigma_post D_pr^-1 + m_c m_c^T -- and by the law of
+    #      total variance E_{y_train}[M_c] = D_pr^-1 K_ss D_pr^-1 = R_star.
+    #      That makes the target the context-blind PRIOR correlation (measured:
+    #      the rank-one mean-shift term carries ~81% of the variance and mean
+    #      |off-diagonal| 0.59 vs 0.013 for the residual term). Standardizing
+    #      by the posterior sets m_c = 0 and Var(z | context) = 1 exactly, so
+    #      M_c = R_post -- the conditional correlation, which is what
+    #      pit.gp_analytical_posterior's ceiling scores against.
+    #
+    # mu_star/sigma_star themselves stay PRIOR quantities: R_star/Sigma_star
+    # are built from them just above, and pit.gp_analytical_posterior reads
+    # task["mu_star"] specifically as the prior mean term. Only the PIT changes.
+    #
+    # Same block conventions as pit.gp_analytical_posterior: K_sf carries no
+    # nugget (it is entirely off-diagonal in K_all, and measurement noise is
+    # independent across distinct points), K_ss carries it on the diagonal.
+    # Only the DIAGONAL of the Schur complement is needed here, which is why
+    # this does not reintroduce the PSD failure that retired
+    # oracle_mode="posterior": Sigma_post = Cov(f|train) + nugget*I with the
+    # first term PSD, so every diagonal entry is >= nugget > 0 elementwise,
+    # with no eigenvalue repair required.
+    K_sf     = K_all[:, P:P + N, :P]                                               # (B, N, P)
+    V_sf     = torch.linalg.solve_triangular(L_ff, K_sf.mT, upper=False)           # (B, P, N)
+    mu_post  = mu_star + torch.bmm(K_sf, alpha.unsqueeze(-1)).squeeze(-1)          # (B, N)
+    var_post = K_ss.diagonal(dim1=1, dim2=2) - (V_sf ** 2).sum(dim=1)              # (B, N)
+    var_post = var_post.clamp(min=likelihood.noise.reshape(B, 1).clamp(min=1e-10))
+    sig_c        = var_post.sqrt()
+    z_test       = (y_test - mu_post) / sig_c                                      # (B, N)
     log_pdf_test = (
         -0.5 * math.log(2.0 * math.pi) - sig_c.log() - 0.5 * z_test ** 2
     )                                                                               # (B, N)

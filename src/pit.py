@@ -642,9 +642,29 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     Since all data is generated from a GP with known hyperparameters, the
     marginal CDFs are available in closed form — no learned regressor needed.
 
-    Test instances:
-        y_test[i] | D_train ~ N(mu_star[i], sigma_star[i]²)  (exact)
-        z_test[i] = (y_test[i] - mu_star[i]) / sigma_star[i]
+    Test instances — the exact GP POSTERIOR marginals, conditioned on the
+    realized (x_train, y_train):
+        mu_post[i]  = mean(x_test[i]) + [K_sf K_ff^-1 (y_train - mean_train)]_i
+        var_post[i] = (K_ss)_ii - [K_sf K_ff^-1 K_fs]_ii
+        y_test[i] | D_train ~ N(mu_post[i], var_post[i])   (exact)
+        z_test[i]  = (y_test[i] - mu_post[i]) / sqrt(var_post[i])
+
+    NOT (mu_star, sigma_star): under data.oracle_mode="prior" -- the only
+    supported mode (data_gen.py's oracle_mode branch) -- those are the PRIOR
+    mean/std, which is a different distribution. This function is the exact-GP
+    stand-in for what a frozen TabICL supplies, and run_pit (above) calls
+    TabICL with the context labels in-context, so its z_test/log_pdf_test are
+    POSTERIOR PREDICTIVE quantities; standardizing by the prior here would make
+    z_train_source="analytic" and "tabicl" two different problems rather than
+    two estimates of the same z. It also changes the copula head's training
+    target from the conditional correlation R_post to the context-blind prior
+    correlation R_star -- see data_gen._generate_gp_batch_raw's "Posterior PIT
+    for z_test" comment for that derivation.
+
+    Only the DIAGONAL of the Schur complement is used, so this does not
+    reintroduce the PSD failure that retired oracle_mode="posterior":
+    Sigma_post = Cov(f|train) + nugget*I with the first term PSD, hence every
+    diagonal entry is >= nugget > 0 with no eigenvalue repair needed.
 
     Training instances — exact GP LOO (Rasmussen & Williams, GPML Eq. 5.12),
     derived for a zero-mean joint Gaussian, so alpha uses the mean-residual
@@ -661,32 +681,26 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         task: raw task dict returned by generate_gp_task (must contain
               kernel, l, alpha2, nugget, period, rq_alpha, power, l_b,
               alpha2_b, period_b, rq_alpha_b, power_b, kernel_feature_indices,
-              x_norm_train, y_train, y_test, mu_star, sigma_star, and the
+              x_norm_train, x_norm_test, y_train, y_test, mu_star, and the
               mean_* fields from data_gen._sample_mean_module — see
-              _mean_train_from_task).
+              _mean_train_from_task). mu_star is read as the PRIOR mean at
+              the test points (mean_module(x_norm_test)), the same way
+              gp_analytical_posterior reads it.
         eps:  unused (kept for API symmetry with run_pit).
 
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
     x_k_train = task["x_norm_train"]   # (P, d_features)
+    x_k_test   = task["x_norm_test"]              # (N, d_features)
     y_train    = task["y_train"]                  # (P,)
     y_test     = task["y_test"]                   # (N,)
-    mu_star    = task["mu_star"]                  # (N,) posterior mean
-    sigma_star = task["sigma_star"]               # (N,) posterior marginal std
+    mu_star    = task["mu_star"]                  # (N,) PRIOR mean at the test points
 
-    # --- Test: posterior marginals are exact Gaussians ---
-    sig_clamped  = sigma_star.clamp(min=1e-8)
-    z_test       = (y_test - mu_star) / sig_clamped
-    log_pdf_test = (
-        -0.5 * math.log(2.0 * math.pi)
-        - sig_clamped.log()
-        - 0.5 * z_test**2
-    )
-
-    # --- Train: exact GP LOO (R&W Eq. 5.12) ---
-    # Reuse L_ff and alpha from generate_gp_task when available (B: no double Cholesky).
-    # Fall back to kernel reconstruction for tasks loaded from disk.
+    # --- L_ff / alpha: needed by BOTH the test-side posterior marginals and
+    # the train-side LOO, so resolved once up front. Reuse the factors
+    # generate_gp_task cached when available (no double Cholesky); fall back to
+    # kernel reconstruction for tasks loaded from disk.
     P = y_train.shape[0]
     if "_L_ff" in task and "_alpha" in task:
         L     = task["_L_ff"]
@@ -697,6 +711,27 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         mean_train = _mean_train_from_task(task, x_k_train)
         alpha      = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L).squeeze(-1)  # (P,)
 
+    # --- Test: exact GP posterior marginals (see the docstring) ---
+    # Same block conventions as gp_analytical_posterior: K_sf noise-free,
+    # K_ss with the nugget on its diagonal. Only diag(K_ss - K_sf K_ff^-1 K_fs)
+    # is formed, and it is bounded below by the nugget by construction.
+    x_ref     = x_k_test.to(L.device)
+    K_sf      = kernel_fn(x_ref, x_k_train.to(L.device))                       # (N, P)
+    K_ss_diag = (
+        kernel_fn(x_ref, x_ref).diagonal() + nugget
+    )                                                                          # (N,)
+    V_sf      = torch.linalg.solve_triangular(L, K_sf.T.to(L.dtype), upper=False)  # (P, N)
+    mu_post   = mu_star.to(L.device) + K_sf @ alpha                            # (N,)
+    var_post  = (K_ss_diag - (V_sf ** 2).sum(dim=0)).clamp(min=max(nugget, 1e-12))
+    sig_clamped  = var_post.sqrt()
+    z_test       = (y_test.to(L.device) - mu_post) / sig_clamped
+    log_pdf_test = (
+        -0.5 * math.log(2.0 * math.pi)
+        - sig_clamped.log()
+        - 0.5 * z_test**2
+    )
+
+    # --- Train: exact GP LOO (R&W Eq. 5.12) ---
     # diag(K_ff^{-1}) = column-wise squared-norm of L^{-1}
     L_inv      = torch.linalg.solve_triangular(
         L, torch.eye(P, device=L.device, dtype=L.dtype), upper=False
@@ -951,3 +986,42 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
         "nll_post_marginal":  post_parts["marginal"],
         "nll_post_copula":    post_parts["copula"],
     }
+
+
+def gaussian_corr_kl(R_model: torch.Tensor, R_post: torch.Tensor) -> float:
+    """KL( N(0, R_post) || N(0, R_model) ) per point -- a correlation-only
+    divergence with a true zero floor.
+
+        corr_kl/n = 0.5 * [ tr(R_model^-1 R_post) - n + log|R_model| - log|R_post| ] / n
+
+    >= 0, and == 0 iff R_model == R_post.
+
+    Why this exists alongside oracle_diag/gap_nll. gap_nll is a Monte-Carlo
+    estimate of KL(true posterior || model predictive) from ONE realized
+    y_test, so it carries sampling noise and its per-episode value can be
+    negative. This is a functional of the two matrices alone -- no y_test, no
+    noise -- so it isolates the copula head's correlation error exactly, and a
+    zero here means the predicted correlation IS the posterior correlation.
+
+    Both arguments must be correlation matrices (unit diagonal): R_model comes
+    from model.low_rank_correlation (unit diagonal by construction, plus
+    jitter) and R_post from gp_analytical_posterior. Returns +inf rather than
+    raising when R_model is not positive definite even after that jitter --
+    one bad episode must never take down a validation pass.
+    """
+    A = R_model.double()
+    B = R_post.double()
+    n = A.shape[-1]
+    try:
+        L = torch.linalg.cholesky(A)
+    except Exception:
+        return float("inf")
+    if not torch.isfinite(L).all():
+        return float("inf")
+    log_det_model = 2.0 * torch.log(torch.diagonal(L)).sum()
+    trace = torch.diagonal(torch.cholesky_solve(B, L)).sum()
+    sign, log_det_post = torch.linalg.slogdet(B)
+    if sign.item() <= 0:
+        return float("inf")
+    val = 0.5 * (trace - n + log_det_model - log_det_post) / n
+    return float(val.item())
