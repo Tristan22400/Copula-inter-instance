@@ -34,7 +34,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -73,17 +73,20 @@ def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
     if not bool(task.get("mean_nonzero", torch.tensor(False)).item()):
         return zero
 
+    def _on_x(name: str) -> torch.Tensor:
+        return task[name].to(device=x.device, dtype=x.dtype)
+
     family = int(task["mean_family"].item())
     if family == 0:  # linear (incl. constant-only, when mean_weight is all-zero)
-        return (x * task["mean_weight"]).sum(-1) + task["mean_bias"]
+        return (x * _on_x("mean_weight")).sum(-1) + _on_x("mean_bias")
     elif family == 1:  # exponential
-        proj = (x * task["mean_exp_direction"]).sum(-1)
-        exponent = torch.clamp(task["mean_exp_rate"] * proj, min=-10.0, max=10.0)
-        return task["mean_exp_scale"] * torch.exp(exponent)
+        proj = (x * _on_x("mean_exp_direction")).sum(-1)
+        exponent = torch.clamp(_on_x("mean_exp_rate") * proj, min=-10.0, max=10.0)
+        return _on_x("mean_exp_scale") * torch.exp(exponent)
     elif family == 2:  # sparse anomaly
-        proj = (x * task["mean_anomaly_direction"]).sum(-1)
-        hit = (proj > task["mean_anomaly_threshold"]).to(x.dtype)
-        return hit * task["mean_anomaly_magnitude"]
+        proj = (x * _on_x("mean_anomaly_direction")).sum(-1)
+        hit = (proj > _on_x("mean_anomaly_threshold")).to(x.dtype)
+        return hit * _on_x("mean_anomaly_magnitude")
     raise ValueError(f"Unknown mean_family {family}; expected 0, 1, or 2.")
 
 
@@ -119,20 +122,55 @@ def resolve_pit_ckpt(cfg) -> str | None:
     return pit_ckpt
 
 
-def load_tabicl(ckpt_name: str, device: str) -> nn.Module:
-    """Download (if needed) and load a frozen TabICL regressor."""
-    from huggingface_hub import hf_hub_download
+def load_tabicl(
+    ckpt_name: str, device: str, trainable: bool = False, return_config: bool = False
+) -> nn.Module:
+    """Load a TabICL regressor, frozen and in eval mode by default.
+
+    ``ckpt_name`` is either a filename inside the ``jingang/TabICL`` HF repo
+    (the historical contract — downloaded and cached on first use) or a path to
+    a local ``.ckpt``/``.pt`` file carrying the same ``{"config", "state_dict"}``
+    schema. The local branch is what makes a Phase-A fine-tuned marginal
+    (``src/finetune_marginal.py``) a genuine drop-in for ``tabicl.pit_ckpt``:
+    every consumer — offline dataset generation, live workers, ERA5 finetuning,
+    the eval runners — reaches the marginal through this one function, so
+    accepting a path here is the whole integration.
+
+    ``trainable=True`` skips the ``requires_grad_(False)`` sweep and leaves the
+    module in ``.train()`` mode. Both matter for Phase A: gradients obviously,
+    and train mode because TabICL's ``.eval()`` routes into
+    ``_inference_forward``/``InferenceManager`` with its own float16 autocast,
+    which produces NaN here (the same reason ``train.py::validate()`` never
+    calls ``model.eval()``; see ``_train_mode`` below). TabICL has no dropout,
+    so train mode is numerically identical to eval mode's non-autocast path.
+
+    ``return_config=True`` returns ``(model, config)`` instead of just the
+    model. The architecture dict is needed verbatim to write a checkpoint this
+    same function can read back (see
+    ``marginal_finetune.save_marginal_checkpoint``), and re-reading a ~120MB
+    file just to recover it would be silly.
+    """
     from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
-    ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
+    if os.path.isfile(ckpt_name):
+        ckpt_path = ckpt_name
+    else:
+        from huggingface_hub import hf_hub_download
+
+        ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     base = TabICL(**checkpoint["config"])
     base.load_state_dict(checkpoint["state_dict"])
-    for p in base.parameters():
-        p.requires_grad_(False)
-    base.eval()
+    if trainable:
+        base.train()
+    else:
+        for p in base.parameters():
+            p.requires_grad_(False)
+        base.eval()
     base.to(device)
+    if return_config:
+        return base, dict(checkpoint["config"])
     return base
 
 
@@ -289,43 +327,88 @@ def run_pit(
 # ---------------------------------------------------------------------------
 
 
-@torch.no_grad()
-def run_pit_batched(
+def _alpha_levels_of(tabicl: nn.Module, device) -> "torch.Tensor | None":
+    """The nominal quantile levels a TabICL's decoder emits, or None.
+
+    Real TabICL exposes these on its ``QuantileToDistribution`` submodule. Test
+    doubles (``tests/test_pit_batched.py``'s fakes) implement ``quantile_dist``
+    as a plain method with no levels attached, and the levels are pure metadata
+    for the caller -- so absence is reported as None rather than raised, which
+    keeps the fold-geometry tests runnable against a fake and avoids making a
+    diagnostic field into a hard dependency of the forward path.
+    """
+    levels = getattr(getattr(tabicl, "quantile_dist", None), "alpha_levels", None)
+    return None if levels is None else levels.to(device)
+
+
+class _train_mode:
+    """Context manager forcing ``module`` into ``.train()`` for its body.
+
+    TabICL's ``.eval()`` routes ``forward`` into ``_inference_forward``, which
+    runs under ``InferenceManager``'s own float16 autocast on CUDA and produces
+    NaN for this codebase's inputs -- the same hazard that makes
+    ``train.py::validate()`` deliberately never call ``model.eval()``. The
+    grad-enabled PIT path must therefore stay in train mode. TabICL has no
+    dropout, so this changes nothing numerically.
+    """
+
+    def __init__(self, module: nn.Module) -> None:
+        self.module = module
+        self.was_training = module.training
+
+    def __enter__(self) -> nn.Module:
+        self.module.train()
+        return self.module
+
+    def __exit__(self, *exc) -> None:
+        self.module.train(self.was_training)
+
+
+def _run_pit_batched_impl(
     tabicl: nn.Module,
     X_train: torch.Tensor,
     Y_train: torch.Tensor,
     X_test: torch.Tensor,
     Y_test: torch.Tensor,
-    k_folds: int = DEFAULT_K_FOLDS,
-    eps: float = 1e-6,
+    k_folds: int,
+    eps: float,
+    *,
+    return_quantiles: bool = False,
+    fold_subset: "Sequence[int] | None" = None,
+    compute_pit: bool = True,
+    fuse_folds: bool = False,
 ) -> dict:
-    """``run_pit``, vectorised over a leading batch-of-episodes axis B.
+    """Shared body of ``run_pit_batched`` / ``run_pit_batched_grad``.
 
-    Only valid when every episode in the batch shares the same P and N —
-    true for one ``data_gen._generate_gp_batch_raw`` call (all B episodes in
-    a shard-generation batch share P/N by construction), which is the
-    intended caller. The B and target-dim (d) axes are folded together into
-    TabICL's own batch axis (mirrors how ``run_pit`` already folds d alone),
-    so this costs one (B*d)-batched forward pass per fold instead of B
-    separate single-episode ``run_pit`` calls — B*(K+1)x fewer Python-level
-    TabICL invocations, though the K-fold loop's iteration count (and hence
-    wall-clock scaling in K) is unchanged.
+    Kept private and parameterised rather than duplicated so the no-grad
+    inference path and the grad-enabled fine-tuning path cannot drift: the
+    fold geometry, the batch-axis folding and the probit clamp are defined
+    exactly once. Callers pick the gradient policy (and, for the grad path,
+    the train-mode guard) around this call.
 
-    Args:
-        tabicl  : frozen TabICL regressor (max_classes=0)
-        X_train : (B, P, p_x)
-        Y_train : (B, P, d)
-        X_test  : (B, N, p_x)
-        Y_test  : (B, N, d)
-        k_folds : as in ``run_pit`` — clamped into [2, P], shared by every
-                  episode in the batch since P is shared.
-        eps     : clamp before probit.
+    ``fold_subset`` restricts the K-fold loop to the listed fold indices. The
+    fold GEOMETRY is untouched -- ``fold_size = ceil(P/K)`` contiguous blocks,
+    identical to a full run -- only some of the blocks go unscored, so a caller
+    that does not need a complete ``z_train`` (Phase-A marginal fine-tuning
+    scores a query row's own predictive density, never its PIT residual) can
+    pay one forward instead of K per step and still train under exactly the
+    fold conditioning deployment uses. When set, the return dict carries
+    ``train_query_idx`` (the scored rows, in returned order) and its
+    ``z_train``/``u_train``/``q_train`` are indexed by THAT, not by the full P
+    -- there is no complete z_train to return, so none is claimed.
 
-    Returns dict with:
-        z_train      : (B, P, d)
-        z_test       : (B, N, d)
-        log_pdf_test : (B, N, d)   marginal log-densities at Y_test
+    ``return_quantiles=True`` additionally returns the raw quantile *values*
+    TabICL's decoder emits -- for ``max_classes=0`` the model's output IS the
+    999-quantile vector at ``tabicl.quantile_dist.alpha_levels`` -- plus the
+    pre-probit CDF values and probit-clamp saturation fractions. Phase-A
+    marginal fine-tuning (``src/marginal_finetune.py``) needs the quantiles to
+    build its own ``QuantileDistribution`` for NLL/CRPS/distillation without a
+    second forward pass; the saturation fractions are the silent-failure
+    counters the marginal calibration runner reports.
     """
+    if not compute_pit and not return_quantiles:
+        raise ValueError("compute_pit=False requires return_quantiles=True")
+
     device = X_train.device
     B, P, p_x = X_train.shape
     N = X_test.shape[1]
@@ -347,25 +430,37 @@ def run_pit_batched(
     # its output on CPU under GPU memory pressure regardless of input device.
     logits = logits.to(device)
     Q = logits.shape[-1]
-    dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
+    if compute_pit:
+        dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
+        y_test_flat = Y_test.permute(0, 2, 1).reshape(B * d * N)
+        u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)       # (B, N, d)
+        log_pdf_test = dist.log_prob(y_test_flat).reshape(B, d, N).permute(0, 2, 1)
+    else:
+        u_test = log_pdf_test = None
 
-    y_test_flat = Y_test.permute(0, 2, 1).reshape(B * d * N)
-    u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)            # (B, N, d)
-    log_pdf_test = dist.log_prob(y_test_flat).reshape(B, d, N).permute(0, 2, 1)  # (B, N, d)
+    q_test = None
+    if return_quantiles:
+        q_test = logits.reshape(B, d, N, Q).permute(0, 2, 1, 3)                 # (B, N, d, Q)
 
     # ------------------------------------------------------------------ #
-    # B) Training instances: K disjoint folds (fixed K, ≪ P), batch axis  #
+    # B) Training instances: K disjoint folds (fixed K, << P), batch axis #
     #    = B*d, fold membership shared across the batch since P is.       #
     # ------------------------------------------------------------------ #
     fold_size = math.ceil(P / K)
-    u_train = torch.empty(B, P, d, device=device, dtype=Y_train.dtype)
+    u_train_parts: list = []
+    q_train_parts: list = []
     indices = torch.arange(P, device=device)
+    wanted_folds = range(K) if fold_subset is None else sorted(set(int(k) for k in fold_subset))
 
-    for k in range(K):
+    fold_specs = []
+    for k in wanted_folds:
         start = k * fold_size
         end = min(start + fold_size, P)
         if start >= end:
-            break
+            continue  # empty trailing fold (K > P after clamping) -- not an
+            # early exit: with an explicit fold_subset the wanted folds are
+            # not necessarily contiguous from 0, so `break` would silently
+            # drop valid later folds.
 
         qry_idx = indices[start:end]
         ctx_mask = torch.ones(P, dtype=torch.bool, device=device)
@@ -373,32 +468,216 @@ def run_pit_batched(
         ctx_idx = indices[ctx_mask]
         F = qry_idx.numel()
 
-        X_fold = torch.cat([X_train[:, ctx_idx], X_train[:, qry_idx]], dim=1)   # (B, P-F+F, p_x)
-        X_fold_batch = (
-            X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x)
-            .reshape(B * d, X_fold.shape[1], p_x).contiguous()
+        fold_specs.append((qry_idx, ctx_idx, F))
+
+    # Folds with equal query size also have equal context/input shapes.  Phase
+    # A can therefore concatenate them into TabICL's table-batch axis and pay
+    # one better-utilized launch rather than one small launch per fold.  Keep
+    # the default unfused for historical inference callers, where a full
+    # K-fold pass could otherwise multiply peak memory by K.
+    fold_groups: list[list[tuple[torch.Tensor, torch.Tensor, int]]] = []
+    if fuse_folds:
+        by_size: dict[int, list[tuple[torch.Tensor, torch.Tensor, int]]] = {}
+        for spec in fold_specs:
+            by_size.setdefault(spec[2], []).append(spec)
+        fold_groups.extend(by_size.values())
+    else:
+        fold_groups.extend([[spec] for spec in fold_specs])
+
+    for group in fold_groups:
+        x_group = []
+        y_group = []
+        for qry_idx, ctx_idx, F in group:
+            X_fold = torch.cat([X_train[:, ctx_idx], X_train[:, qry_idx]], dim=1)
+            x_group.append(
+                X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x)
+                .reshape(B * d, X_fold.shape[1], p_x).contiguous()
+            )
+            y_group.append(
+                Y_train[:, ctx_idx].permute(0, 2, 1).reshape(B * d, P - F).contiguous()
+            )
+
+        logits_group = tabicl(torch.cat(x_group, dim=0), torch.cat(y_group, dim=0))
+        logits_group = logits_group.to(device)
+
+        for group_idx, (qry_idx, _ctx_idx, F) in enumerate(group):
+            logits_fold = logits_group[group_idx * B * d:(group_idx + 1) * B * d]
+
+            if compute_pit:
+                dist_fold = tabicl.quantile_dist(logits_fold.reshape(B * d * F, Q))
+                y_qry_flat = Y_train[:, qry_idx].permute(0, 2, 1).reshape(B * d * F)
+                u_fold = dist_fold.cdf(y_qry_flat).reshape(B, d, F).permute(0, 2, 1)
+                u_train_parts.append((qry_idx, u_fold))
+            if return_quantiles:
+                q_train_parts.append(
+                    (qry_idx, logits_fold.reshape(B, d, F, Q).permute(0, 2, 1, 3))
+                )
+
+    no_fold_outputs = not (q_train_parts if return_quantiles else u_train_parts)
+    if no_fold_outputs:
+        if fold_subset is None or len(list(fold_subset)) > 0:
+            raise ValueError(
+                f"run_pit_batched: no folds were scored (K={K}, P={P}, "
+                f"fold_subset={fold_subset}). Every requested fold was empty."
+            )
+        # fold_subset=[] is the deliberate "test rows only" request: one
+        # forward with the full P-row context and nothing else. Used by the
+        # Phase-A ERA5 validation pass, where the query points are held out by
+        # construction (never in context) so no leakage-avoiding fold rotation
+        # is needed -- going through this function anyway keeps that pass on
+        # the exact same forward/CDF/log_prob code the training path uses.
+        out = {"train_query_idx": torch.empty(0, dtype=torch.long, device=device)}
+        if compute_pit:
+            out.update({"z_test": _probit(u_test, eps), "log_pdf_test": log_pdf_test})
+        if return_quantiles:
+            out.update(
+                {
+                    "q_test": q_test,
+                    **({
+                        "u_test": u_test,
+                        "clamp_frac_test": (
+                            (u_test <= eps) | (u_test >= 1.0 - eps)
+                        ).float().mean().detach(),
+                    } if compute_pit else {}),
+                }
+            )
+            levels = _alpha_levels_of(tabicl, device)
+            if levels is not None:
+                out["alpha_levels"] = levels                                   # (Q,)
+        return out
+
+    parts_for_order = q_train_parts if return_quantiles else u_train_parts
+    order = torch.cat([qi for qi, _ in parts_for_order], dim=0)                # (P',)
+    if compute_pit:
+        u_train = torch.cat([uf for _, uf in u_train_parts], dim=1)            # (B, P', d)
+    if fold_subset is None:
+        # Full pass: the scored rows are all P of them, so restore the
+        # caller's row order (folds are contiguous blocks, concatenated in
+        # fold order, which is already sorted -- argsort makes that explicit
+        # and independent of the loop's iteration order).
+        inv = torch.argsort(order)
+        if compute_pit:
+            u_train = u_train[:, inv, :]
+    else:
+        inv = None
+
+    out = {}
+    if compute_pit:
+        out.update({
+            "z_train": _probit(u_train, eps),
+            "z_test": _probit(u_test, eps),
+            "log_pdf_test": log_pdf_test,
+        })
+    if fold_subset is not None:
+        out["train_query_idx"] = order
+    if return_quantiles:
+        q_train = torch.cat([qf for _, qf in q_train_parts], dim=1)
+        if inv is not None:
+            q_train = q_train[:, inv, :, :]
+        out.update(
+            {
+                "q_train": q_train,                                            # (B, P', d, Q)
+                "q_test": q_test,                                              # (B, N, d, Q)
+                **({
+                    "u_train": u_train,
+                    "u_test": u_test,
+                    # Silent-failure counters: _probit hard-caps |z| at 4.7534.
+                    "clamp_frac_train": (
+                        (u_train <= eps) | (u_train >= 1.0 - eps)
+                    ).float().mean().detach(),
+                    "clamp_frac_test": (
+                        (u_test <= eps) | (u_test >= 1.0 - eps)
+                    ).float().mean().detach(),
+                } if compute_pit else {}),
+            }
         )
-        y_ctx_batch = (
-            Y_train[:, ctx_idx].permute(0, 2, 1).reshape(B * d, P - F).contiguous()
+        levels = _alpha_levels_of(tabicl, device)
+        if levels is not None:
+            out["alpha_levels"] = levels                                       # (Q,)
+    return out
+
+
+@torch.no_grad()
+def run_pit_batched(
+    tabicl: nn.Module,
+    X_train: torch.Tensor,
+    Y_train: torch.Tensor,
+    X_test: torch.Tensor,
+    Y_test: torch.Tensor,
+    k_folds: int = DEFAULT_K_FOLDS,
+    eps: float = 1e-6,
+    return_quantiles: bool = False,
+) -> dict:
+    """``run_pit``, vectorised over a leading batch-of-episodes axis B.
+
+    Only valid when every episode in the batch shares the same P and N --
+    true for one ``data_gen._generate_gp_batch_raw`` call (all B episodes in
+    a shard-generation batch share P/N by construction), which is the
+    intended caller. The B and target-dim (d) axes are folded together into
+    TabICL's own batch axis (mirrors how ``run_pit`` already folds d alone),
+    so this costs one (B*d)-batched forward pass per fold instead of B
+    separate single-episode ``run_pit`` calls -- B*(K+1)x fewer Python-level
+    TabICL invocations, though the K-fold loop's iteration count (and hence
+    wall-clock scaling in K) is unchanged.
+
+    Args:
+        tabicl  : frozen TabICL regressor (max_classes=0)
+        X_train : (B, P, p_x)
+        Y_train : (B, P, d)
+        X_test  : (B, N, p_x)
+        Y_test  : (B, N, d)
+        k_folds : as in ``run_pit`` -- clamped into [2, P], shared by every
+                  episode in the batch since P is shared.
+        eps     : clamp before probit.
+        return_quantiles : also return the raw decoder quantiles, pre-probit
+                  CDF values and probit-clamp fractions (see
+                  ``_run_pit_batched_impl``). Off by default so the historical
+                  callers' return dict is byte-for-byte unchanged.
+
+    Returns dict with:
+        z_train      : (B, P, d)
+        z_test       : (B, N, d)
+        log_pdf_test : (B, N, d)   marginal log-densities at Y_test
+    """
+    return _run_pit_batched_impl(
+        tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
+        return_quantiles=return_quantiles,
+    )
+
+
+def run_pit_batched_grad(
+    tabicl: nn.Module,
+    X_train: torch.Tensor,
+    Y_train: torch.Tensor,
+    X_test: torch.Tensor,
+    Y_test: torch.Tensor,
+    k_folds: int = DEFAULT_K_FOLDS,
+    eps: float = 1e-6,
+    return_quantiles: bool = True,
+    fold_subset: "Sequence[int] | None" = None,
+    compute_pit: bool = True,
+    fuse_folds: bool = False,
+) -> dict:
+    """Gradient-carrying ``run_pit_batched`` -- same body, no ``no_grad``.
+
+    The public ``run_pit_batched`` above is hard-decorated ``@torch.no_grad()``
+    because every historical caller (dataset generation, live workers,
+    validation) wants exactly that. Phase-A marginal fine-tuning
+    (``src/finetune_marginal.py``) is the one caller that must backprop THROUGH
+    the PIT into the TabICL weights, so it gets its own entry point rather than
+    a mutable flag on the shared one -- a ``no_grad=False`` default would
+    silently make every existing call site build an autograd graph.
+
+    Forces ``tabicl.train()`` for the duration (see ``_train_mode``) and
+    defaults ``return_quantiles=True``, since the fine-tuning objective is
+    defined on the decoder's quantile outputs.
+    """
+    with _train_mode(tabicl):
+        return _run_pit_batched_impl(
+            tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
+            return_quantiles=return_quantiles, fold_subset=fold_subset,
+            compute_pit=compute_pit, fuse_folds=fuse_folds,
         )
-
-        logits_fold = tabicl(X_fold_batch, y_ctx_batch)                        # (B*d, F, Q)
-        logits_fold = logits_fold.to(device)  # see run_pit's offload-mode comment above
-        dist_fold = tabicl.quantile_dist(logits_fold.reshape(B * d * F, Q))
-
-        y_qry_flat = Y_train[:, qry_idx].permute(0, 2, 1).reshape(B * d * F)
-        u_train[:, qry_idx, :] = (
-            dist_fold.cdf(y_qry_flat).reshape(B, d, F).permute(0, 2, 1)
-        )
-
-    z_train = _probit(u_train, eps)
-    z_test = _probit(u_test, eps)
-
-    return {
-        "z_train": z_train,
-        "z_test": z_test,
-        "log_pdf_test": log_pdf_test,
-    }
 
 
 # ---------------------------------------------------------------------------

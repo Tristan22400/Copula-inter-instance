@@ -21,7 +21,8 @@ everything else so only LoRA parameters + the copula head are trained.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple, Union
+import re
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -234,48 +235,103 @@ def _replace_mha_in_module(
     return replaced
 
 
+def is_lora_param_name(name: str) -> bool:
+    """True iff *name* (a ``named_parameters()`` key) is a LoRA A/B matrix."""
+    return (
+        name.startswith("lora_A_")
+        or name.startswith("lora_B_")
+        or ".lora_A_" in name
+        or ".lora_B_" in name
+    )
+
+
+def set_trainable(
+    backbone: nn.Module,
+    also_trainable: Sequence[str] = (),
+) -> int:
+    """Freeze every backbone parameter except LoRA adapters and the allowlist.
+
+    The single place that decides what Phase-A / LoRA runs optimize, so
+    ``apply_lora`` and the tier routing in ``src/marginal_finetune.py`` cannot
+    drift apart on the predicate.
+
+    Args:
+        backbone       : module to freeze in place.
+        also_trainable : regex patterns (``re.search`` against each
+                         ``named_parameters()`` key); a match keeps the
+                         parameter trainable alongside the LoRA adapters.
+                         Regex rather than plain substrings because the
+                         useful selections are conjunctive -- "the norms
+                         inside the ICL stack, but not the identically-named
+                         norms in col_embedder/row_interactor" is
+                         ``r"^icl_predictor\.tf_icl\.blocks\.\d+\.norm[12]\."``
+                         and has no substring spelling. A pattern with no
+                         metacharacters still behaves as a substring match, so
+                         plain names work unchanged. Empty (the default)
+                         reproduces the historical LoRA-only behaviour exactly.
+
+    Returns:
+        Number of parameter *tensors* left trainable.
+    """
+    regexes = [re.compile(pat) for pat in also_trainable]
+    n_trainable = 0
+    for name, param in backbone.named_parameters():
+        keep = is_lora_param_name(name) or any(r.search(name) for r in regexes)
+        param.requires_grad_(keep)
+        n_trainable += int(keep)
+    return n_trainable
+
+
 def apply_lora(
     backbone: nn.Module,
     rank: int,
     alpha: float,
     target: str = "qkvo",
-    stages: List[str] = ("icl", "row", "col"),
+    stages: Sequence[str] = ("icl", "row", "col"),
+    also_trainable: Sequence[str] = (),
 ) -> int:
     """Replace MultiheadAttention modules inside *backbone* with LoRA-augmented versions.
 
     After replacement:
-    - All parameters in *backbone* that are NOT LoRA A/B matrices are frozen.
-    - Only ``lora_A_*`` and ``lora_B_*`` parameters inside the backbone are trainable.
+    - All parameters in *backbone* that are NOT LoRA A/B matrices are frozen,
+      except those matching ``also_trainable``.
+    - Only ``lora_A_*``/``lora_B_*`` parameters plus the ``also_trainable``
+      allowlist inside the backbone are trainable.
+
+    ``rank <= 0`` or an empty ``stages`` degrades cleanly to "no adapters,
+    allowlist only" (0 replacements, no error) — this is what makes a
+    Tier-0-style run (norms/label-path/decoder, no attention adaptation)
+    expressible through the same call as a LoRA tier, instead of needing a
+    separate freeze path that could disagree with this one.
 
     Args:
-        backbone : the TabICL feature_extractor (nn.Module)
-        rank     : LoRA rank r
-        alpha    : LoRA scaling (scale = alpha / rank)
-        target   : subset of "qkvo" — which projections to adapt
-        stages   : list of stage names; valid values: "col", "row", "icl"
+        backbone       : the TabICL backbone (nn.Module)
+        rank           : LoRA rank r; ``<= 0`` disables adapters entirely
+        alpha          : LoRA scaling (scale = alpha / rank)
+        target         : subset of "qkvo" — which projections to adapt
+        stages         : stage names; valid values: "col", "row", "icl"
+        also_trainable : regex patterns kept trainable on top of the adapters
+                         (see ``set_trainable``)
 
     Returns:
-        Number of MultiheadAttention modules replaced.
+        Number of MultiheadAttention modules replaced (0 when adapters are off).
     """
-    MultiheadAttention = _get_mha_class()
     stages = list(stages)
+    adapters_requested = int(rank) > 0 and len(stages) > 0
 
-    n_replaced = _replace_mha_in_module(
-        backbone, "", rank, alpha, target, stages, MultiheadAttention
-    )
-
-    if n_replaced == 0:
-        raise RuntimeError(
-            f"apply_lora found 0 MultiheadAttention modules in stages={stages}. "
-            "Check that stage names are correct ('col', 'row', 'icl')."
+    n_replaced = 0
+    if adapters_requested:
+        MultiheadAttention = _get_mha_class()
+        n_replaced = _replace_mha_in_module(
+            backbone, "", int(rank), alpha, target, stages, MultiheadAttention
         )
+        if n_replaced == 0:
+            raise RuntimeError(
+                f"apply_lora found 0 MultiheadAttention modules in stages={stages}. "
+                "Check that stage names are correct ('col', 'row', 'icl')."
+            )
 
-    # Freeze everything in the backbone except the newly-added LoRA params
-    for name, param in backbone.named_parameters():
-        is_lora = name.startswith("lora_A_") or name.startswith("lora_B_") or \
-                  ".lora_A_" in name or ".lora_B_" in name
-        param.requires_grad_(is_lora)
-
+    set_trainable(backbone, also_trainable)
     return n_replaced
 
 
@@ -338,3 +394,51 @@ def merge_lora_weights(model: nn.Module) -> None:
                 module.out_proj_weight.add_(s * (module.lora_B_o @ module.lora_A_o))
                 module.lora_B_o.zero_()
                 module.lora_A_o.zero_()
+
+
+def merged_base_state_dict(backbone: nn.Module) -> dict:
+    """State dict of *backbone* with LoRA deltas baked in and the ORIGINAL
+    (adapter-free) TabICL key names restored.
+
+    ``apply_lora`` swaps each ``MultiheadAttention`` for a
+    ``LoRAMultiheadAttention``, which renames the pretrained tensors
+    (``attn.out_proj.weight`` becomes the buffer ``attn.out_proj_weight``) and
+    adds ``lora_A_*``/``lora_B_*``. A checkpoint written from that state dict
+    is therefore NOT loadable by a plain ``tabicl._model.tabicl.TabICL``, which
+    breaks the whole point of Phase A: its output must be a drop-in
+    replacement for ``tabicl.pit_ckpt``, consumable by every existing call
+    site through one config line.
+
+    This walks the tree, computes ``W + (alpha/r)*B@A`` for every adapted
+    projection, and re-emits it under the name the base model expects, so
+    ``TabICL(**config).load_state_dict(merged_base_state_dict(bb))`` succeeds
+    strictly. Non-adapted parameters pass through untouched. Unlike
+    ``merge_lora_weights`` this is non-destructive -- the live module keeps its
+    adapters and can go on training after an intermediate checkpoint write.
+
+    Returns CPU tensors (detached clones), ready for ``torch.save``.
+    """
+    lora_paths = [
+        name for name, m in backbone.named_modules()
+        if isinstance(m, LoRAMultiheadAttention)
+    ]
+
+    sd: dict = {}
+    for key, val in backbone.state_dict().items():
+        if any(key.startswith(p + ".") for p in lora_paths):
+            continue  # re-emitted below under its base-model name
+        sd[key] = val.detach().cpu().clone()
+
+    for path in lora_paths:
+        mod = backbone.get_submodule(path)
+        sd[f"{path}.in_proj_weight"] = mod._effective_in_proj_weight().detach().cpu().clone()
+        if mod.in_proj_bias is not None:
+            sd[f"{path}.in_proj_bias"] = mod.in_proj_bias.detach().cpu().clone()
+        sd[f"{path}.out_proj.weight"] = mod._effective_out_proj_weight().detach().cpu().clone()
+        if mod.out_proj_bias is not None:
+            sd[f"{path}.out_proj.bias"] = mod.out_proj_bias.detach().cpu().clone()
+        if mod.ssmax_layer is not None:
+            for k, v in mod.ssmax_layer.state_dict().items():
+                sd[f"{path}.ssmax_layer.{k}"] = v.detach().cpu().clone()
+
+    return sd

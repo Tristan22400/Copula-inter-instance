@@ -47,7 +47,20 @@ class GlobalERA5Corpus:
         cost their own ~15GB of system RAM.
     """
 
-    def __init__(self, cache_dir: str | None = None, *, _shared: dict | None = None):
+    def __init__(
+        self,
+        cache_dir: str | None = None,
+        *,
+        max_months: int | None = None,
+        _shared: dict | None = None,
+    ):
+        """`max_months` caps how many monthly files are read (the most recent
+        ones, since paths are sorted by YYYYMM). The full 120-month corpus is
+        ~15GB resident; a caller that only needs an occasional real-data episode
+        -- src/finetune_marginal.py's Phase-A mixture, which runs the marginal
+        in the MAIN process and so has no shared-memory worker trick to amortize
+        the load -- can bound that without needing a separate, hand-curated
+        cache directory. None (the default) reads everything, unchanged."""
         if _shared is not None:
             # See from_shared()/load_shared_corpus_arrays() below -- attach
             # to already-loaded, already-shared torch storage instead of
@@ -67,6 +80,8 @@ class GlobalERA5Corpus:
                     "`python eval/data/fetch_era5_global.py` first to populate the "
                     "worldwide finetuning corpus."
                 )
+            if max_months is not None and max_months > 0:
+                paths = paths[-int(max_months):]
             self.lat: np.ndarray | None = None
             self.lon: np.ndarray | None = None
             self._t2m_by_month: list[np.ndarray] = []

@@ -127,7 +127,14 @@ def test_reserve_headroom_noop_when_zero_workers(monkeypatch):
 
 
 def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
-    """2 workers * 2.5GB + 1.0GB flat = 6GB headroom on a 24GB card -> 75%."""
+    """2 workers * 2.5GB + 1.0GB flat = 6GB headroom on a 24GB card -> 75%.
+
+    The 2.5GB/worker is 0.5 fixed + 0.02 * group_size, where group_size is
+    batch_size * live_tabicl_group_multiplier (default 2) -- hence batch_size=50
+    below. batch_size is not optional in this fixture: once past its early
+    returns, _reserve_gpu_headroom_for_live_tabicl reads t.batch_size
+    unconditionally.
+    """
     captured = {}
     monkeypatch.setattr(
         torch.cuda, "set_per_process_memory_fraction",
@@ -135,7 +142,7 @@ def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
     cfg = OmegaConf.create({"data": {"z_train_tabicl_mix_enabled": True}})
-    t = OmegaConf.create({"live_tabicl_num_workers": 2})
+    t = OmegaConf.create({"live_tabicl_num_workers": 2, "batch_size": 50})
     train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert captured["device"] == 0
     assert captured["fraction"] == pytest.approx(0.75)
@@ -150,6 +157,6 @@ def test_reserve_headroom_clamps_fraction_floor(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
     cfg = OmegaConf.create({"data": {"z_train_source": "tabicl_split"}})
-    t = OmegaConf.create({"live_tabicl_num_workers": 50})
+    t = OmegaConf.create({"live_tabicl_num_workers": 50, "batch_size": 50})
     train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert captured["fraction"] == pytest.approx(0.5)
