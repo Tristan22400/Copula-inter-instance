@@ -45,7 +45,12 @@ _TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
 if _TABICL_SRC not in sys.path:
     sys.path.insert(0, _TABICL_SRC)
 
-from data_gen import build_kernel_fn, _safe_cholesky, sigma_to_correlation  # noqa: E402
+from data_gen import (  # noqa: E402
+    build_kernel_fn,
+    full_precision_matmul_fn,
+    sigma_to_correlation,
+    _safe_cholesky,
+)
 
 DEFAULT_K_FOLDS = 10
 
@@ -636,6 +641,7 @@ def _kernel_fn_from_task(task: dict):
 
 
 @torch.no_grad()
+@full_precision_matmul_fn
 def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     """Exact PIT from GP LOO (train) and posterior (test) marginals.
 
@@ -715,21 +721,32 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     # Same block conventions as gp_analytical_posterior: K_sf noise-free,
     # K_ss with the nugget on its diagonal. Only diag(K_ss - K_sf K_ff^-1 K_fs)
     # is formed, and it is bounded below by the nugget by construction.
+    # float64 throughout, matching gp_analytical_posterior below block for
+    # block (and data_gen._generate_gp_batch_raw's batched twin, which was
+    # upcast for the same reason): var_post is a Schur-complement
+    # CANCELLATION, so float32 here leaves a per-episode discrepancy of up to
+    # ~1e-4 nats/point against the float64 path -- the whole point of these
+    # two implementations is that they agree to float noise, since
+    # oracle_diag/marginal_gap is defined as their difference. Cast back to
+    # float32 on the way out so the episode schema is unchanged.
     x_ref     = x_k_test.to(L.device)
-    K_sf      = kernel_fn(x_ref, x_k_train.to(L.device))                       # (N, P)
+    L64       = L.double()
+    alpha64   = alpha.double()
+    K_sf      = kernel_fn(x_ref, x_k_train.to(L.device)).double()              # (N, P)
     K_ss_diag = (
-        kernel_fn(x_ref, x_ref).diagonal() + nugget
+        kernel_fn(x_ref, x_ref).diagonal().double() + nugget
     )                                                                          # (N,)
-    V_sf      = torch.linalg.solve_triangular(L, K_sf.T.to(L.dtype), upper=False)  # (P, N)
-    mu_post   = mu_star.to(L.device) + K_sf @ alpha                            # (N,)
+    V_sf      = torch.linalg.solve_triangular(L64, K_sf.T, upper=False)         # (P, N)
+    mu_post   = mu_star.to(L.device).double() + K_sf @ alpha64                 # (N,)
     var_post  = (K_ss_diag - (V_sf ** 2).sum(dim=0)).clamp(min=max(nugget, 1e-12))
     sig_clamped  = var_post.sqrt()
-    z_test       = (y_test.to(L.device) - mu_post) / sig_clamped
+    z_test       = (y_test.to(L.device).double() - mu_post) / sig_clamped
     log_pdf_test = (
         -0.5 * math.log(2.0 * math.pi)
         - sig_clamped.log()
         - 0.5 * z_test**2
     )
+    z_test, log_pdf_test = z_test.float(), log_pdf_test.float()
 
     # --- Train: exact GP LOO (R&W Eq. 5.12) ---
     # diag(K_ff^{-1}) = column-wise squared-norm of L^{-1}
@@ -785,6 +802,7 @@ def mvn_nll_parts(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> d
 
 
 @torch.no_grad()
+@full_precision_matmul_fn
 def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     """Exact GP posterior correlation among test points, conditioned on the
     realized (x_train, y_train) via the Schur complement -- the "mechanism 2"
@@ -823,6 +841,18 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     and clamped up (an eigenvalue-floor repair, not a discard) before
     converting to a correlation matrix, since an eval script wants a number
     for every episode, not a silently dropped one.
+
+    Known small inconsistency, deliberately not papered over. This function
+    re-evaluates the kernel from x, whereas data_gen._generate_gp_batch_raw
+    built y_test from the PSD-REPAIRED K_all (= L_all @ L_all.mT, after
+    psd_safe_cholesky's jitter). On a well-conditioned episode the two agree
+    to float noise; on an ill-conditioned composite chain where that jitter
+    actually fired, the ceiling is computed under a slightly different
+    covariance than the one the data was drawn from. Measured effect on the
+    marginal: ~3e-4 nats/point worst case over 120 production-config episodes,
+    ~1e-7 on the mean. validate()'s oracle_diag/marginal_gap_max_abs is what
+    surfaces it; fixing it properly would mean threading L_all through to
+    here, which is not worth it at that magnitude.
 
     eig_floor is RELATIVE to Sigma_post's own diagonal scale, not an
     absolute eigenvalue cutoff -- see the repair below. Non-stationary

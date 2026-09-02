@@ -324,6 +324,48 @@ baselines:
   probe_N_min: 8
   probe_N_max: 1024
 
+  # val/gp_baseline/<kernel>/* — classical GP-MLE/MAP baselines fitted on the
+  # SAME frozen synthetic val episodes the model is scored on (see
+  # train.py::_build_gp_baseline_val_scores). The synthetic-episode
+  # counterpart of era5_fit/<region>/gp_baseline_* below, and it answers the
+  # first question anyone asks of oracle_diag/copula_gap: how far off is a
+  # competent classical method on these same episodes? Without it the model's
+  # copula NLL is bracketed only by the Bayes-optimal ceiling and by
+  # independence, with nothing in between.
+  #
+  # Fitted ONCE at startup on each episode's own (x_train, y_train) context —
+  # never on y_test, and never on z_train (a leave-one-out PIT residual is
+  # decorrelated by construction, so fitting a kernel to it just collapses to
+  # the identity; see _build_gp_baseline_val_scores and
+  # tests/test_gp_baseline_batched.py). Checkpoint-independent, so the numbers
+  # are constant for a run and re-logged every validate() call as a flat
+  # reference line.
+  #
+  # Cost: the per-episode fit eval/spatial/sweep_core.py uses is ~2.5 s per
+  # episode per kernel (~40 min for 500 episodes x 2 kernels), which is why
+  # this goes through classical.fit_and_eval_gpytorch_batched — one
+  # batch_shape=[E] Adam loop for a whole shape group instead of E sequential
+  # fits. Defaults below fit the WHOLE val set in roughly the time one
+  # sequential episode used to take.
+  gp_baseline_val: true
+  gp_baseline_val_kernels: [matern32, rational_quadratic]
+  gp_baseline_val_episodes: null   # null -> every val episode (same population
+                                   # as oracle_diag/*, so the gaps are directly
+                                   # comparable); an int caps it, and
+                                   # val/gp_baseline/n_episodes then reports
+                                   # what was actually used
+  gp_baseline_val_n_steps_mle: 300 # matches era5_gp_n_steps_mle above, not
+                                   # eval.configs.constants.GP_N_STEPS_MLE
+                                   # (1000) — the offline sweep's rigor budget
+  gp_baseline_val_lr_mle: 0.05
+  gp_baseline_val_n_restarts_mle: 1
+  gp_baseline_val_ard: false       # the model sees every d_features column
+                                   # too, with no idea which are active — an
+                                   # ARD baseline would be solving an easier
+                                   # problem than the one being compared
+  gp_baseline_val_group_max: 64    # max episodes per batched fit; bounds the
+                                   # transient (E, N, N) predictive covariance
+
   # era5_fit/<region>/* validation metrics (see train.py::_build_era5_val_batches):
   # real ARCO-ERA5 spatial-correlation probes, one per eval/configs/regions.py
   # entry, scored against empirical Pearson correlation (no GP oracle exists for

@@ -220,6 +220,7 @@ Total feature count (cfg.data.d_features / d_features_lognormal_loc/scale)
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import itertools
 import math
@@ -2990,7 +2991,97 @@ def _evaluate_kernel_dense(kernel_obj: gpytorch.kernels.Kernel, x_norm: Tensor) 
     return kernel_obj(x_norm).to_dense()
 
 
+# Stack of the matmul precisions full_precision_matmul has replaced, so
+# caller_matmul_precision below can hand the caller's own setting back to a
+# nested block that does not need full precision. Per-process, and DataLoader
+# workers are separate processes, so there is no cross-worker sharing.
+_CALLER_MATMUL_PRECISION: list[str] = []
+
+
+@contextlib.contextmanager
+def full_precision_matmul():
+    """Force full-precision (non-TF32) float32 matmul inside this block.
+
+    train.py sets ``torch.set_float32_matmul_precision("high")`` process-wide,
+    which is the right call for Muon's Newton-Schulz iteration and for
+    y_space_nll's Cholesky path -- but it is a PROCESS-GLOBAL switch, and it
+    also lands on GP episode generation, where it is not harmless.
+
+    Two places it does damage. (a) The dense kernel evaluation below is
+    matmul-heavy (squared distances), so K_all itself picks up TF32's ~1e-3
+    relative error -- while pit.gp_analytical_posterior recomputes the same
+    kernel from x at full precision, so the two disagree on K, not just on the
+    arithmetic downstream of it. (b) The posterior PIT's
+    var_post = diag(K_ss) - sum(V_sf^2) is a CANCELLATION of two similar
+    quantities, which turns that relative error into a much larger one on the
+    small difference; a 1e-3 relative error on var_post moves
+    0.5 * log(var_post) -- i.e. log_pdf_test -- by ~5e-4 nats/point.
+
+    That is not only a diagnostic nuisance (it was the observed constant
+    ~5e-4 oracle_diag/marginal_gap between val/y_nll_marginal_analytic_z and
+    val/y_nll_oracle_posterior_marginal, which are two estimates of the SAME
+    model-independent quantity and should agree to float noise). z_test and
+    log_pdf_test are the copula loss's TARGETS, so it degrades the training
+    signal too.
+
+    Saves/restores via get/set_float32_matmul_precision rather than
+    torch.backends.cuda.matmul.allow_tf32: the boolean flag cannot round-trip
+    the "high" vs "medium" distinction, so restoring through it would silently
+    change a caller's setting.
+    """
+    prev = torch.get_float32_matmul_precision()
+    _CALLER_MATMUL_PRECISION.append(prev)
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        _CALLER_MATMUL_PRECISION.pop()
+        torch.set_float32_matmul_precision(prev)
+
+
+@contextlib.contextmanager
+def caller_matmul_precision():
+    """Temporarily hand precision back to whatever the caller had set, inside a
+    full_precision_matmul region.
+
+    For work that happens to sit inside a guarded function but is NOT
+    load-bearing GP linear algebra -- specifically the TabICL PIT forward pass
+    in _generate_gp_batch_raw. TabICL is an approximate marginal by
+    construction, so full precision buys it nothing, and it runs on every
+    live-generation batch in every DataLoader worker, where throughput does
+    matter (see live_dataset.py's worker auto-sizing). Without this, adding the
+    guard to episode generation would have quietly slowed the training stream
+    down to protect a number TabICL doesn't compute.
+
+    A no-op outside any full_precision_matmul region, so callers of this module
+    that never enter one are unaffected. Nesting-safe: reads the OUTERMOST
+    saved value, i.e. the setting the process actually had.
+    """
+    if not _CALLER_MATMUL_PRECISION:
+        yield
+        return
+    inner = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(_CALLER_MATMUL_PRECISION[0])
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(inner)
+
+
+def full_precision_matmul_fn(fn):
+    """Decorator form of full_precision_matmul, for whole functions whose GP
+    linear algebra must not silently inherit a caller's TF32 setting."""
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with full_precision_matmul():
+            return fn(*args, **kwargs)
+
+    return _wrapped
+
+
 @torch.no_grad()
+@full_precision_matmul_fn
 def _generate_gp_batch_raw(
     cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
     d_override: Optional[int] = None,
@@ -3465,16 +3556,29 @@ def _generate_gp_batch_raw(
     # oracle_mode="posterior": Sigma_post = Cov(f|train) + nugget*I with the
     # first term PSD, so every diagonal entry is >= nugget > 0 elementwise,
     # with no eigenvalue repair required.
-    K_sf     = K_all[:, P:P + N, :P]                                               # (B, N, P)
-    V_sf     = torch.linalg.solve_triangular(L_ff, K_sf.mT, upper=False)           # (B, P, N)
-    mu_post  = mu_star + torch.bmm(K_sf, alpha.unsqueeze(-1)).squeeze(-1)          # (B, N)
-    var_post = K_ss.diagonal(dim1=1, dim2=2) - (V_sf ** 2).sum(dim=1)              # (B, N)
-    var_post = var_post.clamp(min=likelihood.noise.reshape(B, 1).clamp(min=1e-10))
+    #
+    # Run in float64, matching pit.gp_analytical_posterior's own convention
+    # (it upcasts every one of these same blocks). The Schur complement is a
+    # cancellation -- diag(K_ss) and sum(V_sf^2) are close, and their small
+    # difference inherits the full relative error of both -- so float32 here
+    # leaves a per-episode discrepancy against pit.py's float64 recomputation
+    # of up to ~1e-4 nats/point on the marginal (measured, production
+    # gp_tasks.yaml, P=32/N=64). Combined with full_precision_matmul above,
+    # this is what makes oracle_diag/marginal_gap float noise rather than a
+    # number that has to be explained. One extra (B, P, N) triangular solve.
+    K_sf     = K_all[:, P:P + N, :P].double()                                      # (B, N, P)
+    V_sf     = torch.linalg.solve_triangular(L_ff.double(), K_sf.mT, upper=False)  # (B, P, N)
+    mu_post  = mu_star.double() + torch.bmm(K_sf, alpha.double().unsqueeze(-1)).squeeze(-1)
+    var_post = K_ss.diagonal(dim1=1, dim2=2).double() - (V_sf ** 2).sum(dim=1)     # (B, N)
+    var_post = var_post.clamp(
+        min=likelihood.noise.reshape(B, 1).double().clamp(min=1e-10)
+    )
     sig_c        = var_post.sqrt()
-    z_test       = (y_test - mu_post) / sig_c                                      # (B, N)
+    z_test       = (y_test.double() - mu_post) / sig_c                             # (B, N)
     log_pdf_test = (
         -0.5 * math.log(2.0 * math.pi) - sig_c.log() - 0.5 * z_test ** 2
     )                                                                               # (B, N)
+    z_test, log_pdf_test = z_test.float(), log_pdf_test.float()
 
     # LOO residuals are N(0,1) by construction (R&W Eq. 5.12); no empirical
     # rescaling needed.  Filter degenerate episodes instead.
@@ -3577,10 +3681,15 @@ def _generate_gp_batch_raw(
         y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)   # (B, P, 1)
         y_calib_scaled = ((y_calib - y_mean) / y_std).unsqueeze(-1)   # (B, P_C, 1)
-        split_pit = run_pit_calib_split_batched(
-            tabicl_model, x_norm_train, y_train_scaled,
-            x_norm_calib, y_calib_scaled,
-        )
+        # Back to the caller's matmul precision for TabICL's own forward pass
+        # -- see caller_matmul_precision. The precision guard on this function
+        # exists for the exact-GP algebra above, not for an approximate
+        # marginal that runs on every live-generation batch.
+        with caller_matmul_precision():
+            split_pit = run_pit_calib_split_batched(
+                tabicl_model, x_norm_train, y_train_scaled,
+                x_norm_calib, y_calib_scaled,
+            )
         z_train = split_pit["z_train"].squeeze(-1)                    # (B, P)
     elif apply_tabicl:
         # "tabicl": K-fold PIT (pit.py::run_pit_batched), scored against the
@@ -3611,11 +3720,14 @@ def _generate_gp_batch_raw(
         y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)   # (B, P, 1)
         y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)     # (B, N, 1)
-        tabicl_pit = run_pit_batched(
-            tabicl_model, x_norm_train, y_train_scaled,
-            x_norm_test, y_test_scaled,
-            k_folds=tabicl_k_folds,
-        )
+        # Caller's matmul precision for TabICL's forward pass -- see
+        # caller_matmul_precision and the calib-split branch above.
+        with caller_matmul_precision():
+            tabicl_pit = run_pit_batched(
+                tabicl_model, x_norm_train, y_train_scaled,
+                x_norm_test, y_test_scaled,
+                k_folds=tabicl_k_folds,
+            )
         z_train = tabicl_pit["z_train"].squeeze(-1)                   # (B, P)
         z_test = tabicl_pit["z_test"].squeeze(-1)                     # (B, N)
         # Jacobian correction back to raw-y-space nats (log p_raw =

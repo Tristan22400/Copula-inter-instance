@@ -98,6 +98,8 @@ __all__ = [
     "save_baseline_cache",
     "EXPECTED_BASELINE_KEYS",
     "assert_shared_z_test",
+    "fit_and_eval_gpytorch",
+    "fit_and_eval_gpytorch_batched",
 ]
 
 
@@ -639,6 +641,257 @@ def fit_and_eval_gpytorch(
 
     R, _ = sigma_to_correlation(Sigma_post)
     return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
+
+
+class _BatchedExactGPModel(gpytorch.models.ExactGP):
+    """batch_shape=[E] twin of _ExactGPModel: E independent GPs, one per
+    episode, sharing a single set of tensors and a single Adam loop.
+
+    Independence is exact, not approximate. gpytorch's batch_shape gives every
+    batch element its own hyperparameters, ExactMarginalLogLikelihood returns
+    an (E,) vector of per-episode MLLs (with each element's own MAP prior term
+    -- see its res.ndim-aware _add_other_terms), and no term couples two
+    elements, so summing that vector and calling .backward() optimizes E
+    separate fits at once. Same trick data_gen._sample_episode_kernel already
+    uses to draw E independent generative kernels in one call.
+
+    Deliberately narrower than _ExactGPModel: stationary kernels with a
+    lengthscale only, no DKL feature extractor, no polynomial-degree search.
+    Those exist for the offline eval sweeps; this exists to make a classical
+    baseline affordable INSIDE a training run, and the extra machinery would
+    have to be re-derived in batched form for no benefit there.
+    """
+
+    def __init__(
+        self,
+        X_train: Tensor,
+        y_train: Tensor,
+        likelihood: gpytorch.likelihoods.GaussianLikelihood,
+        kernel_name: str,
+        batch_shape: torch.Size,
+        ard_num_dims: "int | None" = None,
+        kernel_priors: "dict[str, Prior] | None" = None,
+    ) -> None:
+        super().__init__(X_train, y_train, likelihood)
+        kp = kernel_priors or {}
+        # Same "omit ard_num_dims entirely rather than pass None" quirk as
+        # _ExactGPModel (PeriodicKernel reads it out of kwargs directly).
+        ard_kw = {} if ard_num_dims is None else {"ard_num_dims": ard_num_dims}
+        self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
+
+        if kernel_name == "rbf":
+            base = gpytorch.kernels.RBFKernel(
+                batch_shape=batch_shape,
+                lengthscale_prior=kp.get("lengthscale_prior"),
+                **ard_kw,
+            )
+        elif kernel_name in _MATERN_NU:
+            base = gpytorch.kernels.MaternKernel(
+                nu=_MATERN_NU[kernel_name],
+                batch_shape=batch_shape,
+                lengthscale_prior=kp.get("lengthscale_prior"),
+                **ard_kw,
+            )
+        elif kernel_name == "periodic":
+            base = gpytorch.kernels.PeriodicKernel(
+                batch_shape=batch_shape,
+                lengthscale_prior=kp.get("lengthscale_prior"),
+                period_length_prior=kp.get("period_length_prior"),
+                **ard_kw,
+            )
+        elif kernel_name == "rational_quadratic":
+            base = gpytorch.kernels.RQKernel(
+                batch_shape=batch_shape,
+                lengthscale_prior=kp.get("lengthscale_prior"),
+                alpha_prior=kp.get("alpha_prior"),
+                **ard_kw,
+            )
+        else:
+            raise NotImplementedError(
+                f"fit_and_eval_gpytorch_batched does not support kernel_name={kernel_name!r} "
+                f"(supported: rbf, {', '.join(sorted(_MATERN_NU))}, periodic, "
+                f"rational_quadratic). Use the per-episode fit_and_eval_gpytorch for "
+                f"dot_product/polynomial/DKL."
+            )
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            base, batch_shape=batch_shape, outputscale_prior=kp.get("outputscale_prior"),
+        )
+
+    def forward(self, x: Tensor) -> gpytorch.distributions.MultivariateNormal:
+        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
+
+
+def _batched_sigma_to_correlation(Sigma: Tensor) -> Tensor:
+    """Batched D^-1/2 Sigma D^-1/2, same two-pass normalization
+    data_gen.sigma_to_correlation uses (the second pass only removes float
+    rounding drift off the unit diagonal; it is not a second normalization)."""
+    var = Sigma.diagonal(dim1=-2, dim2=-1).clamp(min=1e-10)
+    inv = var.rsqrt()
+    R = Sigma * inv.unsqueeze(-1) * inv.unsqueeze(-2)
+    d = R.diagonal(dim1=-2, dim2=-1).clamp(min=1e-10).sqrt()
+    return R / (d.unsqueeze(-1) * d.unsqueeze(-2))
+
+
+def fit_and_eval_gpytorch_batched(
+    X_train: Tensor,
+    y_train: Tensor,
+    X_test: Tensor,
+    kernel_name: str,
+    n_steps: int,
+    lr: float,
+    ard: bool = False,
+    jitter: float = 1e-6,
+    oracle_mode: str = "posterior",
+    prior_cfg: "dict | None" = None,
+    n_restarts: int = 1,
+) -> "dict[str, Tensor]":
+    """E independent GP-MLE/MAP fits in one Adam loop -- the batched twin of
+    fit_and_eval_gpytorch, for scoring a whole validation set's worth of
+    classical baselines at training time instead of only in an offline sweep.
+
+    Why it exists: the per-episode function costs ~2.5 s/episode/kernel, so a
+    500-episode val set x 2 kernels is ~40 minutes of startup. Batched, a step
+    is one (E, P, P) Cholesky (P=32 in production) and the whole val set fits
+    in about the time one episode used to take.
+
+    Args:
+        X_train : (E, P, d)  per-episode context inputs
+        y_train : (E, P)     per-episode context targets, RAW y.
+
+            NOT z_train, for two independent reasons. (1) The leak argument in
+            fit_and_eval_gpytorch's docstring: the analytic z_train is derived
+            from the true generating kernel's own Cholesky factor. (2) More
+            fundamentally, z_train is a LEAVE-ONE-OUT PIT residual, so it is
+            decorrelated by construction -- Cov(z_LOO) is the partial-
+            correlation matrix D^1/2 K^-1 D^1/2, whose off-diagonals are small
+            and carry the INVERSE kernel's structure. Type-II ML on
+            approximately-white data has one optimum: push all variance into
+            the nugget. Measured (matern32, 300 steps, production gp_tasks,
+            P=32/N=64, 6 episodes) fitting on z_train gives mean |off-diagonal|
+            0.0002-0.0039 and a copula NLL numerically equal to independence,
+            versus 0.004-0.045 fitting the same kernel on y_train, against an
+            oracle R_post at 0.022-0.063. Fitting on z_train would be an
+            expensive way to recompute zero.
+
+        X_test  : (E, N, d)  per-episode query inputs
+        n_restarts : independent random inits, run as n_restarts sequential
+            BATCHED fits (not E x n_restarts sequential ones), keeping each
+            episode's own best-final-loss restart.
+
+    All E episodes must share P, N and d. That is a tensor-shape constraint,
+    not a modelling one -- callers group episodes accordingly.
+
+    Returns {"R": (E, N, N), "mean": (E, N), "Sigma": (E, N, N),
+             "ok": (E,) bool, "loss": (E,)}. `ok` is False for episodes whose
+    every restart produced a non-finite loss or predictive; those carry an
+    identity-R placeholder and callers must drop them rather than score them.
+    """
+    if X_train.dim() != 3 or X_test.dim() != 3 or y_train.dim() != 2:
+        raise ValueError(
+            f"fit_and_eval_gpytorch_batched expects (E,P,d)/(E,P)/(E,N,d); got "
+            f"{tuple(X_train.shape)}/{tuple(y_train.shape)}/{tuple(X_test.shape)}"
+        )
+    if oracle_mode not in ("prior", "posterior"):
+        raise ValueError(f"Unknown oracle_mode {oracle_mode!r}")
+
+    E, P, d_x = X_train.shape
+    N = X_test.shape[1]
+    device = X_train.device
+    batch_shape = torch.Size([E])
+    ard_num_dims = d_x if ard else None
+
+    kernel_priors = _kernel_priors(prior_cfg or {}, kernel_name, ard=ard)
+    noise_prior = _noise_prior(prior_cfg or {})
+    lengthscale_init_prior = _lengthscale_init_prior(prior_cfg or {})
+
+    best_loss = torch.full((E,), float("inf"), device=device, dtype=torch.float64)
+    best_mean = torch.zeros(E, N, device=device)
+    best_Sigma = torch.zeros(E, N, N, device=device)
+    ok = torch.zeros(E, dtype=torch.bool, device=device)
+
+    for restart in range(max(1, n_restarts)):
+        try:
+            # Same exp(-8)..exp(2) noise interval, and the same
+            # fresh-Interval-per-fit reasoning, as fit_and_eval_gpytorch:
+            # a shared Interval instance carries device state in place.
+            noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
+            likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=noise_constraint,
+                noise_prior=noise_prior,
+                batch_shape=batch_shape,
+            )
+            likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(device).clamp(
+                min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
+            )
+            model = _BatchedExactGPModel(
+                X_train, y_train, likelihood, kernel_name, batch_shape,
+                ard_num_dims=ard_num_dims, kernel_priors=kernel_priors,
+            ).to(device)
+            _randomize_init(
+                model, kernel_priors, kernel_name,
+                lengthscale_init_prior=lengthscale_init_prior,
+            )
+
+            model.train()
+            likelihood.train()
+            opt = Adam(model.parameters(), lr=lr)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+            loss_vec = None
+            for _ in range(n_steps):
+                opt.zero_grad()
+                loss_vec = -mll(model(X_train), y_train)   # (E,)
+                # .sum(), not .mean(): each element's gradient has to keep its
+                # own scale relative to its own MAP prior term, which the MLL
+                # already adds per batch element.
+                loss_vec.sum().backward()
+                opt.step()
+
+            model.eval()
+            likelihood.eval()
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                pred = (
+                    likelihood(model.forward(X_test)) if oracle_mode == "prior"
+                    else likelihood(model(X_test))
+                )
+                mean_r = pred.mean                                            # (E, N)
+                Sigma_r = pred.covariance_matrix                              # (E, N, N)
+                Sigma_r = 0.5 * (Sigma_r + Sigma_r.mT) + jitter * torch.eye(
+                    N, dtype=Sigma_r.dtype, device=device
+                )
+                final = loss_vec.detach().double()                            # (E,)
+
+            finite = (
+                torch.isfinite(final)
+                & torch.isfinite(mean_r).all(dim=-1)
+                & torch.isfinite(Sigma_r).flatten(1).all(dim=-1)
+                & (Sigma_r.diagonal(dim1=-2, dim2=-1) > 0).all(dim=-1)
+            )
+            # Per-EPISODE restart selection: one episode converging badly on
+            # restart 0 must not cost every other episode its good fit, which
+            # is what a whole-batch "keep the best restart" would do.
+            take = finite & (final < best_loss)
+            if bool(take.any()):
+                best_loss = torch.where(take, final, best_loss)
+                best_mean[take] = mean_r[take]
+                best_Sigma[take] = Sigma_r[take]
+                ok |= take
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [gp_mle_{kernel_name} batched] restart {restart} failed: {exc}")
+            continue
+
+    if not bool(ok.any()):
+        raise RuntimeError(
+            f"fit_and_eval_gpytorch_batched(kernel_name={kernel_name!r}): every restart failed "
+            f"for all {E} episodes (see printed exceptions above)."
+        )
+    R = _batched_sigma_to_correlation(best_Sigma)
+    if not bool(ok.all()):
+        # Well-shaped placeholder for failed episodes so downstream batched
+        # Choleskys don't blow up; `ok` is what callers filter on.
+        eye = torch.eye(N, device=device, dtype=R.dtype)
+        R = torch.where(ok.view(E, 1, 1), R, eye)
+    return {"R": R, "mean": best_mean, "Sigma": best_Sigma, "ok": ok, "loss": best_loss}
 
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:

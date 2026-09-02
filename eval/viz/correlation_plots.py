@@ -151,9 +151,17 @@ def plot_corr_grid(
 
     n_cols = len(labels)
     fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
-    if n_cols == 1:
-        axes = [axes]
+    axes = [axes] if n_cols == 1 else list(axes)
 
+    # cbar=False on EVERY panel, with one shared colorbar attached to all of
+    # them afterwards (the same construction plot_correlation_heatmaps above
+    # uses). Drawing the colorbar inside the last heatmap call -- the obvious
+    # thing, and what this did originally -- takes the colorbar's width out of
+    # that ONE axes, and square=True then shrinks its height to match, so the
+    # last matrix renders visibly smaller than the others: measured 2.92in vs
+    # 3.56in (18% smaller) for two identical 64x64 inputs. That reads as a
+    # shape mismatch between the oracle and the estimator when both matrices
+    # are the same size by construction, which is exactly how it was reported.
     for ax, lbl, R in zip(axes, labels, mats):
         R_np = R.numpy()
         sns.heatmap(
@@ -166,7 +174,7 @@ def plot_corr_grid(
             square=True,
             xticklabels=False,
             yticklabels=False,
-            cbar=lbl == labels[-1],
+            cbar=False,
         )
         color = "red" if lbl == "oracle" else "black"
         for spine in ax.spines.values():
@@ -174,9 +182,13 @@ def plot_corr_grid(
             spine.set_linewidth(2 if lbl == "oracle" else 1)
         ax.set_title(lbl, fontsize=9)
 
+    # fraction/pad are taken off every axes equally, so the panels stay the
+    # same size as each other. No tight_layout(): fig.colorbar(ax=axes) has
+    # already re-laid the axes out, and calling it afterwards re-introduces
+    # per-axes width differences.
+    fig.colorbar(axes[-1].collections[0], ax=axes, fraction=0.046, pad=0.04)
     if title:
         fig.suptitle(title, fontsize=11, y=1.01)
-    plt.tight_layout()
     return fig
 
 

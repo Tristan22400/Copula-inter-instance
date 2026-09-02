@@ -72,6 +72,7 @@ from dataset import (
     ShardHomogeneousBatchSampler,
     collate_fn,
 )
+from eval.baselines.classical import fit_and_eval_gpytorch_batched
 from eval.configs.constants import GP_LR_MLE
 from eval.configs.regions import REGIONS as ERA5_REGIONS
 from era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
@@ -92,7 +93,7 @@ from live_dataset import (
     resolve_live_tabicl_num_workers,
     validate_analytic_only,
 )
-from loss import _safe_cholesky, y_space_nll
+from loss import _safe_cholesky, gp_oracle_y_nll, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation
 from muon import Muon
 from pit import (
@@ -360,6 +361,22 @@ def _resolve_probe_chunk_size(cfg: DictConfig) -> int:
 
 
 _ORACLE_CEILING_KEY = "_oracle_ceiling"
+
+# |oracle_diag/marginal_gap| above this on ANY single val episode gets a
+# printed warning from validate() -- but ONLY when the batch actually carries
+# the exact analytic marginal (analytic_only, or data.z_train_source=
+# "analytic"), which is the case where both sides of the difference are the
+# same episode's exact GP posterior marginal NLL computed two ways and the
+# honest tolerance is float noise. Under data.z_train_source="tabicl" the
+# batch marginal is TabICL's approximation, so a large gap there is a real
+# measurement, not a defect, and warning about it would be noise.
+#
+# 1e-3 sits well above float64 rounding and well below the ~5e-4-to-1e-2
+# excursions a reduced-precision matmul setting produces, so it fires on the
+# failure and not on the noise. The largest per-episode disagreement measured
+# after data_gen.full_precision_matmul + the float64 upcast is ~3e-4, over 120
+# production-config episodes.
+_MARGINAL_GAP_WARN = 1e-3
 
 
 def _attach_oracle_ceilings(episodes: list[dict]) -> None:
@@ -1292,6 +1309,261 @@ def _tabicl_pit_batch(
     }
 
 
+def _build_gp_baseline_val_scores(
+    cfg: DictConfig,
+    val_loader,
+    val_episodes_meta: "dict[int, list[dict]] | None",
+    tabicl_val_z: "dict | None",
+    device: str,
+) -> "dict | None":
+    """Classical GP-MLE/MAP baselines (default matern32 + rational_quadratic)
+    scored on the SAME frozen validation episodes the model is scored on --
+    the synthetic-episode counterpart of era5_fit/<region>/gp_baseline_*.
+
+    Why validation needs this. oracle_diag/copula_nll is bracketed below by
+    y_nll_oracle_posterior_copula (Bayes-optimal, true kernel and true
+    hyperparameters known) and above by 0 (predicting independence), and
+    nothing sits in between. "0.05 nats off the ceiling" is unreadable without
+    knowing what a competent classical method gets on the same episodes, and
+    that is the first comparison anyone reading the result will ask for.
+
+    Computed ONCE, at startup, and re-logged unchanged every validate() call.
+    Nothing here depends on the checkpoint: the fit sees only each episode's
+    context, and the scores use only the frozen episodes' own z_test /
+    log_pdf_test. In wandb that draws a flat reference line the model's curve
+    has to cross, which is exactly what a baseline should look like.
+
+    Two scoring conventions, both logged, because either alone misleads:
+
+      * SHARED-MARGINAL (gp_baseline/<k>/copula_nll, /total_nll) -- the fitted
+        correlation R_k pushed through the same loss.y_space_nll against the
+        same batch z_test/log_pdf_test that oracle_diag/copula_nll uses. Only
+        R differs between the model, the baselines and the ceiling, so these
+        are directly subtractable. This is the valid way to compare
+        correlation structures: two Sklar splits taken at DIFFERENT marginals
+        are not comparable term by term (see eval/metrics/joint_nll.py's
+        NAMING TRAP), so the comparison has to be made by a proper scoring
+        rule on one common basis, never by comparing matrices entrywise.
+      * OWN-MARGINAL (gp_baseline/<k>/own_*) -- the GP's genuine end-to-end
+        predictive N(mu_k, Sigma_k) at the query points via
+        loss.gp_oracle_y_nll. Comparable to y_nll_oracle_posterior (also an
+        MVN total) and to val/y_nll_total. The shared-marginal number hands
+        the GP a free oracle marginal it would never have at deployment; the
+        own-marginal one conflates marginal and copula error. Both, or
+        neither.
+
+    Fitted on y_train, NOT z_train. The model only ever sees z_train, so
+    "fit the baseline on z_train for information parity" is the obvious
+    proposal -- and it does not work. z_train is a leave-one-out PIT residual,
+    decorrelated by construction (Cov(z_LOO) is the partial-correlation matrix
+    D^1/2 K^-1 D^1/2), so type-II ML on it pushes all variance into the nugget
+    and returns R ~ I: measured mean |off-diagonal| 0.0005 vs 0.0340 for the
+    same kernel fitted on y_train, against an oracle R_post at 0.0587
+    (tests/test_gp_baseline_batched.py pins this). It would be an expensive
+    way to recompute the independence baseline, which is already 0.
+
+    The remaining asymmetry is real and is deliberately left in: y_train is
+    un-whitened, so the GP reads the context in its natural space while the
+    model has to recover the same structure from a PIT. That is the inference
+    step the model exists to perform, so this is a STRONG comparator, not a
+    matched one. It is not, however, a marginal advantage: R is invariant to
+    the marginal's location and scale, and these episodes are Gaussian by
+    construction, so y_train carries no marginal-shape information z_train
+    lacks.
+
+    oracle_mode="posterior" (not fit_and_eval_gpytorch's "prior" default): the
+    copula target is the CONDITIONAL correlation R_post, so the comparator has
+    to be the fitted kernel's context-conditioned posterior too.
+
+    Cost. eval/spatial/sweep_core.py's per-episode fit is ~2.5 s/episode/
+    kernel, i.e. ~40 minutes for a 500-episode val set x 2 kernels, which is
+    not payable at every training launch. classical.fit_and_eval_gpytorch_
+    batched fits every episode in one batch_shape=[E] Adam loop instead (one
+    (E, P, P) Cholesky per step, P=32 in production), bringing the whole val
+    set down to roughly what a single episode used to cost. Episodes are
+    grouped by (P, N, d) because that batching is a tensor-shape constraint;
+    build_fixed_live_val_batches already makes each val batch internally
+    homogeneous, so the grouping is coarse in practice.
+
+    Returns None when disabled or when there is nothing to fit. Otherwise
+    {"n_episodes": int, "kernels": {name: {metric: value}},
+     "oracle": {"copula_nll": ..., "total_nll": ...}}. The oracle entries cover
+    the same episode set the baselines were fitted on -- not the whole val set
+    -- so gp_baseline/<k>/copula_gap is a same-population subtraction even when
+    baselines.gp_baseline_val_episodes caps the baseline to a subset. Each
+    kernel additionally reports its own "n_episodes" and "failed" counts, which
+    differ from the top-level n_episodes only if some fit did not converge.
+    """
+    bcfg = cfg.get("baselines", {}) or {}
+    if not bool(bcfg.get("gp_baseline_val", True)) or not val_episodes_meta:
+        return None
+    kernels = list(bcfg.get("gp_baseline_val_kernels") or [])
+    if not kernels:
+        return None
+
+    n_cap_raw = bcfg.get("gp_baseline_val_episodes", None)
+    n_cap = int(n_cap_raw) if n_cap_raw is not None else None
+    n_steps = int(bcfg.get("gp_baseline_val_n_steps_mle", 300))
+    lr = float(bcfg.get("gp_baseline_val_lr_mle", GP_LR_MLE))
+    n_restarts = int(bcfg.get("gp_baseline_val_n_restarts_mle", 1))
+    ard = bool(bcfg.get("gp_baseline_val_ard", False))
+    group_max = int(bcfg.get("gp_baseline_val_group_max", 64))
+
+    # ---- Collect episode slots, grouped by the shapes a batched fit needs ---
+    # Materialized once: this indexes batches by position twice (grouping,
+    # then stacking), and val_loader is only a plain list in live-generation
+    # mode -- the disk path hands validate() a real DataLoader.
+    batches = list(val_loader)
+    groups: dict[tuple, list[tuple[int, int]]] = {}
+    n_seen = 0
+    for batch_idx, batch in enumerate(batches):
+        eps_b = val_episodes_meta.get(batch_idx)
+        if not eps_b:
+            continue
+        for b in range(min(int(batch["x_train"].shape[0]), len(eps_b))):
+            if n_cap is not None and n_seen >= n_cap:
+                break
+            p = int(batch["train_mask"][b].sum())
+            n = int(batch["test_mask"][b].sum())
+            if p < 2 or n < 2:
+                continue
+            groups.setdefault((p, n, int(batch["x_train"].shape[-1])), []).append((batch_idx, b))
+            n_seen += 1
+    if not groups:
+        return None
+
+    # Sub-batch each shape group so a fit never holds more than group_max
+    # (E, N, N) predictive covariances at once -- at the production N=256 that
+    # is ~17 MB per tensor per chunk, which matters because this runs before
+    # the model is built and should not set the run's peak memory.
+    chunks: list[list[tuple[int, int]]] = []
+    for slots in groups.values():
+        for i in range(0, len(slots), group_max):
+            chunks.append(slots[i : i + group_max])
+
+    acc: dict[str, dict[str, float]] = {
+        k: {name: 0.0 for name in (
+            "copula_nll", "total_nll", "own_total_nll", "own_marginal_nll",
+            "own_copula_nll", "copula_nll_tabicl", "total_nll_tabicl",
+        )} for k in kernels
+    }
+    weight: dict[str, float] = {k: 0.0 for k in kernels}
+    weight_tabicl: dict[str, float] = {k: 0.0 for k in kernels}
+    failed: dict[str, int] = {k: 0 for k in kernels}
+    oracle_cop: list[float] = []
+    oracle_tot: list[float] = []
+    n_scored = 0
+
+    t0 = time.time()
+    print(
+        f"[train] Fitting classical GP validation baselines {kernels} on "
+        f"{n_seen} val episodes ({len(chunks)} batched fit(s) per kernel, "
+        f"{n_steps} steps, {n_restarts} restart(s))..."
+    )
+    for chunk in chunks:
+        b0, _ = chunk[0]
+        p = int(batches[b0]["train_mask"][chunk[0][1]].sum())
+        n = int(batches[b0]["test_mask"][chunk[0][1]].sum())
+
+        def _stack(key: str, size: int) -> torch.Tensor:
+            return torch.stack(
+                [batches[bi][key][b, :size] for bi, b in chunk]
+            ).to(device)
+
+        X_tr = _stack("x_train", p)
+        y_tr = _stack("y_train", p)
+        X_te = _stack("x_test", n)
+        y_te = _stack("y_test", n)
+        z_te = _stack("z_test", n).float()
+        lp_te = _stack("log_pdf_test", n).float()
+        mask = torch.ones(len(chunk), n, dtype=torch.bool, device=device)
+
+        # TabICL-basis scoring is all-or-nothing per chunk: a partial cache
+        # would silently average two different marginals into one number.
+        z_tb = lp_tb = None
+        if tabicl_val_z and all(bi in tabicl_val_z for bi, _ in chunk):
+            z_tb = torch.stack(
+                [tabicl_val_z[bi]["z_test"][b, :n] for bi, b in chunk]
+            ).to(device).float()
+            lp_tb = torch.stack(
+                [tabicl_val_z[bi]["log_pdf_test"][b, :n] for bi, b in chunk]
+            ).to(device).float()
+
+        for kname in kernels:
+            try:
+                fit = fit_and_eval_gpytorch_batched(
+                    X_tr, y_tr, X_te, kname, n_steps=n_steps, lr=lr, ard=ard,
+                    oracle_mode="posterior", n_restarts=n_restarts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[train]   gp_baseline {kname}: chunk of {len(chunk)} failed: {exc}")
+                failed[kname] += len(chunk)
+                continue
+            ok = fit["ok"]
+            failed[kname] += int((~ok).sum())
+            if not bool(ok.any()):
+                continue
+            with torch.no_grad():
+                R_ok = fit["R"][ok]
+                m_ok = mask[ok]
+                parts = y_space_nll(R_ok, z_te[ok], lp_te[ok], m_ok)
+                own = gp_oracle_y_nll(fit["Sigma"][ok], fit["mean"][ok], y_te[ok], m_ok)
+                w = float(int(ok.sum()))
+                acc[kname]["copula_nll"] += parts["copula"].item() * w
+                acc[kname]["total_nll"] += parts["total"].item() * w
+                acc[kname]["own_total_nll"] += own["total"].item() * w
+                acc[kname]["own_marginal_nll"] += own["marginal"].item() * w
+                acc[kname]["own_copula_nll"] += own["copula"].item() * w
+                weight[kname] += w
+                if z_tb is not None:
+                    parts_tb = y_space_nll(R_ok, z_tb[ok], lp_tb[ok], m_ok)
+                    acc[kname]["copula_nll_tabicl"] += parts_tb["copula"].item() * w
+                    acc[kname]["total_nll_tabicl"] += parts_tb["total"].item() * w
+                    weight_tabicl[kname] += w
+
+        # Ceiling on exactly these episodes, so gp_baseline/<k>/copula_gap and
+        # oracle_diag/copula_gap are subtractions over the same population.
+        for bi, b in chunk:
+            eps_bi = val_episodes_meta.get(bi) or []
+            ceil = eps_bi[b].get(_ORACLE_CEILING_KEY) if b < len(eps_bi) else None
+            if ceil is not None:
+                oracle_cop.append(ceil["nll_post_copula"])
+                oracle_tot.append(ceil["nll_post"])
+        n_scored += len(chunk)
+
+    out: dict = {"n_episodes": n_scored, "kernels": {}, "oracle": {}}
+    if oracle_cop:
+        out["oracle"]["copula_nll"] = float(np.mean(oracle_cop))
+        out["oracle"]["total_nll"] = float(np.mean(oracle_tot))
+    for kname in kernels:
+        w, w_tb = weight[kname], weight_tabicl[kname]
+        if w <= 0:
+            continue
+        entry = {
+            "copula_nll": acc[kname]["copula_nll"] / w,
+            "total_nll": acc[kname]["total_nll"] / w,
+            "own_total_nll": acc[kname]["own_total_nll"] / w,
+            "own_marginal_nll": acc[kname]["own_marginal_nll"] / w,
+            "own_copula_nll": acc[kname]["own_copula_nll"] / w,
+            "failed": float(failed[kname]),
+            "n_episodes": w,
+        }
+        if w_tb > 0:
+            entry["copula_nll_tabicl"] = acc[kname]["copula_nll_tabicl"] / w_tb
+            entry["total_nll_tabicl"] = acc[kname]["total_nll_tabicl"] / w_tb
+        if "copula_nll" in out["oracle"]:
+            entry["copula_gap"] = entry["copula_nll"] - out["oracle"]["copula_nll"]
+            entry["gap_nll"] = entry["own_total_nll"] - out["oracle"]["total_nll"]
+        out["kernels"][kname] = entry
+        print(
+            f"[train]   gp_baseline/{kname}: copula_nll={entry['copula_nll']:+.4f} "
+            f"(shared marginal)  own_total_nll={entry['own_total_nll']:+.4f}  "
+            f"failed={failed[kname]}"
+        )
+    print(f"[train] Classical GP validation baselines done in {time.time() - t0:.1f}s.")
+    return out if out["kernels"] else None
+
+
 @torch.no_grad()
 def _build_tabicl_val_z(
     val_loader, tabicl_marginal: nn.Module, k_folds: int, device: str,
@@ -1454,6 +1726,7 @@ def validate(
     posterior_probe: dict | None = None,
     val_episodes_meta: dict[int, list[dict]] | None = None,
     analytic_only: bool = False,
+    gp_baseline_scores: dict | None = None,
 ) -> tuple[dict, list]:
     """Compute validation metrics for the current model.
 
@@ -1526,6 +1799,23 @@ def validate(
     # between a batch-of-means and a mean-of-episodes; the point of keeping it
     # per-episode is the tail, which a mean cannot show.
     gap_per_episode: list[float] = []
+    # Per-EPISODE (model marginal - ceiling marginal), the paired version of
+    # oracle_diag/marginal_gap. Both sides are the exact GP posterior marginal
+    # NLL of the SAME episode -- a quantity the model never touches -- so every
+    # entry here should be float noise. Differencing the two population MEANS
+    # instead (which is what marginal_gap used to be) silently mixes three
+    # unrelated effects: float32-vs-float64 code paths, episodes present in one
+    # average but not the other (see marginal_ceiling_skipped below), and
+    # batch-mean-of-episode-means vs flat-mean-over-episodes weighting. A
+    # non-zero value then cannot be attributed to any of them. Paired
+    # per-episode, it can.
+    marginal_gap_per_episode: list[float] = []
+    # Episodes dropped from the ceiling averages (no analytic posterior for
+    # this kernel schema, or n_test < 2) but still present in the model-side
+    # batch averages. Previously invisible, and a population mismatch of even
+    # one or two episodes moves marginal_gap by ~1e-3 given how much the
+    # per-episode marginal varies (measured spread ~+-1 nat/point).
+    marginal_ceiling_skipped = 0
     # KL(N(0,R_post) || N(0,Sigma_theta)) per point, per episode. Unlike
     # gap_nll -- a Monte-Carlo estimate from the single realized y_test --
     # this is a functional of the two correlation matrices alone, so it has
@@ -1575,6 +1865,9 @@ def validate(
         # batch had no episode with >= 2 test points (no copula term exists),
         # in which case gap_nll_p90 simply skips the batch.
         episode_total_cur: list[float] | None = None
+        # Same, for the marginal term alone -- paired against the ceiling's own
+        # marginal below to make oracle_diag/marginal_gap attributable.
+        episode_marginal_cur: list[float] | None = None
 
         if valid_cur.any():
             mask_2d_cur = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
@@ -1631,6 +1924,7 @@ def validate(
             # episodes rather than uniform mild miscalibration.
             mar_cur = -(batch["log_pdf_test"].float() * mask_f).sum(-1) / n_safe_cur
             episode_total_cur = (cop_cur + mar_cur).cpu().tolist()
+            episode_marginal_cur = mar_cur.cpu().tolist()
 
         # ---- TabICL-marginal real (non-oracle) NLL scoring ----
         # Runs on EVERY val_loader batch every val_every step: this is what
@@ -1643,6 +1937,11 @@ def validate(
         for b in range(B):
             n = int(batch["test_mask"][b].sum())
             if n < 2:
+                # Counted, not silently dropped: this episode is still inside
+                # the batch-level y_space_nll averages above (which only skip
+                # n_test == 0), so it is exactly the kind of population
+                # mismatch marginal_ceiling_skipped exists to surface.
+                marginal_ceiling_skipped += 1
                 continue
 
             # Sim-to-real check: re-run the model on this SAME episode
@@ -1695,6 +1994,8 @@ def validate(
             # None means no analytic posterior exists for this episode's
             # kernel schema. Independent of z_cache_b/do_plot above.
             ceil_b = eps_b[b].get(_ORACLE_CEILING_KEY) if (eps_b is not None and b < len(eps_b)) else None
+            if ceil_b is None and eps_b is not None and b < len(eps_b):
+                marginal_ceiling_skipped += 1
             if ceil_b is not None:
                 nll_post_per_point.append(ceil_b["nll_post"])  # already nats/point, matching y_space_nll
                 nll_post_marginal_per_point.append(ceil_b["nll_post_marginal"])
@@ -1706,6 +2007,19 @@ def validate(
                 # plausible-looking but meaningless number.
                 if episode_total_cur is not None and ceil_b["n_test"] == n:
                     gap_per_episode.append(episode_total_cur[b] - ceil_b["nll_post"])
+                # Paired marginal check on the same episode, same guard. Both
+                # operands are the exact GP posterior marginal NLL: the left
+                # one via data_gen's batched PIT (episode["log_pdf_test"]),
+                # the right one via pit.gp_analytical_posterior's float64
+                # Schur complement. Same number, two implementations -- so
+                # this is a pure numerical-agreement check, not a model
+                # metric, and anything above float noise means one of the two
+                # paths has drifted (historically: TF32 on the batched one,
+                # see data_gen.full_precision_matmul).
+                if episode_marginal_cur is not None and ceil_b["n_test"] == n:
+                    marginal_gap_per_episode.append(
+                        episode_marginal_cur[b] - ceil_b["nll_post_marginal"]
+                    )
                 if ceil_b["off_R_post"] is not None:
                     ri_p, ci_p = np.triu_indices(n, k=1)
                     off_p_post.append(Sigma[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
@@ -1824,6 +2138,10 @@ def validate(
                 n = int(ep["x_norm_test"].shape[0])
                 ceil_p = ep.get(_ORACLE_CEILING_KEY)
                 if n < 1 or ceil_p is None:
+                    # Counted for the same reason as in the main loop: this
+                    # episode is in the model-side chunk average above but not
+                    # in the ceiling averages below.
+                    marginal_ceiling_skipped += 1
                     continue  # unsupported kernel schema / no analytic posterior
                 # Already per-point (nll_post = nll_post_marginal +
                 # nll_post_copula in raw-sum units, each divided by this
@@ -1832,6 +2150,13 @@ def validate(
                 nll_post_per_point.append(ceil_p["nll_post"])
                 nll_post_marginal_per_point.append(ceil_p["nll_post_marginal"])
                 nll_post_copula_per_point.append(ceil_p["nll_post_copula"])
+                # Paired numerical-agreement check, same as the main loop's.
+                n_ep_p = int(sub["test_mask"][b_local].sum())
+                if n_ep_p > 0 and ceil_p["n_test"] == n_ep_p:
+                    marginal_gap_per_episode.append(
+                        -(sub["log_pdf_test"][b_local, :n_ep_p].float().sum().item()) / n_ep_p
+                        - ceil_p["nll_post_marginal"]
+                    )
                 if ceil_p["off_R_post"] is not None:
                     ri_p, ci_p = np.triu_indices(n, k=1)
                     off_p_post.append(Sigma_p[b_local, :n, :n].float().cpu().numpy()[ri_p, ci_p])
@@ -1914,13 +2239,100 @@ def validate(
             # copula_gap exceeding it means the model is worse than R = I.
             metrics["oracle_diag/copula_headroom"] = -metrics["y_nll_oracle_posterior_copula"]
         if "oracle_diag/marginal_nll" in metrics:
-            # Must be ~0 and flat: the model never predicts a marginal, and
-            # under analytic_only both sides are the same exact posterior
-            # marginal. Non-zero means the two paths disagree about the
-            # marginal, which invalidates copula_gap above.
-            metrics["oracle_diag/marginal_gap"] = (
+            # Kept for continuity, but read marginal_gap (the PAIRED version
+            # below) instead: this is a difference of two POPULATION MEANS,
+            # and the two populations are not the same set of episodes
+            # (marginal_ceiling_skipped) and are not even weighted the same
+            # way (batch-mean-of-episode-means on the left, flat mean over
+            # episodes on the right). Both effects show up here as a nonzero
+            # value that says nothing about whether the two marginals
+            # actually disagree.
+            metrics["oracle_diag/marginal_gap_pooled"] = (
                 metrics["oracle_diag/marginal_nll"] - metrics["y_nll_oracle_posterior_marginal"]
             )
+    if marginal_gap_per_episode:
+        # Per-episode (batch marginal - exact GP posterior marginal), paired on
+        # the same episode. What it means depends on which marginal the batch
+        # actually carries, and there are two regimes:
+        #
+        #   analytic basis (analytic_only, or data.z_train_source="analytic"):
+        #     both sides are the SAME quantity computed twice -- data_gen's
+        #     batched PIT vs pit.gp_analytical_posterior's float64 Schur
+        #     complement -- with the model involved in neither. It must be
+        #     float noise and flat for the whole run; anything else invalidates
+        #     copula_gap above, since that subtraction is only like-for-like
+        #     while the two marginals agree. History: a constant ~+5e-4 on GPU
+        #     and ~1e-6 on CPU, which is what a process-global
+        #     torch.set_float32_matmul_precision("high") does to a
+        #     Schur-complement cancellation (see data_gen.full_precision_matmul).
+        #
+        #   TabICL basis (data.z_train_source="tabicl"/"tabicl_split"):
+        #     batch["log_pdf_test"] is TabICL's own K-fold PIT marginal, so
+        #     this is NOT a numerical check -- it is the frozen marginal's
+        #     approximation error in nats/point, measured against the exact GP
+        #     posterior marginal on the same episodes. A large value here is
+        #     information, not a bug (it is a lower-bounding component of
+        #     val/y_nll_total), but it does mean oracle_diag/copula_gap is
+        #     comparing two Sklar splits taken at different marginals.
+        #
+        # max_abs is logged beside the mean either way: the per-episode value
+        # is signed and heavy-tailed, so a mean near zero can hide large
+        # excursions that cancel.
+        marginal_is_exact = analytic_only or str(
+            cfg.data.get("z_train_source", "analytic")
+        ) == "analytic"
+        mg = np.asarray(marginal_gap_per_episode, dtype=np.float64)
+        metrics["oracle_diag/marginal_gap"] = float(mg.mean())
+        metrics["oracle_diag/marginal_gap_p90"] = float(np.percentile(np.abs(mg), 90))
+        metrics["oracle_diag/marginal_gap_max_abs"] = float(np.abs(mg).max())
+        metrics["oracle_diag/marginal_gap_n"] = float(mg.shape[0])
+        # 1.0 = the two sides are the same quantity and the gap is a pure
+        # numerical-agreement check; 0.0 = it is the TabICL marginal's error.
+        metrics["oracle_diag/marginal_gap_exact_basis"] = float(marginal_is_exact)
+        if marginal_is_exact and float(np.abs(mg).max()) > _MARGINAL_GAP_WARN:
+            worst = int(np.argmax(np.abs(mg)))
+            print(
+                f"[validate] oracle_diag/marginal_gap_max_abs="
+                f"{float(np.abs(mg).max()):.3e} > {_MARGINAL_GAP_WARN:.0e} on episode "
+                f"{worst} of {mg.shape[0]} (mean {float(mg.mean()):+.3e}). The batched PIT "
+                f"(data_gen) and the float64 ceiling (pit.gp_analytical_posterior) disagree "
+                f"about the SAME episode's posterior marginal, so oracle_diag/copula_gap is "
+                f"not a like-for-like subtraction. Usual cause: a float32 matmul-precision "
+                f"setting leaking into the GP linear algebra."
+            )
+    if marginal_ceiling_skipped:
+        # Episodes in the model-side averages but not the ceiling ones.
+        metrics["oracle_diag/marginal_ceiling_skipped"] = float(marginal_ceiling_skipped)
+
+    # ---- Classical GP baselines (frozen; see _build_gp_baseline_val_scores) --
+    # Constants for the whole run -- fitted once at startup on each val
+    # episode's own context, then re-logged here every call so wandb draws them
+    # as a flat reference line beside the model's curve. Read them as the
+    # middle of a three-way bracket:
+    #
+    #   y_nll_oracle_posterior_copula  <=  gp_baseline/<k>/copula_nll  <=  0
+    #      (true kernel, true hyper-        (matern32 / rational_quadratic,     (independence)
+    #       parameters, Bayes-optimal)       misspecified: the generator draws
+    #                                        chains of 1-8 elementary kernels)
+    #
+    # with oracle_diag/copula_nll -- the model -- somewhere in that range. All
+    # of them are scored through the SAME y_space_nll against the SAME
+    # z_test/log_pdf_test, so only R differs and the differences are
+    # meaningful; comparing the matrices entrywise instead would not be (see
+    # _build_gp_baseline_val_scores, and this repo's
+    # feedback_no_raw_correlation_vs_oracle_comparison note).
+    #
+    # gp_baseline/oracle_* repeats the ceiling restricted to exactly the
+    # episodes the baselines were fitted on, so gp_baseline/<k>/copula_gap and
+    # oracle_diag/copula_gap are same-population subtractions even when
+    # baselines.gp_baseline_val_episodes caps the baseline to a subset.
+    if gp_baseline_scores:
+        metrics["gp_baseline/n_episodes"] = float(gp_baseline_scores.get("n_episodes", 0))
+        for key, val in (gp_baseline_scores.get("oracle") or {}).items():
+            metrics[f"gp_baseline/oracle_{key}"] = float(val)
+        for kname, entry in (gp_baseline_scores.get("kernels") or {}).items():
+            for key, val in entry.items():
+                metrics[f"gp_baseline/{kname}/{key}"] = float(val)
     if gap_per_episode:
         # Tail of the per-episode gap distribution. gap_nll's mean can look
         # healthy while a handful of episodes are catastrophically
@@ -2435,9 +2847,21 @@ def main(cfg: DictConfig) -> None:
         # confirmed the single most expensive part of each step: bwd+opt time
         # is several times forward time in profiling) and y_space_nll's
         # Cholesky/logdet path — still runs fp32 matmuls at full CUDA-core
-        # precision without this. One-line, ~free win (negligible accuracy
-        # cost, standard recommendation for Ampere+) that raises MFU's
-        # numerator directly. See torch.set_float32_matmul_precision docs.
+        # precision without this. ~Free win for those two (standard
+        # recommendation for Ampere+) that raises MFU's numerator directly.
+        # See torch.set_float32_matmul_precision docs.
+        #
+        # "Negligible accuracy cost" is true for THOSE paths, and this is a
+        # PROCESS-GLOBAL switch, so it is not true everywhere. GP episode
+        # generation is the exception and is explicitly opted back out: the
+        # exact-GP PIT's var_post = diag(K_ss) - sum(V_sf^2) is a cancellation
+        # of two similar quantities, where TF32's ~1e-3 relative error becomes
+        # a ~5e-4 nats/point error on log_pdf_test — which is a TRAINING
+        # TARGET, not just a metric. data_gen.full_precision_matmul (applied
+        # to _generate_gp_batch_raw, pit.gp_analytical_pit and
+        # pit.gp_analytical_posterior) restores full precision for exactly
+        # those calls. Anything else added here that does load-bearing GP
+        # linear algebra in fp32 needs the same treatment.
         torch.set_float32_matmul_precision("high")
         print(
             f"[train] GPU: {torch.cuda.get_device_name(0)} — assumed peak "
@@ -2975,6 +3399,15 @@ def main(cfg: DictConfig) -> None:
             if era5_viz_on:
                 era5_viz_batch = _build_era5_viz_batch(cfg, None, device)
 
+    # Classical GP validation baselines: fitted once, here, on the frozen val
+    # episodes' own contexts. Deliberately BEFORE the model is built -- the
+    # batched fit briefly holds (E, N, N) predictive covariances, and there is
+    # no reason for that to land on top of the model's own allocation. Also
+    # after tabicl_marginal is freed, so the two never coexist.
+    gp_baseline_scores = _build_gp_baseline_val_scores(
+        cfg, val_loader, val_episodes_meta, tabicl_val_z, device
+    )
+
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
         torch._dynamo.config.capture_scalar_outputs = True
@@ -3426,6 +3859,7 @@ def main(cfg: DictConfig) -> None:
                 posterior_probe=posterior_probe,
                 val_episodes_meta=val_episodes_meta,
                 analytic_only=analytic_only,
+                gp_baseline_scores=gp_baseline_scores,
             )
             # oracle_diag/* keys are already fully qualified (a sibling
             # top-level wandb group, deliberately kept out of val/ — see
@@ -3499,6 +3933,35 @@ def main(cfg: DictConfig) -> None:
                 f"od_σ={metrics['sigma_offdiag_std_analytic_z']:.4f} "
                 f"od_|r|={metrics['sigma_offdiag_abs_mean_analytic_z']:.4f}"
             )
+            # The whole shared-marginal copula bracket on one line: the model,
+            # the classical GP comparators, and the Bayes-optimal ceiling, all
+            # scored through the same y_space_nll against the same z_test, so
+            # only R differs and the four numbers are directly comparable (see
+            # _build_gp_baseline_val_scores). Reading order is
+            # oracle <= m32/rq <= 0, with model somewhere in it; a model number
+            # above 0 is worse than predicting independence. m32/rq are
+            # matern32 and rational_quadratic and are constant for the run --
+            # printed every time anyway so the model's number is never shown
+            # with nothing to compare it against. The whole group is omitted
+            # when the baselines are disabled rather than printed as dead
+            # "n/a" columns.
+            gp_parts = [
+                f"{short}={metrics[f'gp_baseline/{full}/copula_nll']:+.4f}"
+                for short, full in (("m32", "matern32"), ("rq", "rational_quadratic"))
+                if f"gp_baseline/{full}/copula_nll" in metrics
+            ]
+            if gp_parts:
+                head_parts = [
+                    f"{label}={metrics[key]:+.4f}"
+                    for label, key in (
+                        ("model", "oracle_diag/copula_nll"),
+                        ("oracle", "y_nll_oracle_posterior_copula"),
+                    )
+                    if key in metrics and math.isfinite(metrics[key])
+                ]
+                gp_str = "  cop[" + " ".join(head_parts[:1] + gp_parts + head_parts[1:]) + "]"
+            else:
+                gp_str = ""
             if analytic_only:
                 # gap_post IS the headline here -- there is no TabICL-marginal
                 # total to report, so printing "total=n/a  ...  cop_tabicl=n/a"
@@ -3536,7 +3999,8 @@ def main(cfg: DictConfig) -> None:
                     f"corr_r={pearson_str}  "
                     f"{od_str}  "
                     f"cop_std={cop_std_str}  "
-                    f"ceiling={ceiling_str}  "
+                    f"ceiling={ceiling_str}"
+                    f"{gp_str}  "
                     f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
             else:
@@ -3547,7 +4011,8 @@ def main(cfg: DictConfig) -> None:
                     f"corr_r={pearson_str}  "
                     f"{od_str}  "
                     f"cop_std={cop_std_str}  "
-                    f"cop_tabicl={cop_tabicl_str}  "
+                    f"cop_tabicl={cop_tabicl_str}"
+                    f"{gp_str}  "
                     f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
 
