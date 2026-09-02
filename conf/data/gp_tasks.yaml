@@ -408,6 +408,18 @@ z_train_source: tabicl
 # estimate). Lower this only if profiling on your own hardware shows
 # workers falling behind (data= consistently above budget in train.py's
 # perf: log line), not preemptively.
+#
+# This ALSO sets the fold count validation scores against. train.py's
+# _build_tabicl_val_z used to recompute the val PIT at tabicl.pit_k_folds
+# (DEFAULT_K_FOLDS = 10 for every model config that doesn't override it),
+# which put val/y_nll_total -- the real-deployment headline -- on a K=10
+# marginal while the model was conditioned on the K=5 one generated here. A
+# K-fold PIT's sharpness moves with K (see the 0.534/0.557/0.657 gap numbers
+# above), so that difference shifts the total NLL by an amount that has
+# nothing to do with the model. train() now follows this value for the val
+# PIT whenever z_train_source is "tabicl"/"tabicl_split"; tabicl.pit_k_folds
+# still governs where the fold count is a free choice (the kernel_fit/<family>
+# probes, the z_train mix-gap measurement).
 z_train_tabicl_k_folds: 5
 # Calibration-pool size for z_train_source=tabicl_split's
 # run_pit_calib_split_batched call, as a fraction of P (the episode's
