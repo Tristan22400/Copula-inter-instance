@@ -344,7 +344,10 @@ def plot_synthetic_residual_grid(
     independent_fields: list,
     output_path: str, context_coords: "np.ndarray | None" = None,
     oracle_fields: "list[np.ndarray] | None" = None,
-) -> None:
+    pred2_row_label: str = "Copula model\n(TabICLv2 z_train)\ny",
+    oracle_row_label: str = "Oracle correlation\n+ TabICLv2 marginal\ny",
+    suptitle: str = "Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
+) -> "plt.Figure | None":
     """Synthetic-mode analogue of plot_residual_grid: one column per
     independent GP draw from the sampled ground-truth kernel instead of one
     column per real ERA5 day, with the SAME five rows (ground truth /
@@ -357,17 +360,30 @@ def plot_synthetic_residual_grid(
     error from marginal-estimation error. `predicted_fields_true_z` and
     `predicted_fields_tabicl_z` are the SAME copula-model forward pass,
     differing only in whether z_train is the exact GP leave-one-out value or
-    TabICLv2's practical K-fold PIT estimate of it."""
+    TabICLv2's practical K-fold PIT estimate of it.
+
+    `pred2_row_label`/`oracle_row_label`/`suptitle` exist so the ANALYTIC-only
+    regime can reuse this exact renderer with different row semantics. There,
+    no TabICL PIT exists at all, so the row-2 slot carries the best-performing
+    fitted kernel baseline instead of a TabICLv2-z_train variant, and the
+    oracle row carries the exact analytic marginal rather than TabICLv2's --
+    same five rows, same shared color scale and Moran's I annotation, only the
+    labels differ (see eval/runners/analytic_copula_report.py). Defaults
+    reproduce the original TabICL-era labels exactly, so existing callers are
+    unaffected.
+
+    Returns whatever _plot_field_grid returns: None when `output_path` is a
+    path (saved and closed), or the open Figure when it is None."""
     col_titles = [f"draw {i + 1}" for i in range(len(true_fields))]
-    _plot_field_grid(
+    return _plot_field_grid(
         grid_y, grid_x, grid_shape, true_fields, col_titles, output_path,
-        row0_label="Ground truth\n(synthetic kernel)\ny", suptitle="Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
+        row0_label="Ground truth\n(synthetic kernel)\ny", suptitle=suptitle,
         predicted_fields=predicted_fields_true_z, predicted_fields_2=predicted_fields_tabicl_z,
         independent_fields=independent_fields, context_coords=context_coords,
         oracle_fields=oracle_fields,
         pred_row_label="Copula model\n(true z_train)\ny",
-        pred2_row_label="Copula model\n(TabICLv2 z_train)\ny",
+        pred2_row_label=pred2_row_label,
         indep_row_label="Independent\n(no copula)\ny",
-        oracle_row_label="Oracle correlation\n+ TabICLv2 marginal\ny",
+        oracle_row_label=oracle_row_label,
         xlabel="x", cbar_label="Field value",
     )

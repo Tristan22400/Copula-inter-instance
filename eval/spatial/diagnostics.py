@@ -36,6 +36,9 @@ __all__ = [
     "get_ground_truth_observations",
     "empirical_spatial_correlation",
     "morans_i",
+    "gearys_c",
+    "field_roughness",
+    "semivariogram",
     "predict_copula_residual_field",
     "load_copula_model",
     "load_marginal_tabicl",
@@ -604,3 +607,98 @@ def fit_theoretical_law(
     r_squared = 1.0 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot > 0 else float("nan")
 
     return {"model": model, "law_fn": law_fn, "params": dict(zip(param_names, popt)), "r_squared": r_squared}
+
+
+# ---------------------------------------------------------------------------
+# Sample-quality / smoothness indicators
+# ---------------------------------------------------------------------------
+# morans_i (above) answers "is this single field spatially coherent at all?".
+# The three below are deliberately NOT redundant with it, because a copula
+# model can match global coherence while getting local texture wrong:
+#
+#   - gearys_c    is driven by squared differences between ADJACENT cells, so
+#                 it responds to local roughness that a global cross-product
+#                 statistic like Moran's I averages away. The two disagree
+#                 exactly when a field is globally smooth but locally noisy
+#                 (or vice versa), which is the failure mode worth catching.
+#   - field_roughness is scale-free (divided by the field's own std), so it
+#                 separates "wrong texture" from "wrong amplitude" -- a draw
+#                 with the right correlation but an inflated variance scores
+#                 identically to a correctly-scaled one.
+#   - semivariogram is the only one of the four that resolves LENGTH SCALE
+#                 rather than collapsing to a scalar, and the only one that
+#                 works on scattered (non-lattice) points, so it is what a
+#                 non-grid episode gets scored with.
+#
+# IMPORTANT for interpretation: for every one of these, a good sample is one
+# whose indicator DISTRIBUTION matches the ground truth's, not one that
+# maximizes (or minimizes) the statistic. An over-smooth draw is exactly as
+# wrong as an under-smooth one, and reporting "higher Moran's I = better"
+# would reward the former. Callers should compare distributions (see
+# eval/runners/analytic_copula_report.py's Wasserstein summary), never means.
+
+
+def gearys_c(field: np.ndarray) -> float:
+    """Global Geary's C (Geary, 1954) with rook (4-neighbor) adjacency on a
+    regular (H, W) grid: local contrast, the complement to morans_i's global
+    coherence.
+
+    C = (n-1) * sum_ij w_ij (x_i - x_j)^2 / (2 * W * sum_i (x_i - xbar)^2)
+
+    with W = sum_ij w_ij. Under rook adjacency every edge is counted twice
+    (w_ij and w_ji), so both the numerator's pair sum and W reduce to
+    edge-wise sums, and the factor of 2 cancels out of the ratio below.
+
+    ~1 = spatially random, < 1 = smooth (neighbors alike), > 1 =
+    checkerboard-like. Note the sign convention is INVERTED relative to
+    Moran's I, where +1 is the smooth end."""
+    x = field - field.mean()
+    denominator = (x ** 2).sum()
+    if denominator <= 0:
+        return float("nan")
+    diff_h = np.diff(field, axis=1)
+    diff_v = np.diff(field, axis=0)
+    n_edges = diff_h.size + diff_v.size
+    numerator = (diff_h ** 2).sum() + (diff_v ** 2).sum()
+    return float((field.size - 1) * numerator / (2.0 * n_edges * denominator))
+
+
+def field_roughness(field: np.ndarray) -> float:
+    """Mean absolute finite-difference gradient magnitude on a regular (H, W)
+    grid, divided by the field's own standard deviation.
+
+    The normalization is the point: an uncalibrated roughness measure cannot
+    tell "this draw has the wrong texture" from "this draw has the right
+    texture but the wrong amplitude", and a Gaussian-copula sample's
+    amplitude is set by the marginal, not by the correlation matrix under
+    test. Dividing by the std makes this respond only to shape."""
+    std = float(field.std())
+    if std < 1e-12:
+        return float("nan")
+    mean_abs_grad = 0.5 * (float(np.abs(np.diff(field, axis=1)).mean())
+                           + float(np.abs(np.diff(field, axis=0)).mean()))
+    return mean_abs_grad / std
+
+
+def semivariogram(values: np.ndarray, dist: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    """Empirical semivariogram gamma(h) = 0.5 * mean over pairs in bin h of
+    (z_i - z_j)^2, for a flat (D,) field and its (D, D) pairwise distance
+    matrix.
+
+    Unlike the three scalar indicators above this needs no lattice, so it is
+    the indicator that still works on scattered test points. Shares
+    _bin_indices with bin_correlation_by_distance, so a semivariogram and a
+    correlation-vs-distance curve computed from the same `bin_edges` are
+    binned identically and can be read against each other; empty bins come
+    back NaN rather than 0."""
+    iu = np.triu_indices(len(values), k=1)
+    d = dist[iu]
+    sq_diff = 0.5 * (values[iu[0]] - values[iu[1]]) ** 2
+    n_bins = len(bin_edges) - 1
+    bin_idx = _bin_indices(d, bin_edges)
+    out = np.full(n_bins, np.nan)
+    for b in range(n_bins):
+        sel = bin_idx == b
+        if sel.any():
+            out[b] = float(sq_diff[sel].mean())
+    return out
