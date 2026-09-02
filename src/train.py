@@ -1642,6 +1642,11 @@ def validate(
     if all_oracle_total:
         metrics["oracle_diag/copula_nll"] = float(np.mean(all_oracle_copula))
         metrics["oracle_diag/total_nll"] = float(np.mean(all_oracle_total))
+        # y_space_nll's "total" is copula+marginal exactly (loss.py:729-730),
+        # and that identity survives averaging by linearity, so this is a
+        # subtraction of two quantities already computed above, not new
+        # compute — no separate all_oracle_marginal accumulator needed.
+        metrics["oracle_diag/marginal_nll"] = metrics["oracle_diag/total_nll"] - metrics["oracle_diag/copula_nll"]
     if nll_post_per_point:
         # total_nll and y_nll_oracle_posterior are scored on the SAME
         # episode population (whichever source supplied it above) — gap_nll,

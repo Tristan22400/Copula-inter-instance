@@ -258,7 +258,7 @@ def run_real_config(
 
     # Held-out points (never in context) for the joint-NLL score below —
     # drawn from the SAME rng stream right after context_idx, matching
-    # eval/runners/compare_marginal_backbones.py::run_task's synthetic-mode
+    # debug/stages/s7_backbone.py::run_task's synthetic-mode
     # analogue. x_train_norm/x_test_norm recomputes what
     # extract_model_context_correlation does internally per call, needed
     # here directly for tabicl_quantiles's one-shot marginal fit.
