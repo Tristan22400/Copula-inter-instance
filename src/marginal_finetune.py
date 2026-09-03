@@ -30,9 +30,15 @@ known in closed form:
 and since TabICL's regression head emits 999 quantile *values* at fixed levels
 ``alpha_k``, the target for the head is simply ``mu_i + sigma_i * Phi^-1(alpha_k)``
 — an elementwise regression target needing no new distribution code. That turns
-"make the marginal correct" from high-variance one-sample MLE into low-variance
-distillation against a dense exact target, with strictly proper scores (NLL,
-CRPS) carrying the actual correctness guarantee.
+"make the marginal correct" measurable against a dense exact target. The
+production objective is nevertheless direct pinball loss on fresh conditional
+draws: it is the strictly consistent quantile score TabICL was pretrained with,
+and controlled A/B runs improved both GP and ERA5 validation while dense target
+distillation degraded both. Exact distillation remains useful as a low-noise
+single-episode optimization diagnostic. NLL remains the headline validation
+metric, but is not optimized directly because its sparse segment-selection
+gradient destabilizes the raw quantile decoder (details in
+``marginal_objective``).
 
 Two traps this module exists to not fall into
 ---------------------------------------------
@@ -380,22 +386,24 @@ def episode_fold_targets(
 
 
 class MarginalLossWeights:
-    """Weights for ``marginal_objective``'s four terms.
+    """Weights for the marginal fine-tuning loss terms.
 
-    ``distill`` is the dense analytic-quantile regression; ``nll`` and ``crps``
-    are the strictly proper scores that carry the actual correctness guarantee;
+    ``distill`` is the dense analytic-quantile diagnostic; ``pinball`` is the
+    production, strictly consistent sample quantile score; ``nll`` and
+    distribution-based ``crps`` are available as opt-in ablations;
     ``anchor`` is the anti-forgetting pull toward the pretrained weights.
 
-    Set ``distill=0`` on any batch with no analytic target (the real-ERA5
-    mixture fraction) — the proper scores alone are still a valid objective
-    there, they are just higher variance.
+    Set ``distill=0`` and ``pinball>0`` on a batch with no analytic target
+    (the real-ERA5 mixture fraction). Pinball is higher variance than exact
+    distillation but remains statistically consistent for every quantile.
     """
 
     def __init__(
         self,
         distill: float = 1.0,
-        nll: float = 1.0,
-        crps: float = 0.1,
+        nll: float = 0.0,
+        crps: float = 0.0,
+        pinball: float = 0.0,
         anchor: float = 0.0,
         huber_delta: float = 1.0,
         tail_power: float = 0.5,
@@ -403,6 +411,7 @@ class MarginalLossWeights:
         self.distill = float(distill)
         self.nll = float(nll)
         self.crps = float(crps)
+        self.pinball = float(pinball)
         self.anchor = float(anchor)
         self.huber_delta = float(huber_delta)
         self.tail_power = float(tail_power)
@@ -446,15 +455,35 @@ def marginal_objective(
 ) -> dict:
     """Phase-A loss on ``M`` query rows, all in ``normalize_targets`` space.
 
-        L = w_q * Huber( (q_ik - mu_i)/sigma_i , Phi^-1(alpha_k) )   [distillation]
+        L = w_q * Huber( q_ik, mu_i + sigma_i Phi^-1(alpha_k) )       [distillation]
+          + w_p * pinball(alpha_k, y_i - q_ik)                       [quantile score]
           + w_n * ( -log f(y_i) )                                    [NLL,  proper]
           + w_c * CRPS( f, y_i )                                     [CRPS, proper]
 
-    The terms are consistent rather than competing: NLL and CRPS are strictly
-    proper, so their population minimizer over predictive laws is the true
-    conditional ``p(y | x, ctx)`` — and the analytic quantiles ARE that
-    minimizer's quantiles, so distillation is variance reduction aimed at the
-    same optimum, not a second objective pulling elsewhere.
+    The analytic term is direct quantile regression in ``normalize_targets``
+    space.  An earlier version standardized each prediction error by the
+    *posterior* ``sigma_i``.  Although that has the same pointwise optimum, its
+    gradient is proportional to ``1 / sigma_i`` and made nearly deterministic
+    GP rows dominate every clipped optimizer step.  On a fixed validation set,
+    that objective made both GP and ERA5 NLL worse while direct ERA5 pinball
+    improved both.  The inputs and targets here have already been normalized by
+    the context target standard deviation, so a second, per-query scale division
+    is neither needed nor desirable.
+
+    The terms have the same population optimum, but not comparable decoder
+    gradients. ``QuantileDistribution.log_prob`` first locates the two knots
+    surrounding the single observed ``y`` with ``searchsorted`` and then
+    differentiates only through that local interval. With 999 decoder outputs,
+    this makes the NLL gradient both extremely sparse and orders of magnitude
+    larger per active knot than the dense CRPS/distillation gradients. In
+    practice it teaches the raw decoder to permute/collapse knots; the
+    distribution's sorting step hides that from the training NLL until held-out
+    NLL and calibration deteriorate. Distribution-based CRPS also sees sorted
+    knots, making it invariant to raw-output permutations. Therefore ``nll``
+    and ``crps`` are opt-in diagnostic weights (zero in the shipped
+    configuration), while both are always computed and reported. Direct
+    pinball loss preserves quantile identities on real data, and analytic
+    quantile distillation does so on synthetic data.
 
     Args:
         q             : (M, Q) raw decoder quantile values, scaled space.
@@ -463,12 +492,12 @@ def marginal_objective(
         mu, sigma     : (M,) analytic targets, scaled space. Omit to skip the
                         distillation term (real-data mixture batches).
         target_mask   : (M,) bool; rows with a usable analytic target. Rows
-                        outside it still contribute NLL and CRPS -- a kernel
-                        family this repo cannot reconstruct
+                        outside it still contribute configured sample scores;
+                        a kernel family this repo cannot reconstruct
                         (``_kernel_fn_from_task`` raising) is a missing dense
                         target, not a missing observation, so dropping the
-                        whole episode would throw away valid proper-score
-                        signal. ``None`` means "all rows".
+                        whole episode would throw away potentially valid
+                        sample-score signal. ``None`` means "all rows".
         alpha_levels  : (Q,) nominal levels; taken from ``quantile_dist`` if
                         omitted.
 
@@ -481,12 +510,24 @@ def marginal_objective(
     dist = quantile_dist(q)
     nll = -dist.log_prob(y)                     # (M,)
     crps = dist.crps(y)                         # (M,)
+    error = y.unsqueeze(-1) - q
+    pinball = torch.maximum(alpha_levels * error, (alpha_levels - 1.0) * error)
 
     out = {
         "nll": nll.mean(),
         "crps": crps.mean(),
+        "pinball": pinball.mean(),
     }
-    loss = weights.nll * out["nll"] + weights.crps * out["crps"]
+    # Do not spell this as ``0 * nll``: apart from retaining the pathological
+    # sparse NLL graph, IEEE arithmetic would let a diagnostic NaN contaminate
+    # an otherwise finite objective even when its configured weight is zero.
+    loss = q.sum() * 0.0
+    if weights.nll != 0.0:
+        loss = loss + weights.nll * out["nll"]
+    if weights.crps != 0.0:
+        loss = loss + weights.crps * out["crps"]
+    if weights.pinball != 0.0:
+        loss = loss + weights.pinball * out["pinball"]
 
     have_target = mu is not None and sigma is not None and weights.distill != 0.0
     if have_target and target_mask is not None:
@@ -498,12 +539,9 @@ def marginal_objective(
             q_d, mu_d, sig_d = q, mu, sigma
         z_target = _standard_normal_icdf(alpha_levels)                      # (Q,)
         w = quantile_level_weights(alpha_levels, weights.tail_power)        # (Q,)
-        # sigma is a posterior std with the nugget already in it, so it is
-        # bounded below by sqrt(nugget) > 0 -- no clamp needed for the divide,
-        # but keep a floor anyway so a pathological episode cannot produce inf.
-        z_pred = (q_d - mu_d.unsqueeze(-1)) / sig_d.clamp(min=1e-6).unsqueeze(-1)
+        q_target = mu_d.unsqueeze(-1) + sig_d.unsqueeze(-1) * z_target
         per_level = torch.nn.functional.huber_loss(
-            z_pred, z_target.expand_as(z_pred), reduction="none",
+            q_d, q_target, reduction="none",
             delta=weights.huber_delta,
         )
         out["distill"] = (per_level * w).mean()
@@ -720,9 +758,10 @@ def phase_a_batch_loss(
 
     Episodes whose kernel family cannot be reconstructed
     (``NotImplementedError``/``KeyError`` from ``_kernel_fn_from_task``, e.g.
-    whole-chain outer sign modulation) contribute their proper-score terms but
-    no distillation target, rather than crashing the run — the precedent
-    ``gp_analytical_posterior``'s callers already set.
+    whole-chain outer sign modulation) have no distillation target rather than
+    crashing the run. They still contribute any configured sample-score terms;
+    with the shipped pinball loss they still provide valid sample supervision.
+    The precedent ``gp_analytical_posterior``'s callers already set.
     """
     def _mark(name: str, started: float) -> float:
         if timings is not None:
@@ -800,7 +839,7 @@ def phase_a_batch_loss(
                 )
                 mu_tr, sig_tr = episode_fold_targets(ep, train_idx, K, device=device)
             except (NotImplementedError, KeyError):
-                continue  # see docstring: proper scores still apply, target does not
+                continue  # configured sample scores may apply; target does not
             n_ok += 1
             m, sd = batch["y_mean"][b], batch["y_std"][b]
             mu_all[b] = torch.cat([(mu_te - m) / sd, (mu_tr - m) / sd])
@@ -823,6 +862,13 @@ def phase_a_batch_loss(
     res = marginal_objective(
         q_flat, y_flat, tabicl.quantile_dist, weights,
         mu=mu_flat, sigma=sig_flat, target_mask=mask_flat,
+    )
+    # QuantileDistribution sorts raw decoder outputs before scoring them. That
+    # is useful at inference, but can conceal a decoder collapse during
+    # training. Keep the pre-sort crossing rate visible in every train/val
+    # record; the failed NLL-optimized run climbed from ~0.6% to ~49%.
+    res["raw_crossing_frac"] = float(
+        (q_flat[:, 1:] < q_flat[:, :-1]).float().mean().detach()
     )
     _mark("objective", t_part)
     res["n_episodes_with_target"] = n_ok
@@ -994,21 +1040,31 @@ def validate_synthetic_marginal(
     ``val_marginal/mean_nll``/``mean_ece`` degrade is overfitting to the GP
     prior's Gaussianity and should be stopped.
     """
-    zero_w = MarginalLossWeights(distill=0.0, nll=1.0, crps=1.0)
-    nlls, crpss, oracles, eces, kss, clamps, ns = [], [], [], [], [], [], []
+    # Report the actual synthetic training objective on the fixed validation
+    # episodes too. Previously validation only reported density scores, so a
+    # run could not distinguish poor loss generalization from a broken update.
+    metric_w = MarginalLossWeights(distill=1.0, nll=0.0, crps=0.0)
+    nlls, crpss, distills, oracles, crossings = [], [], [], [], []
     for episodes in episode_batches:
         res = phase_a_batch_loss(
-            tabicl, episodes, zero_w, k_folds=k_folds,
+            tabicl, episodes, metric_w, k_folds=k_folds,
             folds_per_step=None, device=device, eps=eps,
         )
         nlls.append(float(res["nll"]))
         crpss.append(float(res["crps"]))
+        distills.append(float(res["distill"]))
         oracles.append(res["oracle_nll"])
-        ns.append(len(episodes))
+        crossings.append(res["raw_crossing_frac"])
     out = {
         "val_marginal/gp/nll": float(np.mean(nlls)) if nlls else float("nan"),
         "val_marginal/gp/crps": float(np.mean(crpss)) if crpss else float("nan"),
+        "val_marginal/gp/distill": (
+            float(np.mean(distills)) if distills else float("nan")
+        ),
         "val_marginal/gp/nll_oracle": float(np.nanmean(oracles)) if oracles else float("nan"),
+        "val_marginal/gp/raw_crossing_frac": (
+            float(np.mean(crossings)) if crossings else float("nan")
+        ),
     }
     out["val_marginal/gp/nll_gap_to_oracle"] = out["val_marginal/gp/nll"] - out["val_marginal/gp/nll_oracle"]
     return out

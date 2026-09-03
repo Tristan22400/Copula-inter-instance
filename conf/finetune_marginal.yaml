@@ -2,7 +2,7 @@
 # Phase A — fine-tune a standalone TabICL so its marginal posterior predictive
 # is CORRECT for the GP prior the copula is trained on.
 #
-#   python src/finetune_marginal.py                       # tier 0, defaults
+#   python src/finetune_marginal.py                       # tier 3, defaults
 #   python src/finetune_marginal.py marginal.tier=1 training.lr=2e-5
 #
 # Output: a checkpoint in TabICL's own {"config", "state_dict"} schema, so it is
@@ -40,11 +40,10 @@ marginal:
   ckpt: tabicl-regressor-v2-20260212.ckpt
 
   # Tier ladder — see marginal_finetune.TIER_SPECS for what each selects and
-  # why. 0 = label path + ICL norms + decoder (~1.6M, 5.5%). Escalate to 1 only
-  # if val_marginal/gp/nll_gap_to_oracle plateaus above zero: tier 0 can rescale
-  # and remap what the trunk computes but cannot change how much context row j
-  # influences query row i, which is what posterior contraction needs.
-  tier: 0
+  # why. The default adapts attention throughout the backbone because posterior
+  # contraction depends on how context rows influence each query. Tiers 0–2
+  # remain available as capacity ablations.
+  tier: 3
   lora_rank: 8
   lora_alpha: 16.0
   lora_target: qkvo
@@ -67,14 +66,21 @@ marginal:
   pit_eps: ${data.pit_eps}
 
   loss:
-    # Distillation against the analytic quantiles: mu_i + sigma_i*Phi^-1(alpha_k).
-    # Variance reduction, not a second objective — the analytic quantiles ARE
-    # the proper scores' population minimizer's quantiles.
-    distill: 1.0
-    # The strictly proper terms. These are what actually guarantee calibration:
-    # their population minimizer over predictive laws is the true conditional.
-    nll: 1.0
-    crps: 0.1
+    # Exact-quantile Huber distillation remains available for diagnostics and
+    # the one-episode overfit test, but is off in production. Although its
+    # target is correct, weighting all 999 knots directly caused destructive
+    # updates on the broad GP prior. Raw pinball improved both fixed GP and
+    # held-out ERA5 NLL in the controlled A/B test and matches TabICL's
+    # pretraining objective.
+    distill: 0.0
+    # NLL is always reported, but is not optimized by default. For the
+    # piecewise-quantile density its gradient reaches only the two knots around
+    # each observed y and previously drove raw crossings close to 50%.
+    nll: 0.0
+    crps: 0.0
+    # Fresh GP episodes provide unbiased samples from the conditional law, so
+    # pinball is a consistent stochastic objective—not one-example fitting.
+    pinball: 1.0
     # Anti-forgetting pull toward the pretrained weights. Off by default —
     # tier topology + low LR + the ERA5 mixture are the first-line guards, and
     # this one costs a full extra parameter copy. Turn it on if
@@ -92,8 +98,17 @@ marginal:
     # value is NON-Gaussian tabular marginals. Training on GP episodes alone
     # invites collapsing the head to "always Gaussian" and destroying exactly
     # the transfer that makes a TabICL marginal worth having. These batches get
-    # the proper scores only (no analytic target exists, and none is needed).
+    # direct pinball loss only (no analytic target exists).
     mix_frac: 0.2
+    # No analytic distribution exists for ERA5, so use direct pinball loss,
+    # the dense quantile-index-aware score TabICL was pretrained with. CRPS is
+    # a valid distribution score but operates after sorting and therefore
+    # cannot penalize raw decoder crossings. The sparse spline-NLL gradient
+    # remains off; NLL and CRPS are still computed and logged.
+    loss:
+      nll: 0.0
+      crps: 0.0
+      pinball: 1.0
     # 2013-01 .. 2022-12. Disjoint from era5_global_val/ (2023) by construction;
     # tests/test_marginal_finetune.py asserts it.
     corpus_dir: ./eval/data/cache/era5_global_train
@@ -113,12 +128,12 @@ training:
   # neural network and retains float32 storage/output.
   matmul_precision: high
   batch_size: 8
-  steps: 20000
-  # 4e-5: finetune_era5.py's empirical precedent, ~20x below the pretraining
-  # default. AdamW rather than Muon deliberately — src/muon.py:64-65 warns it
-  # "may not work well for finetuning pretrained models", and Phase A is
-  # exactly that.
-  lr: 4.0e-5
+  steps: 200000
+  # Full-backbone attention LoRA is more expressive than Tier 0 and needs a
+  # conservative step size. AdamW rather than Muon deliberately —
+  # src/muon.py:64-65 warns it "may not work well for finetuning pretrained
+  # models", and Phase A is exactly that.
+  lr: 1.0e-5
   warmup_steps: 200
   lr_min_frac: 0.1
   weight_decay: 0.01
@@ -127,10 +142,18 @@ training:
   # the hot loop runs without timing synchronizations.
   profile_steps: 10
   log_every: 50
-  val_every: 500
+  # The controlled run reached its best ERA5 validation near step 200 before
+  # a small rebound, so validate densely enough to retain that early optimum.
+  val_every: 200
   save_every: 2000
-  ckpt_dir: ./checkpoints/marginal_finetune
+  ckpt_dir: ./checkpoints/marginal_finetune_2
   resume_ckpt: null
+  # Keep the best fixed-validation model in memory and restore it before the
+  # final checkpoint. This explicitly protects against returning a checkpoint
+  # worse than the pretrained step-0 model.
+  restore_best: true
+  selection_metric: val_marginal/mean_nll
+  selection_min_delta: 0.0
 
 validation:
   # The copula run's own ERA5 validation geometry, reused verbatim

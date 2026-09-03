@@ -36,6 +36,7 @@ logic, only a duplicated ``for step in range(...)``.
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import sys
@@ -244,14 +245,21 @@ def main(cfg: DictConfig) -> None:
         distill=float(cfg.marginal.loss.distill),
         nll=float(cfg.marginal.loss.nll),
         crps=float(cfg.marginal.loss.crps),
+        pinball=float(cfg.marginal.loss.pinball),
         anchor=float(cfg.marginal.loss.anchor),
         huber_delta=float(cfg.marginal.loss.huber_delta),
         tail_power=float(cfg.marginal.loss.tail_power),
     )
-    # Real-data batches carry no analytic target, so distillation is off there.
-    # The proper scores alone are still a valid (higher-variance) objective.
+    # Both sources use raw quantile-index-aware pinball in the shipped config.
+    # Synthetic weights remain separate because exact-target distillation is a
+    # useful opt-in diagnostic there, while ERA5 has no analytic target.
+    era5_loss_cfg = cfg.marginal.era5.loss
     era5_weights = MarginalLossWeights(
-        distill=0.0, nll=weights.nll, crps=weights.crps, anchor=weights.anchor,
+        distill=0.0,
+        nll=float(era5_loss_cfg.nll),
+        crps=float(era5_loss_cfg.crps),
+        pinball=float(era5_loss_cfg.pinball),
+        anchor=weights.anchor,
         huber_delta=weights.huber_delta, tail_power=weights.tail_power,
     )
     anchor = AnchorPenalty(tabicl) if weights.anchor > 0 else None
@@ -287,6 +295,18 @@ def main(cfg: DictConfig) -> None:
     folds_per_step = cfg.marginal.folds_per_step
     folds_per_step = None if folds_per_step is None else int(folds_per_step)
     mix_frac = float(cfg.marginal.era5.mix_frac)
+    if not 0.0 <= mix_frac <= 1.0:
+        raise ValueError(f"marginal.era5.mix_frac must be in [0, 1], got {mix_frac}")
+
+    def _has_sample_objective(w: MarginalLossWeights) -> bool:
+        return any(value != 0.0 for value in (w.distill, w.nll, w.crps, w.pinball))
+
+    # Fail loudly instead of launching an expensive run whose loss is exactly
+    # zero. This also catches misspelled/partial Hydra loss overrides early.
+    if mix_frac < 1.0 and not _has_sample_objective(weights):
+        raise ValueError("Synthetic batches have no non-zero marginal loss weight.")
+    if mix_frac > 0.0 and not _has_sample_objective(era5_weights):
+        raise ValueError("ERA5 batches have no non-zero marginal loss weight.")
 
     era5_sampler = None
     if mix_frac > 0:
@@ -332,7 +352,7 @@ def main(cfg: DictConfig) -> None:
         if run is not None:
             run.log(payload, step=step)
 
-    def _validate(step: int) -> None:
+    def _validate(step: int) -> dict[str, float]:
         t0 = time.time()
         t_era5 = time.time()
         metrics = validate_era5_marginal(tabicl, era5_val, eps=eps)
@@ -352,12 +372,14 @@ def main(cfg: DictConfig) -> None:
             f"ece={metrics.get('val_marginal/mean_ece', float('nan')):.4f} "
             f"ks={metrics.get('val_marginal/mean_ks', float('nan')):.4f} | "
             f"gp nll={metrics.get('val_marginal/gp/nll', float('nan')):.4f} "
+            f"distill={metrics.get('val_marginal/gp/distill', float('nan')):.4f} "
             f"oracle={metrics.get('val_marginal/gp/nll_oracle', float('nan')):.4f} "
             f"gap={metrics.get('val_marginal/gp/nll_gap_to_oracle', float('nan')):.4f} | "
             f"{metrics['val_marginal/seconds']:.2f}s "
             f"(era5 {metrics['val_marginal/era5_seconds']:.2f}s, "
             f"gp {metrics['val_marginal/gp_seconds']:.2f}s)"
         )
+        return metrics
 
     def _save(step: int, tag: str = "") -> str | None:
         if cfg.training.ckpt_dir is None:
@@ -373,7 +395,52 @@ def main(cfg: DictConfig) -> None:
         return path
 
     # ---- train -----------------------------------------------------------
-    _validate(0)
+    initial_metrics = _validate(0)
+    selection_metric = str(cfg.training.get(
+        "selection_metric", "val_marginal/mean_nll"
+    ))
+    if selection_metric not in initial_metrics:
+        raise KeyError(
+            f"training.selection_metric={selection_metric!r} was not emitted by "
+            f"validation. Available metrics: {sorted(initial_metrics)}"
+        )
+    best_value = float(initial_metrics[selection_metric])
+    if not math.isfinite(best_value):
+        raise RuntimeError(
+            f"Initial selection metric {selection_metric} is non-finite: {best_value}"
+        )
+    best_step = 0
+    selection_min_delta = float(cfg.training.get("selection_min_delta", 0.0))
+
+    def _snapshot_trainable() -> dict[str, torch.Tensor]:
+        # Frozen base tensors never change. Keeping only trainable tensors makes
+        # validation selection cheap even for the full pretrained backbone.
+        return {
+            name: p.detach().cpu().clone()
+            for name, p in tabicl.named_parameters()
+            if p.requires_grad
+        }
+
+    def _restore_trainable(state: dict[str, torch.Tensor]) -> None:
+        named = dict(tabicl.named_parameters())
+        with torch.no_grad():
+            for name, value in state.items():
+                named[name].copy_(value.to(device=named[name].device))
+
+    best_state = _snapshot_trainable()
+
+    def _consider_validation(step: int, metrics: dict[str, float]) -> None:
+        nonlocal best_step, best_value, best_state
+        value = float(metrics[selection_metric])
+        if math.isfinite(value) and value < best_value - selection_min_delta:
+            best_step = step
+            best_value = value
+            best_state = _snapshot_trainable()
+            print(
+                f"[selection] new best {selection_metric}={best_value:.6f} "
+                f"at step {best_step}"
+            )
+
     rng = np.random.default_rng(int(cfg.seed) + 991)
     gen = torch.Generator().manual_seed(int(cfg.seed) + 13)
     B = int(cfg.training.batch_size)
@@ -414,7 +481,7 @@ def main(cfg: DictConfig) -> None:
         if anchor is not None:
             a = anchor(tabicl)
             loss = loss + weights.anchor * a
-            anchor_val = float(a)
+            anchor_val = a.detach().item()
 
         backward_started = time.perf_counter()
         opt.zero_grad(set_to_none=True)
@@ -456,12 +523,14 @@ def main(cfg: DictConfig) -> None:
             dt = (time.time() - t_last) / int(cfg.training.log_every)
             t_last = time.time()
             payload = {
-                "train/loss": float(loss),
-                "train/nll": float(res["nll"]),
-                "train/crps": float(res["crps"]),
-                "train/distill": float(res["distill"]),
+                "train/loss": loss.detach().item(),
+                "train/nll": res["nll"].detach().item(),
+                "train/crps": res["crps"].detach().item(),
+                "train/pinball": res["pinball"].detach().item(),
+                "train/distill": res["distill"].detach().item(),
+                "train/raw_crossing_frac": res["raw_crossing_frac"],
                 "train/anchor": anchor_val,
-                "train/grad_norm": float(gnorm),
+                "train/grad_norm": gnorm.detach().item(),
                 "train/lr": sched.get_last_lr()[0],
                 "train/sec_per_step": dt,
                 "train/is_era5_batch": float(use_era5),
@@ -472,8 +541,11 @@ def main(cfg: DictConfig) -> None:
                 payload["train/nll_gap_to_oracle"] = res["nll_gap_to_oracle"]
             _log(payload, step)
             print(
-                f"step {step:>7} loss={float(loss):.4f} nll={float(res['nll']):.4f} "
-                f"distill={float(res['distill']):.4f} "
+                f"step {step:>7} loss={loss.detach().item():.4f} "
+                f"nll={res['nll'].detach().item():.4f} "
+                f"distill={res['distill'].detach().item():.4f} "
+                f"pinball={res['pinball'].detach().item():.4f} "
+                f"cross={res['raw_crossing_frac']:.3%} "
                 f"gap={res.get('nll_gap_to_oracle', float('nan')):.4f} "
                 f"lr={sched.get_last_lr()[0]:.2e} {dt:.2f}s/step"
                 + ("  [era5]" if use_era5 else "")
@@ -481,15 +553,25 @@ def main(cfg: DictConfig) -> None:
 
         hooks_started = time.time()
         if step % int(cfg.training.val_every) == 0:
-            _validate(step)
+            _consider_validation(step, _validate(step))
         if step % int(cfg.training.save_every) == 0:
             _save(step)
         # Do not charge validation/checkpoint I/O to the next sec_per_step window.
         t_last += time.time() - hooks_started
 
     if total_steps % int(cfg.training.val_every) != 0:
-        _validate(total_steps)
-    final = _save(total_steps, tag="_final")
+        _consider_validation(total_steps, _validate(total_steps))
+
+    if bool(cfg.training.get("restore_best", True)):
+        _restore_trainable(best_state)
+        print(
+            f"[selection] restored step {best_step} with "
+            f"{selection_metric}={best_value:.6f} before final export"
+        )
+        export_step = best_step
+    else:
+        export_step = total_steps
+    final = _save(export_step, tag="_final")
     if final:
         print(
             "\nPhase A done. Use it as the copula run's marginal with:\n"

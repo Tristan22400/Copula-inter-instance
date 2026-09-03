@@ -55,6 +55,7 @@ from marginal_finetune import (
     ks_uniform,
     marginal_objective,
     oracle_marginal_nll,
+    phase_a_batch_loss,
     quantile_level_weights,
     rank_histogram,
 )
@@ -129,7 +130,10 @@ def _rbf_task(P: int = 12, N: int = 5, d: int = 2, ls: float = 0.7,
     kfn = build_kernel_fn("rbf", ls, alpha2, active_dims=list(range(d)))
     K = kfn(x, x) + nugget * torch.eye(P + N)
     L = torch.linalg.cholesky(K.double())
-    y = (L @ torch.randn(P + N, 1, generator=g, dtype=torch.float64)).squeeze(-1).float()
+    # A generated dataset is fixed supervision, not a differentiable function
+    # of the temporary gpytorch kernel parameters. Detaching also permits the
+    # same episode to be reused by the full-path overfit test below.
+    y = (L @ torch.randn(P + N, 1, generator=g, dtype=torch.float64)).squeeze(-1).float().detach()
 
     zero = torch.tensor(0.0)
     return {
@@ -191,6 +195,19 @@ def test_tier1_adds_lora_on_icl_only_and_keeps_tier0():
     assert any(n.startswith("icl_predictor.decoder.") for n in trainable)
     assert any(re.search(r"^icl_predictor\.tf_icl\.blocks\.\d+\.norm[12]\.", n) for n in trainable)
     assert report["n_trainable_params"] > apply_tier(_tiny_tabicl(), 0)["n_trainable_params"]
+
+
+def test_tier3_adds_lora_to_every_backbone_stage():
+    m = _tiny_tabicl()
+    report = apply_tier(m, 3, lora_rank=2, lora_alpha=4.0)
+    lora_names = {
+        name for name, p in m.named_parameters()
+        if p.requires_grad and ("lora_A_" in name or "lora_B_" in name)
+    }
+    assert report["lora_modules_replaced"] > 0
+    assert any(name.startswith("col_embedder.") for name in lora_names)
+    assert any(name.startswith("row_interactor.") for name in lora_names)
+    assert any(name.startswith("icl_predictor.") for name in lora_names)
 
 
 def test_unknown_tier_rejected():
@@ -490,6 +507,117 @@ def test_distillation_respects_target_mask():
     assert float(none["distill"]) == 0.0
 
 
+def test_zero_nll_weight_excludes_nll_from_training_loss_but_still_reports_it():
+    """The shipped objective monitors density NLL without backpropagating its
+    sparse two-knot gradient into the raw 999-quantile decoder."""
+    m = _tiny_tabicl(num_quantiles=33)
+    qd = m.quantile_dist
+    alpha = qd.alpha_levels
+    mu = torch.tensor([0.2, -0.4])
+    sigma = torch.tensor([0.7, 1.3])
+    q = (mu[:, None] + sigma[:, None] * _probit(alpha)[None]).requires_grad_()
+    y = torch.tensor([0.1, 0.3])
+
+    weights = MarginalLossWeights(distill=1.0, nll=0.0, crps=0.0, pinball=1.0)
+    out = marginal_objective(q, y, qd, weights, mu=mu, sigma=sigma)
+
+    assert torch.isfinite(out["nll"]), "NLL must remain available for logging"
+    assert torch.allclose(out["loss"], out["distill"] + out["pinball"])
+    grad = torch.autograd.grad(out["loss"], q)[0]
+    assert torch.isfinite(grad).all()
+    assert (grad != 0).all(), "pinball/distillation should provide dense quantile gradients"
+
+
+def test_pinball_uses_raw_quantile_identity_and_penalizes_permutation():
+    m = _tiny_tabicl(num_quantiles=33)
+    qd = m.quantile_dist
+    alpha = qd.alpha_levels
+    # Deterministic inverse-CDF samples make this a low-variance numerical
+    # approximation to the population score under N(0, 1).
+    y = _probit(torch.linspace(0.0005, 0.9995, 2001))
+    q_star = _probit(alpha).expand(y.numel(), -1)
+    q_reversed = q_star.flip(-1)
+    weights = MarginalLossWeights(distill=0.0, nll=0.0, crps=0.0, pinball=1.0)
+
+    good = marginal_objective(q_star, y, qd, weights)["pinball"]
+    crossed = marginal_objective(q_reversed, y, qd, weights)["pinball"]
+    assert crossed > good * 2
+
+
+def test_exact_distillation_can_overfit_one_predictive_distribution():
+    """A direct single-episode analogue at the decoder boundary: optimizing
+    the diagnostic loss must recover its known analytic quantiles."""
+    torch.manual_seed(7)
+    m = _tiny_tabicl(num_quantiles=33)
+    qd = m.quantile_dist
+    alpha = qd.alpha_levels
+    mu = torch.tensor([0.3, -0.7, 1.1])
+    sigma = torch.tensor([0.4, 0.9, 1.5])
+    target = mu[:, None] + sigma[:, None] * _probit(alpha)[None]
+    q = (target + 0.5 * torch.randn_like(target)).requires_grad_()
+    opt = torch.optim.Adam([q], lr=0.05)
+    weights = MarginalLossWeights(distill=1.0, nll=0.0, crps=0.0)
+
+    initial = marginal_objective(q, mu, qd, weights, mu=mu, sigma=sigma)["loss"].item()
+    for _ in range(100):
+        opt.zero_grad(set_to_none=True)
+        loss = marginal_objective(q, mu, qd, weights, mu=mu, sigma=sigma)["loss"]
+        loss.backward()
+        opt.step()
+    final = marginal_objective(q, mu, qd, weights, mu=mu, sigma=sigma)["loss"].item()
+
+    assert final < initial * 1e-2, (initial, final)
+
+
+def test_distillation_does_not_inverse_variance_weight_sharp_rows():
+    """Equal quantile errors should have equal gradients regardless of the
+    query's posterior sigma. The old z-standardized loss amplified the first
+    row by 1 / 0.05 and let sharp GP points dominate clipped updates."""
+    m = _tiny_tabicl(num_quantiles=33)
+    qd = m.quantile_dist
+    alpha = qd.alpha_levels
+    mu = torch.zeros(2)
+    sigma = torch.tensor([0.05, 2.0])
+    target = mu[:, None] + sigma[:, None] * _probit(alpha)[None]
+    q = (target + 0.01).requires_grad_()
+    out = marginal_objective(
+        q, mu, qd,
+        MarginalLossWeights(distill=1.0, nll=0.0, crps=0.0, pinball=0.0),
+        mu=mu, sigma=sigma,
+    )
+    grad = torch.autograd.grad(out["loss"], q)[0]
+    assert torch.allclose(grad[0], grad[1], rtol=1e-5, atol=1e-8)
+
+
+def test_full_phase_a_path_overfits_one_fixed_synthetic_episode():
+    """Exercise model -> folded PIT -> analytic target -> loss -> optimizer,
+    rather than only optimizing a free tensor at the decoder boundary."""
+    torch.manual_seed(11)
+    model = _tiny_tabicl(num_quantiles=33)
+    episode = _rbf_task(P=8, N=4, d=2, seed=19)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=3e-3, weight_decay=0.0)
+    weights = MarginalLossWeights(
+        distill=1.0, nll=0.0, crps=0.0, pinball=0.0,
+    )
+
+    initial = phase_a_batch_loss(
+        model, [episode], weights, k_folds=2, device="cpu"
+    )["loss"].detach().item()
+    for _ in range(60):
+        optimizer.zero_grad(set_to_none=True)
+        result = phase_a_batch_loss(
+            model, [episode], weights, k_folds=2, device="cpu"
+        )
+        result["loss"].backward()
+        optimizer.step()
+    final = phase_a_batch_loss(
+        model, [episode], weights, k_folds=2, device="cpu"
+    )["loss"].detach().item()
+
+    assert final < initial * 0.2, (initial, final)
+
+
 def test_quantile_level_weights_downweight_the_tails_and_average_to_one():
     a = torch.linspace(0.001, 0.999, 999)
     w = quantile_level_weights(a, tail_power=0.5)
@@ -514,12 +642,12 @@ def test_anchor_penalty_is_zero_at_init_and_grows_with_drift():
     m = _tiny_tabicl()
     apply_tier(m, 0)
     anchor = AnchorPenalty(m)
-    assert float(anchor(m)) == pytest.approx(0.0, abs=1e-12)
+    assert anchor(m).detach().item() == pytest.approx(0.0, abs=1e-12)
     with torch.no_grad():
         for p in m.parameters():
             if p.requires_grad:
                 p.add_(0.01)
-    assert float(anchor(m)) > 0.0
+    assert anchor(m).detach().item() > 0.0
 
 
 # ---------------------------------------------------------------------------
