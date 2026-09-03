@@ -359,10 +359,16 @@ baselines:
                                    # (1000) — the offline sweep's rigor budget
   gp_baseline_val_lr_mle: 0.05
   gp_baseline_val_n_restarts_mle: 1
-  gp_baseline_val_ard: false       # the model sees every d_features column
-                                   # too, with no idea which are active — an
-                                   # ARD baseline would be solving an easier
-                                   # problem than the one being compared
+  gp_baseline_val_ard: true        # one lengthscale per input dimension.
+                                   # NOTE this makes the baseline STRONGER than
+                                   # a strict apples-to-apples comparison: the
+                                   # model sees every d_features column with no
+                                   # idea which are active, whereas an ARD GP
+                                   # can learn to switch off the inactive ones.
+                                   # Deliberate — the point of the baseline is
+                                   # to be hard to beat, not to be handicapped.
+                                   # Set false to recover the isotropic
+                                   # single-lengthscale baseline.
   gp_baseline_val_group_max: 64    # max episodes per batched fit; bounds the
                                    # transient (E, N, N) predictive covariance
 

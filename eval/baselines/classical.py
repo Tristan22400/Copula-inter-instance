@@ -85,6 +85,7 @@ _SRC = os.path.join(_REPO_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from data_gen import full_precision_matmul_fn  # noqa: E402
 from loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
 
@@ -397,6 +398,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
 
 
+@full_precision_matmul_fn
 def fit_and_eval_gpytorch(
     X_train: Tensor,
     y_train: Tensor,
@@ -628,7 +630,15 @@ def fit_and_eval_gpytorch(
         model.set_train_data(inputs=X_train, targets=y_train, strict=False)
     model.eval()
     likelihood.eval()
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+    # This covariance is consumed by an exact log-determinant/solve downstream,
+    # so GPyTorch's LOVE/fast_pred_var approximation is not appropriate here.
+    # At large N it can overshoot the Schur-complement correction enough to
+    # make the materialized covariance indefinite.  The function-wide
+    # full_precision_matmul_fn guard is equally important when train.py has
+    # enabled TF32 process-wide: posterior covariance is a cancellation of
+    # K_ss and K_sf K_ff^-1 K_fs, just like the analytic GP PIT guarded in
+    # pit.py.
+    with torch.no_grad():
         pred = likelihood(model.forward(X_test)) if oracle_mode == "prior" else likelihood(model(X_test))
         mean_post = pred.mean
         Sigma_post = pred.covariance_matrix
@@ -732,6 +742,7 @@ def _batched_sigma_to_correlation(Sigma: Tensor) -> Tensor:
     return R / (d.unsqueeze(-1) * d.unsqueeze(-2))
 
 
+@full_precision_matmul_fn
 def fit_and_eval_gpytorch_batched(
     X_train: Tensor,
     y_train: Tensor,
@@ -783,8 +794,9 @@ def fit_and_eval_gpytorch_batched(
 
     Returns {"R": (E, N, N), "mean": (E, N), "Sigma": (E, N, N),
              "ok": (E,) bool, "loss": (E,)}. `ok` is False for episodes whose
-    every restart produced a non-finite loss or predictive; those carry an
-    identity-R placeholder and callers must drop them rather than score them.
+    every restart produced a non-finite or non-positive-definite predictive;
+    those carry an identity-R placeholder and callers must drop them rather
+    than score them.
     """
     if X_train.dim() != 3 or X_test.dim() != 3 or y_train.dim() != 2:
         raise ValueError(
@@ -849,7 +861,13 @@ def fit_and_eval_gpytorch_batched(
 
             model.eval()
             likelihood.eval()
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            # Materialize the exact predictive covariance. fast_pred_var uses
+            # a LOVE approximation intended for cheap marginal variances; the
+            # returned dense matrix is scored with an exact Cholesky below and
+            # can be substantially indefinite at production N=256. The
+            # function-wide precision guard also opts this cancellation-heavy
+            # GP algebra out of train.py's process-global TF32 setting.
+            with torch.no_grad():
                 pred = (
                     likelihood(model.forward(X_test)) if oracle_mode == "prior"
                     else likelihood(model(X_test))
@@ -861,11 +879,19 @@ def fit_and_eval_gpytorch_batched(
                 )
                 final = loss_vec.detach().double()                            # (E,)
 
+            # A positive diagonal is not enough to establish a valid
+            # covariance.  Keep this check per episode so one pathological fit
+            # is dropped (or recovered by a later restart) without poisoning
+            # the whole batched Cholesky in y_space_nll.
+            covariance_pd = torch.linalg.cholesky_ex(
+                Sigma_r, check_errors=False
+            ).info.eq(0)
             finite = (
                 torch.isfinite(final)
                 & torch.isfinite(mean_r).all(dim=-1)
                 & torch.isfinite(Sigma_r).flatten(1).all(dim=-1)
                 & (Sigma_r.diagonal(dim1=-2, dim2=-1) > 0).all(dim=-1)
+                & covariance_pd
             )
             # Per-EPISODE restart selection: one episode converging badly on
             # restart 0 must not cost every other episode its good fit, which

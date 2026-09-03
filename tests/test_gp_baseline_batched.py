@@ -14,6 +14,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+import eval.baselines.classical as classical
 from data_gen import generate_gp_batch
 from eval.baselines.classical import (
     fit_and_eval_gpytorch,
@@ -88,6 +89,43 @@ def test_batched_output_is_a_valid_correlation_matrix_per_episode(small_cfg, ker
     # Positive definite after the jitter fit_and_eval_gpytorch_batched adds.
     torch.linalg.cholesky(R.double())
     assert torch.isfinite(out["loss"]).all()
+
+
+def test_batched_fit_uses_full_matmul_precision_and_restores_caller(small_cfg, monkeypatch):
+    """train.py enables TF32 globally, but exact GP posterior covariance is a
+    cancellation and must opt out without changing the training setting after
+    the baseline fit returns."""
+    ep = _episodes(small_cfg, 1, P=8, N=12)[0]
+    observed = []
+    original_forward = classical._BatchedExactGPModel.forward
+
+    def recording_forward(self, x):
+        observed.append(
+            (
+                torch.get_float32_matmul_precision(),
+                classical.gpytorch.settings.fast_pred_var.on(),
+            )
+        )
+        return original_forward(self, x)
+
+    monkeypatch.setattr(classical._BatchedExactGPModel, "forward", recording_forward)
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("high")
+        fit_and_eval_gpytorch_batched(
+            ep["x_norm_train"].unsqueeze(0),
+            ep["y_train"].unsqueeze(0),
+            ep["x_norm_test"].unsqueeze(0),
+            "matern32",
+            n_steps=2,
+            lr=LR,
+            oracle_mode="posterior",
+        )
+        assert observed and {precision for precision, _ in observed} == {"highest"}
+        assert not any(fast_pred_var for _, fast_pred_var in observed)
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 def test_shape_contract_is_enforced(small_cfg):
