@@ -255,12 +255,28 @@ def _kernel_priors(prior_cfg: dict, kernel_name: str, ard: bool = False) -> dict
     automatically, pulling the fit toward the same hyperparameter regime the
     episodes were actually generated from.
 
-    ard=True omits the lengthscale prior specifically: LogNormal(l_loc, l_scale)
-    describes the lengthscale of a dimension already known to be active — its
-    median-1 pull actively discourages the "grow arbitrarily large" behaviour
-    an ARD lengthscale needs to correctly flag a dimension as irrelevant.
-    Outputscale/noise priors showed no such conflict (they aren't asked to do
-    variable selection) and stay on unconditionally.
+    The lengthscale prior is registered for ARD fits too. It previously was
+    NOT, on the argument that LogNormal(l_loc, l_scale) describes the
+    lengthscale of a dimension already known to be active, so its median-1 pull
+    discourages the "grow arbitrarily large" behaviour an ARD lengthscale needs
+    to flag a dimension as irrelevant. That argument is sound in the limit and
+    badly wrong at the P=32 context sizes these baselines actually see: it
+    leaves d+1 (matern32) or d+2 (rational_quadratic) hyperparameters fit by
+    pure MLE from 32 points with nothing regularising them, and the fits
+    overfit into predictive correlations that score WORSE THAN INDEPENDENCE.
+
+    Measured on the 512-episode analytic_only val set, shared-marginal copula
+    NLL per point (0 = independence, oracle = -0.3746), 300 steps, 1 restart:
+
+        kernel             ARD, no ls prior   ARD, ls prior   isotropic
+        matern32   d=7           +0.0752          -0.0984        -0.0597
+        matern32   d=13          +0.1056          +0.0426        +0.1319
+        rat.quad.  d=7           +0.3689          +0.0764        +0.0310
+        rat.quad.  d=13          +0.7031          +0.1020        +0.3085
+
+    Keeping the prior is worth up to 0.6 nats/point and is what makes an ARD
+    baseline competitive with the isotropic one at all. NOTE this also changes
+    the offline sweep's gp_mle_ard_* baselines, which were fit the old way.
     """
     cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
     if kernel_name == "dot_product":
@@ -277,8 +293,7 @@ def _kernel_priors(prior_cfg: dict, kernel_name: str, ard: bool = False) -> dict
     priors: dict[str, Prior] = {
         "outputscale_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"]),
     }
-    if not ard:
-        priors["lengthscale_prior"] = LogNormalPrior(cfg["l_lognormal_loc"], cfg["l_lognormal_scale"])
+    priors["lengthscale_prior"] = LogNormalPrior(cfg["l_lognormal_loc"], cfg["l_lognormal_scale"])
     if kernel_name == "periodic":
         priors["period_length_prior"] = LogNormalPrior(cfg["period_lognormal_loc"], cfg["period_lognormal_scale"])
     elif kernel_name == "rational_quadratic":
@@ -294,9 +309,9 @@ def _noise_prior(prior_cfg: dict) -> LogNormalPrior:
 def _lengthscale_init_prior(prior_cfg: dict) -> LogNormalPrior:
     """Same LogNormal distribution _kernel_priors would've used for the
     lengthscale prior — used here only to sample a fresh *initial* value per
-    restart when ard=True omits it as a registered MAP prior, so ARD restarts
-    still diversify their starting point instead of all beginning from
-    gpytorch's identical default init."""
+    restart, so ARD restarts diversify their starting point instead of all
+    beginning from gpytorch's identical default init. (The prior itself is now
+    registered for ARD too; this remains the init sampler.)"""
     cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
     return LogNormalPrior(cfg["l_lognormal_loc"], cfg["l_lognormal_scale"])
 
