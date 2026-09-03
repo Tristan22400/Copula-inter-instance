@@ -25,6 +25,8 @@
 # Any Hydra override passes straight through, e.g.:
 #     oarsub -S "./scripts/finetune_marginal.sh marginal.tier=1 training.lr=2e-5"
 #     oarsub -S "./scripts/finetune_marginal.sh marginal.era5.mix_frac=0.3 training.steps=40000"
+# ERA5-only control (validation remains the held-out 2023 ERA5 split):
+#     oarsub -S "./scripts/finetune_marginal.sh marginal.era5.mix_frac=1.0"
 
 set -euo pipefail
 
