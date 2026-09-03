@@ -361,6 +361,23 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         # kwarg entirely rather than pass None, for every kernel uniformly.
         ard_kw = {} if ard_num_dims is None else {"ard_num_dims": ard_num_dims}
 
+        # ARD needs a BOUNDED lengthscale. _kernel_priors deliberately drops the
+        # lengthscale prior when ard=True so a dimension can be flagged
+        # irrelevant by growing its lengthscale -- but that leaves the growth
+        # completely unregularised, and as l -> inf every kernel here tends to a
+        # constant, i.e. K_ff -> all-ones, which is rank 1. The fit's Cholesky
+        # then fails no matter how much jitter is added (observed: ARD
+        # rational_quadratic at d=13, P=32, every restart failing for all 32
+        # episodes). exp(6) ~ 403 on the z-normalised inputs these baselines see
+        # already means "this dimension does nothing", so the bound costs the
+        # variable-selection behaviour nothing while keeping K_ff full rank.
+        # Fresh Interval per model, never shared -- an Interval holds its bounds
+        # as plain tensors and carries device state in place.
+        if ard_num_dims is not None:
+            ard_kw["lengthscale_constraint"] = gpytorch.constraints.Interval(
+                math.exp(-6.0), math.exp(6.0),
+            )
+
         if kernel_name == "rbf":
             base = gpytorch.kernels.RBFKernel(lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
         elif kernel_name in _MATERN_NU:
@@ -687,6 +704,23 @@ class _BatchedExactGPModel(gpytorch.models.ExactGP):
         # Same "omit ard_num_dims entirely rather than pass None" quirk as
         # _ExactGPModel (PeriodicKernel reads it out of kwargs directly).
         ard_kw = {} if ard_num_dims is None else {"ard_num_dims": ard_num_dims}
+
+        # ARD needs a BOUNDED lengthscale. _kernel_priors deliberately drops the
+        # lengthscale prior when ard=True so a dimension can be flagged
+        # irrelevant by growing its lengthscale -- but that leaves the growth
+        # completely unregularised, and as l -> inf every kernel here tends to a
+        # constant, i.e. K_ff -> all-ones, which is rank 1. The fit's Cholesky
+        # then fails no matter how much jitter is added (observed: ARD
+        # rational_quadratic at d=13, P=32, every restart failing for all 32
+        # episodes). exp(6) ~ 403 on the z-normalised inputs these baselines see
+        # already means "this dimension does nothing", so the bound costs the
+        # variable-selection behaviour nothing while keeping K_ff full rank.
+        # Fresh Interval per model, never shared -- an Interval holds its bounds
+        # as plain tensors and carries device state in place.
+        if ard_num_dims is not None:
+            ard_kw["lengthscale_constraint"] = gpytorch.constraints.Interval(
+                math.exp(-6.0), math.exp(6.0),
+            )
         self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
 
         if kernel_name == "rbf":
