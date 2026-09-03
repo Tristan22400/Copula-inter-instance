@@ -105,6 +105,40 @@ mlp_num_layers_max: 4
 # fan-in scaling -- keeps the pre-activation roughly variance-preserving.
 mlp_mix_weight_std: 1.0
 
+# Kernel-hidden warp: optionally evaluate kernel_obj/mean_module (the R_star/
+# Sigma_star/mu_star oracle, AND the actual GP draw y_all) on a further,
+# HIDDEN-ONLY transform of x_norm that the model never sees -- unlike
+# mlp_mixing above (which the model DOES see, since it runs before
+# x_norm_train/x_norm_test are cut), this exists purely to stop the model
+# from solving "predict R_star" by recognising the kernel family straight off
+# its own input. See data_gen.py::apply_kernel_hidden_warp for why the
+# down-projection bottleneck (not just extra depth) is what actually
+# prevents this. Default off: byte-for-byte no-op for every existing
+# config/dataset -- unvalidated at scale, same convention as
+# structural_warp_enabled below; validate against
+# tests/test_dataset_corr_uniform.py on a pilot dataset before enabling.
+kernel_hidden_enabled: false
+# Fraction of episodes per generate_gp_batch call that get the hidden warp
+# at all (Bernoulli gate); the rest fall back to oracle == x_norm (same
+# per-episode-gate convention as mlp_mixing_prob). Default 1.0 (always on
+# once enabled) since this defines the generative ground truth, not a
+# stylistic augmentation like mlp_mixing.
+kernel_hidden_prob: 1.0
+# Number of hidden mixing layers (at the reduced bottleneck width), sampled
+# once per batch call. Kept small for the same reason as mlp_num_layers_*.
+kernel_hidden_layers_min: 1
+kernel_hidden_layers_max: 2
+# Bottleneck width as a fraction of d_features: r = round(frac * d), clamped
+# to [1, d-1] so it's always a genuine (non-trivial) rank reduction. This is
+# the knob that matters -- fan-in-scaled d->d layers alone are close to an
+# isometry (JL-type concentration) and can be absorbed as a single unknown
+# lengthscale rescaling; the rank-deficient down-projection below is what
+# actually destroys pairwise-distance ordering.
+kernel_hidden_bottleneck_frac: 0.5
+# Std of each layer's random weight matrix before fan-in scaling (same role
+# as mlp_mix_weight_std, applied at each stage's own input width).
+kernel_hidden_weight_std: 1.0
+
 # Structural feature warp: optionally apply TempoPFN-inspired (github.com/
 # automl/TempoPFN) transforms to each feature column independently, per
 # episode -- mirrors TempoPFN's own 6-category orchestration
