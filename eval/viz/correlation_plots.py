@@ -287,6 +287,8 @@ def plot_residual_grid(
     data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: "str | None",
     context_coords: "np.ndarray | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
+    oracle_fields: "list[np.ndarray] | None" = None,
+    oracle_row_label: str = "Exact GP posterior\n(fitted kernel)\nsample\nLatitude",
     target: str = "raw",
 ):
     """Small-multiples panel of the `target` field (raw temperature Z_t by
@@ -299,7 +301,17 @@ def plot_residual_grid(
     marginal-per-point prediction with the copula's cross-location
     correlation switched off (R replaced by the identity), isolating what
     the learned correlation structure itself adds on top of the per-point
-    marginal. If `context_coords` is given, the real-context locations that
+    marginal. If `oracle_fields` is given, it is rendered ABOVE the model
+    rows as a reference predictor -- for src/train.py's val/era5_predictions
+    figure that is one draw from an exact GP posterior fitted on the same
+    sparse context (see train.py::_era5_viz_gp_field), so the copula model's
+    sample can be compared against what a classical GP actually produces on
+    the identical problem rather than against the ground-truth field alone.
+    That comparison matters because the ground truth is a single realization
+    with full information, while both the GP row and the model row are
+    posterior SAMPLES at ~5% context -- judging the model against the smooth
+    truth rewards overconfidence, judging it against the GP's own sample
+    does not. If `context_coords` is given, the real-context locations that
     condition both predicted rows are overlaid as black markers on those
     rows only.
 
@@ -330,10 +342,14 @@ def plot_residual_grid(
             else "Raw Temperature Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
         )
         cbar_label = "Temperature (deg C)"
+    if oracle_fields is not None and predicted_fields is not None:
+        suptitle += "\n(rows 2-4 are posterior SAMPLES on the same context and the same latent noise)"
     return _plot_field_grid(
         lat, lon, grid_shape, true_fields, col_titles, output_path,
         row0_label="Ground truth\nLatitude", suptitle=suptitle,
-        predicted_fields=predicted_fields, independent_fields=independent_fields, context_coords=context_coords,
+        predicted_fields=predicted_fields, independent_fields=independent_fields,
+        oracle_fields=oracle_fields, oracle_row_label=oracle_row_label,
+        context_coords=context_coords,
         cbar_label=cbar_label,
     )
 

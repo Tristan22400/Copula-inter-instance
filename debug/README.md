@@ -58,6 +58,7 @@ undertraining. That's why S1 (rank ceiling) is the stage to run first.
 |---|---|---|
 | **S0** `s0_signal.py` | How much copula signal does this prior even offer, as a function of context size P? | no |
 | **S1** `s1_rank_ceiling.py` | **The key stage.** Exact rank-r ceiling: the best a `covnorm` factor model of rank r *could* do against `R_post`, no sampling noise. Sweeps r; model rank stays fixed at 32 by design (see "Rank is fixed" below). | no |
+| **S1b** `s1b_rank_gap_decomp.py` | S1's ceiling re-expressed as a **gap to the exact GP posterior**, which is what says whether rank actually binds. Also fits an alternative basis — a sparse-GP Schur complement `K_theta - K_su(K_uu+D)^-1 K_us`, i.e. prior kernel minus rank-m correction, the shape `K_post` genuinely has — and reports `n_params` alongside, since a head must emit these per episode. | no |
 | **S2** `s2_uspace.py` | u-space (PIT) audit: calibration (KS/ECE/reliability curve) + a **clamping census** — how much mass piles onto the hard `_probit` clamp (`u≤1e-6`) and TabICL's spline-knot boundary (`u≤1e-3`), pooled and per-episode. | no |
 | **S3** `s3_pit_floor.py` | Attainable copula floor once TabICL's own PIT (not the oracle) is the marginal — decomposes the gap into rank-ceiling loss vs. PIT-distortion loss. | no |
 | **S4** `s4_overfit.py` | Single-episode overfit sanity check. `--target prior\|posterior`, `--z-source oracle\|tabicl`. | no (trains from scratch) |

@@ -591,6 +591,14 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     context_frac = float(ecfg.get("era5_viz_context_frac", 0.05))
     seed = int(ecfg.get("era5_viz_seed", 20260825))
     pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
+    # Exact-GP reference row (see _era5_viz_gp_posterior). Reuses the
+    # era5_gp_*_mle knobs the era5_fit NLL probe's baseline already reads,
+    # so there's one place to tune fit fidelity for both.
+    gp_row_enabled = bool(ecfg.get("era5_viz_gp", True))
+    gp_row_kernel = str(ecfg.get("era5_viz_gp_kernel", "matern32"))
+    gp_row_n_steps = int(ecfg.get("era5_gp_n_steps_mle", 300))
+    gp_row_lr = float(ecfg.get("era5_gp_lr_mle", GP_LR_MLE))
+    gp_row_n_restarts = int(ecfg.get("era5_gp_n_restarts_mle", 1))
 
     lat_bounds, lon_bounds = ERA5_REGIONS[region_name]
     nc_path = fetch_era5(region_name, lat_bounds, lon_bounds, grid_size, n_days_fetch)
@@ -616,12 +624,19 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
 
     true_fields, z_train_per_day = [], []
     dists_per_day, y_mean_per_day, y_std_per_day = [], [], []
+    gp_post_per_day: list = []
     for d in days:
         frame = data["t2m"][d]
         true_fields.append(frame)
         context_values = frame.ravel()[context_idx]
         z_train_per_day.append(
             compute_context_z_train(x_train_norm, context_values, tabicl_marginal, device, k_folds=pit_k_folds)
+        )
+        gp_post_per_day.append(
+            _era5_viz_gp_posterior(
+                x_train_norm, context_values, x_test_norm, gp_row_kernel,
+                gp_row_n_steps, gp_row_lr, gp_row_n_restarts, device,
+            ) if gp_row_enabled else None
         )
         context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
         context_values_scaled_t, _, y_mean_t, y_std_t = normalize_targets(context_values_t)
@@ -641,8 +656,69 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
         "x_train_norm": x_train_norm, "x_test_norm": x_test_norm,
         "z_train_per_day": z_train_per_day,
         "dists_per_day": dists_per_day, "y_mean_per_day": y_mean_per_day, "y_std_per_day": y_std_per_day,
+        "gp_post_per_day": gp_post_per_day, "gp_row_kernel": gp_row_kernel,
         "seed": seed,
     }
+
+
+def _era5_viz_gp_posterior(
+    x_train_norm: np.ndarray, context_values: np.ndarray, x_test_norm: np.ndarray,
+    kernel_name: str, n_steps: int, lr: float, n_restarts: int, device: str,
+) -> "dict | None":
+    """Exact-GP posterior (mean, Cholesky factor) at the viz grid, fitted by
+    MLE+MAP on the SAME sparse context the copula model sees -- the reference
+    predictor behind val/era5_predictions' "Exact GP posterior sample" row.
+
+    Same fit as the era5_fit/<region> NLL probe's GP baseline
+    (eval/spatial/sweep_core.py::_fit_gp_baseline_nll): identical
+    fit_and_eval_gpytorch call, oracle_mode="posterior" (a real
+    context-conditioned spatial predictor, not the unconditioned prior), and
+    the same z-score-fit-rescale dance -- fit_and_eval_gpytorch's MAP priors
+    are tuned to data_gen.py's ~unit-variance synthetic y-scale, so raw
+    Kelvin has to be standardized before fitting and the posterior rescaled
+    back afterwards, or the prior drags the outputscale/noise to the wrong
+    magnitude.
+
+    Precomputed once per viz day (this is a pure function of the frozen
+    context sample, not of the still-training copula model, exactly like
+    _build_era5_viz_batch's z_train/dists), and the O(D^3) Cholesky is done
+    here rather than per do_plot call so drawing the sample later is one
+    matvec. Returns None -- caller drops the GP row and the figure renders
+    as it did before -- if the fit or the factorization fails, since a
+    reference panel is never worth killing a validation pass over.
+    """
+    from eval.baselines.classical import fit_and_eval_gpytorch
+
+    try:
+        mu_y = float(context_values.mean())
+        sigma_y = max(float(context_values.std(ddof=1)), 1e-6) if len(context_values) > 1 else 1.0
+        X_tr = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
+        X_te = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
+        y_tr = torch.as_tensor((context_values - mu_y) / sigma_y, dtype=torch.float32, device=device)
+        fit = fit_and_eval_gpytorch(
+            X_tr, y_tr, X_te, kernel_name, n_steps=n_steps, lr=lr,
+            oracle_mode="posterior", n_restarts=n_restarts,
+        )
+        mean = (fit["mean"].double() * sigma_y + mu_y).cpu().numpy()
+        Sigma = (fit["Sigma"].double() * (sigma_y ** 2)).cpu().numpy()
+        return {"mean": mean, "L": safe_cholesky(Sigma), "kernel": kernel_name}
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [era5_viz_gp:{kernel_name}] fit failed, dropping GP row: {exc}")
+        return None
+
+
+def _era5_viz_gp_field(gp: dict, z_shared: np.ndarray) -> np.ndarray:
+    """One joint draw (D,) from the fitted exact-GP posterior of
+    _era5_viz_gp_posterior, using the SAME latent white-noise vector
+    `z_shared` that _era5_viz_field injects into the copula model's Sigma.
+
+    Sharing z_shared is the point: the GP row and the copula row then differ
+    ONLY in their correlation structure (and in the GP's own Gaussian
+    marginal), not in which realization of the noise they happened to draw,
+    so a visible difference in smoothness is attributable to the model
+    rather than to sampling luck.
+    """
+    return gp["mean"] + gp["L"] @ z_shared
 
 
 def _era5_viz_field(Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.Tensor, z_shared: np.ndarray, device: str) -> np.ndarray:
@@ -675,9 +751,19 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
     _build_era5_viz_batch probe: reruns the CURRENT model's forward pass
     (the only per-step-changing input) to get Sigma for each of the probe's
     few frozen days, samples one field from it via _era5_viz_field, and
-    renders ground-truth vs. predicted (vs. independent, copula switched
-    off) small multiples via eval.viz.correlation_plots.plot_residual_grid.
+    renders ground-truth vs. exact-GP-posterior vs. predicted (vs.
+    independent, copula switched off) small multiples via
+    eval.viz.correlation_plots.plot_residual_grid.
     Returns None if the probe's grid was degenerate (e.g. 0 valid days).
+
+    The exact-GP row (precomputed by _build_era5_viz_batch, drawn here with
+    the SAME z_shared as the copula row) is the reference that makes the
+    figure readable: both it and the model row are posterior SAMPLES at <5%
+    context, whereas the ground-truth row is a fully-observed realization.
+    Comparing a sample against the truth rewards whichever model is most
+    overconfident -- emitting the prior correlation rather than the
+    posterior gives beautiful smooth fields and a much WORSE held-out NLL.
+    Against the GP's own sample, that trade is visible instead of hidden.
     """
     if not vb["days"]:
         return None
@@ -685,7 +771,8 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
     x_test_v = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
     rng_v = np.random.default_rng(vb["seed"])
     R_indep = np.eye(vb["D"])
-    predicted_fields, independent_fields = [], []
+    predicted_fields, independent_fields, gp_fields = [], [], []
+    gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
     for i in range(len(vb["days"])):
         z_train_v = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
         out_v = model({"x_train": x_train_v, "z_train": z_train_v, "x_test": x_test_v})
@@ -694,10 +781,19 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
         dist_i, y_mean_i, y_std_i = vb["dists_per_day"][i], vb["y_mean_per_day"][i], vb["y_std_per_day"][i]
         predicted_fields.append(_era5_viz_field(Sigma_v, dist_i, y_mean_i, y_std_i, z_shared, device))
         independent_fields.append(_era5_viz_field(R_indep, dist_i, y_mean_i, y_std_i, z_shared, device))
+        if gp_post[i] is not None:
+            gp_fields.append(_era5_viz_gp_field(gp_post[i], z_shared))
+    # All-or-nothing: a partially populated oracle row would silently pair
+    # day j's GP draw with day k's column (_plot_field_grid zips rows against
+    # true_fields positionally), so one failed per-day fit drops the row.
+    oracle_fields = gp_fields if len(gp_fields) == len(vb["days"]) else None
     data_like = {"latitude": vb["lat"], "longitude": vb["lon"], "t2m": dict(zip(vb["days"], vb["true_fields"]))}
     return plot_residual_grid(
         data_like, vb["days"], predicted_fields, output_path=None,
-        context_coords=vb["context_coords"], independent_fields=independent_fields, target="raw",
+        context_coords=vb["context_coords"], independent_fields=independent_fields,
+        oracle_fields=oracle_fields,
+        oracle_row_label=f"Exact GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample\nLatitude",
+        target="raw",
     )
 
 
