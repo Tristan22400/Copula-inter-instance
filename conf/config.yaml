@@ -317,6 +317,19 @@ baselines:
   era5_viz_context_frac: 0.05     # context size is floor(context_frac * grid_size^2) -- strictly < 5%
   era5_viz_seed: 20260825
 
+  # Exact-GP posterior reference row on that same figure
+  # (train.py::_era5_viz_gp_posterior): one draw from a GP fitted by
+  # MLE+MAP on the identical sparse context, sharing the copula row's
+  # latent noise vector so the two rows differ only in correlation
+  # structure. Both rows are posterior SAMPLES -- the ground-truth row is
+  # not -- so this is what stops "looks smoother" from reading as "is
+  # better" (a model emitting the prior instead of the posterior looks
+  # smoothest and scores worst). Fit fidelity reuses the era5_gp_*_mle
+  # knobs above; set era5_viz_gp: false to drop the row and its
+  # one-time-at-startup fit cost.
+  era5_viz_gp: true
+  era5_viz_gp_kernel: matern32    # any eval/baselines/classical.py kernel name
+
 # training.live_source=era5's data knobs (src/era5_live_dataset.py). Ignored
 # unless training.live_generation=true AND training.live_source=era5.
 era5_live:
