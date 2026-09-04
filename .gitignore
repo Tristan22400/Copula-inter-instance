@@ -13,3 +13,4 @@ src/models/__pycache__/
 *.pdf
 *.png
 eval/data/cache/
+.agent/ 
