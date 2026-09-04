@@ -970,8 +970,8 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
-    x_k_train = task["x_norm_train"]   # (P, d_features)
-    x_k_test   = task["x_norm_test"]              # (N, d_features)
+    x_k_train = task.get("x_kernel_train", task["x_norm_train"])   # (P, d_features)
+    x_k_test   = task.get("x_kernel_test", task["x_norm_test"])    # (N, d_features)
     y_train    = task["y_train"]                  # (P,)
     y_test     = task["y_test"]                   # (N,)
     mu_star    = task["mu_star"]                  # (N,) PRIOR mean at the test points
@@ -1160,9 +1160,11 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     # live-generated on GPU, so move x/y onto whatever device _L_ff/_alpha
     # already live on (falling back to x_train's own device when absent,
     # i.e. the recompute-from-scratch branch below, which never leaves CPU).
-    ref_device = task["_L_ff"].device if "_L_ff" in task else task["x_norm_train"].device
-    x_train = task["x_norm_train"].to(ref_device)   # (P, d), float32
-    x_test  = task["x_norm_test"].to(ref_device)    # (N, d), float32
+    x_train_raw = task.get("x_kernel_train", task["x_norm_train"])
+    x_test_raw  = task.get("x_kernel_test", task["x_norm_test"])
+    ref_device = task["_L_ff"].device if "_L_ff" in task else x_train_raw.device
+    x_train = x_train_raw.to(ref_device)   # (P, d), float32
+    x_test  = x_test_raw.to(ref_device)    # (N, d), float32
     y_train = task["y_train"].to(ref_device)         # (P,)
     P, N = x_train.shape[0], x_test.shape[0]
 

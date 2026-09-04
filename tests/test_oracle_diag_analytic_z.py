@@ -221,3 +221,25 @@ def test_corr_kl_is_emitted_and_nonnegative(small_cfg, small_model_cfg):
     assert math.isfinite(m["oracle_diag/corr_kl"])
     assert math.isfinite(m["oracle_diag/corr_kl_p90"])
     assert m["oracle_diag/corr_kl_nonfinite"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 6. kernel_hidden_enabled maintains exact oracle calibration
+# ---------------------------------------------------------------------------
+def test_kernel_hidden_warp_oracle_diag_marginal_gap_vanishes(small_cfg, small_model_cfg):
+    """When data.kernel_hidden_enabled=True, kernel/mean oracle operates on x_kernel
+    rather than x_norm. Validation oracle_diag metrics must remain in exact correspondence
+    (marginal_gap == 0 and copula_gap == gap_nll)."""
+    cfg = _cfg(small_cfg, small_model_cfg)
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_prob = 1.0
+    eps = _episodes(cfg, b=4, seed=5)
+    batches = [collate_fn(eps)]
+    model = build_copula_transformer(cfg)
+    cache = _build_analytic_val_z(batches, {0: eps}, "cpu")
+    m = _run_validate(cfg, model, batches, [eps], cache)
+
+    assert m["oracle_diag/marginal_gap"] == pytest.approx(0.0, abs=1e-3)
+    assert m["oracle_diag/copula_gap"] == pytest.approx(m["oracle_diag/gap_nll"], abs=1e-4)
+    assert m["oracle_diag/copula_headroom"] > 0.0
+

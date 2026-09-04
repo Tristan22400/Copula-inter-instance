@@ -58,15 +58,15 @@ class GlobalERA5Corpus:
         cache_dir: str | None = None,
         *,
         max_months: int | None = None,
+        lazy: bool | None = None,
         _shared: dict | None = None,
     ):
         """`max_months` caps how many monthly files are read (the most recent
-        ones, since paths are sorted by YYYYMM). The full 120-month corpus is
-        ~15GB resident; a caller that only needs an occasional real-data episode
-        -- src/finetune_marginal.py's Phase-A mixture, which runs the marginal
-        in the MAIN process and so has no shared-memory worker trick to amortize
-        the load -- can bound that without needing a separate, hand-curated
-        cache directory. None (the default) reads everything, unchanged."""
+        ones, since paths are sorted by YYYYMM). When lazy is None (the default),
+        corpora with >60 months automatically use lazy on-demand memory-mapped
+        reading in `_day_slice`, keeping resident RAM under 100MB even for the
+        full 33-year (396 months, ~56GB) archive. None for max_months reads
+        everything."""
         if _shared is not None:
             # See from_shared()/load_shared_corpus_arrays() below -- attach
             # to already-loaded, already-shared torch storage instead of
@@ -79,6 +79,8 @@ class GlobalERA5Corpus:
             self.lon = _shared["lon"].numpy()
             self._t2m_by_month = [t.numpy() for t in _shared["t2m_by_month"]]
             self.static = {k: v.numpy() for k, v in _shared["static"].items()}
+            self._paths: list[str] | None = None
+            day_counts = [a.shape[0] for a in self._t2m_by_month]
         else:
             paths = sorted(glob.glob(os.path.join(cache_dir, "era5_global_t2m_*.nc")))
             if not paths:
@@ -89,21 +91,54 @@ class GlobalERA5Corpus:
                 )
             if max_months is not None and max_months > 0:
                 paths = paths[-int(max_months):]
+            self._paths = paths
+
+            if lazy is None:
+                lazy = len(paths) > 60
+
             self.lat: np.ndarray | None = None
             self.lon: np.ndarray | None = None
             self.static: dict[str, np.ndarray] = {}
-            self._t2m_by_month: list[np.ndarray] = []
-            for p in paths:
-                t2m, lat, lon, static = _load_month(p)
-                if self.lat is None:
-                    self.lat, self.lon = lat, lon
-                    if static:
-                        self.static = static
-                self._t2m_by_month.append(t2m)
-            if not self.static:
-                st = load_static()
-                self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
-        day_counts = [a.shape[0] for a in self._t2m_by_month]
+
+            if lazy:
+                self._t2m_by_month = None
+                import calendar
+                import re
+
+                f0 = netcdf_file(paths[0], "r", mmap=True)
+                self.lat = f0.variables["latitude"][:].astype(np.float64).copy()
+                self.lon = f0.variables["longitude"][:].astype(np.float64).copy()
+                for v in STATIC_VARS:
+                    if v in f0.variables:
+                        self.static[v] = f0.variables[v][:].astype(np.float32).copy()
+                f0.close()
+                if not self.static:
+                    st = load_static()
+                    self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
+
+                day_counts = []
+                for p in paths:
+                    m = re.search(r"era5_global_t2m_(\d{4})(\d{2})\.nc", p)
+                    if m:
+                        day_counts.append(calendar.monthrange(int(m.group(1)), int(m.group(2)))[1])
+                    else:
+                        f = netcdf_file(p, "r", mmap=True)
+                        day_counts.append(f.variables["t2m"].shape[0])
+                        f.close()
+            else:
+                self._t2m_by_month: list[np.ndarray] = []
+                for p in paths:
+                    t2m, lat, lon, static = _load_month(p)
+                    if self.lat is None:
+                        self.lat, self.lon = lat, lon
+                        if static:
+                            self.static = static
+                    self._t2m_by_month.append(t2m)
+                if not self.static:
+                    st = load_static()
+                    self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
+                day_counts = [a.shape[0] for a in self._t2m_by_month]
+
         self.n_days_total = int(sum(day_counts))
         self._cum_days = np.cumsum([0] + day_counts)
 
@@ -119,7 +154,12 @@ class GlobalERA5Corpus:
     def _day_slice(self, day_global_idx: int) -> np.ndarray:
         m = int(np.searchsorted(self._cum_days, day_global_idx, side="right") - 1)
         d = day_global_idx - int(self._cum_days[m])
-        return self._t2m_by_month[m][d]
+        if self._t2m_by_month is not None:
+            return self._t2m_by_month[m][d]
+        f = netcdf_file(self._paths[m], "r", mmap=True)
+        slice_2d = f.variables["t2m"][d].astype(np.float32).copy()
+        f.close()
+        return slice_2d
 
     def sample_episode(
         self,
