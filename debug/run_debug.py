@@ -40,6 +40,7 @@ _STAGES_DIR = os.path.join(_HERE, "stages")
 STAGE_SCRIPTS = {
     "s0": "s0_signal.py",
     "s1": "s1_rank_ceiling.py",
+    "s1b": "s1b_rank_gap_decomp.py",
     "s2": "s2_uspace.py",
     "s3": "s3_pit_floor.py",
     "s4": "s4_overfit.py",
