@@ -29,13 +29,22 @@ def haversine_distance_km(coords: np.ndarray) -> np.ndarray:
 
 def load_era5_data(nc_path: str) -> dict:
     """Read an ERA5-schema NetCDF3-classic file (t2m/latitude/longitude/time
-    variables — see eval.data.fetch_era5.fetch) into plain numpy arrays."""
+    and static variables — see eval.data.fetch_era5.fetch) into plain numpy arrays."""
     f = netcdf_file(nc_path, "r", mmap=False)
     t2m = f.variables["t2m"][:].astype(np.float64).copy()
     lat = f.variables["latitude"][:].astype(np.float64).copy()
     lon = f.variables["longitude"][:].astype(np.float64).copy()
+    out = {"t2m": t2m, "latitude": lat, "longitude": lon}
+    for v in (
+        "geopotential_at_surface",
+        "land_sea_mask",
+        "standard_deviation_of_orography",
+        "slope_of_sub_gridscale_orography",
+    ):
+        if v in f.variables:
+            out[v] = f.variables[v][:].astype(np.float64).copy()
     f.close()
-    return {"t2m": t2m, "latitude": lat, "longitude": lon}
+    return out
 
 
 def safe_cholesky(C: np.ndarray, jitter: float = 1e-6, max_tries: int = 6) -> np.ndarray:

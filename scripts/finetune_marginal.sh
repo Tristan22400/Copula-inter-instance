@@ -78,11 +78,16 @@ if [[ -n "${ERA5_CACHE_DIR:-}" ]] && has_global_corpus "$ERA5_CACHE_DIR"; then
     EXTRA_OVERRIDES+=("marginal.era5.corpus_dir=$ERA5_CACHE_DIR/era5_global_train")
 fi
 
+if [[ -n "${CKPT_DIR:-}" ]]; then
+    EXTRA_OVERRIDES+=("training.ckpt_dir=$CKPT_DIR")
+fi
+
 mkdir -p logs
 
 echo "[$(date +%H:%M:%S)] OAR job ${OAR_JOB_ID:-local} — host: $(hostname)"
 echo "[$(date +%H:%M:%S)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
 echo "[$(date +%H:%M:%S)] ERA5 cache: ${ERA5_CACHE_DIR:-not found}"
+echo "[$(date +%H:%M:%S)] Checkpoint dir: ${CKPT_DIR:-default from conf (./checkpoints/marginal_finetune_era5_10y)}"
 echo "[$(date +%H:%M:%S)] Phase A: marginal fine-tuning..."
 echo "    overrides: $*"
 

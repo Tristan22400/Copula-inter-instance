@@ -457,6 +457,20 @@ def build_era5_probe(
     coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
     D = coords.shape[0]
 
+    static_cols = []
+    for v in (
+        "geopotential_at_surface",
+        "land_sea_mask",
+        "standard_deviation_of_orography",
+        "slope_of_sub_gridscale_orography",
+    ):
+        if v in data:
+            static_cols.append(data[v].ravel())
+    if static_cols:
+        features = np.column_stack([lon_grid.ravel(), lat_grid.ravel()] + static_cols)
+    else:
+        features = coords
+
     R_emp = empirical_spatial_correlation(data, target="raw")
     dist = haversine_distance_km(coords)
     dist_iu = dist[np.triu_indices_from(dist, k=1)]
@@ -472,9 +486,9 @@ def build_era5_probe(
 
     n_context_eff = max(1, min(n_context, D - 1))
     context_idx = rng.choice(D, size=n_context_eff, replace=False)
-    context_coords = coords[context_idx]
+    context_features = features[context_idx]
 
-    x_train_norm, x_test_norm = normalize_features(context_coords, coords)
+    x_train_norm, x_test_norm = normalize_features(context_features, features)
 
     # Held-out (never-in-context) points for the real, non-oracle Y-space
     # NLL probe below -- same construction as run_real_config's

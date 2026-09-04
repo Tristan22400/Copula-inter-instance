@@ -146,8 +146,8 @@ def test_build_era5_probe_shapes_and_finite(tabicl_fake):
 
     assert probe["D"] == D
     assert probe["n_context"] == n_context
-    assert probe["x_train_norm"].shape == (n_context, 2)
-    assert probe["x_test_norm"].shape == (D, 2)
+    assert probe["x_train_norm"].shape == (n_context, 6)
+    assert probe["x_test_norm"].shape == (D, 6)
     assert probe["z_train_per_day"].shape == (_TINY_DAYS_PROBE, n_context)
     assert probe["dist"].shape == (D, D)
     assert probe["rho_emp"].shape == (_TINY_BINS,)
@@ -227,8 +227,8 @@ def test_build_era5_val_batches_shapes(tabicl_fake):
     n_context = min(_TINY_CONTEXT, D - 1)
     n_nll = min(30, D - n_context)  # eval.configs.constants.N_NLL_TEST, capped
     b = probe["batch"]
-    assert b["x_train"].shape == (_TINY_DAYS_PROBE, n_context, 2)
-    assert b["x_test"].shape == (_TINY_DAYS_PROBE, D, 2)
+    assert b["x_train"].shape == (_TINY_DAYS_PROBE, n_context, 6)
+    assert b["x_test"].shape == (_TINY_DAYS_PROBE, D, 6)
     assert b["z_train"].shape == (_TINY_DAYS_PROBE, n_context)
     assert b["test_mask"].shape == (_TINY_DAYS_PROBE, D)
     assert b["test_mask"].dtype == torch.bool
