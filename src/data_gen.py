@@ -3842,6 +3842,8 @@ def _generate_gp_batch_raw(
         tensors["nugget"] = nugget.cpu()
         tensors["mlp_mixed"] = mlp_mixed.cpu()
         tensors["kernel_hidden_applied"] = kernel_hidden_applied.cpu()
+        tensors["x_kernel_train"] = x_kernel_train.cpu()
+        tensors["x_kernel_test"] = x_kernel_test.cpu()
         for key in (
             "mean_weight", "mean_bias", "mean_nonzero", "mean_family", "mean_linear",
             "mean_exp_direction", "mean_exp_rate", "mean_exp_scale",

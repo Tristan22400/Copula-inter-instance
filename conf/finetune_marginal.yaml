@@ -112,9 +112,9 @@ marginal:
     # 2013-01 .. 2022-12. Disjoint from era5_global_val/ (2023) by construction;
     # tests/test_marginal_finetune.py asserts it.
     corpus_dir: ./eval/data/cache/era5_global_train
-    # Full 10-year corpus (120 months, 2013-01 .. 2022-12, ~15GB resident).
+    # Full 33-year corpus (396 months, 1990-01 .. 2022-12).
     # Disjoint from era5_global_val/ (2023) by construction.
-    max_months: 120
+    max_months: 396
     grid_size: 16
     n_context: 60
     box_deg_min: 5.0
@@ -145,7 +145,7 @@ training:
   # a small rebound, so validate densely enough to retain that early optimum.
   val_every: 200
   save_every: 2000
-  ckpt_dir: ./checkpoints/marginal_finetune_era5_10y
+  ckpt_dir: ./checkpoints/marginal_finetune_era5_33y
   resume_ckpt: null
   # Keep the best fixed-validation model in memory and restore it before the
   # final checkpoint. This explicitly protects against returning a checkpoint
