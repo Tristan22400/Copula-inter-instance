@@ -73,9 +73,12 @@ def fetch_month(year: int, month: int, cache_dir: str = _CACHE_DIR, force: bool 
     lon = sub["longitude"].values.astype(np.float64)
     n_time = t2m.shape[0]
 
+    from eval.data.fetch_era5_static import STATIC_VARS, load_static
+    static_dict = load_static()
+
     f = netcdf_file(target_path, "w")
     f.history = (
-        f"Full global ERA5 2m_temperature from ARCO-ERA5 Zarr, {year:04d}-{month:02d}, "
+        f"Full global ERA5 2m_temperature and static surface variables from ARCO-ERA5 Zarr, {year:04d}-{month:02d}, "
         f"{n_time} daily (00:00 UTC) snapshots, native 0.25deg grid."
     )
     f.source = "arco_era5_real_global"
@@ -90,6 +93,11 @@ def fetch_month(year: int, month: int, cache_dir: str = _CACHE_DIR, force: bool 
     var_lon[:] = lon
     var_time = f.createVariable("time", "i4", ("time",))
     var_time[:] = np.arange(n_time)
+
+    for vname in STATIC_VARS:
+        v = f.createVariable(vname, "f4", ("latitude", "longitude"))
+        v[:] = static_dict[vname]
+
     f.close()
     print(f"Cached {target_path} ({os.path.getsize(target_path) / 1e6:.0f} MB)")
     return target_path

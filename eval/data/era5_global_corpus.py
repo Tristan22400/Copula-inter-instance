@@ -19,16 +19,22 @@ import numpy as np
 import torch
 from scipy.io.netcdf import netcdf_file
 
-__all__ = ["GlobalERA5Corpus", "load_shared_corpus_arrays"]
+from eval.data.fetch_era5_static import STATIC_VARS, load_static
+
+__all__ = ["GlobalERA5Corpus", "load_shared_corpus_arrays", "STATIC_VARS"]
 
 
-def _load_month(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_month(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     f = netcdf_file(path, "r", mmap=False)
     t2m = f.variables["t2m"][:].astype(np.float32).copy()  # (T, H, W)
     lat = f.variables["latitude"][:].astype(np.float64).copy()
     lon = f.variables["longitude"][:].astype(np.float64).copy()
+    static = {}
+    for v in STATIC_VARS:
+        if v in f.variables:
+            static[v] = f.variables[v][:].astype(np.float32).copy()
     f.close()
-    return t2m, lat, lon
+    return t2m, lat, lon, static
 
 
 class GlobalERA5Corpus:
@@ -72,6 +78,7 @@ class GlobalERA5Corpus:
             self.lat = _shared["lat"].numpy()
             self.lon = _shared["lon"].numpy()
             self._t2m_by_month = [t.numpy() for t in _shared["t2m_by_month"]]
+            self.static = {k: v.numpy() for k, v in _shared["static"].items()}
         else:
             paths = sorted(glob.glob(os.path.join(cache_dir, "era5_global_t2m_*.nc")))
             if not paths:
@@ -84,12 +91,18 @@ class GlobalERA5Corpus:
                 paths = paths[-int(max_months):]
             self.lat: np.ndarray | None = None
             self.lon: np.ndarray | None = None
+            self.static: dict[str, np.ndarray] = {}
             self._t2m_by_month: list[np.ndarray] = []
             for p in paths:
-                t2m, lat, lon = _load_month(p)
+                t2m, lat, lon, static = _load_month(p)
                 if self.lat is None:
                     self.lat, self.lon = lat, lon
+                    if static:
+                        self.static = static
                 self._t2m_by_month.append(t2m)
+            if not self.static:
+                st = load_static()
+                self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
         day_counts = [a.shape[0] for a in self._t2m_by_month]
         self.n_days_total = int(sum(day_counts))
         self._cum_days = np.cumsum([0] + day_counts)
@@ -165,7 +178,8 @@ class GlobalERA5Corpus:
         sub = field[np.ix_(row_pick, col_pick)]  # (gs_r, gs_c)
 
         lon_grid, lat_grid = np.meshgrid(self.lon[col_pick], self.lat[row_pick])
-        coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()]).astype(np.float64)
+        static_cols = [self.static[v][np.ix_(row_pick, col_pick)].ravel() for v in STATIC_VARS]
+        coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()] + static_cols).astype(np.float64)
         values = sub.ravel().astype(np.float64)
         D = coords.shape[0]
 
@@ -229,7 +243,8 @@ class GlobalERA5Corpus:
         sub = field[np.ix_(row_pick, col_pick)]  # (grid_size, grid_size)
 
         lon_grid, lat_grid = np.meshgrid(self.lon[col_pick], self.lat[row_pick])
-        coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()]).astype(np.float64)
+        static_cols = [self.static[v][np.ix_(row_pick, col_pick)].ravel() for v in STATIC_VARS]
+        coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()] + static_cols).astype(np.float64)
         values = sub.ravel().astype(np.float64)
         D = coords.shape[0]  # == grid_size**2 by construction
         if not (1 <= n_context <= D - 1):
@@ -276,4 +291,5 @@ def load_shared_corpus_arrays(cache_dir: str) -> dict:
         "lat": torch.from_numpy(corpus.lat).share_memory_(),
         "lon": torch.from_numpy(corpus.lon).share_memory_(),
         "t2m_by_month": [torch.from_numpy(a).share_memory_() for a in corpus._t2m_by_month],
+        "static": {k: torch.from_numpy(v).share_memory_() for k, v in corpus.static.items()},
     }

@@ -107,8 +107,12 @@ def normalize_features(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndar
     X_test = np.asarray(X_test, dtype=np.float64)
     X_all = np.concatenate([X_train, X_test], axis=0)
     mean = X_all.mean(axis=0, keepdims=True)
-    std = np.clip(X_all.std(axis=0, ddof=1, keepdims=True), 1e-8, None)
-    return (X_train - mean) / std, (X_test - mean) / std
+    std_raw = X_all.std(axis=0, ddof=1, keepdims=True)
+    is_constant = std_raw < 1e-6
+    std = np.where(is_constant, 1.0, std_raw)
+    norm_tr = np.where(is_constant, 0.0, (X_train - mean) / std)
+    norm_te = np.where(is_constant, 0.0, (X_test - mean) / std)
+    return norm_tr, norm_te
 
 
 # ---------------------------------------------------------------------------

@@ -92,9 +92,16 @@ def fetch(
     n_time = t2m.shape[0]
     print(f"Final grid: {n_time} days x {lat.size}x{lon.size} ({lat.size * lon.size} points).")
 
+    from eval.data.fetch_era5_static import STATIC_VARS, load_static
+    from scipy.interpolate import RegularGridInterpolator
+    static_dict = load_static()
+    lat_asc = static_dict["latitude"][::-1]
+    lon_grid, lat_grid = np.meshgrid(lon % 360.0, lat)
+    pts = np.column_stack([lat_grid.ravel(), lon_grid.ravel()])
+
     f = netcdf_file(target_path, "w")
     f.history = (
-        f"Real ERA5 2m_temperature from ARCO-ERA5 Zarr, {start_date} + {n_time} daily "
+        f"Real ERA5 2m_temperature and static variables from ARCO-ERA5 Zarr, {start_date} + {n_time} daily "
         f"(00:00 UTC) snapshots. region={region_name}, lat_bounds={lat_bounds}, lon_bounds={lon_bounds}."
     )
     f.source = "arco_era5_real"
@@ -110,6 +117,14 @@ def fetch(
     var_lon[:] = lon
     var_time = f.createVariable("time", "i4", ("time",))
     var_time[:] = np.arange(n_time)  # one integer index per day, all at the same UTC hour
+
+    for vname in STATIC_VARS:
+        arr_asc = static_dict[vname][::-1, :]
+        interp = RegularGridInterpolator((lat_asc, static_dict["longitude"]), arr_asc, method="linear", bounds_error=False, fill_value=None)
+        sub_vals = interp(pts).reshape(lat.size, lon.size).astype(np.float64)
+        v = f.createVariable(vname, "f8", ("latitude", "longitude"))
+        v[:] = sub_vals
+
     f.close()
     print(f"Cached {target_path}")
     return target_path
