@@ -163,10 +163,20 @@ class ERA5Pool:
             fields = sub.reshape(len(day_pick), -1).astype(np.float64)
 
             lon_grid, lat_grid = np.meshgrid(self.lon[col_pick], self.lat[row_pick])
-            coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()]).astype(np.float64)
             static_cols = np.stack(
                 [self.static[k][np.ix_(row_pick, col_pick)].ravel() for k in range(self.static.shape[0])],
                 axis=1,
+            ).astype(np.float64)
+            # d = 2 + len(STATIC_VARS) = 6, matching what a real episode actually
+            # carries (era5_global_corpus.sample_episode_fixed_shape column-stacks
+            # the static covariates onto lon/lat). Reporting d_x = 2 here -- as an
+            # earlier version did by stashing the statics in `meta` -- understates
+            # ERA5's dimensionality and makes the d comparison against the
+            # synthetic prior wrong. No other indicator is affected: every
+            # distance comes from `dist` below, which is haversine on lon/lat, and
+            # the detrend/anisotropy/blocking helpers all read coords[:, :2].
+            coords = np.column_stack(
+                [lon_grid.ravel(), lat_grid.ravel(), static_cols]
             ).astype(np.float64)
 
             from eval.data.era5_io import haversine_distance_km

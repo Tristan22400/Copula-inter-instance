@@ -1,0 +1,20 @@
+{
+  "synthetic_current": {
+    "auc": 1.0,
+    "top_discriminative": [
+      {
+        "indicator": "nonstat_var_cv",
+        "importance": 0.49166666666666664
+      }
+    ]
+  },
+  "lattice_matern_probe": {
+    "auc": 1.0,
+    "top_discriminative": [
+      {
+        "indicator": "nn_cv",
+        "importance": 0.49166666666666664
+      }
+    ]
+  }
+}

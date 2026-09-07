@@ -144,9 +144,13 @@ def _crossing(centres: np.ndarray, rho: np.ndarray, level: float) -> float:
 
 def _eigen_stats(C: np.ndarray, prefix: str) -> dict:
     """Cumulative eigenvalue mass at the ranks the copula head can actually
-    represent. `model.rank` is 32 today, so evr32 is the share of the target
-    correlation a rank-32 covnorm head could capture at best; 1 - evr32 is the
-    independent white-noise floor it is forced to leave behind."""
+    represent. The production head runs at rank 128 (the checked-in
+    conf/model/copula_prod.yaml still says 32 -- it is overridden at the CLI),
+    so `evr128` is the operative number: the share of the target correlation a
+    rank-128 covnorm head could capture at best, and 1 - evr128 is the
+    independent white-noise floor it is forced to leave behind. evr8/32/64 are
+    reported alongside it so the ceiling can be read as a function of rank
+    rather than at one operating point."""
     w = np.linalg.eigvalsh((C + C.T) / 2.0)[::-1]
     w = np.clip(w, 0.0, None)
     tot = w.sum() + 1e-12
@@ -319,8 +323,8 @@ def tier2_posterior(bundle, med_nn: float, context_fracs=(0.05, 0.20), seed: int
     """Condition the estimated prior on a random context subset (Schur
     complement) and describe the resulting correlation the model is asked to
     predict. This is the tier that ties directly to the known failure mode:
-    on ERA5 the posterior is near-full-rank while a rank-32 head can only
-    represent `post_evr32` of it."""
+    on ERA5 the posterior is near-full-rank while a rank-r head can only
+    represent `post_evr<r>` of it -- `post05_evr128` at the production rank."""
     rng = np.random.default_rng(seed)
     C = _empirical_corr(bundle.fields)
     out = _eigen_stats(C, "prior")
@@ -489,9 +493,9 @@ INDICATOR_TIERS = {
     "tier2_posterior": [
         "prior_evr32", "prior_eff_rank_frac", "prior_od_mu", "lw_shrinkage",
         "prior_det_evr32", "prior_det_evr64", "prior_det_evr128", "prior_det_eff_rank_frac",
-        "post05_evr32", "post05_evr64", "post05_evr128", "post05_eff_rank_frac",
+        "post05_evr128", "post05_evr64", "post05_evr32", "post05_eff_rank_frac",
         "post05_var_ratio", "post05_od_mu", "post05_range_over_nn", "post05_rel_change",
-        "post20_evr32", "post20_eff_rank_frac", "post20_var_ratio", "post20_od_mu", "post20_rel_change",
+        "post20_evr128", "post20_evr32", "post20_eff_rank_frac", "post20_var_ratio", "post20_od_mu", "post20_rel_change",
     ],
     "tier3_marginal": [
         "spatial_skew_abs", "spatial_exkurt", "spatial_gauss_ks", "increment_exkurt",

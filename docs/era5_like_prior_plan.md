@@ -71,8 +71,10 @@ Headline numbers, median [q25, q75], and the gap in reference standard deviation
 | `post05_evr32` | 0.619 | 0.493 | **−2.3** | 0.645 | +0.5 |
 | `post20_rel_change` | 0.990 | 0.947 | **−16.2** | 0.988 | −0.8 |
 | `increment_exkurt` | 4.62 | 2.72 | −0.4 | 3.42 | −0.2 |
+| `nonstat_var_cv` | 0.295 | 0.0059 | **−1.7 (50×)** | 0.560 | +1.6 |
 | `chi_095_excess` | 0.039 | 0.006 | **−1.4** | 0.006 | −1.4 |
 | `spatial_exkurt` | −0.43 | +0.45 | +1.3 | +1.78 | **+3.2** |
+| **C2ST AUC vs ERA5** | — | **1.00** | saturated | **1.00** | saturated |
 
 Two independent checks that the harness is measuring the right thing: ERA5's
 `post05_evr32` comes out at 0.619, against 0.63 measured at D=600 by a completely
@@ -92,6 +94,32 @@ The downstream consequence is visible one row down: the synthetic prior *decorre
 inside the episode* (`rho_far` 0.033, `decorrelates_in_box` = 1 for every bundle) while
 ERA5 never does (`rho_far` 0.697, `decorrelates_in_box` = 0 for every bundle). These are
 qualitatively different regimes, not two points on one continuum.
+
+### D1b — Noise columns, not dimensionality
+
+The parallel speckle-bottleneck decomposition ([[project_speckle_bottleneck_decomposition]])
+found that adding **uninformative** columns switches the head off: kernel on the first 2
+coordinates, remaining columns iid noise, true correlation byte-identical — signal
+captured falls **31.9% (d=2) → 16.3% (d=5) → 2.6% (d=10) → 2.4% (d=20)**.
+
+It is important not to read that as "low `d` is good". A real ERA5 episode is **d = 6**
+(lon, lat + `geopotential_at_surface`, `land_sea_mask`,
+`standard_deviation_of_orography`, `slope_of_sub_gridscale_orography` —
+`era5_global_corpus.py:222`), and d=6 sits at the **10th percentile** of
+`d_features ~ LogNormal(log 10, 0.4)`, i.e. comfortably inside the prior's support. The
+dimension itself is not the mismatch.
+
+The mismatch is **how many of those columns carry no signal**. ERA5's four static columns
+are genuinely informative — orography and land/sea modulate temperature. The synthetic
+prior's extra columns are *inactive by construction*: `inactive_frac_min: 0.1`,
+`inactive_frac_max: 0.8` means at the median d=10 the kernel reads between **9 and 2**
+columns, so the prior routinely generates **2 informative + 8 pure-noise columns** —
+precisely the probe's worst case, the 2.6% one. Averaged over the `inactive_frac` prior,
+about half of every episode's columns are noise.
+
+So the lever is **`inactive_frac`, not `d_features`**: lower `inactive_frac_max` (0.8 →
+~0.3), and in the lattice branch make the covariate columns genuinely modulate the kernel
+(§2.4) rather than sit inert. Changing `d_features` is not indicated by the measurement.
 
 ### D2 — Conditioning barely does anything, and leaves near-independence
 
@@ -113,7 +141,29 @@ by the posterior marginals, so the graded quantity is already the conditional co
 (`data_gen.py:3502-3512`, `pit.py::gp_analytical_posterior`). The problem is the data, not
 the label.
 
-### D3 — Spectral concentration and single-scale-ness
+**Independent corroboration, and the specific config line responsible.** The parallel
+decomposition attributes **38% of the total ERA5 speckle gap to training** and names the
+mechanism *"the head is context-blind"*: sweeping P on a fixed synthetic 2-D grid, the
+true nearest-neighbour correlation falls monotonically (0.675 at P=8 → 0.024 at P=512)
+while the model's output stays **flat and peaks at exactly P=32** —
+
+```
+P            8     16     32     64    128    256    512
+true rho_nn  .675  .617  .522  .376  .238  .103  .024
+model        .077  .128  .346  .303  .320  .291  .263   <- flat, peaks at P=32
+```
+
+because `conf/data/gp_tasks.yaml` pins **`P_min = P_max = 32`** and
+**`N_min = N_max = 256`** (lines 34-39). The model learned one amplitude for one shape.
+A post-hoc scalar temperature buys only 0.01 nats — the error is structural. So
+**unpinning P/N is a prerequisite, not an optional extra**, and it is cheap: it is a
+config change plus whatever `ShardHomogeneousBatchSampler` needs to keep batches
+homogeneous. Notably `era5_live` already varies `grid_size` 8–28 and `n_context_frac`
+0.05–0.4, which is exactly the variation the synthetic path lacks — further evidence that
+ERA5 finetuning "works" partly by supplying P/N variation rather than by supplying real
+geography.
+
+### D3 — Spectral concentration, single-scale-ness, and stationarity
 
 `prior_eff_rank_frac` 0.044 vs 0.0047 — the synthetic prior's spectrum is **~10× flatter**
 (+15.1σ). ERA5 boxes are dominated by a few large-scale modes with structure underneath;
@@ -122,6 +172,14 @@ one-scale-vs-two-scale story as D2 seen in the spectral domain, and it is what �
 
 Correlation *shape* differs too: ERA5 is near-exponential (`matern_nu` 0.47) while the
 synthetic prior is smoother (1.02, +4.5σ).
+
+Stationarity is the cleanest ratio in the whole suite: `nonstat_var_cv` is **0.295 for
+ERA5 against 0.0059 for the synthetic prior — a factor of 50**. (The σ-gap reads only
+−1.7 because ERA5's own spread across regions is wide; the ratio is the honest summary
+here, and this is a good example of why the table carries IQRs and not just gaps.) Within
+a single ERA5 box, marginal variance genuinely varies by regime — land/sea, orography —
+while a stationary kernel with one scalar `alpha2` per episode is constant by
+construction. §2.4 exists for this row.
 
 ### D4 — Non-Gaussianity: **hypothesis not supported, deprioritise**
 
@@ -160,16 +218,39 @@ probability `data.lattice2d_frac`.
   binary field (land-sea-like). **These must be the same latent fields that modulate the
   kernel (§2.4)** — otherwise they are noise columns and the model correctly learns to
   ignore them, which is what happens with the real static columns today.
-- Context fraction `P/D ~ U[0.05, 0.4]`, matching `era5_live`.
+- **Unpin P and N.** `P_min = P_max = 32`, `N_min = N_max = 256` today; the head is
+  measurably context-blind as a result (§1/D2). Draw `D = grid_size²` and a context
+  fraction `P/D ~ U[0.05, 0.4]`, matching `era5_live`. This is a prerequisite for the rest
+  of this section to be worth anything, and it is worth doing on the *existing*
+  Gaussian-cloud path too rather than only inside the new branch — it is the cheapest
+  item in this whole plan and does not depend on any of the geometry work.
 
 ### 2.2 Two-scale correlation — fixes D2, and part of D3
 
-`C = w · K_large(L_large) + (1 − w) · K_small(L_small)`, with `w ~ Beta`,
-`L_small ∈ [1.5, 8]` sample spacings and `L_large / L_small ~ U[5, 40]`.
+`C = w · K_large(L_large) + (1 − w) · K_small(L_small)`. The large-scale component is what
+context removes; the small-scale component is what the model then has to predict.
 
-The large-scale component is what the context removes; the small-scale component is what
-the model then has to predict. This is the single most important change for
-post-conditioning rank, and it is what makes `post05_var_ratio` movable.
+**These parameters are not guesses — they are inverted from the ERA5 measurements.**
+Writing `ρ(r) = w·ρ_L(r) + (1−w)·ρ_S(r)` with `ρ_L ≈ 1` inside the box, and using
+Matérn ν = ½ (`matern_nu` measured 0.47):
+
+| quantity | from | median | ERA5 IQR |
+|---|---|---|---|
+| `L_small` | `det_rho_at_1nn` = 0.859 → `−1/ln ρ` | **6.6 Δ** | 3.9 – 9.6 |
+| `L_small` | `det_range_over_nn` = 4.25 → `−r/ln 0.5` | **6.1 Δ** | 4.7 – 8.0 |
+| `w` (large-scale share) | `rho_far` = 0.697 at r ≈ 12 Δ | **0.64** | 0.52 – 0.73 |
+| `ν` | Matérn fit to the raw correlogram | **0.47** | 0.36 – 0.53 |
+| `L_large` | raw curve barely decays across the box | ≫ box (≥ 5× `L_small`) | — |
+
+The two independent `L_small` estimators — the one-spacing correlation and the
+half-decay distance — agree to within 8%. That agreement is itself the evidence that a
+two-component exponential is the right functional form for ERA5 at these scales, not just
+a convenient one.
+
+So: `L_small ~ LogUniform[4, 9] · Δ`, `w ~ Beta` fitted to mean 0.64 on [0.45, 0.80],
+`L_large ~ L_small · U[5, 40]`, `ν` drawn near ½ (allow {0.5, 1.0, 1.5} with mass
+concentrated on 0.5). Targets to re-measure against: `post05_var_ratio` 0.267 → 0.041,
+`prior_eff_rank_frac` 0.044 → 0.0047, `rho_far` 0.033 → 0.697.
 
 ### 2.3 Anisotropy — and retiring the ripple artifact
 
@@ -184,18 +265,41 @@ of the deformation angle gives orientation structure without a lattice-locked pe
 
 ### 2.4 Non-stationarity — fixes D3
 
-Two mechanisms, both standard geostatistics, both cheap:
+**The measurement says something specific and counter-intuitive here: modulate the
+variance, and leave the range alone.**
 
-1. **Covariate-modulated parameters.** `log σ(x)` and `log L(x)` affine in the synthetic
-   static covariates plus a smooth random field. This is what makes the covariate columns
-   informative.
-2. **Interface.** With probability ~0.3, a level set of a smooth random field partitions
-   the box into two regimes with different `(σ, L)` and partial decorrelation across the
-   boundary — a synthetic coastline.
+| indicator | ERA5 | current prior | probe | reading |
+|---|---|---|---|---|
+| `nonstat_var_cv` | **0.295** [0.186, 0.414] | 0.0059 | 0.560 | prior is 50× too homogeneous; probe overshoots ~2× |
+| `nonstat_range_cv` | **0.088** [0.039, 0.136] | 0.164 | 0.126 | prior is already **too heterogeneous** |
+| `aniso_diff` | +0.027 [−0.015, 0.078] | −0.016 | −0.024 | small, −0.6σ |
 
-Build the non-stationary covariance as `diag(σ) · K_deformed · diag(σ)` (PSD by
-construction), or by the Paciorek–Schervish closed form if range variation needs to be
-stronger than a deformation can express.
+So within one ERA5 box, marginal variance varies a lot (land/sea, orography) while the
+*correlation range* is comparatively homogeneous — and the current prior has it backwards
+on the second count. Concretely:
+
+1. **Variance modulation — the main mechanism.** `σ(x) = exp(s · u(x))` with `u` a
+   standardized smooth field, itself an affine function of the synthetic static covariates
+   (this is also what makes those columns informative, closing D1b). The probe used
+   `s ~ U[0, 1.2]` and measured `nonstat_var_cv` 0.560 against ERA5's 0.295, so start near
+   **`s ~ U[0, 0.6]`** and tune `s` against the measured value rather than turning it up.
+2. **Range modulation — keep it mild.** Do *not* add the aggressive coordinate deformation
+   I originally proposed: `nonstat_range_cv` is already 0.164 in the prior against ERA5's
+   0.088, so a deformation would push a row that needs to move *down*. A gentle global
+   anisotropy is fine; strong spatially-varying range is not indicated.
+3. **Interface.** With probability ~0.3, a level set of a smooth random field partitions
+   the box into two regimes — a synthetic coastline. Make it primarily a **variance/regime
+   jump**, consistent with rows 1 and 2.
+
+Build as `diag(σ) · K · diag(σ)`, PSD by construction; the Paciorek–Schervish closed form
+is not needed if range variation stays mild, which the measurement says it should.
+
+**On anisotropy, one correction.** The lattice-locked ripple recorded in
+[[project_kernel_sweep_tabicl_retrain_spatial_diag]] is a *model output* artifact of
+separable ARD/periodic kernels — it is not a gap in the training data's own anisotropy.
+Measured `aniso_diff` differs by only −0.6σ. So excluding `periodic`/`cosine` and setting
+`ard: false` on the spatial columns is still worth doing (it removes the artifact at the
+source), but adding *more* anisotropy to the prior is not, and this is a minor row.
 
 ### 2.5 Marginal warp — fixes D4, and is free
 
@@ -326,8 +430,13 @@ is over episodes.
 Indicator gates, cheap, run per phase:
 
 - **Gate A (geometry).** `nn_cv`, `spread_over_nn` medians inside ERA5's IQR.
-- **Gate B (rank).** `post05_evr32` median inside ERA5's IQR — this is the gate the whole
-  exercise exists for.
+- ~~**Gate B (rank).**~~ **Dropped as a gate.** Sample non-smoothness is unchanged at any
+  head rank (§7.1), so `post05_evr*` cannot gate work whose outcome it does not predict.
+  Keep `post05_evr128` / `evr64` / `evr32` as reported diagnostics — they still say what
+  the representable ceiling is — but the gate that replaces it is **Gate B′**:
+  `post05_var_ratio` and `post05_range_over_nn` inside ERA5's IQR, i.e. *does conditioning
+  do the right amount of work and leave the right amount of structure*, which is the
+  defect actually measured in §1/D2.
 - **Gate C (structure).** `det_range_over_nn`, `nonstat_var_cv`, `aniso_diff` medians inside
   ERA5's IQR; `det_matern_r2` comparable.
 - **Gate D (indistinguishability).** C2ST AUC ≤ 0.65 on Tier 0–3.
@@ -356,7 +465,8 @@ proxy that can be optimised between expensive training runs.
 | phase | content | expected to move |
 |---|---|---|
 | **0** ✅ | indicator harness + baseline gap table (this document) | — |
-| **1** | lattice design + two-scale Matérn | `nn_cv`, `rho_far`, `od_mu`, `prior_eff_rank_frac`, `post05_var_ratio`, `post05_evr32` — **measured below to close nearly all of them** |
+| **1a** | **unpin `P_min`/`P_max`/`N_min`/`N_max`** — smallest change here, and independently measured to matter most for the context-blind head | the P-sweep response curve, not an indicator in this suite |
+| **1b** | lattice design + two-scale Matérn | `nn_cv`, `rho_far`, `od_mu`, `prior_eff_rank_frac`, `post05_var_ratio`, `post05_evr32` — **measured below to close nearly all of them** |
 | **2** | anisotropy + non-stationarity + informative static covariates | `nonstat_var_cv`, `nonstat_range_cv`, `aniso_diff`, `orient_spread` |
 | **3** | tail dependence + nugget calibration; marginal warp only if Phase 1–2 leaves a marginal gap | `chi_095_excess`, `spec_nyquist_excess` |
 | **4** | mix into the production prior, one full training run, Gates A–E | Gate E |
@@ -392,20 +502,46 @@ Where the probe *fails*, and what Phases 2–3 therefore have to own:
 
 ## 7. What this plan cannot fix, and must be paired with
 
-1. **Rank.** Even a perfect prior leaves a rank-32 covnorm head unable to represent an ERA5
-   posterior: `post05_evr32` = 0.619 here, 0.63 at D=600 from the independent exact-GP
-   analysis. ~38% of every point's variance is forced to independent noise, which *is* the
-   visible speckle. Pair this work with a rank increase (64/128 — `post05_evr64` = 0.756,
-   `evr128` = 0.869) or a structured local-plus-low-rank parameterization.
+1. **Rank is not the lever — deprioritise it.** Two facts settle this.
+
+   *Observed:* sample non-smoothness is **unchanged whatever rank the head is given**
+   (user, 2026-09-07, production runs at rank 128). Raising rank does not fix the speckle.
+
+   *Measured, and consistent with it:* the eigenvalue ceiling does loosen with rank —
+   ERA5's `post05_evr128` is **0.869** [0.830, 0.895] (a ~13% white-noise floor) against
+   `evr32` 0.619 (~38%) — so the *representable* ceiling at rank 128 is comfortably above
+   what any current checkpoint achieves. The ceiling stopped binding, and the speckle
+   stayed. Therefore the speckle is not a ceiling effect.
+
+   **The most likely reconciliation, and it is checkable in one line.**
+   [[project_speckle_bottleneck_decomposition]] records `eff-rank(W)` = **11.2 / 32** for
+   a synthetic checkpoint and **18.9 / 32** after ERA5 finetuning. *The head was never
+   using the rank it already had.* Handing it 128 columns cannot help a model that
+   saturates around 11–19 effective ones. If that is right, then the binding constraint is
+   what the head is **taught to produce**, not what it **can** produce — which is exactly
+   what §1's D1/D2/D3 and the context-blind head describe, and exactly what this plan
+   addresses. Confirm by logging `eff_rank(W)` and communality `c̄` at rank 128: if
+   `eff_rank(W)` is still ~15–20 out of 128, the diagnosis holds and rank work should stop.
+
+   Two consequences:
+   - **Drop Gate B** (`post05_evr*` inside ERA5's IQR) as a *gate*. Keep the indicator as a
+     diagnostic, but it cannot gate work that has been shown not to move the outcome.
+   - **Do not carry the 61% / 38% / 1% decomposition forward.** It was measured with a
+     rank-32 head, and its "61% parametrization" term is a statement about the best Σ
+     *inside* the class, not about what training actually reaches — which the rank-128
+     result shows is the operative constraint. Re-derive before using it to rank work.
+
+   Housekeeping: `conf/model/copula_prod.yaml` still reads `rank: 32`, overridden at the
+   CLI. Worth bringing the checked-in default in line with practice, or anyone reading the
+   config (or tooling that loads it) computes the wrong ceiling.
 
    **Correction to a plausible-sounding argument I had to drop.** I expected the synthetic
-   prior to be *more* representable at rank 32 than ERA5 — "the prior never produces a
-   target that needs the extra rank", which would have made rank work pointless until the
-   prior was fixed. The measurement says the opposite: `post05_evr32` is **0.493 for the
-   current prior versus 0.619 for ERA5**. Synthetic conditional correlation is *less*
-   concentrated, because it is closer to the identity (D2) and near-identity spectra are
-   flat. So the two workstreams are independent: rank is a real ERA5-side ceiling worth
-   lifting on its own schedule, and it is not gated on the prior work.
+   prior to be *more* representable at low rank than ERA5 — "the prior never produces a
+   target that needs the extra rank". The measurement says the opposite: `post05_evr32` is
+   **0.493 for the current prior versus 0.619 for ERA5** (`evr128`: 0.727 vs 0.869).
+   Synthetic conditional correlation is *less* concentrated, because it is closer to the
+   identity (D2) and near-identity spectra are flat. Combined with the rank-invariance of
+   the observed speckle, the conclusion is not "rank later" but "rank is not the lever".
 2. **Gaussian-copula misspecification.** `chi_095_excess` bounds how much of the real-data
    NLL is unreachable for *any* Gaussian copula, however good the prior.
 3. **The `val/y_nll_copula` discrepancy.** Independent scoring of held-out ERA5 and the
