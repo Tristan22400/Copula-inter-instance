@@ -8,7 +8,7 @@ point being that you can iterate on the figure, or eyeball a finished
 checkpoint, without a training run in the loop.
 
 The Moran's I table is the numeric version of the figure's central
-comparison. Rows 2-4 (exact GP posterior / copula model / independent) are
+comparison. Rows 2-4 (fitted GP posterior / copula model / independent) are
 posterior SAMPLES on the same context and the same latent noise vector; row
 1 is a fully-observed realization. So the model row should be read against
 the GP row, never against the ground-truth row -- a model that emits the
@@ -57,7 +57,7 @@ def main() -> None:
     p.add_argument("--region", default=None, help="override baselines.era5_viz_region")
     p.add_argument("--grid-size", type=int, default=None)
     p.add_argument("--gp-kernel", default="matern32")
-    p.add_argument("--no-gp", action="store_true", help="drop the exact-GP row")
+    p.add_argument("--no-gp", action="store_true", help="drop the fitted-GP row")
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
