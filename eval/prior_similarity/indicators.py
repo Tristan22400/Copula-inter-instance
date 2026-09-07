@@ -272,7 +272,18 @@ def tier1_nonstationarity(bundle, med_nn: float, n_blocks: int = 4) -> dict:
     different correlation range? A stationary GP says no (up to estimation
     noise, which the synthetic side measures for us since both sides use the
     same number of realizations). Real boxes mix land/sea/orography and say
-    yes, loudly."""
+    yes, loudly.
+
+    The two halves deliberately use different fields. Variance is measured on
+    the RAW field: projecting out a plane removes a position-dependent amount
+    of variance (most at the edges of the coordinate spread, least at its
+    centre), which manufactures block-to-block variance differences out of a
+    perfectly stationary field -- measured at ~0.14 for the stationary
+    synthetic prior, i.e. the same magnitude as ERA5's real signal, which made
+    the detrended version of this indicator useless. Range is measured on the
+    detrended field, where removing the dominant large-scale mode is what
+    makes a within-block 0.5-crossing exist at all.
+    """
     from scipy.cluster.vq import kmeans2
 
     if bundle.D < 4 * n_blocks:
@@ -280,7 +291,7 @@ def tier1_nonstationarity(bundle, med_nn: float, n_blocks: int = 4) -> dict:
     xy = bundle.coords[:, :2]
     _, lab = kmeans2(xy, n_blocks, minit="++", seed=0)
     det = _detrend_plane(bundle)
-    var = det.var(axis=0)
+    var = bundle.fields.var(axis=0)
     block_var, block_rng = [], []
     for b in range(n_blocks):
         m = lab == b

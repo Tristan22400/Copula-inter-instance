@@ -51,54 +51,92 @@ Distances are always in units of the design's own median nearest-neighbour spaci
 the only unit in which a scattered 9-dimensional point cloud and a lat/lon lattice are
 comparable at all.
 
-<!-- MEASURED_TABLE -->
+Headline numbers, median [q25, q75], and the gap in reference standard deviations
+(`(median_synth − median_era5) / (IQR_era5 / 1.349)`). The full 50-indicator table is
+`eval/reports/prior_similarity/summary.md`.
 
-### D1 — Design geometry
+| indicator | ERA5 | current prior | gap | lattice+Matérn probe | gap |
+|---|---|---|---|---|---|
+| `nn_cv` | 0.095 | 1.19 | **+11.4** | 0.00 | −1.0 |
+| `spread_over_nn` | 16.6 | 8.4 | **−1.8** | 12.2 | −1.0 |
+| `rho_at_1nn` | 0.983 | 0.847 | **−7.8** | 0.986 | +0.2 |
+| `rho_far` | 0.697 | 0.033 | **−3.6** | 0.671 | −0.1 |
+| `decorrelates_in_box` | 0.0 | 1.0 | **qualitative** | 0.0 | 0.0 |
+| `od_mu` | 0.803 | 0.223 | **−4.5** | 0.770 | −0.3 |
+| `matern_nu` | 0.47 | 1.02 | **+4.5** | 0.47 | −0.1 |
+| `prior_eff_rank_frac` | 0.0047 | 0.0443 | **+15.1** | 0.0052 | +0.2 |
+| `post05_var_ratio` | 0.041 | 0.267 | **+6.5** | 0.042 | +0.0 |
+| `post05_rel_change` | 0.966 | 0.882 | **−6.5** | 0.964 | −0.2 |
+| `post05_range_over_nn` | 2.18 | 0.774 | **−2.0** | 1.81 | −0.5 |
+| `post05_evr32` | 0.619 | 0.493 | **−2.3** | 0.645 | +0.5 |
+| `post20_rel_change` | 0.990 | 0.947 | **−16.2** | 0.988 | −0.8 |
+| `increment_exkurt` | 4.62 | 2.72 | −0.4 | 3.42 | −0.2 |
+| `chi_095_excess` | 0.039 | 0.006 | **−1.4** | 0.006 | −1.4 |
+| `spatial_exkurt` | −0.43 | +0.45 | +1.3 | +1.78 | **+3.2** |
 
-`data_gen._generate_gp_batch_raw` draws `x_raw ~ N(0, I_d)` with `d ~ LogNormal(log 10, 0.4)`
-and lets the kernel read `k` of those columns. ERA5 episodes are a regular
-`grid_size × grid_size` lattice of (lon, lat) plus four static covariates.
+Two independent checks that the harness is measuring the right thing: ERA5's
+`post05_evr32` comes out at 0.619, against 0.63 measured at D=600 by a completely
+different route (per-day exact-GP-MLE fit) in the earlier rank-ceiling analysis; and the
+ERA5 correlogram is fit by a Matérn with ν ≈ 0.47, i.e. near-exponential, which is the
+shape the existing baseline curve-fitting already lands on.
 
-This is not cosmetic. In ~9 dimensions, concentration of measure pushes almost every
-pairwise distance to the same value, so a stationary kernel returns a correlation matrix
-close to "one common mode plus a diagonal" — smooth, low-rank, and trivially predictable.
-A 2-D lattice spans an ordered range of distances from one spacing out to `√2·grid_size`
-spacings, which is exactly what produces rich, near-full-rank conditional correlation.
+### D1 — Design geometry (confirmed, largest single gap)
 
-### D2 — The context does not inform the posterior
+`data_gen._generate_gp_batch_raw:3345` draws `x_raw ~ N(0, I_d)` with
+`d ~ LogNormal(log 10, 0.4)` and lets the kernel read `k` of those columns; ERA5 episodes
+are a `grid_size × grid_size` lattice of (lon, lat) plus four static covariates. Measured
+`nn_cv` 1.19 vs 0.095 — **+11.4σ, the largest gap in the suite**. (ERA5 is not exactly 0
+because lat/lon spacing is anisotropic in km and varies with latitude.)
 
-The sharpest number in the table. Conditioning on 5% of the points removes only about a
-third of the variance in a current synthetic episode, versus essentially all of it in an
-ERA5 episode.
+The downstream consequence is visible one row down: the synthetic prior *decorrelates
+inside the episode* (`rho_far` 0.033, `decorrelates_in_box` = 1 for every bundle) while
+ERA5 never does (`rho_far` 0.697, `decorrelates_in_box` = 0 for every bundle). These are
+qualitatively different regimes, not two points on one continuum.
 
-The target definition is *not* the problem here, and it is worth being precise because it
-is easy to get backwards. `oracle_mode: prior` governs `R_star` / `Sigma_star`, which feed
-only the `aux_mae` head (weight 0 by default); the copula loss is scored on `z_test`, which
-is standardized by the *posterior* marginals, so the quantity the head is actually graded
-against is already the conditional correlation (`data_gen.py:3502-3512`,
-`pit.py::gp_analytical_posterior`). The problem is that **in these episodes the posterior
-is nearly the prior**: 32 context points scattered in ~9 dimensions barely constrain
-anything, so "predict the conditional correlation" and "predict the prior correlation" are
-almost the same task, and a head trained on them is never forced to learn conditioning.
-On ERA5 they are completely different tasks. This is the mechanism behind the recorded
-observation that synthetic-trained checkpoints emit beautiful, smooth, prior-like ERA5
-samples and score worse than independence.
+### D2 — Conditioning barely does anything, and leaves near-independence
 
-### D3 — Stationarity and single-scale-ness
+The core finding, and it is sharper than expected.
 
-ERA5 boxes mix land/sea/orographic regimes, so marginal variance and correlation range
-both vary strongly *within one episode*. Synthetic kernels are stationary by construction
-(`kernel_hidden_enabled: false` today disables the one warp that could induce mild
-non-stationarity). And an ERA5 box carries at least two well-separated scales — a
-near-constant synoptic/seasonal mode plus mesoscale structure — while the kernel chain
-draws one lengthscale per component from one LogNormal.
+- Context removes 96% of the variance in an ERA5 episode and 73% in a synthetic one
+  (`post05_var_ratio` 0.041 vs 0.267, +6.5σ).
+- Conditioning changes the correlation far less (`post20_rel_change` gap −16.2σ).
+- **After conditioning, synthetic test points are essentially independent**:
+  `post05_range_over_nn` is 0.774 — the residual correlation length is *shorter than one
+  sample spacing* — versus 2.18 for ERA5. So the head spends most of training on episodes
+  whose correct answer is close to the identity matrix, then is asked at deployment to
+  emit substantial off-diagonal structure.
 
-### D4 — Non-Gaussianity
+One precision worth stating because it is easy to get backwards: the *target definition*
+is not the problem. `oracle_mode: prior` governs `R_star`/`Sigma_star`, which feed only the
+`aux_mae` head (weight 0 by default); the copula loss is scored on `z_test`, standardized
+by the posterior marginals, so the graded quantity is already the conditional correlation
+(`data_gen.py:3502-3512`, `pit.py::gp_analytical_posterior`). The problem is the data, not
+the label.
 
-Nearest-neighbour increment excess kurtosis is ~0 for any GP draw *by construction* and
-large for ERA5 (fronts). No stationary Gaussian kernel can produce this. A monotone
-marginal warp closes part of the gap for free (§2.5); the rest is a genuine ceiling on
-the Gaussian-copula model and should be documented as such rather than chased.
+### D3 — Spectral concentration and single-scale-ness
+
+`prior_eff_rank_frac` 0.044 vs 0.0047 — the synthetic prior's spectrum is **~10× flatter**
+(+15.1σ). ERA5 boxes are dominated by a few large-scale modes with structure underneath;
+the synthetic prior spreads its variance evenly across many modes. This is the same
+one-scale-vs-two-scale story as D2 seen in the spectral domain, and it is what §2.2 targets.
+
+Correlation *shape* differs too: ERA5 is near-exponential (`matern_nu` 0.47) while the
+synthetic prior is smoother (1.02, +4.5σ).
+
+### D4 — Non-Gaussianity: **hypothesis not supported, deprioritise**
+
+I expected `increment_exkurt` ≈ 0 for the synthetic prior "by construction" — a GP draw has
+Gaussian increments. That is wrong for *this* prior: measured 2.72 against ERA5's 4.62, a
+−0.4σ gap that is not significant at 40 bundles. The existing feature machinery
+(`tabiclv2_warp_features`, `apply_structural_feature_warp`, `apply_mlp_feature_mixing`,
+`mean_fn`) already makes episodes substantially non-Gaussian in space. **The marginal warp
+in §2.5 is therefore a low-priority nice-to-have, not a fix for a measured defect**, and I
+would not build it before Phases 1–2.
+
+What *is* different in Tier 3 is tail dependence: `chi_095_excess` 0.039 (ERA5) vs 0.006
+(synthetic), i.e. ERA5 neighbours co-exceed high quantiles more often than a Gaussian
+copula at the same correlation predicts. Neither synthetic source reproduces this, and a
+Gaussian-copula model structurally cannot — see §7.
 
 ---
 
@@ -318,27 +356,56 @@ proxy that can be optimised between expensive training runs.
 | phase | content | expected to move |
 |---|---|---|
 | **0** ✅ | indicator harness + baseline gap table (this document) | — |
-| **1** | lattice design + two-scale Matérn | `nn_cv`, `spread_over_nn`, `post05_var_ratio`, `post05_evr32` — the largest single jump |
+| **1** | lattice design + two-scale Matérn | `nn_cv`, `rho_far`, `od_mu`, `prior_eff_rank_frac`, `post05_var_ratio`, `post05_evr32` — **measured below to close nearly all of them** |
 | **2** | anisotropy + non-stationarity + informative static covariates | `nonstat_var_cv`, `nonstat_range_cv`, `aniso_diff`, `orient_spread` |
-| **3** | monotone marginal warp + nugget calibration | `spatial_skew_abs`, `spatial_exkurt`, `increment_exkurt` (partly), `spec_nyquist_excess` |
+| **3** | tail dependence + nugget calibration; marginal warp only if Phase 1–2 leaves a marginal gap | `chi_095_excess`, `spec_nyquist_excess` |
 | **4** | mix into the production prior, one full training run, Gates A–E | Gate E |
 
-A reference probe for Phase 1+2 (`lattice_matern_probe` in `bundles.py`) is already in the
-harness, so the claim "a lattice plus a two-scale anisotropic Matérn moves indicators X, Y, Z"
-is measured in the baseline table rather than asserted. It is deliberately *not* wired into
-`src/data_gen.py`; that is Phase 1's job.
+### Phase 1 is already validated, before writing it
+
+`lattice_matern_probe` in `bundles.py` is a standalone reference implementation of §2.1 +
+§2.2 + a first cut of §2.3/§2.4, deliberately *not* wired into `src/data_gen.py`. Running
+it through the same suite is the cheapest possible test of the plan's central claim, and
+it passes: the probe's gap to ERA5 is **under 1σ on 13 of the 16 headline indicators**,
+including every Tier-2 posterior indicator — `post05_var_ratio` +0.0σ (from +6.5σ),
+`post05_rel_change` −0.2σ (from −6.5σ), `post05_evr32` +0.5σ (from −2.3σ), `rho_far` −0.1σ
+(from −3.6σ), `od_mu` −0.3σ (from −4.5σ), `matern_nu` −0.1σ (from +4.5σ),
+`prior_eff_rank_frac` +0.2σ (from +15.1σ).
+
+That is strong evidence that a lattice design plus a two-scale Matérn is the right shape
+for Phase 1, and that most of the measured distance to ERA5 is carried by those two
+ingredients rather than by the more elaborate machinery in §2.3–§2.6.
+
+Where the probe *fails*, and what Phases 2–3 therefore have to own:
+
+- `spatial_exkurt` +3.2σ and `spatial_skew_abs` +2.5σ — the probe's log-variance
+  modulation overshoots and makes the spatial marginal far too heavy-tailed. ERA5's
+  within-episode spatial marginal is mildly *platykurtic* (−0.43), which is the opposite of
+  what I assumed when writing §2.5. Non-stationarity strength needs a calibrated, not a
+  generous, prior.
+- `chi_095_excess` −1.4σ — the probe reproduces ERA5's tail dependence no better than the
+  current prior does. Expected: it is a Gaussian field.
+- `nn_cv` −1.0σ — a perfectly regular lattice is *too* regular; the jitter and irregular
+  subsampling in §2.1 exist for this and are not in the probe.
 
 ---
 
 ## 7. What this plan cannot fix, and must be paired with
 
 1. **Rank.** Even a perfect prior leaves a rank-32 covnorm head unable to represent an ERA5
-   posterior — measured `post05_evr32` in this suite, and independently ~0.63 at D=600 from
-   an exact-GP analysis. That forces ~40% of every point's variance to independent noise,
-   which *is* the visible speckle. The prior work is necessary but not sufficient; pair it
-   with a rank increase (64/128) or a structured (local + low-rank) parameterization. Note
-   the ordering matters: raising rank *without* fixing the prior is equally wasted, because
-   today's prior never produces a target that needs the extra rank.
+   posterior: `post05_evr32` = 0.619 here, 0.63 at D=600 from the independent exact-GP
+   analysis. ~38% of every point's variance is forced to independent noise, which *is* the
+   visible speckle. Pair this work with a rank increase (64/128 — `post05_evr64` = 0.756,
+   `evr128` = 0.869) or a structured local-plus-low-rank parameterization.
+
+   **Correction to a plausible-sounding argument I had to drop.** I expected the synthetic
+   prior to be *more* representable at rank 32 than ERA5 — "the prior never produces a
+   target that needs the extra rank", which would have made rank work pointless until the
+   prior was fixed. The measurement says the opposite: `post05_evr32` is **0.493 for the
+   current prior versus 0.619 for ERA5**. Synthetic conditional correlation is *less*
+   concentrated, because it is closer to the identity (D2) and near-identity spectra are
+   flat. So the two workstreams are independent: rank is a real ERA5-side ceiling worth
+   lifting on its own schedule, and it is not gated on the prior work.
 2. **Gaussian-copula misspecification.** `chi_095_excess` bounds how much of the real-data
    NLL is unreachable for *any* Gaussian copula, however good the prior.
 3. **The `val/y_nll_copula` discrepancy.** Independent scoring of held-out ERA5 and the

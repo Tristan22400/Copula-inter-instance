@@ -156,6 +156,8 @@ def c2st(rows: list, out_dir: str, ref: str = "era5") -> dict:
     from sklearn.model_selection import StratifiedKFold, cross_val_predict
     from sklearn.metrics import roc_auc_score
 
+    from threadpoolctl import threadpool_limits
+
     df = pd.DataFrame([{k: v for k, v in r.items() if not k.endswith("_curve")} for r in rows])
     feats = [c for c in df.columns if c not in ("source", "D", "d_x", "R_realizations", "med_nn")]
     results = {}
@@ -170,10 +172,15 @@ def c2st(rows: list, out_dir: str, ref: str = "era5") -> dict:
             continue
         clf = HistGradientBoostingClassifier(max_iter=200, max_depth=3, random_state=0)
         cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
-        p = cross_val_predict(clf, X, y, cv=cv, method="predict_proba")[:, 1]
-        auc = float(roc_auc_score(y, p))
-        clf.fit(X, y)
-        imp = permutation_importance(clf, X, y, n_repeats=15, random_state=0)
+        # A few dozen rows by a few dozen columns is far too small to
+        # parallelize: left at the machine default this stage spun 48 OpenMP
+        # threads at ~3700% CPU for many minutes on an 80-row problem, dwarfing
+        # the indicator computation it exists to summarize.
+        with threadpool_limits(limits=2):
+            p = cross_val_predict(clf, X, y, cv=cv, method="predict_proba")[:, 1]
+            auc = float(roc_auc_score(y, p))
+            clf.fit(X, y)
+            imp = permutation_importance(clf, X, y, n_repeats=15, random_state=0)
         order = np.argsort(imp.importances_mean)[::-1][:10]
         results[s] = {
             "auc": auc,
