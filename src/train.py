@@ -102,6 +102,8 @@ from pit import (
     load_tabicl,
     normalize_targets,
     resolve_pit_ckpt,
+    configure_tabicl_inference_amp,
+    tabicl_forward,
     run_pit,
 )
 
@@ -591,7 +593,7 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     context_frac = float(ecfg.get("era5_viz_context_frac", 0.05))
     seed = int(ecfg.get("era5_viz_seed", 20260825))
     pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
-    # Exact-GP reference row (see _era5_viz_gp_posterior). Reuses the
+    # Fitted-GP reference row (see _era5_viz_gp_posterior). Reuses the
     # era5_gp_*_mle knobs the era5_fit NLL probe's baseline already reads,
     # so there's one place to tune fit fidelity for both.
     gp_row_enabled = bool(ecfg.get("era5_viz_gp", True))
@@ -646,7 +648,9 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
             dists_per_day.append(None)
             continue
         with torch.no_grad():
-            logits = tabicl_marginal(x_batch, context_values_scaled_t.unsqueeze(0))  # (1, D, Q)
+            logits = tabicl_forward(
+                tabicl_marginal, x_batch, context_values_scaled_t.unsqueeze(0)
+            )  # (1, D, Q)
             dists_per_day.append(tabicl_marginal.quantile_dist(logits.reshape(D, -1)))
 
     return {
@@ -665,9 +669,9 @@ def _era5_viz_gp_posterior(
     x_train_norm: np.ndarray, context_values: np.ndarray, x_test_norm: np.ndarray,
     kernel_name: str, n_steps: int, lr: float, n_restarts: int, device: str,
 ) -> "dict | None":
-    """Exact-GP posterior (mean, Cholesky factor) at the viz grid, fitted by
+    """Fitted-GP posterior (mean, Cholesky factor) at the viz grid, fitted by
     MLE+MAP on the SAME sparse context the copula model sees -- the reference
-    predictor behind val/era5_predictions' "Exact GP posterior sample" row.
+    predictor behind val/era5_predictions' "Fitted GP posterior sample" row.
 
     Same fit as the era5_fit/<region> NLL probe's GP baseline
     (eval/spatial/sweep_core.py::_fit_gp_baseline_nll): identical
@@ -708,7 +712,7 @@ def _era5_viz_gp_posterior(
 
 
 def _era5_viz_gp_field(gp: dict, z_shared: np.ndarray) -> np.ndarray:
-    """One joint draw (D,) from the fitted exact-GP posterior of
+    """One joint draw (D,) from the fitted GP posterior of
     _era5_viz_gp_posterior, using the SAME latent white-noise vector
     `z_shared` that _era5_viz_field injects into the copula model's Sigma.
 
@@ -719,6 +723,13 @@ def _era5_viz_gp_field(gp: dict, z_shared: np.ndarray) -> np.ndarray:
     rather than to sampling luck.
     """
     return gp["mean"] + gp["L"] @ z_shared
+
+
+def _era5_viz_gp_correlation(gp: dict) -> np.ndarray:
+    """Convert the fitted GP posterior covariance into its correlation matrix."""
+    Sigma = gp["L"] @ gp["L"].T
+    std = np.sqrt(np.maximum(np.diag(Sigma), 1e-12))
+    return Sigma / np.outer(std, std)
 
 
 def _era5_viz_field(Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.Tensor, z_shared: np.ndarray, device: str) -> np.ndarray:
@@ -751,12 +762,12 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
     _build_era5_viz_batch probe: reruns the CURRENT model's forward pass
     (the only per-step-changing input) to get Sigma for each of the probe's
     few frozen days, samples one field from it via _era5_viz_field, and
-    renders ground-truth vs. exact-GP-posterior vs. predicted (vs.
+    renders ground-truth vs. fitted-GP-posterior vs. predicted (vs.
     independent, copula switched off) small multiples via
     eval.viz.correlation_plots.plot_residual_grid.
     Returns None if the probe's grid was degenerate (e.g. 0 valid days).
 
-    The exact-GP row (precomputed by _build_era5_viz_batch, drawn here with
+    The fitted-GP row (precomputed by _build_era5_viz_batch, drawn here with
     the SAME z_shared as the copula row) is the reference that makes the
     figure readable: both it and the model row are posterior SAMPLES at <5%
     context, whereas the ground-truth row is a fully-observed realization.
@@ -771,7 +782,7 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
     x_test_v = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
     rng_v = np.random.default_rng(vb["seed"])
     R_indep = np.eye(vb["D"])
-    predicted_fields, independent_fields, gp_fields = [], [], []
+    predicted_fields, gp_tabicl_fields, independent_fields, gp_fields = [], [], [], []
     gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
     for i in range(len(vb["days"])):
         z_train_v = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
@@ -783,16 +794,24 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
         independent_fields.append(_era5_viz_field(R_indep, dist_i, y_mean_i, y_std_i, z_shared, device))
         if gp_post[i] is not None:
             gp_fields.append(_era5_viz_gp_field(gp_post[i], z_shared))
+            gp_tabicl_fields.append(
+                _era5_viz_field(
+                    _era5_viz_gp_correlation(gp_post[i]),
+                    dist_i, y_mean_i, y_std_i, z_shared, device,
+                )
+            )
     # All-or-nothing: a partially populated oracle row would silently pair
     # day j's GP draw with day k's column (_plot_field_grid zips rows against
     # true_fields positionally), so one failed per-day fit drops the row.
     oracle_fields = gp_fields if len(gp_fields) == len(vb["days"]) else None
+    gp_tabicl_row = gp_tabicl_fields if len(gp_tabicl_fields) == len(vb["days"]) else None
     data_like = {"latitude": vb["lat"], "longitude": vb["lon"], "t2m": dict(zip(vb["days"], vb["true_fields"]))}
     return plot_residual_grid(
         data_like, vb["days"], predicted_fields, output_path=None,
         context_coords=vb["context_coords"], independent_fields=independent_fields,
-        oracle_fields=oracle_fields,
-        oracle_row_label=f"Exact GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample\nLatitude",
+        oracle_fields=oracle_fields, predicted_fields_2=gp_tabicl_row,
+        oracle_row_label=f"Fitted GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample\nLatitude",
+        pred2_row_label="Fitted GP correlation\n+ TabICLv2 marginal\nsample\nLatitude",
         target="raw",
     )
 
@@ -2261,6 +2280,9 @@ def main(cfg: DictConfig) -> None:
         )
 
     t = cfg.training
+    tabicl_amp = bool(t.get("tabicl_inference_amp", True))
+    configure_tabicl_inference_amp(tabicl_amp)
+    print(f"[train] frozen TabICL marginal inference AMP={'on' if tabicl_amp else 'off (float32)'}")
     live_generation = bool(t.get("live_generation", False))
     live_source = str(t.get("live_source", "gp"))
     if live_generation and live_source == "era5" and float(t.get("aux_mae_weight", 0.0)) > 0.0:

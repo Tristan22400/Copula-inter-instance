@@ -39,7 +39,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from live_dataset import resolve_live_tabicl_num_workers
-from pit import load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
+from pit import configure_tabicl_inference_amp, load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
 
 from eval.data.era5_global_corpus import GlobalERA5Corpus, load_shared_corpus_arrays
 
@@ -214,6 +214,7 @@ class LiveERA5Dataset(IterableDataset):
         n_context_frac_range: Tuple[float, float],
         base_seed: int,
         group_size: int = 1,
+        tabicl_inference_amp: bool = True,
     ):
         self.shared_corpus = shared_corpus
         self.tabicl_ckpt = tabicl_ckpt
@@ -224,6 +225,7 @@ class LiveERA5Dataset(IterableDataset):
         self.n_context_frac_range = n_context_frac_range
         self.base_seed = base_seed
         self.group_size = group_size
+        self.tabicl_inference_amp = bool(tabicl_inference_amp)
 
     def _seed_for(self, worker_id: int, call_idx: int) -> int:
         raw = (self.base_seed + 1) * 1_000_003 + worker_id * 1_000_000_007 + call_idx
@@ -234,6 +236,7 @@ class LiveERA5Dataset(IterableDataset):
 
         info = get_worker_info()
         worker_id = info.id if info is not None else 0
+        configure_tabicl_inference_amp(self.tabicl_inference_amp)
         print(f"[era5_live_dataset] worker {worker_id}: attaching to shared global ERA5 corpus")
         corpus = GlobalERA5Corpus.from_shared(self.shared_corpus)
         print(f"[era5_live_dataset] worker {worker_id}: loading frozen TabICL marginal: {self.tabicl_ckpt}")
@@ -365,6 +368,7 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         n_context_frac_range=ecfg["n_context_frac_range"],
         base_seed=base_seed,
         group_size=group_size,
+        tabicl_inference_amp=bool(t.get("tabicl_inference_amp", True)),
     )
     # GPU-headroom-bound only, same as the synthetic-GP tabicl path -- no
     # longer separately RAM-capped, since every worker shares one corpus

@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
-from pit import load_tabicl, resolve_pit_ckpt
+from pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
 
 # Thread count for generate_gp_batch calls made directly in the MAIN process
 # (build_fixed_live_val_batches below, train.py's z_train-gap diagnostic) --
@@ -345,6 +345,7 @@ class LiveGPDataset(IterableDataset):
         info = get_worker_info()
         worker_id = info.id if info is not None else 0
         cfg = copy.deepcopy(self._cfg)
+        configure_tabicl_inference_amp(bool(cfg.training.get("tabicl_inference_amp", True)))
         call_idx = 0
         # data_gen.py warns (RuntimeWarning) on every degenerate-episode
         # discard — a routine, expected event at this call rate (every worker,

@@ -198,8 +198,8 @@ def _plot_field_grid(
     ERA5 days) and plot_synthetic_residual_grid (synthetic GP draws): top row
     `true_fields`, then an optional oracle-correlation row, then optional
     predicted/predicted_2/independent rows below (flat (D,) arrays, reshaped
-    to grid_shape here). `oracle_fields`/`predicted_fields_2` are only ever
-    passed by plot_synthetic_residual_grid. All rows share one color scale
+    to grid_shape here). `oracle_fields`/`predicted_fields_2` add optional
+    reference or alternate-model rows. All rows share one color scale
     and a Moran's I annotation (see eval.spatial.diagnostics.morans_i).
 
     `output_path=None` skips the save-to-disk step and returns the open
@@ -286,9 +286,11 @@ def _plot_field_grid(
 def plot_residual_grid(
     data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: "str | None",
     context_coords: "np.ndarray | None" = None,
+    predicted_fields_2: "list[np.ndarray] | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
     oracle_fields: "list[np.ndarray] | None" = None,
-    oracle_row_label: str = "Exact GP posterior\n(fitted kernel)\nsample\nLatitude",
+    oracle_row_label: str = "Fitted GP posterior\n(fitted kernel)\nsample\nLatitude",
+    pred2_row_label: str = "Second model\n(predicted)\nLatitude",
     target: str = "raw",
 ):
     """Small-multiples panel of the `target` field (raw temperature Z_t by
@@ -297,13 +299,14 @@ def plot_residual_grid(
     field; if `predicted_fields` is given, the next row is the copula
     model's predicted field for that SAME day (see
     eval.spatial.diagnostics.predict_copula_residual_field); if
-    `independent_fields` is also given, a third row shows the SAME
+    `predicted_fields_2` is given, a second model-combination row is shown;
+    if `independent_fields` is also given, another row shows the SAME
     marginal-per-point prediction with the copula's cross-location
     correlation switched off (R replaced by the identity), isolating what
     the learned correlation structure itself adds on top of the per-point
     marginal. If `oracle_fields` is given, it is rendered ABOVE the model
     rows as a reference predictor -- for src/train.py's val/era5_predictions
-    figure that is one draw from an exact GP posterior fitted on the same
+    figure that is one draw from a fitted GP posterior on the same
     sparse context (see train.py::_era5_viz_gp_field), so the copula model's
     sample can be compared against what a classical GP actually produces on
     the identical problem rather than against the ground-truth field alone.
@@ -343,12 +346,14 @@ def plot_residual_grid(
         )
         cbar_label = "Temperature (deg C)"
     if oracle_fields is not None and predicted_fields is not None:
-        suptitle += "\n(rows 2-4 are posterior SAMPLES on the same context and the same latent noise)"
+        suptitle += "\n(prediction rows are posterior SAMPLES on the same context and latent noise)"
     return _plot_field_grid(
         lat, lon, grid_shape, true_fields, col_titles, output_path,
         row0_label="Ground truth\nLatitude", suptitle=suptitle,
-        predicted_fields=predicted_fields, independent_fields=independent_fields,
+        predicted_fields=predicted_fields, predicted_fields_2=predicted_fields_2,
+        independent_fields=independent_fields,
         oracle_fields=oracle_fields, oracle_row_label=oracle_row_label,
+        pred2_row_label=pred2_row_label,
         context_coords=context_coords,
         cbar_label=cbar_label,
     )

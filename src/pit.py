@@ -46,8 +46,37 @@ if _TABICL_SRC not in sys.path:
     sys.path.insert(0, _TABICL_SRC)
 
 from data_gen import build_kernel_fn, _safe_cholesky, sigma_to_correlation  # noqa: E402
+from tabicl._model.inference_config import InferenceConfig  # noqa: E402
 
 DEFAULT_K_FOLDS = 10
+
+# ``None`` preserves TabICL's historical default (AMP enabled on CUDA).  The
+# training entrypoint sets this once from ``training.tabicl_inference_amp``;
+# DataLoader workers inherit it before they start generating PITs.
+_TABICL_INFERENCE_CONFIG: Optional[InferenceConfig] = None
+
+
+def configure_tabicl_inference_amp(use_amp: bool) -> None:
+    """Set the inference precision used by every PIT TabICL forward.
+
+    This is intentionally process-global: PIT calls occur in the live-data
+    workers as well as in validation, and the workers inherit the setting when
+    they are spawned.  ``use_amp=False`` keeps the marginal's quantile grid in
+    float32, which is required for stable quantile derivatives/log densities.
+    """
+    global _TABICL_INFERENCE_CONFIG
+    _TABICL_INFERENCE_CONFIG = InferenceConfig(
+        COL_CONFIG={"use_amp": bool(use_amp)},
+        ROW_CONFIG={"use_amp": bool(use_amp)},
+        ICL_CONFIG={"use_amp": bool(use_amp)},
+    )
+
+
+def tabicl_forward(tabicl: nn.Module, X: torch.Tensor, y_train: torch.Tensor, **kwargs) -> torch.Tensor:
+    """Forward through TabICL using the configured marginal precision."""
+    if _TABICL_INFERENCE_CONFIG is None:
+        return tabicl(X, y_train, **kwargs)
+    return tabicl(X, y_train, inference_config=_TABICL_INFERENCE_CONFIG, **kwargs)
 
 
 def _optional_param(t: torch.Tensor):
@@ -266,7 +295,7 @@ def run_pit(
     X_test_batch = X_concat.unsqueeze(0).expand(d, -1, -1).contiguous()  # (d, P+N, p_x)
     y_train_batch = Y_train.permute(1, 0).contiguous()                   # (d, P)
 
-    logits = tabicl(X_test_batch, y_train_batch)                         # (d, N, Q)
+    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)         # (d, N, Q)
     # TabICL's InferenceManager auto-batches large forward calls and, under
     # low free GPU memory, may offload its output to CPU regardless of the
     # input device (see inference.py's _resolve_offload_mode) -- re-sync
@@ -303,7 +332,7 @@ def run_pit(
         X_fold_batch = X_fold.unsqueeze(0).expand(d, -1, -1).contiguous()
         y_ctx_batch = Y_train[ctx_idx].permute(1, 0).contiguous()          # (d, P-F)
 
-        logits_fold = tabicl(X_fold_batch, y_ctx_batch)                    # (d, F, Q)
+        logits_fold = tabicl_forward(tabicl, X_fold_batch, y_ctx_batch)    # (d, F, Q)
         logits_fold = logits_fold.to(device)  # see run_pit's offload-mode comment above
         dist_fold = tabicl.quantile_dist(logits_fold.reshape(d * F, Q))
 
@@ -425,7 +454,7 @@ def _run_pit_batched_impl(
     )
     y_train_batch = Y_train.permute(0, 2, 1).reshape(B * d, P).contiguous()     # (B*d, P)
 
-    logits = tabicl(X_test_batch, y_train_batch)                                # (B*d, N, Q)
+    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)                # (B*d, N, Q)
     # See run_pit's offload-mode comment: TabICL's InferenceManager can return
     # its output on CPU under GPU memory pressure regardless of input device.
     logits = logits.to(device)
@@ -497,7 +526,7 @@ def _run_pit_batched_impl(
                 Y_train[:, ctx_idx].permute(0, 2, 1).reshape(B * d, P - F).contiguous()
             )
 
-        logits_group = tabicl(torch.cat(x_group, dim=0), torch.cat(y_group, dim=0))
+        logits_group = tabicl_forward(tabicl, torch.cat(x_group, dim=0), torch.cat(y_group, dim=0))
         logits_group = logits_group.to(device)
 
         for group_idx, (qry_idx, _ctx_idx, F) in enumerate(group):
@@ -735,7 +764,7 @@ def run_pit_calib_split_batched(
     )
     y_calib_batch = Y_calib.permute(0, 2, 1).reshape(B * d, P_C).contiguous()  # (B*d, P_C)
 
-    logits = tabicl(X_batch, y_calib_batch)                                  # (B*d, P_Q, Q)
+    logits = tabicl_forward(tabicl, X_batch, y_calib_batch)                  # (B*d, P_Q, Q)
     # See run_pit's offload-mode comment: TabICL's InferenceManager can return
     # its output on CPU under GPU memory pressure regardless of input device.
     logits = logits.to(device)
