@@ -265,6 +265,45 @@ of the deformation angle gives orientation structure without a lattice-locked pe
 
 ### 2.4 Non-stationarity — fixes D3
 
+> **§2.4 is largely retracted — see the box below.** Variance non-stationarity, the
+> mechanism this section was built around, is provably invisible to the copula target.
+> What remains is the interface mechanism and a much smaller scope.
+
+#### Why variance modulation does not help the copula
+
+If `Σ = diag(σ) · K · diag(σ)` with `σ` a deterministic function of location, then the
+Schur complement factorizes:
+
+```
+Σ_post = D_s (K_ss − K_sf K_ff⁻¹ K_fs) D_s        with D_s = diag(σ_s)
+```
+
+so `corr(Σ_post) = corr(K_post)` **exactly** — the σ field cancels. Verified numerically:
+an 11× spatial variation in marginal sd leaves the posterior correlation unchanged to
+4e-15. The copula head is graded on correlation only, so a spatially varying marginal
+variance is invisible to it.
+
+That kills the main justification for this section. `nonstat_var_cv` (ERA5 0.295 vs prior
+0.0059) is a real and large difference in the *fields*, but it is not a difference in the
+quantity the head predicts. It still matters for the **marginal** branch — TabICL must fit
+a spatially varying scale from context — so it belongs in the Phase-A marginal work, not
+here.
+
+What *would* be copula-relevant is non-stationarity in the **correlation structure**
+itself: range or anisotropy varying with location, or an interface across which points
+decorrelate. Those change `K`, not just its diagonal scaling. But the measurement says
+ERA5 is comparatively homogeneous there — `nonstat_range_cv` is **0.088 for ERA5 against
+0.164 for the current prior**, i.e. the prior is already *more* range-heterogeneous than
+reality.
+
+**Net: reduce this section to (a) the interface mechanism, gated on measuring that it
+moves a correlation-based indicator, and (b) making the covariate columns modulate the
+CORRELATION (a warped distance metric, or same-side-of-boundary coherence) rather than the
+variance — since only the former closes D1b in a way the copula can see.** Do not build
+the σ-field modulation for the copula's sake.
+
+Original section retained below for the record:
+
 **The measurement says something specific and counter-intuitive here: modulate the
 variance, and leave the range alone.**
 
