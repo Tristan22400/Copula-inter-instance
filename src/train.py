@@ -79,7 +79,11 @@ from eval.data.era5_io import load_era5_data, safe_cholesky
 from eval.data.fetch_era5 import fetch as fetch_era5
 from eval.spatial.diagnostics import compute_context_z_train
 from eval.spatial.sweep_core import _fit_gp_baseline_nll, build_era5_probe
-from eval.viz.correlation_plots import plot_residual_grid
+from eval.viz.correlation_plots import (
+    plot_marginal_variance_grid,
+    plot_residual_grid,
+    plot_z_predictor_samples,
+)
 from inference.copula_inference import normalize_features
 from live_dataset import (
     _LIVE_TABICL_FLAT_HEADROOM_GB,
@@ -579,6 +583,11 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     the (VRAM-heavy) tabicl_marginal net resident, or re-run its forward
     pass, for the rest of training; it only reruns the copula model's own
     forward pass plus a cheap Cholesky sample + icdf lookup.
+
+    Also caches each day's `dist.variance()` (rescaled to real Kelvin^2 by
+    the same y_mean/y_std) for val/era5_marginal_variance -- a property of
+    the frozen marginal alone, so it's likewise computed once here rather
+    than in validate()'s do_plot block.
     """
     ecfg = cfg.get("baselines", {}) or {}
     region_pool = list(ecfg.get("era5_regions") or ERA5_REGIONS.keys())
@@ -627,6 +636,7 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     true_fields, z_train_per_day = [], []
     dists_per_day, y_mean_per_day, y_std_per_day = [], [], []
     gp_post_per_day: list = []
+    marginal_var_per_day: list = []
     for d in days:
         frame = data["t2m"][d]
         true_fields.append(frame)
@@ -646,12 +656,21 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
         y_std_per_day.append(y_std_t.double())
         if tabicl_marginal is None:
             dists_per_day.append(None)
+            marginal_var_per_day.append(None)
             continue
         with torch.no_grad():
             logits = tabicl_forward(
                 tabicl_marginal, x_batch, context_values_scaled_t.unsqueeze(0)
             )  # (1, D, Q)
-            dists_per_day.append(tabicl_marginal.quantile_dist(logits.reshape(D, -1)))
+            dist_d = tabicl_marginal.quantile_dist(logits.reshape(D, -1))
+            dists_per_day.append(dist_d)
+            # Var[y|x] in real Kelvin^2 = Var[y_scaled|x] * y_std^2 -- dist_d
+            # lives in the same context-normalized scale normalize_targets
+            # put context_values_scaled_t in (see _era5_viz_field's inverse
+            # rescale). QuantileDistribution.variance() is the analytic
+            # tail-corrected E[Z^2]-E[Z]^2 formula (quantile_dist.py), so this
+            # is exact given the fitted spline/tails, not a sampling estimate.
+            marginal_var_per_day.append((dist_d.variance() * y_std_t.double() ** 2).cpu().numpy())
 
     return {
         "region": region_name, "lat": lat, "lon": lon, "grid_shape": data["t2m"][days[0]].shape,
@@ -660,6 +679,7 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
         "x_train_norm": x_train_norm, "x_test_norm": x_test_norm,
         "z_train_per_day": z_train_per_day,
         "dists_per_day": dists_per_day, "y_mean_per_day": y_mean_per_day, "y_std_per_day": y_std_per_day,
+        "marginal_var_per_day": marginal_var_per_day,
         "gp_post_per_day": gp_post_per_day, "gp_row_kernel": gp_row_kernel,
         "seed": seed,
     }
@@ -813,6 +833,93 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
         oracle_row_label=f"Fitted GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample\nLatitude",
         pred2_row_label="Fitted GP correlation\n+ TabICLv2 marginal\nsample\nLatitude",
         target="raw",
+    )
+
+
+def _era5_z_samples_fig(
+    model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str, n_samples: int = 3,
+) -> "plt.Figure | None":
+    """Builds the ``val/era5_predictions_z`` figure: `n_samples` posterior
+    draws of the COPULA LATENT z (no marginal, no ground truth -- a real
+    field has no observed z) on ONE fixed day, vb["days"][0] -- the SAME day
+    as val/era5_predictions' first column, so the two figures are directly
+    comparable. Rows are the three predictors' correlation structures:
+    independent (R=I), the copula model's current Sigma (one forward pass,
+    reused for all n_samples columns since Sigma doesn't depend on the
+    sample), and the fitted-GP baseline's correlation. Every column shares
+    one white-noise draw z_shared across all three rows (own RNG, seeded off
+    vb["seed"] + 1 so it never perturbs, or is perturbed by, _era5_viz_fig's
+    own per-day z_shared sequence), so column-to-column differences are
+    sampling variation and row-to-row differences are the correlation
+    structure alone.
+
+    Returns None if the probe has no days, or if the fixed day's GP fit
+    failed/was disabled -- 2 of 3 requested predictors isn't this figure.
+    """
+    if not vb["days"]:
+        return None
+    gp0 = (vb.get("gp_post_per_day") or [None])[0]
+    if gp0 is None:
+        return None
+    day0 = vb["days"][0]
+    x_train_v = torch.as_tensor(vb["x_train_norm"], dtype=torch.float32, device=device).unsqueeze(0)
+    x_test_v = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
+    z_train_v = torch.as_tensor(vb["z_train_per_day"][0], dtype=torch.float32, device=device).unsqueeze(0)
+    out_v = model({"x_train": x_train_v, "z_train": z_train_v, "x_test": x_test_v})
+    Sigma_v = build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
+    L_indep = np.eye(vb["D"])
+    L_model = safe_cholesky(Sigma_v)
+    L_gp = safe_cholesky(_era5_viz_gp_correlation(gp0))
+
+    rng_s = np.random.default_rng(vb["seed"] + 1)
+    independent_fields, predicted_fields, gp_fields = [], [], []
+    for _ in range(n_samples):
+        z_shared = rng_s.standard_normal(vb["D"])
+        independent_fields.append(L_indep @ z_shared)
+        predicted_fields.append(L_model @ z_shared)
+        gp_fields.append(L_gp @ z_shared)
+
+    return plot_z_predictor_samples(
+        vb["lat"], vb["lon"], vb["grid_shape"], day0,
+        independent_fields, predicted_fields, gp_fields,
+        output_path=None, context_coords=vb["context_coords"],
+    )
+
+
+def _era5_marginal_variance_fig(vb: dict) -> "plt.Figure | None":
+    """Builds the ``val/era5_marginal_variance`` figure: the frozen per-day
+    TabICL marginal's predictive Var[y|x] (real Kelvin^2, cached per day by
+    _build_era5_viz_batch) at every grid location, one column per probe day,
+    context locations overlaid, plus a second row for the fitted-GP
+    baseline's own posterior Var[y|x] -- diag(Sigma_gp) read straight off
+    gp_post_per_day[i]["L"] (the SAME fitted covariance _era5_viz_gp_field
+    draws samples from, already rescaled to real Kelvin^2 by
+    _era5_viz_gp_posterior), no refit needed. Both rows are pure functions
+    of the frozen marginal/GP fit + context sample -- no model forward pass,
+    no copula, unaffected by training -- so this answers a narrower question
+    than val/era5_predictions: does either predictor's OWN uncertainty grow
+    with distance from context the way a calibrated spatial predictor's
+    should, and does the frozen TabICL marginal track the classical GP's
+    behavior or diverge from it?
+
+    Returns None if the probe has no days, or if any day's marginal variance
+    is missing (no PIT checkpoint configured -- see _build_era5_viz_batch's
+    tabicl_marginal is None branch). The GP row is dropped (all-or-nothing,
+    same convention as _era5_viz_fig's oracle row) rather than the whole
+    figure if any day's GP fit failed or era5_viz_gp is disabled.
+    """
+    var_fields = vb.get("marginal_var_per_day") or []
+    if not vb["days"] or len(var_fields) != len(vb["days"]) or any(v is None for v in var_fields):
+        return None
+    gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
+    gp_var_fields = [np.sum(gp["L"] ** 2, axis=1) for gp in gp_post if gp is not None]
+    if len(gp_var_fields) != len(vb["days"]):
+        gp_var_fields = None
+    return plot_marginal_variance_grid(
+        vb["lat"], vb["lon"], vb["grid_shape"], vb["days"], var_fields,
+        gp_var_fields=gp_var_fields,
+        output_path=None, context_coords=vb["context_coords"],
+        gp_row_label=f"Fitted GP\nposterior\n({vb.get('gp_row_kernel', 'gp')})",
     )
 
 
@@ -1998,7 +2105,7 @@ def validate(
 
     model.train()
 
-    plot_figs: list = []
+    plot_figs: dict = {}
     if do_plot and era5_viz_batch is not None:
         # Real-ERA5 predicted-vs-ground-truth temperature field, sparse
         # context (< baselines.era5_viz_context_frac, default 5%, of the
@@ -2014,7 +2121,23 @@ def validate(
         # eye) in the same real Y-space the model is actually deployed in.
         fig_era5 = _era5_viz_fig(model, cfg, era5_viz_batch, jitter, device)
         if fig_era5 is not None:
-            plot_figs.append(fig_era5)
+            plot_figs["val/era5_predictions"] = fig_era5
+        # Companion figure, same probe, same fixed first day: 3 posterior
+        # SAMPLES of the copula LATENT z itself (no marginal) so the three
+        # predictors' correlation structures — independent / copula model /
+        # GP baseline — are compared directly, isolated from any marginal
+        # differences (see _era5_z_samples_fig).
+        fig_era5_z = _era5_z_samples_fig(model, cfg, era5_viz_batch, jitter, device)
+        if fig_era5_z is not None:
+            plot_figs["val/era5_predictions_z"] = fig_era5_z
+        # Companion figure, same probe, all days: per-location predictive
+        # VARIANCE of the frozen TabICL marginal vs. the fitted-GP baseline
+        # — no model forward pass, unaffected by training — to check
+        # whether either predictor's uncertainty actually grows with
+        # distance from the sparse context (see _era5_marginal_variance_fig).
+        fig_era5_var = _era5_marginal_variance_fig(era5_viz_batch)
+        if fig_era5_var is not None:
+            plot_figs["val/era5_marginal_variance"] = fig_era5_var
 
     return metrics, plot_figs
 
@@ -3303,11 +3426,14 @@ def main(cfg: DictConfig) -> None:
                         continue
                     log_dict[f"val/kernel_sampling_weight/{family}"] = float(new_kernel_weights[i])
             if plot_figs:
-                # The real-ERA5 predicted-vs-ground-truth field figure (see
-                # validate()'s do_plot block / _build_era5_viz_batch).
-                log_dict["val/era5_predictions"] = wandb.Image(plot_figs[0])
-                for f in plot_figs:
-                    plt.close(f)
+                # The real-ERA5 diagnostic figures (see validate()'s
+                # do_plot block / _build_era5_viz_batch): predicted-vs-
+                # ground-truth field, copula-latent-z predictor samples, and
+                # marginal/GP predictive-variance-vs-context-distance — each
+                # keyed by its own wandb panel name already.
+                for key, fig in plot_figs.items():
+                    log_dict[key] = wandb.Image(fig)
+                    plt.close(fig)
             wandb.log(log_dict, step=step)
             # Surfaces the real (TabICL-marginal) total NLL as the
             # live-monitoring headline (only available once a PIT checkpoint
