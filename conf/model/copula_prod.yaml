@@ -16,7 +16,7 @@
 # from-scratch fast dev-loop counterpart.
 # ---------------------------------------------------------------------------
 model:
-  rank: 32                  # low-rank dimension r in W ∈ R^{N×r}
+  rank: 128                  # low-rank dimension r in W ∈ R^{N×r}
   sigma_jitter: 1.0e-4     # added to diag(Σ) for Cholesky stability
   unfreeze_backbone: true  # train TabICL end-to-end alongside the head
   # Which src/correlation_factory.py builder turns the copula head's raw

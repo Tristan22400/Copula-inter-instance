@@ -26,7 +26,7 @@
 #     data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \
 #     training.live_generation=true training.ckpt_dir=./checkpoints/copula_nano
 model:
-  rank: 8                  # vs. 32 in copula_prod.yaml
+  rank: 64                  # vs. 32 in copula_prod.yaml
   sigma_jitter: 1.0e-4
   unfreeze_backbone: true
   # Which src/correlation_factory.py builder turns the copula head's raw

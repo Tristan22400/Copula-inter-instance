@@ -112,6 +112,18 @@ MARGINAL_FAMILIES: dict[str, dict] = {
         "hf_name": "tabicl-regressor-v2-20260212.ckpt",
         "label": "TabICL v2 pretrained (frozen baseline)",
     },
+    "era5-33y": {
+        "dir": "marginal/ablations/marginal_finetune_era5_33y",
+        "filename": "step_0169600_final.pt",
+        "default_step": 169600,
+        "label": "TabICL v2 fine-tune ERA5 33y (step 169.6k final)",
+    },
+    "era5-12m": {
+        "dir": "marginal/ablations/marginal_finetune",
+        "filename": "step_0016200_final.pt",
+        "default_step": 16200,
+        "label": "TabICL v2 fine-tune ERA5 12m (step 16.2k final)",
+    },
 }
 
 
@@ -135,5 +147,7 @@ def resolve_marginal_checkpoint(name_or_path: str) -> str:
         return name_or_path
     if "hf_name" in entry:
         return entry["hf_name"]
+    if "filename" in entry and not step_str:
+        return os.path.join(_CHECKPOINTS_ROOT, entry["dir"], entry["filename"])
     step = int(step_str) if step_str else entry["default_step"]
     return os.path.join(_CHECKPOINTS_ROOT, entry["dir"], f"step_{step:07d}.pt")
