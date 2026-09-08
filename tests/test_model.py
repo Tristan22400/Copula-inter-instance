@@ -96,14 +96,15 @@ def test_output_shape(model_and_cfg):
 
 
 def test_correlation_unit_diagonal(model_and_cfg):
-    """low_rank_correlation(W, s) must have Sigma_ii == 1 (up to jitter)."""
+    """low_rank_correlation(W, s) must have Sigma_ii == 1 exactly (jitter is
+    renormalized back out -- see model._renormalize_to_unit_diagonal)."""
     model, _ = model_and_cfg
     batch = make_batch(B=2, P=10, N=5)
     with torch.no_grad():
         out = model(batch)
         Sigma = low_rank_correlation(out["W"], out["s"], batch["test_mask"])
     diag = Sigma.diagonal(dim1=-2, dim2=-1)
-    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-3), (
+    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-6), (
         f"Diagonal not 1: {diag}"
     )
 

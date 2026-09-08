@@ -13,7 +13,11 @@ Correlation projection (unconstrained), default "covnorm" parametrization:
 
     D = diag(softplus(s_i))
     S = W W^T + D
-    Σ = Λ^{-1/2} S Λ^{-1/2}  +  jitter·I,    Λ = diag(diag(S))
+    R = Λ^{-1/2} S Λ^{-1/2},                 Λ = diag(diag(S))
+    Σ = Γ^{-1/2} (R + jitter·I) Γ^{-1/2},    Γ = diag(diag(R + jitter·I))
+
+(the second congruence transform renormalizes the jittered matrix back to a
+unit diagonal -- see model._renormalize_to_unit_diagonal)
 
 Three alternative parametrizations ("cossim", "tanhnorm", "sparse_covnorm",
 selected via cfg.model.correlation_parametrization) live in
@@ -57,6 +61,25 @@ _NO_SCALAR_COLUMN = {"tanhnorm"}
 # ---------------------------------------------------------------------------
 
 
+def _renormalize_to_unit_diagonal(M: Tensor) -> Tensor:
+    """Rescale a symmetric PSD matrix so its diagonal is exactly 1.
+
+    Every parametrization below already builds a unit-diagonal R before
+    ``jitter`` is added, but ``R + jitter*I`` shifts the diagonal to
+    ``1 + jitter`` while leaving the off-diagonal entries untouched -- so the
+    jittered matrix is no longer a valid correlation matrix (R_ii != 1). This
+    reapplies the same Λ^{-1/2} (·) Λ^{-1/2} congruence transform used to
+    build R in the first place, using the post-jitter diagonal Λ. Off- and
+    on-diagonal entries shrink by the same factor (exactly ``1/(1+jitter)``
+    when the pre-jitter diagonal was exactly 1), which keeps M PSD -- a
+    congruence transform by a positive diagonal matrix preserves
+    positive-semidefiniteness.
+    """
+    diag = M.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
+    inv_sqrt = diag.rsqrt()
+    return M * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
+
+
 def low_rank_correlation(
     W: Tensor,
     s: Optional[Tensor] = None,
@@ -74,7 +97,8 @@ def low_rank_correlation(
                  a sigmoid gate for "cossim", unused for "tanhnorm".
         test_mask : unused inside; caller slices N_b out of Σ before Cholesky
         jitter : added to the diagonal of Σ for numerical stability, applied
-                 uniformly after building Σ regardless of parametrization
+                 uniformly after building Σ regardless of parametrization,
+                 then renormalized back to a unit diagonal (see Returns)
         parametrization : one of "covnorm" (default — original behaviour,
                  byte-identical to the pre-existing implementation),
                  "cossim", "tanhnorm", "sparse_covnorm". See
@@ -83,7 +107,11 @@ def low_rank_correlation(
                  "sparse_covnorm" (see correlation_factory.sparse_covnorm_correlation)
 
     Returns:
-        Sigma : (B, N, N) symmetric PD, unit diagonal up to ``jitter``.
+        Sigma : (B, N, N) symmetric PD, unit diagonal EXACTLY (jitter is
+                folded in and then renormalized back out via
+                ``_renormalize_to_unit_diagonal`` -- see that function's
+                docstring for why the naive ``R + jitter*I`` is not itself a
+                valid correlation matrix).
     """
     B, N, _ = W.shape
     eye = torch.eye(N, device=W.device, dtype=W.dtype).expand(B, N, N)
@@ -95,7 +123,7 @@ def low_rank_correlation(
         diag = S.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
         inv_sqrt = diag.rsqrt()
         Sigma = S * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
-        return Sigma + jitter * eye
+        return _renormalize_to_unit_diagonal(Sigma + jitter * eye)
     elif parametrization == "cossim":
         factor = cossim_correlation(W, s)
     elif parametrization == "tanhnorm":
@@ -107,7 +135,7 @@ def low_rank_correlation(
     else:
         raise ValueError(f"unknown correlation parametrization: {parametrization!r}")
 
-    return factor.dense() + jitter * eye
+    return _renormalize_to_unit_diagonal(factor.dense() + jitter * eye)
 
 
 def build_sigma(
