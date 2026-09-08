@@ -244,6 +244,10 @@ training:
   # correlations to exact zero — encourages sparsity in the predicted
   # covariance structure. 0.0 disables it entirely.
   aux_mae_weight: 0.0
+  # Precision for the frozen TabICL marginal used by PIT/z_train/z_test and
+  # marginal log densities. Keep AMP for speed by default; set false when
+  # quantile-grid precision is more important than live-generation throughput.
+  tabicl_inference_amp: true
 
 # Model-fit-to-classical-kernel diagnostic, evaluated each validation loop:
 #   val/kernel_fit/<kernel>/{copula_nll,corr_mse,corr_mae,corr_pearson}
@@ -317,7 +321,7 @@ baselines:
   era5_viz_context_frac: 0.05     # context size is floor(context_frac * grid_size^2) -- strictly < 5%
   era5_viz_seed: 20260825
 
-  # Exact-GP posterior reference row on that same figure
+  # Fitted-GP posterior reference row on that same figure
   # (train.py::_era5_viz_gp_posterior): one draw from a GP fitted by
   # MLE+MAP on the identical sparse context, sharing the copula row's
   # latent noise vector so the two rows differ only in correlation

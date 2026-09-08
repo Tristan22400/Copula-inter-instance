@@ -13,4 +13,8 @@ src/models/__pycache__/
 *.pdf
 *.png
 eval/data/cache/
-.agent/ 
+eval/data/beijing_pm25/
+*.extracted.txt
+.vscode/
+.codex/
+.agent/
