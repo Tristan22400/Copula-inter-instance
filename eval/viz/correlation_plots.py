@@ -15,6 +15,8 @@ __all__ = [
     "plot_corr_grid",
     "plot_residual_grid",
     "plot_synthetic_residual_grid",
+    "plot_z_predictor_samples",
+    "plot_marginal_variance_grid",
 ]
 
 
@@ -392,3 +394,121 @@ def plot_synthetic_residual_grid(
         oracle_row_label="Oracle correlation\n+ TabICLv2 marginal\ny",
         xlabel="x", cbar_label="Field value",
     )
+
+
+def plot_z_predictor_samples(
+    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, day: int,
+    independent_fields: list, predicted_fields: list, gp_fields: list,
+    output_path: "str | None" = None, context_coords: "np.ndarray | None" = None,
+):
+    """3-row small-multiples of the COPULA LATENT z (not temperature, no
+    marginal involved anywhere): rows are the three predictors --
+    independent (no copula, R=I), the copula model's current R, and the
+    fitted-GP baseline's correlation -- columns are independent posterior
+    SAMPLE draws for one fixed real-ERA5 day (train.py's
+    val/era5_predictions_z figure; `day` is only used for the title, it's
+    the same day as val/era5_predictions' first column). Every column
+    shares the SAME white-noise vector z_shared across all three rows
+    (train.py::_era5_z_samples_fig draws it, then applies each
+    predictor's own Cholesky factor), so a visible difference in spatial
+    smoothness is attributable to the correlation structure alone, not to
+    sampling luck.
+
+    Thin wrapper around _plot_field_grid: `independent_fields` plays the
+    role of its mandatory top row (row0), `predicted_fields`/`gp_fields`
+    the optional pred/oracle rows -- no pred2, no ground truth, since
+    there's no observed z for a real field and (once the marginal is
+    stripped out) "GP posterior sample" and "GP correlation" coincide, so
+    only one GP row is meaningful.
+
+    Unlike `predicted_fields`/`gp_fields` (flat (D,), reshaped internally by
+    _plot_field_grid), `independent_fields` fills _plot_field_grid's
+    `true_fields` row-0 slot, which it uses AS GIVEN with no reshape -- so it
+    must already be (H, W) here.
+    """
+    col_titles = [f"day {day}: sample {i + 1}" for i in range(len(independent_fields))]
+    suptitle = f"Copula Latent z-Samples (day {day}): Independent vs. Copula Model vs. GP Baseline"
+    independent_grids = [f.reshape(grid_shape) for f in independent_fields]
+    return _plot_field_grid(
+        lat, lon, grid_shape, independent_grids, col_titles, output_path,
+        row0_label="Independent\n(no copula)\nLatitude", suptitle=suptitle,
+        predicted_fields=predicted_fields, oracle_fields=gp_fields,
+        pred_row_label="Copula model\nLatitude",
+        oracle_row_label="GP baseline\n(fitted correlation)\nLatitude",
+        context_coords=context_coords, xlabel="Longitude",
+        cbar_label="z (copula latent, std normal)",
+    )
+
+
+def plot_marginal_variance_grid(
+    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, days: list, var_fields: list,
+    gp_var_fields: "list | None" = None,
+    output_path: "str | None" = None, context_coords: "np.ndarray | None" = None,
+    gp_row_label: str = "Fitted GP\nposterior",
+):
+    """Small-multiples of predictive VARIANCE (deg C^2), one column per
+    real-ERA5 day, context locations overlaid -- train.py's
+    val/era5_marginal_variance figure. Top row is the frozen TabICL
+    marginal's Var[y|x] (QuantileDistribution.variance()'s analytic
+    tail-corrected formula -- no copula, no sampling, no model forward pass
+    at all); if `gp_var_fields` is given, a second row is the fitted-GP
+    baseline's own posterior variance (diag of the SAME fitted covariance
+    _era5_viz_gp_posterior draws samples from, on the identical context/day
+    -- both rows are in real Kelvin^2 and directly comparable). Answers:
+    does either predictor's per-location uncertainty grow with distance from
+    the sparse context the way a calibrated spatial predictor's should, and
+    does the frozen TabICL marginal track a classical GP's behavior or
+    diverge from it?
+
+    Not built on _plot_field_grid: that renderer's diverging RdBu_r scale
+    (vmin=-vmax, vmax=vmax) assumes a zero-centered signal, which a
+    non-negative variance field isn't -- half that scale would be wasted and
+    zero would misleadingly read as a meaningful center. Uses a sequential
+    colormap from 0 instead, shared across both rows so the two predictors'
+    magnitudes are visually comparable.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    has_gp = gp_var_fields is not None
+    grids = [f.reshape(grid_shape) for f in var_fields]
+    gp_grids = [f.reshape(grid_shape) for f in gp_var_fields] if has_gp else []
+    vmax = float(np.max(grids + gp_grids)) if (grids or gp_grids) else 1.0
+    n_cols = len(grids)
+    n_rows = 1 + int(has_gp)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False)
+    mesh = None
+
+    def _plot_row(row_idx, row_grids, ylabel, show_col_titles):
+        nonlocal mesh
+        for j, field in enumerate(row_grids):
+            mesh = axes[row_idx][j].pcolormesh(lon, lat, field, cmap="viridis", vmin=0.0, vmax=vmax, shading="auto")
+            if show_col_titles:
+                axes[row_idx][j].set_title(f"day {days[j]}", fontsize=9)
+            if context_coords is not None:
+                axes[row_idx][j].scatter(
+                    context_coords[:, 0], context_coords[:, 1],
+                    c="red", s=8, marker="o", linewidths=0.4, edgecolors="white",
+                    label="Context points" if j == 0 else None,
+                )
+        axes[row_idx][0].set_ylabel(ylabel)
+        if context_coords is not None:
+            axes[row_idx][0].legend(loc="upper left", fontsize=6, framealpha=0.7)
+
+    _plot_row(0, grids, "TabICL marginal\nLatitude", show_col_titles=True)
+    if has_gp:
+        _plot_row(1, gp_grids, f"{gp_row_label}\nLatitude", show_col_titles=False)
+    for j in range(n_cols):
+        axes[-1][j].set_xlabel("Longitude")
+    fig.suptitle("Predictive Variance vs. Distance from Context")
+    plt.tight_layout(rect=(0.0, 0.0, 0.93, 0.94))
+    fig.colorbar(mesh, ax=axes.ravel().tolist(), shrink=0.85, label="Var[y | x] (deg C²)")
+    if output_path is None:
+        return fig
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {output_path}")
+    return None
