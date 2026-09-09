@@ -39,6 +39,7 @@ __all__ = [
     "predict_copula_residual_field",
     "load_copula_model",
     "load_marginal_tabicl",
+    "resolve_checkpoint_marginal_source",
     "extract_model_dummy_context_correlation",
     "compute_context_z_train",
     "extract_model_context_correlation",
@@ -173,21 +174,66 @@ def load_copula_model(ckpt_path: str, device: "str | None" = None):
     return model, cfg, device
 
 
+def resolve_checkpoint_marginal_source(cfg) -> "str | None":
+    """The single (local path or HF filename) identifying a checkpoint's own
+    intended marginal — used consistently everywhere a checkpoint's marginal
+    is needed: the low-level TabICL object load_marginal_tabicl loads below
+    (for z_train/R_context), AND the sklearn TabICLRegressor
+    eval/spatial/sweep_core.py::run_real_config uses for qgrid/NLL scoring.
+    Without a single shared resolver, those two call sites can silently
+    disagree on which marginal a given checkpoint means — the exact bug this
+    function exists to make impossible: run_real_config used to hardcode a
+    module-global default TabICLRegressor for qgrid regardless of which
+    marginal load_marginal_tabicl had loaded for that same checkpoint's
+    R_context, so nll_copula/nll_total scored a "checkpoint's R_context +
+    unrelated default marginal" hybrid instead of the checkpoint's own
+    intended joint model whenever the two diverged (any checkpoint with a
+    custom tabicl.pit_ckpt).
+
+    Prefers tabicl.pit_ckpt when the checkpoint names one (a Phase-A-
+    finetuned or otherwise checkpoint-specific marginal) over tabicl.ckpt's
+    default pretrained HF checkpoint, regardless of tabicl.pretrained: that
+    flag describes whether the COPULA backbone itself started from a
+    pretrained TabICL init, not whether a usable marginal is available — a
+    checkpoint can be pretrained=False yet still name a perfectly good
+    pit_ckpt (exactly load_marginal_tabicl's old bug). Returns None only
+    when neither is usable: pretrained=False AND no pit_ckpt set, i.e. a
+    genuinely from-scratch backbone with no marginal at all.
+    """
+    pit_ckpt = cfg.tabicl.get("pit_ckpt", None)
+    if pit_ckpt:
+        return pit_ckpt
+    if bool(cfg.tabicl.get("pretrained", True)):
+        return cfg.tabicl.ckpt
+    return None
+
+
 def load_marginal_tabicl(cfg, device: str):
-    """Load the frozen, pretrained TabICL quantile regressor used ONLY as a
-    marginal-CDF oracle for the PIT transform in
-    extract_model_context_correlation — NOT the same object as the
-    CopulaTabICL backbone in load_copula_model. Returns None (with a
-    warning) if the checkpoint's backbone was trained from scratch."""
-    if not bool(cfg.tabicl.get("pretrained", True)):
-        print("Warning: cfg.tabicl.pretrained=False — no pretrained quantile "
-              "head available for PIT; context z_train will fall back to "
-              "naive standardization.")
+    """Load the frozen TabICL quantile regressor used ONLY as a marginal-CDF
+    oracle for the PIT transform in extract_model_context_correlation — NOT
+    the same object as the CopulaTabICL backbone in load_copula_model.
+    Returns None (with a warning) if resolve_checkpoint_marginal_source
+    finds no usable marginal (from-scratch backbone), or if loading the
+    resolved source fails (e.g. a checkpoint's embedded tabicl.pit_ckpt
+    naming a path that no longer exists after a checkpoints/ reorg) — a
+    reference marginal is never worth killing a whole sweep/diagnose run
+    over; the caller falls back to naive z_train standardization either
+    way."""
+    source = resolve_checkpoint_marginal_source(cfg)
+    if source is None:
+        print("Warning: cfg.tabicl.pretrained=False and no pit_ckpt set — "
+              "no usable marginal for PIT; context z_train will fall back "
+              "to naive standardization.")
         return None
 
     from src.pit import load_tabicl
 
-    return load_tabicl(cfg.tabicl.ckpt, device)
+    try:
+        return load_tabicl(source, device)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: failed to load marginal '{source}' ({exc}); "
+              "context z_train will fall back to naive standardization.")
+        return None
 
 
 def _forward_correlation(model, device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray) -> np.ndarray:
