@@ -40,6 +40,7 @@ from eval.spatial.diagnostics import (
     load_copula_model,
     load_marginal_tabicl,
     pair_counts_by_distance,
+    resolve_checkpoint_marginal_source,
 )
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import normalize_features
@@ -78,10 +79,25 @@ def get_model(ckpt: str, device: "str | None" = None):
     return _MODEL_CACHE[ckpt]
 
 
-def _get_tabicl_regressor(device: str):
-    if device not in _TABICL_REGRESSOR_CACHE:
-        _TABICL_REGRESSOR_CACHE[device] = make_tabicl_regressor(device=device)
-    return _TABICL_REGRESSOR_CACHE[device]
+def _get_tabicl_regressor(source: "str | None", device: str):
+    """Sklearn-wrapper TabICLRegressor for `source` (see
+    resolve_checkpoint_marginal_source), cached per (source, device).
+
+    `source` MUST be the same marginal identity load_marginal_tabicl
+    resolved for whichever checkpoint's R_context this regressor's qgrid
+    will be paired with in compute_joint_nll — run_real_config used to call
+    this with no source at all (a single module-global default regressor
+    shared by every checkpoint), which silently scored nll_total/nll_copula
+    against a DIFFERENT marginal than whatever `marginal` had produced that
+    checkpoint's own R_context, for any checkpoint whose own marginal wasn't
+    the default (e.g. a custom tabicl.pit_ckpt). Passing None reproduces
+    that old default-only behavior for a from-scratch backbone with no
+    marginal at all (resolve_checkpoint_marginal_source's other None case).
+    """
+    key = (source, device)
+    if key not in _TABICL_REGRESSOR_CACHE:
+        _TABICL_REGRESSOR_CACHE[key] = make_tabicl_regressor(checkpoint=source, device=device)
+    return _TABICL_REGRESSOR_CACHE[key]
 
 
 def weighted_corr(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
@@ -266,7 +282,13 @@ def run_real_config(
     nll_test_idx = rng.choice(remaining_idx, size=min(N_NLL_TEST, len(remaining_idx)), replace=False)
     x_train_norm, x_test_norm = normalize_features(context_coords, coords)
     x_nll_test_norm = x_test_norm[nll_test_idx]
-    tabicl_reg = _get_tabicl_regressor(resolved_device)
+    # SAME marginal `marginal` above was loaded from (see
+    # resolve_checkpoint_marginal_source), not a module-global default --
+    # qgrid below and R_context above must agree on which marginal defines
+    # z-space, or nll_total/nll_copula silently score a "this checkpoint's
+    # R_context + an unrelated marginal" hybrid instead of the checkpoint's
+    # own intended joint model (see _get_tabicl_regressor's docstring).
+    tabicl_reg = _get_tabicl_regressor(resolve_checkpoint_marginal_source(cfg), resolved_device)
 
     gp_kernels = gp_baseline_kernels if gp_baseline_kernels is not None else GP_BASELINE_KERNELS
 
