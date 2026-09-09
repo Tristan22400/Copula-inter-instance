@@ -81,6 +81,7 @@ from eval.spatial.diagnostics import compute_context_z_train
 from eval.spatial.sweep_core import _fit_gp_baseline_nll, build_era5_probe
 from eval.viz.correlation_plots import (
     plot_marginal_variance_grid,
+    plot_mean_removed_grid,
     plot_residual_grid,
     plot_z_predictor_samples,
 )
@@ -585,9 +586,10 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     forward pass plus a cheap Cholesky sample + icdf lookup.
 
     Also caches each day's `dist.variance()` (rescaled to real Kelvin^2 by
-    the same y_mean/y_std) for val/era5_marginal_variance -- a property of
-    the frozen marginal alone, so it's likewise computed once here rather
-    than in validate()'s do_plot block.
+    the same y_mean/y_std) for val/era5_marginal_variance, and `dist.mean()`
+    (rescaled the same way) for val/era5_residuals' mean-removal -- both are
+    properties of the frozen marginal alone, so they're likewise computed
+    once here rather than in validate()'s do_plot block.
     """
     ecfg = cfg.get("baselines", {}) or {}
     region_pool = list(ecfg.get("era5_regions") or ERA5_REGIONS.keys())
@@ -637,6 +639,7 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     dists_per_day, y_mean_per_day, y_std_per_day = [], [], []
     gp_post_per_day: list = []
     marginal_var_per_day: list = []
+    marginal_mean_per_day: list = []
     for d in days:
         frame = data["t2m"][d]
         true_fields.append(frame)
@@ -657,6 +660,7 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
         if tabicl_marginal is None:
             dists_per_day.append(None)
             marginal_var_per_day.append(None)
+            marginal_mean_per_day.append(None)
             continue
         with torch.no_grad():
             logits = tabicl_forward(
@@ -671,6 +675,10 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
             # tail-corrected E[Z^2]-E[Z]^2 formula (quantile_dist.py), so this
             # is exact given the fitted spline/tails, not a sampling estimate.
             marginal_var_per_day.append((dist_d.variance() * y_std_t.double() ** 2).cpu().numpy())
+            # E[y|x] in real Kelvin, same rescale as _era5_viz_field's return
+            # line (linear, so y_std scales rather than y_std^2) -- the
+            # per-location mean val/era5_residuals subtracts off every row.
+            marginal_mean_per_day.append((y_mean_t.double() + y_std_t.double() * dist_d.mean().double()).cpu().numpy())
 
     return {
         "region": region_name, "lat": lat, "lon": lon, "grid_shape": data["t2m"][days[0]].shape,
@@ -679,7 +687,7 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
         "x_train_norm": x_train_norm, "x_test_norm": x_test_norm,
         "z_train_per_day": z_train_per_day,
         "dists_per_day": dists_per_day, "y_mean_per_day": y_mean_per_day, "y_std_per_day": y_std_per_day,
-        "marginal_var_per_day": marginal_var_per_day,
+        "marginal_var_per_day": marginal_var_per_day, "marginal_mean_per_day": marginal_mean_per_day,
         "gp_post_per_day": gp_post_per_day, "gp_row_kernel": gp_row_kernel,
         "seed": seed,
     }
@@ -777,15 +785,18 @@ def _era5_viz_field(Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.
     return (y_mean + y_std * y_pred_scaled).cpu().numpy()
 
 
-def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str) -> "plt.Figure | None":
-    """Builds the ``val/era5_predictions`` figure from a frozen
-    _build_era5_viz_batch probe: reruns the CURRENT model's forward pass
-    (the only per-step-changing input) to get Sigma for each of the probe's
-    few frozen days, samples one field from it via _era5_viz_field, and
-    renders ground-truth vs. fitted-GP-posterior vs. predicted (vs.
-    independent, copula switched off) small multiples via
-    eval.viz.correlation_plots.plot_residual_grid.
-    Returns None if the probe's grid was degenerate (e.g. 0 valid days).
+def _era5_viz_fig(
+    model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str,
+) -> "tuple[plt.Figure | None, plt.Figure | None]":
+    """Builds the ``val/era5_predictions`` figure (and its mean-removed
+    ``val/era5_residuals`` companion) from a frozen _build_era5_viz_batch
+    probe: reruns the CURRENT model's forward pass (the only per-step-
+    changing input) to get Sigma for each of the probe's few frozen days,
+    samples one field from it via _era5_viz_field, and renders ground-truth
+    vs. fitted-GP-posterior vs. predicted (vs. independent, copula switched
+    off) small multiples via eval.viz.correlation_plots.plot_residual_grid.
+    Returns (None, None) if the probe's grid was degenerate (e.g. 0 valid
+    days).
 
     The fitted-GP row (precomputed by _build_era5_viz_batch, drawn here with
     the SAME z_shared as the copula row) is the reference that makes the
@@ -795,38 +806,66 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
     overconfident -- emitting the prior correlation rather than the
     posterior gives beautiful smooth fields and a much WORSE held-out NLL.
     Against the GP's own sample, that trade is visible instead of hidden.
+
+    The residual companion figure subtracts each row's OWN predictive mean
+    (the frozen TabICL marginal's mean field -- see _build_era5_viz_batch's
+    marginal_mean_per_day -- for the ground-truth/predicted/independent
+    rows, the fitted GP's own posterior mean for the GP row) at every
+    location before plotting, via eval.viz.correlation_plots.
+    plot_mean_removed_grid. Raw ERA5 temperature is dominated by a smooth
+    lat/lon gradient that swamps the finer cross-location structure Sigma is
+    actually scored on; removing the mean isolates that structure so the
+    model's residual texture can be compared by eye against the ground
+    truth's and the fitted GP's own residual samples. Reuses this
+    function's per-day forward pass and z_shared draws rather than
+    resampling, so the two figures are built from the identical fields (the
+    residual panel is a strict function of the ones the raw panel already
+    plots) at no extra model-forward cost. Silently drops (None) if any
+    day's marginal mean is missing (no PIT checkpoint configured).
     """
     if not vb["days"]:
-        return None
+        return None, None
     x_train_v = torch.as_tensor(vb["x_train_norm"], dtype=torch.float32, device=device).unsqueeze(0)
     x_test_v = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
     rng_v = np.random.default_rng(vb["seed"])
     R_indep = np.eye(vb["D"])
     predicted_fields, gp_tabicl_fields, independent_fields, gp_fields = [], [], [], []
+    predicted_resid, gp_tabicl_resid, independent_resid, gp_resid, true_resid = [], [], [], [], []
     gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
+    marginal_mean = vb.get("marginal_mean_per_day") or [None] * len(vb["days"])
     for i in range(len(vb["days"])):
         z_train_v = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
         out_v = model({"x_train": x_train_v, "z_train": z_train_v, "x_test": x_test_v})
         Sigma_v = build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
         z_shared = rng_v.standard_normal(vb["D"])
         dist_i, y_mean_i, y_std_i = vb["dists_per_day"][i], vb["y_mean_per_day"][i], vb["y_std_per_day"][i]
-        predicted_fields.append(_era5_viz_field(Sigma_v, dist_i, y_mean_i, y_std_i, z_shared, device))
-        independent_fields.append(_era5_viz_field(R_indep, dist_i, y_mean_i, y_std_i, z_shared, device))
+        pred_field = _era5_viz_field(Sigma_v, dist_i, y_mean_i, y_std_i, z_shared, device)
+        indep_field = _era5_viz_field(R_indep, dist_i, y_mean_i, y_std_i, z_shared, device)
+        predicted_fields.append(pred_field)
+        independent_fields.append(indep_field)
+        mean_i = marginal_mean[i]
+        if mean_i is not None:
+            predicted_resid.append(pred_field - mean_i)
+            independent_resid.append(indep_field - mean_i)
+            true_resid.append(vb["true_fields"][i].ravel() - mean_i)
         if gp_post[i] is not None:
-            gp_fields.append(_era5_viz_gp_field(gp_post[i], z_shared))
-            gp_tabicl_fields.append(
-                _era5_viz_field(
-                    _era5_viz_gp_correlation(gp_post[i]),
-                    dist_i, y_mean_i, y_std_i, z_shared, device,
-                )
+            gp_field = _era5_viz_gp_field(gp_post[i], z_shared)
+            gp_fields.append(gp_field)
+            if mean_i is not None:
+                gp_resid.append(gp_field - gp_post[i]["mean"])
+            gp_tabicl_field = _era5_viz_field(
+                _era5_viz_gp_correlation(gp_post[i]), dist_i, y_mean_i, y_std_i, z_shared, device,
             )
+            gp_tabicl_fields.append(gp_tabicl_field)
+            if mean_i is not None:
+                gp_tabicl_resid.append(gp_tabicl_field - mean_i)
     # All-or-nothing: a partially populated oracle row would silently pair
     # day j's GP draw with day k's column (_plot_field_grid zips rows against
     # true_fields positionally), so one failed per-day fit drops the row.
     oracle_fields = gp_fields if len(gp_fields) == len(vb["days"]) else None
     gp_tabicl_row = gp_tabicl_fields if len(gp_tabicl_fields) == len(vb["days"]) else None
     data_like = {"latitude": vb["lat"], "longitude": vb["lon"], "t2m": dict(zip(vb["days"], vb["true_fields"]))}
-    return plot_residual_grid(
+    fig_raw = plot_residual_grid(
         data_like, vb["days"], predicted_fields, output_path=None,
         context_coords=vb["context_coords"], independent_fields=independent_fields,
         oracle_fields=oracle_fields, predicted_fields_2=gp_tabicl_row,
@@ -834,6 +873,18 @@ def _era5_viz_fig(model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, de
         pred2_row_label="Fitted GP correlation\n+ TabICLv2 marginal\nsample\nLatitude",
         target="raw",
     )
+    fig_resid = None
+    if len(true_resid) == len(vb["days"]):
+        oracle_resid = gp_resid if len(gp_resid) == len(vb["days"]) else None
+        gp_tabicl_resid_row = gp_tabicl_resid if len(gp_tabicl_resid) == len(vb["days"]) else None
+        fig_resid = plot_mean_removed_grid(
+            vb["lat"], vb["lon"], vb["grid_shape"], vb["days"], true_resid, output_path=None,
+            predicted_fields=predicted_resid, predicted_fields_2=gp_tabicl_resid_row,
+            independent_fields=independent_resid, oracle_fields=oracle_resid,
+            context_coords=vb["context_coords"],
+            oracle_row_label=f"Fitted GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample minus\nGP mean\nLatitude",
+        )
+    return fig_raw, fig_resid
 
 
 def _era5_z_samples_fig(
@@ -2119,9 +2170,17 @@ def validate(
         # TabICL's own approximate z-space, not the GP's exact one) — an
         # ERA5 field reconstruction has no such mismatch: it's judged (by
         # eye) in the same real Y-space the model is actually deployed in.
-        fig_era5 = _era5_viz_fig(model, cfg, era5_viz_batch, jitter, device)
+        fig_era5, fig_era5_resid = _era5_viz_fig(model, cfg, era5_viz_batch, jitter, device)
         if fig_era5 is not None:
             plot_figs["val/era5_predictions"] = fig_era5
+        # Companion figure, same probe/day/forward-pass/z_shared draws as
+        # val/era5_predictions: each row's OWN per-location predictive mean
+        # (frozen TabICL marginal, or the fitted GP's own posterior mean for
+        # the GP row) subtracted off, isolating the cross-location
+        # correlation structure from the smooth mean field that otherwise
+        # dominates the raw-temperature panel (see _era5_viz_fig).
+        if fig_era5_resid is not None:
+            plot_figs["val/era5_residuals"] = fig_era5_resid
         # Companion figure, same probe, same fixed first day: 3 posterior
         # SAMPLES of the copula LATENT z itself (no marginal) so the three
         # predictors' correlation structures — independent / copula model /
