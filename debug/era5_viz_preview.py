@@ -1,4 +1,5 @@
-"""era5_viz_preview.py — render validate()'s val/era5_predictions figure for
+"""era5_viz_preview.py — render validate()'s val/era5_predictions figure (and
+its mean-removed val/era5_residuals companion, as `<out>_residuals.png`) for
 a checkpoint WITHOUT launching training, and print the Moran's I table behind
 it.
 
@@ -81,11 +82,18 @@ def main() -> None:
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     with torch.no_grad():
-        fig = T._era5_viz_fig(model, cfg, vb, jitter, device)
+        fig, fig_resid = T._era5_viz_fig(model, cfg, vb, jitter, device)
     if fig is None:
         raise SystemExit("figure unavailable (degenerate probe grid)")
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fig.savefig(args.out, dpi=130, bbox_inches="tight")
+    if fig_resid is not None:
+        resid_out = os.path.join(
+            os.path.dirname(os.path.abspath(args.out)),
+            os.path.splitext(os.path.basename(args.out))[0] + "_residuals.png",
+        )
+        fig_resid.savefig(resid_out, dpi=130, bbox_inches="tight")
+        print(f"wrote {resid_out}")
 
     # Moran's I per row, recomputed on the same shared-z draws the figure used.
     gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
