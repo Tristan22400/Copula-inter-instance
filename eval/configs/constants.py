@@ -16,6 +16,19 @@ PIT_K_FOLDS = 10            # K-fold leave-one-out PIT folds for real-context z_
 N_SYNTHETIC_DRAWS = 20      # independent GP draws averaged per synthetic-mode config
 EARTH_RADIUS_KM = 6371.0
 
+# Real-ERA5 y-space empirical correlation curve (sweep_core.py::
+# run_real_config's rho_model_yspace / model_r2 / shape_corr): per probe
+# day, draw this many joint y-space samples from the checkpoint's OWN
+# implied Sklar model (R_context's copula + its own marginal, via
+# eval.spatial.diagnostics.sample_copula_residual_fields) and pool across
+# days into one (N_DAYS_PROBE * N_YSPACE_MC_SAMPLES, D) observation matrix
+# before computing np.corrcoef -- the same "outer(z,z) is single-draw-noisy,
+# pool across many draws" logic as run_benchmarks.py's empirical_ground_truth
+# proxy, just pooling MC samples per day here instead of pooling episodes.
+# Mirrors N_SYNTHETIC_DRAWS above; kept separate since the two serve
+# different modes (real vs. synthetic) and could legitimately diverge.
+N_YSPACE_MC_SAMPLES = 20
+
 # Total (marginal+copula) joint-NLL diagnostic (eval/metrics/joint_nll.py::
 # compute_joint_nll), shared by debug/stages/s7_backbone.py and
 # sweep_core.py::run_real_config -- neither the per-episode NLL tables in
