@@ -59,6 +59,7 @@ from eval.spatial.diagnostics import (  # noqa: E402
     fit_theoretical_law,
     pair_counts_by_distance,
     predict_copula_residual_field,
+    sample_copula_residual_fields,
     sample_simple_kernel_covariance,
 )
 from eval.spatial.sweep_core import get_model, run_real_config, run_synthetic_config  # noqa: E402
@@ -113,13 +114,13 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
     context_idx = rng.choice(D, size=n_context_eff, replace=False)
     context_coords = coords[context_idx]
 
-    R_context_per_day, predicted_fields, independent_fields = [], [], []
+    predicted_fields, independent_fields = [], []
+    model_yspace_samples, dummy_yspace_samples = [], []
     for d in days:
         context_values = data["t2m"][d].ravel()[context_idx]
         R_context = extract_model_context_correlation(
             model, resolved_device, marginal, context_coords, context_values, coords, k_folds=constants.PIT_K_FOLDS,
         )
-        R_context_per_day.append(R_context)
         z_shared = rng.standard_normal(D)
         predicted_fields.append(
             predict_copula_residual_field(marginal, context_coords, context_values, coords, R_context, resolved_device, z_shared)
@@ -127,19 +128,35 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
         independent_fields.append(
             predict_copula_residual_field(marginal, context_coords, context_values, coords, R_indep, resolved_device, z_shared)
         )
-    R_context_mean = np.mean(R_context_per_day, axis=0)
+
+        # Y-space empirical correlation (see sweep_core.py::run_real_config's
+        # identical fix): R_dummy needs the SAME real context/marginal as
+        # R_context to produce an honest y-space sample at all (there's no
+        # y-space meaning to "no context") -- what varies is which
+        # correlation matrix (context-conditioned vs. unconditional) gets
+        # injected, isolating exactly what conditioning on real context
+        # buys, the same way independent_fields above isolates R_indep.
+        z_batch = rng.standard_normal((constants.N_YSPACE_MC_SAMPLES, D))
+        model_yspace_samples.append(
+            sample_copula_residual_fields(marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch)
+        )
+        dummy_yspace_samples.append(
+            sample_copula_residual_fields(marginal, context_coords, context_values, coords, R_dummy, resolved_device, z_batch)
+        )
+    R_model_yspace = np.corrcoef(np.concatenate(model_yspace_samples, axis=0).T)
+    R_dummy_yspace = np.corrcoef(np.concatenate(dummy_yspace_samples, axis=0).T)
 
     tag = f"{_safe_ckpt_tag(ckpt_token)}_real_{region}_g{grid_size}"
     dist = haversine_distance_km(coords)
     iu = np.triu_indices_from(R_emp, k=1)
     series = {
         "ground_truth": (dist[iu], R_emp[iu]),
-        "model_context": (dist[iu], R_context_mean[iu]),
-        "dummy_context": (dist[iu], R_dummy[iu]),
+        "model_context": (dist[iu], R_model_yspace[iu]),
+        "dummy_context": (dist[iu], R_dummy_yspace[iu]),
     }
     plot_correlation_vs_distance(series, os.path.join(out_dir, f"diagnose_distance_{tag}.png"), scatter_series="ground_truth")
     plot_correlation_heatmaps(
-        {"ground_truth": R_emp, "model_context": R_context_mean, "dummy_context": R_dummy},
+        {"ground_truth": R_emp, "model_context": R_model_yspace, "dummy_context": R_dummy_yspace},
         os.path.join(out_dir, f"diagnose_heatmaps_{tag}.png"),
     )
     plot_residual_grid(
@@ -443,8 +460,14 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
         print(f"Saved {nll_bar_path}")
 
     # --- curve overlays: ground truth vs. every family's predicted curve, one figure per config ---
+    # Both real-mode keys are now in the SAME (raw-y) space: rho_emp is
+    # np.corrcoef of the actual observed days, rho_model_yspace is
+    # np.corrcoef of MC samples drawn from each family's own implied Sklar
+    # model (see sweep_core.py::run_real_config) -- comparable across
+    # families regardless of which marginal each one uses, since raw-y
+    # correlation needs no PIT/marginal at all on the ground-truth side.
     gt_key = "rho_emp" if mode == "real" else "rho_true"
-    pred_key = "rho_context_mean" if mode == "real" else "rho_pred"
+    pred_key = "rho_model_yspace" if mode == "real" else "rho_pred"
     for config_name in configs:
         recs = [r for r in results if r["config"] == config_name and "dist_centers" in r]
         if not recs:

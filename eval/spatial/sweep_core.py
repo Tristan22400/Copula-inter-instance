@@ -22,7 +22,7 @@ import torch
 from eval.baselines.classical import fit_and_eval_gpytorch
 from eval.configs.constants import (
     GP_BASELINE_KERNELS, GP_LR_MLE, GP_N_RESTARTS_MLE, GP_N_STEPS_MLE, MAX_DIST_PERCENTILE, N_BINS,
-    N_CONTEXT, N_DAYS, N_NLL_TEST, NLL_PROBS, PIT_K_FOLDS, SEED,
+    N_CONTEXT, N_DAYS, N_NLL_TEST, N_YSPACE_MC_SAMPLES, NLL_PROBS, PIT_K_FOLDS, SEED,
 )
 from eval.configs.regions import REGIONS
 from eval.data.era5_io import haversine_distance_km, load_era5_data
@@ -41,6 +41,7 @@ from eval.spatial.diagnostics import (
     load_marginal_tabicl,
     pair_counts_by_distance,
     resolve_checkpoint_marginal_source,
+    sample_copula_residual_fields,
 )
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import normalize_features
@@ -292,7 +293,7 @@ def run_real_config(
 
     gp_kernels = gp_baseline_kernels if gp_baseline_kernels is not None else GP_BASELINE_KERNELS
 
-    rho_context_per_day = []
+    model_yspace_samples = []  # (n_days * N_YSPACE_MC_SAMPLES, D) once stacked below
     nll_total_per_day, nll_marginal_per_day, nll_copula_per_day = [], [], []
     gp_nll_per_day: dict = {k: {"total": [], "marginal": [], "copula": []} for k in gp_kernels}
     for d in days:
@@ -301,7 +302,23 @@ def run_real_config(
         R_context = extract_model_context_correlation(
             model, resolved_device, marginal, context_coords, context_values, coords, k_folds=PIT_K_FOLDS,
         )
-        rho_context_per_day.append(bin_correlation_by_distance(R_context, dist, bin_edges))
+
+        # Y-space empirical correlation curve: draw N_YSPACE_MC_SAMPLES
+        # joint samples from THIS checkpoint's own implied Sklar model
+        # (R_context's copula + its own marginal, via
+        # sample_copula_residual_fields) -- i.e. score/compare in the SAME
+        # raw-y space R_emp already lives in, instead of binning R_context
+        # (z-space) directly against a raw-y ground truth. Pooled across all
+        # probe days below (one MC-noisy correlation matrix per day would
+        # be as unreliable as run_benchmarks.py's own single-episode
+        # outer(z,z) proxy -- pooling many draws is what makes it usable,
+        # same idea, more draws per "episode" since there are only ~6 days).
+        z_batch = rng.standard_normal((N_YSPACE_MC_SAMPLES, D))
+        model_yspace_samples.append(
+            sample_copula_residual_fields(
+                marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch,
+            )
+        )
 
         # Total (marginal+copula) Y-space NLL on the held-out points: a
         # one-shot (non-K-fold — never in context) TabICL quantile grid
@@ -330,7 +347,9 @@ def run_real_config(
             for kname, parts in gp_day.items():
                 for comp in ("total", "marginal", "copula"):
                     gp_nll_per_day[kname][comp].append(parts[comp])
-    rho_context_mean = np.nanmean(np.array(rho_context_per_day), axis=0)
+    model_yspace_obs = np.concatenate(model_yspace_samples, axis=0)  # (n_days*K, D)
+    R_model_yspace = np.corrcoef(model_yspace_obs.T)
+    rho_model_yspace = bin_correlation_by_distance(R_model_yspace, dist, bin_edges)
     nll_total = float(np.nanmean(nll_total_per_day)) if nll_total_per_day else float("nan")
     nll_marginal = float(np.nanmean(nll_marginal_per_day)) if nll_marginal_per_day else float("nan")
     nll_copula = float(np.nanmean(nll_copula_per_day)) if nll_copula_per_day else float("nan")
@@ -342,13 +361,13 @@ def run_real_config(
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_dummy = bin_correlation_by_distance(R_dummy, dist, bin_edges)
 
-    shape_corr = weighted_corr(rho_context_mean, rho_emp, pair_counts)
-    rmse, bias = weighted_rmse_bias(rho_context_mean, rho_emp, pair_counts)
-    fro_ratio = float(np.sqrt(np.nanmean((rho_context_mean - rho_emp) ** 2)) /
+    shape_corr = weighted_corr(rho_model_yspace, rho_emp, pair_counts)
+    rmse, bias = weighted_rmse_bias(rho_model_yspace, rho_emp, pair_counts)
+    fro_ratio = float(np.sqrt(np.nanmean((rho_model_yspace - rho_emp) ** 2)) /
                        max(np.sqrt(np.nanmean(rho_emp ** 2)), 1e-8))
 
     gt_fit = fit_theoretical_law(dist_centers, rho_emp, pair_counts.astype(int), "matern")
-    model_r2 = weighted_r2(rho_context_mean, rho_emp, pair_counts)
+    model_r2 = weighted_r2(rho_model_yspace, rho_emp, pair_counts)
 
     result = {
         "ckpt": ckpt,
@@ -373,7 +392,7 @@ def run_real_config(
         "dist_centers": dist_centers.tolist(),
         "pair_counts": pair_counts.tolist(),
         "rho_emp": rho_emp.tolist(),
-        "rho_context_mean": rho_context_mean.tolist(),
+        "rho_model_yspace": rho_model_yspace.tolist(),
         "rho_dummy": rho_dummy.tolist(),
     }
     print(f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
