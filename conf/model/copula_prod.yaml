@@ -28,6 +28,16 @@ model:
 tabicl:
   pretrained: true   # false → randomly-initialised backbone (uses arch section below)
   ckpt: tabicl-regressor-v2-20260212.ckpt  # ignored when pretrained=false
+  # Path to a frozen TabICL checkpoint to use as the PIT marginal (src/pit.py
+  # ::resolve_pit_ckpt) instead of this preset's own `ckpt` above — e.g. a
+  # Phase-A fine-tuned marginal (src/finetune_marginal.py). Declared here
+  # (rather than left for `+tabicl.pit_ckpt=...` to create) so the documented
+  # override `python src/train.py tabicl.pit_ckpt=<path>` (no `+`) actually
+  # works, and so a stray `+tabicl.pit_ckpt=...`/wrong-nesting typo (e.g.
+  # `+model.tabicl.pit_ckpt=...`) errors loudly instead of silently landing
+  # on an unused config path — see conf/model/copula_nano.yaml's own
+  # pit_ckpt for the from-scratch-backbone case this mirrors.
+  pit_ckpt: null
   # Gradient checkpointing (torch.utils.checkpoint) through the pretrained
   # backbone's col/row/icl transformer stages: recomputes activations during
   # backward instead of holding them all, trading ~20-30% extra compute for a

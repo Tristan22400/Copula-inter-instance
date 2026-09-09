@@ -178,6 +178,17 @@ def load_tabicl(
     same function can read back (see
     ``marginal_finetune.save_marginal_checkpoint``), and re-reading a ~120MB
     file just to recover it would be silly.
+
+    Every failure mode below (missing file, wrong checkpoint kind, corrupt
+    state_dict) raises with the checkpoint path baked into the message,
+    rather than letting a bare ``KeyError``/``RuntimeError``/HF-hub exception
+    surface — this is the single function every marginal-loading call site in
+    the repo goes through (train.py, eval_checkpoint.py, spatial diagnostics,
+    era5 calibration, finetune scripts), so one clear error here covers all
+    of them. It does NOT catch the case where ``ckpt_name`` resolves to a
+    real, architecturally-compatible-but-wrong checkpoint (e.g. an unrelated
+    TabICL fine-tune) — no loader can tell "wrong weights" from "right
+    weights" by inspection.
     """
     from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
@@ -186,11 +197,57 @@ def load_tabicl(
     else:
         from huggingface_hub import hf_hub_download
 
-        ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        try:
+            ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load TabICL checkpoint '{ckpt_name}': it is not a local file "
+                f"and could not be fetched from the 'jingang/TabICL' HuggingFace repo "
+                f"({type(exc).__name__}: {exc}). Check the path for typos -- this is the "
+                f"most common cause -- or that HF_HUB_OFFLINE=1 isn't blocking a "
+                f"first-time download of a real HF filename."
+            ) from exc
 
-    base = TabICL(**checkpoint["config"])
-    base.load_state_dict(checkpoint["state_dict"])
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load TabICL checkpoint at '{ckpt_path}' (resolved from "
+            f"'{ckpt_name}'): {type(exc).__name__}: {exc}. The file is likely corrupt "
+            f"or not a torch checkpoint at all."
+        ) from exc
+
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint or "state_dict" not in checkpoint:
+        got = (
+            f"a dict with keys {list(checkpoint.keys())}"
+            if isinstance(checkpoint, dict) else type(checkpoint).__name__
+        )
+        raise RuntimeError(
+            f"'{ckpt_path}' (resolved from '{ckpt_name}') doesn't look like a TabICL "
+            f"checkpoint -- expected a dict with 'config' and 'state_dict' keys, got "
+            f"{got}. Did you pass the wrong checkpoint kind, e.g. a CopulaTabICL "
+            f"checkpoint (--ckpt) where a TabICL marginal checkpoint (--tabicl_ckpt / "
+            f"tabicl.pit_ckpt) was expected?"
+        )
+
+    try:
+        base = TabICL(**checkpoint["config"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"TabICL checkpoint at '{ckpt_path}' (resolved from '{ckpt_name}') has a "
+            f"'config' that doesn't match TabICL's constructor ({type(exc).__name__}: "
+            f"{exc}). This is not a valid TabICL checkpoint."
+        ) from exc
+
+    try:
+        base.load_state_dict(checkpoint["state_dict"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"TabICL checkpoint at '{ckpt_path}' (resolved from '{ckpt_name}') has a "
+            f"'state_dict' that doesn't match the architecture built from its own saved "
+            f"'config' -- the checkpoint is corrupt or was saved by an incompatible "
+            f"TabICL version. Underlying error: {exc}"
+        ) from exc
     if trainable:
         base.train()
     else:
