@@ -784,7 +784,7 @@ def _era5_viz_gp_posterior_on_z(
             oracle_mode="posterior", n_restarts=n_restarts,
         )
         R = fit["R"].double().cpu().numpy()
-        return {"R": R, "L": safe_cholesky(R), "kernel": kernel_name}
+        return {"L": safe_cholesky(R), "kernel": kernel_name}
     except Exception as exc:  # noqa: BLE001
         print(f"  [era5_viz_gp_z:{kernel_name}] fit failed, dropping GP-on-z row: {exc}")
         return None

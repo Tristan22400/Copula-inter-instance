@@ -38,9 +38,9 @@ __all__ = [
     "morans_i",
     "predict_copula_residual_field",
     "sample_copula_residual_fields",
+    "pool_yspace_samples_and_correlate",
     "load_copula_model",
     "load_marginal_tabicl",
-    "resolve_checkpoint_marginal_source",
     "extract_model_dummy_context_correlation",
     "compute_context_z_train",
     "extract_model_context_correlation",
@@ -173,21 +173,29 @@ def sample_copula_residual_fields(
     return (y_mean_t.double() + y_std_t.double() * y_pred_scaled).T.cpu().numpy()  # (K, N)
 
 
+def pool_yspace_samples_and_correlate(samples_per_day: list) -> np.ndarray:
+    """np.corrcoef of every per-day (K, D) sample_copula_residual_fields
+    batch pooled into one (n_days*K, D) observation matrix — the "single
+    draw is noisy, pool many" idiom shared by
+    eval/spatial/sweep_core.py::run_real_config's rho_model_yspace and
+    eval/runners/spatial_correlation_eval.py::_diagnose_real's
+    model_context/dummy_context curves (see N_YSPACE_MC_SAMPLES in
+    eval/configs/constants.py for why pooling matters, and
+    run_benchmarks.py's single-episode outer(z,z) proxy for the same idea
+    applied across episodes instead of days)."""
+    return np.corrcoef(np.concatenate(samples_per_day, axis=0).T)
+
+
 def predict_copula_residual_field(
     tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
     coords_test: np.ndarray, R_context: np.ndarray, device: str, z_shared: np.ndarray,
 ) -> np.ndarray:
-    """One joint draw (D,) from the copula model's implied residual field:
-    inject `R_context` into the shared latent Gaussian vector `z_shared` via
-    Cholesky, then map each coordinate through the frozen TabICL marginal
-    quantile function (conditioned on the same real context) — i.e.
-    y = F_hat^{-1}(Phi(z)). Falls back to a naive Gaussian(mean, std)
-    marginal if `tabicl_marginal` is None (scratch-trained backbone).
-
-    Single-sample convenience wrapper around sample_copula_residual_fields
-    — use that directly when drawing more than one sample (e.g. K>1 for an
-    empirical y-space correlation estimate), since this re-runs the
-    (expensive) marginal forward pass on every call.
+    """One joint draw (D,) from the copula model's implied residual field —
+    a K=1 convenience wrapper around sample_copula_residual_fields (see its
+    docstring for the injection formula and the naive-fallback behavior).
+    Prefer calling that directly for K>1 (e.g. an empirical y-space
+    correlation estimate), since this re-runs the expensive marginal
+    forward pass on every call.
     """
     return sample_copula_residual_fields(
         tabicl_marginal, context_coords, context_values, coords_test, R_context, device,
@@ -213,59 +221,35 @@ def load_copula_model(ckpt_path: str, device: "str | None" = None):
     return model, cfg, device
 
 
-def resolve_checkpoint_marginal_source(cfg) -> "str | None":
-    """The single (local path or HF filename) identifying a checkpoint's own
-    intended marginal — used consistently everywhere a checkpoint's marginal
-    is needed: the low-level TabICL object load_marginal_tabicl loads below
-    (for z_train/R_context), AND the sklearn TabICLRegressor
-    eval/spatial/sweep_core.py::run_real_config uses for qgrid/NLL scoring.
-    Without a single shared resolver, those two call sites can silently
-    disagree on which marginal a given checkpoint means — the exact bug this
-    function exists to make impossible: run_real_config used to hardcode a
-    module-global default TabICLRegressor for qgrid regardless of which
-    marginal load_marginal_tabicl had loaded for that same checkpoint's
-    R_context, so nll_copula/nll_total scored a "checkpoint's R_context +
-    unrelated default marginal" hybrid instead of the checkpoint's own
-    intended joint model whenever the two diverged (any checkpoint with a
-    custom tabicl.pit_ckpt).
-
-    Prefers tabicl.pit_ckpt when the checkpoint names one (a Phase-A-
-    finetuned or otherwise checkpoint-specific marginal) over tabicl.ckpt's
-    default pretrained HF checkpoint, regardless of tabicl.pretrained: that
-    flag describes whether the COPULA backbone itself started from a
-    pretrained TabICL init, not whether a usable marginal is available — a
-    checkpoint can be pretrained=False yet still name a perfectly good
-    pit_ckpt (exactly load_marginal_tabicl's old bug). Returns None only
-    when neither is usable: pretrained=False AND no pit_ckpt set, i.e. a
-    genuinely from-scratch backbone with no marginal at all.
-    """
-    pit_ckpt = cfg.tabicl.get("pit_ckpt", None)
-    if pit_ckpt:
-        return pit_ckpt
-    if bool(cfg.tabicl.get("pretrained", True)):
-        return cfg.tabicl.ckpt
-    return None
-
-
 def load_marginal_tabicl(cfg, device: str):
     """Load the frozen TabICL quantile regressor used ONLY as a marginal-CDF
     oracle for the PIT transform in extract_model_context_correlation — NOT
     the same object as the CopulaTabICL backbone in load_copula_model.
-    Returns None (with a warning) if resolve_checkpoint_marginal_source
-    finds no usable marginal (from-scratch backbone), or if loading the
+
+    Resolves which checkpoint via src/pit.py::resolve_pit_ckpt — the same
+    resolver eval/spatial/sweep_core.py::run_real_config uses to build its
+    qgrid, so the two never silently disagree on which marginal a given
+    checkpoint means (they used to: run_real_config hardcoded a module-
+    global default TabICLRegressor regardless of what this function had
+    loaded, scoring nll_copula/nll_total against a "R_context + unrelated
+    marginal" hybrid for any checkpoint whose own tabicl.pit_ckpt differed
+    from that default).
+
+    Returns None (with a warning) if resolve_pit_ckpt finds no usable
+    marginal (from-scratch backbone, no pit_ckpt set), or if loading the
     resolved source fails (e.g. a checkpoint's embedded tabicl.pit_ckpt
     naming a path that no longer exists after a checkpoints/ reorg) — a
     reference marginal is never worth killing a whole sweep/diagnose run
     over; the caller falls back to naive z_train standardization either
     way."""
-    source = resolve_checkpoint_marginal_source(cfg)
+    from src.pit import load_tabicl, resolve_pit_ckpt
+
+    source = resolve_pit_ckpt(cfg)
     if source is None:
         print("Warning: cfg.tabicl.pretrained=False and no pit_ckpt set — "
               "no usable marginal for PIT; context z_train will fall back "
               "to naive standardization.")
         return None
-
-    from src.pit import load_tabicl
 
     try:
         return load_tabicl(source, device)

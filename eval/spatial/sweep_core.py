@@ -40,12 +40,13 @@ from eval.spatial.diagnostics import (
     load_copula_model,
     load_marginal_tabicl,
     pair_counts_by_distance,
-    resolve_checkpoint_marginal_source,
+    pool_yspace_samples_and_correlate,
     sample_copula_residual_fields,
 )
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import normalize_features
 from loss import gp_oracle_y_nll
+from pit import resolve_pit_ckpt
 
 __all__ = [
     "get_model", "run_real_config", "run_synthetic_config", "build_era5_probe",
@@ -82,18 +83,18 @@ def get_model(ckpt: str, device: "str | None" = None):
 
 def _get_tabicl_regressor(source: "str | None", device: str):
     """Sklearn-wrapper TabICLRegressor for `source` (see
-    resolve_checkpoint_marginal_source), cached per (source, device).
+    src/pit.py::resolve_pit_ckpt), cached per (source, device).
 
-    `source` MUST be the same marginal identity load_marginal_tabicl
-    resolved for whichever checkpoint's R_context this regressor's qgrid
-    will be paired with in compute_joint_nll — run_real_config used to call
-    this with no source at all (a single module-global default regressor
-    shared by every checkpoint), which silently scored nll_total/nll_copula
-    against a DIFFERENT marginal than whatever `marginal` had produced that
-    checkpoint's own R_context, for any checkpoint whose own marginal wasn't
-    the default (e.g. a custom tabicl.pit_ckpt). Passing None reproduces
-    that old default-only behavior for a from-scratch backbone with no
-    marginal at all (resolve_checkpoint_marginal_source's other None case).
+    `source` MUST be resolve_pit_ckpt(cfg) for whichever checkpoint's
+    R_context this regressor's qgrid will be paired with in
+    compute_joint_nll — load_marginal_tabicl (eval/spatial/diagnostics.py)
+    resolves that checkpoint's low-level marginal the same way, so the two
+    never silently disagree (they used to: this used to be a single
+    module-global default regressor shared by every checkpoint, scoring
+    nll_total/nll_copula against a DIFFERENT marginal than whatever
+    `marginal` had produced for any checkpoint with a custom
+    tabicl.pit_ckpt). None reproduces that old default-only behavior, for a
+    from-scratch backbone with no marginal at all.
     """
     key = (source, device)
     if key not in _TABICL_REGRESSOR_CACHE:
@@ -284,12 +285,8 @@ def run_real_config(
     x_train_norm, x_test_norm = normalize_features(context_coords, coords)
     x_nll_test_norm = x_test_norm[nll_test_idx]
     # SAME marginal `marginal` above was loaded from (see
-    # resolve_checkpoint_marginal_source), not a module-global default --
-    # qgrid below and R_context above must agree on which marginal defines
-    # z-space, or nll_total/nll_copula silently score a "this checkpoint's
-    # R_context + an unrelated marginal" hybrid instead of the checkpoint's
-    # own intended joint model (see _get_tabicl_regressor's docstring).
-    tabicl_reg = _get_tabicl_regressor(resolve_checkpoint_marginal_source(cfg), resolved_device)
+    # _get_tabicl_regressor's docstring for why this must match).
+    tabicl_reg = _get_tabicl_regressor(resolve_pit_ckpt(cfg), resolved_device)
 
     gp_kernels = gp_baseline_kernels if gp_baseline_kernels is not None else GP_BASELINE_KERNELS
 
@@ -303,16 +300,11 @@ def run_real_config(
             model, resolved_device, marginal, context_coords, context_values, coords, k_folds=PIT_K_FOLDS,
         )
 
-        # Y-space empirical correlation curve: draw N_YSPACE_MC_SAMPLES
-        # joint samples from THIS checkpoint's own implied Sklar model
-        # (R_context's copula + its own marginal, via
-        # sample_copula_residual_fields) -- i.e. score/compare in the SAME
-        # raw-y space R_emp already lives in, instead of binning R_context
-        # (z-space) directly against a raw-y ground truth. Pooled across all
-        # probe days below (one MC-noisy correlation matrix per day would
-        # be as unreliable as run_benchmarks.py's own single-episode
-        # outer(z,z) proxy -- pooling many draws is what makes it usable,
-        # same idea, more draws per "episode" since there are only ~6 days).
+        # Y-space (not R_context's z-space) empirical correlation curve --
+        # see run_real_config's module-level rationale and
+        # pool_yspace_samples_and_correlate's docstring for why this draws
+        # N_YSPACE_MC_SAMPLES and pools across days rather than binning
+        # R_context directly against the raw-y ground truth R_emp.
         z_batch = rng.standard_normal((N_YSPACE_MC_SAMPLES, D))
         model_yspace_samples.append(
             sample_copula_residual_fields(
@@ -347,8 +339,7 @@ def run_real_config(
             for kname, parts in gp_day.items():
                 for comp in ("total", "marginal", "copula"):
                     gp_nll_per_day[kname][comp].append(parts[comp])
-    model_yspace_obs = np.concatenate(model_yspace_samples, axis=0)  # (n_days*K, D)
-    R_model_yspace = np.corrcoef(model_yspace_obs.T)
+    R_model_yspace = pool_yspace_samples_and_correlate(model_yspace_samples)
     rho_model_yspace = bin_correlation_by_distance(R_model_yspace, dist, bin_edges)
     nll_total = float(np.nanmean(nll_total_per_day)) if nll_total_per_day else float("nan")
     nll_marginal = float(np.nanmean(nll_marginal_per_day)) if nll_marginal_per_day else float("nan")

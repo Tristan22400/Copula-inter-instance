@@ -23,18 +23,18 @@ def make_tabicl_regressor(checkpoint: str | None = None, device: str | None = No
     ``checkpoint`` is either a filename inside the ``jingang/TabICL`` HF repo
     (``checkpoint_version``, TabICLRegressor's own download-and-cache path)
     or a local ``.ckpt``/``.pt`` file (``model_path``, loaded directly) —
-    dispatched on ``os.path.exists``, the same local-path-first convention
+    dispatched on ``os.path.isfile``, the same local-path-first convention
     ``src/pit.py::load_tabicl`` uses, so a checkpoint-specific marginal
     (e.g. a Phase-A-finetuned ``tabicl.pit_ckpt``, or anything
-    ``eval.spatial.diagnostics.resolve_checkpoint_marginal_source``
-    resolves) is a genuine drop-in here too, not just for the low-level
-    TabICL object ``load_marginal_tabicl`` loads.
+    ``src/pit.py::resolve_pit_ckpt`` resolves) is a genuine drop-in here
+    too, not just for the low-level TabICL object ``load_marginal_tabicl``
+    loads.
     """
     from tabicl import TabICLRegressor
 
     kwargs = {"device": device} if device is not None else {}
     if checkpoint is not None:
-        kwargs["model_path" if os.path.exists(checkpoint) else "checkpoint_version"] = checkpoint
+        kwargs["model_path" if os.path.isfile(checkpoint) else "checkpoint_version"] = checkpoint
     return TabICLRegressor(**kwargs)
 
 
