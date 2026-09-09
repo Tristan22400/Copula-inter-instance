@@ -2,7 +2,7 @@
 MEASURABLE, before any weight moves.
 
     python eval/runners/marginal_calibration_eval.py                  # pretrained baseline
-    python eval/runners/marginal_calibration_eval.py --ckpt ./checkpoints/marginal_finetune/step_0020000_final.pt
+    python eval/runners/marginal_calibration_eval.py --ckpt ./checkpoints/marginal/ablations/marginal_finetune/step_0020000_final.pt
     python eval/runners/marginal_calibration_eval.py --p-values 32 --n-episodes 256
 
 Why this runner exists

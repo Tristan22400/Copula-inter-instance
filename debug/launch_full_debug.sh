@@ -61,7 +61,7 @@ fi
 N_EPISODES="${N_EPISODES:-200}"
 S7B_STEPS="${S7B_STEPS:-80}"
 S8_STEPS="${S8_STEPS:-1500}"
-CKPT_DEFAULT="./checkpoints/kernel-sweep-all-tabicl-retrain/step_0015000.pt"
+CKPT_DEFAULT="./checkpoints/copula_prod/canonical/kernel-sweep-all-tabicl-retrain/step_0015000.pt"
 
 # --ckpt is required by S5/S6; default to the family this project's own
 # findings flag as the reference point (see debug/README.md's evidence

@@ -4,7 +4,7 @@ Fine-tunes a STANDALONE TabICL (quantile decoder intact) so its marginal
 posterior predictive is correct for the GP prior the copula is trained on, then
 writes it in TabICL's own checkpoint schema so the copula run picks it up with:
 
-    python src/train.py tabicl.pit_ckpt=<checkpoints/marginal_finetune/...pt>
+    python src/train.py tabicl.pit_ckpt=<checkpoints/marginal/ablations/marginal_finetune/...pt>
 
 Usage
 -----

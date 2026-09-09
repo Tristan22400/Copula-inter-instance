@@ -23,37 +23,37 @@ _CHECKPOINTS_ROOT = os.path.join(
 # TabICL finetune below).
 CHECKPOINT_FAMILIES = {
     "kernel-sweep-all-noisy-mae": {
-        "dir": "kernel-sweep-all-noisy-mae",
+        "dir": "copula_prod/canonical/kernel-sweep-all-noisy-mae",
         "default_step": 355000,
         "label": "Perte MAE + bruit leger (355k steps)",
         "color": "#4c72b0",
     },
     "kernel-sweep-classic-zcorrupt-noise-mild-bigN": {
-        "dir": "kernel-sweep-classic-zcorrupt-noise-mild-bigN",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-zcorrupt-noise-mild-bigN",
         "default_step": 285000,
         "label": "Bruit leger + Grand N (285k steps)",
         "color": "#55a868",
     },
     "kernel-sweep-all-tabicl-retrain-15k": {
-        "dir": "kernel-sweep-all-tabicl-retrain",
+        "dir": "copula_prod/canonical/kernel-sweep-all-tabicl-retrain",
         "default_step": 15000,
         "label": "Entrainement normal + 15k steps avec z_train TabICL",
         "color": "#c44e52",
     },
     "kernel-sweep-classic-prod-tabicl-retrain": {
-        "dir": "kernel-sweep-classic-prod-tabicl-retrain",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-prod-tabicl-retrain",
         "default_step": 5000,
         "label": "Classic-prod (40k) + 5k steps avec z_train TabICL",
         "color": "#937860",
     },
     "kernel-sweep-classic-prod": {
-        "dir": "kernel-sweep-classic-prod",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-prod",
         "default_step": 40000,
         "label": "Classic prod (40k steps)",
         "color": "#8172b2",
     },
     "kernel-sweep-classic-zcorrupt-bigN-retrain": {
-        "dir": "kernel-sweep-classic-zcorrupt-noise-mild-bigN-retrain",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-zcorrupt-noise-mild-bigN-retrain",
         "default_step": 210000,
         "label": "zcorrupt bigN retrain (210k steps)",
         "color": "#937860",
