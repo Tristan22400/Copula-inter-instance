@@ -58,6 +58,7 @@ from eval.spatial.diagnostics import (  # noqa: E402
     extract_model_true_z_train_correlation,
     fit_theoretical_law,
     pair_counts_by_distance,
+    pool_yspace_samples_and_correlate,
     predict_copula_residual_field,
     sample_copula_residual_fields,
     sample_simple_kernel_covariance,
@@ -129,13 +130,15 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
             predict_copula_residual_field(marginal, context_coords, context_values, coords, R_indep, resolved_device, z_shared)
         )
 
-        # Y-space empirical correlation (see sweep_core.py::run_real_config's
-        # identical fix): R_dummy needs the SAME real context/marginal as
-        # R_context to produce an honest y-space sample at all (there's no
-        # y-space meaning to "no context") -- what varies is which
-        # correlation matrix (context-conditioned vs. unconditional) gets
-        # injected, isolating exactly what conditioning on real context
-        # buys, the same way independent_fields above isolates R_indep.
+        # Y-space (not z-space) empirical correlation -- see
+        # pool_yspace_samples_and_correlate's docstring for why this pools
+        # N_YSPACE_MC_SAMPLES draws per day. R_dummy needs the SAME real
+        # context/marginal as R_context to produce an honest y-space sample
+        # at all (there's no y-space meaning to "no context") -- what
+        # varies is which correlation matrix (context-conditioned vs.
+        # unconditional) gets injected, isolating exactly what conditioning
+        # on real context buys, the same way independent_fields above
+        # isolates R_indep.
         z_batch = rng.standard_normal((constants.N_YSPACE_MC_SAMPLES, D))
         model_yspace_samples.append(
             sample_copula_residual_fields(marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch)
@@ -143,8 +146,8 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
         dummy_yspace_samples.append(
             sample_copula_residual_fields(marginal, context_coords, context_values, coords, R_dummy, resolved_device, z_batch)
         )
-    R_model_yspace = np.corrcoef(np.concatenate(model_yspace_samples, axis=0).T)
-    R_dummy_yspace = np.corrcoef(np.concatenate(dummy_yspace_samples, axis=0).T)
+    R_model_yspace = pool_yspace_samples_and_correlate(model_yspace_samples)
+    R_dummy_yspace = pool_yspace_samples_and_correlate(dummy_yspace_samples)
 
     tag = f"{_safe_ckpt_tag(ckpt_token)}_real_{region}_g{grid_size}"
     dist = haversine_distance_km(coords)
