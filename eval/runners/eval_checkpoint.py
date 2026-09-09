@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import random
 import sys
@@ -748,6 +749,17 @@ def main() -> None:
                         help="Local episode index to generate the corr_grid plot for")
     parser.add_argument("--out_dir",      default=os.path.join(_REPO_ROOT, "eval", "results"),
                         help="Directory for saved corr_grid figure")
+    parser.add_argument("--dump_episodes", default=None,
+                        help="Write per-episode NLLs (all_nlls + all_total_nlls, keyed by "
+                             "ep_i, plus each episode's kernel label) to this JSON path. "
+                             "Two runs (e.g. different --ckpt) sharing --config/--seed/"
+                             "--live_generate see identical episodes (see "
+                             "_live_generate_alternating), so their dumps can be joined on "
+                             "ep_i for a PAIRED per-episode comparison — far lower variance "
+                             "than comparing the two runs' printed Mean/Std NLL as independent "
+                             "samples, since episode-to-episode difficulty (kernel, "
+                             "lengthscale, N) cancels in the per-episode difference instead "
+                             "of inflating each run's own across-episode std.")
     parser.add_argument("--device",       default="auto")
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--n_folds",      type=int,   default=5,
@@ -890,6 +902,13 @@ def main() -> None:
     all_nlls: list[dict[str, float]] = []
     all_y_space_nlls: list[dict[str, dict[str, float]]] = []
     all_total_nlls: list[dict[str, dict[str, float]]] = []
+    # Parallel to all_nlls/all_total_nlls (same append order, one entry per
+    # evaluated episode) — only populated for --dump_episodes, so a paired
+    # comparison across two --ckpt runs sharing --seed (identical episodes,
+    # per _live_generate_alternating's determinism) can match rows up by
+    # ep_i instead of assuming list order never drifts (e.g. a skipped
+    # --dataset_dir episode).
+    all_episode_meta: list[dict] = []
     plot_R_dict: dict[str, Tensor] | None = None
     plot_R_oracle: Tensor | None = None
     plot_best_key: str | None = None
@@ -1044,6 +1063,11 @@ def main() -> None:
             "oracle_posterior": {k: v / n_test for k, v in y_space_nlls["posterior"].items()},
         }
         all_total_nlls.append(total_nlls)
+        all_episode_meta.append({
+            "ep_i": ep_i,
+            "n_test": n_test,
+            "kernel": _kernel_composition_label(ep),
+        })
 
         nlls   = {**baseline_nlls, **icl_nlls}
         R_dict = {**baseline_R, **icl_R}
@@ -1132,6 +1156,24 @@ def main() -> None:
     _print_table(all_nlls, z_train_source=args.z_train_source)
     _print_y_space_oracle(all_y_space_nlls)
     _print_total_nll_table(all_total_nlls, z_train_source=args.z_train_source)
+
+    if args.dump_episodes:
+        dump = {
+            "ckpt": args.ckpt,
+            "config": args.config,
+            "seed": args.seed,
+            "live_generate": live_generate,
+            "dataset_dir": args.dataset_dir,
+            "z_train_source": args.z_train_source,
+            "episodes": [
+                {**meta, "nlls": nlls, "total_nlls": total_nlls}
+                for meta, nlls, total_nlls in zip(all_episode_meta, all_nlls, all_total_nlls)
+            ],
+        }
+        os.makedirs(os.path.dirname(args.dump_episodes) or ".", exist_ok=True)
+        with open(args.dump_episodes, "w") as f:
+            json.dump(dump, f, indent=2)
+        print(f"Dumped {len(dump['episodes'])} per-episode NLLs to: {args.dump_episodes}")
 
     # ---- Correlation heatmap ----
     if plot_R_dict is not None and plot_R_oracle is not None:
