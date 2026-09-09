@@ -81,7 +81,14 @@ from dataset import CopulaDataset  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
 from loss import y_space_nll  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
-from pit import DEFAULT_K_FOLDS, gp_analytical_posterior, load_tabicl, normalize_targets, run_pit  # noqa: E402
+from pit import (  # noqa: E402
+    DEFAULT_K_FOLDS,
+    configure_tabicl_inference_amp,
+    gp_analytical_posterior,
+    load_tabicl,
+    normalize_targets,
+    run_pit,
+)
 
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
@@ -745,6 +752,19 @@ def main() -> None:
                         help="K-fold count for --z_train_source=tabicl's run_pit call. "
                              f"Default: cfg.tabicl.pit_k_folds, falling back to "
                              f"pit.DEFAULT_K_FOLDS ({DEFAULT_K_FOLDS}).")
+    parser.add_argument("--tabicl_amp", action=argparse.BooleanOptionalAction, default=True,
+                        help="AMP (float16 autocast) for the frozen TabICL marginal's "
+                             "forward passes under --z_train_source=tabicl (pit.py::"
+                             "configure_tabicl_inference_amp) -- same knob training uses "
+                             "via cfg.training.tabicl_inference_amp (default true there "
+                             "too). eval_checkpoint.py never called this before, so every "
+                             "past eval run got TabICL's own built-in default (AMP on) "
+                             "regardless of this flag's default here. Pass --no-tabicl_amp "
+                             "for float32 quantile-grid precision (conf/config.yaml's own "
+                             "comment: matters more for eval's log_pdf_test/marginal-NLL "
+                             "fidelity than for live-generation throughput) -- useful to "
+                             "rule out AMP noise before attributing a small NLL gap (e.g. "
+                             "float16 vs float32 backbone) to the checkpoints themselves.")
     parser.add_argument("--plot_episode", type=int,   default=0,
                         help="Local episode index to generate the corr_grid plot for")
     parser.add_argument("--out_dir",      default=os.path.join(_REPO_ROOT, "eval", "results"),
@@ -873,6 +893,8 @@ def main() -> None:
         print(f"\nLoading frozen TabICL marginal for --z_train_source=tabicl: {tabicl_ckpt} "
               f"(k_folds={tabicl_pit_k_folds})")
         tabicl_marginal = load_tabicl(tabicl_ckpt, str(device))
+        configure_tabicl_inference_amp(args.tabicl_amp)
+        print(f"Frozen TabICL marginal inference AMP={'on' if args.tabicl_amp else 'off (float32)'}")
     print(f"z_train source (ICL conditioning input): {args.z_train_source}")
 
     # GP-MLE/DKL must score against the same convention used to build this
