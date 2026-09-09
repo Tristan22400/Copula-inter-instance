@@ -117,7 +117,7 @@ mlp_mix_weight_std: 1.0
 # config/dataset -- unvalidated at scale, same convention as
 # structural_warp_enabled below; validate against
 # tests/test_dataset_corr_uniform.py on a pilot dataset before enabling.
-kernel_hidden_enabled: false
+kernel_hidden_enabled: true
 # Fraction of episodes per generate_gp_batch call that get the hidden warp
 # at all (Bernoulli gate); the rest fall back to oracle == x_norm (same
 # per-episode-gate convention as mlp_mixing_prob). Default 1.0 (always on
