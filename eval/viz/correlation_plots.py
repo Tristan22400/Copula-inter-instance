@@ -361,6 +361,58 @@ def plot_residual_grid(
     )
 
 
+def plot_mean_removed_grid(
+    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, days: list,
+    true_resid_fields: list[np.ndarray], output_path: "str | None",
+    predicted_fields: "list[np.ndarray] | None" = None,
+    predicted_fields_2: "list[np.ndarray] | None" = None,
+    independent_fields: "list[np.ndarray] | None" = None,
+    oracle_fields: "list[np.ndarray] | None" = None,
+    context_coords: "np.ndarray | None" = None,
+    oracle_row_label: str = "Fitted GP posterior\nsample minus\nGP mean\nLatitude",
+    pred2_row_label: str = "Fitted GP correlation\n+ TabICLv2 marginal\nsample minus\nmarginal mean\nLatitude",
+):
+    """Small-multiples panel of the MARGINAL-MEAN-REMOVED field, one column
+    per day in `days`: every row has that row's OWN predictive-distribution
+    mean subtracted at each location before plotting -- the frozen TabICL
+    marginal's mean field for the ground-truth/model/independent rows, the
+    fitted GP's own posterior mean for the GP row (see
+    src/train.py::_era5_viz_fig, which builds `true_resid_fields` as
+    ground_truth - TabICL_marginal_mean, and the predicted/independent/
+    oracle rows the same way from each row's own generating mean).
+
+    This is a purely SPATIAL de-trending, unlike plot_residual_grid's
+    target="residual" (a temporal 24h-persistence residual): it strips out
+    the smooth, context-extrapolated mean field (e.g. a broad lat/lon
+    temperature gradient) that otherwise dominates val/era5_predictions'
+    raw-temperature panel and can visually swamp the finer cross-location
+    correlation structure the copula's Sigma is actually scored on. A
+    well-calibrated model's residual row should show the same correlated
+    texture as the ground-truth row and the fitted GP's own residual row,
+    and look visibly less speckled than the independent (R=I) row -- which,
+    with the mean removed, is centered noise by construction.
+
+    `output_path=None` returns the open Figure instead of saving it to disk
+    (see `_plot_field_grid`); otherwise returns None as before."""
+    col_titles = [f"day {d}" for d in days]
+    return _plot_field_grid(
+        lat, lon, grid_shape, true_resid_fields, col_titles, output_path,
+        row0_label="Ground truth\nminus marginal mean\nLatitude",
+        suptitle=(
+            "Mean-Removed Residual Fields: Ground Truth vs. Copula Model Prediction\n"
+            "(each row's own predictive mean subtracted at every location)"
+        ),
+        predicted_fields=predicted_fields, predicted_fields_2=predicted_fields_2,
+        independent_fields=independent_fields,
+        oracle_fields=oracle_fields, oracle_row_label=oracle_row_label,
+        pred_row_label="Copula model\n(predicted) minus\nmarginal mean\nLatitude",
+        pred2_row_label=pred2_row_label,
+        indep_row_label="Independent\n(no copula) minus\nmarginal mean\nLatitude",
+        context_coords=context_coords,
+        cbar_label="Residual from predictive mean (deg C)",
+    )
+
+
 def plot_synthetic_residual_grid(
     grid_y: np.ndarray, grid_x: np.ndarray, grid_shape: tuple,
     true_fields: list, predicted_fields_true_z: list, predicted_fields_tabicl_z: list,
