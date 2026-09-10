@@ -14,16 +14,18 @@ train/loss_ema trajectories from step 0.
 
 _validate_z_train_source closes this by raising immediately on any
 data.z_train_source value outside {"analytic", "tabicl", "tabicl_split",
-"exaone", "tabpfn"}, mirroring generate_pit_dataset.py's existing validation
-for the on-disk pipeline. These tests pin down that behaviour directly,
+"exaone", "tabpfn", "tabldm"}, mirroring generate_pit_dataset.py's existing
+validation for the on-disk pipeline. These tests pin down that behaviour directly,
 without needing a GPU or a live-generation training run.
 
-"exaone"/"tabpfn" added 2026-08-31 alongside data_gen.py's generic
-marginal_backend override (see conf/data/gp_tasks.yaml's z_train_source
-docstring) -- included in the parametrized "known values" cases below, but
-not given their own dedicated integration test here since they route through
-the same _validate_z_train_source/build_live_train_loader/
+"exaone"/"tabpfn" added 2026-08-31, "tabldm" 2026-09-10, alongside
+data_gen.py's generic marginal_backend override (see conf/data/gp_tasks.yaml's
+z_train_source docstring) -- included in the parametrized "known values" cases
+below, but not given their own dedicated integration test here since they
+route through the same _validate_z_train_source/build_live_train_loader/
 build_fixed_live_val_batches call sites already covered by the tabicl cases.
+Each backend's own numerical correctness is covered by its
+tests/test_*_batched.py equivalence test instead.
 """
 
 from __future__ import annotations
@@ -40,7 +42,9 @@ from live_dataset import (
 from train import _reserve_gpu_headroom_for_live_tabicl
 
 
-@pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn"])
+@pytest.mark.parametrize(
+    "value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm"]
+)
 def test_validate_z_train_source_accepts_known_values(value):
     _validate_z_train_source(value)  # must not raise
 
@@ -63,7 +67,9 @@ def test_validate_z_train_source_rejects_unknown_values(value):
 def test_valid_z_train_sources_matches_documented_set():
     # Guards against _VALID_Z_TRAIN_SOURCES silently drifting out of sync
     # with conf/data/gp_tasks.yaml's documented z_train_source values.
-    assert set(_VALID_Z_TRAIN_SOURCES) == {"analytic", "tabicl", "tabicl_split", "exaone", "tabpfn"}
+    assert set(_VALID_Z_TRAIN_SOURCES) == {
+        "analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm",
+    }
 
 
 # ---------------------------------------------------------------------------
