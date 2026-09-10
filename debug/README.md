@@ -64,7 +64,7 @@ undertraining. That's why S1 (rank ceiling) is the stage to run first.
 | **S4** `s4_overfit.py` | Single-episode overfit sanity check. `--target prior\|posterior`, `--z-source oracle\|tabicl`. | no (trains from scratch) |
 | **S5** `s5_kfold.py` | K-fold noise impact on `z_train`, frozen checkpoint (K-folding doesn't touch `z_test`, so this needs no retraining). | **yes** |
 | **S6** `s6_guards.py` | Covnorm escape ratio (what actually sets reachable \|ρ\|) + Cholesky jitter-escalation / non-finite-input counts. | optional (fresh model if omitted) |
-| **S7a** `s7_backbone.py` | z_train-gap diagnostic across marginal backends (tabicl/tabpfn/exaone/tabm) on a frozen copula head. Moved from `eval/runners/compare_marginal_backbones.py`. | **yes** |
+| **S7a** `s7_backbone.py` | z_train-gap diagnostic across marginal backends (tabicl/tabpfn/exaone) on a frozen copula head. Moved from `eval/runners/compare_marginal_backbones.py`. | **yes** |
 | **S7b** `s7b_backend_train.py` | Actually **trains** fresh models under different marginal backends (`--backends tabicl,tabpfn`) and compares gap trajectories. Debug-scoped, not a production knob — see the module docstring for why. | no (trains from scratch) |
 | **S8** `s8_single_kernel.py` | Forces a single kernel family via `train_fast.py`. Most informative once S1/S4 have ruled rank out — a negative control otherwise. | launches training |
 
