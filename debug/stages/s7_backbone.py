@@ -15,7 +15,7 @@ computable in closed form and used as a fixed reference point:
   2. the true spatial correlation matrix R_true.
 
 For each marginal backend (eval.spatial.marginal_backends: tabicl, tabpfn,
-exaone, tabfm, tabm), this script:
+exaone), this script:
   a) estimates z_train via that backend's own K-fold leave-fold-out PIT on
      the SAME context points, and scores the gap against the exact z_train
      (Pearson corr / RMSE / MAE / calibration mean+std);
@@ -42,7 +42,7 @@ eval.spatial.marginal_backends._require_tabpfn_token) — omit "tabpfn" from
 
 Usage:
     python debug/stages/s7_backbone.py \
-        --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone,tabfm,tabm
+        --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone
 """
 
 from __future__ import annotations
@@ -191,7 +191,7 @@ def run_task(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ckpt", type=str, default="kernel-sweep-classic-prod")
-    parser.add_argument("--backends", type=str, default="tabicl,exaone,tabm",
+    parser.add_argument("--backends", type=str, default="tabicl,exaone",
                          help=f"Comma-separated subset of {BACKEND_NAMES}. 'tabpfn' needs TABPFN_TOKEN.")
     parser.add_argument("--profile", type=str, default="low_context_7config",
                          choices=list(constants.SYNTHETIC_SWEEP_PROFILES))

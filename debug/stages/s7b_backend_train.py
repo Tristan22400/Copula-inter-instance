@@ -80,8 +80,8 @@ def _generic_pit_episode(backend: str, regressor, ep: dict, k_folds: int, probs_
     than "tabicl" (which gets its own batched path above) via that module's
     shared {quantiles, loo_pit} contract + eval/metrics/joint_nll.compute_pit
     -- reused, not reimplemented. Originally tabpfn-only (hence the name this
-    replaced, _tabpfn_pit_episode); generalized so "exaone"/"tabfm"/"tabm"
-    plug in the same way -- they already implement the same
+    replaced, _tabpfn_pit_episode); generalized so "exaone" plugs in the
+    same way -- it already implements the same
     (X_context, y_context, X_query, probs) -> quantile_grid contract, so
     nothing backend-specific belongs in this function. Same y-scaling
     convention as data_gen.py's tabicl branch."""
@@ -113,8 +113,8 @@ def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offse
         for i, ep in enumerate(episodes):
             ep["z_train"], ep["z_test"], ep["log_pdf_test"] = z_train[i], z_test[i], log_pdf_test[i]
     else:
-        # Any other eval/spatial/marginal_backends entry (tabpfn, exaone,
-        # tabfm, tabm) -- one .fit()+.predict() (or K of them, for K-fold
+        # Any other eval/spatial/marginal_backends entry (tabpfn, exaone)
+        # -- one .fit()+.predict() (or K of them, for K-fold
         # z_train) per episode, not a single batched GPU forward like
         # tabicl's, so this loop is the real per-backend cost driver.
         for i, ep in enumerate(episodes):
@@ -140,9 +140,7 @@ def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: 
         from eval.spatial.marginal_backends import make_regressor
 
         # One instance reused across every fold/episode/step, same rationale
-        # as tabicl_model above -- "tabm" is the one backend where this is a
-        # no-op (make_regressor returns None: no pretrained weights to
-        # reuse, see marginal_backends.py).
+        # as tabicl_model above (avoid reloading backbone weights per .fit()).
         regressor = make_regressor(backend, device=dcfg.device)
 
     # Fixed eval set: same episodes across both backends and every checkpoint
