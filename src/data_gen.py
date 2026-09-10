@@ -249,6 +249,28 @@ from loss import _safe_cholesky
 # headroom over any realistic T, cheap to raise further if P_max/N_max grow.
 _MAX_CHOLESKY = 8192
 
+# data.z_train_source values that have a genuine multi-episode BATCHED PIT
+# module (one fused forward per fold across the whole generate_gp_batch call,
+# instead of B separate fit/predict loops). Values are lazy importers: these
+# modules pull in heavy optional dependencies (exaonetabular / tabpfn /
+# tabldm), so importing them at module scope would make data_gen.py
+# unimportable for every caller that never touches a marginal backend.
+# Any eval/spatial/marginal_backends.py backend NOT listed here still works
+# -- it falls through to the generic per-episode loop in _generate_gp_batch_raw
+# -- it is just orders of magnitude slower per episode, which matters for
+# live generation and not for offline dataset building.
+_BATCHED_MARGINAL_BACKENDS: Dict[str, Callable[[], Callable]] = {
+    "exaone": lambda: __import__(
+        "eval.spatial.exaone_batched", fromlist=["exaone_run_pit_batched"]
+    ).exaone_run_pit_batched,
+    "tabpfn": lambda: __import__(
+        "eval.spatial.tabpfn_batched", fromlist=["tabpfn_run_pit_batched"]
+    ).tabpfn_run_pit_batched,
+    "tabldm": lambda: __import__(
+        "eval.spatial.tabldm_batched", fromlist=["tabldm_run_pit_batched"]
+    ).tabldm_run_pit_batched,
+}
+
 
 def _seed_everything(seed: int) -> None:
     """Seed python/numpy/torch RNGs for reproducible data generation."""
@@ -3720,14 +3742,15 @@ def _generate_gp_batch_raw(
     else:
         apply_tabicl = tabicl_model is not None
 
-    if marginal_backend in ("exaone", "tabpfn"):
+    if marginal_backend in _BATCHED_MARGINAL_BACKENDS:
         # Genuine multi-episode BATCHED PIT -- the whole B-episode call
         # becomes (k_folds+1) fused forwards total, not B*(k_folds+1)
-        # separate ones (see eval/spatial/exaone_batched.py /
-        # tabpfn_batched.py's module docstrings for how each backend exposes
-        # a batchable forward, and how this was verified equivalent to the
-        # per-episode fallback below). y_train/y_test are z-scored per
-        # episode first, same reasoning as the tabicl branch below.
+        # separate ones (see eval/spatial/{exaone,tabpfn,tabldm}_batched.py's
+        # module docstrings for how each backend exposes a batchable forward,
+        # and how each was verified equivalent to the per-episode fallback
+        # below; they share one K-fold driver, eval/spatial/_batched_pit.py).
+        # y_train/y_test are z-scored per episode first, same reasoning as
+        # the tabicl branch below.
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_s = ((y_train - y_mean) / y_std).detach().cpu().numpy()
@@ -3735,10 +3758,7 @@ def _generate_gp_batch_raw(
         x_train_np = x_norm_train.detach().cpu().numpy()
         x_test_np = x_norm_test.detach().cpu().numpy()
         base_seed = int(getattr(cfg, "seed", None) or 0)
-        if marginal_backend == "exaone":
-            from eval.spatial.exaone_batched import exaone_run_pit_batched as _run_batched
-        else:
-            from eval.spatial.tabpfn_batched import tabpfn_run_pit_batched as _run_batched
+        _run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
         out = _run_batched(
             marginal_regressor, x_train_np, y_train_s, x_test_np, y_test_s,
             k_folds=tabicl_k_folds, probs_n=marginal_probs_n, seed=base_seed,
