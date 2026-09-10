@@ -19,6 +19,10 @@ Usage:
   # See the exact command without running it:
   python src/finetune_era5.py --ckpt <path> --dry-run
 
+  # Finetune against a non-TabICL marginal (see data.z_train_source in
+  # conf/data/gp_tasks.yaml, and era5_live_dataset.py::_resolve_marginal):
+  python src/finetune_era5.py --ckpt <path> --marginal tabldm
+
   # Forward arbitrary extra Hydra overrides verbatim:
   python src/finetune_era5.py --ckpt <path> -- era5_live.grid_size_max=32 wandb.entity=me
 """
@@ -59,6 +63,15 @@ def main() -> None:
         "instead of a fresh warmup/decay over --steps (default: fresh schedule -- this is a deliberate warm "
         "start into a new data regime, not a continuation of the original run).",
     )
+    p.add_argument(
+        "--marginal", default=None,
+        choices=["tabicl", "exaone", "tabpfn", "tabldm"],
+        help="Marginal backend for the ERA5 PIT (default: leave data.z_train_source "
+             "as configured, i.e. the frozen TabICL). Shorthand for the "
+             "data.z_train_source=<v> Hydra override -- see "
+             "eval/spatial/marginal_backends.py for what each backend is, and "
+             "era5_live_dataset.py::_resolve_marginal for how it is read here.",
+    )
     p.add_argument("--dry-run", action="store_true", help="Print the resulting train.py command without running it.")
     p.add_argument("overrides", nargs=argparse.REMAINDER, help="Extra raw Hydra overrides, e.g. -- wandb.entity=me")
     args = p.parse_args()
@@ -93,6 +106,8 @@ def main() -> None:
         f"training.ckpt_dir={ckpt_dir}",
         f"era5_live.corpus_dir={args.corpus_dir}",
     ]
+    if args.marginal is not None:
+        overrides.append(f"data.z_train_source={args.marginal}")
     if args.val_corpus_dir is not None:
         overrides.append(f"era5_live.val_corpus_dir={args.val_corpus_dir}")
     if args.grid_size_min is not None:
