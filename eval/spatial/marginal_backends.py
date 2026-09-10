@@ -68,7 +68,39 @@ BACKEND_NAMES = ["tabicl", "tabpfn", "exaone", "tabldm"]
 # rationale as eval/tabicl_utils.py::make_tabicl_regressor (avoid reloading
 # backbone weights per .fit() call).
 # ---------------------------------------------------------------------------
-def make_regressor(name: str, device: "str | None" = None):
+def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = None):
+    """Build one of BACKEND_NAMES' regressors, optionally loading Phase-A
+    fine-tuned weights over the pretrained ones.
+
+    ``ckpt`` closes Phase A's loop for the non-TabICL backends. TabICL's
+    Phase-A artifact is consumed by pit.load_tabicl via tabicl.pit_ckpt;
+    these libraries publish no equivalent loader, so a fine-tune written by
+    src/marginal_backbones.py::MarginalBackbone.save is applied here, to the
+    same nn.Module that module trained (marginal_backbones._trainable_module
+    is the single place that mapping is defined). Without this a Phase-A run
+    on exaone/tabldm would produce a file nothing could read back.
+    """
+    regressor = _make_pretrained_regressor(name, device)
+    if ckpt:
+        _load_finetuned_weights(name, regressor, ckpt, device)
+    return regressor
+
+
+def _load_finetuned_weights(name: str, regressor, ckpt: str, device: "str | None") -> None:
+    import torch
+
+    from marginal_backbones import _trainable_module
+
+    payload = torch.load(ckpt, map_location=device or "cpu", weights_only=False)
+    written_for = payload.get("backbone")
+    if written_for not in (None, name):
+        raise ValueError(
+            f"marginal checkpoint {ckpt} was written for backbone {written_for!r}, not {name!r}."
+        )
+    _trainable_module(name, regressor).load_state_dict(payload["state_dict"], strict=True)
+
+
+def _make_pretrained_regressor(name: str, device: "str | None" = None):
     if name == "tabicl":
         from eval.tabicl_utils import make_tabicl_regressor
 
