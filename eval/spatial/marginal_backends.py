@@ -34,30 +34,6 @@ Registered backends:
                residuals -- see its docstring for how (a monkeypatch on
                _collapse_members, not a private reimplementation of the
                forward pass).
-  - "tabfm"  : Google Research TabFM (pip `tabfm[pytorch]`), pretrained,
-               released 2026-06-30. Unlike "exaone", genuinely has NO native
-               quantile function for regression: confirmed against tabfm
-               1.0.1's own source (classifier_and_regressor.py::
-               _check_regressor_output_dim asserts the model's output last
-               axis is exactly 1 -- "produces scalar regression outputs" --
-               immediately squeezed away). What it does have is a real
-               32-member ensemble (`n_estimators`) whose UNAVERAGED
-               per-member point predictions are exposed via the private
-               `_predict_internal` (the same call `.predict()` itself
-               makes before averaging over members) -- _tabfm_quantiles
-               below takes the empirical quantile grid over that ensemble
-               axis, the same idea "tabm" uses below (real per-query
-               disagreement across members), not an invented constant-sigma
-               spread. CPU by default (small fold contexts here, ~20-30
-               rows; not forced like exaone's SDPA constraint below, just
-               untested on GPU).
-  - "tabm"   : Yandex Research TabM (pip `tabm`) -- NOT a pretrained
-               foundation model (no downloadable weights, see its own
-               README); trained from scratch on each fold's context with a
-               short full-batch Adam loop, then its k parallel ensemble
-               heads' raw (unaveraged) predictions give a heteroscedastic
-               empirical quantile grid directly (see _tabm_quantiles) --
-               no distributional assumption needed, unlike "exaone".
 """
 
 from __future__ import annotations
@@ -69,14 +45,13 @@ import numpy as np
 
 __all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
 
-BACKEND_NAMES = ["tabicl", "tabpfn", "exaone", "tabfm", "tabm"]
+BACKEND_NAMES = ["tabicl", "tabpfn", "exaone"]
 
 
 # ---------------------------------------------------------------------------
 # Regressor construction — one instance reused across every fold/task, same
 # rationale as eval/tabicl_utils.py::make_tabicl_regressor (avoid reloading
-# backbone weights per .fit() call). "tabm" returns None: it has no
-# pretrained weights to reuse, a fresh model is trained per quantiles() call.
+# backbone weights per .fit() call).
 # ---------------------------------------------------------------------------
 def make_regressor(name: str, device: "str | None" = None):
     if name == "tabicl":
@@ -112,20 +87,6 @@ def make_regressor(name: str, device: "str | None" = None):
             and torch.cuda.get_device_capability(device)[0] >= 8
         )
         return EXAONETabularRegressor.from_pretrained(device="cuda" if use_cuda else "cpu")
-    if name == "tabfm":
-        from tabfm import TabFMRegressor, tabfm_v1_0_0_pytorch as tabfm_v1_0_0
-
-        # tabfm_v1_0_0.load's own `device` kwarg defaults to "cpu" (see its
-        # docstring); no sm80 constraint here like exaone above (a plain
-        # torch.nn.Module forward, no hardcoded SDPA backend selection), so
-        # just pass the requested device straight through when CUDA is
-        # actually available.
-        import torch
-
-        load_device = device if (device and torch.cuda.is_available()) else "cpu"
-        return TabFMRegressor(model=tabfm_v1_0_0.load(model_type="regression", device=load_device))
-    if name == "tabm":
-        return None
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
 
 
@@ -158,10 +119,6 @@ def quantiles(
         return np.asarray(out).T  # (n_quantiles, n_query) -> (n_query, n_quantiles)
     if name == "exaone":
         return _exaone_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
-    if name == "tabfm":
-        return _tabfm_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
-    if name == "tabm":
-        return _tabm_quantiles(X_context, y_context, X_query, probs, seed=seed)
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
 
 
@@ -215,9 +172,9 @@ def _exaone_quantiles(
     levels, fixed by the released checkpoint -- not the caller's `probs`),
     recovered via _exaone_capture_quantile_bank above and linearly
     interpolated onto whatever `probs` the caller asked for. `seed` is
-    unused (EXAONE's forward pass is deterministic given its fitted state,
-    unlike tabm's from-scratch training loop below) but kept for a uniform
-    call signature across every backend's quantiles() dispatch.
+    unused (EXAONE's forward pass is deterministic given its fitted state)
+    but kept for a uniform call signature across every backend's
+    quantiles() dispatch.
     """
     regressor.fit(X_context, y_context)
     if regressor._fitted_state.get("member_weights") is not None:
@@ -234,83 +191,6 @@ def _exaone_quantiles(
     for i in range(bank.shape[0]):
         out[i] = np.interp(probs, native_probs, bank[i])
     return out
-
-
-def _tabfm_quantiles(
-    regressor, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray,
-    probs: np.ndarray, *, seed: int,
-) -> np.ndarray:
-    """Empirical quantile grid from TabFMRegressor's own ensemble members
-    (default n_estimators=32), the same idea _tabm_quantiles below uses --
-    NOT split-conformal, because unlike "exaone" there is no per-row quantile
-    function to recover: confirmed against tabfm 1.0.1's own source
-    (classifier_and_regressor.py::_check_regressor_output_dim asserts the
-    model's regression output is a single scalar per row, per member --
-    "produces scalar regression outputs"). What TabFM DOES have is real
-    cross-member disagreement: `_predict_internal` (the same call
-    `.predict()` itself makes, before averaging) exposes each of the 32
-    members' UNAVERAGED point prediction. Each member is inverse-transformed
-    individually (mirroring `_combine_predictions`'s own NNLS branch) before
-    taking the empirical quantile over the member axis -- heteroscedastic
-    across X_query for free, unlike a constant-sigma approximation.
-    `seed` is unused (TabFM's ensemble diversity comes from its own fixed
-    per-member preprocessing views, not a call-time RNG) but kept for a
-    uniform call signature across every backend's quantiles() dispatch.
-    """
-    regressor.fit(X_context, y_context)
-    member_preds_scaled = np.asarray(regressor._predict_internal(X_query))  # (n_estimators, n_query), scaled
-    member_preds = np.stack(
-        [regressor._inverse_transform_y(row) for row in member_preds_scaled], axis=0
-    )  # (n_estimators, n_query), raw y-units
-    return np.quantile(member_preds, probs, axis=0).T  # (n_query, Q)
-
-
-def _tabm_quantiles(
-    X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray, probs: np.ndarray,
-    *, seed: int, k: int = 16, n_steps: int = 200, lr: float = 1e-2,
-    d_block: int = 32, n_blocks: int = 1,
-) -> np.ndarray:
-    """TabM has no pretrained weights (confirmed against its own README: "If
-    you need zero-shot tabular capabilities ... TabM is not the right
-    tool"), so a fresh k-head ensemble is trained on THIS fold's context
-    alone via a short full-batch Adam loop, then every one of its k
-    unaveraged member predictions at X_query becomes one empirical quantile
-    sample -- np.quantile over the k axis, no Gaussian assumption, unlike
-    "exaone" above (which has no ensemble to draw from). Deliberately small
-    (k=16, n_steps=200, d_block=32, n_blocks=1): TabM.make()'s OWN defaults
-    (d_block=512, n_blocks=3) are sized for real datasets with thousands of
-    rows -- at those widths, 300 full-batch steps on a ~25-point fold
-    context measured ~190s/call (see PR discussion), ~100x more than
-    exaone/tabpfn's native-quantile calls on the same data. Shrinking the
-    backbone to match the data scale isn't just a speed fix: a 512-wide
-    3-block MLP ensemble on 19-27 points would be absurdly overparameterized
-    regardless of runtime. A systematically underdispersed ensemble on this
-    little data is itself part of the gap this comparison is meant to
-    surface, not something to engineer away by over-provisioning capacity.
-    """
-    import torch
-    from tabm import TabM
-
-    torch.manual_seed(seed)
-    y_mean, y_std = float(y_context.mean()), max(float(y_context.std()), 1e-6)
-    Xt = torch.as_tensor(X_context, dtype=torch.float32)
-    yt = torch.as_tensor((y_context - y_mean) / y_std, dtype=torch.float32)
-
-    model = TabM.make(n_num_features=X_context.shape[1], d_out=1, k=k, d_block=d_block, n_blocks=n_blocks)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    model.train()
-    for _ in range(n_steps):
-        opt.zero_grad()
-        pred = model(Xt)  # (n_context, k, 1)
-        loss = ((pred.squeeze(-1) - yt.unsqueeze(1)) ** 2).mean()
-        loss.backward()
-        opt.step()
-
-    model.eval()
-    with torch.no_grad():
-        out = model(torch.as_tensor(X_query, dtype=torch.float32))  # (n_query, k, 1)
-    ensemble = out.squeeze(-1).numpy() * y_std + y_mean  # (n_query, k), raw y-units
-    return np.quantile(ensemble, probs, axis=1).T  # (n_query, Q)
 
 
 # ---------------------------------------------------------------------------
