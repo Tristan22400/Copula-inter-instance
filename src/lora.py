@@ -139,8 +139,8 @@ class LoRAMultiheadAttention(nn.Module):
         # B zero-init → delta = B@A = 0 at start → exact pretrained behaviour
         for proj in ("q", "k", "v", "o"):
             if proj in target:
-                A = nn.Parameter(torch.empty(rank, D))
-                B = nn.Parameter(torch.zeros(D, rank))
+                A = nn.Parameter(torch.empty(rank, D, device=mha.in_proj_weight.device))
+                B = nn.Parameter(torch.zeros(D, rank, device=mha.in_proj_weight.device))
                 nn.init.kaiming_uniform_(A, a=math.sqrt(5))
                 setattr(self, f"lora_A_{proj}", A)
                 setattr(self, f"lora_B_{proj}", B)
@@ -278,7 +278,7 @@ def set_trainable(
     backbone: nn.Module,
     also_trainable: Sequence[str] = (),
 ) -> int:
-    """Freeze every backbone parameter except LoRA adapters and the allowlist.
+    r"""Freeze every backbone parameter except LoRA adapters and the allowlist.
 
     The single place that decides what Phase-A / LoRA runs optimize, so
     ``apply_lora`` and the tier routing in ``src/marginal_finetune.py`` cannot
@@ -511,14 +511,18 @@ class LoRAParametrization(nn.Module):
     def __init__(self, weight: Tensor, rank: int, alpha: float):
         super().__init__()
         out_features, in_features = weight.shape[-2], weight.shape[-1]
-        self.A = nn.Parameter(torch.zeros(rank, in_features, dtype=torch.float32))
+        self.A = nn.Parameter(
+            torch.zeros(rank, in_features, dtype=torch.float32, device=weight.device)
+        )
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
-        self.B = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float32))
+        self.B = nn.Parameter(
+            torch.zeros(out_features, rank, dtype=torch.float32, device=weight.device)
+        )
         self.scaling = float(alpha) / float(rank)
 
     def forward(self, weight: Tensor) -> Tensor:
         delta = (self.B @ self.A) * self.scaling
-        return weight + delta.to(weight.dtype).view_as(weight)
+        return weight + delta.to(device=weight.device, dtype=weight.dtype).view_as(weight)
 
 
 def is_parametrized_original(name: str) -> bool:
