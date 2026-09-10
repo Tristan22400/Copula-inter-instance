@@ -59,10 +59,15 @@ context sizes this pipeline uses.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import numpy as np
 import torch
 
 __all__ = ["exaone_run_pit_batched"]
+
+# Silence EXAONE's NNLS member-weighting fallback warning on small context sizes
+logging.getLogger("exaonetabular.regressor").setLevel(logging.ERROR)
 
 
 def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarray, x_query: np.ndarray):
@@ -73,6 +78,15 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
     the pooled output later. Raises if this episode's NNLS weighting fired
     (see module docstring)."""
     from exaonetabular.ensemble import EnsemblePlan, build_ensemble_inputs
+
+    if getattr(getattr(regressor, "manifest", None), "regression", None) is not None:
+        if regressor.manifest.regression.member_weighting != "uniform":
+            regressor.manifest = dataclasses.replace(
+                regressor.manifest,
+                regression=dataclasses.replace(
+                    regressor.manifest.regression, member_weighting="uniform"
+                ),
+            )
 
     regressor.fit(x_support, y_support)
     state = regressor._fitted_state
