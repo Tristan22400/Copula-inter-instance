@@ -1,12 +1,15 @@
  Workflow to run:
-  # 1. Generate PIT episodes
+  # 1. Generate PIT episodes. data.z_train_source selects the marginal:
+  #    analytic (oracle) | tabicl | tabicl_split | exaone | tabpfn | tabldm.
+  #    Non-TabICL backends need no GPU here (unlike live generation), just time.
   python src/generate_pit_dataset.py dataset.n_episodes=5000
   # 2. Train
   python src/train.py training.dataset_dir=./data/pit_episodes
   # 3. Evaluate vs. classical baselines (synthetic GP episodes). Defaults to
   #    --z_train_source tabicl (K-fold TabICL PIT context, matching real
   #    deployment) so the total marginal+copula NLL table is populated;
-  #    pass --z_train_source oracle for the exact-GP-LOO idealized upper bound.
+  #    pass --z_train_source oracle for the exact-GP-LOO idealized upper bound,
+  #    or exaone/tabpfn/tabldm to score against the marginal a run trained with.
   python eval/runners/eval_checkpoint.py --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
 
   # 3b. Evaluate on real-world datasets (UCI Beijing PM2.5, California Housing)
@@ -32,13 +35,21 @@ a checkpoint path. src/model.py and conf/config.yaml are untouched.
   #    (+ LoRA on icl_predictor) only if the oracle gap plateaus above zero.
   python src/finetune_marginal.py                      # or: marginal.tier=1
   oarsub -S ./scripts/finetune_marginal.sh             # on Grid5000
+  #    Other marginal backbones (src/marginal_backbones.py): tabicl/tabldm reach
+  #    tiers 0-3, exaone tier 0 only (its attention holds raw Parameters, so
+  #    there is nothing for LoRA to swap); tabpfn is wired but licence-gated and
+  #    never executed here. Non-tabicl checkpoints are loaded back via
+  #    marginal_backends.make_regressor(..., ckpt=<path>), not pit.load_tabicl.
+  python src/finetune_marginal.py marginal.backbone=tabldm marginal.tier=1
+  python src/finetune_marginal.py marginal.backbone=exaone marginal.tier=0
   # 3. Re-measure, then gate on real data (must not regress -- the whole point of a
   #    TabICL marginal is non-Gaussian tabular transfer, which GP-only training can
   #    destroy), then hand the result to a normal copula run:
   python eval/runners/marginal_calibration_eval.py --ckpt <the _final.pt>
   python eval/runners/run_benchmarks.py
   python src/train.py tabicl.pit_ckpt=<the _final.pt>
-Phase A checkpoints are plain TabICL ({"config","state_dict"}) and are registered in
+Phase A checkpoints for backbone=tabicl are plain TabICL ({"config","state_dict"});
+other backbones use the same shape plus a "backbone" tag. Both are registered in
 eval/configs/checkpoints.py::MARGINAL_FAMILIES -- a SEPARATE registry from
 CHECKPOINT_FAMILIES, which holds copula checkpoints that `sweep --checkpoints all`
 iterates. Do not mix the two.
