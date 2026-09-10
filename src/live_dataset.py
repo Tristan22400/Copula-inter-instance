@@ -72,8 +72,8 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
 # tabicl_model's pit.py path below, see build_live_train_loader's
 # batched_marginal_worker_enabled for the shared worker/device/spawn
 # handling this now gets.
-_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", "exaone", "tabpfn")
-_GENERIC_MARGINAL_BACKENDS = ("exaone", "tabpfn")
+_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm")
+_GENERIC_MARGINAL_BACKENDS = ("exaone", "tabpfn", "tabldm")
 
 
 def _validate_z_train_source(z_train_source: str) -> None:
