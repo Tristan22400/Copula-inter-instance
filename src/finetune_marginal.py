@@ -70,7 +70,11 @@ from train import cosine_lr_lambda  # noqa: E402
 import zlib
 from typing import Callable, Optional, Sequence
 import torch.nn as nn
-from lora import apply_lora, merged_base_state_dict
+from lora import (
+    apply_lora,
+    apply_lora_all_layers,
+    merged_base_state_dict_any,
+)
 from pit import (
     DEFAULT_K_FOLDS,
     _kernel_fn_from_task,
@@ -151,6 +155,7 @@ def apply_tier(
     lora_target: str = "qkvo",
     extra_patterns: Sequence[str] = (),
     backbone_name: str = "tabicl",
+    all_layers: bool = False,
 ) -> dict:
     """Route Phase-A trainability over *backbone* according to ``tier``.
 
@@ -167,7 +172,11 @@ def apply_tier(
         raise ValueError(f"Unknown tier {tier}; expected one of {sorted(TIER_SPECS)}.")
     # Raises (rather than clamping) when this architecture cannot reach the
     # requested tier -- see marginal_backbones.resolve_tier for why.
-    resolve_tier(backbone_name, tier)
+    if not all_layers:
+        # The stage ladder can only reach architectures whose attention is a
+        # swappable module; all_layers below is uniform across all of them, so
+        # it is exempt from that ceiling.
+        resolve_tier(backbone_name, tier)
     spec = TIER_SPECS[tier]
     stages = list(spec["lora_stages"])
     patterns = tuple(_BACKBONE_TIER0[backbone_name]) + tuple(extra_patterns)
@@ -175,20 +184,34 @@ def apply_tier(
     # nothing, instead of quietly training a smaller set than we report.
     assert_patterns_match(backbone, _BACKBONE_TIER0[backbone_name])
 
-    n_replaced = apply_lora(
-        backbone=backbone,
-        rank=int(lora_rank) if stages else 0,
-        alpha=float(lora_alpha),
-        target=lora_target,
-        stages=stages,
-        also_trainable=patterns,
-    )
+    if all_layers:
+        # Every 2-D weight matrix in the model, one shared rank, regardless of
+        # architecture -- see lora.apply_lora_all_layers for why this uses
+        # parametrization rather than module replacement (EXAONE has almost no
+        # swappable modules to replace).
+        n_replaced = apply_lora_all_layers(
+            backbone=backbone,
+            rank=int(lora_rank),
+            alpha=float(lora_alpha),
+            also_trainable=patterns,
+        )
+    else:
+        n_replaced = apply_lora(
+            backbone=backbone,
+            rank=int(lora_rank) if stages else 0,
+            alpha=float(lora_alpha),
+            target=lora_target,
+            stages=stages,
+            also_trainable=patterns,
+        )
     report = trainable_param_report(backbone)
     report.update(
         {
             "backbone": backbone_name,
             "tier": tier,
-            "tier_desc": spec["desc"],
+            "tier_desc": "all layers (LoRA on every 2-D weight)" if all_layers else spec["desc"],
+            "lora_all_layers": bool(all_layers),
+            "lora_rank": int(lora_rank),
             "lora_stages": stages,
             "lora_modules_replaced": n_replaced,
         }
@@ -1110,7 +1133,7 @@ def save_marginal_checkpoint(
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     payload = {
         "config": dict(tabicl_config),
-        "state_dict": merged_base_state_dict(backbone),
+        "state_dict": merged_base_state_dict_any(backbone),
         "step": int(step),
     }
     if cfg is not None:
@@ -1300,13 +1323,14 @@ def main(cfg: DictConfig) -> None:
         lora_alpha=float(cfg.marginal.lora_alpha),
         lora_target=str(cfg.marginal.lora_target),
         backbone_name=backbone_name,
+        all_layers=bool(cfg.marginal.get("lora_all_layers", True)),
     )
     trainable_module.to(device)
     print(
         f"[{report.get('backbone', 'tabicl')} tier {report['tier']}] {report['tier_desc']}: "
         f"{report['n_trainable_params']:,} / {report['n_total_params']:,} trainable "
         f"({100 * report['trainable_frac']:.2f}%), "
-        f"{report['lora_modules_replaced']} LoRA module(s)"
+        f"{report['lora_modules_replaced']} LoRA module(s) at rank {report['lora_rank']}"
     )
 
     weights = MarginalLossWeights(

@@ -126,9 +126,16 @@ TIER0_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Tiers >= 1 install LoRA on attention modules (lora.py). Only architectures
-# whose attention is a swappable nn.Module that LoRAMultiheadAttention can
-# stand in for can climb the ladder -- see the module docstring.
+# Tiers >= 1 install LoRA on attention MODULES (lora.apply_lora). Only
+# architectures whose attention is a swappable nn.Module that
+# LoRAMultiheadAttention can stand in for can climb that ladder -- see the
+# module docstring.
+#
+# This ceiling applies ONLY to the stage ladder. The default path,
+# marginal.lora_all_layers=true (lora.apply_lora_all_layers), adapts every 2-D
+# weight matrix by PARAMETRIZATION rather than module replacement, is uniform
+# across all four architectures at one shared rank, and is exempt from
+# MAX_TIER entirely.
 MAX_TIER: dict[str, int] = {"tabicl": 3, "tabldm": 3, "exaone": 0, "tabpfn": 0}
 
 
@@ -238,12 +245,12 @@ class MarginalBackbone:
         shape plus a ``backbone`` tag, and are loaded back through
         eval/spatial/marginal_backends.py::make_regressor(..., ckpt=path).
         """
-        from lora import merged_base_state_dict
+        from lora import merged_base_state_dict_any
 
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         payload = {
             "config": dict(self.config),
-            "state_dict": merged_base_state_dict(self.module),
+            "state_dict": merged_base_state_dict_any(self.module),
             "step": int(step),
             "backbone": self.name,
         }
