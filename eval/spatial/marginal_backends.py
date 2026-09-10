@@ -54,11 +54,16 @@ Registered backends:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import logging
 import os
 
 import numpy as np
 
 __all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
+
+# Silence EXAONE's NNLS member-weighting fallback warning on small context sizes
+logging.getLogger("exaonetabular.regressor").setLevel(logging.ERROR)
 
 BACKEND_NAMES = ["tabicl", "tabpfn", "exaone", "tabldm"]
 
@@ -185,9 +190,23 @@ def _make_pretrained_regressor(name: str, device: "str | None" = None):
         # EnsemblePlan construction and its expected-shape check, so this
         # needs no shape-side change. Cuts the forward/preprocessing cost
         # (fit() ensemble expansion + _forward_chunked) by ~8x.
-        return EXAONETabularRegressor.from_pretrained(
+        reg = EXAONETabularRegressor.from_pretrained(
             device="cuda" if use_cuda else "cpu", ensemble_count=1
         )
+        # Disable NNLS member-weighting: our GP context sizes (tens to hundreds
+        # of rows) are far below EXAONE's nnls_min_validation_rows=2000, so
+        # member_weighting="nnls" only logs a warning on every single fit() call
+        # before falling back to uniform weights anyway. Setting "uniform"
+        # skips the validation split and silences the warning while matching
+        # the uniform-pooling assumption in exaone_batched.py and _exaone_quantiles.
+        if getattr(getattr(reg, "manifest", None), "regression", None) is not None:
+            reg.manifest = dataclasses.replace(
+                reg.manifest,
+                regression=dataclasses.replace(
+                    reg.manifest.regression, member_weighting="uniform"
+                ),
+            )
+        return reg
     if name == "tabldm":
         from tabldm import TabLDMRegressor
 
@@ -301,6 +320,14 @@ def _exaone_quantiles(
     but kept for a uniform call signature across every backend's
     quantiles() dispatch.
     """
+    if getattr(getattr(regressor, "manifest", None), "regression", None) is not None:
+        if regressor.manifest.regression.member_weighting != "uniform":
+            regressor.manifest = dataclasses.replace(
+                regressor.manifest,
+                regression=dataclasses.replace(
+                    regressor.manifest.regression, member_weighting="uniform"
+                ),
+            )
     regressor.fit(X_context, y_context)
     if regressor._fitted_state.get("member_weights") is not None:
         raise RuntimeError(
