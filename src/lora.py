@@ -34,8 +34,34 @@ from torch import Tensor
 # ---------------------------------------------------------------------------
 
 def _get_mha_class():
+    """Every MultiheadAttention class LoRAMultiheadAttention is a valid
+    drop-in for, as a tuple suitable for ``isinstance``.
+
+    Xiaomi-TabLDM forks TabICL's attention stack: as of tabldm 0.1.0,
+    ``inspect.getsource`` of tabldm._model.layers.MultiheadAttention,
+    _model.attention.multi_head_attention_forward, _model.rope.
+    RotaryEmbedding and _model.kv_cache.KVCacheEntry are all BYTE-IDENTICAL
+    to TabICL's (asserted by tests/test_lora_tabldm_compat.py, so a future
+    upstream divergence fails loudly here instead of silently installing
+    adapters whose forward no longer matches). They are still distinct class
+    OBJECTS, so a lone `isinstance(child, tabicl_MHA)` silently matched
+    nothing on a TabLDM backbone and apply_lora raised "found 0
+    MultiheadAttention modules" -- tier >= 1 was unreachable for TabLDM for
+    that reason alone, not for any architectural one.
+
+    tabldm is optional: absent, this degrades to the TabICL-only tuple.
+    """
     from tabicl._model.layers import MultiheadAttention  # type: ignore[import]
-    return MultiheadAttention
+
+    classes = [MultiheadAttention]
+    try:
+        from tabldm._model.layers import MultiheadAttention as TabLDMMHA  # type: ignore[import]
+    except Exception:
+        pass
+    else:
+        if TabLDMMHA is not MultiheadAttention:
+            classes.append(TabLDMMHA)
+    return tuple(classes)
 
 
 def _get_mha_forward():
