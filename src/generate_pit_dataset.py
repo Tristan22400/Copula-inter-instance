@@ -49,6 +49,12 @@ Usage
     # z_train_source=tabicl, see run_pit_calib_split_batched's docstring in
     # pit.py for the cost/quality trade-off:
     python src/generate_pit_dataset.py data.n_tasks=5000 data.z_train_source=tabicl_split
+
+    # ... or any other tabular-foundation-model marginal backend
+    # (eval/spatial/marginal_backends.py). Unlike training.live_generation
+    # these do not require a GPU here -- offline generation may simply take
+    # much longer on CPU. Pilot on a small n_tasks first.
+    python src/generate_pit_dataset.py data.n_tasks=500 data.z_train_source=tabldm
 """
 
 from __future__ import annotations
@@ -76,6 +82,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from data_gen import generate_gp_batch
+from live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
 
 
 _MAX_CUSOLVER_RETRIES = 8
@@ -126,6 +133,7 @@ def _is_transient_cusolver_error(exc: BaseException) -> bool:
 def _generate_shard_with_oom_retry(
     cfg, n_this: int, device: str, *, tabicl_model, tabicl_k_folds: int,
     tabicl_split_calib_frac: float = 0.0,
+    marginal_backend=None, marginal_regressor=None, marginal_probs_n: int = 99,
 ) -> list:
     """Generate n_this episodes for one shard, halving the chunk size and
     retrying on CUDA OOM (or backing off and retrying unchanged on a
@@ -176,6 +184,9 @@ def _generate_shard_with_oom_retry(
                 cfg, this_chunk, device, d_override=d_fixed,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
+                marginal_backend=marginal_backend,
+                marginal_regressor=marginal_regressor,
+                marginal_probs_n=marginal_probs_n,
             )
             if d_fixed is None and new_episodes:
                 d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
@@ -303,8 +314,12 @@ def main(cfg: DictConfig) -> None:
     # checkpoint -- they only differ in how pit.py scores the train set
     # against it (K-fold rotation vs. a one-pass calibration split; see
     # tabicl_split_calib_frac below).
-    z_train_source = cfg.data.get("z_train_source", "analytic")
+    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    _validate_z_train_source(z_train_source)
     tabicl_model = None
+    marginal_backend = z_train_source if z_train_source in _GENERIC_MARGINAL_BACKENDS else None
+    marginal_regressor = None
+    marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
     tabicl_split_calib_frac = (
         float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
@@ -321,11 +336,25 @@ def main(cfg: DictConfig) -> None:
             )
         print(f"Loading frozen TabICL marginal for data.z_train_source={z_train_source}: {ckpt}")
         tabicl_model = load_tabicl(ckpt, device)
-    elif z_train_source != "analytic":
-        raise ValueError(
-            f"Unknown data.z_train_source {z_train_source!r}; expected 'analytic', "
-            "'tabicl', or 'tabicl_split'."
-        )
+    elif marginal_backend is not None:
+        # "exaone"/"tabpfn"/"tabldm": one regressor built here and reused for
+        # every shard, exactly like tabicl_model above (avoid reloading
+        # backbone weights per .fit() call -- see
+        # eval/spatial/marginal_backends.py::make_regressor).
+        #
+        # Unlike training.live_generation, this pipeline does NOT require
+        # device='cuda' for these backends. The live path rejects CPU because
+        # a slow per-episode PIT stalls the training loop itself
+        # (live_dataset.py::build_live_train_loader); offline dataset
+        # generation just takes longer, which is a cost the caller can choose
+        # to pay -- and this pipeline already supports --num_workers sharding
+        # to spread it. It is still slow enough to warrant a pilot run: see
+        # data.z_train_source's docstring in conf/data/gp_tasks.yaml for
+        # measured per-episode numbers per backend.
+        from eval.spatial.marginal_backends import make_regressor
+
+        print(f"Building {z_train_source} marginal for data.z_train_source={z_train_source} on {device}")
+        marginal_regressor = make_regressor(marginal_backend, device=device)
 
     worker_shard_idxs = range(worker_id, n_shards, num_workers)
     n_tasks_this_worker = sum(min(B, n_tasks - i * B) for i in worker_shard_idxs)
@@ -369,6 +398,9 @@ def main(cfg: DictConfig) -> None:
                 cfg, n_this, device,
                 tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
+                marginal_backend=marginal_backend,
+                marginal_regressor=marginal_regressor,
+                marginal_probs_n=marginal_probs_n,
             )
             # Drop the two fields reconstructible from R_star/sigma_star at
             # load time (see module docstring) -- cuts on-disk shard size by
