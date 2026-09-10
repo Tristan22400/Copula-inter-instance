@@ -420,12 +420,14 @@ pit_eps: 1.0e-6
 # forward pass, but over a larger context) -- pilot on a small n_tasks before
 # scaling a production run up.
 #
-# "exaone"/"tabpfn": same idea as "tabicl" -- override z_train AND
+# "exaone"/"tabpfn"/"tabldm": same idea as "tabicl" -- override z_train AND
 # z_test/log_pdf_test with a real (non-oracle) tabular foundation model's own
 # K-fold PIT -- genuinely BATCHED across every episode in a shard-generation
 # call, same shape of speedup as "tabicl"'s pit.py::run_pit_batched, via
-# eval/spatial/exaone_batched.py / tabpfn_batched.py (see data_gen.py::
-# _generate_gp_batch_raw's marginal_backend arg). "exaone" recovers LG AI
+# eval/spatial/{exaone,tabpfn,tabldm}_batched.py (registered in data_gen.py::
+# _BATCHED_MARGINAL_BACKENDS; see _generate_gp_batch_raw's marginal_backend
+# arg). All three share one K-fold PIT driver, eval/spatial/_batched_pit.py
+# -- only the per-backend quantile-bank call differs. "exaone" recovers LG AI
 # Research EXAONE-Tabular's real native 999-level quantile head, fused into
 # ONE forward per k-fold across the whole batch by concatenating every
 # episode's own ensemble-member tensors along EXAONE's own internal batch
@@ -438,7 +440,16 @@ pit_eps: 1.0e-6
 # than exaone's approach since it needs no internal-API reverse-engineering
 # -- NOT execution-verified in this repo's environment (no TABPFN_TOKEN set
 # when tabpfn_batched.py was written; tests/test_tabpfn_batched.py is
-# skipped without one).
+# skipped without one). "tabldm" is Xiaomi-TabLDM (arXiv:2609.03880,
+# Apache-2.0, pip Xiaomi-TabLDM) and is the lowest-risk of the three: its
+# predictive quantiles are PUBLIC API (predict(output_type="quantiles",
+# alphas=...) evaluated directly on the requested grid, no native-grid
+# interpolation), and its forward's leading axis is documented by TabLDM
+# itself as "the number of tables", so stacking episodes there is that axis'
+# intended use rather than a reinterpretation. Verified against the
+# per-episode path on CPU, tests/test_tabldm_batched.py. Its weights are
+# pulled from HF (occams/Xiaomi-TabLDM) on first use -- pre-cache them
+# before running under HF_HUB_OFFLINE=1, which scripts/train.sh sets.
 #
 # Still meaningfully slower than "tabicl" per episode (measured on an RTX
 # A5000: ~740ms/episode for exaone at B=16,P=32,k_folds=5, vs TabICL's
@@ -446,8 +457,10 @@ pit_eps: 1.0e-6
 # scale, but not TabICL-parity), and requires device='cuda' for
 # live-generation (CPU EXAONE is ~120x slower per call, see
 # eval/spatial/marginal_backends.py::make_regressor's "exaone" branch) --
-# training.live_generation with z_train_source=exaone/tabpfn raises if
-# device isn't 'cuda' (live_dataset.py::build_live_train_loader). Any
+# training.live_generation with z_train_source=exaone/tabpfn/tabldm raises
+# if device isn't 'cuda' (live_dataset.py::build_live_train_loader). TabLDM
+# on CPU measured ~4.9s per fit+predict call at P=32 -- far cheaper than
+# EXAONE's CPU path, still nowhere near usable for live generation. Any
 # backend eval/spatial/marginal_backends.py registers with no dedicated
 # _batched module falls back to the slow per-episode Python loop instead
 # (see data_gen.py's marginal_backend branch); every registered backend
@@ -456,7 +469,7 @@ pit_eps: 1.0e-6
 # with a small batch_size/z_train_tabicl_k_folds/z_train_marginal_probs_n
 # before scaling up.
 z_train_source: tabicl
-# Quantile grid size for z_train_source=exaone/tabpfn's PIT (ignored for
+# Quantile grid size for z_train_source=exaone/tabpfn/tabldm's PIT (ignored for
 # every other z_train_source, which use their own native grid -- TabICL's is
 # always 999-level). Default 99 matches
 # debug/stages/s7b_backend_train.py's DEFAULT_PROBS_N; raise for closer
