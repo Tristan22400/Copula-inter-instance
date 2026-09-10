@@ -745,7 +745,7 @@ def phase_a_batch_loss(
     device: str | torch.device = "cuda",
     eps: float = 1e-6,
     timings: Optional[dict[str, float]] = None,
-    marginal_probs_n: int = 99,
+    marginal_probs_n: "int | None" = None,
 ) -> dict:
     """One Phase-A training step's forward + loss on a batch of GP episodes.
 
@@ -816,8 +816,17 @@ def phase_a_batch_loss(
 
     is_backbone = isinstance(tabicl, MarginalBackbone) and tabicl.name != "tabicl"
     if is_backbone:
-        probs = np.linspace(
-            1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
+        # None => the model's native decoder grid (999 levels for every
+        # backbone here, TabICL included). That is what the TabICL path has
+        # always scored, so leaving it native keeps the objective comparable
+        # across backbones instead of scoring a resampling of one of them.
+        probs = (
+            None if marginal_probs_n is None
+            else np.linspace(
+                1.0 / (marginal_probs_n + 1),
+                marginal_probs_n / (marginal_probs_n + 1),
+                marginal_probs_n,
+            )
         )
         out = kfold_quantiles_grad(
             tabicl, batch["x_train"], batch["y_train_scaled"],
@@ -1059,7 +1068,7 @@ def validate_synthetic_marginal(
     k_folds: int = DEFAULT_K_FOLDS,
     eps: float = 1e-6,
     device: str | torch.device = "cuda",
-    marginal_probs_n: int = 99,
+    marginal_probs_n: "int | None" = None,
 ) -> dict:
     """Synthetic-GP counterpart of the ERA5 pass: the analytic headroom.
 
@@ -1301,7 +1310,8 @@ def main(cfg: DictConfig) -> None:
 
     # ---- model + tier routing -------------------------------------------
     backbone_name = str(cfg.marginal.get("backbone", "tabicl"))
-    marginal_probs_n = int(cfg.marginal.get("probs_n", 99))
+    _probs_n_cfg = cfg.marginal.get("probs_n", None)
+    marginal_probs_n = None if _probs_n_cfg is None else int(_probs_n_cfg)
     if backbone_name == "tabicl":
         # Unchanged path: load_tabicl owns TabICL's own checkpoint schema.
         tabicl, tabicl_config = load_tabicl(

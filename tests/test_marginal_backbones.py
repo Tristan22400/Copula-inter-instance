@@ -98,6 +98,45 @@ def test_quantile_forward_is_differentiable_into_the_trunk(backbone):
     )
 
 
+def test_native_grid_is_the_default_and_matches_the_model_head(backbone):
+    """Phase A scores the decoder's OWN 999 levels, not a resampling.
+
+    Every backbone here emits 999 (TabLDM's decoder is the same (999, 1024)
+    shape as TabICL's; EXAONE's manifest reports output_width=999), so the
+    default must not silently downsample -- doing so both loses resolution and
+    makes the objective incomparable with the tabicl path, which has always
+    been scored at 999.
+    """
+    rng = np.random.default_rng(3)
+    Xc, yc, Xq = _episode(rng)
+
+    assert backbone.native_quantile_count == 999
+    q = backbone.quantile_forward([Xc], [yc], [Xq])          # probs=None
+    assert q.shape == (1, Xq.shape[0], 999)
+    assert q.requires_grad and torch.isfinite(q).all()
+
+    # The head must be built on the same levels the forward produced, or its
+    # spline setup raises on the shape mismatch.
+    head = backbone.quantile_dist_module()
+    dist = head(q.reshape(-1, q.shape[-1]))
+    lp = dist.log_prob(torch.zeros(q.shape[0] * q.shape[1]))
+    assert torch.isfinite(lp).all() and lp.requires_grad
+
+    # An explicit grid still works, as the documented cost lever.
+    q99 = backbone.quantile_forward([Xc], [yc], [Xq], np.linspace(1 / 100, 99 / 100, 99))
+    assert q99.shape == (1, Xq.shape[0], 99)
+
+
+def test_native_probs_follow_the_repo_grid_convention(backbone):
+    """native_probs must equal linspace(1/(n+1), n/(n+1), n) -- the same
+    convention every explicitly-requested grid uses -- so a native grid and a
+    999-level explicit grid are the same numbers, not merely the same size."""
+    n = backbone.native_quantile_count
+    np.testing.assert_allclose(
+        backbone.native_probs, np.linspace(1.0 / (n + 1), n / (n + 1), n), rtol=0, atol=1e-12
+    )
+
+
 def test_quantile_forward_is_monotone_in_probs(backbone):
     """A quantile function that isn't nondecreasing in alpha would make the
     downstream finite-difference density negative."""

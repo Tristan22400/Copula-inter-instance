@@ -50,11 +50,23 @@ marginal:
   # backbone=tabicl use `ckpt` below instead, which pit.load_tabicl reads.
   resume_ckpt: null
 
-  # Quantile grid size for non-tabicl backbones' Phase-A forward. Ignored for
-  # tabicl, which is scored at its own native levels by run_pit_batched_grad.
-  # A proportional lever on per-step cost: every fold's forward evaluates this
-  # many levels.
-  probs_n: 99
+  # Quantile grid size for non-tabicl backbones' Phase-A forward.
+  #
+  # null (the default) = the model's OWN native decoder grid, which is 999
+  # levels for every backbone here -- TabICL, TabLDM (whose decoder is
+  # literally the same (999, 1024) shape) and EXAONE (manifest
+  # output_width=999) alike. Native is both more faithful and cheaper:
+  # TabLDM reads its raw decoder output instead of running its spline/GPD
+  # inverse-CDF once per requested level, and EXAONE skips interpolating its
+  # 999-level bank down. It also keeps the objective comparable with the
+  # tabicl path, which has always been scored at 999.
+  #
+  # Set an integer to resample onto that many evenly-spaced levels instead --
+  # a proportional cost lever, at the price of a coarser CDF for the
+  # finite-difference density and the CRPS integral. (Distinct from
+  # data.z_train_marginal_probs_n, which is the same idea on the
+  # generation/inference side and does default to 99 there.)
+  probs_n: null
 
   # Starting point. Any name in the jingang/TabICL HF repo, or a local path
   # (pit.load_tabicl accepts both) — so a Phase-A run can also resume from an
