@@ -35,13 +35,20 @@ a checkpoint path. src/model.py and conf/config.yaml are untouched.
   #    (+ LoRA on icl_predictor) only if the oracle gap plateaus above zero.
   python src/finetune_marginal.py                      # or: marginal.tier=1
   oarsub -S ./scripts/finetune_marginal.sh             # on Grid5000
-  #    Other marginal backbones (src/marginal_backbones.py): tabicl/tabldm reach
-  #    tiers 0-3, exaone tier 0 only (its attention holds raw Parameters, so
-  #    there is nothing for LoRA to swap); tabpfn is wired but licence-gated and
-  #    never executed here. Non-tabicl checkpoints are loaded back via
-  #    marginal_backends.make_regressor(..., ckpt=<path>), not pit.load_tabicl.
-  python src/finetune_marginal.py marginal.backbone=tabldm marginal.tier=1
-  python src/finetune_marginal.py marginal.backbone=exaone marginal.tier=0
+  #    marginal.lora_all_layers=true (the DEFAULT) puts LoRA at ONE shared rank
+  #    on every 2-D weight matrix of whichever backbone is selected, so the
+  #    tier ladder above only matters as an ablation (lora_all_layers=false).
+  #    Measured coverage at rank 8: tabicl 153 matrices / 854K trainable
+  #    (2.91%), tabldm 295 / 2.00M (2.73%), exaone 360 / 1.43M (6.33%).
+  #    Other marginal backbones (src/marginal_backbones.py): tabpfn is wired
+  #    but licence-gated and never executed here. Non-tabicl checkpoints are
+  #    loaded back via marginal_backends.make_regressor(..., ckpt=<path>),
+  #    not pit.load_tabicl.
+  python src/finetune_marginal.py marginal.backbone=tabldm
+  python src/finetune_marginal.py marginal.backbone=exaone
+  #    Stage-ladder ablation (only tabicl/tabldm can climb it -- exaone's
+  #    attention has no swappable module, see marginal_backbones.MAX_TIER):
+  python src/finetune_marginal.py marginal.lora_all_layers=false marginal.tier=1
   # 3. Re-measure, then gate on real data (must not regress -- the whole point of a
   #    TabICL marginal is non-Gaussian tabular transfer, which GP-only training can
   #    destroy), then hand the result to a normal copula run:
