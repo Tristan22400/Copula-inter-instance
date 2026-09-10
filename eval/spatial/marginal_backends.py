@@ -34,6 +34,21 @@ Registered backends:
                residuals -- see its docstring for how (a monkeypatch on
                _collapse_members, not a private reimplementation of the
                forward pass).
+  - "tabldm" : Xiaomi-TabLDM (pip `Xiaomi-TabLDM`, arXiv:2609.03880),
+               pretrained. The only backend here whose predictive quantiles
+               are PUBLIC API: `predict(X, output_type="quantiles",
+               alphas=[...])` returns (n_query, len(alphas)) directly, in
+               the caller's own `probs` grid -- no monkeypatch (exaone), no
+               transpose (tabpfn), and no interpolation off a fixed native
+               grid, since the model evaluates the requested alphas itself.
+               Underneath it is a real predictive CDF, not an ensemble
+               spread: a monotone spline quantile function with generalized-
+               Pareto tails (tabldm/_model/quantile_dist.py), so the
+               finite-difference density compute_pit takes downstream is
+               differencing a genuine conditional distribution. Weights are
+               Apache-2.0 and pulled from HF (occams/Xiaomi-TabLDM) on first
+               use -- pre-cache them before running under HF_HUB_OFFLINE=1
+               (scripts/train.sh sets that by default).
 """
 
 from __future__ import annotations
@@ -45,7 +60,7 @@ import numpy as np
 
 __all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
 
-BACKEND_NAMES = ["tabicl", "tabpfn", "exaone"]
+BACKEND_NAMES = ["tabicl", "tabpfn", "exaone", "tabldm"]
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +156,28 @@ def make_regressor(name: str, device: "str | None" = None):
         return EXAONETabularRegressor.from_pretrained(
             device="cuda" if use_cuda else "cpu", ensemble_count=1
         )
+    if name == "tabldm":
+        from tabldm import TabLDMRegressor
+
+        # n_estimators=1: the same "ensemble diversity nobody reads" case as
+        # tabpfn/exaone above -- TabLDM's default 8 members are independently
+        # preprocessed views of the SAME context whose per-member quantile
+        # banks predict() mean-pools ((n_estimators, n_query, n_quantiles) ->
+        # (n_query, n_quantiles), see regressor.py's y_scaler_ inverse-
+        # transform block), and quantiles() below reads one pooled grid, not
+        # a spread across members.
+        #
+        # device: passed straight through (None lets TabLDM pick CUDA/CPU
+        # itself). No sm80 guard like exaone's above -- TabLDM's attention
+        # degrades gracefully, logging "[FlashAttention] fast path bypassed
+        # -> SDPA" and running the SDPA path rather than raising "No
+        # available kernel", so an older card is slow here, not broken.
+        #
+        # random_state is a CONSTRUCTOR argument, so it is fixed for this
+        # regressor's whole lifetime; quantiles()' per-call `seed` cannot
+        # reach it. That matches exaone (deterministic given fitted state)
+        # rather than being a limitation -- see _tabldm_quantiles.
+        return TabLDMRegressor(n_estimators=1, device=device, random_state=0)
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
 
 
@@ -173,6 +210,8 @@ def quantiles(
         return np.asarray(out).T  # (n_quantiles, n_query) -> (n_query, n_quantiles)
     if name == "exaone":
         return _exaone_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
+    if name == "tabldm":
+        return _tabldm_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
 
 
@@ -245,6 +284,33 @@ def _exaone_quantiles(
     for i in range(bank.shape[0]):
         out[i] = np.interp(probs, native_probs, bank[i])
     return out
+
+
+def _tabldm_quantiles(
+    regressor, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray,
+    probs: np.ndarray, *, seed: int,
+) -> np.ndarray:
+    """TabLDM's public predictive-quantile API, evaluated directly at the
+    caller's own `probs` -- the whole adapter, because
+    `predict(output_type="quantiles", alphas=...)` already returns exactly
+    this module's (n_query, Q) contract in raw y-units.
+
+    Nothing is reconstructed or approximated here, unlike the other two
+    non-native paths: exaone needs a monkeypatch to stop `.predict()`
+    discarding its quantile bank and then interpolates off a fixed 999-level
+    native grid, and tabpfn returns (Q, n_query) needing a transpose. TabLDM
+    evaluates the requested alphas inside its own spline/GPD quantile
+    distribution, so there is no grid mismatch to interpolate across at all.
+
+    `seed` is unused: TabLDM's randomness is seeded by the `random_state`
+    constructor argument make_regressor fixes, and its forward pass is
+    deterministic given the fitted state -- the same situation as
+    _exaone_quantiles. The argument is kept for a uniform call signature
+    across every backend's quantiles() dispatch.
+    """
+    regressor.fit(X_context, y_context)
+    q = np.asarray(regressor.predict(X_query, output_type="quantiles", alphas=list(probs)))
+    return q  # (n_query, Q), already this module's orientation
 
 
 # ---------------------------------------------------------------------------
