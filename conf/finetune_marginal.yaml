@@ -66,6 +66,22 @@ marginal:
   # contraction depends on how context rows influence each query. Tiers 0–2
   # remain available as capacity ablations.
   tier: 3
+
+  # LoRA on EVERY 2-D weight matrix in the backbone, at one shared rank, for
+  # every architecture (src/lora.py::apply_lora_all_layers). This is the
+  # default because the stage ladder above adapts only swappable attention
+  # MODULES, which covers ~91% of TabLDM's parameters but ~2% of EXAONE's --
+  # its attention and feed-forward weights are raw nn.Parameters inside
+  # custom modules. Parametrization reaches those too, so "same low rank on
+  # every model, every layer" holds uniformly instead of depending on which
+  # library happened to use nn.Module children.
+  #
+  # Set false to fall back to the stage/tier ladder (a capacity ablation; only
+  # tabicl and tabldm can climb it -- see marginal_backbones.MAX_TIER).
+  lora_all_layers: true
+
+  # The shared low rank. One value, applied identically to every adapted
+  # matrix in every backbone.
   lora_rank: 8
   lora_alpha: 16.0
   lora_target: qkvo
