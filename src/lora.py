@@ -268,6 +268,9 @@ def is_lora_param_name(name: str) -> bool:
         or name.startswith("lora_B_")
         or ".lora_A_" in name
         or ".lora_B_" in name
+        # Parametrization form (apply_lora_all_layers): the adapter lives at
+        # <module>.parametrizations.<weight>.0.{A,B}.
+        or (".parametrizations." in name and (name.endswith(".A") or name.endswith(".B")))
     )
 
 
@@ -302,7 +305,11 @@ def set_trainable(
     regexes = [re.compile(pat) for pat in also_trainable]
     n_trainable = 0
     for name, param in backbone.named_parameters():
-        keep = is_lora_param_name(name) or any(r.search(name) for r in regexes)
+        # A parametrization's `.original` is the frozen base weight by
+        # construction; never let an allowlist pattern unfreeze it (see
+        # is_parametrized_original).
+        allow = not is_parametrized_original(name) and any(r.search(name) for r in regexes)
+        keep = is_lora_param_name(name) or allow
         param.requires_grad_(keep)
         n_trainable += int(keep)
     return n_trainable
@@ -468,3 +475,157 @@ def merged_base_state_dict(backbone: nn.Module) -> dict:
                 sd[f"{path}.ssmax_layer.{k}"] = v.detach().cpu().clone()
 
     return sd
+
+
+# ---------------------------------------------------------------------------
+# Universal (all-layers) LoRA
+#
+# LoRAMultiheadAttention above adapts attention by SWAPPING the module. That
+# only reaches architectures whose attention is a swappable nn.Module, which
+# made coverage wildly uneven across the marginal backbones: ~91% of TabLDM's
+# parameters sit in Linear/MultiheadAttention children, but ~98% of EXAONE's
+# are raw nn.Parameters inside custom TensorAttention/FeedForward modules
+# (query_weight/key_weight/value_weight/output_weight, 106 modules) with no
+# submodule to replace and no way to intercept their forward.
+#
+# torch.nn.utils.parametrize adapts the PARAMETER instead of the module: after
+# registration, every read of `module.weight` returns W + (B@A)*scale, so the
+# owning module's forward is untouched and needs to know nothing. That makes
+# "every weight matrix, same rank, every architecture" achievable uniformly --
+# including for modules this repo does not own and must not edit.
+# ---------------------------------------------------------------------------
+class LoRAParametrization(nn.Module):
+    """``W -> W + (B @ A) * (alpha / rank)`` as a torch parametrization.
+
+    A/B are held in float32 even when the base weight is float16 (EXAONE's
+    released weights are), and the delta is computed in float32 before being
+    cast back. Optimizer state on fp16 parameters is where small updates
+    silently round to zero; the cast back is required anyway, since
+    register_parametrization refuses to change a tensor's dtype.
+
+    B is zero-initialised, so the adapted weight is EXACTLY the pretrained one
+    at step 0 -- adding adapters never perturbs a pretrained model before any
+    training happens (asserted in tests/test_lora_all_layers.py).
+    """
+
+    def __init__(self, weight: Tensor, rank: int, alpha: float):
+        super().__init__()
+        out_features, in_features = weight.shape[-2], weight.shape[-1]
+        self.A = nn.Parameter(torch.zeros(rank, in_features, dtype=torch.float32))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        self.B = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float32))
+        self.scaling = float(alpha) / float(rank)
+
+    def forward(self, weight: Tensor) -> Tensor:
+        delta = (self.B @ self.A) * self.scaling
+        return weight + delta.to(weight.dtype).view_as(weight)
+
+
+def is_parametrized_original(name: str) -> bool:
+    """True for the frozen base weight a parametrization hides.
+
+    ``register_parametrization`` renames ``foo.weight`` to
+    ``foo.parametrizations.weight.original``. That name still matches
+    prefix-style tier-0 patterns (``^icl_predictor\\.decoder\\.``), so without
+    this guard set_trainable would unfreeze the full pretrained matrix
+    alongside its adapter -- i.e. quietly full-fine-tune the very layers LoRA
+    was installed on.
+    """
+    return ".parametrizations." in name and name.endswith(".original")
+
+
+def apply_lora_all_layers(
+    backbone: nn.Module,
+    rank: int,
+    alpha: float,
+    also_trainable: Sequence[str] = (),
+    skip_patterns: Sequence[str] = (),
+) -> int:
+    """Install a LoRA parametrization on EVERY 2-D weight matrix in *backbone*.
+
+    Uniform by construction: one ``rank`` for every layer and every
+    architecture, rather than a per-model subset determined by which modules
+    happen to be swappable. Returns the number of adapted matrices.
+
+    Only ``dim() == 2`` parameters are adapted -- a low-rank factorisation of a
+    1-D tensor is meaningless, so norms and biases are untouched here and stay
+    covered by the tier-0 allowlist (``also_trainable``), which is where they
+    were already handled.
+
+    Attention modules already swapped by ``apply_lora`` are skipped: their
+    pretrained weights live in buffers, not parameters, so they are invisible
+    to this walk and cannot be double-adapted.
+    """
+    import torch.nn.utils.parametrize as P
+
+    skip = [re.compile(p) for p in skip_patterns]
+
+    # Materialise the target list BEFORE registering anything. Registration
+    # inserts a `parametrizations` ModuleDict holding a LoRAParametrization,
+    # whose own A/B are 2-D parameters -- walking a live tree would adapt the
+    # adapters, and then their adapters, until the recursion limit.
+    targets = [
+        (mod_name, module)
+        for mod_name, module in backbone.named_modules()
+        if not isinstance(module, LoRAParametrization) and not P.is_parametrized(module)
+    ]
+
+    n_adapted = 0
+    for mod_name, module in targets:
+        for p_name, param in list(module.named_parameters(recurse=False)):
+            full = f"{mod_name}.{p_name}" if mod_name else p_name
+            if param.dim() != 2 or is_lora_param_name(full):
+                continue
+            if any(r.search(full) for r in skip):
+                continue
+            P.register_parametrization(module, p_name, LoRAParametrization(param, rank, alpha))
+            n_adapted += 1
+
+    set_trainable(backbone, also_trainable)
+    return n_adapted
+
+
+def merged_base_state_dict_parametrized(backbone: nn.Module) -> dict:
+    """``merged_base_state_dict``'s counterpart for parametrized adapters.
+
+    Returns the state dict under the ORIGINAL parameter names with each
+    adapted weight replaced by its effective ``W + (B@A)*scale``, so the file
+    loads into a stock model. Non-destructive: the live module keeps its
+    adapters and training continues after an intermediate checkpoint write.
+    """
+    import torch.nn.utils.parametrize as P
+
+    effective = {}
+    for mod_name, module in backbone.named_modules():
+        if not P.is_parametrized(module):
+            continue
+        for p_name in list(module.parametrizations.keys()):  # type: ignore[union-attr]
+            full = f"{mod_name}.{p_name}" if mod_name else p_name
+            effective[full] = getattr(module, p_name).detach().cpu().clone()
+
+    out = {}
+    for name, tensor in backbone.state_dict().items():
+        if ".parametrizations." in name:
+            continue  # emitted under its original name from `effective`
+        out[name] = tensor.detach().cpu().clone()
+    out.update(effective)
+    return out
+
+
+def merged_base_state_dict_any(backbone: nn.Module) -> dict:
+    """``merged_base_state_dict`` for whichever adapter style is installed.
+
+    A Phase-A checkpoint has to load into a stock model regardless of how it
+    was adapted, and the two styles rename tensors differently: module
+    replacement turns ``attn.out_proj.weight`` into a buffer
+    ``attn.out_proj_weight``, parametrization turns ``foo.weight`` into
+    ``foo.parametrizations.weight.original``. Callers should not have to know
+    which was used -- picking the wrong merger writes a file that fails
+    ``load_state_dict`` at the next run, long after the training spend.
+    """
+    import torch.nn.utils.parametrize as P
+
+    has_parametrized = any(P.is_parametrized(m) for m in backbone.modules())
+    if has_parametrized:
+        return merged_base_state_dict_parametrized(backbone)
+    return merged_base_state_dict(backbone)
