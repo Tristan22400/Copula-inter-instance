@@ -87,6 +87,7 @@ from eval.viz.correlation_plots import (
 )
 from inference.copula_inference import normalize_features
 from live_dataset import (
+    _GENERIC_MARGINAL_BACKENDS,
     _LIVE_TABICL_FLAT_HEADROOM_GB,
     _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB,
     _LIVE_TABICL_WORKER_PER_EPISODE_GB,
@@ -183,9 +184,12 @@ def get_gpu_peak_flops(device: int = 0) -> float:
 
 def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device: str) -> None:
     """Cap this (main) process's own CUDA memory fraction when live-generation
-    will also run TabICL inference inside separate GPU DataLoader worker
-    processes on the same card (live_dataset.py's data.z_train_tabicl_mix_* /
-    data.z_train_source=tabicl* path).
+    will also run marginal-backend inference inside separate GPU DataLoader
+    worker processes on the same card (live_dataset.py's
+    data.z_train_tabicl_mix_* / data.z_train_source=tabicl*/exaone/tabpfn
+    path -- live_dataset.py::batched_marginal_worker_enabled, all sharing the
+    same worker/spawn pattern now that exaone/tabpfn batch their own forward
+    too, see eval/spatial/exaone_batched.py and tabpfn_batched.py).
 
     Root cause this works around: each such worker holds its own CUDA
     context, entirely separate from this process's caching allocator pool.
@@ -196,8 +200,8 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     which nothing here calls outside the OOM handler below. Reserved memory
     is invisible to *other* processes even when this process isn't actively
     using most of it, so given enough steps this process's pool can starve a
-    TabICL worker's small allocation of the little free VRAM the driver has
-    left -- and unlike this process's own OOMs, a worker's OOM was previously
+    worker's small allocation of the little free VRAM the driver has left --
+    and unlike this process's own OOMs, a worker's OOM was previously
     completely uncaught (see next(train_iter) below), taking the whole run
     down instead of costing one skipped step.
 
@@ -207,12 +211,22 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     instead of silently starving them. It only caps future growth -- it does
     not reclaim memory already reserved -- so this must run before any
     training-loop allocation happens.
+
+    exaone/tabpfn workers share TabICL's own headroom formula below (see
+    resolve_live_tabicl_num_workers' docstring for the caveat that its
+    constants are calibrated against TabICL's per-worker VRAM specifically,
+    not benchmarked per backend) -- a shared conservative estimate rather
+    than no reservation at all, consistent with live_dataset.py's
+    build_live_train_loader treating every batched-GPU-worker backend
+    identically for worker/group-size sizing too.
     """
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
     _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
-    tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
-    if not tabicl_live_enabled or device != "cuda":
+    batched_marginal_worker_enabled = (
+        mix_enabled or z_train_source in ("tabicl", "tabicl_split") or z_train_source in _GENERIC_MARGINAL_BACKENDS
+    )
+    if not batched_marginal_worker_enabled or device != "cuda":
         return
     # Same resolution build_live_train_loader uses below (auto-sized from
     # currently-free GPU memory when training.live_tabicl_num_workers is
@@ -2475,7 +2489,6 @@ def main(cfg: DictConfig) -> None:
         print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
         t.aux_mae_weight = 0.0
     if live_generation:
-        _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         # dataset_dir is ignored entirely in this mode (see below) — naming the
         # run after it would be misleading, so summarize cfg.data.* instead.
         # Also fold in ckpt_dir's basename since it's often the only
@@ -2586,6 +2599,20 @@ def main(cfg: DictConfig) -> None:
             train_loader, adaptive_kernel_weights, tabicl_mix_weights = build_live_train_loader(cfg, t, device)
             val_loader, val_episodes_by_batch = build_fixed_live_val_batches(cfg, t, device)
             val_episodes_meta = dict(enumerate(val_episodes_by_batch))
+        # Reserve worker headroom only now, after build_fixed_live_val_batches'
+        # own (uncapped-need) marginal-backend forward passes have already run
+        # and freed their temporary model copy (see that function's docstring)
+        # — capping this process's own VRAM fraction any earlier (the previous
+        # location, right at live_generation's top) starved that one-time
+        # setup call itself instead of protecting it: exaone/tabpfn's batched
+        # forward at real (non-toy) P/N easily needs more than half the GPU
+        # for a single call, well past this formula's own 0.5 floor, so the
+        # main process was OOMing on its OWN val-batch construction before a
+        # single worker even existed to protect (see git history for the
+        # observed traceback). No iter(train_loader) call — the only thing
+        # that actually spawns the persistent GPU workers this guards against
+        # — happens before this point in any live_generation branch.
+        _reserve_gpu_headroom_for_live_tabicl(cfg, t, device)
         print(f"Train: <live> | Val: {len(val_loader) * t.batch_size} episodes (fixed)")
         # Kick off the persistent DataLoader workers now rather than waiting
         # until right before the training loop (the old location of this

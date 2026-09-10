@@ -178,6 +178,17 @@ training:
   # (combined with live_tabicl_num_workers auto-sizing above, this took real
   # in-training data-wait time from ~85ms/step average, spiking to 170ms, down
   # to ~1ms/step average on an idle RTX 6000 Ada at z_train_tabicl_k_folds=2).
+  # live_tabicl_num_workers/live_tabicl_group_multiplier (above) are SHARED
+  # with data.z_train_source=exaone/tabpfn too, not just tabicl/tabicl_split
+  # -- both now batch their own forward across the whole group_size call
+  # (eval/spatial/exaone_batched.py / tabpfn_batched.py), the same batched-
+  # GPU-worker shape as tabicl (see live_dataset.py::build_live_train_loader's
+  # batched_marginal_worker_enabled). The auto-sizing formula's constants are
+  # still calibrated against TabICL's own per-worker VRAM specifically (no
+  # dedicated exaone/tabpfn benchmark exists yet) -- a reasonable common
+  # starting point, not a validated per-backend figure; set
+  # live_tabicl_num_workers explicitly once you've measured your own
+  # node/backend/context-size combination.
   live_tabicl_group_multiplier: 2
   live_val_seed: 20260723  # fixed seed for the validation set (independent of the training seed stream)
   # For sharded datasets: shuffle within blocks of this many shards at a time
