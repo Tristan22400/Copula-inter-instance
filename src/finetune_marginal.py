@@ -54,6 +54,14 @@ for _p in (_HERE, _REPO_ROOT, os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
         sys.path.insert(0, _p)
 
 from data_gen import generate_gp_batch  # noqa: E402
+from marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0  # noqa: E402
+from marginal_backbones import MarginalBackbone  # noqa: E402
+from marginal_backbones import (  # noqa: E402
+    assert_patterns_match,
+    kfold_quantiles_grad,
+    load_backbone,
+    resolve_tier,
+)
 from pit import load_tabicl  # noqa: E402
 from train import cosine_lr_lambda  # noqa: E402
 
@@ -97,13 +105,10 @@ from pit import (
 # Regex, not substrings: "the norms inside the ICL stack" has no substring
 # spelling that excludes the identically-named norms in col_embedder and
 # row_interactor.
-TIER0_PATTERNS: tuple[str, ...] = (
-    r"^icl_predictor\.y_encoder\.",
-    r"^col_embedder\.y_encoder\.",
-    r"^icl_predictor\.ln\.",
-    r"^icl_predictor\.tf_icl\.blocks\.\d+\.norm[12]\.",
-    r"^icl_predictor\.decoder\.",
-)
+# Per-architecture, in src/marginal_backbones.py -- TabICL's entry there is
+# character-for-character the tuple that used to live here. Re-exported so
+# existing importers of finetune_marginal.TIER0_PATTERNS keep working.
+TIER0_PATTERNS: tuple[str, ...] = _BACKBONE_TIER0["tabicl"]
 
 # Tier ladder. Deliberately a ladder and not a guess: Tier 0 can only rescale
 # and remap what the trunk already computes; it cannot change *how much context
@@ -145,6 +150,7 @@ def apply_tier(
     lora_alpha: float = 16.0,
     lora_target: str = "qkvo",
     extra_patterns: Sequence[str] = (),
+    backbone_name: str = "tabicl",
 ) -> dict:
     """Route Phase-A trainability over *backbone* according to ``tier``.
 
@@ -159,9 +165,15 @@ def apply_tier(
     """
     if tier not in TIER_SPECS:
         raise ValueError(f"Unknown tier {tier}; expected one of {sorted(TIER_SPECS)}.")
+    # Raises (rather than clamping) when this architecture cannot reach the
+    # requested tier -- see marginal_backbones.resolve_tier for why.
+    resolve_tier(backbone_name, tier)
     spec = TIER_SPECS[tier]
     stages = list(spec["lora_stages"])
-    patterns = tuple(TIER0_PATTERNS) + tuple(extra_patterns)
+    patterns = tuple(_BACKBONE_TIER0[backbone_name]) + tuple(extra_patterns)
+    # Fail loudly if an upstream rename has made a tier-0 pattern match
+    # nothing, instead of quietly training a smaller set than we report.
+    assert_patterns_match(backbone, _BACKBONE_TIER0[backbone_name])
 
     n_replaced = apply_lora(
         backbone=backbone,
@@ -174,6 +186,7 @@ def apply_tier(
     report = trainable_param_report(backbone)
     report.update(
         {
+            "backbone": backbone_name,
             "tier": tier,
             "tier_desc": spec["desc"],
             "lora_stages": stages,
@@ -699,7 +712,7 @@ def stack_episodes(episodes: Sequence[dict], device: str | torch.device) -> dict
 
 
 def phase_a_batch_loss(
-    tabicl: nn.Module,
+    tabicl: "nn.Module | MarginalBackbone",
     episodes: Sequence[dict],
     weights: MarginalLossWeights,
     *,
@@ -709,6 +722,7 @@ def phase_a_batch_loss(
     device: str | torch.device = "cuda",
     eps: float = 1e-6,
     timings: Optional[dict[str, float]] = None,
+    marginal_probs_n: int = 99,
 ) -> dict:
     """One Phase-A training step's forward + loss on a batch of GP episodes.
 
@@ -732,6 +746,17 @@ def phase_a_batch_loss(
     crashing the run. They still contribute any configured sample-score terms;
     with the shipped pinball loss they still provide valid sample supervision.
     The precedent ``gp_analytical_posterior``'s callers already set.
+
+    ``tabicl`` may be a raw TabICL module (the original path, scored through
+    pit.py::run_pit_batched_grad at TabICL's native quantile levels) or a
+    ``MarginalBackbone`` (src/marginal_backbones.py). For a non-TabICL
+    backbone the forward instead goes through
+    ``marginal_backbones.kfold_quantiles_grad``, which reproduces pit.py's
+    CONTIGUOUS-block fold geometry exactly -- that geometry is what
+    ``episode_fold_targets`` conditions its analytic targets on, so a
+    different partition would score every training row against a target built
+    from the wrong context. Everything after the forward (targets, objective,
+    oracle gap) is architecture-agnostic and shared verbatim.
     """
     def _mark(name: str, started: float) -> float:
         if timings is not None:
@@ -766,23 +791,37 @@ def phase_a_batch_loss(
         perm = torch.randperm(n_folds_eff, generator=generator)[:n_f]
         fold_subset = sorted(perm.tolist())
 
-    out = run_pit_batched_grad(
-        tabicl,
-        batch["x_train"],
-        batch["y_train_scaled"].unsqueeze(-1),
-        batch["x_test"],
-        batch["y_test_scaled"].unsqueeze(-1),
-        k_folds=K,
-        eps=eps,
-        return_quantiles=True,
-        fold_subset=fold_subset,
-        compute_pit=False,
-        fuse_folds=True,
-    )
+    is_backbone = isinstance(tabicl, MarginalBackbone) and tabicl.name != "tabicl"
+    if is_backbone:
+        probs = np.linspace(
+            1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
+        )
+        out = kfold_quantiles_grad(
+            tabicl, batch["x_train"], batch["y_train_scaled"],
+            batch["x_test"], batch["y_test_scaled"],
+            k_folds=K, probs=probs, fold_subset=fold_subset,
+        )
+        quantile_dist = tabicl.quantile_dist_module(probs)
+        q_test, q_train = out["q_test"], out["q_train"]
+    else:
+        module = tabicl.module if isinstance(tabicl, MarginalBackbone) else tabicl
+        out = run_pit_batched_grad(
+            module,
+            batch["x_train"],
+            batch["y_train_scaled"].unsqueeze(-1),
+            batch["x_test"],
+            batch["y_test_scaled"].unsqueeze(-1),
+            k_folds=K,
+            eps=eps,
+            return_quantiles=True,
+            fold_subset=fold_subset,
+            compute_pit=False,
+            fuse_folds=True,
+        )
+        quantile_dist = module.quantile_dist
+        q_test = out["q_test"].squeeze(2)                             # (B, N, Q)
+        q_train = out["q_train"].squeeze(2)                           # (B, P', Q)
     t_part = _mark("tabicl_forward", t_part)
-
-    q_test = out["q_test"].squeeze(2)                                # (B, N, Q)
-    q_train = out["q_train"].squeeze(2)                              # (B, P', Q)
     if fold_subset is None:
         train_idx = torch.arange(P, device=q_train.device)
     else:
@@ -830,7 +869,7 @@ def phase_a_batch_loss(
     mask_flat = mask_all.reshape(-1)
 
     res = marginal_objective(
-        q_flat, y_flat, tabicl.quantile_dist, weights,
+        q_flat, y_flat, quantile_dist, weights,
         mu=mu_flat, sigma=sig_flat, target_mask=mask_flat,
     )
     # QuantileDistribution sorts raw decoder outputs before scoring them. That
@@ -991,12 +1030,13 @@ def validate_era5_marginal(
 
 @torch.no_grad()
 def validate_synthetic_marginal(
-    tabicl: nn.Module,
+    tabicl: "nn.Module | MarginalBackbone",
     episode_batches: Sequence[Sequence[dict]],
     *,
     k_folds: int = DEFAULT_K_FOLDS,
     eps: float = 1e-6,
     device: str | torch.device = "cuda",
+    marginal_probs_n: int = 99,
 ) -> dict:
     """Synthetic-GP counterpart of the ERA5 pass: the analytic headroom.
 
@@ -1019,6 +1059,7 @@ def validate_synthetic_marginal(
         res = phase_a_batch_loss(
             tabicl, episodes, metric_w, k_folds=k_folds,
             folds_per_step=None, device=device, eps=eps,
+            marginal_probs_n=marginal_probs_n,
         )
         nlls.append(float(res["nll"]))
         crpss.append(float(res["crps"]))
@@ -1236,19 +1277,33 @@ def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     # ---- model + tier routing -------------------------------------------
-    tabicl, tabicl_config = load_tabicl(
-        str(cfg.marginal.ckpt), device, trainable=True, return_config=True
-    )
+    backbone_name = str(cfg.marginal.get("backbone", "tabicl"))
+    marginal_probs_n = int(cfg.marginal.get("probs_n", 99))
+    if backbone_name == "tabicl":
+        # Unchanged path: load_tabicl owns TabICL's own checkpoint schema.
+        tabicl, tabicl_config = load_tabicl(
+            str(cfg.marginal.ckpt), device, trainable=True, return_config=True
+        )
+        trainable_module = tabicl
+    else:
+        backbone_obj = load_backbone(
+            backbone_name, ckpt=cfg.marginal.get("resume_ckpt", None), device=device
+        )
+        tabicl, tabicl_config = backbone_obj, {}
+        trainable_module = backbone_obj.module
+        for p_ in trainable_module.parameters():
+            p_.requires_grad_(True)
     report = apply_tier(
-        tabicl,
+        trainable_module,
         int(cfg.marginal.tier),
         lora_rank=int(cfg.marginal.lora_rank),
         lora_alpha=float(cfg.marginal.lora_alpha),
         lora_target=str(cfg.marginal.lora_target),
+        backbone_name=backbone_name,
     )
-    tabicl.to(device)
+    trainable_module.to(device)
     print(
-        f"[tier {report['tier']}] {report['tier_desc']}: "
+        f"[{report.get('backbone', 'tabicl')} tier {report['tier']}] {report['tier_desc']}: "
         f"{report['n_trainable_params']:,} / {report['n_total_params']:,} trainable "
         f"({100 * report['trainable_frac']:.2f}%), "
         f"{report['lora_modules_replaced']} LoRA module(s)"
@@ -1373,7 +1428,8 @@ def main(cfg: DictConfig) -> None:
         t_gp = time.time()
         metrics.update(
             validate_synthetic_marginal(
-                tabicl, gp_val, k_folds=k_folds, eps=eps, device=device
+                tabicl, gp_val, k_folds=k_folds, eps=eps, device=device,
+                marginal_probs_n=marginal_probs_n,
             )
         )
         metrics["val_marginal/gp_seconds"] = time.time() - t_gp
@@ -1399,11 +1455,17 @@ def main(cfg: DictConfig) -> None:
             return None
         name = f"step_{step:07d}{tag}.pt"
         path = os.path.join(str(cfg.training.ckpt_dir), name)
-        save_marginal_checkpoint(
-            path, tabicl, tabicl_config, step=step, cfg=cfg,
-            extra={"tier_report": {k: v for k, v in report.items()
-                                   if isinstance(v, (int, float, str))}},
-        )
+        tier_extra = {"tier_report": {k: v for k, v in report.items()
+                                      if isinstance(v, (int, float, str))}}
+        if isinstance(tabicl, MarginalBackbone):
+            # Non-TabICL backbones have no published loader for TabICL's
+            # schema; MarginalBackbone.save writes theirs, and
+            # marginal_backends.make_regressor(..., ckpt=path) reads it back.
+            tabicl.save(path, step=step, cfg=cfg, extra=tier_extra)
+        else:
+            save_marginal_checkpoint(
+                path, tabicl, tabicl_config, step=step, cfg=cfg, extra=tier_extra,
+            )
         print(f"[ckpt] {path}")
         return path
 
@@ -1487,12 +1549,12 @@ def main(cfg: DictConfig) -> None:
             tabicl, episodes, w,
             k_folds=k_folds, folds_per_step=folds_per_step,
             generator=gen, device=device, eps=eps,
-            timings=part_timings,
+            timings=part_timings, marginal_probs_n=marginal_probs_n,
         )
         loss = res["loss"]
         anchor_val = 0.0
         if anchor is not None:
-            a = anchor(tabicl)
+            a = anchor(trainable_module)
             loss = loss + weights.anchor * a
             anchor_val = a.detach().item()
 
