@@ -995,7 +995,11 @@ def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
 
 @torch.no_grad()
 def validate_era5_marginal(
-    tabicl: nn.Module, batches: dict, *, eps: float = 1e-6
+    tabicl: "nn.Module | MarginalBackbone",
+    batches: dict,
+    *,
+    eps: float = 1e-6,
+    marginal_probs_n: int = 99,
 ) -> dict:
     """Marginal-only metrics per region, plus across-region means.
 
@@ -1012,6 +1016,13 @@ def validate_era5_marginal(
     forward/CDF/log_prob path is byte-identical to training's.
     """
     per_region: dict[str, dict] = {}
+    is_backbone = isinstance(tabicl, MarginalBackbone) and tabicl.name != "tabicl"
+    if is_backbone:
+        probs = np.linspace(
+            1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
+        )
+        quantile_dist = tabicl.quantile_dist_module(probs)
+
     for region, b in batches.items():
         y_tr_s, y_te_s, mean, std = [], [], [], []
         for d in range(b["y_train"].shape[0]):
@@ -1021,20 +1032,35 @@ def validate_era5_marginal(
         y_te_s = torch.stack(y_te_s)
         std_t = torch.stack(std)
 
-        out = run_pit_batched_grad(
-            tabicl, b["x_train"], y_tr_s.unsqueeze(-1),
-            b["x_test"], y_te_s.unsqueeze(-1),
-            k_folds=2, eps=eps, return_quantiles=True, fold_subset=[],
-            compute_pit=False,
-        )
-        q = out["q_test"].squeeze(2)                                  # (days, N, Q)
+        if is_backbone:
+            xtr = b["x_train"].detach().cpu().numpy()
+            ytr = y_tr_s.detach().cpu().numpy()
+            xte = b["x_test"].detach().cpu().numpy()
+            days = b["y_train"].shape[0]
+            q = tabicl.quantile_forward(
+                [xtr[d] for d in range(days)],
+                [ytr[d] for d in range(days)],
+                [xte[d] for d in range(days)],
+                probs,
+            )
+        else:
+            module = tabicl.module if isinstance(tabicl, MarginalBackbone) else tabicl
+            out = run_pit_batched_grad(
+                module, b["x_train"], y_tr_s.unsqueeze(-1),
+                b["x_test"], y_te_s.unsqueeze(-1),
+                k_folds=2, eps=eps, return_quantiles=True, fold_subset=[],
+                compute_pit=False,
+            )
+            q = out["q_test"].squeeze(2)                                  # (days, N, Q)
+            quantile_dist = module.quantile_dist
+
         # Per-day std, broadcast over that day's query rows, so the raw-nats
         # Jacobian is each day's own -- days are normalized independently.
         n_q = q.shape[1]
         log_std = std_t.log().unsqueeze(1).expand(-1, n_q).reshape(-1)
         y_std = std_t.unsqueeze(1).expand(-1, n_q).reshape(-1)
         m = marginal_metrics(
-            q.reshape(-1, q.shape[-1]), y_te_s.reshape(-1), tabicl.quantile_dist,
+            q.reshape(-1, q.shape[-1]), y_te_s.reshape(-1), quantile_dist,
             log_std=log_std, y_std=y_std, eps=eps,
         )
         per_region[region] = m
@@ -1354,7 +1380,7 @@ def main(cfg: DictConfig) -> None:
         anchor=weights.anchor,
         huber_delta=weights.huber_delta, tail_power=weights.tail_power,
     )
-    anchor = AnchorPenalty(tabicl) if weights.anchor > 0 else None
+    anchor = AnchorPenalty(trainable_module) if weights.anchor > 0 else None
 
     # ---- optimizer -------------------------------------------------------
     # AdamW, one group, no ndim split. Two reasons this is not train.py's
@@ -1364,7 +1390,7 @@ def main(cfg: DictConfig) -> None:
     # moments to params by position in the flattened list) is a hazard the
     # moment param groups change, which a tier ladder does by construction.
     # A single group over `requires_grad` params has no positional ambiguity.
-    params = [p for p in tabicl.parameters() if p.requires_grad]
+    params = [p for p in trainable_module.parameters() if p.requires_grad]
     if not params:
         raise RuntimeError("Tier routing left no trainable parameters.")
     opt = torch.optim.AdamW(
@@ -1436,7 +1462,7 @@ def main(cfg: DictConfig) -> None:
             config=OmegaConf.to_container(cfg, resolve=True),
             mode=str(cfg.wandb.mode),
         )
-        wandb.watch(tabicl, log="gradients", log_freq=max(1, int(cfg.training.log_every)))
+        wandb.watch(trainable_module, log="gradients", log_freq=max(1, int(cfg.training.log_every)))
         wandb.log({f"model/{k}": v for k, v in report.items()
                    if isinstance(v, (int, float))}, step=0)
 
@@ -1447,7 +1473,9 @@ def main(cfg: DictConfig) -> None:
     def _validate(step: int) -> dict[str, float]:
         t0 = time.time()
         t_era5 = time.time()
-        metrics = validate_era5_marginal(tabicl, era5_val, eps=eps)
+        metrics = validate_era5_marginal(
+            tabicl, era5_val, eps=eps, marginal_probs_n=marginal_probs_n
+        )
         metrics["val_marginal/era5_seconds"] = time.time() - t_era5
         t_gp = time.time()
         metrics.update(
@@ -1516,12 +1544,12 @@ def main(cfg: DictConfig) -> None:
         # validation selection cheap even for the full pretrained backbone.
         return {
             name: p.detach().cpu().clone()
-            for name, p in tabicl.named_parameters()
+            for name, p in trainable_module.named_parameters()
             if p.requires_grad
         }
 
     def _restore_trainable(state: dict[str, torch.Tensor]) -> None:
-        named = dict(tabicl.named_parameters())
+        named = dict(trainable_module.named_parameters())
         with torch.no_grad():
             for name, value in state.items():
                 named[name].copy_(value.to(device=named[name].device))
