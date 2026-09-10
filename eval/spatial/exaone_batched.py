@@ -144,90 +144,48 @@ def _quantile_bank_batched(regressor, X_context: list, y_context: list, X_query:
     return (pooled * scale + center).cpu().numpy()
 
 
+def _quantile_bank_on_probs(regressor, X_context: list, y_context: list, X_query: list,
+                            probs: np.ndarray) -> np.ndarray:
+    """_quantile_bank_batched, interpolated from EXAONE's fixed native grid
+    onto the caller's ``probs``.
+
+    EXAONE is the one backend whose model emits a grid it chose (999 evenly
+    spaced levels, fixed by the released checkpoint) rather than the levels
+    asked for, so the interpolation the shared driver must never have to know
+    about lives here -- the same np.interp step
+    marginal_backends.py::_exaone_quantiles does per episode.
+    """
+    quantile_count = regressor.manifest.regression.quantile_count
+    native_probs = np.linspace(
+        1.0 / (quantile_count + 1), quantile_count / (quantile_count + 1), quantile_count
+    )
+    bank = _quantile_bank_batched(regressor, X_context, y_context, X_query)  # (B, F, quantile_count)
+    out = np.empty(bank.shape[:2] + (len(probs),), dtype=np.float64)
+    for b in range(bank.shape[0]):
+        for i in range(bank.shape[1]):
+            out[b, i] = np.interp(probs, native_probs, bank[b, i])
+    return out
+
+
 def exaone_run_pit_batched(
     regressor, X_train: np.ndarray, Y_train: np.ndarray, X_test: np.ndarray, Y_test: np.ndarray,
     k_folds: int = 10, probs_n: int = 99, eps: float = 1e-6, seed: int = 0,
 ) -> dict:
-    """``run_pit_batched``, EXAONE version -- K-fold PIT for z_train AND a
-    single held-in-context pass for z_test/log_pdf_test, batched across every
-    episode in the call (see module docstring for why this is safe).
+    """``run_pit_batched``, EXAONE version. Signature, y-unit convention and
+    return dict are identical to tabpfn_batched.py/tabldm_batched.py's -- the
+    whole K-fold driver is shared (_batched_pit.py::run_kfold_pit_batched,
+    which also documents the fold-assignment recipe and the equal-fold-size
+    guarantee batching relies on); only the bank above is backend-specific.
 
-    Args:
-        X_train: (B, P, p_x)   X_test: (B, N, p_x)
-        Y_train: (B, P)        Y_test: (B, N)      -- already y-scaled by the
-            caller (data_gen.py z-scores y_train/y_test per episode before
-            calling this, same convention as pit.py::run_pit_batched).
-        k_folds: clamped into [1, P] (matching eval/metrics/joint_nll.py::
-            kfold_loo_pit's own `min(k_folds, n)`, NOT pit.py::run_pit_
-            batched's `max(2, ...)` floor), shared across the batch since P
-            is -- see below for why fold SIZE is guaranteed equal across
-            episodes even though fold MEMBERSHIP differs per episode.
-        probs_n: quantile grid size EXAONE's native 999-level bank is
-            interpolated onto (see marginal_backends.py::_exaone_quantiles).
-        seed: per-episode fold assignment uses
-            np.random.default_rng(seed + b).permutation(P) % K -- the exact
-            recipe eval/metrics/joint_nll.py::kfold_loo_pit uses (bit-
-            identical to marginal_backends.py::loo_pit's fold splits when
-            called with matching per-episode seeds, e.g. data_gen.py's
-            marginal_backend branch's `seed_b = (base_seed + b) %
-            (2**31)`), NOT pit.py::run_pit_batched's shared contiguous-block
-            split -- this backend's per-episode PIT path already committed
-            to the random-permutation convention, and this module exists to
-            batch it faster, not to change its semantics. Fold SIZE (not
-            membership) only depends on P and K, both shared across the
-            batch, so every episode's fold k has the same query-row count
-            regardless of its own seed -- permutation preserves the multiset
-            of residues {0..P-1} mod K, just reorders which original row
-            index lands in which fold -- so batching per fold across
-            episodes is still valid despite the differing seeds.
-
-    Returns dict with z_train (B,P), z_test (B,N), log_pdf_test (B,N) --
-    log_pdf_test is in the SAME (already-scaled) y-units as Y_test; callers
-    apply their own Jacobian correction back to raw-y nats, matching every
-    other backend's convention in this pipeline.
+    probs_n is the grid EXAONE's native 999-level bank is interpolated onto
+    (see _quantile_bank_on_probs).
     """
-    from eval.metrics.joint_nll import compute_pit
+    from eval.spatial._batched_pit import run_kfold_pit_batched
 
-    B, P, _p_x = X_train.shape
-    N = X_test.shape[1]
-    K = min(int(k_folds), P)
-    quantile_count = regressor.manifest.regression.quantile_count
-    native_probs = np.linspace(1.0 / (quantile_count + 1), quantile_count / (quantile_count + 1), quantile_count)
-    probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
-
-    fold_ids = [np.random.default_rng(seed + b).permutation(P) % K for b in range(B)]
-
-    z_train = np.empty((B, P), dtype=np.float32)
-    for k in range(K):
-        held = [fold_ids[b] == k for b in range(B)]
-        qry_idx = [np.where(held[b])[0] for b in range(B)]
-        ctx_idx = [np.where(~held[b])[0] for b in range(B)]
-        if qry_idx[0].size == 0 or ctx_idx[0].size == 0:
-            continue  # size is shared across b (see docstring); checking b=0 suffices
-        X_ctx = [X_train[b][ctx_idx[b]] for b in range(B)]
-        y_ctx = [Y_train[b][ctx_idx[b]] for b in range(B)]
-        X_qry = [X_train[b][qry_idx[b]] for b in range(B)]
-        bank = _quantile_bank_batched(regressor, X_ctx, y_ctx, X_qry)  # (B, F, quantile_count)
-        for b in range(B):
-            F = qry_idx[b].size
-            q_interp = np.empty((F, len(probs)))
-            for i in range(F):
-                q_interp[i] = np.interp(probs, native_probs, bank[b, i])
-            z_held, _ = compute_pit(q_interp, probs, Y_train[b][qry_idx[b]], eps)
-            z_train[b, qry_idx[b]] = z_held
-
-    X_ctx_full = [X_train[b] for b in range(B)]
-    y_ctx_full = [Y_train[b] for b in range(B)]
-    X_qry_full = [X_test[b] for b in range(B)]
-    bank_test = _quantile_bank_batched(regressor, X_ctx_full, y_ctx_full, X_qry_full)  # (B, N, quantile_count)
-    z_test = np.empty((B, N), dtype=np.float32)
-    log_pdf_test = np.empty((B, N), dtype=np.float32)
-    for b in range(B):
-        q_interp = np.empty((N, len(probs)))
-        for i in range(N):
-            q_interp[i] = np.interp(probs, native_probs, bank_test[b, i])
-        z_b, log_pdf_b = compute_pit(q_interp, probs, Y_test[b], eps)
-        z_test[b] = z_b
-        log_pdf_test[b] = log_pdf_b
-
-    return {"z_train": z_train, "z_test": z_test, "log_pdf_test": log_pdf_test}
+    return run_kfold_pit_batched(
+        lambda X_ctx, y_ctx, X_qry, probs: _quantile_bank_on_probs(
+            regressor, X_ctx, y_ctx, X_qry, probs
+        ),
+        X_train, Y_train, X_test, Y_test,
+        k_folds=k_folds, probs_n=probs_n, eps=eps, seed=seed,
+    )

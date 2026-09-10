@@ -34,9 +34,31 @@ wandb:
   mode: online          # "disabled" for a local smoke run
 
 marginal:
+  # Which tabular foundation model's marginal to fine-tune. See
+  # src/marginal_backbones.py for what each supports and why they differ:
+  # tabicl/tabldm reach tiers 0-3, exaone tier 0 only (its attention holds raw
+  # Parameters, so there is nothing for LoRA to swap), tabpfn is wired but
+  # licence-gated and never executed here.
+  #   tabicl : the original; `ckpt` below is its starting checkpoint.
+  #   tabldm : Xiaomi-TabLDM. `ckpt` is ignored (weights come from HF); pass a
+  #            previous Phase-A output via marginal.resume_ckpt to continue.
+  #   exaone : EXAONE-Tabular, same convention as tabldm.
+  backbone: tabicl
+
+  # Resume a previous Phase-A run of a NON-tabicl backbone (a file written by
+  # MarginalBackbone.save). null = start from the pretrained weights. For
+  # backbone=tabicl use `ckpt` below instead, which pit.load_tabicl reads.
+  resume_ckpt: null
+
+  # Quantile grid size for non-tabicl backbones' Phase-A forward. Ignored for
+  # tabicl, which is scored at its own native levels by run_pit_batched_grad.
+  # A proportional lever on per-step cost: every fold's forward evaluates this
+  # many levels.
+  probs_n: 99
+
   # Starting point. Any name in the jingang/TabICL HF repo, or a local path
   # (pit.load_tabicl accepts both) — so a Phase-A run can also resume from an
-  # earlier Phase-A output.
+  # earlier Phase-A output. Only used when backbone=tabicl.
   ckpt: tabicl-regressor-v2-20260212.ckpt
 
   # Tier ladder — see marginal_finetune.TIER_SPECS for what each selects and
