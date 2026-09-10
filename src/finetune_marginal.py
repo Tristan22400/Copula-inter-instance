@@ -1008,7 +1008,7 @@ def validate_era5_marginal(
     batches: dict,
     *,
     eps: float = 1e-6,
-    marginal_probs_n: int = 99,
+    marginal_probs_n: "int | None" = None,
 ) -> dict:
     """Marginal-only metrics per region, plus across-region means.
 
@@ -1027,8 +1027,11 @@ def validate_era5_marginal(
     per_region: dict[str, dict] = {}
     is_backbone = isinstance(tabicl, MarginalBackbone) and tabicl.name != "tabicl"
     if is_backbone:
-        probs = np.linspace(
-            1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
+        probs = (
+            None if marginal_probs_n is None
+            else np.linspace(
+                1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
+            )
         )
         quantile_dist = tabicl.quantile_dist_module(probs)
 
