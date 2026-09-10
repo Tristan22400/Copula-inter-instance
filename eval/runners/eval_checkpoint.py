@@ -18,7 +18,8 @@ Usage
         [--lr_dkl 0.01]           # learning rate for DKL Adam
         [--n_steps_per_ep 500]    # training steps for PerEpisodeTransformer
         [--patience_per_ep 100]   # early stopping patience (steps without improvement)
-        [--z_train_source tabicl]  # (default) or 'oracle': feed the ICL model the
+        [--z_train_source tabicl]  # (default) 'oracle', or exaone/tabpfn/tabldm:
+                                   #   feed the ICL model the
                                    # exact GP-LOO z_train instead of TabICL's own
                                    # K-fold PIT estimate, to measure the sim-to-real
                                    # gap ('oracle' leaves the total-NLL table's icl
@@ -148,20 +149,20 @@ def _eval_icl_episode(
     ep: dict,
     icl_model: nn.Module,
     device: torch.device,
-    tabicl_pit: dict[str, Tensor] | None = None,
+    marginal_pit: dict[str, Tensor] | None = None,
 ) -> tuple[dict[str, float], dict[str, Tensor], Tensor, dict[str, dict[str, float]], dict[str, float]]:
     """Evaluate just the ICL model + oracle lower bound on one episode — the
     cheap, per-checkpoint part of the comparison (no fitting/training loop),
     always recomputed even when the baseline results are served from cache.
 
-    tabicl_pit, when given (see --z_train_source=tabicl in main(), built by
+    marginal_pit, when given (see --z_train_source=tabicl in main(), built by
     _tabicl_pit), replaces the episode's own exact GP-LOO z_train as the ICL
     model's conditioning input via its "z_train" key — everything else
     (z_test, R_oracle, the baselines) still scores/fits against the
     episode's true values, since only the model's *input* is meant to
     change, not what "correct" means for the copula-only `nlls` table.
 
-    tabicl_pit's "z_test"/"log_pdf_test" keys additionally provide a
+    marginal_pit's "z_test"/"log_pdf_test" keys additionally provide a
     genuine (non-oracle) marginal for the ICL model itself, letting it be
     scored on total (marginal+copula) Y-space NLL the same way the
     GP-MLE/DKL baselines now are (see eval_baselines_episode) — this is
@@ -176,12 +177,12 @@ def _eval_icl_episode(
     copula-only NLL every other entry in `nlls` is, so they're not in the
     same units/comparable via the same table — all-nan dicts when
     unavailable). icl_y_parts is {"total","marginal","copula"}, all-nan
-    whenever tabicl_pit is None (oracle z_train mode) — same per-episode
+    whenever marginal_pit is None (oracle z_train mode) — same per-episode
     Sklar split now exposed for every baseline via eval_baselines_episode.
     """
     X_train = ep["x_norm_train"].to(device)   # (P, d_x)
     z_train = (
-        tabicl_pit["z_train"].to(device) if tabicl_pit is not None
+        marginal_pit["z_train"].to(device) if marginal_pit is not None
         else ep["z_train"].to(device)
     )                                            # (P,)  ICL's conditioning input — oracle LOO-PIT residual by default
     X_test  = ep["x_norm_test"].to(device)     # (N, d_x)
@@ -214,12 +215,12 @@ def _eval_icl_episode(
         R_icl = Sigma_icl[0, :N, :N]
         nlls["icl"] = corr_nll_single(R_icl, z_test)
         R_dict["icl"] = R_icl
-        if tabicl_pit is not None:
+        if marginal_pit is not None:
             test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
             icl_parts = y_space_nll(
                 Sigma_icl[:, :N, :N],
-                tabicl_pit["z_test"].to(device).unsqueeze(0),
-                tabicl_pit["log_pdf_test"].to(device).unsqueeze(0),
+                marginal_pit["z_test"].to(device).unsqueeze(0),
+                marginal_pit["log_pdf_test"].to(device).unsqueeze(0),
                 test_mask,
             )
             icl_y_parts = {k: v.item() for k, v in icl_parts.items()}
@@ -268,18 +269,30 @@ def _eval_icl_episode(
     return nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts
 
 
-def _tabicl_pit(
+def _marginal_pit(
     ep: dict,
-    tabicl_marginal: nn.Module,
+    tabicl_marginal: nn.Module | None,
     k_folds: int,
     device: torch.device,
+    marginal_backend: str | None = None,
+    marginal_regressor=None,
+    marginal_probs_n: int = 99,
+    seed: int = 0,
 ) -> dict[str, Tensor] | None:
-    """K-fold PIT from the frozen TabICL marginal (pit.py::run_pit), in
-    place of the episode's exact GP-LOO/posterior PIT — the same "does the
-    model's correlation prediction hold up against TabICL's own estimated
-    marginals instead of the oracle ones" check src/train.py's
-    _build_tabicl_val_z runs during training, used here at eval time via
-    --z_train_source=tabicl.
+    """K-fold PIT from a real (non-oracle) marginal, in place of the
+    episode's exact GP-LOO/posterior PIT — the same "does the model's
+    correlation prediction hold up against an estimated marginal instead of
+    the oracle one" check src/train.py's _build_tabicl_val_z runs during
+    training, used here at eval time via --z_train_source.
+
+    Two sources, one output contract. --z_train_source=tabicl uses the
+    frozen TabICL marginal via pit.py::run_pit (`tabicl_marginal`); the
+    other backends (exaone/tabpfn/tabldm, see
+    eval/spatial/marginal_backends.py) go through their shared batched PIT
+    module with a leading singleton episode axis (`marginal_backend` /
+    `marginal_regressor`). Both return z_train/z_test/log_pdf_test with
+    log_pdf_test in RAW nats, so nothing downstream needs to know which
+    marginal produced them.
 
     Unlike this function's predecessor (_tabicl_z_train, which queried
     X_train[:1]/Y_train[:1] as a throwaway probe since it only needed
@@ -326,6 +339,25 @@ def _tabicl_pit(
     if P < 2:
         return None
     y_train_scaled, y_test_scaled, _, std = normalize_targets(y_train, y_test)
+    if marginal_backend is not None:
+        # Same batched module the training pipelines use, B=1 -- so eval and
+        # training score the identical PIT recipe per backend rather than
+        # this file growing its own per-backend copy.
+        from data_gen import _BATCHED_MARGINAL_BACKENDS
+
+        run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
+        out = run_batched(
+            marginal_regressor,
+            X_train.unsqueeze(0).cpu().numpy(), y_train_scaled.unsqueeze(0).cpu().numpy(),
+            X_test.unsqueeze(0).cpu().numpy(), y_test_scaled.unsqueeze(0).cpu().numpy(),
+            k_folds=k_folds, probs_n=marginal_probs_n, seed=seed,
+        )
+        as_t = lambda a: torch.as_tensor(a[0], dtype=torch.float32, device=device)  # noqa: E731
+        return {
+            "z_train": as_t(out["z_train"]),
+            "z_test": as_t(out["z_test"]),
+            "log_pdf_test": as_t(out["log_pdf_test"]) - std.log(),
+        }
     Y_train = y_train_scaled.unsqueeze(-1)      # (P, 1)
     Y_test  = y_test_scaled.unsqueeze(-1)       # (N, 1)
     pit_out = run_pit(
@@ -562,7 +594,8 @@ def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "tabicl
     print(f"\n{'─' * total}")
     print(f"Inter-instance copula NLL (z-space) — lower is better  [N={len(all_nlls)} episodes]")
     print(f"ICL z_train source: {z_train_source}"
-          + ("  (exact GP-LOO PIT)" if z_train_source == "oracle" else "  (TabICL K-fold PIT estimate)"))
+          + ("  (exact GP-LOO PIT)" if z_train_source == "oracle"
+             else f"  ({z_train_source} K-fold PIT estimate)"))
     print(f"{'─' * total}")
     print(f"{'Method':<{col}}{'Mean NLL':>12}{'Std NLL':>12}")
     print(f"{'─' * col}{'─' * 12}{'─' * 12}")
@@ -670,7 +703,7 @@ def _print_total_nll_table(
           f"lower is better  [N={len(all_total_nlls)} episodes]")
     print(f"ICL z_train source: {z_train_source}"
           + ("  (icl row n/a — oracle mode has no learned ICL marginal to score)"
-             if z_train_source == "oracle" else "  (TabICL K-fold PIT estimate)"))
+             if z_train_source == "oracle" else f"  ({z_train_source} K-fold PIT estimate)"))
     print(f"{'─' * total}")
     print(f"{'Method':<{col}}{'Mean Total':>12}{'Std Total':>12}{'Mean Marg.':>12}{'Mean Cop.':>12}")
     print(f"{'─' * col}{'─' * 12}{'─' * 12}{'─' * 12}{'─' * 12}")
@@ -728,7 +761,8 @@ def main() -> None:
                         help="Training steps for PerEpisodeTransformer")
     parser.add_argument("--patience_per_ep", type=int, default=500,
                         help="Early stopping patience for PerEpisodeTransformer")
-    parser.add_argument("--z_train_source", default="tabicl", choices=["oracle", "tabicl"],
+    parser.add_argument("--z_train_source", default="tabicl",
+                        choices=["oracle", "tabicl", "exaone", "tabpfn", "tabldm"],
                         help="What the ICL model conditions on for each episode's z_train. "
                              "'tabicl' (default): a K-fold cross-fitted PIT estimate from the "
                              "frozen TabICL marginal (pit.py::run_pit) — the same proxy "
@@ -744,7 +778,18 @@ def main() -> None:
                              "either source is unaffected in every other respect: z_test, "
                              "R_oracle, and every baseline still score/fit against the "
                              "episode's true values — use both to measure the sim-to-real "
-                             "gap.")
+                             "gap. 'exaone'/'tabpfn'/'tabldm': the same non-oracle idea with "
+                             "a different tabular foundation model supplying the marginal "
+                             "(eval/spatial/marginal_backends.py), through the identical "
+                             "batched PIT module the training pipelines use — so an eval "
+                             "scores exactly the marginal a run trained against. These need "
+                             "no --tabicl_ckpt; --tabicl_pit_k_folds still sets K, and "
+                             "--marginal_probs_n sets their quantile-grid size.")
+    parser.add_argument("--marginal_probs_n", type=int, default=99,
+                        help="Quantile grid size for --z_train_source=exaone/tabpfn/tabldm "
+                             "(ignored for oracle/tabicl, which use their own native grids). "
+                             "Mirrors data.z_train_marginal_probs_n in conf/data/gp_tasks.yaml; "
+                             "a proportional lever on those backends' per-episode cost.")
     parser.add_argument("--tabicl_ckpt",  default=None,
                         help="TabICL checkpoint filename for --z_train_source=tabicl. "
                              "Default: read from --config's cfg.tabicl.ckpt.")
@@ -879,8 +924,21 @@ def main() -> None:
     # ---- Optionally load a second, frozen TabICL marginal purely to
     # K-fold-PIT each episode's z_train (see --z_train_source's help text) ----
     tabicl_marginal: nn.Module | None = None
+    marginal_backend: str | None = (
+        args.z_train_source if args.z_train_source not in ("oracle", "tabicl") else None
+    )
+    marginal_regressor = None
     tabicl_pit_k_folds = DEFAULT_K_FOLDS
-    if args.z_train_source == "tabicl":
+    if marginal_backend is not None:
+        from eval.spatial.marginal_backends import make_regressor
+
+        tabicl_pit_k_folds = args.tabicl_pit_k_folds or int(
+            OmegaConf.select(cfg, "tabicl.pit_k_folds", default=DEFAULT_K_FOLDS)
+        )
+        print(f"\nBuilding {marginal_backend} marginal for --z_train_source={marginal_backend} "
+              f"(k_folds={tabicl_pit_k_folds}, probs_n={args.marginal_probs_n})")
+        marginal_regressor = make_regressor(marginal_backend, device=str(device))
+    elif args.z_train_source == "tabicl":
         tabicl_ckpt = args.tabicl_ckpt or OmegaConf.select(cfg, "tabicl.ckpt", default=None)
         if not tabicl_ckpt:
             raise ValueError(
@@ -1058,17 +1116,19 @@ def main() -> None:
                 }
                 cache_dirty = True
 
-        tabicl_pit = None
-        if tabicl_marginal is not None:
-            tabicl_pit = _tabicl_pit(
+        marginal_pit = None
+        if tabicl_marginal is not None or marginal_regressor is not None:
+            marginal_pit = _marginal_pit(
                 ep=ep, tabicl_marginal=tabicl_marginal, k_folds=tabicl_pit_k_folds, device=device,
+                marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
+                marginal_probs_n=args.marginal_probs_n, seed=ep_i,
             )
-            if tabicl_pit is None:
+            if marginal_pit is None:
                 print(f"  [ep {ep_i}] fewer than 2 training points — "
                       "falling back to oracle z_train for this episode")
 
         icl_nlls, icl_R, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
-            ep=ep, icl_model=icl_model, device=device, tabicl_pit=tabicl_pit,
+            ep=ep, icl_model=icl_model, device=device, marginal_pit=marginal_pit,
         )
         all_y_space_nlls.append(y_space_nlls)
 
