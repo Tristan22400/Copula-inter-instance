@@ -61,63 +61,21 @@ def tabpfn_run_pit_batched(
     regressor, X_train: np.ndarray, Y_train: np.ndarray, X_test: np.ndarray, Y_test: np.ndarray,
     k_folds: int = 10, probs_n: int = 99, eps: float = 1e-6, seed: int = 0,
 ) -> dict:
-    """``run_pit_batched``, TabPFN version -- K-fold PIT for z_train AND a
-    single held-in-context pass for z_test/log_pdf_test, batched across every
-    episode in the call via TabPFNRegressor.predict_batched (see module
-    docstring).
+    """``run_pit_batched``, TabPFN version. Signature, y-unit convention and
+    return dict are identical to exaone_batched.py/tabldm_batched.py's -- the
+    whole K-fold driver is shared (_batched_pit.py::run_kfold_pit_batched,
+    which also documents the fold-assignment recipe and the equal-fold-size
+    guarantee batching relies on); only the bank above is backend-specific.
 
-    Args:
-        X_train: (B, P, p_x)   X_test: (B, N, p_x)
-        Y_train: (B, P)        Y_test: (B, N)      -- already y-scaled by the
-            caller, same convention as pit.py::run_pit_batched.
-        k_folds: clamped into [1, P] (matching eval/metrics/joint_nll.py::
-            kfold_loo_pit's own `min(k_folds, n)`), shared across the batch
-            since P is.
-        probs_n: quantile grid size requested directly from TabPFN (no
-            native-grid interpolation needed, unlike exaone_batched.py).
-        seed: per-episode fold assignment uses
-            np.random.default_rng(seed + b).permutation(P) % K -- the exact
-            recipe eval/metrics/joint_nll.py::kfold_loo_pit uses (see
-            exaone_batched.py::exaone_run_pit_batched's docstring for why
-            fold SIZE, not membership, is guaranteed equal across episodes
-            despite each using its own seed -- same argument applies here).
-
-    Returns dict with z_train (B,P), z_test (B,N), log_pdf_test (B,N) --
-    log_pdf_test is in the SAME (already-scaled) y-units as Y_test; callers
-    apply their own Jacobian correction back to raw-y nats.
+    probs_n is requested directly from TabPFN's predict_batched, so unlike
+    exaone_batched.py there is no native-grid interpolation step.
     """
-    from eval.metrics.joint_nll import compute_pit
+    from eval.spatial._batched_pit import run_kfold_pit_batched
 
-    B, P, _p_x = X_train.shape
-    N = X_test.shape[1]
-    K = min(int(k_folds), P)
-    probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
-
-    fold_ids = [np.random.default_rng(seed + b).permutation(P) % K for b in range(B)]
-
-    z_train = np.empty((B, P), dtype=np.float32)
-    for k in range(K):
-        held = [fold_ids[b] == k for b in range(B)]
-        qry_idx = [np.where(held[b])[0] for b in range(B)]
-        ctx_idx = [np.where(~held[b])[0] for b in range(B)]
-        if qry_idx[0].size == 0 or ctx_idx[0].size == 0:
-            continue  # size is shared across b (see docstring); checking b=0 suffices
-        X_ctx = [X_train[b][ctx_idx[b]] for b in range(B)]
-        y_ctx = [Y_train[b][ctx_idx[b]] for b in range(B)]
-        X_qry = [X_train[b][qry_idx[b]] for b in range(B)]
-        bank = _quantile_bank_batched(regressor, X_ctx, y_ctx, X_qry, probs)  # (B, F, len(probs))
-        for b in range(B):
-            z_held, _ = compute_pit(bank[b], probs, Y_train[b][qry_idx[b]], eps)
-            z_train[b, qry_idx[b]] = z_held
-
-    bank_test = _quantile_bank_batched(
-        regressor, list(X_train), list(Y_train), list(X_test), probs
-    )  # (B, N, len(probs))
-    z_test = np.empty((B, N), dtype=np.float32)
-    log_pdf_test = np.empty((B, N), dtype=np.float32)
-    for b in range(B):
-        z_b, log_pdf_b = compute_pit(bank_test[b], probs, Y_test[b], eps)
-        z_test[b] = z_b
-        log_pdf_test[b] = log_pdf_b
-
-    return {"z_train": z_train, "z_test": z_test, "log_pdf_test": log_pdf_test}
+    return run_kfold_pit_batched(
+        lambda X_ctx, y_ctx, X_qry, probs: _quantile_bank_batched(
+            regressor, X_ctx, y_ctx, X_qry, probs
+        ),
+        X_train, Y_train, X_test, Y_test,
+        k_folds=k_folds, probs_n=probs_n, eps=eps, seed=seed,
+    )
