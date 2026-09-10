@@ -187,6 +187,12 @@ class MarginalBackbone:
     def max_tier(self) -> int:
         return MAX_TIER[self.name]
 
+    def parameters(self, *args, **kwargs):
+        return self.module.parameters(*args, **kwargs)
+
+    def named_parameters(self, *args, **kwargs):
+        return self.module.named_parameters(*args, **kwargs)
+
     def trainable_report(self) -> dict:
         n_train = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.module.parameters())
