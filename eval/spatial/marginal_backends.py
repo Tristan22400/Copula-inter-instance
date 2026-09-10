@@ -60,9 +60,47 @@ def make_regressor(name: str, device: "str | None" = None):
         return make_tabicl_regressor(device=device)
     if name == "tabpfn":
         _require_tabpfn_token()
+        # tabpfn 8.3.0's own model_loading.load_model() keeps an in-memory
+        # LRU of *built* models (architecture + loaded state dict), keyed by
+        # checkpoint path+identity, but only consults it when
+        # TABPFN_MODEL_CACHE_SIZE > 0 (env-gated, defaults to 0 = off) AND
+        # cache_trainset_representation is False -- true for every fit_mode
+        # we use ("fit_preprocessors", set by predict_batched and by
+        # loo_pit's per-episode path alike). Without this, EVERY .fit() call
+        # rebuilds the whole transformer from scratch (kaiming/uniform-init
+        # ~2500 Linear layers, then immediately overwrites them via
+        # load_state_dict) before running a single forward pass -- profiled
+        # at ~660ms of a ~700ms .fit() call, i.e. the rebuild *is* the cost,
+        # not preprocessing or the model forward. Setting this once (as
+        # setdefault, so an operator's own value always wins) cut measured
+        # batched-PIT throughput from ~5.0s/episode to ~1.0s/episode
+        # (B=16,P=32,N=16,K=5, RTX A5000) -- pure caching, same weights,
+        # bit-for-bit identical predictions, verified against
+        # tests/test_tabpfn_batched.py. Size 2 is headroom, not a
+        # requirement: this process only ever resolves one model_path
+        # ("auto"), and the cache holds a reference to the already-loaded
+        # nn.Module (no extra GPU memory per cache slot), not a copy.
+        os.environ.setdefault("TABPFN_MODEL_CACHE_SIZE", "2")
         from tabpfn import TabPFNRegressor
 
-        return TabPFNRegressor(device=device or "cpu")
+        # n_estimators=1: explicit, not "auto". TabPFN's ensemble diversity
+        # (default n_estimators="auto" -> DEFAULT_N_ESTIMATORS, further
+        # raised by scale_n_estimators_for_feature_coverage) comes from
+        # running several independently-preprocessed "views" of the same
+        # context (feature-index rotation, per-member power-transform/
+        # outlier-removal variants) and averaging their predictions --
+        # useful for point-prediction accuracy, but for this repo's
+        # marginal-quantile role it multiplies both the preprocessing cost
+        # (a full sklearn Pipeline.fit_transform per member, see
+        # tabpfn_batched.py's docstring) and the model forward cost by
+        # n_estimators, for a diversity benefit this pipeline doesn't use
+        # (quantiles() below reads a single quantile grid, not an ensemble
+        # spread). Fixing n_estimators=1 removes that multiplier outright
+        # -- a direct, uncapped lever on top of the model-rebuild-cache fix
+        # above -- with no batching-shape change (predict_batched's
+        # (ensemble_count, n_query, quantile_count) output collapses to
+        # ensemble_count=1).
+        return TabPFNRegressor(device=device or "cpu", n_estimators=1)
     if name == "exaone":
         from exaonetabular import EXAONETabularRegressor
 
@@ -86,7 +124,23 @@ def make_regressor(name: str, device: "str | None" = None):
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability(device)[0] >= 8
         )
-        return EXAONETabularRegressor.from_pretrained(device="cuda" if use_cuda else "cpu")
+        # ensemble_count=1: the exact same "diversity nobody reads" case as
+        # TabPFN's n_estimators=1 above. from_pretrained's default manifest
+        # pins runtime.ensemble_count=8 -- predict() runs 8 member views of
+        # the SAME fitted dataset through the model and mean-pools them
+        # (exaone_batched.py's own docstring/_quantile_bank_batched: "the
+        # same pooling predict() does when member_weights is None"), for a
+        # spread this pipeline never reads (a single pooled quantile bank,
+        # same as tabpfn's case). ensemble_count is a real override kwarg
+        # (see EXAONETabularClassifier.from_pretrained's docstring: "...
+        # override the matching runtime knobs"), and exaone_batched.py reads
+        # manifest.runtime.ensemble_count dynamically for both its
+        # EnsemblePlan construction and its expected-shape check, so this
+        # needs no shape-side change. Cuts the forward/preprocessing cost
+        # (fit() ensemble expansion + _forward_chunked) by ~8x.
+        return EXAONETabularRegressor.from_pretrained(
+            device="cuda" if use_cuda else "cpu", ensemble_count=1
+        )
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
 
 
