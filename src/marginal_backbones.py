@@ -197,10 +197,40 @@ class MarginalBackbone:
             "trainable_frac": float(n_train / max(n_total, 1)),
         }
 
+    @property
+    def native_quantile_count(self) -> int:
+        """How many quantile levels this model's decoder actually emits.
+
+        All of them are 999, and not by coincidence: TabLDM's decoder is
+        literally the same shape as TabICL's ((999, 1024) + bias), and EXAONE's
+        manifest reports output_width=999 / quantile_count=999. Phase A should
+        score the grid the model produces, not a resampling of it.
+        """
+        own = getattr(self.module, "quantile_dist", None)
+        levels = getattr(own, "alpha_levels", None) if own is not None else None
+        if levels is not None:
+            return int(levels.numel() if torch.is_tensor(levels) else len(levels))
+        if self.handle is not None and hasattr(self.handle, "manifest"):
+            return int(self.handle.manifest.output_width)
+        raise RuntimeError(f"cannot determine native quantile count for {self.name!r}")
+
+    @property
+    def native_probs(self) -> np.ndarray:
+        """The alpha levels of that native grid.
+
+        ``QuantileToDistribution``'s own default is
+        ``linspace(0, 1, n + 2)[1:-1]``, i.e. exactly this repo's
+        ``linspace(1/(n+1), n/(n+1), n)`` convention -- verified equal on the
+        loaded models, so a native grid and an explicitly-requested grid of the
+        same size are the same numbers.
+        """
+        n = self.native_quantile_count
+        return np.linspace(1.0 / (n + 1), n / (n + 1), n)
+
     # -- gradient-carrying quantile forward -----------------------------------
     def quantile_forward(
         self, X_context: Sequence[np.ndarray], y_context: Sequence[np.ndarray],
-        X_query: Sequence[np.ndarray], probs: np.ndarray,
+        X_query: Sequence[np.ndarray], probs: "np.ndarray | None" = None,
     ) -> torch.Tensor:
         """(B, n_query, Q) quantiles in RAW y-units, WITH gradients.
 
@@ -208,29 +238,39 @@ class MarginalBackbone:
         it returns a grad-carrying torch.Tensor instead of a detached numpy
         array -- the Phase-A loss is defined on these outputs, so the graph
         back to the trunk must survive.
+
+        ``probs=None`` (the default, and what Phase A uses) reads the model's
+        NATIVE decoder grid: TabLDM via ``output_type="raw_quantiles"``, EXAONE
+        via its raw 999-level bank with no interpolation. That is both more
+        faithful and cheaper than requesting an arbitrary grid -- TabLDM would
+        otherwise run its spline/GPD inverse-CDF once per requested level, and
+        EXAONE would compute all 999 and then discard most of them. Passing an
+        explicit ``probs`` re-enables resampling as a cost lever.
         """
         return _QUANTILE_FORWARDS[self.name](self, X_context, y_context, X_query, probs)
 
-    def quantile_dist_module(self, probs: np.ndarray) -> nn.Module:
+    def quantile_dist_module(self, probs: "np.ndarray | None" = None) -> nn.Module:
         """The parameterless quantile-grid -> distribution head Phase A's loss
-        scores through (finetune_marginal.marginal_objective's third argument),
-        built on the SAME ``probs`` grid quantile_forward was asked for.
+        scores through, matched to the grid ``quantile_forward`` produced.
 
-        Deliberately not the model's own ``quantile_dist`` attribute, even
-        though TabICL and TabLDM both have one and the class is byte-identical
-        between them: that instance is constructed with the model's NATIVE
-        alpha levels (999), so handing it a grid of any other size raises a
-        shape error deep inside its spline setup ("size of tensor a (18) must
-        match tensor b (998)"). Native levels are only guaranteed on the
-        TabICL path, whose quantiles come from pit.py::run_pit_batched_grad;
-        every backbone routed through quantile_forward picks its own grid.
+        ``probs=None`` means the native grid, so the model's OWN
+        ``quantile_dist`` is used where it has one (tabicl, tabldm) -- that
+        instance is constructed with exactly these levels. EXAONE has no such
+        module, but the mapping is architecture-agnostic and holds no
+        parameters, so it borrows TabICL's class on EXAONE's own 999 levels.
 
-        Constructing one here is reuse, not reimplementation: the mapping is a
-        pure function of (quantile grid, alpha levels) holding no parameters,
-        and it is the same class both libraries ship.
+        A mismatch here is loud but LATE: handing a 999-level head a 99-level
+        grid raises inside its spline setup ("size of tensor a (18) must match
+        tensor b (998)"). The grid and the head are therefore derived from the
+        same argument rather than chosen independently.
         """
         from tabicl._model.quantile_dist import QuantileToDistribution
 
+        if probs is None:
+            own = getattr(self.module, "quantile_dist", None)
+            if own is not None:
+                return own
+            probs = self.native_probs
         return QuantileToDistribution(alpha_levels=list(probs)).to(
             next(self.module.parameters()).device
         )
@@ -288,11 +328,18 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
 
     # regressor._batch_forward's body, minus its `with torch.no_grad()` and
     # minus the VRAM chunking (a Phase-A batch is already sized to fit).
-    out = bb.module.predict_stats(
-        xs, ys, output_type="quantiles", alphas=list(probs),
-        inference_config=bb.handle.inference_config_,
-    )  # (B*members, n_query, Q)
-    out = out.reshape(B, members, -1, len(probs))
+    if probs is None:
+        # The decoder's own grid, straight out -- no per-level inverse-CDF.
+        out = bb.module.predict_stats(
+            xs, ys, output_type="raw_quantiles",
+            inference_config=bb.handle.inference_config_,
+        )
+    else:
+        out = bb.module.predict_stats(
+            xs, ys, output_type="quantiles", alphas=list(probs),
+            inference_config=bb.handle.inference_config_,
+        )
+    out = out.reshape(B, members, -1, out.shape[-1])  # (B, members, n_query, Q)
 
     # predict()'s own de-standardization, differentiably: StandardScaler's
     # inverse_transform is an affine map, so it is applied as one rather than
@@ -331,6 +378,9 @@ def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
     center = torch.tensor([per_episode[b][1] for b in range(B)], device=pooled.device).view(B, 1, 1)
     scale = torch.tensor([per_episode[b][2] for b in range(B)], device=pooled.device).view(B, 1, 1)
     bank = pooled * scale + center
+
+    if probs is None:
+        return bank  # already the native 999-level grid
 
     # EXAONE emits a fixed native grid; interpolate onto the caller's probs
     # the differentiable way (torch, not np.interp -- which would detach).
@@ -465,7 +515,7 @@ def assert_patterns_match(module: nn.Module, patterns: Sequence[str]) -> dict[st
 def kfold_quantiles_grad(
     backbone: "MarginalBackbone", x_train: torch.Tensor, y_train_scaled: torch.Tensor,
     x_test: torch.Tensor, y_test_scaled: torch.Tensor, *, k_folds: int,
-    probs: np.ndarray, fold_subset: Optional[Sequence[int]] = None,
+    probs: "np.ndarray | None" = None, fold_subset: Optional[Sequence[int]] = None,
 ) -> dict:
     """Phase-A's ``run_pit_batched_grad`` for a non-TabICL backbone.
 
@@ -515,7 +565,7 @@ def kfold_quantiles_grad(
 
     q_train = (
         torch.cat(q_train_parts, dim=1) if q_train_parts
-        else q_test.new_zeros((B, 0, len(probs)))
+        else q_test.new_zeros((B, 0, q_test.shape[-1]))
     )
     train_query_idx = (
         torch.cat(idx_parts) if idx_parts

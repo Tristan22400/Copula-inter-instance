@@ -44,6 +44,10 @@ a checkpoint path. src/model.py and conf/config.yaml are untouched.
   #    but licence-gated and never executed here. Non-tabicl checkpoints are
   #    loaded back via marginal_backends.make_regressor(..., ckpt=<path>),
   #    not pit.load_tabicl.
+  #    Phase A scores each model's NATIVE 999-level decoder grid by default
+  #    (marginal.probs_n=null) -- TabICL, TabLDM and EXAONE all emit 999, so
+  #    the objective is comparable across backbones. Set probs_n=<int> only to
+  #    resample onto a coarser grid.
   python src/finetune_marginal.py marginal.backbone=tabldm
   python src/finetune_marginal.py marginal.backbone=exaone
   #    Stage-ladder ablation (only tabicl/tabldm can climb it -- exaone's
