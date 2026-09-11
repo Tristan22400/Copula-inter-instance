@@ -255,6 +255,14 @@ training:
   # correlations to exact zero — encourages sparsity in the predicted
   # covariance structure. 0.0 disables it entirely.
   aux_mae_weight: 0.0
+  # Weight on the copula BACKBONE's own auxiliary loss, when it has one --
+  # currently only model.backbone=tabldm (MoE router z-loss + load-balance,
+  # already internally scaled by the checkpoint's own coefficients -- see
+  # src/copula_backbones.py::moe_aux_loss). A no-op (nothing to add) for
+  # model.backbone=tabicl. 1.0 is the standard "just add it" MoE-training
+  # convention; this is not a term to tune down casually -- dropping it
+  # while training a MoE end-to-end risks expert imbalance/collapse.
+  moe_aux_weight: 1.0
   # Precision for the frozen TabICL marginal used by PIT/z_train/z_test and
   # marginal log densities. Keep AMP for speed by default; set false when
   # quantile-grid precision is more important than live-generation throughput.

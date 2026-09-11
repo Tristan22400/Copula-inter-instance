@@ -2294,13 +2294,15 @@ def _forward_and_loss(
     jitter: float,
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
     parametrization: str = "covnorm",
+    moe_aux_weight: float = 1.0,
     phase_start=lambda: None,
     phase_end=lambda name, start: None,
 ):
-    """Forward pass + NLL(+aux MAE) loss — shared by _run_train_step and the
-    throwaway FLOP-measurement pass in _measure_step_flops (phase_start/
-    phase_end default to no-ops there, since that pass must not pollute the
-    fwd/loss/backward_step timers with a second, throwaway forward).
+    """Forward pass + NLL(+aux MAE)(+MoE aux) loss — shared by
+    _run_train_step and the throwaway FLOP-measurement pass in
+    _measure_step_flops (phase_start/phase_end default to no-ops there,
+    since that pass must not pollute the fwd/loss/backward_step timers with
+    a second, throwaway forward).
     """
     ev_fwd0 = phase_start()
     with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
@@ -2343,6 +2345,14 @@ def _forward_and_loss(
             oracle_off = batch["R_star"].float()[:, ri, ci][valid_off]
             aux_mae = (pred_off - oracle_off).abs().mean()
         loss = loss + aux_mae_weight * aux_mae
+
+    # Backbone's own auxiliary loss (MoE z-loss + load-balance -- TabLDM
+    # only, see model.py's forward / copula_backbones.moe_aux_loss). Only
+    # present in `out` when the loaded backbone actually has one, so this is
+    # a no-op for the TabICL backbone.
+    moe_aux = out.get("moe_aux_loss")
+    if moe_aux is not None:
+        loss = loss + moe_aux_weight * moe_aux
     phase_end("loss", ev_loss0)
     return out, Sigma, parts, loss, aux_mae
 
@@ -2359,6 +2369,7 @@ def _measure_step_flops(
     jitter: float,
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
     parametrization: str = "covnorm",
+    moe_aux_weight: float = 1.0,
 ) -> float:
     """Throwaway forward+backward (no optimizer/scheduler step) under
     FlopCounterMode, to measure this step's real dispatched FLOPs for MFU.
@@ -2382,6 +2393,7 @@ def _measure_step_flops(
             jitter=jitter,
             triu_cache=triu_cache,
             parametrization=parametrization,
+            moe_aux_weight=moe_aux_weight,
         )
         loss.backward()
     model.zero_grad(set_to_none=True)
@@ -2407,6 +2419,7 @@ def _run_train_step(
     phase_start,
     phase_end,
     parametrization: str = "covnorm",
+    moe_aux_weight: float = 1.0,
 ):
     """Execute one training step in a short-lived frame.
 
@@ -2430,6 +2443,7 @@ def _run_train_step(
         phase_start=phase_start,
         phase_end=phase_end,
         parametrization=parametrization,
+        moe_aux_weight=moe_aux_weight,
     )
     grad_norm = None
 
@@ -3107,6 +3121,12 @@ def main(cfg: DictConfig) -> None:
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
     aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
+    # Backbone's own MoE auxiliary loss weight (TabLDM only -- see
+    # model.py's forward / copula_backbones.moe_aux_loss; a no-op for
+    # backbones that don't emit "moe_aux_loss"). Defaults to 1.0, standard
+    # MoE-training convention, since the term is already internally scaled
+    # by the checkpoint's own router-loss coefficients.
+    moe_aux_weight = float(t.get("moe_aux_weight", 1.0))
 
     model.train()
     # NOT itertools.cycle(train_loader): cycle() caches every yielded batch
@@ -3224,6 +3244,7 @@ def main(cfg: DictConfig) -> None:
                 phase_start=_phase_start,
                 phase_end=_phase_end,
                 parametrization=parametrization,
+                moe_aux_weight=moe_aux_weight,
             )
             # At log steps only, run one throwaway forward+backward under
             # FlopCounterMode to measure this step's *actual* dispatched
@@ -3264,6 +3285,7 @@ def main(cfg: DictConfig) -> None:
                         jitter=jitter,
                         triu_cache=_triu_cache,
                         parametrization=parametrization,
+                        moe_aux_weight=moe_aux_weight,
                     )
                 except torch.cuda.OutOfMemoryError:
                     # The real step above already completed and applied its
