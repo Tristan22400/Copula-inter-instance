@@ -288,7 +288,7 @@ def _plot_locality_aggregate(all_dists, all_r_test, all_r_true, out_path: str, n
 def main() -> None:
     parser = argparse.ArgumentParser(description="Experiment B — quantitative joint comparison")
     parser.add_argument("--copula-ckpt", default="./checkpoints/systematic-composition/step_0180000.pt")
-    parser.add_argument("--tabicl-ckpt", default="tabicl-regressor-v2-20260212.ckpt")
+    parser.add_argument("--tabicl-ckpt", default=None)
     parser.add_argument("--pfn4bo-model", default="hebo_plus_model")
     parser.add_argument("--kernels", default="rbf,matern32", help="Comma-separated kernel names to sample from")
     parser.add_argument("--n-functions", type=int, default=60)

@@ -122,7 +122,7 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot predicted vs. oracle correlation matrices")
     parser.add_argument("--copula-ckpt", default="./checkpoints/systematic-composition/step_0180000.pt")
-    parser.add_argument("--tabicl-ckpt", default="tabicl-regressor-v2-20260212.ckpt")
+    parser.add_argument("--tabicl-ckpt", default=None)
     parser.add_argument("--kernels", default="rbf,matern32", help="Comma-separated kernel names to sample from")
     parser.add_argument("--seeds", default="0,1,2,3", help="Comma-separated function seeds to plot")
     parser.add_argument("--n-test", type=int, default=40)
