@@ -70,9 +70,19 @@ BACKBONE_NAMES: tuple[str, ...] = ("tabicl", "tabldm")
 # TabICL — moved verbatim from model.py (byte-identical behaviour).
 # ---------------------------------------------------------------------------
 def _load_pretrained_tabicl(ckpt_name: str, recompute: bool = False) -> TabICL:
-    from huggingface_hub import hf_hub_download
+    # ``ckpt_name`` is either a filename inside the ``jingang/TabICL`` HF repo
+    # (the historical contract) or a path to a local ``.ckpt``/``.pt`` file --
+    # e.g. a Phase-A fine-tuned marginal, which conf/model/copula_prod.yaml's
+    # tabicl.ckpt now defaults to. Mirrors pit.py::load_tabicl's same check,
+    # which is why that path has worked offline all along while this one
+    # (used only when tabicl.pretrained=true selects the copula's own trunk)
+    # didn't.
+    if os.path.isfile(ckpt_name):
+        ckpt_path = ckpt_name
+    else:
+        from huggingface_hub import hf_hub_download
 
-    ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
+        ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     # The checkpoint's saved config carries whatever `recompute` value the
     # original TabICL training run used (checkpointing is a training-time-only
