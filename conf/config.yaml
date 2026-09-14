@@ -258,7 +258,7 @@ training:
   # Precision for the frozen TabICL marginal used by PIT/z_train/z_test and
   # marginal log densities. Keep AMP for speed by default; set false when
   # quantile-grid precision is more important than live-generation throughput.
-  tabicl_inference_amp: true
+  tabicl_inference_amp: false
 
 # Model-fit-to-classical-kernel diagnostic, evaluated each validation loop:
 #   val/kernel_fit/<kernel>/{copula_nll,corr_mse,corr_mae,corr_pearson}
