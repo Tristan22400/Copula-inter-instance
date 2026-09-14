@@ -219,6 +219,13 @@ def _plot_field_grid(
     has_pred2 = predicted_fields_2 is not None
     has_indep = independent_fields is not None
     has_oracle = oracle_fields is not None
+    # true_fields may arrive already gridded (H, W) (plot_residual_grid) or
+    # flat (D,) (plot_mean_removed_grid's per-day residual vectors) -- np's
+    # reshape is a no-op on an already-(H, W) array of matching size, so
+    # normalizing unconditionally here keeps it homogeneous with the other
+    # (always-reshaped) rows below instead of silently producing a ragged
+    # list when concatenated for vmax.
+    true_fields = [np.asarray(f).reshape(grid_shape) for f in true_fields]
     pred_grids = [f.reshape(grid_shape) for f in predicted_fields] if has_pred else []
     pred2_grids = [f.reshape(grid_shape) for f in predicted_fields_2] if has_pred2 else []
     indep_grids = [f.reshape(grid_shape) for f in independent_fields] if has_indep else []
