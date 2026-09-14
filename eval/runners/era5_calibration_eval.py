@@ -379,7 +379,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--tabicl-ckpt", type=str, default=None,
-        help="TabICLRegressor checkpoint_version (default: the library's own default checkpoint).",
+        help="TabICLRegressor marginal checkpoint (required for the non-default estimator).",
     )
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     parser.add_argument("--n-ctx", type=int, default=1000, help="Global context points sampled per timestamp.")
