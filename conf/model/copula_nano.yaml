@@ -26,7 +26,7 @@
 #     data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \
 #     training.live_generation=true training.ckpt_dir=./checkpoints/copula_nano
 model:
-  rank: 64                  # vs. 32 in copula_prod.yaml
+  rank: 128                  # vs. 32 in copula_prod.yaml
   sigma_jitter: 1.0e-4
   unfreeze_backbone: true
   # Which src/correlation_factory.py builder turns the copula head's raw
@@ -90,8 +90,10 @@ tabicl:
   # episodes — independent of this run's own from-scratch backbone above, so
   # it's set here explicitly rather than inherited from `pretrained: false`.
   # Same checkpoint copula_prod.yaml's backbone loads; only ever used frozen,
-  # for validation, never trained.
-  pit_ckpt: tabicl-regressor-v2-20260212.ckpt
+  # for validation, never trained. Phase A ERA5 fine-tune of the frozen
+  # TabICL marginal (src/finetune_marginal.py), swapped in for the pretrained
+  # HF checkpoint.
+  pit_ckpt: checkpoints/marginal/ablations/marginal_finetune_era5_run1/step_0177600_final.pt
   arch:
     embed_dim: 32       # vs. 128 in the pretrained checkpoint
     col_num_blocks: 1   # vs. 3 in the pretrained checkpoint

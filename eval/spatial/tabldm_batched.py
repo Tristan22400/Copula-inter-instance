@@ -32,11 +32,10 @@ i.e. it already treats that axis as a VRAM-chunkable batch of unrelated
 tables.
 
 What episodes must share to be stacked: T (context rows + query rows), H
-(feature count), and train_size. data_gen.py's generate_gp_batch guarantees
-all three across one call (see its module docstring), and
-_batched_pit.py::run_kfold_pit_batched's docstring explains why per-fold
-query counts stay equal across episodes even though each episode draws its
-own fold permutation.
+(feature count), and train_size after preprocessing. Even equal-width raw
+inputs can lose different constant columns in TabLDM's per-episode feature
+filter. Episodes are therefore grouped by their preprocessed shapes, with
+one fused forward per group and results restored to the original order.
 
 REUSE, NOT REIMPLEMENTATION: every step that isn't the fused forward goes
 through the regressor's own real code, in the exact order its own predict()
@@ -58,7 +57,7 @@ runs them (see TabLDMRegressor.predict's non-enhanced path) --
     axis -- UNMODIFIED, predict()'s own de-standardization/pooling, applied
     per episode with THAT episode's own scaler (each fit() refits it).
 The only new code here is the orchestration: capture each episode's member
-batch, concatenate, one forward, split the result back per episode.
+batch, group compatible shapes, forward, split the result back per episode.
 
 NOT SUPPORTED, and rejected loudly rather than silently mis-fused:
 enhance_candidates=True (predict()'s "enhanced path" only supports
@@ -90,6 +89,16 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
     """
     from tabldm._sklearn.sklearn_utils import validate_data
 
+    if not getattr(regressor, "_load_model_cached", False):
+        orig_load = regressor._load_model
+
+        def _cached_load():
+            if getattr(regressor, "model_", None) is None:
+                orig_load()
+
+        regressor._load_model = _cached_load
+        regressor._load_model_cached = True
+
     regressor.fit(x_support, y_support)
 
     if getattr(regressor, "enhance_candidates", False):
@@ -119,10 +128,18 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
     return xs, ys, regressor.y_scaler_
 
 
+def _group_episode_batches(per_episode):
+    """Group compatible preprocessed inputs without padding extra features."""
+    groups = {}
+    for b, (xs, ys, _) in enumerate(per_episode):
+        groups.setdefault((xs.shape, ys.shape), []).append(b)
+    return list(groups.values())
+
+
 def _quantile_bank_batched(
     regressor, X_context: list, y_context: list, X_query: list, probs: np.ndarray,
 ) -> np.ndarray:
-    """One fused _batch_forward for B episodes sharing T/H/train_size.
+    """One fused _batch_forward per compatible preprocessed shape.
 
     Returns (B, n_query, len(probs)) in RAW y-units, already on the caller's
     own ``probs`` grid -- TabLDM evaluates the requested alphas inside its own
@@ -133,25 +150,17 @@ def _quantile_bank_batched(
     per_episode = [
         _episode_member_batch(regressor, X_context[b], y_context[b], X_query[b]) for b in range(B)
     ]
-    members = per_episode[0][0].shape[0]
-    if any(e[0].shape != per_episode[0][0].shape for e in per_episode):
-        raise RuntimeError(
-            "tabldm_batched requires every episode in a call to share "
-            f"(members, T, H); got {[e[0].shape for e in per_episode]}. "
-            "data_gen.py's generate_gp_batch guarantees this per call."
-        )
-
-    xs = np.concatenate([e[0] for e in per_episode], axis=0)  # (B*members, T, H)
-    ys = np.concatenate([e[1] for e in per_episode], axis=0)  # (B*members, train_size)
-    out = regressor._batch_forward(xs, ys, output_type="quantiles", alphas=list(probs))
-    out = np.asarray(out).reshape(B, members, -1, len(probs))  # (B, members, n_query, Q)
-
-    bank = np.empty(out.shape[0:1] + out.shape[2:], dtype=np.float64)
-    for b in range(B):
-        # predict()'s own de-standardization + member pooling, per episode
-        # with that episode's own scaler.
-        arr = per_episode[b][2].inverse_transform(out[b].reshape(-1, 1)).reshape(out[b].shape)
-        bank[b] = arr.mean(axis=0)
+    banks = [None] * B
+    for indices in _group_episode_batches(per_episode):
+        members = per_episode[indices[0]][0].shape[0]
+        xs = np.concatenate([per_episode[b][0] for b in indices], axis=0)
+        ys = np.concatenate([per_episode[b][1] for b in indices], axis=0)
+        out = regressor._batch_forward(xs, ys, output_type="quantiles", alphas=list(probs))
+        out = np.asarray(out).reshape(len(indices), members, -1, len(probs))
+        for local, b in enumerate(indices):
+            arr = per_episode[b][2].inverse_transform(out[local].reshape(-1, 1)).reshape(out[local].shape)
+            banks[b] = arr.mean(axis=0)
+    bank = np.stack(banks).astype(np.float64)
     return bank
 
 

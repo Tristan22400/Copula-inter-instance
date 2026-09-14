@@ -1351,6 +1351,13 @@ def main(cfg: DictConfig) -> None:
         backbone_obj = load_backbone(
             backbone_name, ckpt=cfg.marginal.get("resume_ckpt", None), device=device
         )
+        if backbone_name == "exaone":
+            backbone_obj.exaone_chunk_size = int(cfg.marginal.exaone.chunk_size)
+            if backbone_obj.exaone_chunk_size < 1:
+                raise ValueError("marginal.exaone.chunk_size must be positive")
+            backbone_obj.exaone_activation_checkpointing = bool(
+                cfg.marginal.exaone.activation_checkpointing
+            )
         tabicl, tabicl_config = backbone_obj, {}
         trainable_module = backbone_obj.module
         for p_ in trainable_module.parameters():
@@ -1406,9 +1413,11 @@ def main(cfg: DictConfig) -> None:
     params = [p for p in trainable_module.parameters() if p.requires_grad]
     if not params:
         raise RuntimeError("Tier routing left no trainable parameters.")
+    adam_eps = 1e-4 if any(p.dtype == torch.float16 for p in params) else 1e-8
     opt = torch.optim.AdamW(
         params, lr=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay),
+        eps=adam_eps,
     )
     total_steps = int(cfg.training.steps)
     sched = torch.optim.lr_scheduler.LambdaLR(

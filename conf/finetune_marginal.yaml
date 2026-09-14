@@ -45,6 +45,15 @@ marginal:
   #   exaone : EXAONE-Tabular, same convention as tabldm.
   backbone: tabicl
 
+  # EXAONE execution only: one member per forward/recomputation keeps
+  # larger-feature batches within 24 GiB. This does not change training.batch_size.
+  # Increase chunk_size only on GPUs with enough memory for backward.
+  # Keep checkpointing on for the variable-size GP prior; disabling it
+  # retains the activations of every scored fold until backward.
+  exaone:
+    chunk_size: 1
+    activation_checkpointing: true
+
   # Resume a previous Phase-A run of a NON-tabicl backbone (a file written by
   # MarginalBackbone.save). null = start from the pretrained weights. For
   # backbone=tabicl use `ckpt` below instead, which pit.load_tabicl reads.

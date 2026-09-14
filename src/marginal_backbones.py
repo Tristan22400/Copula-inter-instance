@@ -178,6 +178,9 @@ class MarginalBackbone:
     module: nn.Module
     handle: Any = None
     config: dict = field(default_factory=dict)
+    # Execution settings only; never part of the model's checkpoint schema.
+    exaone_chunk_size: int = 1
+    exaone_activation_checkpointing: bool = True
 
     @property
     def tier0_patterns(self) -> tuple[str, ...]:
@@ -319,44 +322,127 @@ class MarginalBackbone:
 # that every existing caller of the inference modules cannot accidentally
 # start building an autograd graph, the same reasoning pit.py gives for
 # having a separate run_pit_batched_grad.
-# ---------------------------------------------------------------------------
+def _patch_tabldm_inference_manager() -> None:
+    try:
+        from tabldm._model.inference import InferenceManager, flash_attn3_toggle
+    except ImportError:
+        return
+    if getattr(InferenceManager, "_grad_patched", False):
+        return
+
+    _orig_run_forward = InferenceManager._run_forward
+
+    def _grad_aware_run_forward(self, forward_fn, inputs):
+        if torch.is_grad_enabled():
+            with flash_attn3_toggle(self.use_fa3):
+                return forward_fn(**inputs)
+        return _orig_run_forward(self, forward_fn, inputs)
+
+    InferenceManager._run_forward = _grad_aware_run_forward
+    InferenceManager._grad_patched = True
+
+
 def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.Tensor:
-    from eval.spatial.tabldm_batched import _episode_member_batch
+    _patch_tabldm_inference_manager()
+    from eval.spatial.tabldm_batched import _episode_member_batch, _group_episode_batches
 
     B = len(X_context)
     per_episode = [
         _episode_member_batch(bb.handle, X_context[b], y_context[b], X_query[b]) for b in range(B)
     ]
-    members = per_episode[0][0].shape[0]
     device = next(bb.module.parameters()).device
-    xs = torch.from_numpy(np.concatenate([e[0] for e in per_episode], axis=0)).float().to(device)
-    ys = torch.from_numpy(np.concatenate([e[1] for e in per_episode], axis=0)).float().to(device)
+    banks = [None] * B
+    for indices in _group_episode_batches(per_episode):
+        members = per_episode[indices[0]][0].shape[0]
+        xs = torch.from_numpy(np.concatenate([per_episode[b][0] for b in indices], axis=0)).float().to(device)
+        ys = torch.from_numpy(np.concatenate([per_episode[b][1] for b in indices], axis=0)).float().to(device)
 
-    # regressor._batch_forward's body, minus its `with torch.no_grad()` and
-    # minus the VRAM chunking (a Phase-A batch is already sized to fit).
-    if probs is None:
-        # The decoder's own grid, straight out -- no per-level inverse-CDF.
+        # Same forward as the regressor, with autograd enabled.
+        kwargs = {"output_type": "raw_quantiles"} if probs is None else {
+            "output_type": "quantiles", "alphas": list(probs),
+        }
         out = bb.module.predict_stats(
-            xs, ys, output_type="raw_quantiles",
-            inference_config=bb.handle.inference_config_,
+            xs, ys, inference_config=bb.handle.inference_config_, **kwargs,
         )
-    else:
-        out = bb.module.predict_stats(
-            xs, ys, output_type="quantiles", alphas=list(probs),
-            inference_config=bb.handle.inference_config_,
-        )
-    out = out.reshape(B, members, -1, out.shape[-1])  # (B, members, n_query, Q)
+        out = out.reshape(len(indices), members, -1, out.shape[-1])
 
-    # predict()'s own de-standardization, differentiably: StandardScaler's
-    # inverse_transform is an affine map, so it is applied as one rather than
-    # by calling the sklearn object (which would detach through numpy).
-    banks = []
-    for b in range(B):
-        scaler = per_episode[b][2]
-        scale = float(scaler.scale_[0]) if scaler.scale_ is not None else 1.0
-        mean = float(scaler.mean_[0]) if scaler.mean_ is not None else 0.0
-        banks.append((out[b] * scale + mean).mean(dim=0))
+        # Apply each episode's inverse scaling without detaching the graph.
+        for local, b in enumerate(indices):
+            scaler = per_episode[b][2]
+            scale = float(scaler.scale_[0]) if scaler.scale_ is not None else 1.0
+            mean = float(scaler.mean_[0]) if scaler.mean_ is not None else 0.0
+            banks[b] = (out[local] * scale + mean).mean(dim=0)
     return torch.stack(banks, dim=0)  # (B, n_query, Q)
+
+
+def _exaone_grad_forward(
+    bb, support: torch.Tensor, label: torch.Tensor, query: torch.Tensor, chunk_size: Optional[int] = None
+) -> torch.Tensor:
+    """Memory-efficient forward pass for EXAONE under autograd.
+
+    EXAONE's built-in _forward_chunked relies on _InferenceExecutor, which
+    assumes inference mode and builds support-only KV caches across forward calls.
+    In autograd training (Phase A), that executor's cache causes state conflicts
+    across steps and retains all intermediate transformer activations in memory,
+    causing out-of-memory errors on 24GB GPUs when scoring multi-fold batches.
+
+    This function calls the underlying model directly without KV-cache side-effects,
+    applies activation checkpointing (torch.utils.checkpoint.checkpoint) so
+    activations are not held across multiple folds/passes, and chunks along the
+    batch axis (dim 0) to bound peak VRAM during the backward pass.
+    """
+    from torch.nn.utils import parametrize
+    from torch.utils.checkpoint import checkpoint
+
+    if chunk_size is None:
+        chunk_size = bb.exaone_chunk_size
+    if chunk_size < 1:
+        raise ValueError("EXAONE chunk_size must be positive")
+    ffn_chunk = 524_288 if support.device.type == "cpu" else 9984
+    query_chunk_size = query.shape[1]
+
+    def _model_call(sub_s, sub_l, sub_q):
+        # EXAONE validates and reads each raw weight repeatedly. Materialize
+        # each LoRA weight once per model call, keeping its autograd graph.
+        # This scope MUST be inside the checkpointed function: recomputation
+        # needs a fresh cache, and nothing may survive an optimizer update.
+        with parametrize.cached():
+            return bb.handle.model(
+                sub_s,
+                sub_l,
+                sub_q,
+                feedforward_token_chunk=ffn_chunk,
+                query_chunk_size=query_chunk_size,
+                trusted_internal_inputs=True,
+            )
+
+    use_ckpt = (
+        bb.exaone_activation_checkpointing and torch.is_grad_enabled()
+        and any(p.requires_grad for p in bb.module.parameters())
+    )
+    total_members = support.shape[0]
+    if total_members <= chunk_size:
+        if use_ckpt:
+            return checkpoint(
+                _model_call, support, label, query, use_reentrant=False
+            )
+        return _model_call(support, label, query)
+
+    chunks = []
+    for start in range(0, total_members, chunk_size):
+        stop = min(start + chunk_size, total_members)
+        sub_s = support[start:stop]
+        sub_l = label[start:stop]
+        sub_q = query[start:stop]
+        if use_ckpt:
+            chunks.append(
+                checkpoint(
+                    _model_call, sub_s, sub_l, sub_q, use_reentrant=False
+                )
+            )
+        else:
+            chunks.append(_model_call(sub_s, sub_l, sub_q))
+    return torch.cat(chunks, dim=0)
 
 
 def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.Tensor:
@@ -375,7 +461,7 @@ def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
         label = torch.cat([per_episode[b][0][p][1] for b in range(B)], dim=0).to(device)
         query = torch.cat([per_episode[b][0][p][2] for b in range(B)], dim=0).to(device)
         members = per_episode[0][0][p][0].shape[0]
-        raw = bb.handle._forward_chunked(support, label, query)  # no inference_mode here
+        raw = _exaone_grad_forward(bb, support, label, query)
         pass_outputs.append(raw.float().reshape(B, members, query.shape[1], -1))
 
     pooled = torch.cat(pass_outputs, dim=1)
@@ -554,20 +640,46 @@ def kfold_quantiles_grad(
 
     wanted = range(K) if fold_subset is None else sorted({int(k) for k in fold_subset})
     q_train_parts, idx_parts = [], []
-    for k in wanted:
-        start, end = k * fold_size, min(k * fold_size + fold_size, P)
-        if start >= end:
-            continue  # empty tail fold when P is not a multiple of fold_size
-        qry = np.arange(start, end)
-        ctx = np.concatenate([np.arange(0, start), np.arange(end, P)])
-        if ctx.size == 0:
-            continue
-        q_fold = backbone.quantile_forward(
-            [xtr[b][ctx] for b in range(B)], [ytr[b][ctx] for b in range(B)],
-            [xtr[b][qry] for b in range(B)], probs,
-        )
-        q_train_parts.append(q_fold)
-        idx_parts.append(torch.as_tensor(qry, dtype=torch.long, device=q_test.device))
+    if backbone.name == "tabldm":
+        fold_specs = []
+        for k in wanted:
+            start, end = k * fold_size, min(k * fold_size + fold_size, P)
+            if start >= end:
+                continue  # empty tail fold when P is not a multiple of fold_size
+            qry = np.arange(start, end)
+            ctx = np.concatenate([np.arange(0, start), np.arange(end, P)])
+            if ctx.size == 0:
+                continue
+            fold_specs.append((k, ctx, qry, len(qry)))
+
+        # Group folds by query size so equal-sized folds can be forwarded together
+        by_size: dict[int, list] = {}
+        for spec in fold_specs:
+            by_size.setdefault(spec[3], []).append(spec)
+
+        for _qry_len, group in by_size.items():
+            ctx_list = [xtr[b][spec[1]] for spec in group for b in range(B)]
+            y_ctx_list = [ytr[b][spec[1]] for spec in group for b in range(B)]
+            qry_list = [xtr[b][spec[2]] for spec in group for b in range(B)]
+            q_fused = backbone.quantile_forward(ctx_list, y_ctx_list, qry_list, probs)
+            for i, spec in enumerate(group):
+                q_train_parts.append(q_fused[i * B : (i + 1) * B])
+                idx_parts.append(torch.as_tensor(spec[2], dtype=torch.long, device=q_test.device))
+    else:
+        for k in wanted:
+            start, end = k * fold_size, min(k * fold_size + fold_size, P)
+            if start >= end:
+                continue  # empty tail fold when P is not a multiple of fold_size
+            qry = np.arange(start, end)
+            ctx = np.concatenate([np.arange(0, start), np.arange(end, P)])
+            if ctx.size == 0:
+                continue
+            q_fold = backbone.quantile_forward(
+                [xtr[b][ctx] for b in range(B)], [ytr[b][ctx] for b in range(B)],
+                [xtr[b][qry] for b in range(B)], probs,
+            )
+            q_train_parts.append(q_fold)
+            idx_parts.append(torch.as_tensor(qry, dtype=torch.long, device=q_test.device))
 
     q_train = (
         torch.cat(q_train_parts, dim=1) if q_train_parts
