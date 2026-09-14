@@ -228,7 +228,17 @@ def _make_pretrained_regressor(name: str, device: "str | None" = None):
         # regressor's whole lifetime; quantiles()' per-call `seed` cannot
         # reach it. That matches exaone (deterministic given fitted state)
         # rather than being a limitation -- see _tabldm_quantiles.
-        return TabLDMRegressor(n_estimators=1, device=device, random_state=0)
+        reg = TabLDMRegressor(n_estimators=1, device=device, random_state=0)
+        # Avoid reloading the ~300MB checkpoint from disk on every .fit() call.
+        orig_load = reg._load_model
+
+        def _cached_load():
+            if getattr(reg, "model_", None) is None:
+                orig_load()
+
+        reg._load_model = _cached_load
+        reg._load_model_cached = True
+        return reg
     raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
 
 

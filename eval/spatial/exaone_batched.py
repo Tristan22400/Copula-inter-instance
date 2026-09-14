@@ -133,13 +133,14 @@ def _quantile_bank_batched(regressor, X_context: list, y_context: list, X_query:
         query_batch = torch.cat([per_episode[b][0][p][2] for b in range(B)], dim=0)
         members_per_episode = per_episode[0][0][p][0].shape[0]
 
-        # eval() + inference_mode(): same as _member_points' own forward call
-        # (regressor.py) -- without inference_mode the output tensor stays
+        # eval() + no_grad(): without no_grad the output tensor stays
         # grad-tracked (build_ensemble_inputs' tensors are plain floats, not
         # leaves under no_grad, so autograd would otherwise record the whole
-        # forward for nothing) and .numpy() below fails.
+        # forward for nothing) and .numpy() below fails. Note: we use no_grad()
+        # rather than inference_mode() because LoRA-parametrized weights require
+        # version counter tracking in TensorAttention's lazy projection cache.
         regressor.model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             raw = regressor._forward_chunked(support_batch, label_batch, query_batch)  # (B*members, query_rows, Q)
         expected = (B * members_per_episode, query_rows, regressor.manifest.output_width)
         if tuple(raw.shape) != expected or not bool(torch.isfinite(raw).all()):

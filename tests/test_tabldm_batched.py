@@ -39,7 +39,8 @@ def regressor():
     return make_regressor("tabldm", device="cpu")
 
 
-def test_tabldm_batched_matches_per_episode(regressor):
+@pytest.mark.parametrize("constant_column", [False, True])
+def test_tabldm_batched_matches_per_episode(regressor, constant_column):
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.marginal_backends import loo_pit, quantiles
     from eval.spatial.tabldm_batched import tabldm_run_pit_batched
@@ -55,6 +56,10 @@ def test_tabldm_batched_matches_per_episode(regressor):
     Y_test = (
         np.einsum("bni,bi->bn", X_test, true_w) + 0.2 * rng.normal(size=(B, N))
     ).astype(np.float32)
+    if constant_column:
+        # Equal raw widths become different widths after per-episode fitting.
+        X_train[1, :, -1] = 1.0
+        X_test[1, :, -1] = 1.0
     probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
     base_seed = 12345
 

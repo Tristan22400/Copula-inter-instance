@@ -3067,7 +3067,7 @@ def main(cfg: DictConfig) -> None:
     )
     lr_min_frac = t.muon_lr_min / t.muon_lr
 
-    use_amp = device == "cuda"
+    use_amp = (device == "cuda") and bool(t.get("use_amp", True))
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
 
