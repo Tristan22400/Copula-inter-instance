@@ -167,7 +167,7 @@ def run_episode(
 def main() -> None:
     parser = argparse.ArgumentParser(description="TabICLv2 + Copula inter-instance benchmark suite")
     parser.add_argument("--copula_ckpt", default="./checkpoints/systematic-composition-k5/step_0045000.pt")
-    parser.add_argument("--tabicl_ckpt", default="tabicl-regressor-v2-20260212.ckpt")
+    parser.add_argument("--tabicl_ckpt", default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num_episodes", type=int, default=50)
     parser.add_argument("--n_samples", type=int, default=1000)

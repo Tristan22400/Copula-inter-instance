@@ -3,6 +3,7 @@ outputs/
 results/
 logs/
 checkpoints/
+baseline_cache.pt
 /data/
 src/__pycache__/
 src/models/__pycache__/

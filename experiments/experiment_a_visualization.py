@@ -192,7 +192,7 @@ def run_one_function(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Experiment A — qualitative 1D sample visualization")
     parser.add_argument("--copula-ckpt", default="./checkpoints/systematic-composition/step_0180000.pt")
-    parser.add_argument("--tabicl-ckpt", default="tabicl-regressor-v2-20260212.ckpt")
+    parser.add_argument("--tabicl-ckpt", default=None)
     parser.add_argument("--pfn4bo-model", default="hebo_plus_model")
     parser.add_argument("--out-dir", default="./results/figures")
     parser.add_argument("--device", default="auto")

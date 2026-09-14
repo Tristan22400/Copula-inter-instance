@@ -5,9 +5,13 @@ model class, which does no target scaling of its own)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 __all__ = ["make_tabicl_regressor", "tabicl_quantiles", "tabicl_loo_pit"]
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_tabicl_regressor(checkpoint: str | None = None, device: str | None = None):
@@ -22,6 +26,18 @@ def make_tabicl_regressor(checkpoint: str | None = None, device: str | None = No
 
     kwargs = {"device": device} if device is not None else {}
     if checkpoint is not None:
+        checkpoint_path = Path(checkpoint)
+        is_local = checkpoint_path.is_absolute() or "/" in checkpoint or checkpoint_path.suffix == ".pt"
+    else:
+        checkpoint_path = None
+        is_local = False
+    if is_local:
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = _REPO_ROOT / checkpoint_path
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Marginal checkpoint not found: {checkpoint_path}")
+        kwargs.update(model_path=str(checkpoint_path), allow_auto_download=False)
+    elif checkpoint is not None:
         kwargs["checkpoint_version"] = checkpoint
     return TabICLRegressor(**kwargs)
 

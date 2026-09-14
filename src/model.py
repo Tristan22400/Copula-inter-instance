@@ -256,9 +256,19 @@ class CopulaTabICL(nn.Module):
 
 
 def _load_pretrained_tabicl(ckpt_name: str, recompute: bool = False) -> TabICL:
-    from huggingface_hub import hf_hub_download
+    from pathlib import Path
 
-    ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
+    ckpt_path = Path(ckpt_name)
+    if ckpt_path.is_absolute() or "/" in ckpt_name or ckpt_path.suffix == ".pt":
+        repo_root = Path(__file__).resolve().parents[1]
+        if not ckpt_path.is_absolute():
+            ckpt_path = repo_root / ckpt_path
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Copula backbone checkpoint not found: {ckpt_path}")
+    else:
+        from huggingface_hub import hf_hub_download
+
+        ckpt_path = Path(hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name))
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     # The checkpoint's saved config carries whatever `recompute` value the
     # original TabICL training run used (checkpointing is a training-time-only
