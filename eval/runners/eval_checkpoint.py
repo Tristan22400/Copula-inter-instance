@@ -10,14 +10,20 @@ Usage
     python eval/runners/eval_checkpoint.py \\
         --config conf/config.yaml \\
         --ckpt   ./checkpoints/copula_transformer/step_XXXXXX_final.pt \\
-        [--n_episodes 50]         # episodes to evaluate
-        [--episode_idx 0]         # starting episode index
-        [--n_steps_mle 300]       # Adam steps for GP MLE fitting (also used for ARD variants)
+        [--n_episodes 30]         # episodes to evaluate
+        [--episode_idx 0]         # starting episode index (--dataset_dir only)
+        [--episode_offset 0]      # first global episode index (--live_generate only;
+                                  # shard one episode stream across array jobs)
+        [--n_steps_mle 1000]      # Adam steps for GP MLE fitting (also used for ARD variants)
         [--lr_mle 0.05]           # learning rate for GP MLE
-        [--n_steps_dkl 300]       # Adam steps for Deep Kernel Learning (MLP+GP) fitting
+        [--n_restarts_mle 5]      # random restarts per GP-MLE kernel fit
+        [--n_steps_dkl 5000]      # Adam steps for Deep Kernel Learning (MLP+GP) fitting
         [--lr_dkl 0.01]           # learning rate for DKL Adam
-        [--n_steps_per_ep 500]    # training steps for PerEpisodeTransformer
-        [--patience_per_ep 100]   # early stopping patience (steps without improvement)
+        [--n_steps_per_ep 5000]   # training steps for PerEpisodeTransformer
+        [--patience_per_ep 500]   # early stopping patience (steps without improvement)
+        [--baseline_device cpu]   # where to fit baselines (cpu is FASTER here, see below)
+        [--baseline_workers 0]    # 0=auto (min(8, allocated cores)); 1=serial
+        [--cache_save_every 25]   # persist the baseline cache every N episodes
         [--z_train_source tabicl]  # (default) 'oracle', or exaone/tabpfn/tabldm:
                                    #   feed the ICL model the
                                    # exact GP-LOO z_train instead of TabICL's own
@@ -39,7 +45,33 @@ Baseline caching is handled by eval/baselines/classical.py (see its module
 docstring): GP-MLE/DKL/per_ep_transformer fitting dominates runtime and is
 unaffected by which checkpoint is under test, so repeated runs against a new
 checkpoint reuse the cached fits and only redo the cheap ICL forward pass +
-oracle NLL.
+oracle NLL. The cache is written every --cache_save_every episodes, not just
+at the end, so a run killed at its OAR walltime still leaves the fits it paid
+for behind.
+
+Runtime
+-------
+Baseline fitting is ~98% of this script's cost. Measured at the defaults
+above (P=32 train / N=256 test / d_x=9): 649 s per episode, split GP-MLE
+350 s (9 kernel+ARD labels x 5 restarts x 1000 steps) / polynomial 121 s
+(3 degrees x 5 restarts) / DKL 168 s / per_ep_transformer 10 s. That is
+~85,000 Adam steps per episode, every one of them a 32x32 Cholesky, so the
+work is dominated by per-step launch latency rather than arithmetic. Two
+consequences, both handled by the defaults:
+
+  * --baseline_device defaults to **cpu**, which is ~2x faster than a GPU
+    here for bit-comparable NLLs (measured: GP-MLE rbf 2.98 s vs 7.50 s per
+    1000 steps, DKL rbf 20.23 s vs 38.54 s, nll 2.1604 either way).
+  * --baseline_workers spreads episodes (perfectly independent) across
+    processes, defaulting to the cores actually allocated to the job.
+
+Together these take a 400-episode run from ~72 h to a few hours. Note what is
+NOT a speed knob: --n_steps_mle materially changes the reported baseline
+numbers rather than merely refining them (under oracle_mode="prior", longer
+fits sharpen the fitted kernel's prior correlation at the test points and the
+copula NLL rises monotonically — measured ~11 -> ~25 nats for ARD-RBF between
+100 and 1000 steps), so it must be chosen on a convergence criterion over the
+fitting objective and held fixed, never trimmed to fit a walltime.
 
 With --live_generate (the default), the episodes themselves come from
 --config's own cfg.data — resolved through Hydra's defaults list, NOT the
@@ -60,6 +92,8 @@ import json
 import os
 import random
 import sys
+import time
+import zlib
 from collections import Counter
 
 import hydra
@@ -540,8 +574,196 @@ def _kernel_composition_label(ep: dict) -> str:
     return label
 
 
-def _live_generate_alternating(gen_cfg, n_ep: int, device, seed: int) -> list[dict]:
-    """Live-generate n_ep episodes, forcing every even local index (0, 2, 4,
+# ---------------------------------------------------------------------------
+# Parallel baseline fitting
+# ---------------------------------------------------------------------------
+#
+# Baseline fitting is ~98% of this script's runtime (measured at the argparse
+# defaults, P=32/N=256/d_x=9: 649 s per episode, of which GP-MLE 350 s,
+# polynomial 121 s, DKL 168 s, per_ep_transformer 10 s) and is perfectly
+# independent across episodes — nothing in eval_baselines_episode reads any
+# state shared with another episode. Two facts make that worth exploiting:
+#
+#   1. It is faster on ONE CPU core than on a GPU. Episodes carry P=32
+#      training points, so every one of the ~85,000 Adam steps per episode is
+#      a 32x32 Cholesky: nanoseconds of arithmetic behind a millisecond of
+#      kernel-launch latency. Measured on a TITAN-RTX-class GPU vs. a single
+#      Xeon E5-2623 v3 thread, same seeds, same steps: GP-MLE rbf 7.50 s ->
+#      2.98 s, ARD matern32 6.41 s -> 3.53 s, RQ 7.37 s -> 4.37 s, DKL rbf
+#      38.54 s -> 20.23 s, with identical NLLs (2.1604 vs 2.1604 for rbf).
+#      Hence --baseline_device defaults to cpu.
+#   2. Being CPU-bound and single-threaded, it then parallelises across cores
+#      with no GPU contention and no memory pressure (an episode is a few MB).
+#
+# So the expensive part runs as a pool pre-pass over the uncached episodes,
+# and the main evaluation loop below is left untouched: it finds every
+# episode already in cache_entries and does only the cheap, genuinely
+# checkpoint-dependent work (the ICL forward pass, the TabICL PIT, the oracle)
+# on the GPU, in order, exactly as before.
+
+
+def _fit_baselines_task(payload: tuple) -> tuple:
+    """One episode's classical baselines, fit in a worker process.
+
+    Module-level (not a closure) so it survives pickling under the "spawn"
+    start method, which _prefit_baselines_parallel uses unconditionally: the
+    parent has almost certainly initialised CUDA by this point (the ICL model
+    and TabICL marginal are already resident), and a forked child inheriting
+    a CUDA context crashes the moment it touches a tensor. Spawned workers
+    re-import this module from scratch and never initialise CUDA at all.
+
+    Tensors arrive and leave on the CPU; the caller moves R back to the
+    evaluation device.
+    """
+    cache_key, ep, fit_seed, kwargs = payload
+    import torch as _torch  # re-imported in the spawned interpreter
+
+    # One thread per worker: these are 32x32 problems, so intra-op threading
+    # buys nothing and merely oversubscribes the cores the pool is already
+    # using for real parallelism (and on an OAR allocation, cores this job
+    # was never given).
+    _torch.set_num_threads(1)
+    try:
+        nlls, R_dict, y_nlls = eval_baselines_episode(
+            ep=ep, device=_torch.device("cpu"), fit_seed=fit_seed, **kwargs
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        import traceback
+
+        return cache_key, None, f"{exc}\n{traceback.format_exc()}"
+    return cache_key, {
+        "nlls": nlls,
+        "R_dict": {k: v.detach().cpu() for k, v in R_dict.items()},
+        "y_nlls": y_nlls,
+    }, None
+
+
+def _baseline_fit_seed(seed: int, cache_key: str) -> int:
+    """Deterministic per-episode seed for baseline fitting.
+
+    Keyed off the episode's cache key (which encodes its global index), not
+    its position in this run's loop, so an episode fits identically whether it
+    was episode 3 of 400 in one job or episode 3 of a --episode_offset shard,
+    and regardless of which worker process picked it up.
+
+    crc32, not Python's hash(): str.__hash__ is salted by PYTHONHASHSEED and
+    would make every run silently unreproducible.
+    """
+    return (zlib.crc32(cache_key.encode()) ^ (seed * 2_654_435_761)) % (2 ** 31 - 1)
+
+
+def _valid_cached_entry(cache_entries: dict, cache_key: str, ep_i: int) -> dict | None:
+    """The cached baseline entry for this episode, or None if it is missing or
+    was written by an older version of eval_baselines_episode.
+
+    A fingerprint match only guarantees the episode and the fitting
+    hyperparameters agree; it says nothing about which baselines existed, or
+    what shape their results had, when the entry was written. Each check below
+    is a schema migration for one such change, and all of them mean the same
+    thing: refit this episode rather than serve a result missing a key the
+    tables downstream will index into.
+    """
+    cached = cache_entries.get(cache_key)
+    if cached is None:
+        return None
+    if not EXPECTED_BASELINE_KEYS.issubset(cached["nlls"].keys()):
+        # Predates a baseline added to eval_baselines_episode since (e.g.
+        # gp_mle_polynomial).
+        missing = EXPECTED_BASELINE_KEYS - cached["nlls"].keys()
+        print(f"  [ep {ep_i}] cached baselines missing {sorted(missing)} — refitting")
+        return None
+    if "y_nlls" not in cached:
+        # Predates the total Y-space NLL addition — refit rather than silently
+        # leaving the total-NLL table's baseline rows as nan for this episode.
+        print(f"  [ep {ep_i}] cached entry predates total-NLL tracking — refitting")
+        return None
+    if any(not isinstance(v, dict) for v in cached["y_nlls"].values()):
+        # Predates the marginal/copula split of y_nlls (each value used to be
+        # a bare total float) — refit rather than crashing on own["copula"].
+        print(f"  [ep {ep_i}] cached y_nlls predates marginal/copula split — refitting")
+        return None
+    return cached
+
+
+def _episode_to_cpu(ep: dict) -> dict:
+    """CPU copy of an episode, for shipping to a worker process."""
+    return {
+        k: (v.detach().cpu() if isinstance(v, Tensor) else v) for k, v in ep.items()
+    }
+
+
+def _prefit_baselines_parallel(
+    pending: list[tuple[str, int, dict]],
+    fit_kwargs: dict,
+    n_workers: int,
+    cache_path: str,
+    fingerprint: dict,
+    cache_entries: dict,
+    use_cache: bool,
+    save_every: int,
+) -> None:
+    """Fit every episode in `pending` across a process pool, writing results
+    into cache_entries (and periodically to disk) as they complete.
+
+    Results are saved every `save_every` completions rather than only at the
+    end, so a walltime kill keeps the fits already paid for. This matters
+    more than it sounds: a full run is many GPU-hours, the whole point of the
+    cache is that a *later* run against a different --ckpt reuses it, and
+    before this change the single save at the end of main() meant any run
+    that hit its walltime — the common case for large --n_episodes — wrote
+    nothing at all and the next run started from zero.
+    """
+    import multiprocessing as mp
+
+    total = len(pending)
+    done = 0
+    failures = 0
+    t0 = time.time()
+    since_save = 0
+
+    ctx = mp.get_context("spawn")
+    payloads = [
+        (key, _episode_to_cpu(ep), fit_seed, fit_kwargs) for key, fit_seed, ep in pending
+    ]
+
+    with ctx.Pool(processes=n_workers) as pool:
+        for cache_key, result, err in pool.imap_unordered(_fit_baselines_task, payloads):
+            done += 1
+            if err is not None:
+                failures += 1
+                print(f"  [prefit] {cache_key} FAILED:\n{err}", flush=True)
+            else:
+                cache_entries[cache_key] = result
+                since_save += 1
+
+            elapsed = time.time() - t0
+            rate = elapsed / done
+            eta = rate * (total - done)
+            print(
+                f"  [prefit {done}/{total}] {cache_key}  "
+                f"({elapsed/60:.1f} min elapsed, {rate:.1f} s/ep wall, "
+                f"ETA {eta/60:.1f} min)",
+                flush=True,
+            )
+
+            if use_cache and since_save >= save_every and done < total:
+                save_baseline_cache(cache_path, fingerprint, cache_entries)
+                since_save = 0
+
+    if use_cache and since_save:
+        save_baseline_cache(cache_path, fingerprint, cache_entries)
+    print(
+        f"  [prefit] fitted {done - failures}/{total} episode(s) on "
+        f"{n_workers} worker(s) in {(time.time() - t0)/60:.1f} min"
+        + (f" — {failures} FAILED" if failures else ""),
+        flush=True,
+    )
+
+
+def _live_generate_alternating(
+    gen_cfg, n_ep: int, device, seed: int, offset: int = 0,
+) -> list[dict]:
+    """Live-generate n_ep episodes, forcing every even global index (0, 2, 4,
     ...) to a single elementary kernel (no composition) so each consecutive
     pair of evaluated episodes includes one non-composite draw — otherwise
     non-composite episodes are rare under this repo's default composite
@@ -550,15 +772,29 @@ def _live_generate_alternating(gen_cfg, n_ep: int, device, seed: int) -> list[di
     generate_gp_batch samples its kernel structure once per call and shares
     it across the whole batch, so getting per-episode composition variety at
     all requires B=1 calls rather than a single batched B=n_ep call. Each
-    call gets its own seed (seed + local_i): generate_gp_batch reseeds every
+    call gets its own seed (seed + global_i): generate_gp_batch reseeds every
     RNG from cfg.seed at the start of each call, so reusing one seed across
     calls would otherwise resample the identical episode n_ep times.
+
+    offset (--episode_offset) shifts the *global* episode index this call
+    starts from, so a run can evaluate a contiguous slice of one shared
+    episode stream instead of always restarting it at 0. Everything that
+    identifies an episode — its generating seed, its even/odd non-composite
+    parity, its baseline cache key, and its nested-CV holdout seed — is
+    derived from global_i = offset + local_i rather than local_i, so episode
+    k is bit-identical whether it was produced by a single --n_episodes 400
+    run or by four --n_episodes 100 --episode_offset {0,100,200,300} shards.
+    That is what makes sharding across OAR array jobs (each writing its own
+    --baseline_cache, merged afterwards) a pure parallelisation of the same
+    experiment rather than a different one. offset=0 reproduces the previous
+    behaviour exactly (global_i == local_i).
     """
     episodes: list[dict] = []
     for local_i in range(n_ep):
+        global_i = offset + local_i
         ep_cfg = copy.deepcopy(gen_cfg)
-        ep_cfg.seed = seed + local_i
-        if local_i % 2 == 0:
+        ep_cfg.seed = seed + global_i
+        if global_i % 2 == 0:
             # Force non-composite for both kernel-selection modes
             # _resolve_kernel_name / _sample_kernel_chain_structure support.
             if bool(getattr(ep_cfg.data, "systematic_composition", False)):
@@ -894,6 +1130,49 @@ def main() -> None:
                         help="Recompute every baseline even if a matching cache entry "
                              "exists, overwriting it (still writes --baseline_cache unless "
                              "--no_baseline_cache is also given).")
+    parser.add_argument("--cache_save_every", type=int, default=25,
+                        help="Write --baseline_cache to disk every N episodes fitted, "
+                             "instead of only once after every episode is done. A full "
+                             "run is many hours and the cache exists precisely so a LATER "
+                             "run against a different --ckpt is nearly free — saving only "
+                             "at the end meant any run that hit its OAR walltime (the "
+                             "common case at large --n_episodes) persisted nothing and "
+                             "left the next run to refit from scratch. Each save rewrites "
+                             "the whole file atomically (~4 MB per cached episode at "
+                             "N=256), so lower values cost more I/O; 0 restores the old "
+                             "save-only-at-the-end behaviour.")
+    parser.add_argument("--baseline_device", default="cpu", choices=["cpu", "cuda", "auto"],
+                        help="Device for fitting the classical baselines (GP-MLE/DKL/"
+                             "per_ep_transformer) only — the ICL model, TabICL marginal "
+                             "and oracle always run on --device. Defaults to cpu because "
+                             "it is measurably FASTER here: episodes have P=32 training "
+                             "points, so each of the ~85,000 Adam steps per episode is a "
+                             "32x32 Cholesky whose launch latency dwarfs its arithmetic. "
+                             "Measured same-seed, same-steps against a TITAN-RTX-class "
+                             "GPU, one CPU thread runs GP-MLE rbf in 2.98 s vs 7.50 s and "
+                             "DKL rbf in 20.23 s vs 38.54 s, for identical NLLs. 'auto' "
+                             "follows --device; pass cuda to reproduce the old behaviour.")
+    parser.add_argument("--baseline_workers", type=int, default=0,
+                        help="Worker processes for fitting baselines, which are perfectly "
+                             "independent across episodes. 0 (default) = auto: the number "
+                             "of cores this process is actually allowed to use "
+                             "(os.sched_getaffinity, so an OAR allocation is respected), "
+                             "capped at 8. 1 fits serially in-process, as before. Only "
+                             "used with --baseline_device=cpu: spreading GPU fits across "
+                             "processes just contends for one device. Combined with the "
+                             "cpu default this is the main speedup — ~2x from the device "
+                             "plus ~Nx from the cores.")
+    parser.add_argument("--episode_offset", type=int, default=0,
+                        help="Global index of the first live-generated episode (ignored "
+                             "unless --live_generate). Lets one episode stream be split "
+                             "across OAR array jobs: --n_episodes 100 with "
+                             "--episode_offset 0/100/200/300 evaluates the same 400 "
+                             "episodes as a single --n_episodes 400 run, bit-identically "
+                             "(generating seed, non-composite parity, cache key and "
+                             "nested-CV holdout seed all key off the global index — see "
+                             "_live_generate_alternating). Give each shard its own "
+                             "--baseline_cache; the resulting files share a fingerprint "
+                             "and can be merged by concatenating their 'entries' dicts.")
     args = parser.parse_args()
 
     _set_seed(args.seed)
@@ -1014,8 +1293,11 @@ def main() -> None:
                 cfg.data.N_max = cfg.data.N_min
         print(f"\nLive-generating {n_ep} episodes via generate_gp_batch "
               f"(return_kernel_metadata=True), seed={args.seed}, "
+              f"global indices {args.episode_offset}..{args.episode_offset + n_ep - 1}, "
               "alternating every-other episode to a non-composite kernel")
-        live_episodes = _live_generate_alternating(cfg, n_ep, device, args.seed)
+        live_episodes = _live_generate_alternating(
+            cfg, n_ep, device, args.seed, offset=args.episode_offset,
+        )
     else:
         dataset_dir = args.dataset_dir or cfg.training.dataset_dir
         dataset = CopulaDataset(episode_dir=dataset_dir)
@@ -1046,9 +1328,33 @@ def main() -> None:
     cache_entries = load_baseline_cache(args.baseline_cache, fingerprint) if use_cache else {}
     cache_dirty = False
 
+    baseline_device = torch.device(
+        str(device) if args.baseline_device == "auto" else args.baseline_device
+    )
+    fit_kwargs = dict(
+        icl_rank=icl_rank,
+        n_steps_mle=args.n_steps_mle,
+        lr_mle=args.lr_mle,
+        n_steps_dkl=args.n_steps_dkl,
+        lr_dkl=args.lr_dkl,
+        n_steps_per_ep=args.n_steps_per_ep,
+        patience_per_ep=args.patience_per_ep,
+        oracle_mode=oracle_mode,
+        prior_cfg=prior_cfg,
+        n_restarts_mle=args.n_restarts_mle,
+    )
+
+    # ---- Episode plan: every episode that will actually be evaluated, with
+    # --dataset_dir's skip rules already applied, so the parallel pre-fit pass
+    # below and the evaluation loop after it agree exactly on which episodes
+    # exist and what each one's cache key is. ----
+    episode_plan: list[tuple[int, int, str, dict]] = []
     for local_i in range(n_ep):
         if live_generate:
-            ep_i = local_i
+            # Global index (== local_i unless --episode_offset): what the
+            # generating seed, the cache key and the nested-CV holdout seed
+            # all key off, so shards of one episode stream agree.
+            ep_i = args.episode_offset + local_i
             ep = live_episodes[local_i]
         else:
             ep_i = args.episode_idx + local_i
@@ -1062,52 +1368,96 @@ def main() -> None:
                       f"{min_test_points}), skipping — best_baseline needs enough for "
                       ">=2 nested-CV folds")
                 continue
+        cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, ep_i, ep_i)
+        episode_plan.append((local_i, ep_i, cache_key, ep))
 
-        cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, local_i, ep_i)
-        cached = cache_entries.get(cache_key) if (use_cache and not args.refresh_baselines) else None
-        if cached is not None and not EXPECTED_BASELINE_KEYS.issubset(cached["nlls"].keys()):
-            # Same episode/fingerprint, but this entry predates a baseline
-            # that was added to eval_baselines_episode since it was cached
-            # (e.g. gp_mle_polynomial) — refit everything for this episode
-            # rather than silently serving a result with that key missing.
-            missing = EXPECTED_BASELINE_KEYS - cached["nlls"].keys()
-            print(f"  [ep {ep_i}] cached baselines missing {sorted(missing)} — refitting")
-            cached = None
-        if cached is not None and "y_nlls" not in cached:
-            # Same episode/fingerprint, but this entry predates the total
-            # Y-space NLL addition to eval_baselines_episode — refit rather
-            # than silently leaving the new total-NLL table's baseline rows
-            # as nan for this episode.
-            print(f"  [ep {ep_i}] cached entry predates total-NLL tracking — refitting")
-            cached = None
-        if cached is not None and any(
-            not isinstance(v, dict) for v in cached["y_nlls"].values()
-        ):
-            # Same episode/fingerprint, but this entry predates the
-            # marginal/copula split of y_nlls (each value used to be a bare
-            # total float) — refit rather than crashing on `own["copula"]`
-            # in the per-episode top-5 print below.
-            print(f"  [ep {ep_i}] cached y_nlls predates marginal/copula split — refitting")
-            cached = None
+    # ---- Parallel pre-fit of the expensive, checkpoint-independent half ----
+    # Everything the evaluation loop needs that does NOT depend on --ckpt is
+    # fitted here, across processes, so the loop itself only does the cheap
+    # GPU work. See _prefit_baselines_parallel.
+    n_workers = args.baseline_workers
+    if n_workers <= 0:
+        try:
+            n_avail = len(os.sched_getaffinity(0))
+        except AttributeError:  # pragma: no cover - non-Linux
+            n_avail = os.cpu_count() or 1
+        n_workers = max(1, min(8, n_avail))
+    if baseline_device.type != "cpu" and n_workers > 1:
+        print(f"  [prefit] --baseline_device={baseline_device.type}: forcing "
+              "--baseline_workers=1 (parallel processes would just contend for one GPU)")
+        n_workers = 1
+
+    pending = [
+        (cache_key, _baseline_fit_seed(args.seed, cache_key), ep)
+        for _, ep_i, cache_key, ep in episode_plan
+        if args.refresh_baselines or not use_cache
+        or _valid_cached_entry(cache_entries, cache_key, ep_i) is None
+    ]
+    n_reused = len(episode_plan) - len(pending)
+    print(f"\nBaselines: {n_reused} episode(s) reused from cache, "
+          f"{len(pending)} to fit on {baseline_device.type}"
+          + (f" across {n_workers} worker process(es)" if n_workers > 1 else " serially"))
+    if pending and n_workers > 1:
+        _prefit_baselines_parallel(
+            pending, fit_kwargs, n_workers, args.baseline_cache, fingerprint,
+            cache_entries, use_cache, args.cache_save_every,
+        )
+        # Entries written by the pool are already on disk; the loop below now
+        # finds every episode cached and must not re-save them as "dirty".
+        cache_dirty = False
+
+    for local_i, ep_i, cache_key, ep in episode_plan:
+        cached = (
+            _valid_cached_entry(cache_entries, cache_key, ep_i)
+            if (use_cache and not args.refresh_baselines) else None
+        )
+        # A pooled fit lands in cache_entries even with --no_baseline_cache /
+        # --refresh_baselines (both of which only govern the on-disk file, not
+        # whether this run recomputes an episode it already fitted seconds ago).
+        if cached is None and n_workers > 1:
+            cached = cache_entries.get(cache_key)
         if cached is not None:
             baseline_nlls   = cached["nlls"]
             baseline_R      = {k: v.to(device) for k, v in cached["R_dict"].items()}
             baseline_y_nlls = cached["y_nlls"]
         else:
-            baseline_nlls, baseline_R, baseline_y_nlls = eval_baselines_episode(
-                ep=ep,
-                icl_rank=icl_rank,
-                n_steps_mle=args.n_steps_mle,
-                lr_mle=args.lr_mle,
-                n_steps_dkl=args.n_steps_dkl,
-                lr_dkl=args.lr_dkl,
-                n_steps_per_ep=args.n_steps_per_ep,
-                patience_per_ep=args.patience_per_ep,
-                device=device,
-                oracle_mode=oracle_mode,
-                prior_cfg=prior_cfg,
-                n_restarts_mle=args.n_restarts_mle,
+            # Serial path: --baseline_workers=1, or a GPU --baseline_device.
+            # Fitting happens on baseline_device, but everything downstream
+            # (the nested-CV selection, the plot) expects R on the evaluation
+            # device, so move the results back.
+            #
+            # eval_baselines_episode reseeds the global RNG from fit_seed (see
+            # its docstring). In a worker process that is harmless, but here it
+            # would shift the stream every later episode's ICL-side work draws
+            # from — so snapshot and restore it, leaving the rest of the loop
+            # bit-identical to a run with no baseline fitting in it at all.
+            _rng_cpu = torch.get_rng_state()
+            _rng_cuda = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             )
+            # One BLAS thread, matching _fit_baselines_task, so a fit does not
+            # depend on how many cores the machine happened to offer. Thread
+            # count changes floating-point reduction order, and these fits are
+            # ill-conditioned enough to amplify that: measured on 4 episodes,
+            # 8-thread and 1-thread runs agree to ~1e-5 relative on a typical
+            # baseline but differ by 5.4e4 nats on gp_prior_rbf, whose NLL runs
+            # to ~6e4 on a near-singular R. Pinned to 1, the serial and pooled
+            # paths come out bit-identical across all 284 per-episode numbers.
+            _prev_threads = torch.get_num_threads()
+            if baseline_device.type == "cpu":
+                torch.set_num_threads(1)
+            baseline_nlls, baseline_R, baseline_y_nlls = eval_baselines_episode(
+                ep={k: (v.to(baseline_device) if isinstance(v, Tensor) else v)
+                    for k, v in ep.items()},
+                device=baseline_device,
+                fit_seed=_baseline_fit_seed(args.seed, cache_key),
+                **fit_kwargs,
+            )
+            torch.set_num_threads(_prev_threads)
+            torch.set_rng_state(_rng_cpu)
+            if _rng_cuda is not None:
+                torch.cuda.set_rng_state_all(_rng_cuda)
+            baseline_R = {k: v.to(device) for k, v in baseline_R.items()}
             if use_cache:
                 cache_entries[cache_key] = {
                     "nlls": baseline_nlls,
@@ -1115,6 +1465,11 @@ def main() -> None:
                     "y_nlls": baseline_y_nlls,
                 }
                 cache_dirty = True
+                if args.cache_save_every and (
+                    sum(1 for _ in cache_entries) % args.cache_save_every == 0
+                ):
+                    save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
+                    cache_dirty = False
 
         marginal_pit = None
         if tabicl_marginal is not None or marginal_regressor is not None:
