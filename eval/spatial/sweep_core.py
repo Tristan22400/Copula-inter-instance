@@ -22,7 +22,7 @@ import torch
 from eval.baselines.classical import fit_and_eval_gpytorch
 from eval.configs.constants import (
     GP_BASELINE_KERNELS, GP_LR_MLE, GP_N_RESTARTS_MLE, GP_N_STEPS_MLE, MAX_DIST_PERCENTILE, N_BINS,
-    N_CONTEXT, N_DAYS, N_NLL_TEST, NLL_PROBS, PIT_K_FOLDS, SEED,
+    N_CONTEXT, N_DAYS, N_NLL_TEST, N_YSPACE_MC_SAMPLES, NLL_PROBS, PIT_K_FOLDS, SEED,
 )
 from eval.configs.regions import REGIONS
 from eval.data.era5_io import haversine_distance_km, load_era5_data
@@ -40,10 +40,13 @@ from eval.spatial.diagnostics import (
     load_copula_model,
     load_marginal_tabicl,
     pair_counts_by_distance,
+    pool_yspace_samples_and_correlate,
+    sample_copula_residual_fields,
 )
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import normalize_features
 from loss import gp_oracle_y_nll
+from pit import resolve_pit_ckpt
 
 __all__ = [
     "get_model", "run_real_config", "run_synthetic_config", "build_era5_probe",
@@ -78,10 +81,25 @@ def get_model(ckpt: str, device: "str | None" = None):
     return _MODEL_CACHE[ckpt]
 
 
-def _get_tabicl_regressor(device: str):
-    if device not in _TABICL_REGRESSOR_CACHE:
-        _TABICL_REGRESSOR_CACHE[device] = make_tabicl_regressor(device=device)
-    return _TABICL_REGRESSOR_CACHE[device]
+def _get_tabicl_regressor(source: "str | None", device: str):
+    """Sklearn-wrapper TabICLRegressor for `source` (see
+    src/pit.py::resolve_pit_ckpt), cached per (source, device).
+
+    `source` MUST be resolve_pit_ckpt(cfg) for whichever checkpoint's
+    R_context this regressor's qgrid will be paired with in
+    compute_joint_nll — load_marginal_tabicl (eval/spatial/diagnostics.py)
+    resolves that checkpoint's low-level marginal the same way, so the two
+    never silently disagree (they used to: this used to be a single
+    module-global default regressor shared by every checkpoint, scoring
+    nll_total/nll_copula against a DIFFERENT marginal than whatever
+    `marginal` had produced for any checkpoint with a custom
+    tabicl.pit_ckpt). None reproduces that old default-only behavior, for a
+    from-scratch backbone with no marginal at all.
+    """
+    key = (source, device)
+    if key not in _TABICL_REGRESSOR_CACHE:
+        _TABICL_REGRESSOR_CACHE[key] = make_tabicl_regressor(checkpoint=source, device=device)
+    return _TABICL_REGRESSOR_CACHE[key]
 
 
 def weighted_corr(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
@@ -266,11 +284,13 @@ def run_real_config(
     nll_test_idx = rng.choice(remaining_idx, size=min(N_NLL_TEST, len(remaining_idx)), replace=False)
     x_train_norm, x_test_norm = normalize_features(context_coords, coords)
     x_nll_test_norm = x_test_norm[nll_test_idx]
-    tabicl_reg = _get_tabicl_regressor(resolved_device)
+    # SAME marginal `marginal` above was loaded from (see
+    # _get_tabicl_regressor's docstring for why this must match).
+    tabicl_reg = _get_tabicl_regressor(resolve_pit_ckpt(cfg), resolved_device)
 
     gp_kernels = gp_baseline_kernels if gp_baseline_kernels is not None else GP_BASELINE_KERNELS
 
-    rho_context_per_day = []
+    model_yspace_samples = []  # (n_days * N_YSPACE_MC_SAMPLES, D) once stacked below
     nll_total_per_day, nll_marginal_per_day, nll_copula_per_day = [], [], []
     gp_nll_per_day: dict = {k: {"total": [], "marginal": [], "copula": []} for k in gp_kernels}
     for d in days:
@@ -279,7 +299,18 @@ def run_real_config(
         R_context = extract_model_context_correlation(
             model, resolved_device, marginal, context_coords, context_values, coords, k_folds=PIT_K_FOLDS,
         )
-        rho_context_per_day.append(bin_correlation_by_distance(R_context, dist, bin_edges))
+
+        # Y-space (not R_context's z-space) empirical correlation curve --
+        # see run_real_config's module-level rationale and
+        # pool_yspace_samples_and_correlate's docstring for why this draws
+        # N_YSPACE_MC_SAMPLES and pools across days rather than binning
+        # R_context directly against the raw-y ground truth R_emp.
+        z_batch = rng.standard_normal((N_YSPACE_MC_SAMPLES, D))
+        model_yspace_samples.append(
+            sample_copula_residual_fields(
+                marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch,
+            )
+        )
 
         # Total (marginal+copula) Y-space NLL on the held-out points: a
         # one-shot (non-K-fold — never in context) TabICL quantile grid
@@ -308,7 +339,8 @@ def run_real_config(
             for kname, parts in gp_day.items():
                 for comp in ("total", "marginal", "copula"):
                     gp_nll_per_day[kname][comp].append(parts[comp])
-    rho_context_mean = np.nanmean(np.array(rho_context_per_day), axis=0)
+    R_model_yspace = pool_yspace_samples_and_correlate(model_yspace_samples)
+    rho_model_yspace = bin_correlation_by_distance(R_model_yspace, dist, bin_edges)
     nll_total = float(np.nanmean(nll_total_per_day)) if nll_total_per_day else float("nan")
     nll_marginal = float(np.nanmean(nll_marginal_per_day)) if nll_marginal_per_day else float("nan")
     nll_copula = float(np.nanmean(nll_copula_per_day)) if nll_copula_per_day else float("nan")
@@ -320,13 +352,13 @@ def run_real_config(
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_dummy = bin_correlation_by_distance(R_dummy, dist, bin_edges)
 
-    shape_corr = weighted_corr(rho_context_mean, rho_emp, pair_counts)
-    rmse, bias = weighted_rmse_bias(rho_context_mean, rho_emp, pair_counts)
-    fro_ratio = float(np.sqrt(np.nanmean((rho_context_mean - rho_emp) ** 2)) /
+    shape_corr = weighted_corr(rho_model_yspace, rho_emp, pair_counts)
+    rmse, bias = weighted_rmse_bias(rho_model_yspace, rho_emp, pair_counts)
+    fro_ratio = float(np.sqrt(np.nanmean((rho_model_yspace - rho_emp) ** 2)) /
                        max(np.sqrt(np.nanmean(rho_emp ** 2)), 1e-8))
 
     gt_fit = fit_theoretical_law(dist_centers, rho_emp, pair_counts.astype(int), "matern")
-    model_r2 = weighted_r2(rho_context_mean, rho_emp, pair_counts)
+    model_r2 = weighted_r2(rho_model_yspace, rho_emp, pair_counts)
 
     result = {
         "ckpt": ckpt,
@@ -351,7 +383,7 @@ def run_real_config(
         "dist_centers": dist_centers.tolist(),
         "pair_counts": pair_counts.tolist(),
         "rho_emp": rho_emp.tolist(),
-        "rho_context_mean": rho_context_mean.tolist(),
+        "rho_model_yspace": rho_model_yspace.tolist(),
         "rho_dummy": rho_dummy.tolist(),
     }
     print(f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
