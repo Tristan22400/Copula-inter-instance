@@ -240,6 +240,7 @@ class GlobalERA5Corpus:
             "lat_bounds": (lat_c - half, lat_c + half),
             "lon_bounds": (lon_c - half, lon_c + half),
             "grid_size": grid_size,
+            "day_idx": day_idx,
         }
 
     def sample_episode_fixed_shape(
