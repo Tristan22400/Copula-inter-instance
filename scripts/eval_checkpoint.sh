@@ -28,9 +28,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "[$(date +%H:%M:%S)] OAR job ${OAR_JOB_ID:-local} — host: $(hostname)"
 echo "[$(date +%H:%M:%S)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
+echo "[$(date +%H:%M:%S)] CPU cores available to this job: $(python -c 'import os; print(len(os.sched_getaffinity(0)))' 2>/dev/null || nproc)"
 echo "[$(date +%H:%M:%S)] Evaluating checkpoint..."
 echo "    args: $*"
 
-python eval/runners/eval_checkpoint.py "$@"
+# -u: unbuffered. Python block-buffers stdout when it is a file, so without
+# this an OAR job's .out held nothing but the bash echoes above until the
+# process exited — and a run killed at its walltime therefore showed no
+# progress at all for the whole reservation.
+python -u eval/runners/eval_checkpoint.py "$@"
 
 echo "[$(date +%H:%M:%S)] Evaluation complete."

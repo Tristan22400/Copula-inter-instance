@@ -146,7 +146,13 @@ EXPECTED_BASELINE_KEYS = frozenset(
 # exact same gen_cfg.data as before, so without this the fingerprint would
 # match an old cache built under the old fixed-degree fit and silently keep
 # serving it as if it were still correct.
-_BASELINE_ALGO_VERSION = 1
+#
+# v2: eval_baselines_episode takes `fit_seed` and reseeds torch from it, so a
+# fit depends only on (episode, hyperparameters) and no longer on how many
+# episodes happened to be drawn from the global RNG before it. v1 entries were
+# produced under the old order-dependent stream and are not reproducible
+# results of the current code, so they must not be served as if they were.
+_BASELINE_ALGO_VERSION = 2
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
@@ -896,9 +902,22 @@ def eval_baselines_episode(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
+    fit_seed: int | None = None,
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
     """Evaluate every classical/fitted baseline (everything except the ICL
     model and the oracle) on one episode, under identical conventions.
+
+    fit_seed, when given, reseeds torch at entry so this episode's fit depends
+    only on (episode, hyperparameters, fit_seed). Every stochastic choice in
+    here draws from the global torch RNG — GP-MLE's random restart inits
+    (_randomize_init, plus the sampled noise init), DKL's MLP init and its
+    validation split, per_ep_transformer's init and its support/query
+    resampling — so without it a fit also depends on how many episodes were
+    drawn from that stream beforehand. That order-dependence makes a cached
+    entry unreproducible, and is outright wrong once episodes are fitted
+    across worker processes (each with its own RNG) or split into shards.
+    Callers should derive it from the episode's GLOBAL index so the same
+    episode fits identically however the run was partitioned.
 
     Split out from ICL/oracle evaluation so these (expensive: many Adam
     restarts per GP-MLE kernel, DKL training, per-episode-transformer
@@ -927,6 +946,9 @@ def eval_baselines_episode(
                        independence/gp_prior_rbf are unfit references, not
                        included here (mirrors _NON_FITTED_EXCLUDED).
     """
+    if fit_seed is not None:
+        torch.manual_seed(fit_seed)
+
     X_train = ep["x_norm_train"].to(device)      # (P, d_x)
     y_train = ep["y_train"].to(device)            # (P,)  raw target, used to fit the GP-MLE/DKL baselines
     z_train_self = _standardize_y(y_train)        # (P,) z-scored y_train, used to train per_ep_transformer
@@ -1143,8 +1165,19 @@ def load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
 
 
 def save_baseline_cache(path: str, fingerprint: dict, entries: dict[str, dict]) -> None:
+    """Write the cache atomically (temp file + os.replace).
+
+    Callers now save periodically mid-run rather than only at the end, so a
+    walltime kill lands during a write far more often than it used to. A
+    half-written file would be worse than no file at all: load_baseline_cache
+    would fail to torch.load it and silently refit everything, throwing away
+    exactly the hours this cache exists to protect. os.replace is atomic on
+    POSIX, so the previous save stays intact until the new one is complete.
+    """
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    torch.save({"fingerprint": fingerprint, "entries": entries}, path)
-    print(f"  [baseline_cache] saved {len(entries)} episode(s) to {path}")
+    tmp = f"{path}.tmp{os.getpid()}"
+    torch.save({"fingerprint": fingerprint, "entries": entries}, tmp)
+    os.replace(tmp, path)
+    print(f"  [baseline_cache] saved {len(entries)} episode(s) to {path}", flush=True)
