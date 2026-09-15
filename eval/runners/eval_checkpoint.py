@@ -65,7 +65,12 @@ consequences, both handled by the defaults:
   * --baseline_workers spreads episodes (perfectly independent) across
     processes, defaulting to the cores actually allocated to the job.
 
-Together these take a 400-episode run from ~72 h to a few hours. Note what is
+Measured end to end on a real 400-episode run: 78.6 s/episode against the
+649 s/episode above, i.e. ~8x, on an allocation of 8 logical CPUs that were
+only 4 physical cores. Speedup is ~2x from the device and the rest from
+PHYSICAL core count, so ask the scheduler for real cores rather than threads
+(see _count_physical_cores, which prints the distinction at startup). Note
+what is
 NOT a speed knob: --n_steps_mle materially changes the reported baseline
 numbers rather than merely refining them (under oracle_mode="prior", longer
 fits sharpen the fitted kernel's prior correlation at the test points and the
@@ -638,6 +643,26 @@ def _fit_baselines_task(payload: tuple) -> tuple:
     }, None
 
 
+def _count_physical_cores(cpus: set[int]) -> int:
+    """How many distinct physical cores the given logical CPUs sit on.
+
+    A scheduler allocation is reported in logical CPUs, which on a
+    hyperthreaded node can be half as many real cores — and baseline fitting
+    scales with the real ones. Returns 0 if the topology is unreadable, in
+    which case the caller simply says nothing.
+    """
+    cores = set()
+    for c in cpus:
+        try:
+            with open(
+                f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
+            ) as fh:
+                cores.add(fh.read().strip())
+        except OSError:
+            return 0
+    return len(cores)
+
+
 def _baseline_fit_seed(seed: int, cache_key: str) -> int:
     """Deterministic per-episode seed for baseline fitting.
 
@@ -1160,8 +1185,11 @@ def main() -> None:
                              "capped at 8. 1 fits serially in-process, as before. Only "
                              "used with --baseline_device=cpu: spreading GPU fits across "
                              "processes just contends for one device. Combined with the "
-                             "cpu default this is the main speedup — ~2x from the device "
-                             "plus ~Nx from the cores.")
+                             "cpu default this is the main speedup — ~2x from the device, "
+                             "the rest from cores. Scaling tracks PHYSICAL cores: measured "
+                             "78.6 s/episode vs 649 s on GPU (~8x) where the 8 allocated "
+                             "logical CPUs were only 4 physical ones, so ask the scheduler "
+                             "for real cores, not threads.")
     parser.add_argument("--episode_offset", type=int, default=0,
                         help="Global index of the first live-generated episode (ignored "
                              "unless --live_generate). Lets one episode stream be split "
@@ -1376,12 +1404,24 @@ def main() -> None:
     # fitted here, across processes, so the loop itself only does the cheap
     # GPU work. See _prefit_baselines_parallel.
     n_workers = args.baseline_workers
+    try:
+        _aff = os.sched_getaffinity(0)
+    except AttributeError:  # pragma: no cover - non-Linux
+        _aff = set(range(os.cpu_count() or 1))
+    n_physical = _count_physical_cores(_aff)
     if n_workers <= 0:
-        try:
-            n_avail = len(os.sched_getaffinity(0))
-        except AttributeError:  # pragma: no cover - non-Linux
-            n_avail = os.cpu_count() or 1
-        n_workers = max(1, min(8, n_avail))
+        n_workers = max(1, min(8, len(_aff)))
+    if n_physical and n_physical < len(_aff):
+        # Scaling tracks PHYSICAL cores, not the logical count: these fits are
+        # compute-bound enough that a hyperthread sibling adds well under a
+        # full core. Measured on an allocation of 8 logical CPUs that were only
+        # 4 physical cores (Xeon E5-2623 v3): 78.6 s/episode against 649 s on a
+        # GPU — ~8x, where 8 real cores would have given roughly twice that.
+        # Worth printing, because "8 cores" from the scheduler looks like 8.
+        print(f"  [prefit] note: the {len(_aff)} allocated logical CPUs are only "
+              f"{n_physical} physical core(s) ({len(_aff) // n_physical} threads each) — "
+              "expect scaling closer to the physical count; request more cores "
+              "from the scheduler for a proportionally faster run")
     if baseline_device.type != "cpu" and n_workers > 1:
         print(f"  [prefit] --baseline_device={baseline_device.type}: forcing "
               "--baseline_workers=1 (parallel processes would just contend for one GPU)")
