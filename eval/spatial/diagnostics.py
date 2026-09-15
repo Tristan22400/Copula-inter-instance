@@ -37,6 +37,8 @@ __all__ = [
     "empirical_spatial_correlation",
     "morans_i",
     "predict_copula_residual_field",
+    "sample_copula_residual_fields",
+    "pool_yspace_samples_and_correlate",
     "load_copula_model",
     "load_marginal_tabicl",
     "extract_model_dummy_context_correlation",
@@ -111,28 +113,44 @@ def morans_i(field: np.ndarray) -> float:
     return float(field.size * numerator / (n_edges * denominator))
 
 
-def predict_copula_residual_field(
+def sample_copula_residual_fields(
     tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
-    coords_test: np.ndarray, R_context: np.ndarray, device: str, z_shared: np.ndarray,
+    coords_test: np.ndarray, R_context: np.ndarray, device: str, z_shared_batch: np.ndarray,
 ) -> np.ndarray:
-    """One joint draw (D,) from the copula model's implied residual field:
-    inject `R_context` into the shared latent Gaussian vector `z_shared` via
-    Cholesky, then map each coordinate through the frozen TabICL marginal
-    quantile function (conditioned on the same real context) — i.e.
-    y = F_hat^{-1}(Phi(z)). Falls back to a naive Gaussian(mean, std)
+    """K joint draws (K, D) from the copula model's implied residual field —
+    the batched form of predict_copula_residual_field (which now delegates
+    here with K=1), sharing ONE marginal forward pass across all K draws
+    instead of repeating it: the TabICL forward pass is the expensive part
+    of a draw, the Cholesky/icdf step is cheap, so batching only the latter
+    over `z_shared_batch` (K, D) rows is what makes drawing many samples
+    (e.g. to empirically estimate a y-space correlation curve — see
+    eval/spatial/sweep_core.py::run_real_config) affordable.
+
+    Each row z_shared_batch[k] is injected into `R_context` via Cholesky,
+    then mapped through the frozen TabICL marginal quantile function
+    (conditioned on the same real context) — i.e. y_k = F_hat^{-1}(Phi(L
+    @ z_shared_batch[k])). Falls back to a naive Gaussian(mean, std)
     marginal if `tabicl_marginal` is None (scratch-trained backbone).
+
+    Internally works in (D, K) — quantile_dist.icdf requires its `alpha`
+    argument shaped (*batch_shape, n) where batch_shape=(D,) is the fitted
+    per-point distribution batch and n is the number of levels to evaluate
+    PER point, not an arbitrary extra leading batch dim (it does not
+    broadcast one in) — so the K samples must be icdf's trailing axis, not
+    a leading one. Transposed back to (K, D) — samples as rows, matching
+    empirical_spatial_correlation's own (n_obs, D) convention — on return.
     """
     from scipy.stats import norm
 
     L = safe_cholesky(R_context)
-    z_copula = L @ z_shared
-    u_copula = np.clip(norm.cdf(z_copula), 1e-6, 1.0 - 1e-6)
+    z_copula = L @ np.asarray(z_shared_batch).T  # (D, K)
+    u_copula = np.clip(norm.cdf(z_copula), 1e-6, 1.0 - 1e-6)  # (D, K)
 
     y_mean = context_values.mean()
     y_std = max(context_values.std(), 1e-8)
 
     if tabicl_marginal is None:
-        return y_mean + y_std * z_copula
+        return (y_mean + y_std * z_copula).T  # (K, D)
 
     import torch
 
@@ -149,10 +167,40 @@ def predict_copula_residual_field(
     with torch.no_grad():
         logits = tabicl_marginal(x_batch, y_train_batch)  # (1, N, Q) -- N test rows only
         n_test = coords_test.shape[0]
-        dist = tabicl_marginal.quantile_dist(logits.reshape(n_test, -1))
-        u_t = torch.as_tensor(u_copula, dtype=torch.float32, device=device).unsqueeze(-1)
-        y_pred_scaled = dist.icdf(u_t).squeeze(-1).double()
-    return (y_mean_t.double() + y_std_t.double() * y_pred_scaled).cpu().numpy()
+        dist = tabicl_marginal.quantile_dist(logits.reshape(n_test, -1))  # batch_shape=(N,)
+        u_t = torch.as_tensor(u_copula, dtype=torch.float32, device=device)  # (N, K)
+        y_pred_scaled = dist.icdf(u_t).double()  # (N, K)
+    return (y_mean_t.double() + y_std_t.double() * y_pred_scaled).T.cpu().numpy()  # (K, N)
+
+
+def pool_yspace_samples_and_correlate(samples_per_day: list) -> np.ndarray:
+    """np.corrcoef of every per-day (K, D) sample_copula_residual_fields
+    batch pooled into one (n_days*K, D) observation matrix — the "single
+    draw is noisy, pool many" idiom shared by
+    eval/spatial/sweep_core.py::run_real_config's rho_model_yspace and
+    eval/runners/spatial_correlation_eval.py::_diagnose_real's
+    model_context/dummy_context curves (see N_YSPACE_MC_SAMPLES in
+    eval/configs/constants.py for why pooling matters, and
+    run_benchmarks.py's single-episode outer(z,z) proxy for the same idea
+    applied across episodes instead of days)."""
+    return np.corrcoef(np.concatenate(samples_per_day, axis=0).T)
+
+
+def predict_copula_residual_field(
+    tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
+    coords_test: np.ndarray, R_context: np.ndarray, device: str, z_shared: np.ndarray,
+) -> np.ndarray:
+    """One joint draw (D,) from the copula model's implied residual field —
+    a K=1 convenience wrapper around sample_copula_residual_fields (see its
+    docstring for the injection formula and the naive-fallback behavior).
+    Prefer calling that directly for K>1 (e.g. an empirical y-space
+    correlation estimate), since this re-runs the expensive marginal
+    forward pass on every call.
+    """
+    return sample_copula_residual_fields(
+        tabicl_marginal, context_coords, context_values, coords_test, R_context, device,
+        np.asarray(z_shared)[None, :],
+    )[0]
 
 
 # ---------------------------------------------------------------------------
@@ -174,20 +222,41 @@ def load_copula_model(ckpt_path: str, device: "str | None" = None):
 
 
 def load_marginal_tabicl(cfg, device: str):
-    """Load the frozen, pretrained TabICL quantile regressor used ONLY as a
-    marginal-CDF oracle for the PIT transform in
-    extract_model_context_correlation — NOT the same object as the
-    CopulaTabICL backbone in load_copula_model. Returns None (with a
-    warning) if the checkpoint's backbone was trained from scratch."""
-    if not bool(cfg.tabicl.get("pretrained", True)):
-        print("Warning: cfg.tabicl.pretrained=False — no pretrained quantile "
-              "head available for PIT; context z_train will fall back to "
-              "naive standardization.")
+    """Load the frozen TabICL quantile regressor used ONLY as a marginal-CDF
+    oracle for the PIT transform in extract_model_context_correlation — NOT
+    the same object as the CopulaTabICL backbone in load_copula_model.
+
+    Resolves which checkpoint via src/pit.py::resolve_pit_ckpt — the same
+    resolver eval/spatial/sweep_core.py::run_real_config uses to build its
+    qgrid, so the two never silently disagree on which marginal a given
+    checkpoint means (they used to: run_real_config hardcoded a module-
+    global default TabICLRegressor regardless of what this function had
+    loaded, scoring nll_copula/nll_total against a "R_context + unrelated
+    marginal" hybrid for any checkpoint whose own tabicl.pit_ckpt differed
+    from that default).
+
+    Returns None (with a warning) if resolve_pit_ckpt finds no usable
+    marginal (from-scratch backbone, no pit_ckpt set), or if loading the
+    resolved source fails (e.g. a checkpoint's embedded tabicl.pit_ckpt
+    naming a path that no longer exists after a checkpoints/ reorg) — a
+    reference marginal is never worth killing a whole sweep/diagnose run
+    over; the caller falls back to naive z_train standardization either
+    way."""
+    from src.pit import load_tabicl, resolve_pit_ckpt
+
+    source = resolve_pit_ckpt(cfg)
+    if source is None:
+        print("Warning: cfg.tabicl.pretrained=False and no pit_ckpt set — "
+              "no usable marginal for PIT; context z_train will fall back "
+              "to naive standardization.")
         return None
 
-    from src.pit import load_tabicl
-
-    return load_tabicl(cfg.tabicl.ckpt, device)
+    try:
+        return load_tabicl(source, device)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: failed to load marginal '{source}' ({exc}); "
+              "context z_train will fall back to naive standardization.")
+        return None
 
 
 def _forward_correlation(model, device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray) -> np.ndarray:
