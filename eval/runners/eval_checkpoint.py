@@ -132,6 +132,7 @@ from pit import (  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
+    GP_VAL_SELECT_MODES,
     assert_shared_z_test,
     baseline_fingerprint,
     corr_nll_single,
@@ -1272,23 +1273,24 @@ def main() -> None:
     parser.add_argument("--no_results_cache", action="store_true",
                         help="Disable the scored-results cache: always re-score every "
                              "episode and never read or write --results_cache.")
-    parser.add_argument("--gp_val_select", action=argparse.BooleanOptionalAction, default=True,
-                        help="Pick each GP-MLE fit on a held-out 20%% split of the "
-                             "episode's training points -- both which step within a "
-                             "restart and which of --n_restarts_mle restarts -- instead "
-                             "of running to --n_steps_mle and keeping the lowest TRAINING "
-                             "loss. On by default because the old behaviour badly "
-                             "over-fits the ARD kernels: measured over 8 episodes on the "
-                             "posterior predictive at the real y_test, ard_rbf is +6.06 "
-                             "nats/point worse at 1000 steps than at its own optimum (10 "
-                             "steps), ard_rq +1.30 and ard_matern32 +0.85, while the "
-                             "non-ARD kernels are within 0.003. The cause is ARD "
-                             "lengthscales running away unbounded (9 of them from P=32 "
-                             "points), not optimiser divergence -- see "
-                             "eval.baselines.classical.fit_and_eval_gpytorch. Costs 20%% "
-                             "of the fitting points for hyperparameter selection; the "
-                             "final predictive still conditions on all of X_train. Pass "
-                             "--no-gp_val_select to reproduce pre-v3 baseline numbers.")
+    parser.add_argument("--gp_val_select", choices=GP_VAL_SELECT_MODES, default="ard",
+                        help="Which GP-MLE kernels pick their fit on a held-out 20%% "
+                             "split of the episode's training points -- both which step "
+                             "within a restart and which of --n_restarts_mle restarts -- "
+                             "instead of running to --n_steps_mle and keeping the lowest "
+                             "TRAINING loss. 'ard' (default) applies it to the ARD "
+                             "kernels only, 'always' to every kernel, 'never' restores "
+                             "the pre-v3 behaviour. ARD needs it: it fits one lengthscale "
+                             "per input dimension (9 from P=32 points), the LogNormal "
+                             "prior does not hold them, and they run away unbounded -- "
+                             "ard_rbf ends up +6.06 nats/point worse at 1000 steps than "
+                             "at its own optimum (10 steps). The non-ARD kernels do not: "
+                             "with 2-3 hyperparameters the prior regularises them "
+                             "adequately, so the split is pure data loss (dot_product, a "
+                             "linear kernel with nothing to overfit, measures +0.36 "
+                             "nats/point WORSE under 'always'). See "
+                             "eval.baselines.classical._resolve_val_select for the "
+                             "per-kernel numbers.")
     parser.add_argument("--cache_save_every", type=int, default=0,
                         help="Additionally consolidate --baseline_cache into its single "
                              "legacy file every N episodes (0 = never, the default). "

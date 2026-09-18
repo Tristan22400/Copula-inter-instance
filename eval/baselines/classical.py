@@ -97,6 +97,7 @@ __all__ = [
     "load_baseline_cache",
     "save_baseline_cache",
     "save_baseline_entry",
+    "GP_VAL_SELECT_MODES",
     "EXPECTED_BASELINE_KEYS",
     "assert_shared_z_test",
 ]
@@ -159,6 +160,46 @@ EXPECTED_BASELINE_KEYS = frozenset(
 # fit_and_eval_gpytorch's docstring for the measured ARD overfitting this
 # fixes. v2 entries hold systematically over-fit ARD rows (up to +6 nats/pt).
 _BASELINE_ALGO_VERSION = 3
+
+
+GP_VAL_SELECT_MODES = ("ard", "always", "never")
+
+
+def _resolve_val_select(mode: str, ard: bool) -> bool:
+    """Whether THIS kernel should pick its fit on a held-out split.
+
+    Held-out selection buys protection against hyperparameter overfitting and
+    costs 20% of an already-small P (32 points) — so it is worth it exactly
+    where the free-parameter count is large relative to P, and a net loss
+    where it is not. Measured over 8 episodes on the posterior predictive at
+    the real y_test (nats/point, negative = better):
+
+        ard_rbf        -2.58      dot_product    +0.36
+        ard_rq         -2.72      rational_quad  -0.13
+        ard_matern32   -0.48      rbf            -0.01
+                                  matern32       -0.00
+                                  periodic       +0.00
+
+    ARD carries one lengthscale per input dimension (9 here), which the
+    LogNormal prior does not hold; the non-ARD kernels have 2-3
+    hyperparameters that the same prior regularises adequately, so for them
+    the split is pure data loss. dot_product is the clearest case — a linear
+    kernel with variance and noise and no lengthscale at all, nothing to
+    overfit, so it only pays the cost.
+
+    "ard" (default) follows that split; "always" applies it everywhere;
+    "never" restores the pre-v3 behaviour of running to n_steps and keeping
+    the lowest TRAINING loss.
+    """
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if mode == "ard":
+        return ard
+    raise ValueError(
+        f"gp_val_select={mode!r} is not one of {GP_VAL_SELECT_MODES}"
+    )
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
@@ -942,7 +983,7 @@ def eval_baselines_episode(
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
     fit_seed: int | None = None,
-    gp_val_select: bool = True,
+    gp_val_select: str = "ard",
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
     """Evaluate every classical/fitted baseline (everything except the ICL
     model and the oracle) on one episode, under identical conventions.
@@ -1037,11 +1078,15 @@ def eval_baselines_episode(
         for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
             label = _LABEL_MAP[(kname, ard)]
             try:
+                # "ard" (the default) spends the held-out split only where the
+                # hyperparameter count is large relative to P — see
+                # _resolve_val_select.
                 fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                              n_steps=n_steps_mle, lr=lr_mle, ard=ard,
                                              oracle_mode=oracle_mode, prior_cfg=prior_cfg,
                                              n_restarts=n_restarts_mle,
-                                             val_select=gp_val_select)
+                                             val_select=_resolve_val_select(
+                                                 gp_val_select, ard))
                 nlls[label] = corr_nll_single(fit["R"], z_test)
                 R_dict[label] = fit["R"]
                 y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
@@ -1136,7 +1181,7 @@ def baseline_fingerprint(
     lr_dkl: float,
     n_steps_per_ep: int,
     patience_per_ep: int,
-    gp_val_select: bool = True,
+    gp_val_select: str = "ard",
 ) -> dict:
     """Everything that determines the *baseline* fit results for an episode,
     other than which episode it is (see episode_cache_key for that half).
