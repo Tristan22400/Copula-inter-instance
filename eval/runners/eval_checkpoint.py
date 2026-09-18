@@ -1316,10 +1316,12 @@ def main() -> None:
                              "follows --device; pass cuda to reproduce the old behaviour.")
     parser.add_argument("--baseline_workers", type=int, default=0,
                         help="Worker processes for fitting baselines, which are perfectly "
-                             "independent across episodes. 0 (default) = auto: the number "
-                             "of cores this process is actually allowed to use "
-                             "(os.sched_getaffinity, so an OAR allocation is respected), "
-                             "capped at 8. 1 fits serially in-process, as before. Only "
+                             "independent across episodes. 0 (default) = auto: one per "
+                             "PHYSICAL core this process is allowed to use "
+                             "(os.sched_getaffinity, so an OAR allocation is respected; "
+                             "hyperthread siblings are not counted twice because they add "
+                             "well under a core here), capped at 32. 1 fits serially "
+                             "in-process, as before. Only "
                              "used with --baseline_device=cpu: spreading GPU fits across "
                              "processes just contends for one device. Combined with the "
                              "cpu default this is the main speedup — ~2x from the device, "
@@ -1560,7 +1562,15 @@ def main() -> None:
         _aff = set(range(os.cpu_count() or 1))
     n_physical = _count_physical_cores(_aff)
     if n_workers <= 0:
-        n_workers = max(1, min(8, len(_aff)))
+        # Scale with PHYSICAL cores (see _count_physical_cores): a hyperthread
+        # sibling adds well under a full core on this workload, and one worker
+        # per physical core is what the measured ~2x-device x Nx-cores speedup
+        # assumes. Capped at 32 only to bound memory and process churn on a
+        # very large allocation; raise it with --baseline_workers if you have
+        # the cores. A fixed low cap silently wasted most of a big node --
+        # observed on a 24-physical-core allocation where the old cap of 8
+        # left two thirds of it idle.
+        n_workers = max(1, min(32, n_physical or len(_aff)))
     if n_physical and n_physical < len(_aff):
         # Scaling tracks PHYSICAL cores, not the logical count: these fits are
         # compute-bound enough that a hyperthread sibling adds well under a
