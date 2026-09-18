@@ -139,6 +139,7 @@ from eval.baselines.classical import (  # noqa: E402
     eval_baselines_episode,
     load_baseline_cache,
     save_baseline_cache,
+    save_baseline_entry,
 )
 from eval.viz.correlation_plots import plot_corr_grid  # noqa: E402
 
@@ -643,6 +644,96 @@ def _fit_baselines_task(payload: tuple) -> tuple:
     }, None
 
 
+def _results_fingerprint(baseline_fp: dict, args, tabicl_pit_k_folds: int) -> dict:
+    """Everything that determines an episode's SCORED results, not just its
+    fitted baselines.
+
+    Strictly wider than baseline_fingerprint: baseline fits are deliberately
+    checkpoint-independent (that is what lets one cache serve many --ckpt
+    runs), but the numbers this runner reports are not — they include the ICL
+    model's own NLL, the marginal PIT it conditions on, and the nested-CV
+    best_baseline pick. Reusing a scored episode across a different --ckpt
+    would silently report the OLD checkpoint's results, so the checkpoint and
+    every marginal/CV setting belong in this key.
+    """
+    ckpt = os.path.abspath(args.ckpt) if args.ckpt else None
+    try:
+        ckpt_mtime = os.path.getmtime(ckpt) if ckpt and os.path.exists(ckpt) else None
+    except OSError:
+        ckpt_mtime = None
+    return {
+        "baseline": baseline_fp,
+        "ckpt": ckpt,
+        "ckpt_mtime": ckpt_mtime,
+        "z_train_source": args.z_train_source,
+        "tabicl_ckpt": (os.path.abspath(args.tabicl_ckpt)
+                        if args.tabicl_ckpt else None),
+        "tabicl_pit_k_folds": tabicl_pit_k_folds,
+        "tabicl_amp": args.tabicl_amp,
+        "marginal_probs_n": args.marginal_probs_n,
+        "n_folds": args.n_folds,
+        "min_fold_size": args.min_fold_size,
+        "seed": args.seed,
+    }
+
+
+def _jsonable(obj):
+    """Plain-Python copy of a nested result dict, for the JSON results cache.
+
+    The per-episode values are floats almost everywhere, but a few come
+    straight out of torch (gp_analytical_posterior's raw sums), and a 0-dim
+    tensor would make json.dump raise mid-run — after the episode was already
+    computed, which is exactly the work the cache exists to protect.
+    """
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, Tensor):
+        return obj.item() if obj.ndim == 0 else obj.tolist()
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        return obj
+    return float(obj)
+
+
+def _load_results_cache(path: str, fingerprint: dict) -> dict[str, dict]:
+    """Per-episode scored results from a previous, possibly interrupted run."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as fh:
+            blob = json.load(fh)
+    except Exception as exc:
+        print(f"  [results_cache] failed to read {path}: {exc} — starting fresh")
+        return {}
+    if blob.get("fingerprint") != fingerprint:
+        print(f"  [results_cache] {path} was produced under different settings "
+              "(checkpoint, marginal or episode config) — ignoring it")
+        return {}
+    entries = blob.get("episodes", {})
+    print(f"  [results_cache] resuming with {len(entries)} already-scored episode(s) "
+          f"from {path}")
+    return entries
+
+
+def _save_results_cache(path: str, fingerprint: dict, entries: dict[str, dict]) -> None:
+    """Write scored results atomically.
+
+    Called after EVERY episode rather than every N: unlike the baseline cache
+    (whose entries carry N x N R matrices, ~4.3 MB each), these are a few
+    dozen floats per episode, so rewriting the whole file each time is
+    negligible and there is no reason to risk losing even one episode's ICL
+    forward pass, marginal PIT and CV selection.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as fh:
+        json.dump({"fingerprint": fingerprint, "episodes": entries}, fh)
+    os.replace(tmp, path)
+
+
 def _count_physical_cores(cpus: set[int]) -> int:
     """How many distinct physical cores the given logical CPUs sit on.
 
@@ -760,6 +851,11 @@ def _prefit_baselines_parallel(
             else:
                 cache_entries[cache_key] = result
                 since_save += 1
+                if use_cache:
+                    # One small file per episode, written the moment it is
+                    # fitted — see save_baseline_entry. Nothing completed is
+                    # ever lost, and the cost does not grow with the cache.
+                    save_baseline_entry(cache_path, fingerprint, cache_key, result)
 
             elapsed = time.time() - t0
             rate = elapsed / done
@@ -771,11 +867,16 @@ def _prefit_baselines_parallel(
                 flush=True,
             )
 
-            if use_cache and since_save >= save_every and done < total:
+            # save_every=0 (the default) means "never consolidate": durability
+            # is already covered by the per-episode shard above. Guarding on
+            # save_every matters — `since_save >= 0` is vacuously true, which
+            # would rewrite the whole (eventually ~1.7 GB) cache once per
+            # episode, the exact cost sharding exists to avoid.
+            if use_cache and save_every and since_save >= save_every and done < total:
                 save_baseline_cache(cache_path, fingerprint, cache_entries)
                 since_save = 0
 
-    if use_cache and since_save:
+    if use_cache and save_every and since_save:
         save_baseline_cache(cache_path, fingerprint, cache_entries)
     print(
         f"  [prefit] fitted {done - failures}/{total} episode(s) on "
@@ -1155,17 +1256,51 @@ def main() -> None:
                         help="Recompute every baseline even if a matching cache entry "
                              "exists, overwriting it (still writes --baseline_cache unless "
                              "--no_baseline_cache is also given).")
-    parser.add_argument("--cache_save_every", type=int, default=25,
-                        help="Write --baseline_cache to disk every N episodes fitted, "
-                             "instead of only once after every episode is done. A full "
-                             "run is many hours and the cache exists precisely so a LATER "
-                             "run against a different --ckpt is nearly free — saving only "
-                             "at the end meant any run that hit its OAR walltime (the "
-                             "common case at large --n_episodes) persisted nothing and "
-                             "left the next run to refit from scratch. Each save rewrites "
-                             "the whole file atomically (~4 MB per cached episode at "
-                             "N=256), so lower values cost more I/O; 0 restores the old "
-                             "save-only-at-the-end behaviour.")
+    parser.add_argument("--results_cache", default="./eval_results_partial.json",
+                        help="Per-episode SCORED results (every table this script "
+                             "prints), written after each episode and reused on a "
+                             "restart. --baseline_cache only spares the classical "
+                             "fitting; the ICL forward pass, the marginal PIT and the "
+                             "nested-CV best_baseline pick lived only in memory until "
+                             "the summary tables, so an interrupted run used to re-score "
+                             "every episode. Unlike --baseline_cache this key INCLUDES "
+                             "the checkpoint and every marginal/CV setting (results "
+                             "depend on --ckpt; baseline fits deliberately do not), so "
+                             "pointing two different checkpoints at one path makes the "
+                             "second ignore the first's entries rather than report them "
+                             "— give concurrent runs distinct paths.")
+    parser.add_argument("--no_results_cache", action="store_true",
+                        help="Disable the scored-results cache: always re-score every "
+                             "episode and never read or write --results_cache.")
+    parser.add_argument("--gp_val_select", action=argparse.BooleanOptionalAction, default=True,
+                        help="Pick each GP-MLE fit on a held-out 20%% split of the "
+                             "episode's training points -- both which step within a "
+                             "restart and which of --n_restarts_mle restarts -- instead "
+                             "of running to --n_steps_mle and keeping the lowest TRAINING "
+                             "loss. On by default because the old behaviour badly "
+                             "over-fits the ARD kernels: measured over 8 episodes on the "
+                             "posterior predictive at the real y_test, ard_rbf is +6.06 "
+                             "nats/point worse at 1000 steps than at its own optimum (10 "
+                             "steps), ard_rq +1.30 and ard_matern32 +0.85, while the "
+                             "non-ARD kernels are within 0.003. The cause is ARD "
+                             "lengthscales running away unbounded (9 of them from P=32 "
+                             "points), not optimiser divergence -- see "
+                             "eval.baselines.classical.fit_and_eval_gpytorch. Costs 20%% "
+                             "of the fitting points for hyperparameter selection; the "
+                             "final predictive still conditions on all of X_train. Pass "
+                             "--no-gp_val_select to reproduce pre-v3 baseline numbers.")
+    parser.add_argument("--cache_save_every", type=int, default=0,
+                        help="Additionally consolidate --baseline_cache into its single "
+                             "legacy file every N episodes (0 = never, the default). "
+                             "Durability no longer depends on this: every fitted episode "
+                             "is written immediately as its own shard under "
+                             "<--baseline_cache>.d/, which costs one ~4 MB write instead "
+                             "of rewriting a cache that reaches ~1.7 GB over 400 "
+                             "episodes. Batched whole-file saves were the old compromise "
+                             "between I/O and durability, and they still lost work: a run "
+                             "killed at episode 72 under the previous default of 25 had "
+                             "persisted only 50. Shards are read back automatically "
+                             "alongside any existing legacy file.")
     parser.add_argument("--baseline_device", default="cpu", choices=["cpu", "cuda", "auto"],
                         help="Device for fitting the classical baselines (GP-MLE/DKL/"
                              "per_ep_transformer) only — the ICL model, TabICL marginal "
@@ -1352,9 +1487,21 @@ def main() -> None:
         cfg, live_generate, args.dataset_dir, args.seed, icl_rank, oracle_mode,
         args.n_steps_mle, args.lr_mle, args.n_restarts_mle,
         args.n_steps_dkl, args.lr_dkl, args.n_steps_per_ep, args.patience_per_ep,
+        gp_val_select=args.gp_val_select,
     )
     cache_entries = load_baseline_cache(args.baseline_cache, fingerprint) if use_cache else {}
     cache_dirty = False
+
+    # ---- Scored-results cache: the checkpoint-DEPENDENT half of a resume ----
+    use_results_cache = not args.no_results_cache
+    results_fp = _results_fingerprint(fingerprint, args, tabicl_pit_k_folds)
+    results_entries = (
+        _load_results_cache(args.results_cache, results_fp) if use_results_cache else {}
+    )
+    if use_results_cache and args.refresh_baselines:
+        # Refit implies rescore: the results were produced from the very fits
+        # being thrown away.
+        results_entries = {}
 
     baseline_device = torch.device(
         str(device) if args.baseline_device == "auto" else args.baseline_device
@@ -1370,6 +1517,7 @@ def main() -> None:
         oracle_mode=oracle_mode,
         prior_cfg=prior_cfg,
         n_restarts_mle=args.n_restarts_mle,
+        gp_val_select=args.gp_val_select,
     )
 
     # ---- Episode plan: every episode that will actually be evaluated, with
@@ -1504,12 +1652,37 @@ def main() -> None:
                     "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
                     "y_nlls": baseline_y_nlls,
                 }
+                # Shard first: this episode is now safe on disk regardless of
+                # what --cache_save_every does below.
+                save_baseline_entry(
+                    args.baseline_cache, fingerprint, cache_key, cache_entries[cache_key],
+                )
                 cache_dirty = True
                 if args.cache_save_every and (
-                    sum(1 for _ in cache_entries) % args.cache_save_every == 0
+                    len(cache_entries) % args.cache_save_every == 0
                 ):
                     save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
                     cache_dirty = False
+
+        # ---- Already-scored episode? Reuse and skip the GPU work ----
+        # The baseline cache above only spares the fitting; the ICL forward
+        # pass, the marginal PIT and the nested-CV selection below used to be
+        # redone on every restart because their results lived purely in the
+        # in-memory accumulators until the summary tables at the end of main().
+        # An interrupted run therefore resumed with correct baselines but
+        # re-scored every episode from scratch.
+        want_plot = (local_i == args.plot_episode)
+        res_cached = results_entries.get(str(ep_i)) if use_results_cache else None
+        if res_cached is not None and not want_plot:
+            # want_plot is excluded because the corr_grid figure needs this
+            # episode's live R matrices, which the results cache does not keep
+            # (they are large, and only one episode is ever plotted).
+            all_y_space_nlls.append(res_cached["y_space_nlls"])
+            all_total_nlls.append(res_cached["total_nlls"])
+            all_episode_meta.append(res_cached["meta"])
+            all_nlls.append(res_cached["nlls"])
+            print(f"  ep {ep_i:04d}: reusing scored results (--results_cache)")
+            continue
 
         marginal_pit = None
         if tabicl_marginal is not None or marginal_regressor is not None:
@@ -1572,6 +1745,19 @@ def main() -> None:
         nlls["best_baseline"] = best_nll
         all_nlls.append(nlls)
 
+        # Persist this episode's scored results immediately. These are a few
+        # dozen floats, so unlike the baseline cache there is no reason to
+        # batch the writes: a run killed at any point resumes having lost at
+        # most the episode currently in flight.
+        if use_results_cache:
+            results_entries[str(ep_i)] = _jsonable({
+                "nlls": nlls,
+                "total_nlls": total_nlls,
+                "y_space_nlls": y_space_nlls,
+                "meta": all_episode_meta[-1],
+            })
+            _save_results_cache(args.results_cache, results_fp, results_entries)
+
         if local_i == args.plot_episode:
             plot_R_dict   = R_dict
             plot_R_oracle = R_oracle
@@ -1623,7 +1809,9 @@ def main() -> None:
                   f"own(cop={own['copula']:.4f}, marg={own['marginal']:.4f}, "
                   f"tot={own['total']:.4f})")
 
-    if use_cache and cache_dirty:
+    if use_cache and cache_dirty and args.cache_save_every:
+        # Every entry is already durable as a shard; this only refreshes the
+        # consolidated legacy file, and only if the user asked for one.
         save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
 
     if not all_nlls:
