@@ -369,7 +369,7 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
                 },
             }),
         )
-        episodes = generate_gp_batch(synth_cfg, n_episodes, device="cpu", return_kernel_metadata=True)
+        episodes = generate_gp_batch(synth_cfg, n_episodes, device=device, return_kernel_metadata=True)
         batch = collate_fn(episodes)
         batches[family] = {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
     return batches
@@ -418,7 +418,7 @@ def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
     n_episodes = int(bcfg.get("posterior_probe_n_episodes", 64))
     base_seed = int(bcfg.get("synth_seed", 20260718)) + 2  # +1 is _compute_tabicl_z_train_gap's
     probe_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": base_seed}))
-    episodes = generate_gp_batch(probe_cfg, n_episodes, device="cpu", return_kernel_metadata=True)
+    episodes = generate_gp_batch(probe_cfg, n_episodes, device=device, return_kernel_metadata=True)
     batch = collate_fn(episodes)
     return {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
 
@@ -652,18 +652,24 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     true_fields, z_train_per_day = [], []
     dists_per_day, y_mean_per_day, y_std_per_day = [], [], []
     gp_post_per_day: list = []
+    gp_post_z_per_day: list = []
     marginal_var_per_day: list = []
     marginal_mean_per_day: list = []
     for d in days:
         frame = data["t2m"][d]
         true_fields.append(frame)
         context_values = frame.ravel()[context_idx]
-        z_train_per_day.append(
-            compute_context_z_train(x_train_norm, context_values, tabicl_marginal, device, k_folds=pit_k_folds)
-        )
+        z_train_d = compute_context_z_train(x_train_norm, context_values, tabicl_marginal, device, k_folds=pit_k_folds)
+        z_train_per_day.append(z_train_d)
         gp_post_per_day.append(
             _era5_viz_gp_posterior(
                 x_train_norm, context_values, x_test_norm, gp_row_kernel,
+                gp_row_n_steps, gp_row_lr, gp_row_n_restarts, device,
+            ) if gp_row_enabled else None
+        )
+        gp_post_z_per_day.append(
+            _era5_viz_gp_posterior_on_z(
+                x_train_norm, z_train_d, x_test_norm, gp_row_kernel,
                 gp_row_n_steps, gp_row_lr, gp_row_n_restarts, device,
             ) if gp_row_enabled else None
         )
@@ -702,7 +708,8 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
         "z_train_per_day": z_train_per_day,
         "dists_per_day": dists_per_day, "y_mean_per_day": y_mean_per_day, "y_std_per_day": y_std_per_day,
         "marginal_var_per_day": marginal_var_per_day, "marginal_mean_per_day": marginal_mean_per_day,
-        "gp_post_per_day": gp_post_per_day, "gp_row_kernel": gp_row_kernel,
+        "gp_post_per_day": gp_post_per_day, "gp_post_z_per_day": gp_post_z_per_day,
+        "gp_row_kernel": gp_row_kernel,
         "seed": seed,
     }
 
@@ -750,6 +757,58 @@ def _era5_viz_gp_posterior(
         return {"mean": mean, "L": safe_cholesky(Sigma), "kernel": kernel_name}
     except Exception as exc:  # noqa: BLE001
         print(f"  [era5_viz_gp:{kernel_name}] fit failed, dropping GP row: {exc}")
+        return None
+
+
+def _era5_viz_gp_posterior_on_z(
+    x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray,
+    kernel_name: str, n_steps: int, lr: float, n_restarts: int, device: str,
+) -> "dict | None":
+    """Fitted-GP CORRELATION ONLY, MLE-fit directly on the PIT latent
+    z_train instead of raw Kelvin -- a SEPARATE fit from
+    _era5_viz_gp_posterior, backing val/era5_predictions' "Fitted GP
+    correlation + TabICLv2 marginal" row and val/era5_predictions_z's GP
+    row, in place of that other function's correlation.
+
+    Why a second fit rather than reusing _era5_viz_gp_posterior's: that fit's
+    kernel hyperparameters (lengthscale/outputscale/noise) are a Gaussian-
+    likelihood MLE against raw Kelvin, only mean/std-normalized -- real T2m
+    still has whatever skew/heteroscedasticity mean/std normalization
+    doesn't remove, so a Gaussian likelihood is somewhat misspecified against
+    it, which can bias the fitted correlation (e.g. heavy tails inflating
+    the noise estimate, over-shrinking off-diagonal correlation). z_train has
+    already been Gaussianized by TabICL's own conditional PIT
+    (compute_context_z_train) -- fitting the SAME kernel family's
+    hyperparameters against it instead removes that marginal-shape
+    contamination from the correlation-only estimate, which is the fairest
+    classical-GP reference for isolating whether the neural copula's
+    correlation beats a classical GP's, holding the (TabICL) marginal fixed
+    on both sides.
+
+    No y_mean/y_std rescale-back needed (unlike _era5_viz_gp_posterior):
+    z_train is already ~zero-mean/unit-variance by construction (PIT
+    output), matching the MAP priors' assumed scale as-is, and only the
+    fit's correlation matrix R is kept -- its posterior MEAN is never used
+    by either downstream row (both draw a zero-mean copula sample and let
+    TabICL's marginal supply location/scale), so it isn't computed here.
+
+    Returns None (caller drops the row) on fit/factorization failure, same
+    convention as _era5_viz_gp_posterior.
+    """
+    from eval.baselines.classical import fit_and_eval_gpytorch
+
+    try:
+        X_tr = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
+        X_te = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
+        z_tr = torch.as_tensor(z_train, dtype=torch.float32, device=device)
+        fit = fit_and_eval_gpytorch(
+            X_tr, z_tr, X_te, kernel_name, n_steps=n_steps, lr=lr,
+            oracle_mode="posterior", n_restarts=n_restarts,
+        )
+        R = fit["R"].double().cpu().numpy()
+        return {"L": safe_cholesky(R), "kernel": kernel_name}
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [era5_viz_gp_z:{kernel_name}] fit failed, dropping GP-on-z row: {exc}")
         return None
 
 
@@ -847,6 +906,7 @@ def _era5_viz_fig(
     predicted_resid, gp_tabicl_resid, independent_resid, gp_resid, true_resid = [], [], [], [], []
     gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
     marginal_mean = vb.get("marginal_mean_per_day") or [None] * len(vb["days"])
+    gp_post_z = vb.get("gp_post_z_per_day") or [None] * len(vb["days"])
     for i in range(len(vb["days"])):
         z_train_v = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
         out_v = model({"x_train": x_train_v, "z_train": z_train_v, "x_test": x_test_v})
@@ -867,8 +927,13 @@ def _era5_viz_fig(
             gp_fields.append(gp_field)
             if mean_i is not None:
                 gp_resid.append(gp_field - gp_post[i]["mean"])
+        # gp_post_z (correlation fit on z_train) is a SEPARATE fit from
+        # gp_post (correlation+mean fit on raw y) -- see
+        # _era5_viz_gp_posterior_on_z -- so it fails/succeeds independently
+        # and gets its own all-or-nothing gate below.
+        if gp_post_z[i] is not None:
             gp_tabicl_field = _era5_viz_field(
-                _era5_viz_gp_correlation(gp_post[i]), dist_i, y_mean_i, y_std_i, z_shared, device,
+                _era5_viz_gp_correlation(gp_post_z[i]), dist_i, y_mean_i, y_std_i, z_shared, device,
             )
             gp_tabicl_fields.append(gp_tabicl_field)
             if mean_i is not None:
@@ -911,19 +976,22 @@ def _era5_z_samples_fig(
     comparable. Rows are the three predictors' correlation structures:
     independent (R=I), the copula model's current Sigma (one forward pass,
     reused for all n_samples columns since Sigma doesn't depend on the
-    sample), and the fitted-GP baseline's correlation. Every column shares
-    one white-noise draw z_shared across all three rows (own RNG, seeded off
-    vb["seed"] + 1 so it never perturbs, or is perturbed by, _era5_viz_fig's
-    own per-day z_shared sequence), so column-to-column differences are
-    sampling variation and row-to-row differences are the correlation
-    structure alone.
+    sample), and the fitted-GP baseline's correlation -- the LATTER from
+    _era5_viz_gp_posterior_on_z (MLE-fit directly on z_train), not
+    _era5_viz_gp_posterior's raw-y fit, since this whole figure lives in
+    z-space already and z_train is the honest target for a z-space
+    correlation baseline. Every column shares one white-noise draw z_shared
+    across all three rows (own RNG, seeded off vb["seed"] + 1 so it never
+    perturbs, or is perturbed by, _era5_viz_fig's own per-day z_shared
+    sequence), so column-to-column differences are sampling variation and
+    row-to-row differences are the correlation structure alone.
 
-    Returns None if the probe has no days, or if the fixed day's GP fit
+    Returns None if the probe has no days, or if the fixed day's GP-on-z fit
     failed/was disabled -- 2 of 3 requested predictors isn't this figure.
     """
     if not vb["days"]:
         return None
-    gp0 = (vb.get("gp_post_per_day") or [None])[0]
+    gp0 = (vb.get("gp_post_z_per_day") or [None])[0]
     if gp0 is None:
         return None
     day0 = vb["days"][0]
@@ -2294,13 +2362,15 @@ def _forward_and_loss(
     jitter: float,
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
     parametrization: str = "covnorm",
+    moe_aux_weight: float = 1.0,
     phase_start=lambda: None,
     phase_end=lambda name, start: None,
 ):
-    """Forward pass + NLL(+aux MAE) loss — shared by _run_train_step and the
-    throwaway FLOP-measurement pass in _measure_step_flops (phase_start/
-    phase_end default to no-ops there, since that pass must not pollute the
-    fwd/loss/backward_step timers with a second, throwaway forward).
+    """Forward pass + NLL(+aux MAE)(+MoE aux) loss — shared by
+    _run_train_step and the throwaway FLOP-measurement pass in
+    _measure_step_flops (phase_start/phase_end default to no-ops there,
+    since that pass must not pollute the fwd/loss/backward_step timers with
+    a second, throwaway forward).
     """
     ev_fwd0 = phase_start()
     with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
@@ -2343,6 +2413,14 @@ def _forward_and_loss(
             oracle_off = batch["R_star"].float()[:, ri, ci][valid_off]
             aux_mae = (pred_off - oracle_off).abs().mean()
         loss = loss + aux_mae_weight * aux_mae
+
+    # Backbone's own auxiliary loss (MoE z-loss + load-balance -- TabLDM
+    # only, see model.py's forward / copula_backbones.moe_aux_loss). Only
+    # present in `out` when the loaded backbone actually has one, so this is
+    # a no-op for the TabICL backbone.
+    moe_aux = out.get("moe_aux_loss")
+    if moe_aux is not None:
+        loss = loss + moe_aux_weight * moe_aux
     phase_end("loss", ev_loss0)
     return out, Sigma, parts, loss, aux_mae
 
@@ -2359,6 +2437,7 @@ def _measure_step_flops(
     jitter: float,
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
     parametrization: str = "covnorm",
+    moe_aux_weight: float = 1.0,
 ) -> float:
     """Throwaway forward+backward (no optimizer/scheduler step) under
     FlopCounterMode, to measure this step's real dispatched FLOPs for MFU.
@@ -2382,6 +2461,7 @@ def _measure_step_flops(
             jitter=jitter,
             triu_cache=triu_cache,
             parametrization=parametrization,
+            moe_aux_weight=moe_aux_weight,
         )
         loss.backward()
     model.zero_grad(set_to_none=True)
@@ -2407,6 +2487,7 @@ def _run_train_step(
     phase_start,
     phase_end,
     parametrization: str = "covnorm",
+    moe_aux_weight: float = 1.0,
 ):
     """Execute one training step in a short-lived frame.
 
@@ -2430,6 +2511,7 @@ def _run_train_step(
         phase_start=phase_start,
         phase_end=phase_end,
         parametrization=parametrization,
+        moe_aux_weight=moe_aux_weight,
     )
     grad_norm = None
 
@@ -3107,6 +3189,12 @@ def main(cfg: DictConfig) -> None:
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
     aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
+    # Backbone's own MoE auxiliary loss weight (TabLDM only -- see
+    # model.py's forward / copula_backbones.moe_aux_loss; a no-op for
+    # backbones that don't emit "moe_aux_loss"). Defaults to 1.0, standard
+    # MoE-training convention, since the term is already internally scaled
+    # by the checkpoint's own router-loss coefficients.
+    moe_aux_weight = float(t.get("moe_aux_weight", 1.0))
 
     model.train()
     # NOT itertools.cycle(train_loader): cycle() caches every yielded batch
@@ -3224,6 +3312,7 @@ def main(cfg: DictConfig) -> None:
                 phase_start=_phase_start,
                 phase_end=_phase_end,
                 parametrization=parametrization,
+                moe_aux_weight=moe_aux_weight,
             )
             # At log steps only, run one throwaway forward+backward under
             # FlopCounterMode to measure this step's *actual* dispatched
@@ -3264,6 +3353,7 @@ def main(cfg: DictConfig) -> None:
                         jitter=jitter,
                         triu_cache=_triu_cache,
                         parametrization=parametrization,
+                        moe_aux_weight=moe_aux_weight,
                     )
                 except torch.cuda.OutOfMemoryError:
                     # The real step above already completed and applied its

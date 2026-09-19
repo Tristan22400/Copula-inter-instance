@@ -1,12 +1,23 @@
 """
-model.py — CopulaTabICL: TabICL as a frozen feature extractor + copula head.
+model.py — CopulaTabICL: a tabular ICL backbone as a frozen/finetuned
+feature extractor + copula head.
+
+Despite the class name (kept for state-dict/call-site stability — see
+copula_backbones.py's docstring for why only two backbones qualify), the
+backbone is a CHOICE: ``cfg.model.backbone`` selects "tabicl" (default) or
+"tabldm" (Xiaomi-TabLDM), dispatched through src/copula_backbones.py. All
+architecture-specific construction (pretrained/scratch loading, decoder
+discovery+stripping, an optional MoE auxiliary loss) lives there; this
+module only holds the feature-extractor pattern and the copula head itself,
+both backbone-agnostic.
 
 Pattern (ResNet/feature-extractor style):
-  1. Load the pretrained TabICL regressor.
+  1. Load the pretrained backbone (TabICL or TabLDM).
   2. STRIP its final quantile decoder by replacing it with ``nn.Identity()``
-     — TabICL now emits raw test-instance features of dimension
-     ``embed_dim * row_num_cls`` instead of quantile logits.
-  3. Add our own ``copula_head : R^{icl_dim} → R^{r+1}`` as a SEPARATE
+     — the backbone now emits raw test-instance features of dimension
+     ``feature_dim`` (== embed_dim * row_num_cls for both backbones)
+     instead of quantile logits.
+  3. Add our own ``copula_head : R^{feature_dim} → R^{r+1}`` as a SEPARATE
      module.  Output splits into ``(w_i ∈ R^r, s_i ∈ R)``.
 
 Correlation projection (unconstrained), default "covnorm" parametrization:
@@ -42,9 +53,10 @@ _REPO_ROOT = os.path.dirname(_HERE)
 _TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
 if _TABICL_SRC not in sys.path:
     sys.path.insert(0, _TABICL_SRC)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-from tabicl._model.tabicl import TabICL  # type: ignore[import]
-
+import copula_backbones
 from correlation_factory import (
     cossim_correlation,
     sparse_covnorm_correlation,
@@ -169,11 +181,14 @@ def build_sigma(
 
 
 class CopulaTabICL(nn.Module):
-    """TabICL stripped of its quantile decoder, with a copula head bolted on.
+    """A tabular ICL backbone (TabICL or TabLDM) stripped of its quantile
+    decoder, with a copula head bolted on. Class name kept for state-dict/
+    call-site stability — see model.py's module docstring; the actual
+    backbone is a choice, resolved by copula_backbones.py.
 
-    The TabICL instance is held as ``self.feature_extractor`` and used as a
-    black box: calling it returns (B, N_test, icl_dim) — raw features for
-    each test instance — because we have replaced its ICL decoder with
+    The backbone instance is held as ``self.feature_extractor`` and used as
+    a black box: calling it returns (B, N_test, feature_dim) — raw features
+    for each test instance — because we have replaced its ICL decoder with
     ``nn.Identity()``.
 
     ``self.copula_head`` then projects to (W, s) — or just W for
@@ -186,26 +201,25 @@ class CopulaTabICL(nn.Module):
 
     def __init__(
         self,
-        base: TabICL,
+        base: nn.Module,
         rank: int,
         correlation_parametrization: str = "covnorm",
+        backbone_name: str = "tabicl",
     ):
         super().__init__()
-        # 1. Discover the feature dimension before stripping the decoder.
-        decoder = base.icl_predictor.decoder
-        first_linear = decoder[0]  # nn.Sequential(Linear, GELU, Linear)
-        in_features = first_linear.in_features  # == embed_dim * row_num_cls
+        # 1. Discover the feature dimension, then strip the final quantile
+        #    decoder — feature-extractor pattern, shared by both backbones
+        #    (see copula_backbones.strip_decoder's docstring).
+        in_features = copula_backbones.strip_decoder(base)
 
-        # 2. Strip the final quantile decoder — feature-extractor pattern.
-        base.icl_predictor.decoder = nn.Identity()
-
-        # 3. Save the (now feature-only) backbone.
+        # 2. Save the (now feature-only) backbone.
         self.feature_extractor = base
+        self.backbone_name = backbone_name
         self.rank = rank
         self.feature_dim = in_features
         self.correlation_parametrization = correlation_parametrization
 
-        # 4. Our own copula head — completely separate module. Output width
+        # 3. Our own copula head — completely separate module. Output width
         #    varies per parametrization: tanhnorm needs only the r-dim raw
         #    factor, the others also need one trailing scalar column.
         head_out_dim = rank if correlation_parametrization in _NO_SCALAR_COLUMN else rank + 1
@@ -235,9 +249,9 @@ class CopulaTabICL(nn.Module):
         z_train = batch["z_train"]            # (B, P_max) — Z-space context labels
 
         X = torch.cat([x_train, x_test], dim=1)            # (B, T, d_x)
-        # TabICL in training/eval mode returns (B, N_test, out_dim).
-        # With decoder replaced by Identity, out_dim == feature_dim.
-        features = self.feature_extractor(X, z_train)      # (B, N_max, icl_dim)
+        # Backbone in training/eval mode returns (B, N_test, out_dim). With
+        # decoder replaced by Identity, out_dim == feature_dim.
+        features = self.feature_extractor(X, z_train)      # (B, N_max, feature_dim)
 
         head_out = self.copula_head(features)              # (B, N_max, head_out_dim)
         W = head_out[..., : self.rank]                      # (B, N_max, r)
@@ -247,6 +261,14 @@ class CopulaTabICL(nn.Module):
             out["s"] = head_out[..., self.rank]              # (B, N_max)
         if self.correlation_parametrization == "sparse_covnorm":
             out["lam"] = self.sparse_lambda_raw
+
+        # Backbone's own auxiliary loss (MoE z-loss + load-balance, TabLDM
+        # only — see copula_backbones.moe_aux_loss). Surfaced here, the
+        # single choke point over this backbone's forward, rather than
+        # requiring train.py to know which backbone is loaded.
+        aux = copula_backbones.moe_aux_loss(self.backbone_name, self.feature_extractor)
+        if aux is not None:
+            out["moe_aux_loss"] = aux
         return out
 
 
@@ -255,89 +277,35 @@ class CopulaTabICL(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _load_pretrained_tabicl(ckpt_name: str, recompute: bool = False) -> TabICL:
-    from pathlib import Path
-
-    ckpt_path = Path(ckpt_name)
-    if ckpt_path.is_absolute() or "/" in ckpt_name or ckpt_path.suffix == ".pt":
-        repo_root = Path(__file__).resolve().parents[1]
-        if not ckpt_path.is_absolute():
-            ckpt_path = repo_root / ckpt_path
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"Copula backbone checkpoint not found: {ckpt_path}")
-    else:
-        from huggingface_hub import hf_hub_download
-
-        ckpt_path = Path(hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name))
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    # The checkpoint's saved config carries whatever `recompute` value the
-    # original TabICL training run used (checkpointing is a training-time-only
-    # memory/compute tradeoff, so it's almost always False in a saved config).
-    # Override it here rather than after construction: `recompute` is threaded
-    # through TabICL.__init__ into col_embedder/row_interactor/icl_predictor
-    # and further down into their own nested encoders, each capturing its own
-    # `self.recompute` at construction time — flipping an attribute post-hoc
-    # on only the top-level submodules would miss those nested copies. It adds
-    # no parameters (pure torch.utils.checkpoint control flow), so this has no
-    # effect on `load_state_dict` compatibility below.
-    ckpt_config = dict(ckpt["config"])
-    if recompute:
-        ckpt_config["recompute"] = True
-    base = TabICL(**ckpt_config)
-    base.load_state_dict(ckpt["state_dict"])
-    return base
-
-
-def _build_tabicl_scratch(cfg: DictConfig) -> TabICL:
-    """Instantiate a randomly-initialised TabICL from cfg.tabicl.arch."""
-    a = cfg.tabicl.get("arch", {})
-    return TabICL(
-        max_classes=int(a.get("max_classes", 0)),
-        num_quantiles=int(a.get("num_quantiles", 999)),
-        embed_dim=int(a.get("embed_dim", 128)),
-        col_num_blocks=int(a.get("col_num_blocks", 3)),
-        col_nhead=int(a.get("col_nhead", 8)),
-        col_num_inds=int(a.get("col_num_inds", 128)),
-        col_affine=bool(a.get("col_affine", False)),
-        col_feature_group=a.get("col_feature_group", "same"),
-        col_feature_group_size=int(a.get("col_feature_group_size", 3)),
-        col_target_aware=bool(a.get("col_target_aware", True)),
-        col_ssmax=a.get("col_ssmax", "qassmax-mlp-elementwise"),
-        row_num_blocks=int(a.get("row_num_blocks", 3)),
-        row_nhead=int(a.get("row_nhead", 8)),
-        row_num_cls=int(a.get("row_num_cls", 4)),
-        row_rope_base=float(a.get("row_rope_base", 100000)),
-        row_rope_interleaved=bool(a.get("row_rope_interleaved", False)),
-        icl_num_blocks=int(a.get("icl_num_blocks", 12)),
-        icl_nhead=int(a.get("icl_nhead", 8)),
-        icl_ssmax=a.get("icl_ssmax", "qassmax-mlp-elementwise"),
-        ff_factor=int(a.get("ff_factor", 2)),
-        dropout=float(a.get("dropout", 0.0)),
-        activation=a.get("activation", "gelu"),
-        norm_first=bool(a.get("norm_first", True)),
-        bias_free_ln=bool(a.get("bias_free_ln", False)),
-        recompute=bool(a.get("recompute", False)),
-    )
-
-
 def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
-    """Construct CopulaTabICL with either a pretrained or scratch TabICL backbone.
+    """Construct CopulaTabICL with the selected backbone.
 
     Reads:
+        cfg.model.backbone             (default "tabicl"; one of
+                                         copula_backbones.BACKBONE_NAMES —
+                                         "tabicl" | "tabldm". See
+                                         src/copula_backbones.py for the
+                                         per-architecture construction this
+                                         dispatches to.)
         cfg.model.rank
         cfg.model.correlation_parametrization
                                         (default "covnorm"; one of "covnorm",
                                          "cossim", "tanhnorm", "sparse_covnorm"
                                          — see correlation_factory.py)
-        cfg.tabicl.pretrained          (default True)
-        cfg.tabicl.ckpt                (only when pretrained=True)
+        cfg.tabicl.pretrained          (default True; tabldm has no
+                                         from-scratch path and raises if
+                                         this is False)
+        cfg.tabicl.ckpt                (tabicl only, only when pretrained=True)
         cfg.tabicl.recompute           (default False; gradient checkpointing
-                                         through the TabICL backbone — trades
+                                         through the backbone — trades
                                          ~20-30% extra compute for a large cut
                                          in peak activation memory, useful when
                                          large N_max/P_max push attention
-                                         length T=P+N close to the VRAM ceiling)
-        cfg.tabicl.arch.*              (only when pretrained=False)
+                                         length T=P+N close to the VRAM
+                                         ceiling. For tabldm this is an
+                                         escalate-only override — see
+                                         copula_backbones._load_tabldm.)
+        cfg.tabicl.arch.*              (tabicl only, only when pretrained=False)
         cfg.model.unfreeze_backbone    (default True)
         cfg.lora.enabled               (default False)
         cfg.lora.rank                  (default 8)
@@ -345,17 +313,19 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
         cfg.lora.target                (default "qkvo")
         cfg.lora.stages                (default ["icl", "row", "col"])
     """
-    pretrained = bool(cfg.tabicl.get("pretrained", True))
-    recompute = bool(cfg.tabicl.get("recompute", False))
-    if pretrained:
-        base = _load_pretrained_tabicl(cfg.tabicl.ckpt, recompute=recompute)
-    else:
-        base = _build_tabicl_scratch(cfg)
+    backbone_name = str(cfg.model.get("backbone", "tabicl"))
+    if backbone_name not in copula_backbones.BACKBONE_NAMES:
+        raise ValueError(
+            f"Unknown cfg.model.backbone={backbone_name!r}; expected one of "
+            f"{list(copula_backbones.BACKBONE_NAMES)}."
+        )
+    base = copula_backbones.load_raw_backbone(backbone_name, cfg)
 
     model = CopulaTabICL(
         base=base,
         rank=int(cfg.model.rank),
         correlation_parametrization=str(cfg.model.get("correlation_parametrization", "covnorm")),
+        backbone_name=backbone_name,
     )
 
     lora_cfg = cfg.get("lora", {})
