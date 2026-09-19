@@ -319,7 +319,7 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path):
         ep=tiny_episode, icl_rank=2, n_steps_mle=3, lr_mle=0.1, n_steps_dkl=3, lr_dkl=0.1,
         n_steps_per_ep=3, patience_per_ep=2, device=torch.device("cpu"), oracle_mode="prior", n_restarts_mle=1,
     )
-    key = episode_cache_key(live_generate=True, dataset_dir=None, seed=0, local_i=0, ep_i=0)
+    key = episode_cache_key(live_generate=True, dataset_dir=None, seed=0, ep_i=0)
     save_baseline_cache(
         cache_path, fingerprint,
         {key: {"nlls": nlls, "R_dict": R_dict, "y_nlls": y_space_nlls}},

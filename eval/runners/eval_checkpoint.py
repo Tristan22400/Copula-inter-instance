@@ -23,7 +23,6 @@ Usage
         [--patience_per_ep 500]   # early stopping patience (steps without improvement)
         [--baseline_device cpu]   # where to fit baselines (cpu is FASTER here, see below)
         [--baseline_workers 0]    # 0=auto (min(8, allocated cores)); 1=serial
-        [--cache_save_every 25]   # persist the baseline cache every N episodes
         [--z_train_source tabicl]  # (default) 'oracle', or exaone/tabpfn/tabldm:
                                    #   feed the ICL model the
                                    # exact GP-LOO z_train instead of TabICL's own
@@ -45,9 +44,9 @@ Baseline caching is handled by eval/baselines/classical.py (see its module
 docstring): GP-MLE/DKL/per_ep_transformer fitting dominates runtime and is
 unaffected by which checkpoint is under test, so repeated runs against a new
 checkpoint reuse the cached fits and only redo the cheap ICL forward pass +
-oracle NLL. The cache is written every --cache_save_every episodes, not just
-at the end, so a run killed at its OAR walltime still leaves the fits it paid
-for behind.
+oracle NLL. Each episode is written to the cache the moment it is fitted (one
+small file per episode), so a run killed at its OAR walltime still leaves
+behind every fit it paid for.
 
 Runtime
 -------
@@ -94,6 +93,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import multiprocessing as mp
 import os
 import random
 import sys
@@ -139,7 +139,6 @@ from eval.baselines.classical import (  # noqa: E402
     episode_cache_key,
     eval_baselines_episode,
     load_baseline_cache,
-    save_baseline_cache,
     save_baseline_entry,
 )
 from eval.viz.correlation_plots import plot_corr_grid  # noqa: E402
@@ -815,28 +814,25 @@ def _prefit_baselines_parallel(
     n_workers: int,
     cache_path: str,
     fingerprint: dict,
-    cache_entries: dict,
+    fitted: dict,
     use_cache: bool,
-    save_every: int,
 ) -> None:
     """Fit every episode in `pending` across a process pool, writing results
-    into cache_entries (and periodically to disk) as they complete.
+    into `fitted` (and, unless caching is off, straight to disk) as they
+    complete.
 
-    Results are saved every `save_every` completions rather than only at the
-    end, so a walltime kill keeps the fits already paid for. This matters
+    Each result is persisted the moment it arrives rather than at the end of
+    the run, so a walltime kill keeps the fits already paid for. This matters
     more than it sounds: a full run is many GPU-hours, the whole point of the
     cache is that a *later* run against a different --ckpt reuses it, and
     before this change the single save at the end of main() meant any run
     that hit its walltime — the common case for large --n_episodes — wrote
     nothing at all and the next run started from zero.
     """
-    import multiprocessing as mp
-
     total = len(pending)
     done = 0
     failures = 0
     t0 = time.time()
-    since_save = 0
 
     ctx = mp.get_context("spawn")
     payloads = [
@@ -850,8 +846,7 @@ def _prefit_baselines_parallel(
                 failures += 1
                 print(f"  [prefit] {cache_key} FAILED:\n{err}", flush=True)
             else:
-                cache_entries[cache_key] = result
-                since_save += 1
+                fitted[cache_key] = result
                 if use_cache:
                     # One small file per episode, written the moment it is
                     # fitted — see save_baseline_entry. Nothing completed is
@@ -868,17 +863,6 @@ def _prefit_baselines_parallel(
                 flush=True,
             )
 
-            # save_every=0 (the default) means "never consolidate": durability
-            # is already covered by the per-episode shard above. Guarding on
-            # save_every matters — `since_save >= 0` is vacuously true, which
-            # would rewrite the whole (eventually ~1.7 GB) cache once per
-            # episode, the exact cost sharding exists to avoid.
-            if use_cache and save_every and since_save >= save_every and done < total:
-                save_baseline_cache(cache_path, fingerprint, cache_entries)
-                since_save = 0
-
-    if use_cache and save_every and since_save:
-        save_baseline_cache(cache_path, fingerprint, cache_entries)
     print(
         f"  [prefit] fitted {done - failures}/{total} episode(s) on "
         f"{n_workers} worker(s) in {(time.time() - t0)/60:.1f} min"
@@ -1291,18 +1275,6 @@ def main() -> None:
                              "nats/point WORSE under 'always'). See "
                              "eval.baselines.classical._resolve_val_select for the "
                              "per-kernel numbers.")
-    parser.add_argument("--cache_save_every", type=int, default=0,
-                        help="Additionally consolidate --baseline_cache into its single "
-                             "legacy file every N episodes (0 = never, the default). "
-                             "Durability no longer depends on this: every fitted episode "
-                             "is written immediately as its own shard under "
-                             "<--baseline_cache>.d/, which costs one ~4 MB write instead "
-                             "of rewriting a cache that reaches ~1.7 GB over 400 "
-                             "episodes. Batched whole-file saves were the old compromise "
-                             "between I/O and durability, and they still lost work: a run "
-                             "killed at episode 72 under the previous default of 25 had "
-                             "persisted only 50. Shards are read back automatically "
-                             "alongside any existing legacy file.")
     parser.add_argument("--baseline_device", default="cpu", choices=["cpu", "cuda", "auto"],
                         help="Device for fitting the classical baselines (GP-MLE/DKL/"
                              "per_ep_transformer) only — the ICL model, TabICL marginal "
@@ -1494,7 +1466,6 @@ def main() -> None:
         gp_val_select=args.gp_val_select,
     )
     cache_entries = load_baseline_cache(args.baseline_cache, fingerprint) if use_cache else {}
-    cache_dirty = False
 
     # ---- Scored-results cache: the checkpoint-DEPENDENT half of a resume ----
     use_results_cache = not args.no_results_cache
@@ -1528,7 +1499,7 @@ def main() -> None:
     # --dataset_dir's skip rules already applied, so the parallel pre-fit pass
     # below and the evaluation loop after it agree exactly on which episodes
     # exist and what each one's cache key is. ----
-    episode_plan: list[tuple[int, int, str, dict]] = []
+    episode_plan: list[tuple[int, int, str, dict, int]] = []
     for local_i in range(n_ep):
         if live_generate:
             # Global index (== local_i unless --episode_offset): what the
@@ -1548,8 +1519,10 @@ def main() -> None:
                       f"{min_test_points}), skipping — best_baseline needs enough for "
                       ">=2 nested-CV folds")
                 continue
-        cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, ep_i, ep_i)
-        episode_plan.append((local_i, ep_i, cache_key, ep))
+        cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, ep_i)
+        episode_plan.append(
+            (local_i, ep_i, cache_key, ep, _baseline_fit_seed(args.seed, cache_key))
+        )
 
     # ---- Parallel pre-fit of the expensive, checkpoint-independent half ----
     # Everything the evaluation loop needs that does NOT depend on --ckpt is
@@ -1561,23 +1534,21 @@ def main() -> None:
     except AttributeError:  # pragma: no cover - non-Linux
         _aff = set(range(os.cpu_count() or 1))
     n_physical = _count_physical_cores(_aff)
+    # One worker per PHYSICAL core, not per logical CPU: these fits are
+    # compute-bound enough that a hyperthread sibling adds well under a full
+    # core, so the measured "~2x from the device x N from cores" speedup scales
+    # with N = physical. Measured on an allocation of 8 logical CPUs that were
+    # only 4 physical cores (Xeon E5-2623 v3): 78.6 s/episode against 649 s on
+    # a GPU — ~8x, where 8 real cores would have given roughly twice that.
+    # The cap only bounds memory and process churn on a very large allocation;
+    # raise it with --baseline_workers if you have the cores (a fixed low cap
+    # silently wasted most of a big node -- observed on a 24-physical-core
+    # allocation where an earlier cap of 8 left two thirds of it idle).
     if n_workers <= 0:
-        # Scale with PHYSICAL cores (see _count_physical_cores): a hyperthread
-        # sibling adds well under a full core on this workload, and one worker
-        # per physical core is what the measured ~2x-device x Nx-cores speedup
-        # assumes. Capped at 32 only to bound memory and process churn on a
-        # very large allocation; raise it with --baseline_workers if you have
-        # the cores. A fixed low cap silently wasted most of a big node --
-        # observed on a 24-physical-core allocation where the old cap of 8
-        # left two thirds of it idle.
         n_workers = max(1, min(32, n_physical or len(_aff)))
     if n_physical and n_physical < len(_aff):
-        # Scaling tracks PHYSICAL cores, not the logical count: these fits are
-        # compute-bound enough that a hyperthread sibling adds well under a
-        # full core. Measured on an allocation of 8 logical CPUs that were only
-        # 4 physical cores (Xeon E5-2623 v3): 78.6 s/episode against 649 s on a
-        # GPU — ~8x, where 8 real cores would have given roughly twice that.
-        # Worth printing, because "8 cores" from the scheduler looks like 8.
+        # Worth saying out loud, because "8 cores" from the scheduler looks
+        # like 8 until the run comes in at half the expected rate.
         print(f"  [prefit] note: the {len(_aff)} allocated logical CPUs are only "
               f"{n_physical} physical core(s) ({len(_aff) // n_physical} threads each) — "
               "expect scaling closer to the physical count; request more cores "
@@ -1587,39 +1558,38 @@ def main() -> None:
               "--baseline_workers=1 (parallel processes would just contend for one GPU)")
         n_workers = 1
 
+    # Every episode whose baselines this run already has: reusable cache
+    # entries up front, plus whatever the pool fits below. The loop then has a
+    # single question to ask per episode — is it in here? — instead of
+    # re-deciding cache validity and separately remembering that a pooled fit
+    # counts even when the on-disk cache is disabled.
+    fitted: dict[str, dict] = {}
+    if use_cache and not args.refresh_baselines:
+        for _, ep_i, cache_key, _, _ in episode_plan:
+            entry = _valid_cached_entry(cache_entries, cache_key, ep_i)
+            if entry is not None:
+                fitted[cache_key] = entry
+
     pending = [
-        (cache_key, _baseline_fit_seed(args.seed, cache_key), ep)
-        for _, ep_i, cache_key, ep in episode_plan
-        if args.refresh_baselines or not use_cache
-        or _valid_cached_entry(cache_entries, cache_key, ep_i) is None
+        (cache_key, fit_seed, ep)
+        for _, _, cache_key, ep, fit_seed in episode_plan
+        if cache_key not in fitted
     ]
-    n_reused = len(episode_plan) - len(pending)
-    print(f"\nBaselines: {n_reused} episode(s) reused from cache, "
+    print(f"\nBaselines: {len(fitted)} episode(s) reused from cache, "
           f"{len(pending)} to fit on {baseline_device.type}"
           + (f" across {n_workers} worker process(es)" if n_workers > 1 else " serially"))
     if pending and n_workers > 1:
         _prefit_baselines_parallel(
             pending, fit_kwargs, n_workers, args.baseline_cache, fingerprint,
-            cache_entries, use_cache, args.cache_save_every,
+            fitted, use_cache,
         )
-        # Entries written by the pool are already on disk; the loop below now
-        # finds every episode cached and must not re-save them as "dirty".
-        cache_dirty = False
 
-    for local_i, ep_i, cache_key, ep in episode_plan:
-        cached = (
-            _valid_cached_entry(cache_entries, cache_key, ep_i)
-            if (use_cache and not args.refresh_baselines) else None
-        )
-        # A pooled fit lands in cache_entries even with --no_baseline_cache /
-        # --refresh_baselines (both of which only govern the on-disk file, not
-        # whether this run recomputes an episode it already fitted seconds ago).
-        if cached is None and n_workers > 1:
-            cached = cache_entries.get(cache_key)
-        if cached is not None:
-            baseline_nlls   = cached["nlls"]
-            baseline_R      = {k: v.to(device) for k, v in cached["R_dict"].items()}
-            baseline_y_nlls = cached["y_nlls"]
+    for local_i, ep_i, cache_key, ep, fit_seed in episode_plan:
+        entry = fitted.get(cache_key)
+        if entry is not None:
+            baseline_nlls   = entry["nlls"]
+            baseline_R      = {k: v.to(device) for k, v in entry["R_dict"].items()}
+            baseline_y_nlls = entry["y_nlls"]
         else:
             # Serial path: --baseline_workers=1, or a GPU --baseline_device.
             # Fitting happens on baseline_device, but everything downstream
@@ -1650,7 +1620,7 @@ def main() -> None:
                 ep={k: (v.to(baseline_device) if isinstance(v, Tensor) else v)
                     for k, v in ep.items()},
                 device=baseline_device,
-                fit_seed=_baseline_fit_seed(args.seed, cache_key),
+                fit_seed=fit_seed,
                 **fit_kwargs,
             )
             torch.set_num_threads(_prev_threads)
@@ -1659,22 +1629,11 @@ def main() -> None:
                 torch.cuda.set_rng_state_all(_rng_cuda)
             baseline_R = {k: v.to(device) for k, v in baseline_R.items()}
             if use_cache:
-                cache_entries[cache_key] = {
+                save_baseline_entry(args.baseline_cache, fingerprint, cache_key, {
                     "nlls": baseline_nlls,
                     "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
                     "y_nlls": baseline_y_nlls,
-                }
-                # Shard first: this episode is now safe on disk regardless of
-                # what --cache_save_every does below.
-                save_baseline_entry(
-                    args.baseline_cache, fingerprint, cache_key, cache_entries[cache_key],
-                )
-                cache_dirty = True
-                if args.cache_save_every and (
-                    len(cache_entries) % args.cache_save_every == 0
-                ):
-                    save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
-                    cache_dirty = False
+                })
 
         # ---- Already-scored episode? Reuse and skip the GPU work ----
         # The baseline cache above only spares the fitting; the ICL forward
@@ -1820,11 +1779,6 @@ def main() -> None:
                   f"shared_copula={val:.4f}  "
                   f"own(cop={own['copula']:.4f}, marg={own['marginal']:.4f}, "
                   f"tot={own['total']:.4f})")
-
-    if use_cache and cache_dirty and args.cache_save_every:
-        # Every entry is already durable as a shard; this only refreshes the
-        # consolidated legacy file, and only if the user asked for one.
-        save_baseline_cache(args.baseline_cache, fingerprint, cache_entries)
 
     if not all_nlls:
         print("No episodes evaluated successfully.")

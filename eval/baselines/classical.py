@@ -48,15 +48,19 @@ GP-MLE (with restarts)/DKL/per_ep_transformer fitting dominates evaluation
 runtime and, unlike the ICL model under test, only depends on the
 episode-generating config and the fitting hyperparameters passed to
 ``eval_baselines_episode`` — not on which checkpoint is being evaluated.
-``baseline_fingerprint`` + ``episode_cache_key`` + ``load_baseline_cache`` /
-``save_baseline_cache`` let a runner cache results per episode across
+``baseline_fingerprint`` + ``episode_cache_key`` + ``save_baseline_entry`` /
+``load_baseline_cache`` let a runner cache results per episode across
 repeated runs against new checkpoints; any change to a fitting
 hyperparameter or the episode config invalidates the cache automatically.
+Entries are written one file per episode, so a run that dies keeps every fit
+it finished (``save_baseline_cache`` writes the older single-file layout,
+which ``load_baseline_cache`` still reads).
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
 import sys
@@ -731,7 +735,6 @@ def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
     """RBF prior correlation at test points with median bandwidth (no training data)."""
     from data_gen import _sq_dist  # noqa: E402
 
-    N = X_test.shape[0]
     sq = _sq_dist(X_test, X_test)
     h2 = torch.pdist(X_test).pow(2).median().clamp(min=1e-6)
     R = torch.exp(-sq / (2.0 * h2))
@@ -1004,7 +1007,7 @@ def eval_baselines_episode(
     restarts per GP-MLE kernel, DKL training, per-episode-transformer
     training) results can be cached across repeated eval_checkpoint.py runs
     that only change the checkpoint under test — see baseline_fingerprint /
-    load_baseline_cache / save_baseline_cache below.
+    save_baseline_entry / load_baseline_cache below.
 
     Returns:
         nlls        : {method_name: copula_nll_float} — z-space, common
@@ -1221,13 +1224,16 @@ def baseline_fingerprint(
     }
 
 
-def episode_cache_key(live_generate: bool, dataset_dir: str | None, seed: int, local_i: int, ep_i: int) -> str:
+def episode_cache_key(live_generate: bool, dataset_dir: str | None, seed: int, ep_i: int) -> str:
     """Identifies which episode a cached baseline result belongs to.
 
-    Live episodes are fully determined by (seed, local_i); dataset episodes
-    by (dataset_dir, ep_i)."""
+    Live episodes are fully determined by (seed, ep_i); dataset episodes by
+    (dataset_dir, ep_i). ep_i is the episode's GLOBAL index in both cases, so
+    a run that evaluates a slice of one episode stream (eval_checkpoint.py's
+    --episode_offset) keys the same episode the same way as a run that starts
+    at 0."""
     if live_generate:
-        return f"live:seed{seed}:idx{local_i}"
+        return f"live:seed{seed}:idx{ep_i}"
     return f"dataset:{os.path.abspath(dataset_dir)}:idx{ep_i}"
 
 
@@ -1244,8 +1250,6 @@ def _shard_name(cache_key: str) -> str:
     shard too, so a collision would be detected on load rather than silently
     serving the wrong episode.
     """
-    import hashlib
-
     return hashlib.sha1(cache_key.encode()).hexdigest() + ".pt"
 
 
@@ -1322,14 +1326,19 @@ def load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
 
 
 def save_baseline_cache(path: str, fingerprint: dict, entries: dict[str, dict]) -> None:
-    """Write the cache atomically (temp file + os.replace).
+    """Write the whole cache to one file, atomically (temp + os.replace).
 
-    Callers now save periodically mid-run rather than only at the end, so a
-    walltime kill lands during a write far more often than it used to. A
-    half-written file would be worse than no file at all: load_baseline_cache
-    would fail to torch.load it and silently refit everything, throwing away
-    exactly the hours this cache exists to protect. os.replace is atomic on
-    POSIX, so the previous save stays intact until the new one is complete.
+    This is the LEGACY layout. Runners write save_baseline_entry shards
+    instead — one file per episode, so the cost of persisting a fit does not
+    grow with how many are already cached — and load_baseline_cache reads both.
+    Kept because caches in this format still exist on disk and must keep
+    loading; the round-trip test is what guards that path.
+
+    Atomic because a half-written file would be worse than no file at all:
+    load_baseline_cache would fail to torch.load it and silently refit
+    everything, throwing away exactly the hours this cache exists to protect.
+    os.replace is atomic on POSIX, so the previous save stays intact until the
+    new one is complete.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
