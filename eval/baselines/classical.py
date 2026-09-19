@@ -48,15 +48,19 @@ GP-MLE (with restarts)/DKL/per_ep_transformer fitting dominates evaluation
 runtime and, unlike the ICL model under test, only depends on the
 episode-generating config and the fitting hyperparameters passed to
 ``eval_baselines_episode`` — not on which checkpoint is being evaluated.
-``baseline_fingerprint`` + ``episode_cache_key`` + ``load_baseline_cache`` /
-``save_baseline_cache`` let a runner cache results per episode across
+``baseline_fingerprint`` + ``episode_cache_key`` + ``save_baseline_entry`` /
+``load_baseline_cache`` let a runner cache results per episode across
 repeated runs against new checkpoints; any change to a fitting
 hyperparameter or the episode config invalidates the cache automatically.
+Entries are written one file per episode, so a run that dies keeps every fit
+it finished (``save_baseline_cache`` writes the older single-file layout,
+which ``load_baseline_cache`` still reads).
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
 import sys
@@ -96,6 +100,8 @@ __all__ = [
     "episode_cache_key",
     "load_baseline_cache",
     "save_baseline_cache",
+    "save_baseline_entry",
+    "GP_VAL_SELECT_MODES",
     "EXPECTED_BASELINE_KEYS",
     "assert_shared_z_test",
 ]
@@ -152,7 +158,52 @@ EXPECTED_BASELINE_KEYS = frozenset(
 # episodes happened to be drawn from the global RNG before it. v1 entries were
 # produced under the old order-dependent stream and are not reproducible
 # results of the current code, so they must not be served as if they were.
-_BASELINE_ALGO_VERSION = 2
+#
+# v3: GP-MLE fits select on a held-out split (val_select) instead of running
+# to a fixed n_steps and keeping the lowest TRAINING loss -- see
+# fit_and_eval_gpytorch's docstring for the measured ARD overfitting this
+# fixes. v2 entries hold systematically over-fit ARD rows (up to +6 nats/pt).
+_BASELINE_ALGO_VERSION = 3
+
+
+GP_VAL_SELECT_MODES = ("ard", "always", "never")
+
+
+def _resolve_val_select(mode: str, ard: bool) -> bool:
+    """Whether THIS kernel should pick its fit on a held-out split.
+
+    Held-out selection buys protection against hyperparameter overfitting and
+    costs 20% of an already-small P (32 points) — so it is worth it exactly
+    where the free-parameter count is large relative to P, and a net loss
+    where it is not. Measured over 8 episodes on the posterior predictive at
+    the real y_test (nats/point, negative = better):
+
+        ard_rbf        -2.58      dot_product    +0.36
+        ard_rq         -2.72      rational_quad  -0.13
+        ard_matern32   -0.48      rbf            -0.01
+                                  matern32       -0.00
+                                  periodic       +0.00
+
+    ARD carries one lengthscale per input dimension (9 here), which the
+    LogNormal prior does not hold; the non-ARD kernels have 2-3
+    hyperparameters that the same prior regularises adequately, so for them
+    the split is pure data loss. dot_product is the clearest case — a linear
+    kernel with variance and noise and no lengthscale at all, nothing to
+    overfit, so it only pays the cost.
+
+    "ard" (default) follows that split; "always" applies it everywhere;
+    "never" restores the pre-v3 behaviour of running to n_steps and keeping
+    the lowest TRAINING loss.
+    """
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if mode == "ard":
+        return ard
+    raise ValueError(
+        f"gp_val_select={mode!r} is not one of {GP_VAL_SELECT_MODES}"
+    )
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
@@ -414,6 +465,7 @@ def fit_and_eval_gpytorch(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts: int = 1,
+    val_select: bool = False,
 ) -> dict[str, Tensor]:
     """Fit a GP (optionally over a learned feature extractor, i.e. DKL) on the
     raw y-space target by maximising the exact marginal log-likelihood, and
@@ -488,9 +540,41 @@ def fit_and_eval_gpytorch(
     (off-diagonal correlation -> ~1) — training loss keeps improving long
     after held-out NLL has turned catastrophically worse than independence,
     so a fixed step count with no validation signal silently picks the worst
-    point on that curve. Skipped for P < 8 (too few points for a meaningful
-    split); falls back to training on the full set with no early stopping,
-    same as the no-feature-extractor path.
+    point on that curve.
+
+    val_select extends that same guard to the plain GP-MLE path, which needs
+    it for ARD. The reasoning just above — that plain GP-MLE "has only 2-3
+    free hyperparameters, already regularised by kernel_priors" — holds
+    without ARD and fails with it: ard_num_dims gives one lengthscale per
+    input dimension, i.e. 9 of them inferred from P=32 points, and the
+    LogNormal lengthscale prior does not hold them. Measured over 8 episodes,
+    one fit per kernel evaluated along its own trajectory, scoring the
+    posterior predictive at the real y_test (nats/point, median):
+
+        kernel          best step   NLL@best   NLL@1000   penalty
+        rbf (no ARD)          700      1.879      1.879     +0.000
+        matern32 (no ARD)    3000      1.794      1.795     +0.001
+        rq (no ARD)           400      1.705      1.708     +0.003
+        ard_matern32           25      1.813      2.664     +0.850
+        ard_rq                 25      1.796      3.091     +1.295
+        ard_rbf                10      1.964      8.025     +6.060
+
+    The training objective falls monotonically throughout and the fitted
+    noise stays at ~8e-3 (nowhere near its exp(-8) floor), so this is not
+    divergence — it is the ARD lengthscales running away unbounded (mean
+    1.3 -> 5.9 at step 1000 -> 8.9 at step 3000, still climbing, on
+    normalised inputs where ~9 is already a near-constant function). Every
+    ARD kernel at n_steps=1000 ends up worse than its own non-ARD sibling
+    (+0.87, +1.38, +6.15 nats/point), and ard_rbf degrades in 8 episodes
+    out of 8. Cutting n_steps is the wrong fix: it would tune a step count
+    to a pathology, and the non-ARD kernels genuinely want the steps.
+
+    Selecting on held-out NLL fixes both halves at once — which step is kept
+    within a restart, and (because final_loss then carries best_step_val
+    instead of the training loss) which restart is kept across n_restarts.
+
+    Skipped for P < 8 (too few points for a meaningful split); falls back to
+    training on the full set with no early stopping.
     """
     if kernel_name == "periodic" and feature_extractor is not None:
         raise ValueError("kernel_name='periodic' is not PD in a >1D DKL latent space")
@@ -516,7 +600,7 @@ def fit_and_eval_gpytorch(
     lengthscale_init_prior = _lengthscale_init_prior(prior_cfg or {})
 
     P = X_train.shape[0]
-    use_val = feature_extractor is not None and P >= 8
+    use_val = (feature_extractor is not None or val_select) and P >= 8
     if use_val:
         n_val = max(2, int(round(0.2 * P)))
         perm = torch.randperm(P, device=X_train.device)
@@ -651,7 +735,6 @@ def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
     """RBF prior correlation at test points with median bandwidth (no training data)."""
     from data_gen import _sq_dist  # noqa: E402
 
-    N = X_test.shape[0]
     sq = _sq_dist(X_test, X_test)
     h2 = torch.pdist(X_test).pow(2).median().clamp(min=1e-6)
     R = torch.exp(-sq / (2.0 * h2))
@@ -903,6 +986,7 @@ def eval_baselines_episode(
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
     fit_seed: int | None = None,
+    gp_val_select: str = "ard",
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
     """Evaluate every classical/fitted baseline (everything except the ICL
     model and the oracle) on one episode, under identical conventions.
@@ -923,7 +1007,7 @@ def eval_baselines_episode(
     restarts per GP-MLE kernel, DKL training, per-episode-transformer
     training) results can be cached across repeated eval_checkpoint.py runs
     that only change the checkpoint under test — see baseline_fingerprint /
-    load_baseline_cache / save_baseline_cache below.
+    save_baseline_entry / load_baseline_cache below.
 
     Returns:
         nlls        : {method_name: copula_nll_float} — z-space, common
@@ -997,10 +1081,15 @@ def eval_baselines_episode(
         for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
             label = _LABEL_MAP[(kname, ard)]
             try:
+                # "ard" (the default) spends the held-out split only where the
+                # hyperparameter count is large relative to P — see
+                # _resolve_val_select.
                 fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                              n_steps=n_steps_mle, lr=lr_mle, ard=ard,
                                              oracle_mode=oracle_mode, prior_cfg=prior_cfg,
-                                             n_restarts=n_restarts_mle)
+                                             n_restarts=n_restarts_mle,
+                                             val_select=_resolve_val_select(
+                                                 gp_val_select, ard))
                 nlls[label] = corr_nll_single(fit["R"], z_test)
                 R_dict[label] = fit["R"]
                 y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
@@ -1034,7 +1123,15 @@ def eval_baselines_episode(
             print(f"  [{label}] failed: {exc}")
             nlls[label] = float("nan")
             R_dict[label] = R_I.clone()
-            y_space_nlls[label] = float("nan")
+            # _NAN_PARTS, not a bare nan: every other value in y_space_nlls is
+            # a {total, marginal, copula} dict, and a bare float here is both a
+            # crash waiting to happen downstream (eval_checkpoint's top-5 print
+            # indexes own["copula"]) and a permanently poisoned cache entry --
+            # _valid_cached_entry reads the non-dict as "predates the
+            # marginal/copula split" and refits the episode on EVERY run, which
+            # reproduces the same bare float, so it never stops refitting.
+            # Observed on episode 239 of a 400-episode run.
+            y_space_nlls[label] = _NAN_PARTS.copy()
 
     # --- per-episode transformer ---
     # Trained/queried against z_train_self (z-scored from y_train), not the
@@ -1095,6 +1192,7 @@ def baseline_fingerprint(
     lr_dkl: float,
     n_steps_per_ep: int,
     patience_per_ep: int,
+    gp_val_select: str = "ard",
 ) -> dict:
     """Everything that determines the *baseline* fit results for an episode,
     other than which episode it is (see episode_cache_key for that half).
@@ -1130,49 +1228,125 @@ def baseline_fingerprint(
         "lr_dkl": lr_dkl,
         "n_steps_per_ep": n_steps_per_ep,
         "patience_per_ep": patience_per_ep,
+        "gp_val_select": gp_val_select,
     }
 
 
-def episode_cache_key(live_generate: bool, dataset_dir: str | None, seed: int, local_i: int, ep_i: int) -> str:
+def episode_cache_key(live_generate: bool, dataset_dir: str | None, seed: int, ep_i: int) -> str:
     """Identifies which episode a cached baseline result belongs to.
 
-    Live episodes are fully determined by (seed, local_i); dataset episodes
-    by (dataset_dir, ep_i)."""
+    Live episodes are fully determined by (seed, ep_i); dataset episodes by
+    (dataset_dir, ep_i). ep_i is the episode's GLOBAL index in both cases, so
+    a run that evaluates a slice of one episode stream (eval_checkpoint.py's
+    --episode_offset) keys the same episode the same way as a run that starts
+    at 0."""
     if live_generate:
-        return f"live:seed{seed}:idx{local_i}"
+        return f"live:seed{seed}:idx{ep_i}"
     return f"dataset:{os.path.abspath(dataset_dir)}:idx{ep_i}"
 
 
+def _shard_dir(path: str) -> str:
+    """Directory holding this cache's per-episode shards."""
+    return f"{path}.d"
+
+
+def _shard_name(cache_key: str) -> str:
+    """Filesystem-safe filename for one episode's shard.
+
+    Cache keys carry ':' and (for --dataset_dir) an absolute path, neither of
+    which belongs in a filename, so hash them. The key is stored inside the
+    shard too, so a collision would be detected on load rather than silently
+    serving the wrong episode.
+    """
+    return hashlib.sha1(cache_key.encode()).hexdigest() + ".pt"
+
+
+def save_baseline_entry(path: str, fingerprint: dict, cache_key: str, entry: dict) -> None:
+    """Persist ONE episode's fitted baselines, immediately.
+
+    Each episode gets its own small file under <path>.d/ rather than being
+    folded into one big blob. An episode's entry is ~4.3 MB (mostly the N x N
+    R matrices), so a single consolidated file reaches ~1.7 GB over 400
+    episodes and rewriting it per episode would cost more I/O than the fitting
+    it protects -- which is why saves used to be batched every N episodes, and
+    why a crash still threw away up to N episodes of work (observed: a job
+    killed at episode 72 had persisted only 50).
+
+    Writing a shard per episode makes the cost O(one episode) instead of
+    O(whole cache), so every completed fit survives immediately, and a run
+    that dies resumes having lost nothing.
+    """
+    d = _shard_dir(path)
+    os.makedirs(d, exist_ok=True)
+    dest = os.path.join(d, _shard_name(cache_key))
+    tmp = f"{dest}.tmp{os.getpid()}"
+    torch.save({"fingerprint": fingerprint, "cache_key": cache_key, "entry": entry}, tmp)
+    os.replace(tmp, dest)
+
+
 def load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
-    """Load {episode_key: {"nlls": ..., "R_dict": ...}} from path if its
-    stored fingerprint matches; otherwise (missing file, or a fingerprint
-    mismatch meaning the cache was built under different generation/fitting
-    settings) start from an empty cache rather than serving stale results."""
-    if not os.path.exists(path):
-        return {}
-    try:
-        blob = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:
-        print(f"  [baseline_cache] failed to load {path}: {exc} — starting fresh")
-        return {}
-    if blob.get("fingerprint") != fingerprint:
-        print(f"  [baseline_cache] {path} was built with different generation/fitting "
-              "settings — ignoring it and refitting all baselines")
-        return {}
-    entries = blob.get("entries", {})
-    print(f"  [baseline_cache] loaded {len(entries)} cached episode(s) from {path}")
+    """Load {episode_key: {"nlls": ..., "R_dict": ...}}, merging the
+    per-episode shards under <path>.d/ with the legacy single file at `path`.
+
+    Both are filtered on the fingerprint, so entries built under different
+    generation/fitting settings are ignored rather than served stale. Shards
+    win over the legacy file for the same key (they are what current runs
+    write). A shard that fails to load individually is skipped and refitted,
+    instead of discarding every other episode alongside it.
+    """
+    entries: dict[str, dict] = {}
+    n_stale = 0
+
+    if os.path.exists(path):
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+            if blob.get("fingerprint") == fingerprint:
+                entries.update(blob.get("entries", {}))
+                print(f"  [baseline_cache] loaded {len(entries)} episode(s) from {path}")
+            else:
+                n_stale += len(blob.get("entries", {}))
+        except Exception as exc:
+            print(f"  [baseline_cache] failed to load {path}: {exc} — ignoring it")
+
+    d = _shard_dir(path)
+    if os.path.isdir(d):
+        n_shard = 0
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".pt"):
+                continue
+            try:
+                blob = torch.load(os.path.join(d, fn), map_location="cpu", weights_only=False)
+            except Exception as exc:
+                print(f"  [baseline_cache] shard {fn} unreadable ({exc}) — will refit it")
+                continue
+            if blob.get("fingerprint") != fingerprint:
+                n_stale += 1
+                continue
+            entries[blob["cache_key"]] = blob["entry"]
+            n_shard += 1
+        if n_shard:
+            print(f"  [baseline_cache] loaded {n_shard} episode(s) from {d}")
+
+    if n_stale:
+        print(f"  [baseline_cache] ignored {n_stale} entr(ies) built under different "
+              "generation/fitting settings — those episodes will be refitted")
     return entries
 
 
 def save_baseline_cache(path: str, fingerprint: dict, entries: dict[str, dict]) -> None:
-    """Write the cache atomically (temp file + os.replace).
+    """Write the whole cache to one file, atomically (temp + os.replace).
 
-    Callers now save periodically mid-run rather than only at the end, so a
-    walltime kill lands during a write far more often than it used to. A
-    half-written file would be worse than no file at all: load_baseline_cache
-    would fail to torch.load it and silently refit everything, throwing away
-    exactly the hours this cache exists to protect. os.replace is atomic on
-    POSIX, so the previous save stays intact until the new one is complete.
+    This is the LEGACY layout. Runners write save_baseline_entry shards
+    instead — one file per episode, so the cost of persisting a fit does not
+    grow with how many are already cached — and load_baseline_cache reads both.
+    Kept because caches in this format still exist on disk and must keep
+    loading; the round-trip test is what guards that path.
+
+    Atomic because a half-written file would be worse than no file at all:
+    load_baseline_cache would fail to torch.load it and silently refit
+    everything, throwing away exactly the hours this cache exists to protect.
+    os.replace is atomic on POSIX, so the previous save stays intact until the
+    new one is complete.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
