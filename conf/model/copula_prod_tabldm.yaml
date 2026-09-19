@@ -1,0 +1,54 @@
+# @package _global_
+# ---------------------------------------------------------------------------
+# Copula Transformer — Xiaomi-TabLDM backbone variant of copula_prod.yaml
+# (https://github.com/xiaomi-research/xiaomi-tabldm).
+#
+# Same copula head (rank/jitter/parametrization) as copula_prod.yaml; only
+# `model.backbone` differs. Everything architecture-specific (loading the
+# pretrained trunk, stripping its quantile decoder, the MoE auxiliary loss)
+# is dispatched through src/copula_backbones.py — see that module's
+# docstring for why TabLDM is a legitimate drop-in for TabICL here (it forks
+# TabICL's architecture: same col_embedder/row_interactor/icl_predictor
+# stages, same strippable decoder shape, same forward(X, y_train) contract).
+#
+# Backbone size: TabLDM is ~71M params vs. TabICL's ~28.5M (2.5x) -- if this
+# OOMs at copula_prod.yaml's usual batch_size/N_max/P_max, first try
+# tabicl.recompute=true (see the tabicl: block below for what that actually
+# does for this backbone -- NOT symmetric with TabICL's own recompute
+# override) before shrinking batch_size/N_max/P_max.
+#
+# The MARGINAL stays frozen TabICL regardless of this file (data.
+# z_train_source defaults to "tabicl", untouched here) -- this preset
+# isolates the COPULA backbone as the only variable, so a run under this
+# preset is a clean A/B against copula_prod.yaml.
+#
+# Usage:
+#   python src/train.py model=copula_prod_tabldm
+# ---------------------------------------------------------------------------
+model:
+  backbone: tabldm
+  rank: 128                  # low-rank dimension r in W ∈ R^{N×r} -- same as copula_prod.yaml
+  sigma_jitter: 1.0e-4
+  unfreeze_backbone: true    # train the TabLDM trunk end-to-end alongside the head
+  correlation_parametrization: covnorm
+
+tabicl:
+  # NOTE: this config GROUP is named "tabicl" regardless of model.backbone
+  # (see src/copula_backbones.py::load_raw_backbone's docstring) -- it also
+  # configures the frozen TabICL MARGINAL/PIT path (pit.py, live_dataset.py,
+  # era5_live_dataset.py), which is independent of the copula backbone
+  # choice above and stays TabICL here. `pretrained`/`recompute` below are
+  # read by BOTH the tabldm copula-backbone loader (this file's actual
+  # point) and, for `pretrained`, by that separate marginal path.
+  pretrained: true   # tabldm has NO from-scratch path -- false raises here.
+  ckpt: tabicl-regressor-v2-20260212.ckpt  # the frozen MARGINAL's checkpoint (unrelated to the tabldm copula backbone, which has its own HF checkpoint baked into the `tabldm` pip package)
+  # Xiaomi-TabLDM's released checkpoint already ships with gradient
+  # checkpointing ON for its two heaviest stages (row_interactor,
+  # icl_predictor) and OFF for col_embedder -- see
+  # copula_backbones._load_tabldm's docstring for how this was verified.
+  # Leaving this at the shared default (false) is a no-op for this backbone
+  # -- it does NOT undo that upstream tuning, unlike TabICL's symmetric
+  # override. Set true only to ESCALATE (forces every stage's checkpointing
+  # on) if you hit CUDA OOM even with the checkpoint's own defaults.
+  recompute: false
+  pit_k_folds: 10
