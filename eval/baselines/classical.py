@@ -1123,7 +1123,15 @@ def eval_baselines_episode(
             print(f"  [{label}] failed: {exc}")
             nlls[label] = float("nan")
             R_dict[label] = R_I.clone()
-            y_space_nlls[label] = float("nan")
+            # _NAN_PARTS, not a bare nan: every other value in y_space_nlls is
+            # a {total, marginal, copula} dict, and a bare float here is both a
+            # crash waiting to happen downstream (eval_checkpoint's top-5 print
+            # indexes own["copula"]) and a permanently poisoned cache entry --
+            # _valid_cached_entry reads the non-dict as "predates the
+            # marginal/copula split" and refits the episode on EVERY run, which
+            # reproduces the same bare float, so it never stops refitting.
+            # Observed on episode 239 of a 400-episode run.
+            y_space_nlls[label] = _NAN_PARTS.copy()
 
     # --- per-episode transformer ---
     # Trained/queried against z_train_self (z-scored from y_train), not the
