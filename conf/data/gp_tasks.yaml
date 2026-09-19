@@ -468,6 +468,18 @@ pit_eps: 1.0e-6
 # live_tabicl_group_multiplier with "tabicl" (see conf/config.yaml) -- pilot
 # with a small batch_size/z_train_tabicl_k_folds/z_train_marginal_probs_n
 # before scaling up.
+#
+# "y_train": no-PIT control/ablation arm -- z_train becomes the raw
+# per-episode z-scored target ((y_train - mean) / std), no marginal model
+# involved at all (cheapest of every non-"analytic" option here, CPU-only,
+# no live_tabicl_num_workers/spawn machinery). z_test/log_pdf_test stay the
+# exact analytic oracle (only "tabicl_split"'s sibling behavior -- every
+# other override above replaces those too), so this isolates exactly one
+# variable: does the ICL conditioning input need PIT preprocessing at all.
+# See data_gen.py::_generate_gp_batch_raw's raw_y_override and
+# live_dataset.py's _RAW_Y_SOURCES. training.live_generation=true only -- no
+# on-disk generate_pit_dataset.py implementation exists (raises if selected
+# there).
 z_train_source: tabicl
 # Quantile grid size for z_train_source=exaone/tabpfn/tabldm's PIT (ignored for
 # every other z_train_source, which use their own native grid -- TabICL's is

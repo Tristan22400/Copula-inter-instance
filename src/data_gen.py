@@ -3143,6 +3143,7 @@ def _generate_gp_batch_raw(
     marginal_backend: Optional[str] = None,
     marginal_regressor=None,
     marginal_probs_n: int = 99,
+    raw_y_override: bool = False,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in a single vectorised call — the
     "raw" worker generate_gp_batch (below) wraps: may return FEWER than B
@@ -3262,6 +3263,17 @@ def _generate_gp_batch_raw(
             (ignored for "tabicl"/None, which always use TabICL's own native
             999-level grid). Default 99 matches
             debug/stages/s7b_backend_train.py's DEFAULT_PROBS_N.
+        raw_y_override: if True (cfg.data.z_train_source="y_train" — see
+            live_dataset.py's _RAW_Y_SOURCES), z_train is overridden with the
+            per-episode z-scored raw target ((y_train - mean) / std) instead
+            of any PIT transform — no marginal model involved at all. A pure
+            no-PIT ablation/control arm: z_test/log_pdf_test are left at the
+            exact analytic oracle (untouched), so only the ICL conditioning
+            input changes, unlike marginal_backend/tabicl_model above which
+            override z_test/log_pdf_test too. Mutually exclusive with
+            tabicl_model/marginal_backend (callers set at most one override
+            mechanism — enforced by z_train_source being a single string).
+            False (default) preserves the exact analytic pipeline.
 
     Returns:
         list of B episode dicts ready for torch.save.
@@ -3742,7 +3754,23 @@ def _generate_gp_batch_raw(
     else:
         apply_tabicl = tabicl_model is not None
 
-    if marginal_backend in _BATCHED_MARGINAL_BACKENDS:
+    if raw_y_override:
+        # "y_train" ablation (cfg.data.z_train_source="y_train"): no PIT at
+        # all -- z_train becomes the raw per-episode z-scored target, the
+        # same scaling convention every other branch below uses before
+        # calling its own marginal model, just with no model call at all.
+        # z_test/log_pdf_test are deliberately left at the exact analytic
+        # oracle computed above (unlike every other override branch here,
+        # which replaces those too) -- this isolates exactly one variable
+        # (does the ICL conditioning input need to be PIT-transformed at
+        # all) instead of also changing what the loss/val metrics are scored
+        # against, so a z_train_source="y_train" run stays comparable,
+        # metric-definition-for-metric-definition, to an "analytic"/"tabicl"
+        # run at the same seed/config.
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        z_train = ((y_train - y_mean) / y_std).detach()
+    elif marginal_backend in _BATCHED_MARGINAL_BACKENDS:
         # Genuine multi-episode BATCHED PIT -- the whole B-episode call
         # becomes (k_folds+1) fused forwards total, not B*(k_folds+1)
         # separate ones (see eval/spatial/{exaone,tabpfn,tabldm}_batched.py's
@@ -4032,6 +4060,7 @@ def generate_gp_batch(
     marginal_backend: Optional[str] = None,
     marginal_regressor=None,
     marginal_probs_n: int = 99,
+    raw_y_override: bool = False,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, discarding and regenerating any that
     turn out degenerate (see _generate_gp_batch_raw's `discard` — an
@@ -4076,7 +4105,7 @@ def generate_gp_batch(
         tabicl_split_calib_frac=tabicl_split_calib_frac,
         kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
         marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
-        marginal_probs_n=marginal_probs_n,
+        marginal_probs_n=marginal_probs_n, raw_y_override=raw_y_override,
     )
     # Pin every top-up round to the first round's d_features (or the
     # caller-supplied d_override, if the first round came up empty). Top-up
@@ -4107,7 +4136,7 @@ def generate_gp_batch(
             tabicl_split_calib_frac=tabicl_split_calib_frac,
             kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
             marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
-            marginal_probs_n=marginal_probs_n,
+            marginal_probs_n=marginal_probs_n, raw_y_override=raw_y_override,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])

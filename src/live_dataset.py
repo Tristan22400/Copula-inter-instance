@@ -72,8 +72,26 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
 # tabicl_model's pit.py path below, see build_live_train_loader's
 # batched_marginal_worker_enabled for the shared worker/device/spawn
 # handling this now gets.
-_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm")
+#
+# "y_train": no PIT at all -- a no-marginal-model control/ablation arm. The
+# ICL conditioning input becomes the raw per-episode z-scored target
+# ((y_train - mean) / std), computed in-process with no extra model to load
+# (unlike every other non-"analytic" entry here, which loads a frozen
+# marginal backend per worker -- see _RAW_Y_SOURCES below and
+# data_gen.py::_generate_gp_batch_raw's raw_y_override). z_test/log_pdf_test
+# stay the exact analytic oracle, so the loss target and every val metric's
+# ground truth are byte-identical to a z_train_source="analytic" run -- only
+# the model's own context input changes, isolating the PIT-preprocessing
+# question from every other confound. live_generation-only (see
+# generate_pit_dataset.py's on-disk-path guard) -- no on-disk pipeline
+# support exists.
+_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train")
 _GENERIC_MARGINAL_BACKENDS = ("exaone", "tabpfn", "tabldm")
+# z_train_source values needing no marginal model loaded at all (unlike
+# _GENERIC_MARGINAL_BACKENDS/"tabicl"/"tabicl_split") -- the override is a
+# pure tensor op inside data_gen.py, gated by a plain bool thread through
+# every generate_gp_batch call site below.
+_RAW_Y_SOURCES = ("y_train",)
 
 
 def _validate_z_train_source(z_train_source: str) -> None:
@@ -383,6 +401,7 @@ class LiveGPDataset(IterableDataset):
         # instead of the whole run.
         z_train_source = str(cfg.data.get("z_train_source", "analytic"))
         _validate_z_train_source(z_train_source)
+        raw_y_override = z_train_source in _RAW_Y_SOURCES
         tabicl_model = None
         gen_device = "cpu"
         tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
@@ -440,6 +459,7 @@ class LiveGPDataset(IterableDataset):
                 tabicl_mix_weights=self.tabicl_mix_weights,
                 marginal_backend=self.marginal_backend, marginal_regressor=marginal_regressor,
                 marginal_probs_n=self.marginal_probs_n,
+                raw_y_override=raw_y_override,
             )
             for ep in episodes:
                 yield ep
@@ -740,6 +760,7 @@ def build_fixed_live_val_batches(
     _validate_z_train_source(z_train_source)
     tabicl_live_enabled = z_train_source in ("tabicl", "tabicl_split")
     generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS
+    raw_y_override = z_train_source in _RAW_Y_SOURCES
     if (tabicl_live_enabled or generic_marginal_enabled) and device != "cuda":
         raise ValueError(
             f"training.live_generation with data.z_train_source={z_train_source} "
@@ -798,6 +819,7 @@ def build_fixed_live_val_batches(
                 return_kernel_metadata=True,
                 marginal_backend=z_train_source if generic_marginal_enabled else None,
                 marginal_regressor=marginal_regressor, marginal_probs_n=marginal_probs_n,
+                raw_y_override=raw_y_override,
             )
             if gen_device == "cuda":
                 for ep in episodes:

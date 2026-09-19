@@ -26,6 +26,16 @@ route through the same _validate_z_train_source/build_live_train_loader/
 build_fixed_live_val_batches call sites already covered by the tabicl cases.
 Each backend's own numerical correctness is covered by its
 tests/test_*_batched.py equivalence test instead.
+
+"y_train" added 2026-09-19 (a no-PIT control/ablation arm -- see
+data_gen.py::_generate_gp_batch_raw's raw_y_override and live_dataset.py's
+_RAW_Y_SOURCES): included in the parametrized "known values" cases, plus a
+dedicated numerical test below (unlike exaone/tabpfn/tabldm, it has no
+marginal model to cross-check against a per-episode fallback -- the only
+thing to pin down is the raw-y-space arithmetic itself and that z_test/
+log_pdf_test are left untouched), and a guard test confirming
+generate_pit_dataset.py's on-disk path rejects it rather than silently
+falling back to plain analytic generation.
 """
 
 from __future__ import annotations
@@ -43,7 +53,7 @@ from train import _reserve_gpu_headroom_for_live_tabicl
 
 
 @pytest.mark.parametrize(
-    "value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm"]
+    "value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train"]
 )
 def test_validate_z_train_source_accepts_known_values(value):
     _validate_z_train_source(value)  # must not raise
@@ -68,7 +78,7 @@ def test_valid_z_train_sources_matches_documented_set():
     # Guards against _VALID_Z_TRAIN_SOURCES silently drifting out of sync
     # with conf/data/gp_tasks.yaml's documented z_train_source values.
     assert set(_VALID_Z_TRAIN_SOURCES) == {
-        "analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm",
+        "analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train",
     }
 
 
@@ -103,3 +113,59 @@ def test_reserve_gpu_headroom_raises_on_typo():
     t = OmegaConf.create({})
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
         _reserve_gpu_headroom_for_live_tabicl(cfg, t, device="cpu")
+
+
+# ---------------------------------------------------------------------------
+# "y_train" (raw_y_override): the ICL context becomes the raw, per-episode
+# z-scored target instead of any PIT transform, while z_test/log_pdf_test
+# stay the exact analytic oracle -- pin both halves of that contract.
+# ---------------------------------------------------------------------------
+
+
+def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg):
+    import torch
+    from omegaconf import OmegaConf as OC
+
+    from data_gen import generate_gp_batch
+
+    cfg = OC.create(OC.to_container(small_cfg, resolve=True))
+    cfg.data.P_min = cfg.data.P_max = 8
+    cfg.data.N_min = cfg.data.N_max = 6
+    cfg.data.kernel = "rbf"
+    torch.manual_seed(0)
+    episodes = generate_gp_batch(cfg, 6, "cpu", raw_y_override=True)
+    for ep in episodes:
+        y_train = ep["y_train"]
+        expected = (y_train - y_train.mean()) / y_train.std().clamp(min=1e-8)
+        assert torch.allclose(ep["z_train"], expected, atol=1e-5)
+
+
+def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg):
+    import torch
+    from omegaconf import OmegaConf as OC
+
+    from data_gen import generate_gp_batch
+
+    cfg = OC.create(OC.to_container(small_cfg, resolve=True))
+    cfg.data.P_min = cfg.data.P_max = 8
+    cfg.data.N_min = cfg.data.N_max = 6
+    cfg.data.kernel = "rbf"
+
+    torch.manual_seed(0)
+    raw_episodes = generate_gp_batch(cfg, 6, "cpu", raw_y_override=True)
+    torch.manual_seed(0)
+    analytic_episodes = generate_gp_batch(cfg, 6, "cpu", raw_y_override=False)
+
+    for raw_ep, an_ep in zip(raw_episodes, analytic_episodes):
+        assert torch.allclose(raw_ep["z_test"], an_ep["z_test"])
+        assert torch.allclose(raw_ep["log_pdf_test"], an_ep["log_pdf_test"])
+        # The whole point of the ablation: the context changes...
+        assert not torch.allclose(raw_ep["z_train"], an_ep["z_train"])
+
+
+def test_generate_pit_dataset_rejects_y_train_on_disk():
+    from generate_pit_dataset import _reject_disk_unsupported_z_train_source
+
+    with pytest.raises(ValueError, match="only supported under training.live_generation"):
+        _reject_disk_unsupported_z_train_source("y_train")
+    _reject_disk_unsupported_z_train_source("analytic")  # must not raise

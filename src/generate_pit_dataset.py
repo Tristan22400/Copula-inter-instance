@@ -283,6 +283,27 @@ def _scan_meta_total(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int)
     return total
 
 
+def _reject_disk_unsupported_z_train_source(z_train_source: str) -> None:
+    """Raise for any data.z_train_source with no on-disk implementation,
+    instead of silently falling through to plain analytic generation --
+    exactly the silent-no-op bug class _validate_z_train_source itself was
+    built to catch (see its docstring's "tabicl-split" typo root-cause).
+    Factored out of main() (which is @hydra.main-wrapped and awkward to
+    exercise directly in a test) so this one check stays independently
+    testable.
+
+    Currently only "y_train" (see data_gen.py::_generate_gp_batch_raw's
+    raw_y_override): threaded through the live-generation path only
+    (live_dataset.py) -- no on-disk implementation exists.
+    """
+    if z_train_source == "y_train":
+        raise ValueError(
+            "data.z_train_source=y_train is only supported under "
+            "training.live_generation=true (src/live_dataset.py) -- no "
+            "on-disk generate_pit_dataset.py implementation exists."
+        )
+
+
 @hydra.main(config_path="../conf", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     device  = "cuda" if torch.cuda.is_available() else "cpu"
@@ -316,6 +337,7 @@ def main(cfg: DictConfig) -> None:
     # tabicl_split_calib_frac below).
     z_train_source = str(cfg.data.get("z_train_source", "analytic"))
     _validate_z_train_source(z_train_source)
+    _reject_disk_unsupported_z_train_source(z_train_source)
     tabicl_model = None
     marginal_backend = z_train_source if z_train_source in _GENERIC_MARGINAL_BACKENDS else None
     marginal_regressor = None
