@@ -11,8 +11,14 @@ _CHECKPOINTS_ROOT = os.path.join(
 )
 
 # name -> {dir, default_step, label, color}. `dir` is the run directory under
-# checkpoints/; `default_step` picks which step_*.pt file `diagnose`/`sweep`
-# use when a bare family name (not "family:step") is given.
+# checkpoints/ (may itself be several path segments, e.g. the
+# "copula_prod/canonical/..." nesting the checkpoints/ reorg -- commit
+# 902d35c, "Reorganize checkpoint structure..." -- introduced; every entry
+# below was re-pointed at its post-reorg location then, so keep `dir` in
+# sync with wherever a family's step_*.pt actually lives on disk, not just
+# its bare run-directory name); `default_step` picks which step_*.pt file
+# `diagnose`/`sweep` use when a bare family name (not "family:step") is
+# given.
 #
 # Kept to the best-performing checkpoint per training lineage (per the
 # spatial-correlation model_r2 sweeps -- see project memory): dropped
@@ -23,37 +29,37 @@ _CHECKPOINTS_ROOT = os.path.join(
 # TabICL finetune below).
 CHECKPOINT_FAMILIES = {
     "kernel-sweep-all-noisy-mae": {
-        "dir": "kernel-sweep-all-noisy-mae",
+        "dir": "copula_prod/canonical/kernel-sweep-all-noisy-mae",
         "default_step": 355000,
         "label": "Perte MAE + bruit leger (355k steps)",
         "color": "#4c72b0",
     },
     "kernel-sweep-classic-zcorrupt-noise-mild-bigN": {
-        "dir": "kernel-sweep-classic-zcorrupt-noise-mild-bigN",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-zcorrupt-noise-mild-bigN",
         "default_step": 285000,
         "label": "Bruit leger + Grand N (285k steps)",
         "color": "#55a868",
     },
     "kernel-sweep-all-tabicl-retrain-15k": {
-        "dir": "kernel-sweep-all-tabicl-retrain",
+        "dir": "copula_prod/canonical/kernel-sweep-all-tabicl-retrain",
         "default_step": 15000,
         "label": "Entrainement normal + 15k steps avec z_train TabICL",
         "color": "#c44e52",
     },
     "kernel-sweep-classic-prod-tabicl-retrain": {
-        "dir": "kernel-sweep-classic-prod-tabicl-retrain",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-prod-tabicl-retrain",
         "default_step": 5000,
         "label": "Classic-prod (40k) + 5k steps avec z_train TabICL",
         "color": "#937860",
     },
     "kernel-sweep-classic-prod": {
-        "dir": "kernel-sweep-classic-prod",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-prod",
         "default_step": 40000,
         "label": "Classic prod (40k steps)",
         "color": "#8172b2",
     },
     "kernel-sweep-classic-zcorrupt-bigN-retrain": {
-        "dir": "kernel-sweep-classic-zcorrupt-noise-mild-bigN-retrain",
+        "dir": "copula_prod/canonical/kernel-sweep-classic-zcorrupt-noise-mild-bigN-retrain",
         "default_step": 210000,
         "label": "zcorrupt bigN retrain (210k steps)",
         "color": "#937860",
