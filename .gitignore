@@ -4,6 +4,7 @@ results/
 logs/
 checkpoints/
 baseline_cache.pt
+baseline_cache*.pt.d/
 /data/
 src/__pycache__/
 src/models/__pycache__/
