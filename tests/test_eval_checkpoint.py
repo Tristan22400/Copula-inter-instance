@@ -319,7 +319,7 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path):
         ep=tiny_episode, icl_rank=2, n_steps_mle=3, lr_mle=0.1, n_steps_dkl=3, lr_dkl=0.1,
         n_steps_per_ep=3, patience_per_ep=2, device=torch.device("cpu"), oracle_mode="prior", n_restarts_mle=1,
     )
-    key = episode_cache_key(live_generate=True, dataset_dir=None, seed=0, local_i=0, ep_i=0)
+    key = episode_cache_key(live_generate=True, dataset_dir=None, seed=0, ep_i=0)
     save_baseline_cache(
         cache_path, fingerprint,
         {key: {"nlls": nlls, "R_dict": R_dict, "y_nlls": y_space_nlls}},
@@ -340,3 +340,48 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path):
         n_steps_dkl=3, lr_dkl=0.1, n_steps_per_ep=3, patience_per_ep=2,
     )
     assert load_baseline_cache(cache_path, other_fingerprint) == {}
+
+def test_failed_baseline_fit_still_yields_nan_parts_dict(tiny_episode, monkeypatch):
+    """A baseline whose fit RAISES must still record a {total, marginal,
+    copula} dict in y_nlls, never a bare float.
+
+    The DKL failure path used to store `float("nan")` while every other
+    failure path stored _NAN_PARTS, which broke two things at once, both of
+    them only long after the episode itself looked fine:
+
+      * _print_total_nll_table aggregates with
+        `m.get(k, _NAN_PARTS).get(part, nan)`, so a bare float raises
+        AttributeError — at the SUMMARY, i.e. only after every episode in the
+        run has already been scored.
+      * eval_checkpoint's _valid_cached_entry rejects any y_nlls holding a
+        non-dict as "predates the marginal/copula split", so the episode was
+        refit on every subsequent run, and the refit reproduced the same bare
+        float — a cache entry that could never become valid. Observed on
+        episode 239 of a 400-episode run, which refit itself indefinitely.
+    """
+    import eval.baselines.classical as classical
+
+    real_fit = classical.fit_and_eval_gpytorch
+
+    def fail_dkl_only(*args, **kwargs):
+        # Only the DKL calls pass a feature_extractor; leave GP-MLE alone so
+        # the episode still produces real results around the failure.
+        if kwargs.get("feature_extractor") is not None:
+            raise RuntimeError("synthetic DKL failure")
+        return real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(classical, "fit_and_eval_gpytorch", fail_dkl_only)
+
+    _, _, y_space_nlls = eval_baselines_episode(
+        ep=tiny_episode, icl_rank=2, n_steps_mle=3, lr_mle=0.1, n_steps_dkl=3,
+        lr_dkl=0.1, n_steps_per_ep=3, patience_per_ep=2,
+        device=torch.device("cpu"), oracle_mode="prior", n_restarts_mle=1,
+    )
+
+    dkl_labels = [k for k in y_space_nlls if k.startswith("dkl_")]
+    assert dkl_labels, "expected DKL baselines to be present in y_nlls"
+    for label, parts in y_space_nlls.items():
+        assert isinstance(parts, dict), f"{label} stored {type(parts).__name__}, not a dict"
+        assert {"total", "marginal", "copula"} <= parts.keys(), label
+    for label in dkl_labels:
+        assert all(math.isnan(v) for v in y_space_nlls[label].values()), label
