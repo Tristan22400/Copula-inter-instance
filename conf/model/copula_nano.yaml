@@ -93,7 +93,7 @@ tabicl:
   # for validation, never trained. Phase A ERA5 fine-tune of the frozen
   # TabICL marginal (src/finetune_marginal.py), swapped in for the pretrained
   # HF checkpoint.
-  pit_ckpt: checkpoints/marginal/ablations/marginal_finetune_era5_run1/step_0177600_final.pt
+  pit_ckpt: checkpoints/marginal/ablations/marginal_finetune_era5_33y/step_0169600_final.pt
   arch:
     embed_dim: 32       # vs. 128 in the pretrained checkpoint
     col_num_blocks: 1   # vs. 3 in the pretrained checkpoint

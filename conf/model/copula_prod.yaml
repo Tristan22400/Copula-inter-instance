@@ -31,7 +31,7 @@ tabicl:
   # swapped in for the pretrained HF checkpoint above. Same {"config","state_dict"}
   # schema, so it's a drop-in backbone init (pretrained=true) and a drop-in
   # --tabicl_ckpt default for eval_checkpoint.py's z_train_source=tabicl.
-  ckpt: checkpoints/marginal/ablations/marginal_finetune_era5_run1/step_0177600_final.pt  # ignored when pretrained=false
+  ckpt: checkpoints/marginal/ablations/marginal_finetune_era5_33y/step_0169600_final.pt  # ignored when pretrained=false
   # Gradient checkpointing (torch.utils.checkpoint) through the pretrained
   # backbone's col/row/icl transformer stages: recomputes activations during
   # backward instead of holding them all, trading ~20-30% extra compute for a
