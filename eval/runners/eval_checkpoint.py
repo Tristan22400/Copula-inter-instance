@@ -32,6 +32,14 @@ Usage
         [--tabicl_ckpt ...]        # TabICL checkpoint for --z_train_source=tabicl
                                    # (default: cfg.tabicl.ckpt from --config)
         [--tabicl_pit_k_folds 10]  # K-fold count for --z_train_source=tabicl
+        [--zeromean_gp / --no-zeromean_gp]  # (default: on) fit "Marginal + Zero
+                                   # Mean GP (RBF/Matern32)" directly on
+                                   # marginal_pit['z_train'] -- see classical.
+                                   # fit_zero_mean_gp_on_marginal's docstring.
+                                   # No-op under --z_train_source=oracle.
+        [--n_steps_zeromean_gp 500]   # Adam steps per Zero-Mean GP z-space fit
+        [--lr_zeromean_gp 0.05]       # learning rate for the Zero-Mean GP Adam fits
+        [--n_restarts_zeromean_gp 2]  # random restarts per Zero-Mean GP kernel fit
         [--plot_episode 0]        # local episode index to plot corr_grid for
         [--out_dir ./eval/results]  # directory to save corr_grid figure
         [--device auto]
@@ -76,6 +84,22 @@ fits sharpen the fitted kernel's prior correlation at the test points and the
 copula NLL rises monotonically — measured ~11 -> ~25 nats for ARD-RBF between
 100 and 1000 steps), so it must be chosen on a convergence criterion over the
 fitting objective and held fixed, never trimmed to fit a walltime.
+
+"Marginal + Zero Mean GP (RBF/Matern32)" (--zeromean_gp, default on) adds a
+SEPARATE, much cheaper fit on top of the above: 2 kernels x
+--n_restarts_zeromean_gp (2) x --n_steps_zeromean_gp (500) restarts/steps on
+(X_train, marginal_pit['z_train']) instead of raw y_train -- see
+eval.baselines.classical.fit_zero_mean_gp_on_marginal's docstring for why
+this is a distinct, legitimate baseline. Profiled on one real episode
+(P=32/N=256/d_x=11, era5-12m fine-tuned TabICLv2 marginal): 1.8-1.9 ms/Adam-
+step on 1 CPU thread vs. 2.8-2.9 ms/step on GPU (same ~1.5x CPU-is-faster
+pattern as the y-space GP-MLE fits above, for the same reason -- P=32 means
+every step is a small Cholesky dominated by launch latency, not arithmetic),
+fit NLL plateauing by step 500 (500->1000 changes NLL by <0.0002) and by
+restart 2 (a 3rd restart finds nothing further). At those defaults the whole
+addition costs ~3.8 s/episode serially in the main loop (not the parallel
+worker pool -- see _eval_zero_mean_gp_baselines' docstring for why), a small
+fraction of the ~78.6 s/episode baseline-fitting cost measured above.
 
 With --live_generate (the default), the episodes themselves come from
 --config's own cfg.data — resolved through Hydra's defaults list, NOT the
@@ -138,6 +162,7 @@ from eval.baselines.classical import (  # noqa: E402
     corr_nll_single,
     episode_cache_key,
     eval_baselines_episode,
+    fit_zero_mean_gp_on_marginal,
     load_baseline_cache,
     save_baseline_entry,
 )
@@ -410,6 +435,85 @@ def _marginal_pit(
     }
 
 
+# The "few" kernels requested for the Zero-Mean GP baseline — RBF and
+# Matern32 cover the two most common, well-behaved general-purpose kernel
+# families (see classical.fit_zero_mean_gp_on_marginal's module docstring)
+# without paying for the full GP-MLE kernel+ARD sweep a second time in
+# z-space. Fixed (not CLI-configurable) so _METHOD_ORDER/_TOTAL_NLL_ORDER
+# below can list both rows unconditionally instead of growing/shrinking
+# columns at runtime.
+_ZEROMEAN_GP_KERNELS = ("rbf", "matern32")
+
+
+def _eval_zero_mean_gp_baselines(
+    ep: dict,
+    marginal_pit: dict[str, Tensor],
+    device: torch.device,
+    n_steps: int,
+    lr: float,
+    n_restarts: int,
+    oracle_mode: str,
+    prior_cfg: dict,
+) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
+    """Zero-mean GP-MLE baselines ("Marginal + Zero Mean GP (...)") fit
+    directly on marginal_pit["z_train"] — the SAME real, non-oracle marginal
+    input the ICL model itself conditions on (see
+    classical.fit_zero_mean_gp_on_marginal's module docstring for why this
+    is legitimate, unlike fitting a baseline on the oracle z_train).
+
+    nlls/R_dict follow the shared-ground-truth-marginal convention every
+    other baseline uses (scored against ep["z_test"], not
+    marginal_pit["z_test"]), so the caller can merge them straight into
+    baseline_nlls/baseline_R and they participate in the best_baseline
+    nested-CV ranking like any other fitted candidate. y_space_nlls instead
+    scores each fit's OWN total (marginal + copula) Y-space NLL via
+    marginal_pit's z_test/log_pdf_test — the same real marginal the
+    correlation was just fit against — mirroring _eval_icl_episode's
+    icl_y_parts exactly, so "does a classical GP beat the ICL copula head
+    given an IDENTICAL real marginal" is an apples-to-apples comparison in
+    both tables.
+
+    Not routed through eval_baselines_episode/the baseline_cache worker
+    pool: unlike every other classical baseline, this fit depends on which
+    marginal produced z_train (--z_train_source / --tabicl_ckpt), which that
+    checkpoint-independent, oracle-episode-only cache has no way to key on.
+    """
+    X_train = ep["x_norm_train"].to(device)   # (P, d_x)
+    X_test = ep["x_norm_test"].to(device)     # (N, d_x)
+    z_test = ep["z_test"].to(device)          # (N,) ground truth, shared across every baseline
+    z_train_marg = marginal_pit["z_train"].to(device)   # (P,) real marginal's PIT residual
+    N = X_test.shape[0]
+    test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
+    R_I = torch.eye(N, dtype=X_train.dtype, device=device)
+
+    nlls: dict[str, float] = {}
+    R_dict: dict[str, Tensor] = {}
+    y_space_nlls: dict[str, dict[str, float]] = {}
+    for kname in _ZEROMEAN_GP_KERNELS:
+        label = f"gp_zeromean_{kname}"
+        try:
+            fit = fit_zero_mean_gp_on_marginal(
+                X_train, z_train_marg, X_test, kname,
+                n_steps=n_steps, lr=lr, n_restarts=n_restarts,
+                oracle_mode=oracle_mode, prior_cfg=prior_cfg,
+            )
+            nlls[label] = corr_nll_single(fit["R"], z_test)
+            R_dict[label] = fit["R"]
+            parts = y_space_nll(
+                fit["R"].unsqueeze(0),
+                marginal_pit["z_test"].to(device).unsqueeze(0),
+                marginal_pit["log_pdf_test"].to(device).unsqueeze(0),
+                test_mask,
+            )
+            y_space_nlls[label] = {k: v.item() for k, v in parts.items()}
+        except Exception as exc:
+            print(f"  [{label}] failed: {exc}")
+            nlls[label] = float("nan")
+            R_dict[label] = R_I.clone()
+            y_space_nlls[label] = _NAN_PARTS.copy()
+    return nlls, R_dict, y_space_nlls
+
+
 def _make_folds(n: int, k: int, seed: int) -> list[Tensor]:
     """Deterministic, per-episode partition of the n test-point indices into
     k disjoint folds of near-equal size (sizes differ by at most 1) —
@@ -515,6 +619,8 @@ _METHOD_ORDER = [
     ("gp_mle_ard_rq",       "GP-MLE-ARD-RQ"),
     ("gp_mle_dot_product",  "GP-MLE-DotProduct"),
     ("gp_mle_polynomial",   "GP-MLE-Polynomial"),
+    ("gp_zeromean_rbf",     "Marginal + Zero Mean GP (RBF)"),
+    ("gp_zeromean_matern32", "Marginal + Zero Mean GP (Matern32)"),
     ("dkl_rbf",             "Deep Kernel Learning (RBF)"),
     ("dkl_matern32",        "Deep Kernel Learning (Matern32)"),
     ("dkl_rq",              "Deep Kernel Learning (RQ)"),
@@ -674,6 +780,10 @@ def _results_fingerprint(baseline_fp: dict, args, tabicl_pit_k_folds: int) -> di
         "n_folds": args.n_folds,
         "min_fold_size": args.min_fold_size,
         "seed": args.seed,
+        "zeromean_gp": args.zeromean_gp,
+        "n_steps_zeromean_gp": args.n_steps_zeromean_gp,
+        "lr_zeromean_gp": args.lr_zeromean_gp,
+        "n_restarts_zeromean_gp": args.n_restarts_zeromean_gp,
     }
 
 
@@ -1100,6 +1210,37 @@ def main() -> None:
                              "initialised by sampling from the same LogNormal/Gamma "
                              "hyperpriors data_gen.py's generative process uses); keeps "
                              "whichever restart reaches the best final training loss.")
+    parser.add_argument("--zeromean_gp", action=argparse.BooleanOptionalAction, default=True,
+                        help="Fit the 'Marginal + Zero Mean GP (RBF/Matern32)' baselines "
+                             "directly on marginal_pit['z_train'] -- the same real "
+                             "(non-oracle) marginal input the ICL model conditions on -- "
+                             "instead of the raw y-space GP-MLE/DKL baselines above (see "
+                             "eval.baselines.classical.fit_zero_mean_gp_on_marginal's "
+                             "module docstring). Only 2 kernels (RBF, Matern32) by design, "
+                             "to keep this cheap. Automatically a no-op for episodes with "
+                             "no real marginal available (--z_train_source=oracle, or "
+                             "fewer than 2 training points).")
+    parser.add_argument("--n_steps_zeromean_gp", type=int, default=500,
+                        help="Adam steps for each Zero-Mean GP z-space fit. Needs far "
+                             "fewer than --n_steps_mle's 1000: profiled on a real episode "
+                             "(P=32/N=256/d_x=11, RBF/Matern32, 1 CPU thread), the fit "
+                             "NLL plateaus by step 500 (rbf -0.0252, matern32 -0.0386) and "
+                             "barely moves by step 1000 (-0.0251/-0.0386) -- unlike raw "
+                             "y-space GP-MLE, there is no separate mean/scale to also "
+                             "discover here, just 2-3 kernel hyperparameters against an "
+                             "already marginally-standardized target, so it converges much "
+                             "faster. Chosen on that convergence plateau, not trimmed for "
+                             "speed (see the module docstring's Runtime note on why "
+                             "--n_steps_mle itself must never be tuned that way).")
+    parser.add_argument("--lr_zeromean_gp", type=float, default=0.05,
+                        help="Learning rate for the Zero-Mean GP Adam fits")
+    parser.add_argument("--n_restarts_zeromean_gp", type=int, default=2,
+                        help="Random restarts per Zero-Mean GP kernel fit -- fewer than "
+                             "--n_restarts_mle's 5 by design. Profiled on the same episode: "
+                             "restart 2 clearly beats restart 1 (rbf -0.0301 -> -0.0251, "
+                             "matern32 -0.0442 -> -0.0386) but a 3rd restart finds nothing "
+                             "further (identical NLL to 2), so 2 is the measured sweet spot "
+                             "rather than a guess.")
     parser.add_argument("--n_steps_dkl",  type=int,   default=5000,
                         help="Adam steps for Deep Kernel Learning (MLP+GP) fitting")
     parser.add_argument("--lr_dkl",       type=float, default=0.01,
@@ -1665,6 +1806,39 @@ def main() -> None:
             if marginal_pit is None:
                 print(f"  [ep {ep_i}] fewer than 2 training points — "
                       "falling back to oracle z_train for this episode")
+
+        # ---- Marginal + Zero Mean GP baselines: fit directly on the real
+        # marginal's z_train (see _eval_zero_mean_gp_baselines' docstring).
+        # Not part of the checkpoint-independent baseline_cache above (it
+        # depends on --z_train_source/--tabicl_ckpt, which that cache has no
+        # way to key on), so it is fit fresh here every run; only 2 kernels
+        # at a reduced step/restart budget (--n_steps_zeromean_gp/
+        # --n_restarts_zeromean_gp) keeps that cheap. A no-op whenever there
+        # is no real marginal for this episode (--z_train_source=oracle, or
+        # marginal_pit is None). Seeded off this episode's own fit_seed
+        # (independent of --baseline_workers/cache-hit stream position) and
+        # the global RNG snapshot/restored around it, matching the serial
+        # classical-baseline fit above, since eval_baselines_episode's own
+        # fit_seed reseed makes every OTHER baseline's reproducibility
+        # depend only on that reseed, not on what ran before it here.
+        if args.zeromean_gp and marginal_pit is not None:
+            _rng_cpu2 = torch.get_rng_state()
+            _rng_cuda2 = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
+            torch.manual_seed(fit_seed + 1)
+            zm_nlls, zm_R, zm_y_nlls = _eval_zero_mean_gp_baselines(
+                ep=ep, marginal_pit=marginal_pit, device=baseline_device,
+                n_steps=args.n_steps_zeromean_gp, lr=args.lr_zeromean_gp,
+                n_restarts=args.n_restarts_zeromean_gp,
+                oracle_mode=oracle_mode, prior_cfg=prior_cfg,
+            )
+            torch.set_rng_state(_rng_cpu2)
+            if _rng_cuda2 is not None:
+                torch.cuda.set_rng_state_all(_rng_cuda2)
+            baseline_nlls = {**baseline_nlls, **zm_nlls}
+            baseline_R = {**baseline_R, **{k: v.to(device) for k, v in zm_R.items()}}
+            baseline_y_nlls = {**baseline_y_nlls, **zm_y_nlls}
 
         icl_nlls, icl_R, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
             ep=ep, icl_model=icl_model, device=device, marginal_pit=marginal_pit,

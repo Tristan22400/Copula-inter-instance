@@ -104,6 +104,8 @@ __all__ = [
     "GP_VAL_SELECT_MODES",
     "EXPECTED_BASELINE_KEYS",
     "assert_shared_z_test",
+    "fit_zero_mean_gp_on_marginal",
+    "zero_mean_gp_prior_cfg",
 ]
 
 
@@ -729,6 +731,84 @@ def fit_and_eval_gpytorch(
 
     R, _ = sigma_to_correlation(Sigma_post)
     return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
+
+
+
+# ---------------------------------------------------------------------------
+# Zero-Mean GP fit directly on a REAL (non-oracle) marginal's z_train
+# ---------------------------------------------------------------------------
+#
+# Every GP-MLE/DKL baseline above fits in raw y-space precisely because
+# fitting against the ORACLE z_train would leak the true generating kernel's
+# own Cholesky factor (see fit_and_eval_gpytorch's docstring). That concern
+# does not apply to a z_train produced by an independently-fit marginal model
+# (e.g. eval_checkpoint.py's --z_train_source=tabicl, run through a real —
+# possibly Phase-A-fine-tuned — TabICL): those PIT residuals carry no oracle
+# information, they are exactly the same (imperfect) conditioning input the
+# ICL copula head itself receives. Fitting a classical GP directly on that
+# input, with the mean forced to zero (z_train is already meant to be
+# marginally ~N(0,1) if the PIT is well calibrated — plain MLE, no separate
+# mean parameter to estimate), isolates the correlation-modelling question
+# from the marginal-modelling one: given the IDENTICAL real marginal input,
+# does a small classical GP recover the copula structure as well as the
+# learned ICL correlation head?
+#
+# Deliberately not one of eval_baselines_episode's cached, checkpoint-
+# independent baselines: this fit depends on which marginal produced
+# z_train (--z_train_source / --tabicl_ckpt), which eval_baselines_episode's
+# worker pool has no access to (it only ever sees the oracle episode dict).
+# eval_checkpoint.py fits it directly in the main per-episode loop, right
+# after computing that episode's marginal_pit.
+
+
+def zero_mean_gp_prior_cfg(prior_cfg: dict | None = None) -> dict:
+    """Hyperprior overrides for fitting on a marginal's z_train instead of raw
+    y_train: the y-space alpha2 (outputscale) prior has mean
+    alpha2_gamma_concentration / alpha2_gamma_rate ~= 1.33 under
+    _DEFAULT_PRIOR_CFG, tuned to data_gen.py's own y-space generative
+    hyperprior. z_train is instead expected to already be marginally unit-
+    variance (a well-calibrated PIT), so the outputscale prior is
+    recentred at mean 1 (Gamma(2, 2)) instead. Every other hyperprior
+    (lengthscale, noise) is coordinate-free w.r.t. the target's scale and is
+    left unchanged.
+    """
+    cfg = dict(prior_cfg or {})
+    cfg["alpha2_gamma_concentration"] = 2.0
+    cfg["alpha2_gamma_rate"] = 2.0
+    return cfg
+
+
+def fit_zero_mean_gp_on_marginal(
+    X_train: Tensor,
+    z_train: Tensor,
+    X_test: Tensor,
+    kernel_name: str,
+    n_steps: int,
+    lr: float,
+    n_restarts: int,
+    oracle_mode: str = "prior",
+    prior_cfg: dict | None = None,
+    jitter: float = 1e-6,
+) -> dict[str, Tensor]:
+    """Zero-mean GP-MLE fit on (X_train, z_train), z_train being a REAL
+    (non-oracle) marginal's PIT residual — see the module note above for why
+    this is a distinct, legitimate baseline from fit_and_eval_gpytorch's
+    y-space fits rather than the oracle-leakage case that function's
+    docstring warns against.
+
+    Thin wrapper: _ExactGPModel already forces gpytorch.means.ZeroMean()
+    unconditionally for every kernel, so no separate mean-function code path
+    is needed — only the outputscale prior changes (see
+    zero_mean_gp_prior_cfg). Same {"R", "mean", "Sigma"} return contract as
+    fit_and_eval_gpytorch; "mean"/"Sigma" are in z-space here, not raw
+    y-units.
+    """
+    return fit_and_eval_gpytorch(
+        X_train, z_train, X_test, kernel_name,
+        n_steps=n_steps, lr=lr, ard=False, jitter=jitter,
+        oracle_mode=oracle_mode, prior_cfg=zero_mean_gp_prior_cfg(prior_cfg),
+        n_restarts=n_restarts, val_select=False,
+    )
 
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
