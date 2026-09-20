@@ -34,6 +34,18 @@
 # Any eval_checkpoint.py flag passes through, e.g. a different geometry:
 #     oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt <...> --era5_grid_size 16 --n_episodes 800"
 #
+# Disk: the baseline cache holds 16 N x N correlation matrices per episode, so
+# its per-episode size is quadratic in N. At this script's default geometry
+# (grid 24 => N=546) that is ~20 MB/episode, i.e. ~7.8 GB for 400 episodes --
+# about 4.5x the ~4.3 MB/episode the synthetic default (N=256) costs. Halving
+# --era5_grid_size roughly quarters it.
+#
+# Measured runtime at the defaults on 32 physical cores: ~8.4 s/episode wall
+# for the baseline fit pass (~56 min for 400), plus a short scoring pass.
+# Episodes here are cheaper than the synthetic ones (P=30, d_x=6 vs P=32,
+# d_x=9), so do not size a reservation off eval_checkpoint.py's synthetic
+# 78.6 s/episode figure.
+#
 # Sharding across an OAR array: every episode is a pure function of
 # (--seed, its GLOBAL index), so --n_episodes 100 with --episode_offset
 # 0/100/200/300 covers exactly the same 400 episodes as one --n_episodes 400
