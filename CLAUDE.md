@@ -12,6 +12,31 @@
   #    or exaone/tabpfn/tabldm to score against the marginal a run trained with.
   python eval/runners/eval_checkpoint.py --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
 
+  # 3a. SAME comparison, REAL data: the identical baseline table on real
+  #     ARCO-ERA5 2m-temperature episodes instead of synthetic GP draws
+  #     (eval/data/era5_episodes.py). Same classical baselines, same nested-CV
+  #     best-of-baselines, same two tables, same resumable caches. Real data
+  #     has no generating kernel, so the "Oracle (prior)" row and the analytic
+  #     GP prior/posterior Y-space rows are nan, and the shared z_test every
+  #     row is scored against is the frozen-TabICL K-fold PIT rather than a
+  #     ground-truth marginal -- read the TOTAL Y-space NLL table, which is a
+  #     proper scoring rule regardless. --z_train_source=oracle is rejected.
+  #     Targets are z-scored per episode before the baselines are fitted
+  #     (--era5_standardize_y, on by default) and converted back to raw Kelvin
+  #     nats: ERA5 y is ~280 K while classical.py's GP hyperpriors assume
+  #     data_gen.py's O(1) draws, so leaving them raw handicaps the baselines
+  #     on units alone while our model normalizes internally.
+  #     Needs the corpus cached once (defaults to the held-out val year):
+  #       python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 \
+  #           --cache-dir ./eval/data/cache/era5_global_val
+  python eval/runners/eval_checkpoint.py --era5 --n_episodes 400 \
+      --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
+  oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt <ckpt>"   # on Grid5000
+  #     Baseline fitting is ~98% of the runtime and is checkpoint-independent,
+  #     so a SECOND checkpoint over the same episodes/geometry reuses the whole
+  #     --baseline_cache and only redoes the ICL forward pass. Give each
+  #     checkpoint its own --results_cache, share the --baseline_cache.
+
   # 3b. Evaluate on real-world datasets (UCI Beijing PM2.5, California Housing)
   python eval/runners/run_benchmarks.py
 

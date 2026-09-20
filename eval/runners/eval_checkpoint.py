@@ -118,6 +118,12 @@ for _p in (_REPO_ROOT, _SRC):
 
 from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
+
+from eval.data.era5_episodes import (  # noqa: E402
+    DEFAULT_CORPUS_DIR as ERA5_DEFAULT_CORPUS_DIR,
+    build_era5_eval_episodes,
+    era5_episode_fingerprint,
+)
 from inference.copula_inference import load_copula_model  # noqa: E402
 from loss import y_space_nll  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
@@ -228,7 +234,13 @@ def _eval_icl_episode(
     X_test  = ep["x_norm_test"].to(device)     # (N, d_x)
     z_test  = ep["z_test"].to(device)          # (N,)
     assert_shared_z_test(z_test, ep)
-    R_oracle = ep["R_star"].to(device)         # (N, N)
+    # Real-ERA5 episodes (eval/data/era5_episodes.py) carry no generating
+    # kernel, hence no R_star and no analytic prior/posterior: the entire
+    # oracle half of this function is skipped for them and None propagates
+    # to the caller, whose tables print n/a for those rows. Everything else
+    # here -- the ICL forward pass, its shared-marginal copula NLL, and its
+    # own-marginal Y-space split -- is identical on real and synthetic data.
+    R_oracle = ep["R_star"].to(device) if "R_star" in ep else None   # (N, N) or None
 
     P, N = X_train.shape[0], X_test.shape[0]
     nlls: dict[str, float] = {}
@@ -269,8 +281,9 @@ def _eval_icl_episode(
         nlls["icl"] = float("nan")
         R_dict["icl"] = R_I.clone()
 
-    nlls["oracle"] = corr_nll_single(R_oracle, z_test)
-    R_dict["oracle"] = R_oracle
+    if R_oracle is not None:
+        nlls["oracle"] = corr_nll_single(R_oracle, z_test)
+        R_dict["oracle"] = R_oracle
 
     # "oracle" above is the PRIOR reference (cfg.data.oracle_mode="prior" —
     # the only mode data_gen.py's training pipeline supports): R_star = raw
@@ -286,6 +299,11 @@ def _eval_icl_episode(
     # structure), never scored against z_test.
     y_space_nlls = {"prior": _NAN_PARTS.copy(), "posterior": _NAN_PARTS.copy()}
     try:
+        if R_oracle is None:
+            raise NotImplementedError(
+                "no generating kernel (real-data episode) -- no analytic GP "
+                "prior/posterior reference exists"
+            )
         post = gp_analytical_posterior(ep)
         R_dict["oracle_posterior"] = post["R_post"].to(device)
         y_space_nlls = {
@@ -545,6 +563,17 @@ def _kernel_composition_label(ep: dict) -> str:
     fields generate_gp_batch attaches — absent entirely for episodes loaded
     from a pre-built dataset that didn't request that metadata (the common
     case for existing PIT datasets on disk today)."""
+    meta = ep.get("era5_meta")
+    if meta is not None:
+        # Real ERA5: there is no kernel, so this column reports the episode's
+        # geography instead (the closest analogue of "what generated it").
+        lat = meta.get("lat_bounds")
+        lon = meta.get("lon_bounds")
+        where = (
+            f"lat[{lat[0]:.1f},{lat[1]:.1f}] lon[{lon[0]:.1f},{lon[1]:.1f}]"
+            if lat is not None and lon is not None else "region n/a"
+        )
+        return f"ERA5 {where} grid={meta['grid_size']} P={meta['P']} N={meta['N']}"
     if "kernel" not in ep:
         return "unavailable (pass --dataset_dir with pre-generated metadata, or use --live_generate)"
 
@@ -930,7 +959,8 @@ def _live_generate_alternating(
     return episodes
 
 
-def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "tabicl") -> None:
+def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "tabicl",
+                 era5: bool = False) -> None:
     means = {k: float(np.nanmean([m.get(k, float("nan")) for m in all_nlls]))
              for k, _ in _METHOD_ORDER}
     stds  = {k: float(np.nanstd( [m.get(k, float("nan")) for m in all_nlls]))
@@ -940,6 +970,12 @@ def _print_table(all_nlls: list[dict[str, float]], z_train_source: str = "tabicl
     total = col + 2 * 12
     print(f"\n{'─' * total}")
     print(f"Inter-instance copula NLL (z-space) — lower is better  [N={len(all_nlls)} episodes]")
+    if era5:
+        print("Episodes: REAL ARCO-ERA5 2m-temperature. The shared z_test every row "
+              "is scored against is the frozen-{s} K-fold PIT, NOT a ground-truth "
+              "marginal (none exists on real data) — rows still differ only in their "
+              "correlation matrix R, so the ranking is valid, but 'Oracle (prior)' is "
+              "structurally unavailable and prints nan.".format(s=z_train_source))
     print(f"ICL z_train source: {z_train_source}"
           + ("  (exact GP-LOO PIT)" if z_train_source == "oracle"
              else f"  ({z_train_source} K-fold PIT estimate)"))
@@ -1000,6 +1036,7 @@ _TOTAL_NLL_ORDER = [
 
 def _print_total_nll_table(
     all_total_nlls: list[dict[str, dict[str, float]]], z_train_source: str,
+    era5: bool = False,
 ) -> None:
     """Total (marginal + copula) Y-space NLL, EVERY method's own fitted/
     estimated marginal, all divided by that episode's own N (per-point,
@@ -1048,6 +1085,12 @@ def _print_total_nll_table(
     print(f"\n{'─' * total}")
     print(f"Total NLL (Y-space, marginal+copula, own marginal per method) — "
           f"lower is better  [N={len(all_total_nlls)} episodes]")
+    if era5:
+        print("Episodes: REAL ARCO-ERA5 2m-temperature (Kelvin). THIS is the table to "
+              "read on real data: every method supplies its own full predictive "
+              "density and is scored at the same real y_test, which is a proper "
+              "scoring rule regardless of whose marginal is whose. The two Oracle "
+              "rows are nan by construction (no generating kernel behind ERA5).")
     print(f"ICL z_train source: {z_train_source}"
           + ("  (icl row n/a — oracle mode has no learned ICL marginal to score)"
              if z_train_source == "oracle" else f"  ({z_train_source} K-fold PIT estimate)"))
@@ -1089,6 +1132,63 @@ def main() -> None:
                              "instead of loading a pre-built PIT dataset directory. Default: "
                              "True unless --dataset_dir is given. --episode_idx is ignored "
                              "in this mode (episodes are freshly sampled, not indexed).")
+    # ---- Real-ERA5 episode source (eval/data/era5_episodes.py) ----
+    # Everything below only applies with --era5, which replaces the synthetic
+    # GP episode stream with real ARCO-ERA5 2m-temperature crops while leaving
+    # the entire comparison method downstream untouched: the same classical
+    # baselines, the same nested-CV best-of-baselines selection, the same two
+    # summary tables. What it CANNOT keep is the oracle: real data has no
+    # generating kernel, so the z-space table's "Oracle (prior)" row and the
+    # analytic GP prior/posterior Y-space rows are nan, and the shared z_test
+    # every row is scored against becomes the frozen-TabICL K-fold PIT rather
+    # than a ground-truth marginal (see eval/data/era5_episodes.py's module
+    # docstring). --z_train_source=oracle is therefore rejected here.
+    parser.add_argument("--era5", action="store_true",
+                        help="Evaluate on real ARCO-ERA5 episodes instead of synthetic "
+                             "GP draws. Mutually exclusive with --dataset_dir; forces "
+                             "--live_generate off.")
+    parser.add_argument("--era5_corpus_dir", default=ERA5_DEFAULT_CORPUS_DIR,
+                        help="Cached global-ERA5 monthly NetCDF directory (populate with "
+                             "eval/data/fetch_era5_global.py). Defaults to the held-out "
+                             "era5_global_val corpus, deliberately disjoint from the "
+                             "era5_global_train years finetuning draws from.")
+    parser.add_argument("--era5_grid_size", type=int, default=24,
+                        help="Points per side of each sampled region (D = grid_size^2 "
+                             "total). 24 matches conf/config.yaml's baselines.era5_grid_size "
+                             "and eval/configs/regions.py's grid_resolution convention.")
+    parser.add_argument("--era5_n_context", type=int, default=30,
+                        help="In-context points P per episode (eval.configs.constants."
+                             "N_CONTEXT). The remaining grid_size^2 - P points are all "
+                             "held-out targets, so N=546 at the defaults.")
+    parser.add_argument("--era5_box_deg_min", type=float, default=5.0)
+    parser.add_argument("--era5_box_deg_max", type=float, default=25.0,
+                        help="Region box width in degrees, drawn per episode. Boxes too "
+                             "small to hold a full grid_size^2 block of native 0.25deg "
+                             "points are redrawn, not clipped.")
+    parser.add_argument("--era5_vary_geometry", action="store_true",
+                        help="Draw grid_size/context-fraction per episode from era5_live's "
+                             "training ranges instead of the fixed --era5_grid_size/"
+                             "--era5_n_context. Costs the batched PIT (P/N stop being "
+                             "homogeneous) and makes per-episode NLLs N-heterogeneous.")
+    parser.add_argument("--era5_pit_batch", type=int, default=8,
+                        help="Episodes PIT'd per run_pit_batched call (fixed geometry "
+                             "only). Higher is faster until TabICL's activations stop "
+                             "fitting in VRAM.")
+    parser.add_argument("--era5_standardize_y", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Z-score each episode's ERA5 target by its own training "
+                             "mean/std before fitting the classical baselines, then add "
+                             "log(std) per point back to their marginal/total Y-space "
+                             "NLLs so the printed table stays in raw Kelvin nats. On by "
+                             "default: ERA5 targets are absolute Kelvin (~280) while "
+                             "eval/baselines/classical.py's GP hyperpriors are calibrated "
+                             "for data_gen.py's O(1) draws, and the ICL model under test "
+                             "normalizes internally via its TabICL PIT — so leaving the "
+                             "baselines on raw y handicaps them on units alone. Pass "
+                             "--no-era5_standardize_y to fit on raw Kelvin instead.")
+    parser.add_argument("--era5_max_months", type=int, default=None,
+                        help="Cap the corpus to its most recent N monthly files (lower "
+                             "RAM / smaller date range). None reads everything cached.")
     parser.add_argument("--n_episodes",   type=int,   default=30)
     parser.add_argument("--episode_idx",  type=int,   default=0)
     parser.add_argument("--n_steps_mle",  type=int,   default=1000,
@@ -1393,8 +1493,25 @@ def main() -> None:
     print(f"GP-MLE restarts: {args.n_restarts_mle}")
 
     # Live-generate by default, unless the user points at a fixed dataset
-    # with --dataset_dir (see --live_generate's help text).
-    live_generate = args.live_generate if args.live_generate is not None else (args.dataset_dir is None)
+    # with --dataset_dir (see --live_generate's help text). --era5 is a third,
+    # mutually exclusive source and sets live_generate False so nothing
+    # downstream mistakes its episodes for synthetic ones (the cache key and
+    # fingerprint below get their own "era5" namespace for the same reason).
+    era5 = bool(args.era5)
+    if era5:
+        if args.dataset_dir is not None:
+            raise ValueError("--era5 and --dataset_dir are mutually exclusive episode sources.")
+        if args.live_generate:
+            raise ValueError("--era5 and --live_generate are mutually exclusive episode sources.")
+        if args.z_train_source == "oracle":
+            raise ValueError(
+                "--era5 has no oracle marginal: real ERA5 has no generating GP to take "
+                "an exact LOO-PIT residual from. Use --z_train_source=tabicl (default) "
+                "or one of exaone/tabpfn/tabldm."
+            )
+        live_generate = False
+    else:
+        live_generate = args.live_generate if args.live_generate is not None else (args.dataset_dir is None)
 
     n_ep = args.n_episodes
     all_nlls: list[dict[str, float]] = []
@@ -1417,7 +1534,39 @@ def main() -> None:
     # _select_best_baseline_cv needs for >=2 CV folds.
     min_test_points = args.min_test_points if args.min_test_points is not None else 2 * args.min_fold_size
 
-    if live_generate:
+    if era5:
+        print(f"\nBuilding {n_ep} REAL ARCO-ERA5 episodes, seed={args.seed}, "
+              f"global indices {args.episode_offset}..{args.episode_offset + n_ep - 1}")
+        print(f"  corpus={args.era5_corpus_dir}")
+        if args.era5_vary_geometry:
+            print("  geometry: per-episode grid_size/context fraction (era5_live ranges)")
+        else:
+            print(f"  geometry: fixed grid={args.era5_grid_size} "
+                  f"(D={args.era5_grid_size ** 2}), P={args.era5_n_context}, "
+                  f"N={args.era5_grid_size ** 2 - args.era5_n_context}, "
+                  f"box {args.era5_box_deg_min}..{args.era5_box_deg_max} deg")
+        live_episodes = build_era5_eval_episodes(
+            args.era5_corpus_dir, n_ep,
+            seed=args.seed, offset=args.episode_offset,
+            grid_size=args.era5_grid_size, n_context=args.era5_n_context,
+            box_deg_range=(args.era5_box_deg_min, args.era5_box_deg_max),
+            vary_geometry=args.era5_vary_geometry,
+            grid_size_range=(
+                int(OmegaConf.select(cfg, "era5_live.grid_size_min", default=8)),
+                int(OmegaConf.select(cfg, "era5_live.grid_size_max", default=28)),
+            ),
+            n_context_frac_range=(
+                float(OmegaConf.select(cfg, "era5_live.n_context_frac_min", default=0.05)),
+                float(OmegaConf.select(cfg, "era5_live.n_context_frac_max", default=0.4)),
+            ),
+            tabicl_model=tabicl_marginal, k_folds=tabicl_pit_k_folds, device=device,
+            pit_group_size=args.era5_pit_batch,
+            marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
+            marginal_probs_n=args.marginal_probs_n,
+            max_months=args.era5_max_months,
+            standardize_y=args.era5_standardize_y,
+        )
+    elif live_generate:
         # cfg (the fixed eval-generating config, not icl_cfg) drives live
         # generation — same source already used for prior_cfg above — so
         # every checkpoint evaluated against this --config gets identical
@@ -1465,6 +1614,31 @@ def main() -> None:
         args.n_steps_dkl, args.lr_dkl, args.n_steps_per_ep, args.patience_per_ep,
         gp_val_select=args.gp_val_select,
     )
+    if era5:
+        # Real episodes aren't a function of cfg.data at all; what determines
+        # them (corpus, geometry, PIT marginal) goes in here so an ERA5 cache
+        # can never be confused with a synthetic one, nor one ERA5 geometry
+        # with another. cfg.data stays in the fingerprint above because it
+        # still supplies the GP-MLE/DKL hyperpriors these baselines are fitted
+        # under, real data or not.
+        fingerprint["era5"] = era5_episode_fingerprint(
+            args.era5_corpus_dir,
+            grid_size=args.era5_grid_size, n_context=args.era5_n_context,
+            box_deg_range=(args.era5_box_deg_min, args.era5_box_deg_max),
+            vary_geometry=args.era5_vary_geometry,
+            grid_size_range=(
+                int(OmegaConf.select(cfg, "era5_live.grid_size_min", default=8)),
+                int(OmegaConf.select(cfg, "era5_live.grid_size_max", default=28)),
+            ),
+            n_context_frac_range=(
+                float(OmegaConf.select(cfg, "era5_live.n_context_frac_min", default=0.05)),
+                float(OmegaConf.select(cfg, "era5_live.n_context_frac_max", default=0.4)),
+            ),
+            k_folds=tabicl_pit_k_folds,
+            marginal=args.z_train_source,
+            max_months=args.era5_max_months,
+            standardize_y=args.era5_standardize_y,
+        )
     cache_entries = load_baseline_cache(args.baseline_cache, fingerprint) if use_cache else {}
 
     # ---- Scored-results cache: the checkpoint-DEPENDENT half of a resume ----
@@ -1501,7 +1675,15 @@ def main() -> None:
     # exist and what each one's cache key is. ----
     episode_plan: list[tuple[int, int, str, dict, int]] = []
     for local_i in range(n_ep):
-        if live_generate:
+        if era5:
+            # build_era5_eval_episodes may return fewer than n_ep (an episode
+            # whose PIT was unavailable is dropped), so take the global index
+            # off the episode itself rather than recomputing it from local_i.
+            if local_i >= len(live_episodes):
+                continue
+            ep = live_episodes[local_i]
+            ep_i = int(ep["era5_meta"]["ep_i"])
+        elif live_generate:
             # Global index (== local_i unless --episode_offset): what the
             # generating seed, the cache key and the nested-CV holdout seed
             # all key off, so shards of one episode stream agree.
@@ -1519,7 +1701,10 @@ def main() -> None:
                       f"{min_test_points}), skipping — best_baseline needs enough for "
                       ">=2 nested-CV folds")
                 continue
-        cache_key = episode_cache_key(live_generate, args.dataset_dir, args.seed, ep_i)
+        cache_key = (
+            f"era5:seed{args.seed}:idx{ep_i}" if era5
+            else episode_cache_key(live_generate, args.dataset_dir, args.seed, ep_i)
+        )
         episode_plan.append(
             (local_i, ep_i, cache_key, ep, _baseline_fit_seed(args.seed, cache_key))
         )
@@ -1656,7 +1841,17 @@ def main() -> None:
             continue
 
         marginal_pit = None
-        if tabicl_marginal is not None or marginal_regressor is not None:
+        if era5:
+            # Already computed once per episode, batched, inside
+            # build_era5_eval_episodes — and it is the SAME z_test the
+            # baselines were just scored against (ep["z_test"]), which is what
+            # keeps assert_shared_z_test's invariant true on real data.
+            marginal_pit = {
+                "z_train": ep["z_train"],
+                "z_test": ep["z_test"],
+                "log_pdf_test": ep["log_pdf_test"],
+            }
+        elif tabicl_marginal is not None or marginal_regressor is not None:
             marginal_pit = _marginal_pit(
                 ep=ep, tabicl_marginal=tabicl_marginal, k_folds=tabicl_pit_k_folds, device=device,
                 marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
@@ -1677,6 +1872,24 @@ def main() -> None:
         # them on the same per-point footing as every other row (baseline_y_nlls
         # and icl_y_parts are already per-point via gp_oracle_y_nll/y_space_nll)
         # — this table only, _print_y_space_oracle's own numbers stay raw.
+        if era5:
+            # The baselines were fitted on this episode's standardized y (see
+            # --era5_standardize_y); shift their per-point marginal/total back
+            # to raw Kelvin nats so they sit in the same units as the ICL row,
+            # whose log_pdf_test is already Jacobian-corrected by the PIT. The
+            # copula term is invariant under the affine rescaling, so it is
+            # deliberately left alone. A no-op (y_log_std == 0) when the
+            # baselines saw raw y in the first place.
+            _shift = float(ep["era5_meta"]["y_log_std"])
+            if _shift:
+                baseline_y_nlls = {
+                    k: {
+                        "total": v["total"] + _shift,
+                        "marginal": v["marginal"] + _shift,
+                        "copula": v["copula"],
+                    }
+                    for k, v in baseline_y_nlls.items()
+                }
         total_nlls = {
             **baseline_y_nlls,
             "icl": icl_y_parts,
@@ -1784,9 +1997,14 @@ def main() -> None:
         print("No episodes evaluated successfully.")
         return
 
-    _print_table(all_nlls, z_train_source=args.z_train_source)
-    _print_y_space_oracle(all_y_space_nlls)
-    _print_total_nll_table(all_total_nlls, z_train_source=args.z_train_source)
+    _print_table(all_nlls, z_train_source=args.z_train_source, era5=era5)
+    if era5:
+        print("GP oracle total NLL (Y-space): unavailable on real ERA5 — that table is "
+              "the analytic prior/posterior of the GP that generated the episode, and "
+              "no such GP exists here.\n")
+    else:
+        _print_y_space_oracle(all_y_space_nlls)
+    _print_total_nll_table(all_total_nlls, z_train_source=args.z_train_source, era5=era5)
 
     if args.dump_episodes:
         dump = {
