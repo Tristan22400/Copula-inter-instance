@@ -1527,6 +1527,21 @@ def main() -> None:
                              "and can be merged by concatenating their 'entries' dicts.")
     args = parser.parse_args()
 
+    # --autoregressive defaults to ON under --era5 (it is ~1.5 s/episode next
+    # to the baseline fits' ~8.4 s, and the chain-rule row is the copula-free
+    # reference the copula head is being judged against on real data) and is
+    # unavailable elsewhere -- it is computed inside build_era5_eval_episodes,
+    # which is where the marginal is still loaded. Resolved HERE, before the
+    # checkpoint is read off disk, so an unsatisfiable request fails in
+    # milliseconds instead of after a multi-GB load.
+    if args.autoregressive and not args.era5:
+        raise ValueError(
+            "--autoregressive currently requires --era5: the chain runs inside "
+            "build_era5_eval_episodes, the one place the marginal is loaded and "
+            "batched over a whole group of episodes."
+        )
+    args.autoregressive = bool(args.era5) if args.autoregressive is None else bool(args.autoregressive)
+
     _set_seed(args.seed)
 
     device = torch.device(
@@ -1637,21 +1652,6 @@ def main() -> None:
         live_generate = False
     else:
         live_generate = args.live_generate if args.live_generate is not None else (args.dataset_dir is None)
-
-    # --autoregressive defaults to ON under --era5 (it is ~1.5 s/episode next
-    # to the baseline fits' ~8.4 s, and the chain-rule row is the copula-free
-    # reference the copula head is being judged against on real data) and is
-    # unavailable elsewhere -- it is computed inside build_era5_eval_episodes,
-    # which is where the marginal is still loaded. Explicitly asking for it on
-    # another source is a request that cannot be honoured, so say so rather
-    # than printing an all-nan row.
-    if args.autoregressive and not era5:
-        raise ValueError(
-            "--autoregressive currently requires --era5: the chain runs inside "
-            "build_era5_eval_episodes, the one place the marginal is loaded and "
-            "batched over a whole group of episodes."
-        )
-    args.autoregressive = era5 if args.autoregressive is None else bool(args.autoregressive)
 
     n_ep = args.n_episodes
     all_nlls: list[dict[str, float]] = []
