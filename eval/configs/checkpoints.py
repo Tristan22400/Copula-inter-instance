@@ -71,13 +71,16 @@ CHECKPOINT_FAMILIES = {
     # marginal coming from tabicl.pit_ckpt (the ERA5 run1 fine-tune, see
     # MARGINAL_FAMILIES["era5-run1"] below).
     #
-    # Two consequences worth knowing before scoring it:
-    #   * rank 512 enters baseline_fingerprint (it sizes per_ep_transformer's
-    #     low-rank factor), so this checkpoint CANNOT reuse a rank-32
-    #     --baseline_cache; give it its own, and expect a full fit pass.
-    #   * its pinned P=32/N=256 means eval_checkpoint.py --era5's defaults
-    #     (P=30, N=546) sit off its training distribution on both axes. Use
-    #     --era5_grid_size 17 --era5_n_context 32 (P=32, N=257) to match it.
+    # One consequence worth knowing before scoring it: rank 512 enters
+    # baseline_fingerprint (it sizes per_ep_transformer's low-rank factor), so
+    # this checkpoint CANNOT reuse a rank-32 --baseline_cache -- give it its
+    # own and expect a full fit pass.
+    #
+    # Its training P/N being pinned at 32/256 is a fact about the checkpoint,
+    # NOT a reason to score it on a different geometry from every other entry
+    # here: eval runs are compared across checkpoints, so the geometry stays at
+    # eval_checkpoint.py --era5's defaults and the pinning is a caveat to state
+    # alongside the numbers, not a knob to turn.
     "copula-nano-finetune-marginal-float32": {
         "dir": "copula_nano/copula-finetune-marginal-float32",
         "default_step": 630000,
