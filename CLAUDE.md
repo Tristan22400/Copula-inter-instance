@@ -36,6 +36,38 @@
   #     so a SECOND checkpoint over the same episodes/geometry reuses the whole
   #     --baseline_cache and only redoes the ICL forward pass. Give each
   #     checkpoint its own --results_cache, share the --baseline_cache.
+  #
+  #     AUTOREGRESSIVE row (eval/baselines/autoregressive.py), ON BY DEFAULT
+  #     under --era5. Same marginal, no copula head: reveal the test points one
+  #     at a time so each prediction conditions on the ones already revealed.
+  #     log p(y_1..y_N) = sum_i log p(y_s(i) | ctx, y_s(<i)) is an exact
+  #     factorization of a joint density, so the row is directly comparable to
+  #     every other row of the TOTAL table -- and it is the copula-free
+  #     reference the copula head has to beat. Its Marginal column is the
+  #     one-shot (independence) marginal, so its Copula column reads as exactly
+  #     what the sequencing bought. Step 0 reproduces the one-shot PIT's
+  #     log_pdf_test bit-for-bit (the chain keeps the full P+N table at every
+  #     step and only moves the context/query split) -- tests/test_
+  #     autoregressive.py pins that. ~1.5 s/episode at the defaults, batched
+  #     over --era5_pit_batch episodes at once.
+  #       --no-autoregressive          turn the row off
+  #       --ar_order natural           reveal in grid order instead of a seeded
+  #                                    per-episode permutation (an ICL model is
+  #                                    not a coherent joint, so the total really
+  #                                    does depend on the order; "natural" hands
+  #                                    nearly every step a just-revealed
+  #                                    neighbour and reads as a best case)
+  #       --ar_conditioning sample     append a DRAW instead of the true y
+  #                                    (ancestral sampling). The printed number
+  #                                    is then NOT a density of y_test and is
+  #                                    NOT comparable to the other rows -- the
+  #                                    table prints a warning saying so.
+  #       --ar_max_context K           cap the chain's context (the episode's
+  #                                    own P are always kept; oldest revealed
+  #                                    dropped first)
+  #       --ar_n_episodes M            run the chain on the first M episodes
+  #     TabICL marginal only -- the exaone/tabpfn/tabldm backends expose no
+  #     one-query-at-a-time entry point and raise rather than drop the row.
 
   # 3b. Evaluate on real-world datasets (UCI Beijing PM2.5, California Housing)
   python eval/runners/run_benchmarks.py

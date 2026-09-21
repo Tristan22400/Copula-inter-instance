@@ -141,6 +141,11 @@ from pit import (  # noqa: E402
     run_pit,
 )
 
+from eval.baselines.autoregressive import (  # noqa: E402
+    AR_CONDITIONINGS,
+    AR_ORDERS,
+    ar_parts_from_log_pdf,
+)
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
     GP_VAL_SELECT_MODES,
@@ -708,6 +713,14 @@ def _results_fingerprint(baseline_fp: dict, args, tabicl_pit_k_folds: int) -> di
         "n_folds": args.n_folds,
         "min_fold_size": args.min_fold_size,
         "seed": args.seed,
+        # The autoregressive row lives in the cached total_nlls, so a cache
+        # written by a run without it (or with a different chain) must not be
+        # reused: the row would silently stay absent, or be the other chain's.
+        "autoregressive": bool(args.autoregressive),
+        "ar_order": args.ar_order if args.autoregressive else None,
+        "ar_conditioning": args.ar_conditioning if args.autoregressive else None,
+        "ar_max_context": args.ar_max_context if args.autoregressive else None,
+        "ar_n_episodes": args.ar_n_episodes if args.autoregressive else None,
     }
 
 
@@ -1040,18 +1053,56 @@ def _print_y_space_oracle(y_space_nlls: list[dict[str, dict[str, float]]]) -> No
 # Row order for _print_total_nll_table: every method with a genuine (own)
 # marginal — independence/gp_prior_rbf/best_baseline are excluded, same
 # reasons as _NON_FITTED_EXCLUDED (no real fit, or derived after the fact).
+#
+# "autoregressive" is appended here and deliberately NOT added to
+# _METHOD_ORDER: it has no correlation matrix R, so it cannot appear in the
+# z-space copula table (whose every row IS an R scored against a shared
+# z_test) and it is not a candidate for the best-of-baselines ranking. Its
+# marginal column is the one-shot marginal every other row's ICL branch also
+# uses, so its copula column reads directly as "what sequencing bought over
+# independence" — see eval/baselines/autoregressive.py.
 _TOTAL_NLL_ORDER = [
     (k, label) for k, label in _METHOD_ORDER
     if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle")
 ] + [
+    ("autoregressive", "Autoregressive marginal (chain rule)"),
     ("oracle_prior", "Oracle (prior, unconditioned)"),
     ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
 ]
 
 
+def _ar_note(all_total_nlls: list[dict[str, dict[str, float]]],
+             order: str, conditioning: str, max_context: int | None) -> str | None:
+    """The footnote _print_total_nll_table prints for the autoregressive row,
+    or None when no episode carries one.
+
+    It exists mainly for the ``sample`` case: that number is a log-density sum
+    taken along a SAMPLED conditioning path, not a density of y_test (see
+    eval/baselines/autoregressive.py), and a row sitting in a table of proper
+    scoring rules with no warning attached is exactly how it would get
+    compared to its neighbours by mistake.
+    """
+    n_valid = sum(
+        1 for m in all_total_nlls
+        if not np.isnan(m.get("autoregressive", _NAN_PARTS).get("total", float("nan")))
+    )
+    if n_valid == 0:
+        return None
+    cap = "uncapped" if max_context is None else f"max_context={max_context}"
+    note = (f"Autoregressive row: chain-rule joint density from the SAME marginal, "
+            f"revealed in {order} order, {cap}, over {n_valid}/{len(all_total_nlls)} "
+            f"episodes. Its Marginal column is the one-shot (independence) marginal, "
+            f"so its Copula column is exactly what the sequencing bought.")
+    if conditioning != "teacher_forcing":
+        note += ("\n  *** WARNING: --ar_conditioning=sample. Each step appended a DRAW, "
+                 "not the true y, so this row is NOT a joint density of y_test and is "
+                 "NOT comparable to the other rows. Ancestral-sampling diagnostic only. ***")
+    return note
+
+
 def _print_total_nll_table(
     all_total_nlls: list[dict[str, dict[str, float]]], z_train_source: str,
-    era5: bool = False,
+    era5: bool = False, ar_note: str | None = None,
 ) -> None:
     """Total (marginal + copula) Y-space NLL, EVERY method's own fitted/
     estimated marginal, all divided by that episode's own N (per-point,
@@ -1109,6 +1160,8 @@ def _print_total_nll_table(
     print(f"ICL z_train source: {z_train_source}"
           + ("  (icl row n/a — oracle mode has no learned ICL marginal to score)"
              if z_train_source == "oracle" else f"  ({z_train_source} K-fold PIT estimate)"))
+    if ar_note:
+        print(f"  {ar_note}")
     print(f"{'─' * total}")
     print(f"{'Method':<{col}}{'Mean Total':>12}{'Std Total':>12}{'Mean Marg.':>12}{'Mean Cop.':>12}")
     print(f"{'─' * col}{'─' * 12}{'─' * 12}{'─' * 12}{'─' * 12}")
@@ -1201,6 +1254,47 @@ def main() -> None:
                              "normalizes internally via its TabICL PIT — so leaving the "
                              "baselines on raw y handicaps them on units alone. Pass "
                              "--no-era5_standardize_y to fit on raw Kelvin instead.")
+    # ---- Autoregressive (chain-rule) marginal row --------------------------
+    parser.add_argument("--autoregressive", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Add the 'Autoregressive marginal (chain rule)' row to the "
+                             "total Y-space NLL table: the SAME marginal, but revealing "
+                             "the test points one at a time so each prediction conditions "
+                             "on the ones already revealed (eval/baselines/"
+                             "autoregressive.py). An exact factorization of a joint "
+                             "density, so it is directly comparable to every other row, "
+                             "and it is the copula-free reference the copula head has to "
+                             "beat. ERA5 episode source only (--era5); on by default "
+                             "there, where it costs ~1.5 s/episode against the baseline "
+                             "fits' ~8.4 s.")
+    parser.add_argument("--ar_order", default="random", choices=list(AR_ORDERS),
+                        help="Order the chain reveals test points in. An in-context "
+                             "learner is not a coherent joint, so the chain-rule total "
+                             "really does depend on this. 'random' (default) is a seeded "
+                             "per-episode permutation; 'natural' is the grid's row-major "
+                             "order, which hands almost every step a just-revealed "
+                             "neighbour and reads as a best case rather than a typical one.")
+    parser.add_argument("--ar_conditioning", default="teacher_forcing",
+                        choices=list(AR_CONDITIONINGS),
+                        help="What to append to the context at each step. "
+                             "'teacher_forcing' (default) appends the TRUE y, which is "
+                             "what makes the printed number an exact joint log-density "
+                             "and a proper scoring rule. 'sample' appends a draw from "
+                             "that step's predictive instead — ancestral sampling from "
+                             "the model's implied joint, useful for generating fields, "
+                             "but its log-density sum is then taken along a SAMPLED "
+                             "conditioning path and is NOT a density of y_test. Do not "
+                             "compare a 'sample' number to the other rows.")
+    parser.add_argument("--ar_max_context", type=int, default=None,
+                        help="Cap the chain's context at this many rows (the episode's "
+                             "own P are always kept; the oldest revealed points are "
+                             "dropped first). None (default) keeps every revealed point, "
+                             "which at the --era5 defaults grows the context 30 -> 576.")
+    parser.add_argument("--ar_n_episodes", type=int, default=None,
+                        help="Run the chain on only the first N episodes (None = all). "
+                             "The row then averages over those episodes and the rest "
+                             "contribute nan, same convention as every other partially "
+                             "available row.")
     parser.add_argument("--era5_max_months", type=int, default=None,
                         help="Cap the corpus to its most recent N monthly files (smaller "
                              "date range). None reads everything cached. NOTE this is not "
@@ -1544,6 +1638,21 @@ def main() -> None:
     else:
         live_generate = args.live_generate if args.live_generate is not None else (args.dataset_dir is None)
 
+    # --autoregressive defaults to ON under --era5 (it is ~1.5 s/episode next
+    # to the baseline fits' ~8.4 s, and the chain-rule row is the copula-free
+    # reference the copula head is being judged against on real data) and is
+    # unavailable elsewhere -- it is computed inside build_era5_eval_episodes,
+    # which is where the marginal is still loaded. Explicitly asking for it on
+    # another source is a request that cannot be honoured, so say so rather
+    # than printing an all-nan row.
+    if args.autoregressive and not era5:
+        raise ValueError(
+            "--autoregressive currently requires --era5: the chain runs inside "
+            "build_era5_eval_episodes, the one place the marginal is loaded and "
+            "batched over a whole group of episodes."
+        )
+    args.autoregressive = era5 if args.autoregressive is None else bool(args.autoregressive)
+
     n_ep = args.n_episodes
     all_nlls: list[dict[str, float]] = []
     all_y_space_nlls: list[dict[str, dict[str, float]]] = []
@@ -1603,6 +1712,9 @@ def main() -> None:
             pit_group_size=args.era5_pit_batch,
             marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
             marginal_probs_n=args.marginal_probs_n,
+            autoregressive=args.autoregressive, ar_order=args.ar_order,
+            ar_conditioning=args.ar_conditioning,
+            ar_max_context=args.ar_max_context, ar_n_episodes=args.ar_n_episodes,
             **era5_geometry,
         )
         # The PIT is done: every episode carries its own marginal_pit, so the
@@ -1930,9 +2042,20 @@ def main() -> None:
                 }
                 for k, v in baseline_y_nlls.items()
             }
+        # The chain-rule row, when this episode carries one. Both vectors are
+        # already in raw nats (the PIT and the chain each undo their own
+        # scaling), so _shift must NOT be applied to them -- same reason the
+        # icl row above is exempt.
+        ar_log_pdf = ep.get("ar_log_pdf")
+        ar_parts = (
+            ar_parts_from_log_pdf(ar_log_pdf, marginal_pit["log_pdf_test"].cpu())
+            if ar_log_pdf is not None and marginal_pit is not None
+            else _NAN_PARTS.copy()
+        )
         total_nlls = {
             **baseline_y_nlls,
             "icl": icl_y_parts,
+            "autoregressive": ar_parts,
             "oracle_prior": {k: v / n_test for k, v in y_space_nlls["prior"].items()},
             "oracle_posterior": {k: v / n_test for k, v in y_space_nlls["posterior"].items()},
         }
@@ -2044,7 +2167,11 @@ def main() -> None:
               "no such GP exists here.\n")
     else:
         _print_y_space_oracle(all_y_space_nlls)
-    _print_total_nll_table(all_total_nlls, z_train_source=args.z_train_source, era5=era5)
+    _print_total_nll_table(
+        all_total_nlls, z_train_source=args.z_train_source, era5=era5,
+        ar_note=_ar_note(all_total_nlls, args.ar_order, args.ar_conditioning,
+                         args.ar_max_context),
+    )
 
     if args.dump_episodes:
         dump = {

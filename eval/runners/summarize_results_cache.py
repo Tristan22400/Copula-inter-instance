@@ -39,7 +39,11 @@ for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from eval.runners.eval_checkpoint import _print_table, _print_total_nll_table  # noqa: E402
+from eval.runners.eval_checkpoint import (  # noqa: E402
+    _ar_note,
+    _print_table,
+    _print_total_nll_table,
+)
 
 
 def summarize(path: str, era5: bool | None = None, max_episodes: int | None = None) -> None:
@@ -78,7 +82,15 @@ def summarize(path: str, era5: bool | None = None, max_episodes: int | None = No
     print(f"episodes scored: {len(keys)} (indices {keys[0]}..{keys[-1]})")
 
     _print_table(all_nlls, z_train_source=z_src, era5=era5)
-    _print_total_nll_table(all_total, z_train_source=z_src, era5=era5)
+    # The chain's settings are in the fingerprint too, so the autoregressive
+    # row keeps its footnote (including the --ar_conditioning=sample warning)
+    # when the table is reprinted from a cache instead of from a live run.
+    _print_total_nll_table(
+        all_total, z_train_source=z_src, era5=era5,
+        ar_note=_ar_note(all_total, fp.get("ar_order") or "random",
+                         fp.get("ar_conditioning") or "teacher_forcing",
+                         fp.get("ar_max_context")),
+    )
 
 
 def main() -> None:

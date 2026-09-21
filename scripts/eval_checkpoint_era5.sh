@@ -59,6 +59,12 @@
 # d_x=9), so do not size a reservation off eval_checkpoint.py's synthetic
 # 78.6 s/episode figure.
 #
+# On top of that, the autoregressive row (on by default under --era5, see
+# eval/baselines/autoregressive.py) adds a GPU pass of ~1.5 s/episode --
+# measured ~10 min for 400 -- during the episode build, before the fit pass.
+# It is the only part of the run that is neither cached nor checkpoint-
+# dependent, so a resumed run pays it again; --no-autoregressive drops it.
+#
 # Sharding across an OAR array: every episode is a pure function of
 # (--seed, its GLOBAL index), so --n_episodes 100 with --episode_offset
 # 0/100/200/300 covers exactly the same 400 episodes as one --n_episodes 400

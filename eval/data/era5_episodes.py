@@ -155,6 +155,11 @@ def build_era5_eval_episodes(
     max_months: Optional[int] = None,
     lazy: Optional[bool] = None,
     standardize_y: bool = True,
+    autoregressive: bool = False,
+    ar_order: str = "random",
+    ar_conditioning: str = "teacher_forcing",
+    ar_max_context: Optional[int] = None,
+    ar_n_episodes: Optional[int] = None,
     verbose: bool = True,
 ) -> list[dict]:
     """Materialize `n_episodes` real-ERA5 evaluation episodes, PIT'd and ready
@@ -175,10 +180,29 @@ def build_era5_eval_episodes(
         z_train (P,) / z_test (N,)                — frozen-TabICL K-fold PIT
         log_pdf_test (N,)                         — that marginal's log-density
                                                     at y_test, RAW nats
+        ar_log_pdf (N,)                           — only under autoregressive=
+                                                    True: the SAME marginal's
+                                                    chain-rule log-density at
+                                                    y_test, RAW nats (see
+                                                    eval/baselines/
+                                                    autoregressive.py)
         era5_meta                                 — {"ep_i", "grid_size", "P",
                                                     "N", "lat_bounds",
                                                     "lon_bounds"} for reporting
     and deliberately nothing else (no oracle keys — see the module docstring).
+
+    autoregressive (default False) additionally runs
+    eval.baselines.autoregressive.autoregressive_log_pdf over each group,
+    giving every episode an ``ar_log_pdf`` alongside its one-shot
+    ``log_pdf_test``. It runs HERE, next to the PIT, for two reasons: the
+    marginal is loaded and on-device at exactly this point (eval_checkpoint.py
+    releases it immediately afterwards, before the multi-hour CPU baseline
+    pass), and the chain advances a whole group of episodes per forward the
+    same way ``run_pit_batched`` does — measured at the --era5 defaults
+    (P=30, N=546, group 8) that is ~1.5 s/episode against ~6.5 s one at a
+    time. ar_order/ar_conditioning/ar_max_context are passed straight
+    through; ar_n_episodes caps it to the first N episodes of the run (None =
+    all), for when the chain is not worth its wall time on every episode.
 
     standardize_y (default True) z-scores y by the SAME per-episode statistics
     pit.normalize_targets uses (y_train's mean and std, applied to y_test too).
@@ -202,11 +226,24 @@ def build_era5_eval_episodes(
     """
     from era5_live_dataset import _pit_group
 
+    from eval.baselines.autoregressive import autoregressive_log_pdf
+
     if tabicl_model is None and marginal_backend is None:
         raise ValueError(
             "ERA5 episodes need a real marginal to PIT with: pass tabicl_model "
             "(--z_train_source=tabicl) or a marginal_backend + marginal_regressor. "
             "There is no analytic/oracle PIT on real data."
+        )
+    if autoregressive and marginal_backend is not None:
+        # The chain needs a module it can call one query at a time with a
+        # growing context; the exaone/tabpfn/tabldm backends are reached only
+        # through _BATCHED_MARGINAL_BACKENDS' fit-then-predict-a-whole-block
+        # interface (see src/marginal_backbones.py), which has no such entry
+        # point. Fail here rather than silently dropping the row.
+        raise NotImplementedError(
+            f"--autoregressive is implemented for the TabICL marginal only, not "
+            f"for backend {marginal_backend!r}. Re-run with --no-autoregressive, "
+            f"or with the default --z_train_source=tabicl."
         )
 
     if verbose:
@@ -273,7 +310,34 @@ def build_era5_eval_episodes(
                                       ("z_train", "z_test", "log_pdf_test")}
             for b in range(len(chunk))
         ]
-        for r, pit in zip(chunk, pits):
+
+        # ---- Chain-rule pass, same group, same marginal, same RAW y --------
+        # Fed r["y_train"]/r["y_test"] (raw) and not the possibly-standardized
+        # y stored on the episode below, exactly as the PIT above was: both do
+        # their own normalize_targets-equivalent scaling and both undo it, so
+        # both land in raw nats and ar_log_pdf is directly differenceable
+        # against log_pdf_test regardless of `standardize_y`.
+        ar_log_pdf: list[Optional[torch.Tensor]] = [None] * len(chunk)
+        n_ar = (
+            len(chunk) if ar_n_episodes is None
+            else max(0, min(len(chunk), int(ar_n_episodes) - start))
+        )
+        if autoregressive and out is not None and n_ar > 0:
+            sub = chunk[:n_ar]
+            ar_out = autoregressive_log_pdf(
+                tabicl_model,
+                torch.stack([r["x_norm_train"] for r in sub]).to(dev),
+                torch.stack([r["y_train"] for r in sub]).to(dev),
+                torch.stack([r["x_norm_test"] for r in sub]).to(dev),
+                torch.stack([r["y_test"] for r in sub]).to(dev),
+                order=ar_order, conditioning=ar_conditioning,
+                max_context=ar_max_context, seed=seed,
+                episode_indices=[r["ep_i"] for r in sub],
+            )
+            for b in range(len(sub)):
+                ar_log_pdf[b] = ar_out["log_pdf"][b]
+
+        for r, pit, ar in zip(chunk, pits, ar_log_pdf):
             if pit is None:
                 print(f"  [era5] ep {r['ep_i']}: PIT unavailable (too little context), skipping")
                 continue
@@ -295,7 +359,7 @@ def build_era5_eval_episodes(
             else:
                 y_tr, y_te = r["y_train"], r["y_test"]
                 y_log_std = 0.0
-            episodes.append({
+            episode = {
                 "x_norm_train": r["x_norm_train"],
                 "x_norm_test": r["x_norm_test"],
                 "y_train": y_tr,
@@ -326,10 +390,25 @@ def build_era5_eval_episodes(
                     "lat_bounds": r["lat_bounds"],
                     "lon_bounds": r["lon_bounds"],
                 },
-            })
-        if verbose and chunk_i % 10 == 0:
+            }
+            # Absent, not nan, when the chain did not run for this episode:
+            # the runner reads ep.get("ar_log_pdf") and leaves the row's
+            # entry all-nan, so a partial --ar_n_episodes run averages over
+            # the episodes that have it instead of poisoning the mean.
+            if ar is not None:
+                episode["ar_log_pdf"] = ar.detach().float().cpu()
+            episodes.append(episode)
+        # Every chunk once the chain is on: it turns a ~1 s chunk into a ~12 s
+        # one at the --era5 defaults, and a 10-chunk stride would leave a
+        # 400-episode build silent for two minutes at a stretch.
+        if verbose and (autoregressive or chunk_i % 10 == 0):
             print(f"  [era5] PIT {min(start + group, len(raw))}/{len(raw)} episodes", flush=True)
 
+    if verbose and autoregressive:
+        n_with = sum(1 for e in episodes if "ar_log_pdf" in e)
+        print(f"  [era5] autoregressive chain: {n_with}/{len(episodes)} episodes, "
+              f"order={ar_order}, conditioning={ar_conditioning}, "
+              f"max_context={ar_max_context}")
     if verbose and episodes:
         Ps = [e["era5_meta"]["P"] for e in episodes]
         Ns = [e["era5_meta"]["N"] for e in episodes]
