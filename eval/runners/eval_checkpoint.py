@@ -1096,13 +1096,21 @@ def _print_y_space_oracle(y_space_nlls: list[dict[str, dict[str, float]]]) -> No
     print(f"  posterior (Schur-conditioned): mean={np.nanmean(post_vals):.4f}  std={np.nanstd(post_vals):.4f}\n")
 
 
-# Row order for _print_total_nll_table: every method with a genuine (own)
-# marginal — independence/gp_prior_rbf/best_baseline are excluded, same
-# reasons as _NON_FITTED_EXCLUDED (no real fit, or derived after the fact).
-_TOTAL_NLL_ORDER = [
+# Methods with a genuine (own) fit/marginal, i.e. real competitors in a
+# ranking sense — independence/gp_prior_rbf are non-fit floor references and
+# best_baseline/oracle are derived after the fact, so all four are excluded
+# here (same reasons as _NON_FITTED_EXCLUDED, but icl stays IN since it's the
+# model under evaluation). Shared by _print_total_nll_table's row order and
+# both rank tables (_print_rank_table calls in main()).
+_RANK_KEYS = [
     (k, label) for k, label in _METHOD_ORDER
     if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle")
-] + [
+]
+
+# Row order for _print_total_nll_table: every method with a genuine (own)
+# marginal, plus the two oracle rows (which have no z-space-only counterpart
+# in _RANK_KEYS since they're Y-space-only quantities).
+_TOTAL_NLL_ORDER = _RANK_KEYS + [
     ("oracle_prior", "Oracle (prior, unconditioned)"),
     ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
 ]
@@ -1169,6 +1177,61 @@ def _print_total_nll_table(
         mm, mc = means_marginal.get(key, float("nan")), means_copula.get(key, float("nan"))
         marker = "  ← our model" if key == "icl" else ""
         print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{mm:>12.4f}{mc:>12.4f}{marker}")
+    print(f"{'─' * total}\n")
+
+
+def _compute_ranks(values: list[dict[str, float]], keys: list[str]) -> dict[str, list[int]]:
+    """Per-episode competition rank (1 = lowest/best NLL that episode) among
+    `keys`. A method missing or NaN that episode (fit failure, oracle-mode
+    no-op, too few training points) contributes no rank for it rather than a
+    worst-case one — mirrors the nanmean/nanstd convention used everywhere
+    else in this file, so a method's average rank reflects only the episodes
+    it actually competed in (see the printed N column)."""
+    ranks: dict[str, list[int]] = {k: [] for k in keys}
+    for ep in values:
+        scored = [(k, ep.get(k, float("nan"))) for k in keys]
+        scored = [(k, v) for k, v in scored if not np.isnan(v)]
+        scored.sort(key=lambda kv: kv[1])
+        for r, (k, _) in enumerate(scored, start=1):
+            ranks[k].append(r)
+    return ranks
+
+
+def _print_rank_table(
+    values: list[dict[str, float]], order: list[tuple[str, str]], title: str,
+    z_train_source: str,
+) -> None:
+    """Average and median per-episode rank for each method in `order`,
+    computed by _compute_ranks over `values` (one {key: nll} dict per
+    episode — either all_nlls' z-space NLLs or the "total" slice of
+    all_total_nlls' Y-space NLLs, see the two call sites in main()). Mean
+    rank rewards consistent placement, median is robust to the rare episode
+    a normally-strong method fails or gets a pathological fit; reading both
+    together separates "usually great, occasionally terrible" from
+    "reliably mediocre". Sorted by mean rank ascending (best first).
+    """
+    keys = [k for k, _ in order]
+    labels = dict(order)
+    ranks = _compute_ranks(values, keys)
+    rows = [
+        (k, float(np.mean(rs)), float(np.median(rs)), len(rs))
+        for k, rs in ranks.items() if rs
+    ]
+    rows.sort(key=lambda r: r[1])
+    if not rows:
+        return
+
+    col = max(22, max(len(labels[k]) for k, *_ in rows) + 2)
+    total = col + 3 * 12
+    print(f"\n{'─' * total}")
+    print(f"{title}  [1 = best of {len(keys)} candidates that episode; lower is better]")
+    print(f"ICL z_train source: {z_train_source}")
+    print(f"{'─' * total}")
+    print(f"{'Method':<{col}}{'Mean Rank':>12}{'Median Rank':>12}{'N':>12}")
+    print(f"{'─' * col}{'─' * 12}{'─' * 12}{'─' * 12}")
+    for k, mean_r, med_r, n in rows:
+        marker = "  ← our model" if k == "icl" else ""
+        print(f"{labels[k]:<{col}}{mean_r:>12.2f}{med_r:>12.1f}{n:>12d}{marker}")
     print(f"{'─' * total}\n")
 
 
@@ -1961,6 +2024,20 @@ def main() -> None:
     _print_table(all_nlls, z_train_source=args.z_train_source)
     _print_y_space_oracle(all_y_space_nlls)
     _print_total_nll_table(all_total_nlls, z_train_source=args.z_train_source)
+    _print_rank_table(
+        all_nlls, _RANK_KEYS,
+        title="Method rank — z-space copula NLL (shared ground-truth marginal)",
+        z_train_source=args.z_train_source,
+    )
+    total_only = [
+        {k: m.get(k, _NAN_PARTS).get("total", float("nan")) for k, _ in _TOTAL_NLL_ORDER}
+        for m in all_total_nlls
+    ]
+    _print_rank_table(
+        total_only, _TOTAL_NLL_ORDER,
+        title="Method rank — total NLL, Y-space (own marginal per method)",
+        z_train_source=args.z_train_source,
+    )
 
     if args.dump_episodes:
         dump = {
