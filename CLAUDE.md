@@ -48,8 +48,9 @@
   #     what the sequencing bought. Step 0 reproduces the one-shot PIT's
   #     log_pdf_test bit-for-bit (the chain keeps the full P+N table at every
   #     step and only moves the context/query split) -- tests/test_
-  #     autoregressive.py pins that. ~1.5 s/episode at the defaults, batched
-  #     over --era5_pit_batch episodes at once.
+  #     autoregressive.py pins that. Batched over --era5_pit_batch episodes at
+  #     once; GPU-bound, so its cost tracks the card: measured 1.5 s/episode
+  #     on an RTX PRO 6000 Blackwell, 3.6 s/episode on an RTX A5000.
   #       --no-autoregressive          turn the row off
   #       --ar_order natural           reveal in grid order instead of a seeded
   #                                    per-episode permutation (an ICL model is

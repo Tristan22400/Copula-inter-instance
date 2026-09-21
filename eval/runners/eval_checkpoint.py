@@ -1265,8 +1265,9 @@ def main() -> None:
                              "density, so it is directly comparable to every other row, "
                              "and it is the copula-free reference the copula head has to "
                              "beat. ERA5 episode source only (--era5); on by default "
-                             "there, where it costs ~1.5 s/episode against the baseline "
-                             "fits' ~8.4 s.")
+                             "there, where it costs a GPU-bound 1.5-3.6 s/episode "
+                             "depending on the card, against the CPU baseline fits' "
+                             "~8.4 s on 32 physical cores.")
     parser.add_argument("--ar_order", default="random", choices=list(AR_ORDERS),
                         help="Order the chain reveals test points in. An in-context "
                              "learner is not a coherent joint, so the chain-rule total "
@@ -1527,9 +1528,10 @@ def main() -> None:
                              "and can be merged by concatenating their 'entries' dicts.")
     args = parser.parse_args()
 
-    # --autoregressive defaults to ON under --era5 (it is ~1.5 s/episode next
-    # to the baseline fits' ~8.4 s, and the chain-rule row is the copula-free
-    # reference the copula head is being judged against on real data) and is
+    # --autoregressive defaults to ON under --era5 (a GPU-bound 1.5-3.6
+    # s/episode next to the baseline fits' ~8.4 s of CPU, and the chain-rule
+    # row is the copula-free reference the copula head is being judged
+    # against on real data) and is
     # unavailable elsewhere -- it is computed inside build_era5_eval_episodes,
     # which is where the marginal is still loaded. Resolved HERE, before the
     # checkpoint is read off disk, so an unsatisfiable request fails in

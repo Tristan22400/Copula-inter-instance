@@ -198,9 +198,14 @@ def build_era5_eval_episodes(
     marginal is loaded and on-device at exactly this point (eval_checkpoint.py
     releases it immediately afterwards, before the multi-hour CPU baseline
     pass), and the chain advances a whole group of episodes per forward the
-    same way ``run_pit_batched`` does — measured at the --era5 defaults
-    (P=30, N=546, group 8) that is ~1.5 s/episode against ~6.5 s one at a
-    time. ar_order/ar_conditioning/ar_max_context are passed straight
+    same way ``run_pit_batched`` does — at the --era5 defaults (P=30, N=546,
+    group 8) that is a measured 13.4 ms per forward against 21.4 ms for a
+    group of 8, i.e. ~4x.
+
+    Absolute cost is GPU-bound and varies with the card by more than a factor
+    of two: measured 1.5 s/episode on an RTX PRO 6000 Blackwell and 3.6
+    s/episode on an RTX A5000 (~10 and ~24 min respectively for 400
+    episodes). ar_order/ar_conditioning/ar_max_context are passed straight
     through; ar_n_episodes caps it to the first N episodes of the run (None =
     all), for when the chain is not worth its wall time on every episode.
 
