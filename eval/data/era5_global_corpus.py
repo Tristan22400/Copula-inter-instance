@@ -302,6 +302,13 @@ class GlobalERA5Corpus:
             "x_norm_test": x_test_norm.astype(np.float32),
             "y_train": values[context_idx].astype(np.float32),
             "y_test": values[test_idx].astype(np.float32),
+            # Same reporting keys sample_episode returns. The training path
+            # (LiveERA5Dataset) reads only the four arrays above and ignores
+            # these; eval/data/era5_episodes.py uses them to label which
+            # region each evaluated episode actually came from.
+            "lat_bounds": (lat_c - half, lat_c + half),
+            "lon_bounds": (lon_c - half, lon_c + half),
+            "grid_size": grid_size,
         }
 
 
