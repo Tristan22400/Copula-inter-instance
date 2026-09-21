@@ -119,6 +119,7 @@ different file to change that distribution deliberately.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import multiprocessing as mp
@@ -179,6 +180,37 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+@contextlib.contextmanager
+def _snapshot_rng_and_threads(seed: int | None = None, cpu_threads: int | None = None):
+    """Snapshot the global torch RNG (CPU + CUDA) and restore it on exit;
+    optionally reseed to `seed` and/or pin intra-op thread count to
+    `cpu_threads` for the duration. Both the serial classical-baseline fit
+    and the Marginal + Zero Mean GP fit below need this same pattern —
+    reseed so one baseline's random draws don't shift what the next one in
+    the loop sees, single-thread so a CPU fit's floating-point reduction
+    order does not depend on how many cores the machine happened to offer
+    (measured elsewhere in this file: up to 5.4e4 nats of difference
+    between 1-thread and 8-thread runs on a near-singular R) — differing
+    only in which half of the pattern each call site needs, hence one
+    parameterised context manager instead of two hand-rolled copies.
+    """
+    rng_cpu = torch.get_rng_state()
+    rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    prev_threads = torch.get_num_threads() if cpu_threads is not None else None
+    if cpu_threads is not None:
+        torch.set_num_threads(cpu_threads)
+    if seed is not None:
+        torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        if prev_threads is not None:
+            torch.set_num_threads(prev_threads)
+        torch.set_rng_state(rng_cpu)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
 
 
 def _load_full_config(config_path: str) -> OmegaConf:
@@ -1842,10 +1874,7 @@ def main() -> None:
             # would shift the stream every later episode's ICL-side work draws
             # from — so snapshot and restore it, leaving the rest of the loop
             # bit-identical to a run with no baseline fitting in it at all.
-            _rng_cpu = torch.get_rng_state()
-            _rng_cuda = (
-                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-            )
+            #
             # One BLAS thread, matching _fit_baselines_task, so a fit does not
             # depend on how many cores the machine happened to offer. Thread
             # count changes floating-point reduction order, and these fits are
@@ -1854,20 +1883,16 @@ def main() -> None:
             # baseline but differ by 5.4e4 nats on gp_prior_rbf, whose NLL runs
             # to ~6e4 on a near-singular R. Pinned to 1, the serial and pooled
             # paths come out bit-identical across all 284 per-episode numbers.
-            _prev_threads = torch.get_num_threads()
-            if baseline_device.type == "cpu":
-                torch.set_num_threads(1)
-            baseline_nlls, baseline_R, baseline_y_nlls = eval_baselines_episode(
-                ep={k: (v.to(baseline_device) if isinstance(v, Tensor) else v)
-                    for k, v in ep.items()},
-                device=baseline_device,
-                fit_seed=fit_seed,
-                **fit_kwargs,
-            )
-            torch.set_num_threads(_prev_threads)
-            torch.set_rng_state(_rng_cpu)
-            if _rng_cuda is not None:
-                torch.cuda.set_rng_state_all(_rng_cuda)
+            with _snapshot_rng_and_threads(
+                cpu_threads=1 if baseline_device.type == "cpu" else None
+            ):
+                baseline_nlls, baseline_R, baseline_y_nlls = eval_baselines_episode(
+                    ep={k: (v.to(baseline_device) if isinstance(v, Tensor) else v)
+                        for k, v in ep.items()},
+                    device=baseline_device,
+                    fit_seed=fit_seed,
+                    **fit_kwargs,
+                )
             baseline_R = {k: v.to(device) for k, v in baseline_R.items()}
             if use_cache:
                 save_baseline_entry(args.baseline_cache, fingerprint, cache_key, {
@@ -1916,26 +1941,25 @@ def main() -> None:
         # --n_restarts_zeromean_gp) keeps that cheap. A no-op whenever there
         # is no real marginal for this episode (--z_train_source=oracle, or
         # marginal_pit is None). Seeded off this episode's own fit_seed
-        # (independent of --baseline_workers/cache-hit stream position) and
-        # the global RNG snapshot/restored around it, matching the serial
-        # classical-baseline fit above, since eval_baselines_episode's own
-        # fit_seed reseed makes every OTHER baseline's reproducibility
-        # depend only on that reseed, not on what ran before it here.
+        # (independent of --baseline_workers/cache-hit stream position), the
+        # global RNG snapshot/restored around it, and pinned to one CPU
+        # thread — all three matching the serial classical-baseline fit
+        # above (same underlying fit_and_eval_gpytorch Cholesky machinery,
+        # same thread-count-dependent floating-point reduction order), since
+        # eval_baselines_episode's own fit_seed reseed makes every OTHER
+        # baseline's reproducibility depend only on that reseed, not on what
+        # ran before it here.
         if args.zeromean_gp and marginal_pit is not None:
-            _rng_cpu2 = torch.get_rng_state()
-            _rng_cuda2 = (
-                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-            )
-            torch.manual_seed(fit_seed + 1)
-            zm_nlls, zm_R, zm_y_nlls = _eval_zero_mean_gp_baselines(
-                ep=ep, marginal_pit=marginal_pit, device=baseline_device,
-                n_steps=args.n_steps_zeromean_gp, lr=args.lr_zeromean_gp,
-                n_restarts=args.n_restarts_zeromean_gp,
-                oracle_mode=oracle_mode, prior_cfg=prior_cfg,
-            )
-            torch.set_rng_state(_rng_cpu2)
-            if _rng_cuda2 is not None:
-                torch.cuda.set_rng_state_all(_rng_cuda2)
+            with _snapshot_rng_and_threads(
+                seed=fit_seed + 1,
+                cpu_threads=1 if baseline_device.type == "cpu" else None,
+            ):
+                zm_nlls, zm_R, zm_y_nlls = _eval_zero_mean_gp_baselines(
+                    ep=ep, marginal_pit=marginal_pit, device=baseline_device,
+                    n_steps=args.n_steps_zeromean_gp, lr=args.lr_zeromean_gp,
+                    n_restarts=args.n_restarts_zeromean_gp,
+                    oracle_mode=oracle_mode, prior_cfg=prior_cfg,
+                )
             baseline_nlls = {**baseline_nlls, **zm_nlls}
             baseline_R = {**baseline_R, **{k: v.to(device) for k, v in zm_R.items()}}
             baseline_y_nlls = {**baseline_y_nlls, **zm_y_nlls}
