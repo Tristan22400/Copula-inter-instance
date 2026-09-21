@@ -149,7 +149,9 @@ from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
 
 from eval.configs.checkpoints import (  # noqa: E402
+    DEFAULT_CHECKPOINT_FAMILY,
     DEFAULT_MARGINAL_FAMILY,
+    resolve_checkpoint,
     resolve_marginal_checkpoint,
 )
 from eval.configs.constants import N_CONTEXT  # noqa: E402
@@ -1402,7 +1404,15 @@ def main() -> None:
                              "independent of --ckpt's saved training cfg. "
                              "Keeping this fixed is what lets the baseline "
                              "cache survive switching checkpoints.")
-    parser.add_argument("--ckpt",         required=True)
+    parser.add_argument("--ckpt",         default=DEFAULT_CHECKPOINT_FAMILY,
+                        help="Copula checkpoint to score: a path, or a name from "
+                             "eval/configs/checkpoints.py's CHECKPOINT_FAMILIES "
+                             "(\"family\" for its default step, \"family:step\" for "
+                             f"another). Defaults to {DEFAULT_CHECKPOINT_FAMILY}. Its "
+                             "copula head is rank 512 where the prod families are 32, "
+                             "and rank enters the baseline fingerprint, so give this "
+                             "checkpoint its own --baseline_cache rather than one "
+                             "built for a prod checkpoint.")
     parser.add_argument("--dataset_dir",  default=None,
                         help="Episode directory to evaluate on (overrides "
                              "training.dataset_dir from --config). Passing "
@@ -1813,6 +1823,11 @@ def main() -> None:
                              "--baseline_cache; the resulting files share a fingerprint "
                              "and can be merged by concatenating their 'entries' dicts.")
     args = parser.parse_args()
+
+    # A family name or a repo-root-relative path both become a real path here,
+    # once, so everything downstream (the load, the printed header, the
+    # results cache's "ckpt" field) sees the same resolved spelling.
+    args.ckpt = resolve_checkpoint(str(args.ckpt))
 
     # The chain needs the TabICL marginal itself, called one query at a time
     # with a growing context: --z_train_source=oracle has no marginal model at

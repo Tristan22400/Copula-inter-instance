@@ -38,11 +38,13 @@
 #     python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 \
 #         --cache-dir ./eval/data/cache/era5_global_val
 #
-# Submit with:
+# Submit with (--ckpt optional -- it defaults to
+# eval/configs/checkpoints.py's DEFAULT_CHECKPOINT_FAMILY):
 #     mkdir -p logs
-#     oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt ./checkpoints/<run>/step_XXXXXXX.pt"
+#     oarsub -S ./scripts/eval_checkpoint_era5.sh
 #
-# Any eval_checkpoint.py flag passes through, e.g. a different geometry:
+# Any eval_checkpoint.py flag passes through, e.g. another checkpoint or a
+# different geometry:
 #     oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt <...> --era5_grid_size 16 --n_episodes 800"
 #
 # Disk: the baseline cache holds 16 N x N correlation matrices per episode, so
@@ -102,6 +104,11 @@ echo "    args: $*"
 # ~98% of the runtime and is checkpoint-independent, so a second --ckpt over
 # the same episodes reuses every fit and only redoes the cheap ICL forward
 # pass. --results_cache IS checkpoint-dependent; override it per checkpoint.
+# One exception to the sharing: the copula head's RANK is in the baseline
+# fingerprint (it sizes per_ep_transformer's low-rank factor), so checkpoints
+# of different rank cannot share one cache. The default checkpoint is rank
+# 512 and the prod families are 32 -- mixing them refits, correctly but from
+# scratch. Point --baseline_cache somewhere else when switching rank.
 # -u: unbuffered, so a run killed at its walltime still shows its progress.
 python -u eval/runners/eval_checkpoint.py \
     --era5 \

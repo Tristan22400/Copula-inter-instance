@@ -10,7 +10,15 @@
   #    deployment) so the total marginal+copula NLL table is populated;
   #    pass --z_train_source oracle for the exact-GP-LOO idealized upper bound,
   #    or exaone/tabpfn/tabldm to score against the marginal a run trained with.
-  python eval/runners/eval_checkpoint.py --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
+  #    --ckpt defaults to DEFAULT_CHECKPOINT_FAMILY and the marginal to
+  #    DEFAULT_MARGINAL_FAMILY (eval/configs/checkpoints.py), i.e. the nano
+  #    marginal-finetune copula checkpoint scored against the ERA5-run1 TabICL
+  #    it was itself fine-tuned on -- so both evals below run flagless. Pass
+  #    --ckpt <path|family|family:step> for any other one. NOTE the default is
+  #    rank 512 where the prod families are 32, and rank enters the baseline
+  #    fingerprint: give it its OWN --baseline_cache, never a prod one.
+  python eval/runners/eval_checkpoint.py
+  python eval/runners/eval_checkpoint.py --ckpt kernel-sweep-all-tabicl-retrain-15k
 
   #    ONE baseline set, both episode sources (3 and 3a print the same rows):
   #    independence, GP-prior-RBF, GP-MLE over 6 kernel families x {iso, ARD},
@@ -77,9 +85,8 @@
   #     Needs the corpus cached once (defaults to the held-out val year):
   #       python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 \
   #           --cache-dir ./eval/data/cache/era5_global_val
-  python eval/runners/eval_checkpoint.py --era5 --n_episodes 400 \
-      --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
-  oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt <ckpt>"   # on Grid5000
+  python eval/runners/eval_checkpoint.py --era5 --n_episodes 400
+  oarsub -S ./scripts/eval_checkpoint_era5.sh                   # on Grid5000
   #     Baseline fitting is ~98% of the runtime and is checkpoint-independent,
   #     so a SECOND checkpoint over the same episodes/geometry reuses the whole
   #     --baseline_cache and only redoes the ICL forward pass. Give each
