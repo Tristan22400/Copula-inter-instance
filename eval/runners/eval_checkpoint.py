@@ -174,6 +174,7 @@ from eval.baselines.autoregressive import (  # noqa: E402
     AR_CONDITIONINGS,
     AR_ORDERS,
     ar_parts_from_log_pdf,
+    autoregressive_log_pdf,
 )
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
@@ -862,6 +863,9 @@ def _results_fingerprint(baseline_fp: dict, args, tabicl_pit_k_folds: int) -> di
         # The autoregressive row lives in the cached total_nlls, so a cache
         # written by a run without it (or with a different chain) must not be
         # reused: the row would silently stay absent, or be the other chain's.
+        # Bump when the derived total-NLL/rank rows change: old result caches
+        # lack those rows even though their baseline fits remain reusable.
+        "result_schema": 2,
         "autoregressive": bool(args.autoregressive),
         "ar_order": args.ar_order if args.autoregressive else None,
         "ar_conditioning": args.ar_conditioning if args.autoregressive else None,
@@ -1207,9 +1211,29 @@ _RANK_KEYS = [
     if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle")
 ]
 
-# Row order for _print_total_nll_table: _RANK_KEYS, plus the autoregressive
-# row, plus the two oracle rows (which have no z-space-only counterpart in
-# _RANK_KEYS since they're Y-space-only quantities).
+# These are the ordinary GP baselines, rather than DKL (which has a learned
+# neural feature map).  The per-episode minimum is intentionally a post-hoc
+# diagnostic competitor in the Y-space rank table, not a model-selection
+# estimate: it sees that episode's test NLL when choosing its kernel.
+_GP_TOTAL_KEYS = tuple(
+    k for k, _ in _RANK_KEYS
+    if k.startswith("gp_mle_") or k.startswith("gp_zeromean_")
+)
+
+# The total-NLL rank is a distinct competition from the displayed total table:
+# it includes the marginal-only independence baseline and the chain-rule
+# marginal, but excludes the two GP-oracle references.  Neither has a fair
+# counterpart in the z-space correlation ranking.  ``best_gp_total`` is the
+# requested per-episode, post-hoc best-GP competitor.
+_TOTAL_RANK_ORDER = _RANK_KEYS + [
+    ("independence_marginal", "Independence (marginal only)"),
+    ("autoregressive", "Autoregressive marginal (chain rule)"),
+    ("best_gp_total", "Best GP (per-episode, post hoc)"),
+]
+
+# Row order for _print_total_nll_table: fitted competitors, the marginal-only
+# independence and autoregressive rows, then the two oracle references (which
+# have no z-space-only counterpart in _RANK_KEYS since they're Y-space-only).
 #
 # "autoregressive" is appended HERE and is deliberately in neither
 # _METHOD_ORDER nor _RANK_KEYS: it has no correlation matrix R, so it cannot
@@ -1222,6 +1246,7 @@ _RANK_KEYS = [
 # ICL branch also uses, so its copula column reads directly as "what
 # sequencing bought over independence" — see eval/baselines/autoregressive.py.
 _TOTAL_NLL_ORDER = _RANK_KEYS + [
+    ("independence_marginal", "Independence (marginal only)"),
     ("autoregressive", "Autoregressive marginal (chain rule)"),
     ("oracle_prior", "Oracle (prior, unconditioned)"),
     ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
@@ -1468,7 +1493,7 @@ def main() -> None:
                              "--no-era5_standardize_y to fit on raw Kelvin instead.")
     # ---- Autoregressive (chain-rule) marginal row --------------------------
     parser.add_argument("--autoregressive", action=argparse.BooleanOptionalAction,
-                        default=None,
+                        default=True,
                         help="Add the 'Autoregressive marginal (chain rule)' row to the "
                              "total Y-space NLL table: the SAME marginal, but revealing "
                              "the test points one at a time so each prediction conditions "
@@ -1476,10 +1501,8 @@ def main() -> None:
                              "autoregressive.py). An exact factorization of a joint "
                              "density, so it is directly comparable to every other row, "
                              "and it is the copula-free reference the copula head has to "
-                             "beat. ERA5 episode source only (--era5); on by default "
-                             "there, where it costs a GPU-bound 1.5-3.6 s/episode "
-                             "depending on the card, against the CPU baseline fits' "
-                             "~8.4 s on 32 physical cores.")
+                             "beat. On by default for the TabICL marginal on every episode "
+                             "source; it costs one marginal forward pass per test point.")
     parser.add_argument("--ar_order", default="random", choices=list(AR_ORDERS),
                         help="Order the chain reveals test points in. An in-context "
                              "learner is not a coherent joint, so the chain-rule total "
@@ -1802,21 +1825,15 @@ def main() -> None:
                              "and can be merged by concatenating their 'entries' dicts.")
     args = parser.parse_args()
 
-    # --autoregressive defaults to ON under --era5 (a GPU-bound 1.5-3.6
-    # s/episode next to the baseline fits' ~8.4 s of CPU, and the chain-rule
-    # row is the copula-free reference the copula head is being judged
-    # against on real data) and is
-    # unavailable elsewhere -- it is computed inside build_era5_eval_episodes,
-    # which is where the marginal is still loaded. Resolved HERE, before the
-    # checkpoint is read off disk, so an unsatisfiable request fails in
-    # milliseconds instead of after a multi-GB load.
-    if args.autoregressive and not args.era5:
+    # The chain calls the TabICL marginal directly.  Other PIT backends expose
+    # only a fit-then-predict-whole-block interface, so they cannot supply its
+    # growing context.  Validate before loading either large checkpoint.
+    if args.autoregressive and args.z_train_source != "tabicl":
         raise ValueError(
-            "--autoregressive currently requires --era5: the chain runs inside "
-            "build_era5_eval_episodes, the one place the marginal is loaded and "
-            "batched over a whole group of episodes."
+            "--autoregressive requires --z_train_source=tabicl: the chain needs "
+            "a marginal callable with a growing context. Re-run with "
+            "--no-autoregressive for this marginal backend."
         )
-    args.autoregressive = bool(args.era5) if args.autoregressive is None else bool(args.autoregressive)
 
     _set_seed(args.seed)
 
@@ -2284,6 +2301,24 @@ def main() -> None:
                 print(f"  [ep {ep_i}] fewer than 2 training points — "
                       "falling back to oracle z_train for this episode")
 
+        # ERA5 precomputes this batched while its marginal is resident.  All
+        # other episode sources arrive here with the same raw x/y contract, so
+        # score the identical teacher-forced chain in the common path.
+        if (args.autoregressive and "ar_log_pdf" not in ep
+                and (args.ar_n_episodes is None or local_i < args.ar_n_episodes)):
+            if tabicl_marginal is None:
+                raise RuntimeError("autoregressive scoring needs the loaded TabICL marginal")
+            ep["ar_log_pdf"] = autoregressive_log_pdf(
+                tabicl_marginal,
+                ep["x_norm_train"].to(device).unsqueeze(0),
+                ep["y_train"].to(device).unsqueeze(0),
+                ep["x_norm_test"].to(device).unsqueeze(0),
+                ep["y_test"].to(device).unsqueeze(0),
+                order=args.ar_order, conditioning=args.ar_conditioning,
+                max_context=args.ar_max_context, seed=args.seed,
+                episode_indices=[ep_i],
+            )["log_pdf"][0].detach().cpu()
+
         # ---- Marginal + Zero Mean GP baselines: fit directly on the real
         # marginal's z_train (see _eval_zero_mean_gp_baselines' docstring).
         # Not part of the checkpoint-independent baseline_cache above (it
@@ -2355,12 +2390,26 @@ def main() -> None:
             if ar_log_pdf is not None and marginal_pit is not None
             else _NAN_PARTS.copy()
         )
+        marginal_only = {
+            "total": icl_y_parts["marginal"],
+            "marginal": icl_y_parts["marginal"],
+            "copula": 0.0 if not np.isnan(icl_y_parts["marginal"]) else float("nan"),
+        }
         total_nlls = {
             **baseline_y_nlls,
             "icl": icl_y_parts,
+            "independence_marginal": marginal_only,
             "autoregressive": ar_parts,
             "oracle_prior": {k: v / n_test for k, v in y_space_nlls["prior"].items()},
             "oracle_posterior": {k: v / n_test for k, v in y_space_nlls["posterior"].items()},
+        }
+        gp_totals = [
+            total_nlls.get(k, _NAN_PARTS)["total"] for k in _GP_TOTAL_KEYS
+            if not np.isnan(total_nlls.get(k, _NAN_PARTS)["total"])
+        ]
+        total_nlls["best_gp_total"] = {
+            "total": min(gp_totals) if gp_totals else float("nan"),
+            "marginal": float("nan"), "copula": float("nan"),
         }
         all_total_nlls.append(total_nlls)
         all_episode_meta.append({
@@ -2481,11 +2530,11 @@ def main() -> None:
         z_train_source=args.z_train_source,
     )
     total_only = [
-        {k: m.get(k, _NAN_PARTS).get("total", float("nan")) for k, _ in _TOTAL_NLL_ORDER}
+        {k: m.get(k, _NAN_PARTS).get("total", float("nan")) for k, _ in _TOTAL_RANK_ORDER}
         for m in all_total_nlls
     ]
     _print_rank_table(
-        total_only, _TOTAL_NLL_ORDER,
+        total_only, _TOTAL_RANK_ORDER,
         title="Method rank — total NLL, Y-space (own marginal per method)",
         z_train_source=args.z_train_source,
     )

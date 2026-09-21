@@ -194,13 +194,20 @@ def test_ar_parts_split_is_exact_and_independence_is_copula_zero():
 
 
 def test_autoregressive_is_a_total_table_row_only():
-    from eval.runners.eval_checkpoint import _METHOD_ORDER, _TOTAL_NLL_ORDER
+    from eval.runners.eval_checkpoint import (
+        _METHOD_ORDER, _TOTAL_NLL_ORDER, _TOTAL_RANK_ORDER,
+    )
 
     assert "autoregressive" in dict(_TOTAL_NLL_ORDER)
     # No correlation matrix exists for it, so it must never reach the z-space
     # copula table or the best-of-baselines ranking, both of which are driven
     # by _METHOD_ORDER.
     assert "autoregressive" not in dict(_METHOD_ORDER)
+    # Y-space ranks include the marginal-only independence comparator and the
+    # post-hoc best ordinary-GP diagnostic, but never place either in the
+    # correlation-only z-space competition.
+    assert "independence_marginal" in dict(_TOTAL_RANK_ORDER)
+    assert "best_gp_total" in dict(_TOTAL_RANK_ORDER)
 
 
 def test_ar_note_warns_on_sampled_conditioning():
