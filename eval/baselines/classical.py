@@ -1232,14 +1232,33 @@ def baseline_fingerprint(
     }
 
 
-def episode_cache_key(live_generate: bool, dataset_dir: str | None, seed: int, ep_i: int) -> str:
+def episode_cache_key(
+    live_generate: bool, dataset_dir: str | None, seed: int, ep_i: int,
+    *, source: str | None = None,
+) -> str:
     """Identifies which episode a cached baseline result belongs to.
 
-    Live episodes are fully determined by (seed, ep_i); dataset episodes by
-    (dataset_dir, ep_i). ep_i is the episode's GLOBAL index in both cases, so
-    a run that evaluates a slice of one episode stream (eval_checkpoint.py's
-    --episode_offset) keys the same episode the same way as a run that starts
-    at 0."""
+    Three namespaces, all owned here because everything downstream of the key
+    is too: _shard_name hashes it, save_baseline_entry/load_baseline_cache
+    round-trip it, and the shard collision check compares it.
+
+      - "live:seed{seed}:idx{ep_i}"        -- live_generate, determined by (seed, ep_i)
+      - "dataset:{dataset_dir}:idx{ep_i}"  -- a pre-built dataset on disk
+      - "{source}:seed{seed}:idx{ep_i}"    -- any other generated source that is
+                                              also fully determined by (seed, ep_i);
+                                              eval_checkpoint.py --era5 passes
+                                              source="era5"
+
+    ep_i is the episode's GLOBAL index in every case, so a run that evaluates
+    a slice of one episode stream (eval_checkpoint.py's --episode_offset) keys
+    the same episode the same way as a run that starts at 0.
+
+    `source` takes precedence over live_generate/dataset_dir -- a source that
+    generates its own episodes has no dataset_dir to abspath (None would
+    raise), and calling it "live" would collide with the synthetic stream's
+    keys for the same seed."""
+    if source is not None:
+        return f"{source}:seed{seed}:idx{ep_i}"
     if live_generate:
         return f"live:seed{seed}:idx{ep_i}"
     return f"dataset:{os.path.abspath(dataset_dir)}:idx{ep_i}"

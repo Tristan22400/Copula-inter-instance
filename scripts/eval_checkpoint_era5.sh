@@ -1,9 +1,20 @@
 #!/bin/bash
 #OAR -n CopulaEvalERA5
-#OAR -l gpu=1,walltime=48:00:00
+#OAR -l host=1,walltime=48:00:00
+#OAR -p gpu_count > 0
 #OAR -O logs/eval_era5_%jobid%.out
 #OAR -E logs/eval_era5_%jobid%.err
 #OAR -q p1
+#
+# RESOURCES: host=1 reserves the WHOLE node -- every CPU core on it -- and
+# `-p gpu_count > 0` restricts that node to a GPU one. Do NOT go back to a
+# bare `-l gpu=1`: that grants only the cores bound to one GPU, and baseline
+# fitting is ~98% of this script's runtime and is CPU-bound across
+# --baseline_workers processes. Measured on vercors: gpu=1 gave 8 logical /
+# 4 physical cores and the fit pass ran at ~90 s/episode (ETA ~9h for 400),
+# against ~8.4 s/episode on 32 physical cores -- a ~10x difference. The GPU
+# is idle for that entire pass; it is needed only for the short PIT and ICL
+# forward passes. Cores are the thing to reserve here.
 #
 # Evaluate an ICL checkpoint against every classical baseline on REAL
 # ARCO-ERA5 2m-temperature episodes — the real-data counterpart of
@@ -42,6 +53,8 @@
 #
 # Measured runtime at the defaults on 32 physical cores: ~8.4 s/episode wall
 # for the baseline fit pass (~56 min for 400), plus a short scoring pass.
+# That figure needs the whole node (see the host=1 note above); on the 4
+# physical cores a gpu=1 reservation grants, the same pass runs ~10x slower.
 # Episodes here are cheaper than the synthetic ones (P=30, d_x=6 vs P=32,
 # d_x=9), so do not size a reservation off eval_checkpoint.py's synthetic
 # 78.6 s/episode figure.

@@ -183,7 +183,7 @@ def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode):
 
     _, _, _, _, icl_y_parts = _eval_icl_episode(
         ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"),
-        tabicl_pit=tabicl_pit,
+        marginal_pit=tabicl_pit,
     )
 
     assert set(icl_y_parts.keys()) == {"total", "marginal", "copula"}

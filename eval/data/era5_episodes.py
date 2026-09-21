@@ -6,8 +6,8 @@ data instead of synthetic GP draws.
 This is the evaluation-side sibling of src/era5_live_dataset.py (which
 serves the *training* loop): same corpus (eval/data/era5_global_corpus.py),
 same frozen-TabICL K-fold PIT convention (src/pit.py::run_pit /
-run_pit_batched via era5_live_dataset's `_pit_group`/`_pit_episode`, including
-their log-Jacobian correction back to raw nats), but materialized eagerly as
+run_pit_batched via era5_live_dataset's `_pit_group`, including its
+log-Jacobian correction back to raw nats), but materialized eagerly as
 a finite, seed-reproducible LIST rather than an infinite IterableDataset —
 eval_checkpoint.py needs to index episodes by a global index, hand them to a
 worker pool, and key a disk cache on them.
@@ -69,6 +69,8 @@ _SRC = os.path.join(_REPO_ROOT, "src")
 for _p in (_REPO_ROOT, _SRC):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+from pit import normalize_targets
 
 from eval.data.era5_global_corpus import GlobalERA5Corpus
 
@@ -151,7 +153,7 @@ def build_era5_eval_episodes(
     marginal_regressor=None,
     marginal_probs_n: int = 99,
     max_months: Optional[int] = None,
-    corpus: Optional[GlobalERA5Corpus] = None,
+    lazy: Optional[bool] = None,
     standardize_y: bool = True,
     verbose: bool = True,
 ) -> list[dict]:
@@ -198,7 +200,7 @@ def build_era5_eval_episodes(
     and its log_pdf_test already comes back Jacobian-corrected to raw nats), so
     this flag changes nothing about z_train/z_test/log_pdf_test.
     """
-    from era5_live_dataset import _pit_episode, _pit_group
+    from era5_live_dataset import _pit_group
 
     if tabicl_model is None and marginal_backend is None:
         raise ValueError(
@@ -207,10 +209,14 @@ def build_era5_eval_episodes(
             "There is no analytic/oracle PIT on real data."
         )
 
-    if corpus is None:
-        if verbose:
-            print(f"  [era5] loading corpus from {corpus_dir}")
-        corpus = GlobalERA5Corpus(corpus_dir, max_months=max_months)
+    if verbose:
+        print(f"  [era5] loading corpus from {corpus_dir}")
+    # `lazy` is forwarded rather than left to GlobalERA5Corpus's own
+    # len(paths) > 60 heuristic, because max_months is applied to the file
+    # list BEFORE that heuristic runs: capping a 396-month corpus to 60
+    # flips it from memory-mapped to fully eager and *raises* resident RAM
+    # (~7.5 GB for 60 global months) instead of lowering it.
+    corpus = GlobalERA5Corpus(corpus_dir, max_months=max_months, lazy=lazy)
     if verbose:
         print(f"  [era5] corpus: {corpus.n_days_total} daily snapshots, "
               f"native grid {len(corpus.lat)}x{len(corpus.lon)}")
@@ -231,9 +237,13 @@ def build_era5_eval_episodes(
             "x_norm_test": torch.from_numpy(drawn["x_norm_test"]),
             "y_train": torch.from_numpy(drawn["y_train"]),
             "y_test": torch.from_numpy(drawn["y_test"]),
-            "grid_size": int(drawn.get("grid_size", grid_size)),
-            "lat_bounds": drawn.get("lat_bounds"),
-            "lon_bounds": drawn.get("lon_bounds"),
+            # Both corpus samplers return these unconditionally (this
+            # module's change to sample_episode_fixed_shape is what made that
+            # true), so index rather than .get() -- a missing key is a bug in
+            # the corpus, not a case to paper over with a fallback.
+            "grid_size": int(drawn["grid_size"]),
+            "lat_bounds": drawn["lat_bounds"],
+            "lon_bounds": drawn["lon_bounds"],
         })
 
     # ---- PIT (GPU, the expensive half) ----
@@ -242,47 +252,45 @@ def build_era5_eval_episodes(
     dev = torch.device(device)
     group = 1 if vary_geometry else max(1, int(pit_group_size))
     episodes: list[dict] = []
-    for start in range(0, len(raw), group):
+    for chunk_i, start in enumerate(range(0, len(raw), group)):
         chunk = raw[start:start + group]
-        if len(chunk) == 1:
-            r = chunk[0]
-            pit = _pit_episode(
-                r["x_norm_train"].to(dev), r["y_train"].to(dev),
-                r["x_norm_test"].to(dev), r["y_test"].to(dev),
-                tabicl_model, k_folds,
-                marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
-                marginal_probs_n=marginal_probs_n, seed=r["ep_i"],
-            )
-            pits = [pit]
-        else:
-            x_tr = torch.stack([r["x_norm_train"] for r in chunk]).to(dev)
-            y_tr = torch.stack([r["y_train"] for r in chunk]).to(dev)
-            x_te = torch.stack([r["x_norm_test"] for r in chunk]).to(dev)
-            y_te = torch.stack([r["y_test"] for r in chunk]).to(dev)
-            out = _pit_group(
-                x_tr, y_tr, x_te, y_te, tabicl_model, k_folds,
-                marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
-                marginal_probs_n=marginal_probs_n, seed=chunk[0]["ep_i"],
-            )
-            pits = [
-                None if out is None else {k: out[k][b] for k in
-                                          ("z_train", "z_test", "log_pdf_test")}
-                for b in range(len(chunk))
-            ]
+        # One code path for every chunk size: _pit_group handles B=1 (it
+        # reduces with dim=-1/keepdim, and tests/test_pit_batched.py's
+        # test_run_pit_batched_b1_matches_run_pit pins B=1 to run_pit within
+        # 1e-5). Branching on len(chunk)==1 meant the vary_geometry path ran
+        # code the default fixed-geometry run never exercised.
+        out = _pit_group(
+            torch.stack([r["x_norm_train"] for r in chunk]).to(dev),
+            torch.stack([r["y_train"] for r in chunk]).to(dev),
+            torch.stack([r["x_norm_test"] for r in chunk]).to(dev),
+            torch.stack([r["y_test"] for r in chunk]).to(dev),
+            tabicl_model, k_folds,
+            marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
+            marginal_probs_n=marginal_probs_n, seed=chunk[0]["ep_i"],
+        )
+        pits = [
+            None if out is None else {k: out[k][b] for k in
+                                      ("z_train", "z_test", "log_pdf_test")}
+            for b in range(len(chunk))
+        ]
         for r, pit in zip(chunk, pits):
             if pit is None:
                 print(f"  [era5] ep {r['ep_i']}: PIT unavailable (too little context), skipping")
                 continue
             P = int(r["x_norm_train"].shape[0])
             N = int(r["x_norm_test"].shape[0])
-            # Same statistics pit.normalize_targets computed inside the PIT
-            # above, recomputed here rather than plumbed out of it, so the
-            # two can never silently diverge on an unbiased-std convention.
-            y_mean = r["y_train"].mean()
-            y_std = r["y_train"].std().clamp(min=1e-8)
+            # The SAME call the PIT above made internally -- not a
+            # re-derivation of it. y_log_std is only the exact Jacobian for
+            # the y the baselines are fitted on while both use one
+            # convention, and sharing the function is what guarantees that;
+            # recomputing the mean/std here would let the two drift apart the
+            # next time normalize_targets changes its floor or its unbiased
+            # flag.
+            y_tr_scaled, y_te_scaled, _, y_std = normalize_targets(
+                r["y_train"], r["y_test"]
+            )
             if standardize_y:
-                y_tr = (r["y_train"] - y_mean) / y_std
-                y_te = (r["y_test"] - y_mean) / y_std
+                y_tr, y_te = y_tr_scaled, y_te_scaled
                 y_log_std = float(y_std.log())
             else:
                 y_tr, y_te = r["y_train"], r["y_test"]
@@ -295,6 +303,21 @@ def build_era5_eval_episodes(
                 "z_train": pit["z_train"].detach().float().cpu(),
                 "z_test": pit["z_test"].detach().float().cpu(),
                 "log_pdf_test": pit["log_pdf_test"].detach().float().cpu(),
+                # Per-point nats to ADD to any NLL computed on this episode's
+                # y to express it in raw units, 0.0 when the targets were left
+                # raw. Deliberately TOP-LEVEL, not inside era5_meta: it is
+                # numerics every consumer of an episode needs, not ERA5
+                # reporting metadata, so a consumer reads ep.get("y_log_std",
+                # 0.0) and never has to know which source built the episode.
+                "y_log_std": y_log_std,
+                # The PIT this episode already carries, so the runner reuses
+                # it instead of branching on the episode source to decide
+                # whether to recompute one (same duck-typing as "R_star" in ep).
+                "marginal_pit": {
+                    "z_train": pit["z_train"].detach().float().cpu(),
+                    "z_test": pit["z_test"].detach().float().cpu(),
+                    "log_pdf_test": pit["log_pdf_test"].detach().float().cpu(),
+                },
                 "era5_meta": {
                     "ep_i": r["ep_i"],
                     "grid_size": r["grid_size"],
@@ -302,15 +325,9 @@ def build_era5_eval_episodes(
                     "N": N,
                     "lat_bounds": r["lat_bounds"],
                     "lon_bounds": r["lon_bounds"],
-                    "y_mean": float(y_mean),
-                    "y_std": float(y_std),
-                    # Per-point nats to ADD to any NLL computed on the
-                    # standardized y to express it in raw Kelvin. Zero when
-                    # standardize_y=False (the baselines already saw raw y).
-                    "y_log_std": y_log_std,
                 },
             })
-        if verbose and (start // max(group, 1)) % 10 == 0:
+        if verbose and chunk_i % 10 == 0:
             print(f"  [era5] PIT {min(start + group, len(raw))}/{len(raw)} episodes", flush=True)
 
     if verbose and episodes:
@@ -349,8 +366,11 @@ def era5_episode_fingerprint(
         # look like two different corpora -- that would silently discard a
         # whole run's worth of cached baseline fits.
         "corpus_dir": os.path.realpath(corpus_dir),
-        "grid_size": int(grid_size),
-        "n_context": int(n_context),
+        # Symmetric with grid_size_range/n_context_frac_range below: each
+        # pair is recorded only in the mode that actually reads it, so
+        # changing an inert flag does not invalidate a multi-GB cache.
+        "grid_size": None if vary_geometry else int(grid_size),
+        "n_context": None if vary_geometry else int(n_context),
         "box_deg_range": [float(b) for b in box_deg_range],
         "vary_geometry": bool(vary_geometry),
         "grid_size_range": [int(g) for g in grid_size_range] if vary_geometry else None,

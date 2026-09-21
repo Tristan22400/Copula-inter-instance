@@ -119,6 +119,11 @@ for _p in (_REPO_ROOT, _SRC):
 from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
 
+from eval.configs.checkpoints import (  # noqa: E402
+    DEFAULT_MARGINAL_FAMILY,
+    resolve_marginal_checkpoint,
+)
+from eval.configs.constants import N_CONTEXT  # noqa: E402
 from eval.data.era5_episodes import (  # noqa: E402
     DEFAULT_CORPUS_DIR as ERA5_DEFAULT_CORPUS_DIR,
     build_era5_eval_episodes,
@@ -863,6 +868,16 @@ def _prefit_baselines_parallel(
     failures = 0
     t0 = time.time()
 
+    # Return each result through shared-memory FILES rather than file
+    # descriptors. Torch's default "file_descriptor" strategy sends one fd per
+    # tensor, and a result carries ~17 N x N correlation matrices: at the
+    # --era5 defaults (N=546) a 400-episode run overran the per-process fd
+    # limit and died with "OSError: [Errno 24] Too many open files" ~29
+    # episodes in, after paying for every one of those fits. The synthetic
+    # default (N=256, fewer episodes) stayed under the limit, which is why
+    # this only showed up on the real-data geometry.
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
     ctx = mp.get_context("spawn")
     payloads = [
         (key, _episode_to_cpu(ep), fit_seed, fit_kwargs) for key, fit_seed, ep in pending
@@ -1156,7 +1171,7 @@ def main() -> None:
                         help="Points per side of each sampled region (D = grid_size^2 "
                              "total). 24 matches conf/config.yaml's baselines.era5_grid_size "
                              "and eval/configs/regions.py's grid_resolution convention.")
-    parser.add_argument("--era5_n_context", type=int, default=30,
+    parser.add_argument("--era5_n_context", type=int, default=N_CONTEXT,
                         help="In-context points P per episode (eval.configs.constants."
                              "N_CONTEXT). The remaining grid_size^2 - P points are all "
                              "held-out targets, so N=546 at the defaults.")
@@ -1187,8 +1202,12 @@ def main() -> None:
                              "baselines on raw y handicaps them on units alone. Pass "
                              "--no-era5_standardize_y to fit on raw Kelvin instead.")
     parser.add_argument("--era5_max_months", type=int, default=None,
-                        help="Cap the corpus to its most recent N monthly files (lower "
-                             "RAM / smaller date range). None reads everything cached.")
+                        help="Cap the corpus to its most recent N monthly files (smaller "
+                             "date range). None reads everything cached. NOTE this is not "
+                             "a RAM knob and can cost RAM: GlobalERA5Corpus picks "
+                             "memory-mapped reading only when it sees >60 files, and the "
+                             "cap is applied first, so capping a 396-month corpus to 60 "
+                             "makes it load ~7.5 GB eagerly instead of ~100 MB lazily.")
     parser.add_argument("--n_episodes",   type=int,   default=30)
     parser.add_argument("--episode_idx",  type=int,   default=0)
     parser.add_argument("--n_steps_mle",  type=int,   default=1000,
@@ -1237,7 +1256,7 @@ def main() -> None:
                              "(ignored for oracle/tabicl, which use their own native grids). "
                              "Mirrors data.z_train_marginal_probs_n in conf/data/gp_tasks.yaml; "
                              "a proportional lever on those backends' per-episode cost.")
-    parser.add_argument("--tabicl_ckpt",  default=None,
+    parser.add_argument("--tabicl_ckpt",  default=None,  # path OR a MARGINAL_FAMILIES name
                         help="TabICL checkpoint filename for --z_train_source=tabicl. "
                              "Default: read from --config's cfg.tabicl.ckpt.")
     parser.add_argument("--tabicl_pit_k_folds", type=int, default=None,
@@ -1457,7 +1476,19 @@ def main() -> None:
               f"(k_folds={tabicl_pit_k_folds}, probs_n={args.marginal_probs_n})")
         marginal_regressor = make_regressor(marginal_backend, device=str(device))
     elif args.z_train_source == "tabicl":
-        tabicl_ckpt = args.tabicl_ckpt or OmegaConf.select(cfg, "tabicl.ckpt", default=None)
+        # Resolution order: explicit flag, then the config, then the
+        # registry's declared default. resolve_marginal_checkpoint passes a
+        # real path straight through and maps a MARGINAL_FAMILIES name
+        # ("era5-run1", "pretrained", ...) to its file, so --tabicl_ckpt takes
+        # either spelling. Routing the fallback through
+        # DEFAULT_MARGINAL_FAMILY is what stops that constant being a fourth
+        # independent copy of the default -- it is now the thing that decides.
+        tabicl_ckpt = (
+            args.tabicl_ckpt
+            or OmegaConf.select(cfg, "tabicl.ckpt", default=None)
+            or DEFAULT_MARGINAL_FAMILY
+        )
+        tabicl_ckpt = resolve_marginal_checkpoint(str(tabicl_ckpt))
         if not tabicl_ckpt:
             raise ValueError(
                 "--z_train_source=tabicl requires a TabICL checkpoint: pass --tabicl_ckpt "
@@ -1545,9 +1576,12 @@ def main() -> None:
                   f"(D={args.era5_grid_size ** 2}), P={args.era5_n_context}, "
                   f"N={args.era5_grid_size ** 2 - args.era5_n_context}, "
                   f"box {args.era5_box_deg_min}..{args.era5_box_deg_max} deg")
-        live_episodes = build_era5_eval_episodes(
-            args.era5_corpus_dir, n_ep,
-            seed=args.seed, offset=args.episode_offset,
+        # ONE spelling of the episode geometry, shared by the builder and by
+        # the cache fingerprint below. These two must describe the same
+        # episodes or the cache silently serves baselines fitted on different
+        # data, and the failure is a wrong number rather than an error -- so
+        # they splat the same dict instead of repeating it.
+        era5_geometry = dict(
             grid_size=args.era5_grid_size, n_context=args.era5_n_context,
             box_deg_range=(args.era5_box_deg_min, args.era5_box_deg_max),
             vary_geometry=args.era5_vary_geometry,
@@ -1559,13 +1593,26 @@ def main() -> None:
                 float(OmegaConf.select(cfg, "era5_live.n_context_frac_min", default=0.05)),
                 float(OmegaConf.select(cfg, "era5_live.n_context_frac_max", default=0.4)),
             ),
+            max_months=args.era5_max_months,
+            standardize_y=args.era5_standardize_y,
+        )
+        live_episodes = build_era5_eval_episodes(
+            args.era5_corpus_dir, n_ep,
+            seed=args.seed, offset=args.episode_offset,
             tabicl_model=tabicl_marginal, k_folds=tabicl_pit_k_folds, device=device,
             pit_group_size=args.era5_pit_batch,
             marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
             marginal_probs_n=args.marginal_probs_n,
-            max_months=args.era5_max_months,
-            standardize_y=args.era5_standardize_y,
+            **era5_geometry,
         )
+        # The PIT is done: every episode carries its own marginal_pit, so the
+        # scoring loop never touches these again. Release them now rather than
+        # pinning VRAM through the multi-hour CPU baseline pass (a multi-GB
+        # backbone for the exaone/tabldm marginals).
+        tabicl_marginal = None
+        marginal_regressor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     elif live_generate:
         # cfg (the fixed eval-generating config, not icl_cfg) drives live
         # generation — same source already used for prior_cfg above — so
@@ -1623,21 +1670,9 @@ def main() -> None:
         # under, real data or not.
         fingerprint["era5"] = era5_episode_fingerprint(
             args.era5_corpus_dir,
-            grid_size=args.era5_grid_size, n_context=args.era5_n_context,
-            box_deg_range=(args.era5_box_deg_min, args.era5_box_deg_max),
-            vary_geometry=args.era5_vary_geometry,
-            grid_size_range=(
-                int(OmegaConf.select(cfg, "era5_live.grid_size_min", default=8)),
-                int(OmegaConf.select(cfg, "era5_live.grid_size_max", default=28)),
-            ),
-            n_context_frac_range=(
-                float(OmegaConf.select(cfg, "era5_live.n_context_frac_min", default=0.05)),
-                float(OmegaConf.select(cfg, "era5_live.n_context_frac_max", default=0.4)),
-            ),
             k_folds=tabicl_pit_k_folds,
             marginal=args.z_train_source,
-            max_months=args.era5_max_months,
-            standardize_y=args.era5_standardize_y,
+            **era5_geometry,
         )
     cache_entries = load_baseline_cache(args.baseline_cache, fingerprint) if use_cache else {}
 
@@ -1701,9 +1736,9 @@ def main() -> None:
                       f"{min_test_points}), skipping — best_baseline needs enough for "
                       ">=2 nested-CV folds")
                 continue
-        cache_key = (
-            f"era5:seed{args.seed}:idx{ep_i}" if era5
-            else episode_cache_key(live_generate, args.dataset_dir, args.seed, ep_i)
+        cache_key = episode_cache_key(
+            live_generate, args.dataset_dir, args.seed, ep_i,
+            source="era5" if era5 else None,
         )
         episode_plan.append(
             (local_i, ep_i, cache_key, ep, _baseline_fit_seed(args.seed, cache_key))
@@ -1770,7 +1805,14 @@ def main() -> None:
         )
 
     for local_i, ep_i, cache_key, ep, fit_seed in episode_plan:
-        entry = fitted.get(cache_key)
+        # pop, not get: each entry holds ~17 N x N correlation matrices (20 MB
+        # per episode at the --era5 defaults, N=546) and is consumed exactly
+        # once here. Keeping them would hold ~8 GB resident across a 400-episode
+        # run for no reason. cache_entries is popped too -- on the cache-reuse
+        # path both dicts reference the SAME object, so releasing one frees
+        # nothing.
+        entry = fitted.pop(cache_key, None)
+        cache_entries.pop(cache_key, None)
         if entry is not None:
             baseline_nlls   = entry["nlls"]
             baseline_R      = {k: v.to(device) for k, v in entry["R_dict"].items()}
@@ -1840,18 +1882,16 @@ def main() -> None:
             print(f"  ep {ep_i:04d}: reusing scored results (--results_cache)")
             continue
 
-        marginal_pit = None
-        if era5:
-            # Already computed once per episode, batched, inside
-            # build_era5_eval_episodes — and it is the SAME z_test the
-            # baselines were just scored against (ep["z_test"]), which is what
-            # keeps assert_shared_z_test's invariant true on real data.
-            marginal_pit = {
-                "z_train": ep["z_train"],
-                "z_test": ep["z_test"],
-                "log_pdf_test": ep["log_pdf_test"],
-            }
-        elif tabicl_marginal is not None or marginal_regressor is not None:
+        # An episode that already carries its own PIT wins: real-ERA5
+        # episodes are PIT'd once, batched, at build time, and that dict is
+        # the SAME z_test the baselines were scored against (ep["z_test"]),
+        # which is what keeps assert_shared_z_test's invariant true. Reading
+        # it off the episode rather than branching on the source means a
+        # future pre-PIT'd source needs no new arm here.
+        marginal_pit = ep.get("marginal_pit")
+        if marginal_pit is None and (
+            tabicl_marginal is not None or marginal_regressor is not None
+        ):
             marginal_pit = _marginal_pit(
                 ep=ep, tabicl_marginal=tabicl_marginal, k_folds=tabicl_pit_k_folds, device=device,
                 marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
@@ -1872,24 +1912,24 @@ def main() -> None:
         # them on the same per-point footing as every other row (baseline_y_nlls
         # and icl_y_parts are already per-point via gp_oracle_y_nll/y_space_nll)
         # — this table only, _print_y_space_oracle's own numbers stay raw.
-        if era5:
-            # The baselines were fitted on this episode's standardized y (see
-            # --era5_standardize_y); shift their per-point marginal/total back
-            # to raw Kelvin nats so they sit in the same units as the ICL row,
-            # whose log_pdf_test is already Jacobian-corrected by the PIT. The
-            # copula term is invariant under the affine rescaling, so it is
-            # deliberately left alone. A no-op (y_log_std == 0) when the
-            # baselines saw raw y in the first place.
-            _shift = float(ep["era5_meta"]["y_log_std"])
-            if _shift:
-                baseline_y_nlls = {
-                    k: {
-                        "total": v["total"] + _shift,
-                        "marginal": v["marginal"] + _shift,
-                        "copula": v["copula"],
-                    }
-                    for k, v in baseline_y_nlls.items()
+        # An episode whose targets were affinely rescaled carries the
+        # per-point Jacobian to undo it (see --era5_standardize_y); shift the
+        # baselines' marginal/total back to raw units so they sit in the same
+        # units as the ICL row, whose log_pdf_test the PIT already corrected.
+        # The copula term is invariant under that rescaling and is deliberately
+        # left alone. Keyed on the episode, not on the source, so any source
+        # that rescales targets gets this for free -- and 0.0 (the default)
+        # makes it a no-op for every source that does not.
+        _shift = float(ep.get("y_log_std", 0.0))
+        if _shift:
+            baseline_y_nlls = {
+                k: {
+                    "total": v["total"] + _shift,
+                    "marginal": v["marginal"] + _shift,
+                    "copula": v["copula"],
                 }
+                for k, v in baseline_y_nlls.items()
+            }
         total_nlls = {
             **baseline_y_nlls,
             "icl": icl_y_parts,

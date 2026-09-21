@@ -55,7 +55,11 @@ def summarize(path: str, era5: bool | None = None, max_episodes: int | None = No
     # The fingerprint carries the whole run config, so the labels below are
     # read off the file rather than guessed from the filename.
     if era5 is None:
-        era5 = bool(fp.get("era5")) or bool((fp.get("baseline") or {}).get("era5"))
+        # The stored fingerprint is eval_checkpoint.py's _results_fingerprint,
+        # which nests the baseline fingerprint under "baseline" -- and the
+        # era5 sub-dict is set on that baseline fingerprint. There is no
+        # top-level "era5" key to fall back to.
+        era5 = bool((fp.get("baseline") or {}).get("era5"))
     z_src = fp.get("z_train_source") or "tabicl"
     ckpt = fp.get("ckpt")
 
