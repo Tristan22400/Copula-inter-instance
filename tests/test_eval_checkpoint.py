@@ -364,9 +364,9 @@ def test_failed_baseline_fit_still_yields_nan_parts_dict(tiny_episode, monkeypat
     real_fit = classical.fit_and_eval_gpytorch
 
     def fail_dkl_only(*args, **kwargs):
-        # Only the DKL calls pass a feature_extractor; leave GP-MLE alone so
-        # the episode still produces real results around the failure.
-        if kwargs.get("feature_extractor") is not None:
+        # Only the DKL calls pass a feature_extractor_factory; leave GP-MLE
+        # alone so the episode still produces real results around the failure.
+        if kwargs.get("feature_extractor_factory") is not None:
             raise RuntimeError("synthetic DKL failure")
         return real_fit(*args, **kwargs)
 

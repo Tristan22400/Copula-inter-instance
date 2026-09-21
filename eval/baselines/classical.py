@@ -65,6 +65,7 @@ import math
 import os
 import sys
 import warnings
+from typing import Callable
 
 import gpytorch
 import torch
@@ -104,6 +105,8 @@ __all__ = [
     "GP_VAL_SELECT_MODES",
     "EXPECTED_BASELINE_KEYS",
     "assert_shared_z_test",
+    "fit_zero_mean_gp_on_marginal",
+    "zero_mean_gp_prior_cfg",
 ]
 
 
@@ -163,7 +166,22 @@ EXPECTED_BASELINE_KEYS = frozenset(
 # to a fixed n_steps and keeping the lowest TRAINING loss -- see
 # fit_and_eval_gpytorch's docstring for the measured ARD overfitting this
 # fixes. v2 entries hold systematically over-fit ARD rows (up to +6 nats/pt).
-_BASELINE_ALGO_VERSION = 3
+#
+# v4: DKL fixes two compounding bugs diagnosed by tracing a real fit (see
+# fit_and_eval_gpytorch's docstring): (1) the feature extractor was a single
+# nn.Module instance shared across n_restarts iterations, so a "restart"
+# never actually re-initialised the MLP -- moot before v4 anyway since DKL
+# was called with n_restarts=1 (no restart loop at all, so an unlucky single
+# random MLP init had no chance to recover); (2) the held-out-NLL check grid
+# (every n_steps//100 steps) is coarse enough to step over the genuine
+# optimum on the curve traced in that docstring (true min at step 90 vs. the
+# step-50/step-100 grid points bracketing it). v4 gives DKL real restarts
+# (a fresh MLP each time, via a factory) and a step grid dense enough near
+# the start of training to find that optimum. v3 entries hold DKL rows fit
+# from a single, frequently-bad random init and/or missing the true early
+# optimum -- both push the reported DKL NLL far worse than the method
+# actually supports.
+_BASELINE_ALGO_VERSION = 4
 
 
 GP_VAL_SELECT_MODES = ("ard", "always", "never")
@@ -452,6 +470,19 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
 
 
+def _val_check_steps(n_steps: int) -> set[int]:
+    """Which training steps to evaluate held-out NLL at, for use_val's
+    early-stopping guard (see fit_and_eval_gpytorch's docstring for why a
+    flat every-(n_steps//100) grid is too coarse). Dense (every 10 steps)
+    through the first 500 steps, where DKL/ARD-GP-MLE's true validation
+    optimum has empirically landed, layered with the original coarse grid so
+    later-converging fits (e.g. non-ARD val_select) are still covered."""
+    coarse_every = max(1, n_steps // 100)
+    dense = range(0, min(n_steps, 500), 10)
+    coarse = range(0, n_steps, coarse_every)
+    return set(dense) | set(coarse) | {n_steps - 1}
+
+
 def fit_and_eval_gpytorch(
     X_train: Tensor,
     y_train: Tensor,
@@ -460,7 +491,7 @@ def fit_and_eval_gpytorch(
     n_steps: int,
     lr: float,
     ard: bool = False,
-    feature_extractor: nn.Module | None = None,
+    feature_extractor_factory: Callable[[], nn.Module] | None = None,
     jitter: float = 1e-6,
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
@@ -528,19 +559,43 @@ def fit_and_eval_gpytorch(
     being systematically misspecified whenever an episode's true degree
     differs from one hardcoded guess.
 
-    When feature_extractor is given (DKL), training instead holds out a 20%
-    validation split of X_train/y_train and keeps whichever training step's
-    weights reached the best held-out predictive NLL, instead of just running
-    to n_steps and keeping the final weights. The plain (no feature_extractor)
-    GP-MLE fit above has only 2-3 free hyperparameters, already regularised by
-    kernel_priors/noise_prior — but DKL's MLP is unregularised and free to
-    rescale its own output to defeat those priors. Empirically this drives the
-    fitted noise toward the noise_constraint floor, near-interpolating y_train
-    while collapsing every X_test feature into a near-constant direction
-    (off-diagonal correlation -> ~1) — training loss keeps improving long
-    after held-out NLL has turned catastrophically worse than independence,
-    so a fixed step count with no validation signal silently picks the worst
-    point on that curve.
+    When feature_extractor_factory is given (DKL), training instead holds out
+    a 20% validation split of X_train/y_train and keeps whichever training
+    step's weights reached the best held-out predictive NLL, instead of just
+    running to n_steps and keeping the final weights. The plain (no
+    feature_extractor_factory) GP-MLE fit above has only 2-3 free
+    hyperparameters, already regularised by kernel_priors/noise_prior — but
+    DKL's MLP is unregularised and free to rescale its own output to defeat
+    those priors. Empirically this drives the fitted noise toward the
+    noise_constraint floor, near-interpolating y_train while collapsing every
+    X_test feature into a near-constant direction (off-diagonal correlation
+    -> ~1) — training loss keeps improving long after held-out NLL has turned
+    catastrophically worse than independence, so a fixed step count with no
+    validation signal silently picks the worst point on that curve.
+
+    DKL's feature extractor is built fresh EVERY restart via
+    feature_extractor_factory() rather than passed in as one already-
+    constructed module — a restart is supposed to give the optimiser an
+    independent chance to escape a bad basin, but _randomize_init only
+    re-samples the GP kernel's own hyperparameters, never the feature
+    extractor; a shared module instance would carry its Adam-updated weights
+    from one "restart" straight into the next, making the restart a no-op for
+    the one component (the MLP) most likely to have landed badly. Diagnosed
+    by tracing real fits (see the module docstring's DKL entry and
+    eval_baselines_episode's n_restarts_dkl): with the single fixed random
+    MLP init DKL used before this was fixed (n_restarts=1, unconditionally),
+    z-space copula NLL on 4 held-out episodes ranged from 4.9 to 102 nats/pt
+    depending purely on that one seed's luck — the held-out-NLL guard above
+    only ever gets to pick a training STEP, it cannot rescue a fit whose
+    single random init the optimiser never leaves. A step-by-step trace of
+    one such fit also showed the standard "held-out NLL decreases then rises
+    as training overfits" U-curve bottoming out inside the first ~100 of
+    5000 steps (true minimum: step 90, NLL 1.0011) — fine enough that the
+    OLD flat every-(n_steps//100) check grid (every 50 steps here) can miss
+    it entirely, landing one grid point away on a visibly worse checkpoint
+    (step 50, NLL 1.1088). _val_check_steps below checks densely (every 10
+    steps) through step 500 for exactly this reason, on top of the original
+    coarse grid for later steps.
 
     val_select extends that same guard to the plain GP-MLE path, which needs
     it for ARD. The reasoning just above — that plain GP-MLE "has only 2-3
@@ -576,9 +631,9 @@ def fit_and_eval_gpytorch(
     Skipped for P < 8 (too few points for a meaningful split); falls back to
     training on the full set with no early stopping.
     """
-    if kernel_name == "periodic" and feature_extractor is not None:
+    if kernel_name == "periodic" and feature_extractor_factory is not None:
         raise ValueError("kernel_name='periodic' is not PD in a >1D DKL latent space")
-    if ard and feature_extractor is not None:
+    if ard and feature_extractor_factory is not None:
         # ard_num_dims below is derived from d_x (X_train's raw column count),
         # but the base kernel actually sees feature_extractor(x) — a
         # differently-shaped latent tensor. Silently using d_x here would
@@ -600,14 +655,14 @@ def fit_and_eval_gpytorch(
     lengthscale_init_prior = _lengthscale_init_prior(prior_cfg or {})
 
     P = X_train.shape[0]
-    use_val = (feature_extractor is not None or val_select) and P >= 8
+    use_val = (feature_extractor_factory is not None or val_select) and P >= 8
     if use_val:
         n_val = max(2, int(round(0.2 * P)))
         perm = torch.randperm(P, device=X_train.device)
         val_idx, fit_idx = perm[:n_val], perm[n_val:]
         X_fit, y_fit = X_train[fit_idx], y_train[fit_idx]
         X_val, y_val = X_train[val_idx], y_train[val_idx]
-        val_every = max(1, n_steps // 100)
+        val_check_steps = _val_check_steps(n_steps)
     else:
         X_fit, y_fit = X_train, y_train
 
@@ -642,6 +697,14 @@ def fit_and_eval_gpytorch(
                 min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
             )
 
+            # Built fresh every restart (not hoisted above the loop and
+            # reused), same reasoning as noise_constraint above: a shared
+            # feature_extractor instance would carry its Adam-updated
+            # weights from one "restart" into the next, silently defeating
+            # the whole point of restarting (see this function's docstring).
+            feature_extractor = (
+                feature_extractor_factory() if feature_extractor_factory is not None else None
+            )
             model = _ExactGPModel(
                 X_fit, y_fit, likelihood, kernel_name,
                 ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
@@ -663,7 +726,7 @@ def fit_and_eval_gpytorch(
                 loss.backward()
                 opt.step()
 
-                if use_val and (step % val_every == 0 or step == n_steps - 1):
+                if use_val and step in val_check_steps:
                     model.eval()
                     likelihood.eval()
                     with torch.no_grad():
@@ -729,6 +792,84 @@ def fit_and_eval_gpytorch(
 
     R, _ = sigma_to_correlation(Sigma_post)
     return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
+
+
+
+# ---------------------------------------------------------------------------
+# Zero-Mean GP fit directly on a REAL (non-oracle) marginal's z_train
+# ---------------------------------------------------------------------------
+#
+# Every GP-MLE/DKL baseline above fits in raw y-space precisely because
+# fitting against the ORACLE z_train would leak the true generating kernel's
+# own Cholesky factor (see fit_and_eval_gpytorch's docstring). That concern
+# does not apply to a z_train produced by an independently-fit marginal model
+# (e.g. eval_checkpoint.py's --z_train_source=tabicl, run through a real —
+# possibly Phase-A-fine-tuned — TabICL): those PIT residuals carry no oracle
+# information, they are exactly the same (imperfect) conditioning input the
+# ICL copula head itself receives. Fitting a classical GP directly on that
+# input, with the mean forced to zero (z_train is already meant to be
+# marginally ~N(0,1) if the PIT is well calibrated — plain MLE, no separate
+# mean parameter to estimate), isolates the correlation-modelling question
+# from the marginal-modelling one: given the IDENTICAL real marginal input,
+# does a small classical GP recover the copula structure as well as the
+# learned ICL correlation head?
+#
+# Deliberately not one of eval_baselines_episode's cached, checkpoint-
+# independent baselines: this fit depends on which marginal produced
+# z_train (--z_train_source / --tabicl_ckpt), which eval_baselines_episode's
+# worker pool has no access to (it only ever sees the oracle episode dict).
+# eval_checkpoint.py fits it directly in the main per-episode loop, right
+# after computing that episode's marginal_pit.
+
+
+def zero_mean_gp_prior_cfg(prior_cfg: dict | None = None) -> dict:
+    """Hyperprior overrides for fitting on a marginal's z_train instead of raw
+    y_train: the y-space alpha2 (outputscale) prior has mean
+    alpha2_gamma_concentration / alpha2_gamma_rate ~= 1.33 under
+    _DEFAULT_PRIOR_CFG, tuned to data_gen.py's own y-space generative
+    hyperprior. z_train is instead expected to already be marginally unit-
+    variance (a well-calibrated PIT), so the outputscale prior is
+    recentred at mean 1 (Gamma(2, 2)) instead. Every other hyperprior
+    (lengthscale, noise) is coordinate-free w.r.t. the target's scale and is
+    left unchanged.
+    """
+    cfg = dict(prior_cfg or {})
+    cfg["alpha2_gamma_concentration"] = 2.0
+    cfg["alpha2_gamma_rate"] = 2.0
+    return cfg
+
+
+def fit_zero_mean_gp_on_marginal(
+    X_train: Tensor,
+    z_train: Tensor,
+    X_test: Tensor,
+    kernel_name: str,
+    n_steps: int,
+    lr: float,
+    n_restarts: int,
+    oracle_mode: str = "prior",
+    prior_cfg: dict | None = None,
+    jitter: float = 1e-6,
+) -> dict[str, Tensor]:
+    """Zero-mean GP-MLE fit on (X_train, z_train), z_train being a REAL
+    (non-oracle) marginal's PIT residual — see the module note above for why
+    this is a distinct, legitimate baseline from fit_and_eval_gpytorch's
+    y-space fits rather than the oracle-leakage case that function's
+    docstring warns against.
+
+    Thin wrapper: _ExactGPModel already forces gpytorch.means.ZeroMean()
+    unconditionally for every kernel, so no separate mean-function code path
+    is needed — only the outputscale prior changes (see
+    zero_mean_gp_prior_cfg). Same {"R", "mean", "Sigma"} return contract as
+    fit_and_eval_gpytorch; "mean"/"Sigma" are in z-space here, not raw
+    y-units.
+    """
+    return fit_and_eval_gpytorch(
+        X_train, z_train, X_test, kernel_name,
+        n_steps=n_steps, lr=lr, ard=False, jitter=jitter,
+        oracle_mode=oracle_mode, prior_cfg=zero_mean_gp_prior_cfg(prior_cfg),
+        n_restarts=n_restarts, val_select=False,
+    )
 
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
@@ -985,6 +1126,7 @@ def eval_baselines_episode(
     oracle_mode: str = "prior",
     prior_cfg: dict | None = None,
     n_restarts_mle: int = 1,
+    n_restarts_dkl: int = 1,
     fit_seed: int | None = None,
     gp_val_select: str = "ard",
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
@@ -1108,14 +1250,17 @@ def eval_baselines_episode(
         "rational_quadratic": "dkl_rq",
         "dot_product":        "dkl_dot_product",
     }
+    def _make_dkl_mlp(d_x: int = X_train.shape[1], dev: torch.device = device) -> nn.Module:
+        return DKLFeatureExtractor(d_x, hidden=32, out_dim=16, dropout=0.0).to(dev)
+
     for kname in _DKL_KERNELS:
         label = _DKL_LABEL_MAP[kname]
         try:
-            mlp = DKLFeatureExtractor(X_train.shape[1], hidden=32, out_dim=16, dropout=0.0).to(device)
             fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                         n_steps=n_steps_dkl, lr=lr_dkl,
-                                        ard=False, feature_extractor=mlp,
-                                        oracle_mode=oracle_mode, prior_cfg=prior_cfg)
+                                        ard=False, feature_extractor_factory=_make_dkl_mlp,
+                                        oracle_mode=oracle_mode, prior_cfg=prior_cfg,
+                                        n_restarts=n_restarts_dkl)
             nlls[label] = corr_nll_single(fit["R"], z_test)
             R_dict[label] = fit["R"]
             y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
@@ -1193,6 +1338,7 @@ def baseline_fingerprint(
     n_steps_per_ep: int,
     patience_per_ep: int,
     gp_val_select: str = "ard",
+    n_restarts_dkl: int = 1,
 ) -> dict:
     """Everything that determines the *baseline* fit results for an episode,
     other than which episode it is (see episode_cache_key for that half).
@@ -1226,6 +1372,7 @@ def baseline_fingerprint(
         "n_restarts_mle": n_restarts_mle,
         "n_steps_dkl": n_steps_dkl,
         "lr_dkl": lr_dkl,
+        "n_restarts_dkl": n_restarts_dkl,
         "n_steps_per_ep": n_steps_per_ep,
         "patience_per_ep": patience_per_ep,
         "gp_val_select": gp_val_select,
