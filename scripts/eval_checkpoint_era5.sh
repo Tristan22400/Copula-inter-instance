@@ -59,14 +59,13 @@
 # d_x=9), so do not size a reservation off eval_checkpoint.py's synthetic
 # 78.6 s/episode figure.
 #
-# On top of that, the autoregressive row (on by default under --era5, see
-# eval/baselines/autoregressive.py) adds a GPU pass during the episode build,
-# before the fit pass. Unlike everything else here it is GPU-bound, so its
-# cost tracks the card and not the core count: measured 1.5 s/episode on an
-# RTX PRO 6000 Blackwell and 3.6 s/episode on an RTX A5000, i.e. ~10 to ~24
-# min for 400. It is also the only part of the run that is neither cached nor
-# checkpoint-dependent, so a resumed run pays it again; --no-autoregressive
-# drops it.
+# On top of that, the autoregressive row (on by default whenever the marginal
+# is TabICL, see eval/baselines/autoregressive.py) adds a GPU pass before the
+# fit pass. Unlike everything else here it is GPU-bound, so its cost tracks
+# the card and not the core count: measured 1.5 s/episode on an RTX PRO 6000
+# Blackwell and 3.6 s/episode on an RTX A5000, i.e. ~10 to ~24 min for 400.
+# A resumed run skips it for every episode whose scored results the
+# --results_cache already holds; --no-autoregressive drops it entirely.
 #
 # Sharding across an OAR array: every episode is a pure function of
 # (--seed, its GLOBAL index), so --n_episodes 100 with --episode_offset
