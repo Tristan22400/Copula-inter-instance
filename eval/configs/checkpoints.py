@@ -64,6 +64,26 @@ CHECKPOINT_FAMILIES = {
         "label": "zcorrupt bigN retrain (210k steps)",
         "color": "#937860",
     },
+    # The only NANO-backbone entry here, and the only one whose copula head is
+    # rank 512 rather than 32 (feature_dim 128, 386K params total against the
+    # prod families' 27M). Trained with P and N both PINNED -- P 32..32,
+    # N 256..256, d_features 10 -- and with tabicl.pretrained=false, its
+    # marginal coming from tabicl.pit_ckpt (the ERA5 run1 fine-tune, see
+    # MARGINAL_FAMILIES["era5-run1"] below).
+    #
+    # Two consequences worth knowing before scoring it:
+    #   * rank 512 enters baseline_fingerprint (it sizes per_ep_transformer's
+    #     low-rank factor), so this checkpoint CANNOT reuse a rank-32
+    #     --baseline_cache; give it its own, and expect a full fit pass.
+    #   * its pinned P=32/N=256 means eval_checkpoint.py --era5's defaults
+    #     (P=30, N=546) sit off its training distribution on both axes. Use
+    #     --era5_grid_size 17 --era5_n_context 32 (P=32, N=257) to match it.
+    "copula-nano-finetune-marginal-float32": {
+        "dir": "copula_nano/copula-finetune-marginal-float32",
+        "default_step": 630000,
+        "label": "Nano + marginal fine-tune, float32 (630k steps, rank 512)",
+        "color": "#da8bc3",
+    },
 }
 
 
@@ -130,7 +150,26 @@ MARGINAL_FAMILIES: dict[str, dict] = {
         "default_step": 16200,
         "label": "TabICL v2 fine-tune ERA5 12m (step 16.2k final)",
     },
+    # THE CONFIGURED DEFAULT. conf/model/copula_prod.yaml's tabicl.ckpt and
+    # conf/model/copula_nano.yaml's tabicl.pit_ckpt both already point at this
+    # file, so it is what eval_checkpoint.py --z_train_source=tabicl loads when
+    # no --tabicl_ckpt is passed. Registered here so it can also be named
+    # ("--tabicl_ckpt era5-run1") instead of only spelled as a path, and so the
+    # registry stops implying era5-33y/era5-12m are the only fine-tuned
+    # marginals that exist.
+    "era5-run1": {
+        "dir": "marginal/ablations/marginal_finetune_era5_run1",
+        "filename": "step_0177600_final.pt",
+        "default_step": 177600,
+        "label": "TabICL v2 fine-tune ERA5 run1 (step 177.6k final) — default",
+    },
 }
+
+# The marginal every copula run resolves to when nothing overrides it, kept as
+# a name rather than a duplicated path so callers can refer to "the default"
+# without re-spelling conf/model/*.yaml. Changing the configs without changing
+# this (or vice versa) is the drift this constant exists to make obvious.
+DEFAULT_MARGINAL_FAMILY = "era5-run1"
 
 
 def resolve_marginal_checkpoint(name_or_path: str) -> str:
