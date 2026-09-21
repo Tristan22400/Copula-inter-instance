@@ -19,6 +19,7 @@ Usage
         [--n_restarts_mle 5]      # random restarts per GP-MLE kernel fit
         [--n_steps_dkl 5000]      # Adam steps for Deep Kernel Learning (MLP+GP) fitting
         [--lr_dkl 0.01]           # learning rate for DKL Adam
+        [--n_restarts_dkl 2]      # random restarts per DKL kernel fit (fresh MLP each time)
         [--n_steps_per_ep 5000]   # training steps for PerEpisodeTransformer
         [--patience_per_ep 500]   # early stopping patience (steps without improvement)
         [--baseline_device cpu]   # where to fit baselines (cpu is FASTER here, see below)
@@ -61,10 +62,13 @@ Runtime
 Baseline fitting is ~98% of this script's cost. Measured at the defaults
 above (P=32 train / N=256 test / d_x=9): 649 s per episode, split GP-MLE
 350 s (9 kernel+ARD labels x 5 restarts x 1000 steps) / polynomial 121 s
-(3 degrees x 5 restarts) / DKL 168 s / per_ep_transformer 10 s. That is
-~85,000 Adam steps per episode, every one of them a 32x32 Cholesky, so the
-work is dominated by per-step launch latency rather than arithmetic. Two
-consequences, both handled by the defaults:
+(3 degrees x 5 restarts) / DKL 168 s (at the OLD n_restarts_dkl=1 default;
+see --n_restarts_dkl's help for why that was a bug, not a speed choice --
+at the current default of 2 restarts DKL costs ~336 s instead, so 817 s/
+episode total) / per_ep_transformer 10 s. That is ~85,000 Adam steps per
+episode, every one of them a 32x32 Cholesky, so the work is dominated by
+per-step launch latency rather than arithmetic. Two consequences, both
+handled by the defaults:
 
   * --baseline_device defaults to **cpu**, which is ~2x faster than a GPU
     here for bit-comparable NLLs (measured: GP-MLE rbf 2.98 s vs 7.50 s per
@@ -1308,6 +1312,37 @@ def main() -> None:
                         help="Adam steps for Deep Kernel Learning (MLP+GP) fitting")
     parser.add_argument("--lr_dkl",       type=float, default=0.01,
                         help="Learning rate for DKL Adam")
+    parser.add_argument("--n_restarts_dkl", type=int, default=2,
+                        help="Independent random restarts per DKL kernel fit -- each "
+                             "restart gets a FRESH feature-extractor MLP (not the same "
+                             "instance re-trained further), since a shared instance would "
+                             "carry its already-updated weights from one restart into the "
+                             "next and silently defeat the point of restarting (see "
+                             "fit_and_eval_gpytorch's docstring). Was hardcoded to 1 "
+                             "(no restart loop at all) until this option existed: DKL's "
+                             "joint MLP+kernel landscape is harder and more init-sensitive "
+                             "than plain GP-MLE's, so a single unlucky random MLP init had "
+                             "no chance to recover, and diagnostics traced z-space copula "
+                             "NLL swinging from ~5 to >100 nats/pt across episodes purely "
+                             "on that one seed's luck. Measured on 4 held-out episodes "
+                             "(dkl_rbf/dkl_dot_product, n_steps=2000): restart 2 roughly "
+                             "halves the median z-space copula NLL vs. restart 1 (rbf "
+                             "45.5 -> 18.9, dot_product 69.5 -> 55.9 nats/pt), a 3rd "
+                             "restart found nothing further in every one of the 8 "
+                             "(kernel, episode) combinations tried -- same restart-2-"
+                             "suffices pattern as --n_restarts_zeromean_gp. DKL still ends "
+                             "up well behind GP-MLE/Marginal+ZeroMean-GP even at restart 2: "
+                             "unlike those, its kernel operates on a LEARNED feature space, "
+                             "so the same rescale-to-defeat-the-lengthscale-prior "
+                             "identifiability issue the module docstring already describes "
+                             "for the held-out-NLL guard applies to the restarts here too "
+                             "-- restarts pick a better basin, they do not fix the "
+                             "underlying identifiability gap. (A LayerNorm on the MLP "
+                             "output was tried as a fix and made things WORSE -- median "
+                             "NLL 18.9 -> 57.0 for rbf, 55.9 -> 341.7 for dot_product on "
+                             "the same episodes -- because per-sample normalisation erases "
+                             "exactly the relative-magnitude information RBF/dot_product "
+                             "need between different points; not applied.)")
     parser.add_argument("--n_steps_per_ep", type=int, default=5000,
                         help="Training steps for PerEpisodeTransformer")
     parser.add_argument("--patience_per_ep", type=int, default=500,
@@ -1595,6 +1630,7 @@ def main() -> None:
     data_cfg = OmegaConf.select(cfg, "data", default=None)
     prior_cfg = OmegaConf.to_container(data_cfg) if data_cfg is not None else {}
     print(f"GP-MLE restarts: {args.n_restarts_mle}")
+    print(f"DKL restarts: {args.n_restarts_dkl}")
 
     # Live-generate by default, unless the user points at a fixed dataset
     # with --dataset_dir (see --live_generate's help text).
@@ -1667,7 +1703,7 @@ def main() -> None:
         cfg, live_generate, args.dataset_dir, args.seed, icl_rank, oracle_mode,
         args.n_steps_mle, args.lr_mle, args.n_restarts_mle,
         args.n_steps_dkl, args.lr_dkl, args.n_steps_per_ep, args.patience_per_ep,
-        gp_val_select=args.gp_val_select,
+        gp_val_select=args.gp_val_select, n_restarts_dkl=args.n_restarts_dkl,
     )
     cache_entries = load_baseline_cache(args.baseline_cache, fingerprint) if use_cache else {}
 
@@ -1696,6 +1732,7 @@ def main() -> None:
         oracle_mode=oracle_mode,
         prior_cfg=prior_cfg,
         n_restarts_mle=args.n_restarts_mle,
+        n_restarts_dkl=args.n_restarts_dkl,
         gp_val_select=args.gp_val_select,
     )
 
