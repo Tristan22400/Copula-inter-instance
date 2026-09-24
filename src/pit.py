@@ -247,6 +247,23 @@ def normalize_targets(
     return y_train_scaled, y_test_scaled, mean, std
 
 
+def _scale_fold_targets(y_context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Standardize one fold using only its context labels, along the last axis.
+
+    The PIT drivers use full-context scaling for test-side prediction. Their
+    fold side uses raw labels when supplied; otherwise re-standardizing the
+    caller's affine scale gives the same coordinates when context variance is
+    nonzero and at least two context labels are available.
+    A singleton context has no sample standard deviation; use unit scale.
+    """
+    mean = y_context.mean(dim=-1, keepdim=True)
+    std = (
+        y_context.std(dim=-1, keepdim=True).clamp(min=1e-8)
+        if y_context.shape[-1] > 1 else torch.ones_like(mean)
+    )
+    return (y_context - mean) / std, mean, std
+
+
 # ---------------------------------------------------------------------------
 # Single-task PIT
 # ---------------------------------------------------------------------------
@@ -261,19 +278,26 @@ def run_pit(
     Y_test: torch.Tensor,
     k_folds: int = DEFAULT_K_FOLDS,
     eps: float = 1e-6,
+    Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
     """Run the Probability Integral Transform on one task.
 
     Args:
         tabicl  : frozen TabICL regressor (max_classes=0)
         X_train : (P, p_x)
-        Y_train : (P, d)
+        Y_train : (P, d), on the caller's full-context target scale. Each
+                  training fold is re-standardized using only its context
+                  labels before TabICL sees them or its held-out CDF is scored.
         X_test  : (N, p_x)
         Y_test  : (N, d)
         k_folds : number of disjoint folds for the training-set PIT.
                   Bounded above by P; clamp into [2, P].
                   Set to P explicitly for true leave-one-out (slow).
         eps     : clamp before probit.
+        Y_train_raw : optional (P, d) raw labels. Supply this when Y_train
+                      was scaled with full-context moments. Fold scaling then
+                      uses raw labels, including when a fold has one context
+                      row or nearly constant labels.
 
     Returns dict with:
         z_train      : (P, d)
@@ -286,6 +310,7 @@ def run_pit(
     d = Y_train.shape[1]
 
     K = max(2, min(int(k_folds), P))
+    fold_targets = Y_train if Y_train_raw is None else Y_train_raw
 
     # ------------------------------------------------------------------ #
     # A) Test instances: one forward over the full train context, fused #
@@ -330,13 +355,16 @@ def run_pit(
 
         X_fold = torch.cat([X_train[ctx_idx], X_train[qry_idx]], dim=0)    # (P-F+F, p_x)
         X_fold_batch = X_fold.unsqueeze(0).expand(d, -1, -1).contiguous()
-        y_ctx_batch = Y_train[ctx_idx].permute(1, 0).contiguous()          # (d, P-F)
+        y_context = fold_targets[ctx_idx].permute(1, 0)                  # (d, P-F)
+        y_ctx_batch, fold_mean, fold_std = _scale_fold_targets(y_context)
+        y_ctx_batch = y_ctx_batch.contiguous()
 
         logits_fold = tabicl_forward(tabicl, X_fold_batch, y_ctx_batch)    # (d, F, Q)
         logits_fold = logits_fold.to(device)  # see run_pit's offload-mode comment above
         dist_fold = tabicl.quantile_dist(logits_fold.reshape(d * F, Q))
 
-        y_qry_flat = Y_train[qry_idx].permute(1, 0).reshape(d * F)
+        y_query = fold_targets[qry_idx].permute(1, 0)
+        y_qry_flat = ((y_query - fold_mean) / fold_std).reshape(d * F)
         u_train[qry_idx, :] = (
             dist_fold.cdf(y_qry_flat).reshape(d, F).permute(1, 0)
         )
@@ -406,6 +434,7 @@ def _run_pit_batched_impl(
     fold_subset: "Sequence[int] | None" = None,
     compute_pit: bool = True,
     fuse_folds: bool = False,
+    Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
     """Shared body of ``run_pit_batched`` / ``run_pit_batched_grad``.
 
@@ -432,8 +461,10 @@ def _run_pit_batched_impl(
     pre-probit CDF values and probit-clamp saturation fractions. Phase-A
     marginal fine-tuning (``src/marginal_finetune.py``) needs the quantiles to
     build its own ``QuantileDistribution`` for NLL/CRPS/distillation without a
-    second forward pass; the saturation fractions are the silent-failure
-    counters the marginal calibration runner reports.
+    second forward pass. Fold quantiles are mapped back to the caller's target
+    scale so they can be scored alongside test quantiles. The saturation
+    fractions are the silent-failure counters the marginal calibration runner
+    reports.
     """
     if not compute_pit and not return_quantiles:
         raise ValueError("compute_pit=False requires return_quantiles=True")
@@ -444,6 +475,10 @@ def _run_pit_batched_impl(
     d = Y_train.shape[2]
 
     K = max(2, min(int(k_folds), P))
+    fold_targets = Y_train if Y_train_raw is None else Y_train_raw
+    if Y_train_raw is not None:
+        full_mean = Y_train_raw.mean(dim=1).unsqueeze(-1).unsqueeze(-1)
+        full_std = Y_train_raw.std(dim=1).clamp(min=1e-8).unsqueeze(-1).unsqueeze(-1)
 
     # ------------------------------------------------------------------ #
     # A) Test instances: one forward, batch axis = B*d.                   #
@@ -516,30 +551,38 @@ def _run_pit_batched_impl(
     for group in fold_groups:
         x_group = []
         y_group = []
+        fold_scales = []
         for qry_idx, ctx_idx, F in group:
             X_fold = torch.cat([X_train[:, ctx_idx], X_train[:, qry_idx]], dim=1)
             x_group.append(
                 X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x)
                 .reshape(B * d, X_fold.shape[1], p_x).contiguous()
             )
-            y_group.append(
-                Y_train[:, ctx_idx].permute(0, 2, 1).reshape(B * d, P - F).contiguous()
-            )
+            y_context = fold_targets[:, ctx_idx].permute(0, 2, 1)  # (B, d, P-F)
+            y_scaled, fold_mean, fold_std = _scale_fold_targets(y_context)
+            y_group.append(y_scaled.reshape(B * d, P - F).contiguous())
+            fold_scales.append((fold_mean, fold_std))
 
         logits_group = tabicl_forward(tabicl, torch.cat(x_group, dim=0), torch.cat(y_group, dim=0))
         logits_group = logits_group.to(device)
 
         for group_idx, (qry_idx, _ctx_idx, F) in enumerate(group):
             logits_fold = logits_group[group_idx * B * d:(group_idx + 1) * B * d]
+            fold_mean, fold_std = fold_scales[group_idx]
 
             if compute_pit:
                 dist_fold = tabicl.quantile_dist(logits_fold.reshape(B * d * F, Q))
-                y_qry_flat = Y_train[:, qry_idx].permute(0, 2, 1).reshape(B * d * F)
+                y_query = fold_targets[:, qry_idx].permute(0, 2, 1)
+                y_qry_flat = ((y_query - fold_mean) / fold_std).reshape(B * d * F)
                 u_fold = dist_fold.cdf(y_qry_flat).reshape(B, d, F).permute(0, 2, 1)
                 u_train_parts.append((qry_idx, u_fold))
             if return_quantiles:
+                q_fold = logits_fold.reshape(B, d, F, Q)
+                q_fold = q_fold * fold_std.unsqueeze(-1) + fold_mean.unsqueeze(-1)
+                if Y_train_raw is not None:
+                    q_fold = (q_fold - full_mean) / full_std
                 q_train_parts.append(
-                    (qry_idx, logits_fold.reshape(B, d, F, Q).permute(0, 2, 1, 3))
+                    (qry_idx, q_fold.permute(0, 2, 1, 3))
                 )
 
     no_fold_outputs = not (q_train_parts if return_quantiles else u_train_parts)
@@ -636,6 +679,7 @@ def run_pit_batched(
     k_folds: int = DEFAULT_K_FOLDS,
     eps: float = 1e-6,
     return_quantiles: bool = False,
+    Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
     """``run_pit``, vectorised over a leading batch-of-episodes axis B.
 
@@ -652,7 +696,8 @@ def run_pit_batched(
     Args:
         tabicl  : frozen TabICL regressor (max_classes=0)
         X_train : (B, P, p_x)
-        Y_train : (B, P, d)
+        Y_train : (B, P, d), on the caller's full-context target scale.
+                  Training folds are re-standardized on their context labels.
         X_test  : (B, N, p_x)
         Y_test  : (B, N, d)
         k_folds : as in ``run_pit`` -- clamped into [2, P], shared by every
@@ -662,6 +707,9 @@ def run_pit_batched(
                   CDF values and probit-clamp fractions (see
                   ``_run_pit_batched_impl``). Off by default so the historical
                   callers' return dict is byte-for-byte unchanged.
+        Y_train_raw : optional (B, P, d) raw labels for fold-specific scaling.
+                  Production callers pass this alongside globally scaled
+                  Y_train; fold quantiles are returned on Y_train's scale.
 
     Returns dict with:
         z_train      : (B, P, d)
@@ -671,6 +719,7 @@ def run_pit_batched(
     return _run_pit_batched_impl(
         tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
         return_quantiles=return_quantiles,
+        Y_train_raw=Y_train_raw,
     )
 
 
@@ -686,6 +735,7 @@ def run_pit_batched_grad(
     fold_subset: "Sequence[int] | None" = None,
     compute_pit: bool = True,
     fuse_folds: bool = False,
+    Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
     """Gradient-carrying ``run_pit_batched`` -- same body, no ``no_grad``.
 
@@ -706,6 +756,7 @@ def run_pit_batched_grad(
             tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
             return_quantiles=return_quantiles, fold_subset=fold_subset,
             compute_pit=compute_pit, fuse_folds=fuse_folds,
+            Y_train_raw=Y_train_raw,
         )
 
 
@@ -722,6 +773,8 @@ def run_pit_calib_split_batched(
     X_calib: torch.Tensor,
     Y_calib: torch.Tensor,
     eps: float = 1e-6,
+    Y_query_raw: Optional[torch.Tensor] = None,
+    Y_calib_raw: Optional[torch.Tensor] = None,
 ) -> dict:
     """One-pass alternative to ``run_pit_batched``'s K-fold query-side PIT.
 
@@ -749,6 +802,9 @@ def run_pit_calib_split_batched(
         X_calib : (B, P_C, p_x)
         Y_calib : (B, P_C, d)
         eps     : clamp before probit.
+        Y_query_raw, Y_calib_raw : optional raw labels for context-only
+                  scaling. Supply both when the inputs were pre-scaled using
+                  query-set moments.
 
     Returns dict with:
         z_train : (B, P_Q, d)
@@ -762,7 +818,12 @@ def run_pit_calib_split_batched(
     X_batch = (
         X_concat.unsqueeze(1).expand(B, d, P_C + P_Q, p_x).reshape(B * d, P_C + P_Q, p_x).contiguous()
     )
-    y_calib_batch = Y_calib.permute(0, 2, 1).reshape(B * d, P_C).contiguous()  # (B*d, P_C)
+    if (Y_query_raw is None) != (Y_calib_raw is None):
+        raise ValueError("Y_query_raw and Y_calib_raw must be supplied together")
+    calib_source = Y_calib if Y_calib_raw is None else Y_calib_raw
+    query_source = Y_query if Y_query_raw is None else Y_query_raw
+    y_calib_scaled, calib_mean, calib_std = _scale_fold_targets(calib_source.permute(0, 2, 1))
+    y_calib_batch = y_calib_scaled.reshape(B * d, P_C).contiguous()          # (B*d, P_C)
 
     logits = tabicl_forward(tabicl, X_batch, y_calib_batch)                  # (B*d, P_Q, Q)
     # See run_pit's offload-mode comment: TabICL's InferenceManager can return
@@ -771,7 +832,8 @@ def run_pit_calib_split_batched(
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(B * d * P_Q, Q))
 
-    y_query_flat = Y_query.permute(0, 2, 1).reshape(B * d * P_Q)
+    y_query = query_source.permute(0, 2, 1)
+    y_query_flat = ((y_query - calib_mean) / calib_std).reshape(B * d * P_Q)
     u_query = dist.cdf(y_query_flat).reshape(B, d, P_Q).permute(0, 2, 1)     # (B, P_Q, d)
     z_train = _probit(u_query, eps)
 

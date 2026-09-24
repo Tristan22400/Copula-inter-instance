@@ -250,7 +250,10 @@ def loo_pit(
     y_train_scaled, _, _, _ = normalize_targets(y_train_raw_t)
     y_t = y_train_scaled.unsqueeze(-1)  # (P, 1)
 
-    out = run_pit(tabicl, X_t, y_t, X_t[:1], y_t[:1], k_folds=k_folds, eps=eps)
+    out = run_pit(
+        tabicl, X_t, y_t, X_t[:1], y_t[:1], k_folds=k_folds, eps=eps,
+        Y_train_raw=y_train_raw_t.unsqueeze(-1),
+    )
     return out["z_train"].squeeze(-1).cpu().numpy()
 
 

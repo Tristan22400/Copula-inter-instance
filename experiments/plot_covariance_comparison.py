@@ -82,6 +82,7 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
             X_train_norm_t.to(tabicl_device), y_train_scaled.unsqueeze(-1),
             X_test_norm_t.to(tabicl_device), y_test_scaled.unsqueeze(-1),
             k_folds=min(10, len(X_train)),
+            Y_train_raw=y_train_t.to(tabicl_device).unsqueeze(-1),
         )
         Z_train = pit_out["z_train"].squeeze(-1).cpu().numpy()
         R_test = get_test_correlation(copula_model, X_train_norm, Z_train, X_test_norm)

@@ -1396,7 +1396,10 @@ def _tabicl_pit_batch(
         y_b_scaled, y_te_scaled, _, std = normalize_targets(y_train[b, :n], y_test[b, :n_te])
         Y_b = y_b_scaled.unsqueeze(-1)
         Y_te = y_te_scaled.unsqueeze(-1)
-        pit_out = run_pit(tabicl_marginal, X_b, Y_b, X_te, Y_te, k_folds=k_folds)
+        pit_out = run_pit(
+            tabicl_marginal, X_b, Y_b, X_te, Y_te, k_folds=k_folds,
+            Y_train_raw=y_train[b, :n].unsqueeze(-1),
+        )
         z_tabicl[b, :n] = pit_out["z_train"].squeeze(-1)
         z_test_tabicl[b, :n_te] = pit_out["z_test"].squeeze(-1)
         log_pdf_test_tabicl[b, :n_te] = pit_out["log_pdf_test"].squeeze(-1) - std.log()

@@ -181,7 +181,10 @@ def _pit_episode(
         }
     Y_train = y_train_scaled.unsqueeze(-1)
     Y_test = y_test_scaled.unsqueeze(-1)
-    pit_out = run_pit(tabicl_model, x_train, Y_train, x_test, Y_test, k_folds=k_folds)
+    pit_out = run_pit(
+        tabicl_model, x_train, Y_train, x_test, Y_test, k_folds=k_folds,
+        Y_train_raw=y_train.unsqueeze(-1),
+    )
     return {
         "z_train": pit_out["z_train"].squeeze(-1),
         "z_test": pit_out["z_test"].squeeze(-1),
@@ -232,7 +235,10 @@ def _pit_group(
         }
     Y_train = y_train_scaled.unsqueeze(-1)
     Y_test = y_test_scaled.unsqueeze(-1)
-    pit_out = run_pit_batched(tabicl_model, x_train, Y_train, x_test, Y_test, k_folds=k_folds)
+    pit_out = run_pit_batched(
+        tabicl_model, x_train, Y_train, x_test, Y_test, k_folds=k_folds,
+        Y_train_raw=y_train.unsqueeze(-1),
+    )
     return {
         "z_train": pit_out["z_train"].squeeze(-1),
         "z_test": pit_out["z_test"].squeeze(-1),

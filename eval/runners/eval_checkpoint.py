@@ -492,6 +492,7 @@ def _marginal_pit(
     Y_test  = y_test_scaled.unsqueeze(-1)       # (N, 1)
     pit_out = run_pit(
         tabicl_marginal, X_train, Y_train, X_test, Y_test, k_folds=k_folds,
+        Y_train_raw=y_train.unsqueeze(-1),
     )
     return {
         "z_train":      pit_out["z_train"].squeeze(-1),                    # (P,)

@@ -3867,6 +3867,8 @@ def _generate_gp_batch_raw(
         split_pit = run_pit_calib_split_batched(
             tabicl_model, x_norm_train, y_train_scaled,
             x_norm_calib, y_calib_scaled,
+            Y_query_raw=y_train.unsqueeze(-1),
+            Y_calib_raw=y_calib.unsqueeze(-1),
         )
         z_train = split_pit["z_train"].squeeze(-1)                    # (B, P)
     elif apply_tabicl:
@@ -3902,6 +3904,7 @@ def _generate_gp_batch_raw(
             tabicl_model, x_norm_train, y_train_scaled,
             x_norm_test, y_test_scaled,
             k_folds=tabicl_k_folds,
+            Y_train_raw=y_train.unsqueeze(-1),
         )
         z_train = tabicl_pit["z_train"].squeeze(-1)                   # (B, P)
         z_test = tabicl_pit["z_test"].squeeze(-1)                     # (B, N)

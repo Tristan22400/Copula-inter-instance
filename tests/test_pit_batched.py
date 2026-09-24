@@ -17,10 +17,8 @@ Tests verify:
      caused 2026-08-24) -- every other, purely-GP-episode field stays
      exactly the oracle/analytic values, and the override actually changes
      z_train/z_test's values (not a silently inert no-op).
-  4. run_pit_calib_split_batched is exactly run_pit_batched's test-side (part
-     A) computation with the context/query roles renamed -- calling it with
-     (query=X_test-role, calib=X_train-role) must reproduce run_pit_batched's
-     z_test bit-for-bit.
+  4. run_pit_calib_split_batched fits its target scale on calibration labels
+     alone, then matches run_pit_batched's test-side computation on that scale.
   5. Passing tabicl_split_calib_frac > 0 into _generate_gp_batch_raw (the
      "tabicl_split" path) overrides z_train only -- z_test/log_pdf_test stay
      the oracle values, unlike the plain "tabicl" path in (3) -- same
@@ -30,8 +28,7 @@ Tests verify:
      they share one private body precisely so they cannot drift, and this is
      what proves the sharing actually holds.
   7. return_quantiles=True is purely additive: it does not perturb z_train/
-     z_test/log_pdf_test, and the quantiles it returns are the same tensors
-     the returned CDF values were computed from.
+     z_test/log_pdf_test. Fold quantiles are returned on the caller's scale.
 """
 
 from __future__ import annotations
@@ -41,12 +38,14 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 from data_gen import _generate_gp_batch_raw
+from inference.copula_inference import loo_pit
 from pit import (
     _run_pit_batched_impl,
     run_pit,
     run_pit_batched,
     run_pit_batched_grad,
     run_pit_calib_split_batched,
+    normalize_targets,
 )
 
 
@@ -78,6 +77,97 @@ class RowIndependentFakeTabICL(nn.Module):
         loc = logits_flat[:, 0]
         scale = torch.nn.functional.softplus(logits_flat[:, 1]) + 1e-3
         return torch.distributions.Normal(loc, scale)
+
+
+class FoldScaleProbe(nn.Module):
+    """A marginal whose prediction is sensitive to the context label scale."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+
+    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        n_query = X.shape[1] - y.shape[1]
+        loc = y.pow(3).mean(dim=1, keepdim=True) + self.anchor
+        return loc[:, None, :].expand(-1, n_query, -1)
+
+    def quantile_dist(self, logits_flat: torch.Tensor):
+        return torch.distributions.Normal(logits_flat[:, 0], torch.ones_like(logits_flat[:, 0]))
+
+
+def test_fold_target_scaling_uses_only_context_labels():
+    model = FoldScaleProbe()
+    x = torch.arange(6, dtype=torch.float32)[:, None]
+    y = torch.tensor([1., 2., 3., 4., 5., 6.])
+    changed = y.clone()
+    changed[1] = 40.0  # same held-out fold as row 0; row 0's label is fixed
+
+    z = loo_pit(model, x.numpy(), y.numpy(), k_folds=3)
+    z_changed = loo_pit(model, x.numpy(), changed.numpy(), k_folds=3)
+    assert abs(z[0] - z_changed[0]) < 1e-5
+
+    # The B=1 path uses the same fold-local scale, even though its input was
+    # pre-scaled using all P labels for the full-context test-side forward.
+    for labels, expected in ((y, z), (changed, z_changed)):
+        scaled, _, _, _ = normalize_targets(labels)
+        out = run_pit_batched(
+            model, x[None], scaled[None, :, None], x[:1][None],
+            scaled[:1][None, :, None], k_folds=3,
+            Y_train_raw=labels[None, :, None],
+        )
+        assert torch.allclose(out["z_train"][0, :, 0], torch.tensor(expected), atol=1e-5)
+
+
+def test_fold_quantiles_return_on_callers_scale():
+    model = FoldScaleProbe()
+    x = torch.arange(6, dtype=torch.float32)[:, None]
+    y = torch.tensor([1., 2., 3., 4., 5., 6.])
+    scaled, _, _, _ = normalize_targets(y)
+    out = run_pit_batched(
+        model, x[None], scaled[None, :, None], x[:1][None],
+        scaled[:1][None, :, None], k_folds=3, return_quantiles=True,
+        Y_train_raw=y[None, :, None],
+    )
+    context = y[2:]
+    fold_mean, fold_std = context.mean(), context.std()
+    local = (context - fold_mean) / fold_std
+    expected_raw = local.pow(3).mean() * fold_std + fold_mean
+    expected = (expected_raw - y.mean()) / y.std()
+    assert torch.allclose(out["q_train"][0, :2, 0, 0], expected.expand(2), atol=1e-6)
+
+
+def test_single_context_fold_uses_raw_label_units():
+    model = FoldScaleProbe()
+    x = torch.tensor([[0.], [1.]])
+    y = torch.tensor([1., 2.])
+    scaled, _, _, _ = normalize_targets(y)
+    out = run_pit(
+        model, x, scaled[:, None], x[:1], scaled[:1, None],
+        k_folds=2, Y_train_raw=y[:, None],
+    )
+    # With one context label, its fold scale is one raw target unit. The
+    # held-out row 0 is therefore one unit below its context label.
+    assert torch.allclose(out["z_train"][0, 0], torch.tensor(-1.), atol=1e-5)
+
+
+def test_fused_grad_folds_preserve_raw_fold_scaling():
+    model = FoldScaleProbe()
+    x = torch.arange(16, dtype=torch.float32).reshape(2, 8, 1)
+    raw = torch.tensor([[1., 2., 3., 4., 5., 6., 7., 8.],
+                        [4., 1., 6., 2., 9., 3., 8., 5.]])
+    mean = raw.mean(dim=1, keepdim=True)
+    std = raw.std(dim=1, keepdim=True)
+    scaled = (raw - mean) / std
+    args = (model, x, scaled[:, :, None], x[:, :1], scaled[:, :1, None])
+    plain = run_pit_batched_grad(
+        *args, k_folds=4, compute_pit=False, Y_train_raw=raw[:, :, None],
+    )
+    fused = run_pit_batched_grad(
+        *args, k_folds=4, compute_pit=False, fuse_folds=True,
+        Y_train_raw=raw[:, :, None],
+    )
+    assert torch.allclose(plain["q_train"], fused["q_train"], atol=1e-6)
+    assert torch.allclose(plain["q_test"], fused["q_test"], atol=0)
 
 
 def test_run_pit_batched_b1_matches_run_pit():
@@ -127,17 +217,44 @@ def test_run_pit_calib_split_batched_matches_run_pit_batched_test_side():
     X_query = torch.randn(B, P_Q, p_x)
     Y_query = torch.randn(B, P_Q, d)
 
-    # run_pit_batched's part A (test-side PIT) already scores its X_test
-    # against the full X_train context in one forward pass -- with the
-    # context/query roles renamed (X_train -> X_calib, X_test -> X_query),
-    # that is exactly what run_pit_calib_split_batched computes. k_folds is
-    # irrelevant here (only used for run_pit_batched's train-side, K-fold
-    # PIT), so any valid value works.
-    reference = run_pit_batched(tabicl, X_calib, Y_calib, X_query, Y_query, k_folds=3)
+    mean = Y_calib.mean(dim=1, keepdim=True)
+    std = Y_calib.std(dim=1, keepdim=True).clamp(min=1e-8)
+    reference = run_pit_batched(
+        tabicl, X_calib, (Y_calib - mean) / std,
+        X_query, (Y_query - mean) / std, k_folds=3,
+    )
     split = run_pit_calib_split_batched(tabicl, X_query, Y_query, X_calib, Y_calib)
 
     assert split["z_train"].shape == (B, P_Q, d)
     assert torch.allclose(split["z_train"], reference["z_test"], atol=1e-6)
+
+
+def test_calibration_split_query_labels_do_not_scale_context():
+    model = FoldScaleProbe()
+    x_calib = torch.arange(3, dtype=torch.float32)[None, :, None]
+    y_calib = torch.tensor([3., 4., 8.])[None, :, None]
+    x_query = torch.arange(3, 5, dtype=torch.float32)[None, :, None]
+    y_query = torch.tensor([2., 5.])[None, :, None]
+    changed = y_query.clone()
+    changed[0, 1, 0] = 100.
+    out = run_pit_calib_split_batched(model, x_query, y_query, x_calib, y_calib)
+    alt = run_pit_calib_split_batched(model, x_query, changed, x_calib, y_calib)
+    assert torch.allclose(out["z_train"][0, 0], alt["z_train"][0, 0], atol=0)
+
+    # data_gen pre-scales both groups using the query pool's moments. Passing
+    # the raw labels must remove that dependency, including for a singleton
+    # calibration context whose standard deviation is undefined.
+    one_calib = y_calib[:, :1]
+    for query in (y_query, changed):
+        mean = query.mean(dim=1, keepdim=True)
+        std = query.std(dim=1, keepdim=True)
+        scaled_out = run_pit_calib_split_batched(
+            model, x_query, (query - mean) / std, x_calib[:, :1],
+            (one_calib - mean) / std,
+            Y_query_raw=query, Y_calib_raw=one_calib,
+        )
+        assert torch.allclose(scaled_out["z_train"][0, 0],
+                              torch.tensor(-1.), atol=1e-5)
 
 
 def test_run_pit_calib_split_batched_finite():

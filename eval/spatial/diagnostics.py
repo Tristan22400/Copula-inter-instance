@@ -324,6 +324,7 @@ def compute_context_z_train(
     Y_train_t = context_values_scaled_t.unsqueeze(-1)  # (P, 1)
     pit_out = run_pit(
         tabicl_marginal, X_train_t, Y_train_t, X_train_t[:1], Y_train_t[:1], k_folds=k_folds,
+        Y_train_raw=context_values_t.unsqueeze(-1),
     )
     return pit_out["z_train"].squeeze(-1).cpu().numpy()  # (P,)
 

@@ -120,6 +120,7 @@ def _episode_metrics(
     out = run_pit_batched(
         tabicl, x_tr, y_tr_s.unsqueeze(-1), x_te, y_te_s.unsqueeze(-1),
         k_folds=k_folds, eps=eps, return_quantiles=True,
+        Y_train_raw=y_tr.unsqueeze(-1),
     )
     q_test = out["q_test"].squeeze(2)                          # (B, N, Q)
     u_test = out["u_test"].squeeze(2)                          # (B, N)

@@ -849,6 +849,7 @@ def phase_a_batch_loss(
             fold_subset=fold_subset,
             compute_pit=False,
             fuse_folds=True,
+            Y_train_raw=batch["y_train_raw"].unsqueeze(-1),
         )
         quantile_dist = module.quantile_dist
         q_test = out["q_test"].squeeze(2)                             # (B, N, Q)
@@ -1062,6 +1063,7 @@ def validate_era5_marginal(
                 b["x_test"], y_te_s.unsqueeze(-1),
                 k_folds=2, eps=eps, return_quantiles=True, fold_subset=[],
                 compute_pit=False,
+                Y_train_raw=b["y_train"].unsqueeze(-1),
             )
             q = out["q_test"].squeeze(2)                                  # (days, N, Q)
             quantile_dist = module.quantile_dist
