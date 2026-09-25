@@ -58,6 +58,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from correlation_factory import LowRankCorrelationFactor
+
 # ---------------------------------------------------------------------------
 # Numerically stable Cholesky
 # ---------------------------------------------------------------------------
@@ -673,13 +675,14 @@ def y_space_nll(
         Copula_NLL = 0.5 * log|Σ| + 0.5 * z^T (Σ^{-1} − I) z
         Marginal_NLL = − Σ_i log p̂(y_i | x_i, ctx)
 
-    The Σ here is the full N×N correlation matrix from
-    ``low_rank_correlation``, evaluated via dense Cholesky.  N ≤ 100 so
-    O(N³) is fine (no Woodbury needed — the low-rank structure already
-    collapsed into Σ).
+    ``Sigma`` is either the dense N×N correlation matrix from
+    ``low_rank_correlation`` (dense Cholesky, O(N³)), or the same Σ in
+    factored form Σ = U U^T + diag(D) from ``low_rank_correlation_factor``
+    (Matrix Determinant Lemma + Woodbury, O(N r²) -- see
+    ``_y_space_nll_lowrank``). Both return the same numbers.
 
     Args:
-        Sigma         : (B, N_max, N_max)
+        Sigma         : (B, N_max, N_max) or LowRankCorrelationFactor
         z_test        : (B, N_max)        (0 on padding)
         log_pdf_test  : (B, N_max)        TabICL marginal log-densities at Y_test
         test_mask     : (B, N_max) bool
@@ -689,6 +692,9 @@ def y_space_nll(
         copula     : copula NLL term
         marginal   : marginal NLL term
     """
+    if isinstance(Sigma, LowRankCorrelationFactor):
+        return _y_space_nll_lowrank(Sigma, z_test, log_pdf_test, test_mask)
+
     B, N_max, _ = Sigma.shape
     n_test = test_mask.sum(-1).float()  # (B,)
 
@@ -715,6 +721,70 @@ def y_space_nll(
     valid = n_test > 0
     if not valid.any():
         zero = Sigma.sum() * 0.0
+        return {"total": zero, "copula": zero, "marginal": zero}
+
+    copula_mean = copula[valid].mean()
+    marginal_mean = marginal[valid].mean()
+    return {
+        "total": copula_mean + marginal_mean,
+        "copula": copula_mean,
+        "marginal": marginal_mean,
+    }
+
+
+def _y_space_nll_lowrank(
+    factor: LowRankCorrelationFactor,
+    z_test: torch.Tensor,
+    log_pdf_test: torch.Tensor,
+    test_mask: torch.Tensor,
+) -> dict:
+    """``y_space_nll`` for Σ = U U^T + diag(D) without ever forming Σ.
+
+    With Ũ = D^{-1/2} U, z̃ = D^{-1/2} z and the r×r capacitance
+    M = I_r + Ũ^T Ũ = L L^T:
+
+        log|Σ|        = Σ_i log D_i + log|M|           (Matrix Determinant Lemma)
+        z^T Σ^{-1} z  = ||z̃||² − ||L^{-1} Ũ^T z̃||²    (Woodbury identity)
+
+    O(N r² + r³) per episode instead of O(N³). Padded rows get U=0, D=1,
+    z=0, so they contribute log 1 = 0 and nothing to the quadratic form.
+
+    Runs in float64: D can be as small as ~jitter, so both Woodbury terms
+    are O(||z||²/jitter) and their difference is O(N) -- fp32 (let alone
+    the TF32 matmuls train.py enables) cannot resolve that cancellation.
+    The dense path has no such cancellation. The float64 work is only the
+    O(N r²) capacitance products, a small cost next to the forward pass.
+    """
+    out_dtype = factor.U.dtype
+    mask = test_mask.bool()
+    n_test = mask.sum(-1).to(out_dtype)  # (B,)
+
+    U = factor.U.double() * mask.unsqueeze(-1)            # (B, N, r)
+    D = torch.where(mask, factor.D.double(), torch.ones_like(factor.D, dtype=torch.float64))
+    z = z_test.double() * mask
+
+    d_isqrt = D.rsqrt()
+    U_t = U * d_isqrt.unsqueeze(-1)                       # Ũ = D^{-1/2} U
+    z_t = z * d_isqrt                                     # z̃ = D^{-1/2} z
+
+    r = U.shape[-1]
+    eye_r = torch.eye(r, dtype=torch.float64, device=U.device)
+    M = eye_r + U_t.transpose(-1, -2) @ U_t               # (B, r, r)
+    L_M = _safe_cholesky(M)
+
+    log_det = D.log().sum(-1) + 2.0 * L_M.diagonal(dim1=-2, dim2=-1).clamp_min(1e-300).log().sum(-1)
+    w = torch.linalg.solve_triangular(
+        L_M, (U_t.transpose(-1, -2) @ z_t.unsqueeze(-1)), upper=False
+    ).squeeze(-1)                                         # L^{-1} Ũ^T z̃, (B, r)
+    quad = (z_t * z_t).sum(-1) - (w * w).sum(-1)          # z^T Σ^{-1} z
+
+    n_safe = n_test.clamp(min=1)
+    copula = (0.5 * (log_det + quad - (z * z).sum(-1))).to(out_dtype) / n_safe
+    marginal = -log_pdf_test.sum(-1) / n_safe
+
+    valid = n_test > 0
+    if not valid.any():
+        zero = factor.U.sum() * 0.0
         return {"total": zero, "copula": zero, "marginal": zero}
 
     copula_mean = copula[valid].mean()

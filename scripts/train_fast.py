@@ -389,7 +389,7 @@ def main(cfg: DictConfig) -> None:
         step_ms = (time.perf_counter() - step_t0) * 1000.0
 
         if step % DEBUG_LOG_EVERY == 0:
-            stats = _sigma_stats(Sigma.detach(), batch["test_mask"])
+            stats = _sigma_stats(Sigma.dense().detach(), batch["test_mask"])
             gn = float(grad_norm) if grad_norm is not None else float("nan")
             lr_now = optimizer.param_groups[0]["lr"]
             print(

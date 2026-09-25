@@ -58,6 +58,7 @@ if _REPO_ROOT not in sys.path:
 
 import copula_backbones
 from correlation_factory import (
+    LowRankCorrelationFactor,
     cossim_correlation,
     sparse_covnorm_correlation,
     tanhnorm_correlation,
@@ -148,6 +149,52 @@ def low_rank_correlation(
         raise ValueError(f"unknown correlation parametrization: {parametrization!r}")
 
     return _renormalize_to_unit_diagonal(factor.dense() + jitter * eye)
+
+
+def low_rank_correlation_factor(
+    W: Tensor,
+    s: Optional[Tensor] = None,
+    jitter: float = 1e-4,
+    parametrization: str = "covnorm",
+    lam: Optional[Tensor] = None,
+) -> LowRankCorrelationFactor:
+    """The SAME Σ as ``low_rank_correlation``, kept in factored form.
+
+    Every parametrization's Σ is low-rank plus diagonal, and so is its
+    jittered, renormalized version: with R = U U^T + diag(D),
+
+        Σ = Γ^{-1/2} (U U^T + diag(D + jitter)) Γ^{-1/2},   Γ = ||U_i||² + D_i + jitter
+          = U' U'^T + diag(D'),   U' = Γ^{-1/2} U,   D' = (D + jitter) / Γ
+
+    so the NLL can use the Matrix Determinant Lemma + Woodbury on (U', D')
+    (O(N r²)) instead of a dense N×N Cholesky (O(N³)). ``.dense()`` of the
+    result equals ``low_rank_correlation(...)`` up to float rounding
+    (tests/test_lowrank_nll.py pins that).
+    """
+    if parametrization == "covnorm":
+        # Mirrors low_rank_correlation's covnorm branch exactly (softplus(s)
+        # with no +eps, diag clamped at 1e-12) -- NOT correlation_factory's
+        # covnorm_correlation, which differs by an eps on the diagonal.
+        D_raw = F.softplus(s)
+        c = ((W * W).sum(-1) + D_raw).clamp_min(1e-12)
+        U = W * c.rsqrt().unsqueeze(-1)
+        D = D_raw / c
+    else:
+        if parametrization == "cossim":
+            factor = cossim_correlation(W, s)
+        elif parametrization == "tanhnorm":
+            factor = tanhnorm_correlation(W)
+        elif parametrization == "sparse_covnorm":
+            if lam is None:
+                raise ValueError("parametrization='sparse_covnorm' requires `lam`")
+            factor = sparse_covnorm_correlation(W, s, lam)
+        else:
+            raise ValueError(f"unknown correlation parametrization: {parametrization!r}")
+        U, D = factor.U, factor.D
+
+    D = D + jitter
+    gamma = ((U * U).sum(-1) + D).clamp_min(1e-12)
+    return LowRankCorrelationFactor(U=U * gamma.rsqrt().unsqueeze(-1), D=D / gamma)
 
 
 def build_sigma(

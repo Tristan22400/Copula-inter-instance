@@ -98,7 +98,7 @@ from live_dataset import (
     resolve_live_tabicl_num_workers,
 )
 from loss import _safe_cholesky, y_space_nll
-from model import build_copula_transformer, build_sigma, low_rank_correlation
+from model import build_copula_transformer, build_sigma, low_rank_correlation_factor
 from muon import Muon
 from pit import (
     DEFAULT_K_FOLDS,
@@ -2384,10 +2384,13 @@ def _forward_and_loss(
     ev_loss0 = phase_start()
     s = out.get("s")
     lam = out.get("lam")
-    Sigma = low_rank_correlation(
+    # Σ kept factored (U U^T + diag(D)) so the NLL is O(N r²) via the Matrix
+    # Determinant Lemma + Woodbury instead of an O(N³) dense Cholesky. The
+    # returned `Sigma` is the factor; callers that need the dense matrix
+    # (logging stats) call .dense() on it.
+    Sigma = low_rank_correlation_factor(
         out["W"].float(),
         s.float() if s is not None else None,
-        batch["test_mask"],
         jitter=jitter,
         parametrization=parametrization,
         lam=lam.float() if lam is not None else None,
@@ -2401,18 +2404,19 @@ def _forward_and_loss(
     loss = nll_weight * parts["total"]
 
     # Auxiliary MAE (L1) on off-diagonal correlations vs oracle R_star.
-    aux_mae = Sigma.new_tensor(0.0)
+    aux_mae = parts["total"].new_tensor(0.0)
     if aux_mae_weight > 0.0:
-        n_test = Sigma.shape[1]
+        Sigma_dense = Sigma.dense()
+        n_test = Sigma_dense.shape[1]
         mask_2d = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
         if n_test not in triu_cache:
             triu_cache[n_test] = torch.triu_indices(
-                n_test, n_test, offset=1, device=Sigma.device
+                n_test, n_test, offset=1, device=Sigma_dense.device
             )
         ri, ci = triu_cache[n_test]
         valid_off = mask_2d[:, ri, ci]
         if valid_off.any():
-            pred_off = Sigma[:, ri, ci][valid_off]
+            pred_off = Sigma_dense[:, ri, ci][valid_off]
             oracle_off = batch["R_star"].float()[:, ri, ci][valid_off]
             aux_mae = (pred_off - oracle_off).abs().mean()
         loss = loss + aux_mae_weight * aux_mae
@@ -3426,6 +3430,7 @@ def main(cfg: DictConfig) -> None:
             aux_mae_val = aux_mae.item()
             with torch.no_grad():
                 w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
+                Sigma = Sigma.dense()
                 sig_stats = _sigma_stats(Sigma, batch["test_mask"])
                 # Diagnostic for the non-finite-slice masking in _safe_cholesky
                 # (loss.py), which silently substitutes identity for any

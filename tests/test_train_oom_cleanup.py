@@ -40,7 +40,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
     }
     graph_ref = {}
 
-    def fake_correlation(W, _s, _mask, jitter, **_kwargs):
+    def fake_correlation(W, _s, jitter, **_kwargs):
         graph_ref["tensor"] = weakref.ref(W)
         return W[..., :1] @ W[..., :1].transpose(-1, -2)
 
@@ -48,7 +48,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
         total = Sigma.square().mean()
         return {"total": total, "copula": total, "marginal": total}
 
-    monkeypatch.setattr(train, "low_rank_correlation", fake_correlation)
+    monkeypatch.setattr(train, "low_rank_correlation_factor", fake_correlation)
     monkeypatch.setattr(train, "y_space_nll", fake_nll)
 
     def fail_step(*_args, **_kwargs):
