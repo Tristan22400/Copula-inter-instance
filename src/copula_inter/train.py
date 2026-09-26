@@ -62,7 +62,6 @@ from torch.utils.data import DataLoader, Subset
 from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dict, config_dir
-from copula_inter.data_gen import _COMPOSABLE_KERNELS
 from copula_inter.dataset import (
     CopulaDataset,
     ShardBlockSampler,
@@ -70,6 +69,7 @@ from copula_inter.dataset import (
     collate_fn,
 )
 from copula_inter.era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
+from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
 from copula_inter.live_dataset import (
     _GENERIC_MARGINAL_BACKENDS,
     _LIVE_TABICL_FLAT_HEADROOM_GB,

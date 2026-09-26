@@ -63,8 +63,9 @@ from copula_inter.artifacts import artifact_identity, atomic_json_save  # noqa: 
 from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES, GENERIC_MARGINAL_BACKENDS  # noqa: E402
 from copula_inter.config_path import config_dict  # noqa: E402
 from copula_inter.config_path import config_dir as project_config_dir  # noqa: E402
-from copula_inter.data_gen import _parse_composite, generate_gp_batch  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch  # noqa: E402
 from copula_inter.dataset import CopulaDataset  # noqa: E402
+from copula_inter.gp_kernels import _parse_composite  # noqa: E402
 from copula_inter.loss import y_space_nll  # noqa: E402
 from copula_inter.model import low_rank_correlation  # noqa: E402
 from copula_inter.pit import (  # noqa: E402

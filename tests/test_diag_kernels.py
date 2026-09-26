@@ -7,8 +7,9 @@ import random
 import pytest
 import torch
 
-from copula_inter.data_gen import ALL_KERNELS, generate_gp_task
+from copula_inter.data_gen import generate_gp_task
 from copula_inter.diag_kernels import Cfg, batch_off_diagonal_stats, check_task
+from copula_inter.gp_kernels import ALL_KERNELS
 
 # Per-task checks: finite, unit diagonal, range, symmetry, PSD, non-trivial.
 

@@ -14,16 +14,11 @@ import torch
 from omegaconf import OmegaConf
 from scipy.stats import qmc
 
-from copula_inter.data_gen import (  # noqa: E402
-    _build_kernel_chain,
-    _build_likelihood,
-    _kernel_needs_scalar_input,
-    _safe_cholesky,
-    _sample_kernel_chain_structure,
-    _seed_everything,
-    gp_posterior,
-    sigma_to_correlation,
-)
+from copula_inter.data_gen import gp_posterior, sigma_to_correlation  # noqa: E402
+from copula_inter.gp_kernels import _build_likelihood, _kernel_needs_scalar_input  # noqa: E402
+from copula_inter.kernel_sampling import _build_kernel_chain, _sample_kernel_chain_structure  # noqa: E402
+from copula_inter.loss import _safe_cholesky  # noqa: E402
+from copula_inter.rng import seed_everything
 
 if TYPE_CHECKING:
     from copula_inter.type_aliases import HasDataConfig
@@ -97,7 +92,7 @@ def load_split(
     rng_np = np.random.default_rng(seed)
     torch_seed = int(rng_np.integers(0, 2**31 - 1))
     rng_torch = torch.Generator().manual_seed(torch_seed)
-    _seed_everything(int(rng_np.integers(0, 2**31 - 1)))
+    seed_everything(int(rng_np.integers(0, 2**31 - 1)))
 
     kernel_fn, noise_var = _sample_episode_kernel_fn(cfg, d, rng_np)
 

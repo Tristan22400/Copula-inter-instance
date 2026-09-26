@@ -13,10 +13,11 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from copula_inter.classical_kernels import DEFAULT_FAMILIES
-from copula_inter.data_gen import KERNEL_REGISTRY, generate_gp_batch
+from copula_inter.data_gen import generate_gp_batch
 from copula_inter.dataset import (
     collate_fn,
 )
+from copula_inter.gp_kernels import KERNEL_REGISTRY
 from copula_inter.pit import (
     TabICLLike,
     gp_analytical_pit,

@@ -19,8 +19,9 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
-from copula_inter.data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
+from copula_inter.data_gen import generate_gp_batch
 from copula_inter.dataset import collate_fn
+from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
 from copula_inter.pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
 
 # Thread count for generation in the main process (validation batches, gap

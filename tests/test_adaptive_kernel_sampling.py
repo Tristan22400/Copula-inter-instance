@@ -10,7 +10,8 @@ import torch
 from omegaconf import OmegaConf
 
 from copula_inter import adaptive_sampling as train
-from copula_inter.data_gen import _COMPOSABLE_KERNELS, _sample_kernel_chain_structure, _weights_for_pool
+from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
+from copula_inter.kernel_sampling import _sample_kernel_chain_structure, _weights_for_pool
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig

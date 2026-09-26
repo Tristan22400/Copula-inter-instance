@@ -70,7 +70,7 @@ def main() -> None:
     print(f"🧪 Starting Validation Pipeline for Kernel: {kernel}\n")
 
     # Step 1: Mathematical Stability & Goldilocks Bound (Pytest)
-    # test_kernel_goldilocks_and_psd is parametrized over data_gen.ALL_KERNELS
+    # test_kernel_goldilocks_and_psd is parametrized over gp_kernels.ALL_KERNELS
     # (tests/test_data.py), so the node id carries the kernel name in brackets
     # rather than in the function name.
     test_name = f"tests/test_data.py::test_kernel_goldilocks_and_psd[{kernel}]"

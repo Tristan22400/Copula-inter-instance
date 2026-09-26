@@ -306,7 +306,7 @@ def sample_simple_kernel_covariance(
     import torch
     from omegaconf import OmegaConf
 
-    from copula_inter.data_gen import _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS, _build_kernel_component
+    from copula_inter.gp_kernels import _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS, _build_kernel_component
 
     if seed is not None:
         _random.seed(seed)

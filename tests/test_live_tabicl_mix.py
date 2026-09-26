@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING
 import torch
 from omegaconf import OmegaConf
 
-from copula_inter.data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw, _tabicl_mix_prob_for_kernel
+from copula_inter.data_gen import _generate_gp_batch_raw
+from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
+from copula_inter.kernel_sampling import _tabicl_mix_prob_for_kernel
 from tests.test_pit_batched import RowIndependentFakeTabICL
 
 if TYPE_CHECKING:

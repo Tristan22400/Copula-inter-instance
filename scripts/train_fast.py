@@ -46,8 +46,9 @@ from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.checkpointing import load_checkpoint, save_checkpoint
 from copula_inter.config_path import merge_configs
-from copula_inter.data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
+from copula_inter.data_gen import generate_gp_batch
 from copula_inter.dataset import collate_fn
+from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
 from copula_inter.model import build_copula_transformer
 from copula_inter.muon import Muon
 from copula_inter.pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt

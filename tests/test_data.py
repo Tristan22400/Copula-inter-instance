@@ -14,26 +14,25 @@ from omegaconf import DictConfig, OmegaConf
 from pytest import MonkeyPatch
 
 from copula_inter.data_gen import (
-    _CATEGORY_OPS,
-    _DEFAULT_CATEGORY_WEIGHTS,
-    _STRUCTURAL_CATEGORIES,
-    ALL_KERNELS,
     _generate_gp_batch_raw,
-    _kernel_needs_scalar_input,
-    _sample_mean_module,
-    _sample_structural_category_mask,
-    _sample_structural_ops,
-    _structural_warp_column,
-    apply_kernel_hidden_warp,
-    apply_mlp_feature_mixing,
-    apply_structural_feature_warp,
     generate_gp_batch,
     generate_gp_task,
     gp_posterior,
     sigma_to_correlation,
-    tabiclv2_warp_features,
 )
 from copula_inter.dataset import CopulaDataset, _add_derived_fields, collate_fn
+from copula_inter.feature_transforms import apply_kernel_hidden_warp, apply_mlp_feature_mixing, tabiclv2_warp_features
+from copula_inter.gp_kernels import ALL_KERNELS, _kernel_needs_scalar_input
+from copula_inter.kernel_sampling import _sample_mean_module
+from copula_inter.structural_warps import (
+    _CATEGORY_OPS,
+    _DEFAULT_CATEGORY_WEIGHTS,
+    _STRUCTURAL_CATEGORIES,
+    _sample_structural_category_mask,
+    _sample_structural_ops,
+    _structural_warp_column,
+    apply_structural_feature_warp,
+)
 
 
 def test_tabiclv2_warp_features_preserves_shape_and_finite() -> None:
@@ -1702,7 +1701,7 @@ def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg: DictConfig) ->
 
 def test_gp_posterior_helper() -> None:
     """gp_posterior should return correct shapes and PSD Sigma_star."""
-    from copula_inter.data_gen import build_kernel_fn
+    from copula_inter.gp_kernels import build_kernel_fn
 
     P, N, d = 20, 8, 1
     x_train = torch.randn(P, d)

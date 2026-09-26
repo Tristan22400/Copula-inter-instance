@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import math
 import os
-import random
 import time
 import zlib
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, cast
@@ -52,6 +51,7 @@ from copula_inter.pit import (
     normalize_targets,
     run_pit_batched_grad,
 )
+from copula_inter.rng import seed_everything
 from copula_inter.training_core import cosine_lr_lambda  # noqa: E402
 
 if TYPE_CHECKING:
@@ -882,13 +882,6 @@ def _resolve_device(spec: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 class ERA5EpisodeSampler:
     """Batches of real-ERA5 episodes with one shared P and N (sample_episode_fixed_shape); region, day and box vary."""
 
@@ -985,7 +978,7 @@ def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
 def main(cfg: DictConfig) -> None:
     device = _resolve_device(str(cfg.training.device))
     torch.set_float32_matmul_precision(str(cfg.training.matmul_precision))
-    _seed_everything(int(cfg.seed))
+    seed_everything(int(cfg.seed))
     print(OmegaConf.to_yaml(cfg))
 
     # ---- model + tier routing -------------------------------------------

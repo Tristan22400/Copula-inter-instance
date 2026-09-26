@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from copula_inter.data_gen import _parse_composite  # noqa: E402
+from copula_inter.gp_kernels import _parse_composite  # noqa: E402
 from eval.results import (
     NAN_PARTS as _NAN_PARTS,
 )

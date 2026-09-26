@@ -17,11 +17,11 @@ from copula_inter.finetune_marginal import (
     MarginalLossWeights,
     _generate_phase_a_gp_batch,
     _gp_cfg,
-    _seed_everything,
     apply_tier,
     phase_a_batch_loss,
 )
 from copula_inter.pit import load_tabicl
+from copula_inter.rng import seed_everything
 
 
 def _sync() -> None:
@@ -44,7 +44,7 @@ def main() -> None:
         raise RuntimeError("This benchmark requires CUDA")
     device = "cuda"
     torch.set_float32_matmul_precision(args.matmul_precision)
-    _seed_everything(42)
+    seed_everything(42)
     with initialize_config_dir(config_dir=os.path.join(ROOT, "conf"), version_base=None):
         cfg = compose(
             config_name="finetune_marginal",

@@ -510,7 +510,7 @@ def fit_zero_mean_gp_on_marginal(
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
     """RBF prior correlation at the test points with a median bandwidth."""
-    from copula_inter.data_gen import _sq_dist  # noqa: E402
+    from copula_inter.gp_kernels import _sq_dist  # noqa: E402
 
     sq = _sq_dist(X_test, X_test)
     h2 = torch.pdist(X_test).pow(2).median().clamp(min=1e-6)

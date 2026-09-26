@@ -13,7 +13,7 @@ import pytest
 import torch
 from pytest import MonkeyPatch
 
-from copula_inter.data_gen import build_kernel_fn, gp_posterior
+from copula_inter.data_gen import gp_posterior
 from copula_inter.finetune_marginal import (
     TIER0_PATTERNS,
     AnchorPenalty,
@@ -29,6 +29,7 @@ from copula_inter.finetune_marginal import (
     quantile_level_weights,
     rank_histogram,
 )
+from copula_inter.gp_kernels import build_kernel_fn
 from copula_inter.lora import merged_base_state_dict
 from copula_inter.pit import _probit, run_pit_batched, run_pit_batched_grad
 

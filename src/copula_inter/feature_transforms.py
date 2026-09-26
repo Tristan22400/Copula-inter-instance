@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List, Literal, overload
+from typing import List, Literal, Optional, overload
 
 import torch
 from torch import Tensor
 
+from copula_inter.rng import seed_everything
 from copula_inter.type_aliases import Device, HasDataConfig
 
 # Activations for MLP feature mixing.
@@ -165,3 +166,69 @@ def apply_kernel_hidden_warp(
     if return_gate:
         return x_kernel, gate_1d
     return x_kernel
+
+
+def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
+    """Warp each feature column with one of 11 random marginal transforms (TabICLv2-style).
+
+    Transforms include heavy tails, power laws, ordinal steps, bimodal mixtures,
+    periodicity, Cauchy outliers, zero inflation, bounded ranges and left skew.
+
+    Args:
+        x: (B, T, d) or (T, d) standard-normal features.
+        seed: if given, reseed all RNGs first.
+
+    Returns:
+        Tensor shaped like x, each (episode, column) warped independently.
+    """
+    if seed is not None:
+        seed_everything(seed)
+
+    added_batch_dim = x.dim() == 2
+    if added_batch_dim:
+        x = x.unsqueeze(0)
+
+    B, T, d = x.shape
+    warped_x = x.clone()
+    choices = torch.randint(0, 11, (B, d), device=x.device)
+
+    for b in range(B):
+        for col in range(d):
+            c = choices[b, col].item()
+            col_data = warped_x[b, :, col]
+
+            if c == 0:  # Identity — Standard Normal baseline
+                continue
+            elif c == 1:  # Signed-square — mild heavy tails
+                warped_x[b, :, col] = torch.sign(col_data) * (col_data**2)
+            elif c == 2:  # Cube — Student-T-like heavy tails
+                warped_x[b, :, col] = col_data**3
+            elif c == 3:  # Log-normal / exponential — right-skewed power law
+                # Clamp before exp() to avoid float overflow.
+                warped_x[b, :, col] = torch.exp(col_data.clamp(min=-5.0, max=4.0))
+            elif c == 4:  # Quantization — ordinal / discrete steps
+                warped_x[b, :, col] = torch.round(col_data * 2.0) / 2.0
+            elif c == 5:  # Bimodal mixture — mixed populations
+                mask = torch.rand_like(col_data) > 0.5
+                shift = torch.randn(1, device=x.device).item() * 4.0
+                col_data[mask] += shift
+            elif c == 6:  # Cyclic — seasonal / periodic features
+                freq = torch.rand(1, device=x.device).item() * 3.0 + 0.5
+                warped_x[b, :, col] = torch.sin(col_data * freq)
+            elif c == 7:  # Cauchy — extreme heavy tails, undefined variance
+                u = torch.erf(col_data / math.sqrt(2.0))
+                # Scale by 0.95 to keep tan() away from its asymptotes.
+                warped_x[b, :, col] = torch.tan(u * (math.pi / 2.0 * 0.95))
+            elif c == 8:  # Zero-inflation — point mass at 0 mixed with a continuous tail
+                spike_frac = float(torch.empty(1).uniform_(0.2, 0.6))
+                mask = torch.rand_like(col_data) < spike_frac
+                warped_x[b, :, col] = torch.where(mask, torch.zeros_like(col_data), col_data)
+            elif c == 9:  # Bounded / sigmoid squash — proportions, percentages, probabilities
+                scale = float(torch.empty(1).uniform_(0.5, 3.0))
+                warped_x[b, :, col] = torch.sigmoid(col_data * scale)
+            elif c == 10:  # Left-skew — mirror of the log-normal/exponential (c == 3) above
+                warped_x[b, :, col] = -torch.exp((-col_data).clamp(min=-5.0, max=4.0))
+
+    if added_batch_dim:
+        warped_x = warped_x.squeeze(0)
+    return warped_x

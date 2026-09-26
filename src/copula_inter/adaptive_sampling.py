@@ -14,7 +14,8 @@ matplotlib.use("Agg")
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from copula_inter.data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw
+from copula_inter.data_gen import _generate_gp_batch_raw
+from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
 from copula_inter.live_dataset import (
     limited_main_process_threads,
 )
