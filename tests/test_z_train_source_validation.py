@@ -19,7 +19,7 @@ from copula_inter.live_dataset import (
     build_fixed_live_val_batches,
     build_live_train_loader,
 )
-from copula_inter.train import _reserve_gpu_headroom_for_live_tabicl
+from copula_inter.train_setup import _reserve_gpu_headroom_for_live_tabicl
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
