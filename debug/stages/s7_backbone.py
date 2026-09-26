@@ -260,7 +260,7 @@ def _plot_summary(results: list, backends: list, out_path: str) -> None:
         ("nll_total", "total NLL (marginal+copula, nats/pt)"),
     ]
     fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4.5))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(backends)))
+    colors = plt.get_cmap("tab10")(np.linspace(0, 1, len(backends)))
     for ax, (key, title) in zip(axes, metrics):
         means = [np.nanmean([r[b][key] for r in results]) for b in backends]
         stds = [np.nanstd([r[b][key] for r in results]) for b in backends]

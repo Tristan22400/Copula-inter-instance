@@ -236,7 +236,7 @@ def _tabldm_quantile_forward(
         ys = torch.from_numpy(np.concatenate([per_episode[b][1] for b in indices], axis=0)).float().to(device)
 
         # Same forward as the regressor, with autograd enabled.
-        kwargs = (
+        kwargs: dict[str, Any] = (
             {"output_type": "raw_quantiles"}
             if probs is None
             else {

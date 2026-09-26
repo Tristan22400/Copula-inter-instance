@@ -6,7 +6,8 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any
 
 import torch
 from hydra import compose, initialize_config_dir
@@ -104,7 +105,9 @@ def main() -> None:
         generation = time.perf_counter() - t
 
         parts: dict[str, float] | None = {} if measure else None
-        amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if amp_dtype is not None else nullcontext()
+        amp_ctx: AbstractContextManager[Any] = nullcontext()
+        if amp_dtype is not None:
+            amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
         with amp_ctx:
             res = phase_a_batch_loss(
                 tabicl,

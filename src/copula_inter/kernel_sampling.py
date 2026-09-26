@@ -95,7 +95,7 @@ def _tabicl_mix_prob_for_kernel(kernel_name: str, tabicl_mix_weights: Optional[T
     if not members:
         return 0.0
     idx = [_COMPOSABLE_KERNELS.index(n) for n in members]
-    return float(max(tabicl_mix_weights[i] for i in idx))
+    return max(float(tabicl_mix_weights[i]) for i in idx)
 
 
 def _resolve_kernel_name(cfg: HasDataConfig, kernel_weights: Optional[Tensor] = None) -> str:

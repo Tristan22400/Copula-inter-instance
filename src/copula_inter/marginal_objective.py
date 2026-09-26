@@ -263,7 +263,7 @@ class AnchorPenalty:
         self.ref = {name: p.detach().clone() for name, p in module.named_parameters() if p.requires_grad}
 
     def __call__(self, module: nn.Module) -> torch.Tensor:
-        total = None
+        total: torch.Tensor | None = None
         for name, p in module.named_parameters():
             if not p.requires_grad or name not in self.ref:
                 continue
