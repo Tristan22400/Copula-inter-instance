@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,9 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from copula_inter.loss import y_space_nll
 from copula_inter.model import low_rank_correlation_factor
+
+if TYPE_CHECKING:
+    from copula_inter.correlation_factory import LowRankCorrelationFactor
 
 
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
@@ -31,12 +35,12 @@ def _forward_and_loss(
     nll_weight: float,
     aux_mae_weight: float,
     jitter: float,
-    triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    triu_cache: dict[int, torch.Tensor],
     parametrization: str = "covnorm",
     moe_aux_weight: float = 1.0,
-    phase_start=lambda: None,
-    phase_end=lambda name, start: None,
-):
+    phase_start: Callable[[], Any] = lambda: None,
+    phase_end: Callable[[str, Any], None] = lambda name, start: None,
+) -> tuple[dict[str, torch.Tensor], LowRankCorrelationFactor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """Forward pass and loss: Y-space NLL, plus the optional aux MAE and MoE auxiliary terms.
 
     phase_start/phase_end time the phases (no-ops by default).
@@ -100,7 +104,7 @@ def _measure_step_flops(
     nll_weight: float,
     aux_mae_weight: float,
     jitter: float,
-    triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    triu_cache: dict[int, torch.Tensor],
     parametrization: str = "covnorm",
     moe_aux_weight: float = 1.0,
 ) -> float:
@@ -139,12 +143,19 @@ def _run_train_step(
     nll_weight: float,
     aux_mae_weight: float,
     jitter: float,
-    triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    phase_start,
-    phase_end,
+    triu_cache: dict[int, torch.Tensor],
+    phase_start: Callable[[], Any],
+    phase_end: Callable[[str, Any], None],
     parametrization: str = "covnorm",
     moe_aux_weight: float = 1.0,
-):
+) -> tuple[
+    dict[str, torch.Tensor],
+    LowRankCorrelationFactor,
+    dict[str, torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Run one training step in its own frame, so an OOM releases every graph tensor when it unwinds."""
     out, Sigma, parts, loss, aux_mae = _forward_and_loss(
         model=model,
@@ -161,7 +172,6 @@ def _run_train_step(
         parametrization=parametrization,
         moe_aux_weight=moe_aux_weight,
     )
-    grad_norm = None
 
     ev_bwd0 = phase_start()
     if scaler is not None:

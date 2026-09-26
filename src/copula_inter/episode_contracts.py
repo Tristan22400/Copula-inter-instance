@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import NotRequired, TypedDict
+from typing import Any, Mapping, NotRequired, TypedDict
 
 from torch import Tensor
 
@@ -46,7 +46,7 @@ class PaddedBatch(TypedDict):
     R_prior: NotRequired[Tensor]
 
 
-def validate_episode(ep: RawEpisode | dict) -> None:
+def validate_episode(ep: Mapping[str, Any]) -> None:
     """Check row/coordinate alignment once at persistence or collation."""
     try:
         p, n = int(ep["n_train"]), int(ep["n_test"])

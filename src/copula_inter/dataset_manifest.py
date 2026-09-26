@@ -6,18 +6,23 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from omegaconf import OmegaConf
 
 from copula_inter.artifacts import artifact_identity, canonical_digest, file_digest
 from copula_inter.backend_registry import z_train_source as z_train_source_of
+from copula_inter.config_path import config_dict
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 SCHEMA = 1
 
 
-def generation_spec(cfg, marginal_checkpoint: str | None) -> dict:
-    data = OmegaConf.to_container(cfg.data, resolve=True)
+def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
+    data = config_dict(cfg.data)
     for output_key in ("resume", "dataset_dir", "pit_dir"):
         data.pop(output_key, None)
     return {

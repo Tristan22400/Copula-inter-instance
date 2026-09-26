@@ -16,6 +16,9 @@ import gc
 import math
 import os
 import traceback
+from typing import TYPE_CHECKING, Any, Iterator, TypeAlias, cast
+
+import torch.nn as nn
 
 from copula_inter.adaptive_sampling import (
     _compute_tabicl_z_train_gap,
@@ -35,6 +38,9 @@ from copula_inter.probe_batches import (
 )
 from copula_inter.validation import validate
 
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+
 # Batch shapes vary with P and N; expandable segments reduce allocator
 # fragmentation. Must be set before torch initializes CUDA.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -49,13 +55,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import wandb
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
-from copula_inter.config_path import config_dir
+from copula_inter.config_path import config_dict, config_dir
 from copula_inter.data_gen import _COMPOSABLE_KERNELS
 from copula_inter.dataset import (
     CopulaDataset,
@@ -116,6 +122,9 @@ _GPU_PEAK_TFLOPS: dict[str, float] = {
 }
 _GPU_PEAK_FLOPS_DEFAULT = 100e12
 
+# Fixed validation episodes: pre-built batches (live data) or a DataLoader over a dataset dir.
+ValLoader: TypeAlias = "list[dict] | DataLoader"
+
 
 def get_gpu_peak_flops(device: int = 0) -> float:
     """Peak dense FP16/BF16 tensor-core FLOPs of the current GPU, from _GPU_PEAK_TFLOPS (default with a warning)."""
@@ -170,7 +179,7 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     )
 
 
-def _fmt_run_value(value) -> str:
+def _fmt_run_value(value: object) -> str:
     if isinstance(value, bool):
         return str(value).lower()
     if isinstance(value, float):
@@ -225,12 +234,17 @@ def _live_data_segment(data_cfg: DictConfig) -> str:
     return "_d_" + "-".join(parts)
 
 
-def _build_model_and_optimizer(cfg, device, resume_ckpt, t):
+def _build_model_and_optimizer(
+    cfg: DictConfig, device: str, resume_ckpt: str | None, t: DictConfig
+) -> tuple[
+    torch.dtype, CopulaTabICL, Muon, GradScaler | None, torch.optim.lr_scheduler.LambdaLR, int, list[nn.Parameter], bool
+]:
     """Build the copula model, Muon/AdamW optimizer, AMP scaler and LR schedule; resume from training.resume_ckpt if set."""
     model = build_copula_transformer(cfg).to(device)
     if bool(t.get("compile", False)):
         torch._dynamo.config.capture_scalar_outputs = True
-        model = torch.compile(model, dynamic=True)
+        # The compiled wrapper forwards attribute access to the module.
+        model = cast("CopulaTabICL", torch.compile(model, dynamic=True))
     wandb.watch(model, log="gradients", log_freq=5000)
 
     n_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -298,7 +312,14 @@ def _build_model_and_optimizer(cfg, device, resume_ckpt, t):
     return amp_dtype, model, optimizer, scaler, scheduler, start_step, trainable, use_amp
 
 
-def _build_validation_probes(cfg, device, t, tabicl_mix_weights, val_episodes_meta, val_loader):
+def _build_validation_probes(
+    cfg: DictConfig,
+    device: str,
+    t: DictConfig,
+    tabicl_mix_weights: torch.Tensor | None,
+    val_episodes_meta: dict[int, list[dict]] | None,
+    val_loader: ValLoader,
+) -> tuple[dict, dict, dict | None, str | None, dict | None, dict[str, dict], dict, dict]:
     """Build the fixed validation probes (synthetic kernel families, posterior probes, ERA5) and their TabICL/analytic z_train."""
     baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
     synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
@@ -434,7 +455,7 @@ def _build_validation_probes(cfg, device, t, tabicl_mix_weights, val_episodes_me
     )
 
 
-def _init_wandb_run(cfg, dataset_name, t):
+def _init_wandb_run(cfg: DictConfig, dataset_name: str, t: DictConfig) -> str | None:
     """Name the run from its model/training settings and start wandb."""
     lora_cfg = cfg.get("lora", None)
     lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
@@ -488,18 +509,25 @@ def _init_wandb_run(cfg, dataset_name, t):
         project=cfg.wandb.project,
         entity=cfg.wandb.entity if cfg.wandb.entity else None,
         name=run_name,
-        config=OmegaConf.to_container(cfg, resolve=True),
+        config=config_dict(cfg),
     )
     return resume_ckpt
 
 
-def _build_data_loaders(cfg, device, live_generation, live_source, t):
+def _build_data_loaders(
+    cfg: DictConfig, device: str, live_generation: bool, live_source: str, t: DictConfig
+) -> tuple[
+    torch.Tensor | None, torch.Tensor | None, Iterator[Any] | None, DataLoader, dict[int, list[dict]] | None, ValLoader
+]:
     """Build the training iterator and validation loader for live (GP or ERA5) or on-disk data."""
     adaptive_kernel_weights = None  # set below only when live_generation + adaptive_kernel_sampling
     tabicl_mix_weights = None  # set below only when live_generation + data.z_train_tabicl_mix_enabled
     train_iter = None  # possibly kicked off early below (live_generation only) -- see there
     # Raw val episodes with kernel metadata, per batch; only for live GP generation.
     val_episodes_meta: dict[int, list[dict]] | None = None
+    val_loader: ValLoader
+    train_dataset: Subset[Any] | CopulaDataset
+    val_dataset: Subset[Any] | CopulaDataset
     if live_generation:
         # Live generation: episodes are generated by DataLoader workers (live_dataset.py).
         print(
@@ -599,7 +627,7 @@ def _build_data_loaders(cfg, device, live_generation, live_source, t):
         print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} episodes")
 
         # Training never reads R_prior; drop it before collate_fn to skip the copy.
-        def _train_collate_fn(samples):
+        def _train_collate_fn(samples: list[dict]) -> dict:
             for s in samples:
                 s.pop("R_prior", None)
             return collate_fn(samples)
@@ -646,8 +674,9 @@ def main(cfg: DictConfig) -> None:
         if cfg.training.device == "auto" and torch.cuda.is_available()
         else ("cpu" if cfg.training.device == "auto" else cfg.training.device)
     )
-    gpu_peak_flops = get_gpu_peak_flops() if device == "cuda" else None
+    gpu_peak_flops: float | None = None
     if device == "cuda":
+        gpu_peak_flops = get_gpu_peak_flops()
         # Allow TF32 matmuls (used by Muon's Newton-Schulz and the NLL's fp32 algebra).
         torch.set_float32_matmul_precision("high")
         print(
@@ -717,7 +746,7 @@ def main(cfg: DictConfig) -> None:
         train_iter = iter(train_loader)
     loss_ema: float | None = None
     _EMA_ALPHA = 0.98
-    _triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    _triu_cache: dict[int, torch.Tensor] = {}
 
     # Per-phase profiling: CUDA events for GPU phases (read at log steps), wall time for data.
     _prof_phases = ("forward", "loss", "backward_step")
@@ -732,14 +761,14 @@ def main(cfg: DictConfig) -> None:
     _last_log_wall = time.perf_counter()
     _last_log_step = 0
 
-    def _phase_start():
+    def _phase_start() -> Any:
         if device == "cuda":
             ev = torch.cuda.Event(enable_timing=True)
             ev.record()
             return ev
         return time.perf_counter()
 
-    def _phase_end(name, start) -> None:
+    def _phase_end(name: str, start: Any) -> None:
         if device == "cuda":
             end = torch.cuda.Event(enable_timing=True)
             end.record()
@@ -859,10 +888,11 @@ def main(cfg: DictConfig) -> None:
             aux_mae_val = aux_mae.item()
             with torch.no_grad():
                 w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
-                Sigma = Sigma.dense()
-                sig_stats = _sigma_stats(Sigma, batch["test_mask"])
+                Sigma_dense = Sigma.dense()
+                sig_stats = _sigma_stats(Sigma_dense, batch["test_mask"])
                 # Count batches where _safe_cholesky replaced a non-finite slice.
-                sigma_nonfinite = int((~torch.isfinite(Sigma).flatten(1).all(-1)).sum().item())
+                sigma_nonfinite = int((~torch.isfinite(Sigma_dense).flatten(1).all(-1)).sum().item())
+                del Sigma_dense
 
             # Profiling readout (one sync): window averages plus this step's own phase times.
             last_step_ms = dict(_prof_last_ms)  # CPU fallback; overwritten below on CUDA

@@ -37,7 +37,7 @@ import random
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import gpytorch
 import numpy as np
@@ -53,6 +53,10 @@ from copula_inter.feature_transforms import (
     apply_mlp_feature_mixing,
 )
 from copula_inter.loss import _safe_cholesky
+from copula_inter.type_aliases import Device, HasDataConfig
+
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
 
 # Force exact Cholesky solves for every covariance up to this size (gpytorch uses CG above max_cholesky_size).
 _MAX_CHOLESKY = 8192
@@ -121,7 +125,7 @@ class KernelPriorSpec:
 _ARD_ELIGIBLE_KERNELS = frozenset({"rbf", "matern12", "matern32", "matern52", "periodic", "rational_quadratic"})
 
 
-def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
+def _kernel_prior_spec(cfg: HasDataConfig, kernel_name: str) -> KernelPriorSpec:
     """LogNormal/Gamma hyperprior spec for one base kernel family, overridable via cfg.data."""
     isotropic_ratio = float(getattr(cfg.data, "isotropic_ratio", 0.0))
 
@@ -162,14 +166,16 @@ def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
     )
 
 
-def _nugget_prior(cfg, kernel_name: str) -> LogNormalPrior:
+def _nugget_prior(cfg: HasDataConfig, kernel_name: str) -> LogNormalPrior:
     """Noise (nugget) prior shared by every kernel; default LogNormal(-4.63, 0.5)."""
     loc = float(getattr(cfg.data, "nugget_lognormal_loc", -4.63))
     scale = float(getattr(cfg.data, "nugget_lognormal_scale", 0.5))
     return LogNormalPrior(loc, scale)
 
 
-def _build_likelihood(cfg, kernel_name: str, B: int, device) -> gpytorch.likelihoods.GaussianLikelihood:
+def _build_likelihood(
+    cfg: HasDataConfig, kernel_name: str, B: int, device: Device
+) -> gpytorch.likelihoods.GaussianLikelihood:
     """Sample B episodes' noise from _nugget_prior as a GaussianLikelihood (.noise is the nugget)."""
     likelihood = gpytorch.likelihoods.GaussianLikelihood(batch_shape=torch.Size([B])).to(device)
     likelihood.noise = _nugget_prior(cfg, kernel_name).sample(torch.Size([B])).to(device)
@@ -189,7 +195,7 @@ def _collapse_isotropic(sample: Tensor, iso_mask: Optional[Tensor]) -> Tensor:
 
 
 def _build_scaled_kernel(
-    name: str, spec: KernelPriorSpec, k: int, B: int, device, active_dims: Optional[List[int]] = None
+    name: str, spec: KernelPriorSpec, k: int, B: int, device: Device, active_dims: Optional[List[int]] = None
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
     """Sample B episodes' hyperparameters for one base kernel.
 
@@ -250,7 +256,7 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
         b: Tensor,
         a: Tensor,
         active_dims: Optional[List[int]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         # batch_shape comes from w's leading dim (B,).
         super().__init__(batch_shape=torch.Size([w.shape[0]]), **kwargs)
@@ -270,7 +276,7 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
         z = (x_active * w).sum(-1) + b
         return torch.tanh(a * z)
 
-    def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params) -> Tensor:
+    def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params: Any) -> Tensor:
         K = self.base_kernel(x1, x2, diag=diag, **params)
         K = K.to_dense() if hasattr(K, "to_dense") else K
         s1 = self._signs(x1)
@@ -287,14 +293,16 @@ class _DenseComposedKernel(gpytorch.kernels.Kernel):
     near-singular sums that dot_product/polynomial components produce.
     """
 
-    def __init__(self, kernel_a: gpytorch.kernels.Kernel, op: str, kernel_b: gpytorch.kernels.Kernel, **kwargs) -> None:
+    def __init__(
+        self, kernel_a: gpytorch.kernels.Kernel, op: str, kernel_b: gpytorch.kernels.Kernel, **kwargs: Any
+    ) -> None:
         super().__init__(**kwargs)
         assert op in ("+", "*"), f"op must be '+' or '*', got {op!r}"
         self.kernel_a = kernel_a
         self.op = op
         self.kernel_b = kernel_b
 
-    def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params) -> Tensor:
+    def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params: Any) -> Tensor:
         a = self.kernel_a(x1, x2, diag=diag, **params)
         b = self.kernel_b(x1, x2, diag=diag, **params)
         a = a.to_dense() if hasattr(a, "to_dense") else a
@@ -302,7 +310,7 @@ class _DenseComposedKernel(gpytorch.kernels.Kernel):
         return a + b if self.op == "+" else a * b
 
 
-def _sample_sign_modulation(cfg, k: int, B: int, device) -> tuple[Tensor, Tensor, Tensor]:
+def _sample_sign_modulation(cfg: HasDataConfig, k: int, B: int, device: Device) -> tuple[Tensor, Tensor, Tensor]:
     """Sample one hyperplane per episode: w ~ N(0, I_k)/sqrt(k), b ~ N(0, 1), a ~ LogNormal(sharpness loc, scale)."""
     w = torch.randn(B, k, device=device) / math.sqrt(max(k, 1))
     b = torch.randn(B, device=device)
@@ -313,12 +321,12 @@ def _sample_sign_modulation(cfg, k: int, B: int, device) -> tuple[Tensor, Tensor
 
 
 def _maybe_wrap_sign_modulated(
-    cfg,
+    cfg: HasDataConfig,
     kernel: gpytorch.kernels.Kernel,
     prob: float,
     k: int,
     B: int,
-    device,
+    device: Device,
     active_dims: Optional[List[int]],
     param_suffix: str = "",
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
@@ -347,11 +355,11 @@ def _maybe_wrap_sign_modulated(
 
 
 def _build_kernel_component(
-    cfg,
+    cfg: HasDataConfig,
     name: str,
     k: int,
     B: int,
-    device,
+    device: Device,
     active_dims: Optional[List[int]] = None,
     d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
@@ -417,11 +425,11 @@ def _build_kernel_component(
 
 
 def _sample_episode_kernel(
-    cfg,
+    cfg: HasDataConfig,
     kernel_name: str,
     k: int,
     B: int,
-    device,
+    device: Device,
     active_dims: Optional[List[int]] = None,
     d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
@@ -465,7 +473,11 @@ def _sample_episode_kernel(
 
 
 def _wrap_concrete_sign_modulated(
-    kernel: gpytorch.kernels.Kernel, sign_w, sign_b, sign_a, active_dims: Optional[List[int]]
+    kernel: gpytorch.kernels.Kernel,
+    sign_w: Optional[Tensor],
+    sign_b: Optional[Tensor],
+    sign_a: Optional[Tensor],
+    active_dims: Optional[List[int]],
 ) -> gpytorch.kernels.Kernel:
     """Wrap a non-batched kernel in SignModulatedKernel with given sign_w/sign_b/sign_a.
 
@@ -488,16 +500,16 @@ def _wrap_concrete_sign_modulated(
 
 def _build_concrete_kernel(
     name: str,
-    l,
-    alpha2,
+    l: float | Tensor,
+    alpha2: float | Tensor,
     *,
-    period=None,
-    rq_alpha=None,
-    power=None,
+    period: Optional[float | Tensor] = None,
+    rq_alpha: Optional[float] = None,
+    power: Optional[float | int] = None,
     active_dims: Optional[List[int]] = None,
-    sign_w=None,
-    sign_b=None,
-    sign_a=None,
+    sign_w: Optional[Tensor] = None,
+    sign_b: Optional[Tensor] = None,
+    sign_a: Optional[Tensor] = None,
 ) -> gpytorch.kernels.Kernel:
     """Build a non-batched gpytorch Kernel with given hyperparameter values (used by build_kernel_fn).
 
@@ -513,7 +525,7 @@ def _build_concrete_kernel(
 
     if name == "polynomial":
         power_int = int(round(float(power))) if power is not None else 2
-        kernel_kwargs = {"power": power_int}
+        kernel_kwargs: dict[str, Any] = {"power": power_int}
         if active_dims is not None:
             kernel_kwargs["active_dims"] = active_dims
         base = gpytorch.kernels.PolynomialKernel(**kernel_kwargs)
@@ -544,27 +556,27 @@ def _build_concrete_kernel(
 
 def build_kernel_fn(
     kernel_name: str,
-    l,
-    alpha2,
+    l: float | Tensor,
+    alpha2: float | Tensor,
     *,
     period: Optional[float | Tensor] = None,
     rq_alpha: Optional[float] = None,
     power: Optional[float | int] = None,
-    l_b=None,
-    alpha2_b=None,
+    l_b: Optional[float | Tensor] = None,
+    alpha2_b: Optional[float | Tensor] = None,
     period_b: Optional[float | Tensor] = None,
     rq_alpha_b: Optional[float] = None,
     power_b: Optional[float | int] = None,
     active_dims: Optional[List[int]] = None,
-    sign_w=None,
-    sign_b=None,
-    sign_a=None,
-    sign_w_b=None,
-    sign_b_b=None,
-    sign_a_b=None,
-    sign_w_outer=None,
-    sign_b_outer=None,
-    sign_a_outer=None,
+    sign_w: Optional[Tensor] = None,
+    sign_b: Optional[Tensor] = None,
+    sign_a: Optional[Tensor] = None,
+    sign_w_b: Optional[Tensor] = None,
+    sign_b_b: Optional[Tensor] = None,
+    sign_a_b: Optional[Tensor] = None,
+    sign_w_outer: Optional[Tensor] = None,
+    sign_b_outer: Optional[Tensor] = None,
+    sign_a_outer: Optional[Tensor] = None,
 ) -> Callable[[Tensor, Tensor], Tensor]:
     """Return a kernel(X1, X2) -> K callable with the given hyperparameters.
 
@@ -590,6 +602,8 @@ def build_kernel_fn(
         )
     else:
         name_a, op, name_b = composite
+        if l_b is None or alpha2_b is None:
+            raise ValueError(f"composite kernel {kernel_name!r} needs l_b and alpha2_b")
         kernel_a = _build_concrete_kernel(
             name_a,
             l,
@@ -626,47 +640,53 @@ def build_kernel_fn(
 # Hyperparameters are assigned in place, so these do not backpropagate into them.
 
 
-def rbf_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+def rbf_kernel(X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, **_: Any) -> Tensor:
     """Squared exponential (RBF), via gpytorch.kernels.RBFKernel."""
     return build_kernel_fn("rbf", l, alpha2)(X1, X2)
 
 
-def matern12_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+def matern12_kernel(X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, **_: Any) -> Tensor:
     """Matern nu=1/2, via gpytorch.kernels.MaternKernel(nu=0.5)."""
     return build_kernel_fn("matern12", l, alpha2)(X1, X2)
 
 
-def matern32_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+def matern32_kernel(X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, **_: Any) -> Tensor:
     """Matern nu=3/2, via gpytorch.kernels.MaternKernel(nu=1.5)."""
     return build_kernel_fn("matern32", l, alpha2)(X1, X2)
 
 
-def matern52_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+def matern52_kernel(X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, **_: Any) -> Tensor:
     """Matern nu=5/2, via gpytorch.kernels.MaternKernel(nu=2.5)."""
     return build_kernel_fn("matern52", l, alpha2)(X1, X2)
 
 
-def cosine_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, **_) -> Tensor:
+def cosine_kernel(X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, **_: Any) -> Tensor:
     """Cosine (spectral), via gpytorch.kernels.CosineKernel."""
     return build_kernel_fn("cosine", l, alpha2)(X1, X2)
 
 
-def periodic_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, period: float = 1.0, **_) -> Tensor:
+def periodic_kernel(
+    X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, period: float = 1.0, **_: Any
+) -> Tensor:
     """Periodic, via gpytorch.kernels.PeriodicKernel."""
     return build_kernel_fn("periodic", l, alpha2, period=period)(X1, X2)
 
 
-def rational_quadratic_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, rq_alpha: float = 1.0, **_) -> Tensor:
+def rational_quadratic_kernel(
+    X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, rq_alpha: float = 1.0, **_: Any
+) -> Tensor:
     """Rational quadratic, via gpytorch.kernels.RQKernel."""
     return build_kernel_fn("rational_quadratic", l, alpha2, rq_alpha=rq_alpha)(X1, X2)
 
 
-def dot_product_kernel(X1: Tensor, X2: Tensor, *, alpha2: float = 1.0, **_) -> Tensor:
+def dot_product_kernel(X1: Tensor, X2: Tensor, *, alpha2: float = 1.0, **_: Any) -> Tensor:
     """Linear kernel alpha2 * X1 @ X2^T, via gpytorch.kernels.LinearKernel (l is ignored)."""
     return build_kernel_fn("dot_product", 0.0, alpha2)(X1, X2)
 
 
-def polynomial_kernel(X1: Tensor, X2: Tensor, *, l, alpha2, power: float = 2.0, **_) -> Tensor:
+def polynomial_kernel(
+    X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, power: float = 2.0, **_: Any
+) -> Tensor:
     """Polynomial kernel alpha2 * (x1.x2 + c)^d; l holds the offset c and power the degree d."""
     return build_kernel_fn("polynomial", l, alpha2, power=power)(X1, X2)
 
@@ -731,7 +751,7 @@ def _composite_kernel(
     rq_alpha_b: Optional[float] = None,
     power: Optional[float] = None,
     power_b: Optional[float] = None,
-    **_,
+    **_: Any,
 ) -> Tensor:
     """Evaluate a registered "A+B" / "A*B" kernel through build_kernel_fn."""
     fn = build_kernel_fn(
@@ -761,7 +781,7 @@ del _name_a, _name_b, _op, _combo_name
 ALL_KERNELS: List[str] = list(KERNEL_REGISTRY.keys())
 
 
-def _sample_d_features(cfg) -> int:
+def _sample_d_features(cfg: HasDataConfig) -> int:
     """Total feature count d for this call.
 
     d ~ round(LogNormal(d_features_lognormal_loc, _scale)), at least 2, when both
@@ -774,7 +794,7 @@ def _sample_d_features(cfg) -> int:
     return max(2, round(random.lognormvariate(float(loc), float(scale))))
 
 
-def _sample_active_dims(d_total: int, cfg) -> List[int]:
+def _sample_active_dims(d_total: int, cfg: HasDataConfig) -> List[int]:
     """Sorted column indices the kernel uses.
 
     A fraction ~ Uniform[inactive_frac_min, inactive_frac_max] of the d_total
@@ -815,7 +835,7 @@ def _tabicl_mix_prob_for_kernel(kernel_name: str, tabicl_mix_weights: Optional[T
     return float(max(tabicl_mix_weights[i] for i in idx))
 
 
-def _resolve_kernel_name(cfg, kernel_weights: Optional[Tensor] = None) -> str:
+def _resolve_kernel_name(cfg: HasDataConfig, kernel_weights: Optional[Tensor] = None) -> str:
     """Pick one task's kernel from cfg.data.kernel or cfg.data.kernels (optionally weighted by kernel_weights)."""
     data = cfg.data
     if hasattr(data, "kernel") and data.kernel:
@@ -835,7 +855,9 @@ def _resolve_kernel_name(cfg, kernel_weights: Optional[Tensor] = None) -> str:
     return "rbf"
 
 
-def _sample_kernel_chain_structure(cfg, kernel_weights: Optional[Tensor] = None) -> tuple[List[str], List[str], str]:
+def _sample_kernel_chain_structure(
+    cfg: HasDataConfig, kernel_weights: Optional[Tensor] = None
+) -> tuple[List[str], List[str], str]:
     """Sample a kernel chain for systematic composition.
 
     m ~ round(LogNormal(composite_num_kernels_lognormal_loc, _scale)), clipped to
@@ -866,12 +888,12 @@ def _sample_kernel_chain_structure(cfg, kernel_weights: Optional[Tensor] = None)
 
 
 def _build_kernel_chain(
-    cfg,
+    cfg: HasDataConfig,
     names: List[str],
     ops: List[str],
     k: int,
     B: int,
-    device,
+    device: Device,
     active_dims: Optional[List[int]] = None,
     d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, List[Dict[str, Tensor]], Dict[str, Tensor]]:
@@ -946,7 +968,9 @@ class _MeanFunctionBank(gpytorch.means.Mean):
         return (stacked * self.family_onehot.unsqueeze(1)).sum(-1)
 
 
-def _sample_mean_module(cfg, d: int, B: int, device) -> tuple[gpytorch.means.Mean, Dict[str, Tensor]]:
+def _sample_mean_module(
+    cfg: HasDataConfig, d: int, B: int, device: Device
+) -> tuple[gpytorch.means.Mean, Dict[str, Tensor]]:
     """Sample B episodes' GP mean function (cfg.data.mean_fn_*).
 
     With probability mean_fn_prob an episode gets a non-zero mean whose family
@@ -1096,7 +1120,7 @@ def sigma_to_correlation(Sigma: Tensor) -> tuple[Tensor, Tensor]:
 
 
 @torch.no_grad()
-def generate_gp_task(cfg) -> Dict[str, Tensor]:
+def generate_gp_task(cfg: HasDataConfig) -> Dict[str, Tensor]:
     """Generate one GP episode: generate_gp_batch(cfg, 1, "cpu", return_kernel_metadata=True)[0].
 
     Keys: x_norm_train, y_train, x_norm_test, y_test, z_train, z_test,
@@ -1357,9 +1381,9 @@ def _structural_warp_column(col_data: Tensor, op: str, use_index_axis: bool = Fa
                 transformed[s:e] = (seg - seg_mean) * scale + seg_mean + shift
 
     elif op == "shock_recovery":
-        lo = max(1, T // 16)
-        hi = max(lo + 1, T - T // 16)
-        t0 = int(torch.randint(lo, hi, (1,)).item())
+        t_lo = max(1, T // 16)
+        t_hi = max(t_lo + 1, T - T // 16)
+        t0 = int(torch.randint(t_lo, t_hi, (1,)).item())
         mag = float(torch.empty(1).uniform_(0.5, 2.0)) * std.item()
         if torch.rand(1).item() < 0.5:
             mag = -mag
@@ -1482,7 +1506,7 @@ def _sample_structural_category_mask(
     category_weights: Dict[str, float],
     num_ops_min: int,
     num_ops_max: int,
-    device,
+    device: Device,
 ) -> Tuple[Tensor, List[str]]:
     """Batched category selection for M draws (Gumbel top-k).
 
@@ -1692,7 +1716,7 @@ def _structural_warp_batch(col_data: Tensor, op: str, use_index_axis: Tensor) ->
     return warped
 
 
-def apply_structural_feature_warp(x: Tensor, cfg, device) -> Tensor:
+def apply_structural_feature_warp(x: Tensor, cfg: HasDataConfig, device: Device) -> Tensor:
     """Apply TempoPFN-style structural transforms to gated feature columns, per episode.
 
     Each column is gated with structural_warp_prob; gated columns get one op from
@@ -1785,7 +1809,7 @@ DEFAULT_Z_CORRUPTION_RHO_BETA_A = 2.0
 DEFAULT_Z_CORRUPTION_RHO_BETA_B = 3.0
 
 
-def corrupt_z_train(z_train: Tensor, data_cfg) -> Tensor:
+def corrupt_z_train(z_train: Tensor, data_cfg: Any) -> Tensor:
     """Mix z_train with i.i.d. N(0, 1) noise per episode (cfg.data.z_train_corruption_*).
 
         z = sqrt(rho) * z_train + sqrt(1 - rho) * eps,   rho ~ Beta(a, b)
@@ -1845,19 +1869,19 @@ def _evaluate_kernel_dense(kernel_obj: gpytorch.kernels.Kernel, x_norm: Tensor) 
 
 @torch.no_grad()
 def _generate_gp_batch_raw(
-    cfg,
+    cfg: HasDataConfig,
     B: int,
     device: str = "cpu",
     *,
     return_kernel_metadata: bool = False,
     d_override: Optional[int] = None,
-    tabicl_model: Optional[torch.nn.Module] = None,
+    tabicl_model: Optional[TabICLLike] = None,
     tabicl_k_folds: int = 10,
     tabicl_split_calib_frac: float = 0.0,
     kernel_weights: Optional[Tensor] = None,
     tabicl_mix_weights: Optional[Tensor] = None,
     marginal_backend: Optional[str] = None,
-    marginal_regressor=None,
+    marginal_regressor: Any = None,
     marginal_probs_n: int = 99,
     raw_y_override: bool = False,
 ) -> List[Dict[str, Tensor]]:
@@ -2132,6 +2156,7 @@ def _generate_gp_batch_raw(
         log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
     elif marginal_backend not in (None, "tabicl"):
         # Per-episode K-fold PIT for backends without a batched module (slow).
+        assert marginal_backend is not None
         from eval.metrics.joint_nll import compute_pit
         from eval.spatial.marginal_backends import loo_pit as _backend_loo_pit
         from eval.spatial.marginal_backends import quantiles as _backend_quantiles
@@ -2171,6 +2196,8 @@ def _generate_gp_batch_raw(
         # "tabicl_split": one forward with the calibration points as context.
         from copula_inter.pit import run_pit_calib_split_batched  # local: pit.py imports from this module
 
+        assert tabicl_model is not None
+
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
@@ -2189,6 +2216,8 @@ def _generate_gp_batch_raw(
         # "tabicl": K-fold PIT on the training points and a full-context PIT on the
         # real test points; z_train, z_test and log_pdf_test all come from TabICL.
         from copula_inter.pit import run_pit_batched  # local: pit.py imports from this module
+
+        assert tabicl_model is not None
 
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
@@ -2305,19 +2334,19 @@ def _generate_gp_batch_raw(
 
 
 def generate_gp_batch(
-    cfg,
+    cfg: HasDataConfig,
     B: int,
     device: str = "cpu",
     *,
     return_kernel_metadata: bool = False,
-    tabicl_model: Optional[torch.nn.Module] = None,
+    tabicl_model: Optional[TabICLLike] = None,
     tabicl_k_folds: int = 10,
     tabicl_split_calib_frac: float = 0.0,
     d_override: Optional[int] = None,
     kernel_weights: Optional[Tensor] = None,
     tabicl_mix_weights: Optional[Tensor] = None,
     marginal_backend: Optional[str] = None,
-    marginal_regressor=None,
+    marginal_regressor: Any = None,
     marginal_probs_n: int = 99,
     raw_y_override: bool = False,
 ) -> List[Dict[str, Tensor]]:
@@ -2344,6 +2373,7 @@ def generate_gp_batch(
         raw_y_override=raw_y_override,
     )
     # Pin every top-up round to the first round's d (or d_override).
+    d_fixed: Optional[int]
     if episodes:
         d_fixed = int(episodes[0]["x_norm_train"].shape[-1])
     else:
@@ -2355,7 +2385,7 @@ def generate_gp_batch(
         shortfall = B - len(episodes)
         if base_seed is not None:
             # Offset the seed per round so retries draw new kernels.
-            cfg.seed = base_seed + round_idx * 104_729
+            setattr(cfg, "seed", base_seed + round_idx * 104_729)
         new_episodes = _generate_gp_batch_raw(
             cfg,
             shortfall,
@@ -2376,7 +2406,7 @@ def generate_gp_batch(
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
         episodes += new_episodes
     if base_seed is not None:
-        cfg.seed = base_seed
+        setattr(cfg, "seed", base_seed)
     if len(episodes) < B:
         raise RuntimeError(
             f"generate_gp_batch: could not assemble {B} valid episodes after "

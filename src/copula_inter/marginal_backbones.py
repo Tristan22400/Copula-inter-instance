@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
     from tabicl._model.quantile_dist import QuantileToDistribution
 
 from copula_inter.artifacts import atomic_torch_save
@@ -110,10 +112,10 @@ class MarginalBackbone:
     def max_tier(self) -> int:
         return MAX_TIER[self.name]
 
-    def parameters(self, *args, **kwargs):
+    def parameters(self, *args: Any, **kwargs: Any) -> Iterator[nn.Parameter]:
         return self.module.parameters(*args, **kwargs)
 
-    def named_parameters(self, *args, **kwargs):
+    def named_parameters(self, *args: Any, **kwargs: Any) -> Iterator[tuple[str, nn.Parameter]]:
         return self.module.named_parameters(*args, **kwargs)
 
     def trainable_report(self) -> dict:
@@ -173,7 +175,7 @@ class MarginalBackbone:
         return QuantileToDistribution(alpha_levels=list(probs)).to(next(self.module.parameters()).device)
 
     # -- checkpointing ---------------------------------------------------------
-    def save(self, path: str, *, step: int, cfg=None, extra: Optional[dict] = None) -> None:
+    def save(self, path: str, *, step: int, cfg: DictConfig | None = None, extra: Optional[dict] = None) -> None:
         """Write a Phase-A checkpoint: TabICL's {"config", "state_dict"} for tabicl (loadable by pit.load_tabicl), the same plus a "backbone" tag otherwise."""
         from copula_inter.lora import merged_base_state_dict_any
 
@@ -204,7 +206,7 @@ def _patch_tabldm_inference_manager() -> None:
 
     _orig_run_forward = InferenceManager._run_forward
 
-    def _grad_aware_run_forward(self, forward_fn, inputs):
+    def _grad_aware_run_forward(self: Any, forward_fn: Callable[..., Any], inputs: Any) -> Any:
         if torch.is_grad_enabled():
             with flash_attn3_toggle(self.use_fa3):
                 return forward_fn(**inputs)
@@ -214,7 +216,13 @@ def _patch_tabldm_inference_manager() -> None:
     InferenceManager._grad_patched = True
 
 
-def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.Tensor:
+def _tabldm_quantile_forward(
+    bb: MarginalBackbone,
+    X_context: Sequence[np.ndarray],
+    y_context: Sequence[np.ndarray],
+    X_query: Sequence[np.ndarray],
+    probs: np.ndarray | None,
+) -> torch.Tensor:
     _patch_tabldm_inference_manager()
     from eval.spatial.tabldm_batched import _episode_member_batch, _group_episode_batches
 
@@ -236,7 +244,8 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
                 "alphas": list(probs),
             }
         )
-        out = bb.module.predict_stats(
+        # TabLDM's model exposes predict_stats.
+        out = cast(Any, bb.module).predict_stats(
             xs,
             ys,
             inference_config=bb.handle.inference_config_,
@@ -256,7 +265,11 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
 
 
 def _exaone_grad_forward(
-    bb, support: torch.Tensor, label: torch.Tensor, query: torch.Tensor, chunk_size: Optional[int] = None
+    bb: MarginalBackbone,
+    support: torch.Tensor,
+    label: torch.Tensor,
+    query: torch.Tensor,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """EXAONE forward for training: calls the model directly (no inference KV cache), with activation checkpointing, chunked along the batch axis."""
     from torch.nn.utils import parametrize
@@ -269,7 +282,7 @@ def _exaone_grad_forward(
     ffn_chunk = 524_288 if support.device.type == "cpu" else 9984
     query_chunk_size = query.shape[1]
 
-    def _model_call(sub_s, sub_l, sub_q):
+    def _model_call(sub_s: torch.Tensor, sub_l: torch.Tensor, sub_q: torch.Tensor) -> torch.Tensor:
         # Materialize each LoRA weight once per call, inside the checkpointed function.
         with parametrize.cached():
             return bb.handle.model(
@@ -305,7 +318,13 @@ def _exaone_grad_forward(
     return torch.cat(chunks, dim=0)
 
 
-def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.Tensor:
+def _exaone_quantile_forward(
+    bb: MarginalBackbone,
+    X_context: Sequence[np.ndarray],
+    y_context: Sequence[np.ndarray],
+    X_query: Sequence[np.ndarray],
+    probs: np.ndarray | None,
+) -> torch.Tensor:
     from eval.spatial.exaone_batched import _episode_member_batch
 
     B = len(X_context)
@@ -355,7 +374,13 @@ def _interp_last_dim(values: torch.Tensor, xp: torch.Tensor, x: torch.Tensor) ->
     return v_lo + (v_hi - v_lo) * w
 
 
-def _tabicl_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.Tensor:
+def _tabicl_quantile_forward(
+    bb: MarginalBackbone,
+    X_context: Sequence[np.ndarray],
+    y_context: Sequence[np.ndarray],
+    X_query: Sequence[np.ndarray],
+    probs: np.ndarray | None,
+) -> torch.Tensor:
     raise NotImplementedError(
         "tabicl's Phase-A forward goes through pit.py::run_pit_batched_grad, which "
         "finetune_marginal.py calls directly -- it carries K-fold rotation and PIT "
@@ -405,7 +430,7 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
     return MarginalBackbone(name=name, module=module, handle=regressor, config={})
 
 
-def _trainable_module(name: str, regressor) -> nn.Module:
+def _trainable_module(name: str, regressor: Any) -> nn.Module:
     """The nn.Module inside a regressor whose parameters Phase A trains."""
     if name == "tabldm":
         if getattr(regressor, "model_", None) is None:

@@ -8,7 +8,7 @@ frozen TabICL (or another marginal backend) PIT, so a checkpoint is required.
 
 from __future__ import annotations
 
-from typing import Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig
@@ -25,6 +25,9 @@ from copula_inter.pit import (
     run_pit_batched,
 )
 from eval.data.era5_global_corpus import GlobalERA5Corpus, load_shared_corpus_arrays
+
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
 
 __all__ = ["build_era5_train_loader", "build_era5_fixed_val_batches", "era5_collate_fn"]
 
@@ -73,7 +76,7 @@ def era5_collate_fn(samples: List[dict]) -> dict:
     }
 
 
-def _resolve_marginal(cfg) -> Tuple[Optional[str], int]:
+def _resolve_marginal(cfg: DictConfig) -> Tuple[Optional[str], int]:
     """(marginal_backend, marginal_probs_n) from data.z_train_source; backend None means TabICL ("analytic" is treated as TabICL)."""
     from copula_inter.live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
 
@@ -91,7 +94,7 @@ def _backend_pit_batched(
     y_test_scaled: torch.Tensor,
     *,
     backend: str,
-    regressor,
+    regressor: Any,
     k_folds: int,
     probs_n: int,
     seed: int,
@@ -119,11 +122,11 @@ def _pit_episode(
     y_train: torch.Tensor,
     x_test: torch.Tensor,
     y_test: torch.Tensor,
-    tabicl_model,
+    tabicl_model: TabICLLike | None,
     k_folds: int,
     *,
     marginal_backend: Optional[str] = None,
-    marginal_regressor=None,
+    marginal_regressor: Any = None,
     marginal_probs_n: int = 99,
     seed: int = 0,
 ) -> Optional[dict]:
@@ -151,6 +154,7 @@ def _pit_episode(
         }
     Y_train = y_train_scaled.unsqueeze(-1)
     Y_test = y_test_scaled.unsqueeze(-1)
+    assert tabicl_model is not None
     pit_out = run_pit(
         tabicl_model,
         x_train,
@@ -173,11 +177,11 @@ def _pit_group(
     y_train: torch.Tensor,
     x_test: torch.Tensor,
     y_test: torch.Tensor,
-    tabicl_model,
+    tabicl_model: TabICLLike | None,
     k_folds: int,
     *,
     marginal_backend: Optional[str] = None,
-    marginal_regressor=None,
+    marginal_regressor: Any = None,
     marginal_probs_n: int = 99,
     seed: int = 0,
 ) -> Optional[dict]:
@@ -216,6 +220,7 @@ def _pit_group(
         }
     Y_train = y_train_scaled.unsqueeze(-1)
     Y_test = y_test_scaled.unsqueeze(-1)
+    assert tabicl_model is not None
     pit_out = run_pit_batched(
         tabicl_model,
         x_train,
@@ -245,7 +250,7 @@ class LiveERA5Dataset(IterableDataset):
     def __init__(
         self,
         shared_corpus: dict,
-        tabicl_ckpt: str,
+        tabicl_ckpt: str | None,
         tabicl_device: str,
         k_folds: int,
         grid_size_range: Tuple[int, int],
@@ -283,6 +288,7 @@ class LiveERA5Dataset(IterableDataset):
         marginal_regressor = None
         if self.marginal_backend is None:
             print(f"[era5_live_dataset] worker {worker_id}: loading frozen TabICL marginal: {self.tabicl_ckpt}")
+            assert self.tabicl_ckpt is not None
             tabicl_model = load_tabicl(self.tabicl_ckpt, self.tabicl_device)
         else:
             from eval.spatial.marginal_backends import make_regressor
@@ -450,6 +456,7 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
     marginal_regressor = None
     if marginal_backend is None:
         print(f"[era5_live_dataset] Loading frozen TabICL marginal for fixed val batches: {ckpt}")
+        assert ckpt is not None
         tabicl_model = load_tabicl(ckpt, device)
     else:
         from eval.spatial.marginal_backends import make_regressor
@@ -468,7 +475,7 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
     batches = []
     with torch.no_grad():
         for _ in range(n_batches):
-            episodes = []
+            episodes: list[dict] = []
             attempts = 0
             while len(episodes) < batch_size and attempts < batch_size * 20:
                 attempts += 1

@@ -19,7 +19,7 @@ import os
 import random
 import time
 import zlib
-from typing import TYPE_CHECKING, Callable, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, cast
 
 import hydra
 import numpy as np
@@ -55,6 +55,7 @@ from copula_inter.pit import (
 from copula_inter.training_core import cosine_lr_lambda  # noqa: E402
 
 if TYPE_CHECKING:
+    from eval.data.era5_global_corpus import GlobalERA5Corpus
     from tabicl._model.quantile_dist import QuantileToDistribution
     from tabicl._model.tabicl import TabICL
 
@@ -669,7 +670,7 @@ def phase_a_batch_loss(
     return res
 
 
-def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
+def build_era5_marginal_val_batches(vcfg: DictConfig, device: str | torch.device) -> dict:
     """Fixed per-region real-ERA5 probes for Phase-A validation, holding raw (x, y).
 
     Same geometry and seeds as the copula run's ERA5 probes
@@ -679,7 +680,7 @@ def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
     from eval.configs.regions import REGIONS as ERA5_REGIONS
     from eval.spatial.sweep_core import build_era5_probe
 
-    def _g(key, default):
+    def _g(key: str, default: Any) -> Any:
         return vcfg.get(key, default) if hasattr(vcfg, "get") else getattr(vcfg, key, default)
 
     region_names = list(_g("era5_regions", []) or list(ERA5_REGIONS.keys()))
@@ -853,7 +854,7 @@ def save_marginal_checkpoint(
     tabicl_config: dict,
     *,
     step: int,
-    cfg=None,
+    cfg: DictConfig | None = None,
     extra: Optional[dict] = None,
 ) -> None:
     """Write a TabICL-schema checkpoint ({"config", "state_dict"}, LoRA merged) that pit.load_tabicl can read.
@@ -892,7 +893,7 @@ class ERA5EpisodeSampler:
     """Batches of real-ERA5 episodes with one shared P and N (sample_episode_fixed_shape); region, day and box vary."""
 
     def __init__(
-        self, corpus, *, grid_size: int, n_context: int, box_deg_range: tuple[float, float], seed: int
+        self, corpus: GlobalERA5Corpus, *, grid_size: int, n_context: int, box_deg_range: tuple[float, float], seed: int
     ) -> None:
         self.corpus = corpus
         self.grid_size = int(grid_size)

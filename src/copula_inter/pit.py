@@ -12,10 +12,9 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Literal, Optional, Protocol, Sequence, overload
+from typing import Any, Callable, Literal, Optional, Protocol, Sequence, overload
 
 import torch
-import torch.nn as nn
 
 from copula_inter.data_gen import _safe_cholesky, build_kernel_fn, sigma_to_correlation  # noqa: E402
 from tabicl._model.inference_config import InferenceConfig, MgrConfig  # noqa: E402
@@ -27,6 +26,14 @@ DEFAULT_K_FOLDS = 10
 class MarginalDistribution(Protocol):
     def cdf(self, value: torch.Tensor, /) -> torch.Tensor: ...
     def log_prob(self, value: torch.Tensor, /) -> torch.Tensor: ...
+    def icdf(self, value: torch.Tensor, /) -> torch.Tensor: ...
+
+
+class HasTabICLConfig(Protocol):
+    """A config with a tabicl section: a Hydra DictConfig or a test stand-in."""
+
+    @property
+    def tabicl(self) -> Any: ...
 
 
 class TabICLLike(Protocol):
@@ -56,14 +63,14 @@ def configure_tabicl_inference_amp(use_amp: bool) -> None:
     )
 
 
-def tabicl_forward(tabicl: TabICLLike, X: torch.Tensor, y_train: torch.Tensor, **kwargs) -> torch.Tensor:
+def tabicl_forward(tabicl: TabICLLike, X: torch.Tensor, y_train: torch.Tensor, **kwargs: Any) -> torch.Tensor:
     """Forward through TabICL using the configured marginal precision."""
     if _TABICL_INFERENCE_CONFIG is None:
         return tabicl(X, y_train, **kwargs)
     return tabicl(X, y_train, inference_config=_TABICL_INFERENCE_CONFIG, **kwargs)
 
 
-def _optional_param(t: torch.Tensor):
+def _optional_param(t: torch.Tensor) -> float | torch.Tensor | None:
     """None if every entry is the 0.0 "not applicable" sentinel, else a float (scalar) or the tensor (ARD vector)."""
     if torch.all(t == 0.0):
         return None
@@ -93,7 +100,7 @@ def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unknown mean_family {family}; expected 0, 1, or 2.")
 
 
-def resolve_pit_ckpt(cfg) -> str | None:
+def resolve_pit_ckpt(cfg: HasTabICLConfig) -> str | None:
     """The TabICL checkpoint to load as the frozen PIT marginal, or None.
 
     tabicl.pit_ckpt if set; otherwise tabicl.ckpt when tabicl.pretrained is true.
@@ -300,7 +307,7 @@ class _train_mode:
         self.module.train()
         return self.module
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.module.train(self.was_training)
 
 
@@ -623,7 +630,9 @@ def run_pit_calib_split_batched(
     return {"z_train": z_train}
 
 
-def _sign_triple(d: dict, applied_key: str, w_key: str, b_key: str, a_key: str):
+def _sign_triple(
+    d: dict, applied_key: str, w_key: str, b_key: str, a_key: str
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """(sign_w, sign_b, sign_a) from a dict's sign-modulation fields, or (None, None, None) if not applied.
 
     sign_a may be None for datasets saved before the sharpness parameter existed.
@@ -634,7 +643,7 @@ def _sign_triple(d: dict, applied_key: str, w_key: str, b_key: str, a_key: str):
     return d[w_key], d[b_key], d.get(a_key)
 
 
-def _kernel_fn_from_chain_task(task: dict):
+def _kernel_fn_from_chain_task(task: dict) -> tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]:
     """Rebuild (kernel_fn, nugget) for a systematic-composition chain episode.
 
     Each component comes from task["kernel_component_params"][i]; the dense
@@ -681,7 +690,7 @@ def _kernel_fn_from_chain_task(task: dict):
             )
         )
 
-    def kernel_fn(X1, X2):
+    def kernel_fn(X1: torch.Tensor, X2: torch.Tensor) -> torch.Tensor:
         K = component_fns[0](X1, X2)
         for op, fn in zip(ops, component_fns[1:]):
             Ki = fn(X1, X2)
@@ -691,7 +700,7 @@ def _kernel_fn_from_chain_task(task: dict):
     return kernel_fn, nugget
 
 
-def _kernel_fn_from_task(task: dict):
+def _kernel_fn_from_task(task: dict) -> tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]:
     """Rebuild (kernel_fn, nugget) from a task's saved kernel metadata (flat or chain schema)."""
     if "kernel_components" in task:
         return _kernel_fn_from_chain_task(task)

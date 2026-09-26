@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List
+from typing import List, Literal, overload
 
 import torch
 from torch import Tensor
+
+from copula_inter.type_aliases import Device, HasDataConfig
 
 # Activations for MLP feature mixing.
 _MLP_MIX_ACTIVATIONS: List[str] = ["linear", "relu", "sigmoid", "sin", "mod", "leaky_relu"]
@@ -31,7 +33,17 @@ def _apply_mlp_activation(x: Tensor, name: str) -> Tensor:
     raise ValueError(f"Unknown MLP-mixing activation '{name}'")
 
 
-def apply_mlp_feature_mixing(x: Tensor, cfg, device, *, return_gate: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+@overload
+def apply_mlp_feature_mixing(
+    x: Tensor, cfg: HasDataConfig, device: Device, *, return_gate: Literal[False] = ...
+) -> Tensor: ...
+@overload
+def apply_mlp_feature_mixing(
+    x: Tensor, cfg: HasDataConfig, device: Device, *, return_gate: Literal[True]
+) -> tuple[Tensor, Tensor]: ...
+def apply_mlp_feature_mixing(
+    x: Tensor, cfg: HasDataConfig, device: Device, *, return_gate: bool = False
+) -> Tensor | tuple[Tensor, Tensor]:
     """Mix the input feature columns of gated episodes through a small random MLP.
 
     The number of layers and their activations are shared by the call; weights
@@ -83,8 +95,16 @@ def apply_mlp_feature_mixing(x: Tensor, cfg, device, *, return_gate: bool = Fals
     return x_out
 
 
+@overload
 def apply_kernel_hidden_warp(
-    x_norm: Tensor, cfg, device, *, return_gate: bool = False
+    x_norm: Tensor, cfg: HasDataConfig, device: Device, *, return_gate: Literal[False] = ...
+) -> Tensor: ...
+@overload
+def apply_kernel_hidden_warp(
+    x_norm: Tensor, cfg: HasDataConfig, device: Device, *, return_gate: Literal[True]
+) -> tuple[Tensor, Tensor]: ...
+def apply_kernel_hidden_warp(
+    x_norm: Tensor, cfg: HasDataConfig, device: Device, *, return_gate: bool = False
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Warp normalized inputs through a hidden bottleneck MLP seen only by the kernel and mean.
 

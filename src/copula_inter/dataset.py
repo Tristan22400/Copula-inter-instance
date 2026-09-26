@@ -264,7 +264,7 @@ def collate_fn(samples: List[dict]) -> dict:
         Sigma_star[b, :N, :N] = s["Sigma_star"]
         mu_star[b, :N] = s["mu_star"]
         sigma_star[b, :N] = s["sigma_star"]
-        if has_prior:
+        if R_prior is not None:
             R_prior[b, :N, :N] = s["R_prior"]
 
     out = {
@@ -284,7 +284,7 @@ def collate_fn(samples: List[dict]) -> dict:
         "n_train": torch.tensor(P_list, dtype=torch.long),
         "n_test": torch.tensor(N_list, dtype=torch.long),
     }
-    if has_prior:
+    if R_prior is not None:
         out["R_prior"] = R_prior
     return out
 

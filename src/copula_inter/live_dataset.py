@@ -29,7 +29,7 @@ _MAIN_PROCESS_GEN_THREADS = 8
 
 
 @contextlib.contextmanager
-def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
+def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS) -> Iterator[None]:
     """Context manager capping torch's intra-op threads for generation in the main process."""
     prev = torch.get_num_threads()
     torch.set_num_threads(n)

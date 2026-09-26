@@ -9,12 +9,13 @@ batched across parameters of the same shape, fused momentum updates
 
 import math
 from collections import defaultdict
+from typing import Any, Callable, Sequence, overload
 
 import torch
 
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps):
+def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int) -> torch.Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
 
@@ -36,7 +37,7 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-def adjust_lr_wd_for_muon(lr, matched_adamw_rms, param_shape):
+def adjust_lr_wd_for_muon(lr: float, matched_adamw_rms: float, param_shape: Sequence[int]) -> float:
     A, B = param_shape
     adjusted_ratio = math.sqrt(max(A, B)) * matched_adamw_rms
     return lr * adjusted_ratio
@@ -50,14 +51,14 @@ class Muon(torch.optim.Optimizer):
 
     def __init__(
         self,
-        param_groups,
+        param_groups: list[dict[str, Any]],
         lr: float = 2e-2,
         weight_decay: float = 0.1,
         matched_adamw_rms: float = 0.2,
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = 5,
-        adamw_betas=(0.95, 0.95),
+        adamw_betas: tuple[float, float] = (0.95, 0.95),
         adamw_eps: float = 1e-8,
     ) -> None:
         defaults = dict(
@@ -72,7 +73,19 @@ class Muon(torch.optim.Optimizer):
         )
         super().__init__(param_groups, defaults)
 
-    def step(self) -> None:
+    @overload
+    def step(self, closure: None = ...) -> None: ...
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        self._update()
+        return loss
+
+    def _update(self) -> None:
         # ---- Muon groups ----
         for group in self.param_groups:
             if not group.get("use_muon", False):

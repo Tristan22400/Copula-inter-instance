@@ -42,6 +42,12 @@ def _renormalize_to_unit_diagonal(M: Tensor) -> Tensor:
     return M * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
 
 
+def _require_s(s: Optional[Tensor], parametrization: str) -> Tensor:
+    if s is None:
+        raise ValueError(f"parametrization={parametrization!r} requires `s`")
+    return s
+
+
 def low_rank_correlation(
     W: Tensor,
     s: Optional[Tensor] = None,
@@ -69,7 +75,7 @@ def low_rank_correlation(
     eye = torch.eye(N, device=W.device, dtype=W.dtype).expand(B, N, N)
 
     if parametrization == "covnorm":
-        D = F.softplus(s)  # (B, N) > 0
+        D = F.softplus(_require_s(s, parametrization))  # (B, N) > 0
         S = torch.matmul(W, W.transpose(-1, -2))  # (B, N, N)
         S = S + torch.diag_embed(D)
         diag = S.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
@@ -77,13 +83,13 @@ def low_rank_correlation(
         Sigma = S * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
         return _renormalize_to_unit_diagonal(Sigma + jitter * eye)
     elif parametrization == "cossim":
-        factor = cossim_correlation(W, s)
+        factor = cossim_correlation(W, _require_s(s, parametrization))
     elif parametrization == "tanhnorm":
         factor = tanhnorm_correlation(W)
     elif parametrization == "sparse_covnorm":
         if lam is None:
             raise ValueError("parametrization='sparse_covnorm' requires `lam`")
-        factor = sparse_covnorm_correlation(W, s, lam)
+        factor = sparse_covnorm_correlation(W, _require_s(s, parametrization), lam)
     else:
         raise ValueError(f"unknown correlation parametrization: {parametrization!r}")
 
@@ -105,19 +111,19 @@ def low_rank_correlation_factor(
     """
     if parametrization == "covnorm":
         # Same diagonal as low_rank_correlation's covnorm branch (softplus(s), clamp 1e-12).
-        D_raw = F.softplus(s)
+        D_raw = F.softplus(_require_s(s, parametrization))
         c = ((W * W).sum(-1) + D_raw).clamp_min(1e-12)
         U = W * c.rsqrt().unsqueeze(-1)
         D = D_raw / c
     else:
         if parametrization == "cossim":
-            factor = cossim_correlation(W, s)
+            factor = cossim_correlation(W, _require_s(s, parametrization))
         elif parametrization == "tanhnorm":
             factor = tanhnorm_correlation(W)
         elif parametrization == "sparse_covnorm":
             if lam is None:
                 raise ValueError("parametrization='sparse_covnorm' requires `lam`")
-            factor = sparse_covnorm_correlation(W, s, lam)
+            factor = sparse_covnorm_correlation(W, _require_s(s, parametrization), lam)
         else:
             raise ValueError(f"unknown correlation parametrization: {parametrization!r}")
         U, D = factor.U, factor.D

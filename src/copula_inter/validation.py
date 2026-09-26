@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Iterable
 
 import matplotlib
 
@@ -14,7 +15,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
 
 from copula_inter.loss import y_space_nll
 from copula_inter.model import build_sigma
@@ -29,7 +29,7 @@ _PLOT_COLLECT_BATCHES = 5
 @torch.no_grad()
 def validate(
     model: nn.Module,
-    val_loader: DataLoader,
+    val_loader: Iterable[dict[str, torch.Tensor]],
     cfg: DictConfig,
     device: str,
     step: int = 0,

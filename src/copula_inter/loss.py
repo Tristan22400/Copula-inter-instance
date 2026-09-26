@@ -14,11 +14,15 @@ energy_score, kl_gaussian, plot_prediction_comparison.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from copula_inter.correlation_factory import LowRankCorrelationFactor
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 
 def _safe_cholesky(K: torch.Tensor, max_attempts: int = 8) -> torch.Tensor:
@@ -175,7 +179,7 @@ def plot_prediction_comparison(
     batch_idx: int = 0,
     n_instances: int = 3,
     mu_tabicl: torch.Tensor | None = None,
-):
+) -> Figure:
     """Plot predicted vs oracle covariance and mean for n_instances instances of one batch element.
 
     Columns: oracle Sigma, predicted Sigma, |difference|, mu (with optional
@@ -510,7 +514,7 @@ def oracle_copula_nll(
 
 
 def y_space_nll(
-    Sigma: torch.Tensor,
+    Sigma: torch.Tensor | LowRankCorrelationFactor,
     z_test: torch.Tensor,
     log_pdf_test: torch.Tensor,
     test_mask: torch.Tensor,

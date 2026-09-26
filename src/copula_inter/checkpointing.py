@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import matplotlib
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 matplotlib.use("Agg")
 import torch
@@ -15,7 +19,14 @@ from torch.amp import GradScaler
 from copula_inter.artifacts import atomic_torch_save
 
 
-def save_checkpoint(model, optimizer, scheduler, cfg, step: int, scaler=None) -> None:
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    cfg: DictConfig,
+    step: int,
+    scaler: GradScaler | None = None,
+) -> None:
     if cfg.training.ckpt_dir is None:
         return
     os.makedirs(cfg.training.ckpt_dir, exist_ok=True)

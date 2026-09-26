@@ -21,6 +21,10 @@ import gc
 import os
 import time
 import warnings
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
 
 # Set before torch initializes CUDA (reduces allocator fragmentation).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -69,15 +73,15 @@ def _is_transient_cusolver_error(exc: BaseException) -> bool:
 
 
 def _generate_shard_with_oom_retry(
-    cfg,
+    cfg: DictConfig,
     n_this: int,
     device: str,
     *,
-    tabicl_model,
+    tabicl_model: TabICLLike | None,
     tabicl_k_folds: int,
     tabicl_split_calib_frac: float = 0.0,
-    marginal_backend=None,
-    marginal_regressor=None,
+    marginal_backend: str | None = None,
+    marginal_regressor: Any = None,
     marginal_probs_n: int = 99,
 ) -> list:
     """Generate n_this episodes for one shard, halving the chunk size on CUDA OOM.

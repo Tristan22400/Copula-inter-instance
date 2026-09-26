@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
 import matplotlib
 
 from copula_inter.probe_batches import _name_seed, _tabicl_pit_batch
+
+if TYPE_CHECKING:
+    from copula_inter.pit import MarginalDistribution, TabICLLike
+    from tabicl._model.quantile_dist import QuantileDistribution
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -34,7 +40,7 @@ from eval.viz.correlation_plots import (
 from inference.copula_inference import normalize_features
 
 
-def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> dict[str, dict]:
+def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal: TabICLLike | None, device: str) -> dict[str, dict]:
     """Fixed real-ERA5 probes per region for the era5_fit/<region> metrics.
 
     For each region, eval.spatial.sweep_core.build_era5_probe freezes a context
@@ -139,7 +145,7 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
     return batches
 
 
-def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dict | None":
+def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal: TabICLLike | None, device: str) -> "dict | None":
     """Fixed sparse-context ERA5 probe for the val/era5_* figures.
 
     One region, fixed days, and a context of fewer than
@@ -190,7 +196,8 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
     x_batch = torch.as_tensor(x_full, dtype=torch.float32, device=device).unsqueeze(0)
 
     true_fields, z_train_per_day = [], []
-    dists_per_day, y_mean_per_day, y_std_per_day = [], [], []
+    dists_per_day: list[QuantileDistribution | None] = []
+    y_mean_per_day, y_std_per_day = [], []
     gp_post_per_day: list = []
     gp_post_z_per_day: list = []
     marginal_var_per_day: list = []
@@ -240,7 +247,8 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
             continue
         with torch.no_grad():
             logits = tabicl_forward(tabicl_marginal, x_batch, context_values_scaled_t.unsqueeze(0))  # (1, D, Q)
-            dist_d = tabicl_marginal.quantile_dist(logits.reshape(D, -1))
+            # TabICL's quantile distribution (exposes mean and variance).
+            dist_d = cast("QuantileDistribution", tabicl_marginal.quantile_dist(logits.reshape(D, -1)))
             dists_per_day.append(dist_d)
             # Variance in Kelvin^2: Var[y_scaled | x] * y_std^2.
             marginal_var_per_day.append((dist_d.variance() * y_std_t.double() ** 2).cpu().numpy())
@@ -364,7 +372,12 @@ def _era5_viz_gp_correlation(gp: dict) -> np.ndarray:
 
 
 def _era5_viz_field(
-    Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.Tensor, z_shared: np.ndarray, device: str
+    Sigma: np.ndarray,
+    dist: MarginalDistribution | None,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    z_shared: np.ndarray,
+    device: str,
 ) -> np.ndarray:
     """One draw (D,) from the copula model: y = F^{-1}(Phi(chol(Sigma) z_shared)).
 
@@ -540,9 +553,8 @@ def _era5_marginal_variance_fig(vb: dict) -> "plt.Figure | None":
     if not vb["days"] or len(var_fields) != len(vb["days"]) or any(v is None for v in var_fields):
         return None
     gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
-    gp_var_fields = [np.sum(gp["L"] ** 2, axis=1) for gp in gp_post if gp is not None]
-    if len(gp_var_fields) != len(vb["days"]):
-        gp_var_fields = None
+    gp_var_list = [np.sum(gp["L"] ** 2, axis=1) for gp in gp_post if gp is not None]
+    gp_var_fields = gp_var_list if len(gp_var_list) == len(vb["days"]) else None
     return plot_marginal_variance_grid(
         vb["lat"],
         vb["lon"],

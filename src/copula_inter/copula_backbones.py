@@ -7,7 +7,7 @@ icl_predictor.decoder). This is independent of the marginal used for the PIT.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -125,7 +125,7 @@ def load_raw_backbone(name: str, cfg: DictConfig) -> nn.Module:
     raise ValueError(f"Unknown copula backbone {name!r}; expected one of {list(BACKBONE_NAMES)}.")
 
 
-def strip_decoder(module: nn.Module) -> int:
+def strip_decoder(module: Any) -> int:
     """Replace module.icl_predictor.decoder with nn.Identity and return feature_dim (the decoder's input size)."""
     decoder = module.icl_predictor.decoder
     first_linear = decoder[0]  # nn.Sequential(Linear, GELU, Linear)
@@ -134,7 +134,7 @@ def strip_decoder(module: nn.Module) -> int:
     return in_features
 
 
-def moe_aux_loss(name: str, module: nn.Module) -> Optional[Tensor]:
+def moe_aux_loss(name: str, module: Any) -> Optional[Tensor]:
     """The backbone's auxiliary loss: TabLDM's MoE z-loss + load-balance term, None for TabICL."""
     if name == "tabldm":
         return module.icl_predictor.moe_aux_loss()

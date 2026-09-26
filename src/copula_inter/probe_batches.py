@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import zlib
+from typing import Iterable
 
 import matplotlib
 
@@ -190,7 +191,7 @@ def _tabicl_pit_batch(
 
 @torch.no_grad()
 def _build_tabicl_val_z(
-    val_loader,
+    val_loader: Iterable[dict[str, torch.Tensor]],
     tabicl_marginal: TabICLLike,
     k_folds: int,
     device: str,
@@ -211,7 +212,7 @@ def _build_tabicl_val_z(
 
 @torch.no_grad()
 def _build_analytic_val_z(
-    val_loader,
+    val_loader: Iterable[dict[str, torch.Tensor]],
     val_episodes_meta: dict[int, list[dict]],
     device: str,
 ) -> dict[int, dict[str, torch.Tensor]]:

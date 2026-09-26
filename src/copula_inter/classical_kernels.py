@@ -11,6 +11,7 @@ objects built with batch_shape=[B].
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import Any, Sequence
 
 import gpytorch
 import torch
@@ -82,7 +83,7 @@ def _stationary_gram(family: str, x: Tensor, ls: Tensor, ard: bool, rq_alpha: fl
     ``kernel(x).to_dense()`` call.
     """
     B, _, d = x.shape
-    kw = {"batch_shape": torch.Size([B])}
+    kw: dict[str, Any] = {"batch_shape": torch.Size([B])}
     if ard:
         kw["ard_num_dims"] = d
     if family == "rbf":
@@ -122,8 +123,8 @@ def _to_correlation(K: Tensor, mask: Tensor) -> Tensor:
 def compute_kernel_bank(
     x: Tensor,
     mask: Tensor,
-    families=DEFAULT_FAMILIES,
-    ard_flags=DEFAULT_ARD,
+    families: Sequence[str] = DEFAULT_FAMILIES,
+    ard_flags: Sequence[bool] = DEFAULT_ARD,
     rq_alpha: float = 1.0,
     lengthscale_scale: float = 1.0,
 ) -> "OrderedDict[str, Tensor]":
@@ -147,13 +148,14 @@ def compute_kernel_bank(
     bank: "OrderedDict[str, Tensor]" = OrderedDict()
     for family in families:
         for ard in ard_flags:
+            ls = ls_ard if ard else ls_iso
+            assert ls is not None  # computed for every flag in ard_flags
             if family == "dot_product":
                 # LinearKernel has no lengthscale; fold the ARD scale into the
                 # inputs (weighted inner product), then normalise to a cosine.
-                xw = x / ls_ard.unsqueeze(1) if ard else x
+                xw = x / ls.unsqueeze(1) if ard else x
                 K = gpytorch.kernels.LinearKernel().to(x.device)(xw).to_dense()
             else:
-                ls = ls_ard if ard else ls_iso
                 K = _stationary_gram(family, x, ls, ard, rq_alpha)
             bank[kernel_name(family, ard)] = _to_correlation(K, mask)
     return bank

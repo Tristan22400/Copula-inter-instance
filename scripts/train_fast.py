@@ -292,7 +292,7 @@ def main(cfg: DictConfig) -> None:
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
     aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
-    triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    triu_cache: dict[int, torch.Tensor] = {}
 
     print(
         f"[train_fast] Ready to train after {time.perf_counter() - t_script0:.1f}s (steps={int(t.steps)}, batch_size={int(t.batch_size)})"
