@@ -1,19 +1,8 @@
-"""
-live_dataset.py — On-the-fly GP episode generation for training without a
-pre-materialised on-disk dataset (see generate_pit_dataset.py / dataset.py
-for the disk-backed path this substitutes for).
+"""Live GP episode generation for training without an on-disk dataset.
 
-Wraps data_gen.generate_gp_batch — already used at train.py's synthetic-kernel
-validation probes (_build_synthetic_kernel_batches), and identical to what
-generate_pit_dataset.py writes to shard_*.pt — in a torch IterableDataset, so
-DataLoader workers generate episodes in background processes while the GPU
-trains on the previous batch. That's the same overlap num_workers/
-prefetch_factor already gives the disk path for reading shards; here it hides
-generation latency instead of I/O latency.
-
-Temporary, easily-removable substitute for the disk pipeline (e.g. during a
-storage-constrained period): enabled via training.live_generation=true in
-train.py. Nothing in this module touches disk.
+LiveGPDataset wraps data_gen.generate_gp_batch in an IterableDataset so
+DataLoader workers generate episodes while the GPU trains. Enabled with
+training.live_generation=true.
 """
 
 from __future__ import annotations
@@ -34,31 +23,14 @@ from copula_inter.pit import configure_tabicl_inference_amp, load_tabicl, resolv
 from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 
-# Thread count for generate_gp_batch calls made directly in the MAIN process
-# (build_fixed_live_val_batches below, train.py's z_train-gap diagnostic) --
-# these never go through a DataLoader's worker_init_fn, so unlike the
-# persistent training workers (_limit_worker_threads below, torch.set_
-# num_threads(1) each) they'd otherwise run at the OS-default thread count
-# (e.g. 64 on a many-core node). Benchmarked: generate_gp_batch's structural-
-# warp and final NaN/Inf-sweep code makes many small/medium CPU tensor ops
-# whose thread-pool launch overhead dominates at high thread counts -- a
-# single 12-tensor isfinite sweep measured 200ms at 64 threads vs 1.2ms at 16
-# (2026-08-23). Unlike the many-worker case, there's only one caller here, so
-# (unlike _limit_worker_threads's 1) a modest thread count is used instead of
-# fully serializing -- 8 stays comfortably inside the fast, flat region the
-# same benchmark found across 1-16 threads without needing per-node tuning.
+# Thread count for generation in the main process (validation batches, gap
+# diagnostic); small CPU ops are slow at high thread counts.
 _MAIN_PROCESS_GEN_THREADS = 8
 
 
 @contextlib.contextmanager
 def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
-    """Temporarily cap torch's intra-op thread count, restored on exit.
-
-    Wrap any generate_gp_batch/_generate_gp_batch_raw call made directly in
-    the main training process (i.e. NOT inside a DataLoader worker, which
-    already gets _limit_worker_threads via worker_init_fn) with this --
-    see _MAIN_PROCESS_GEN_THREADS' docstring above for why.
-    """
+    """Context manager capping torch's intra-op threads for generation in the main process."""
     prev = torch.get_num_threads()
     torch.set_num_threads(n)
     try:
@@ -67,51 +39,16 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
         torch.set_num_threads(prev)
 
 
-# data.z_train_source's only recognized values (see conf/data/gp_tasks.yaml).
-# "exaone"/"tabpfn" route through eval/spatial/exaone_batched.py /
-# tabpfn_batched.py's genuine multi-episode batched forwards (data_gen.py's
-# marginal_backend override) -- the same batched-GPU-worker shape as
-# tabicl_model's pit.py path below, see build_live_train_loader's
-# batched_marginal_worker_enabled for the shared worker/device/spawn
-# handling this now gets.
-#
-# "y_train": no PIT at all -- a no-marginal-model control/ablation arm. The
-# ICL conditioning input becomes the raw per-episode z-scored target
-# ((y_train - mean) / std), computed in-process with no extra model to load
-# (unlike every other non-"analytic" entry here, which loads a frozen
-# marginal backend per worker -- see _RAW_Y_SOURCES below and
-# data_gen.py::_generate_gp_batch_raw's raw_y_override). z_test/log_pdf_test
-# stay the exact analytic oracle, so the loss target and every val metric's
-# ground truth are byte-identical to a z_train_source="analytic" run -- only
-# the model's own context input changes, isolating the PIT-preprocessing
-# question from every other confound. live_generation-only (see
-# generate_pit_dataset.py's on-disk-path guard) -- no on-disk pipeline
-# support exists.
+# Recognized data.z_train_source values. "y_train" uses the z-scored target as
+# z_train (no marginal model; live generation only).
 _VALID_Z_TRAIN_SOURCES = Z_TRAIN_SOURCES
 _GENERIC_MARGINAL_BACKENDS = GENERIC_MARGINAL_BACKENDS
-# z_train_source values needing no marginal model loaded at all (unlike
-# _GENERIC_MARGINAL_BACKENDS/"tabicl"/"tabicl_split") -- the override is a
-# pure tensor op inside data_gen.py, gated by a plain bool thread through
-# every generate_gp_batch call site below.
+# z_train sources that need no marginal model.
 _RAW_Y_SOURCES = ("y_train",)
 
 
 def _validate_z_train_source(z_train_source: str) -> None:
-    """Fail loud on an unrecognized data.z_train_source instead of letting
-    every `z_train_source in TABICL_Z_TRAIN_SOURCES` gate in this module
-    (and train.py::_reserve_gpu_headroom_for_live_tabicl) silently evaluate
-    False and fall back to plain analytic generation.
-
-    Root-caused 2026-08-24: a data.z_train_source=tabicl-split (hyphen) typo
-    doesn't match any of those checks, which all test for "tabicl_split"
-    (underscore) -- so tabicl_live_enabled comes out False, no TabICL model
-    is ever loaded, and the run silently trains as pure analytic with no
-    warning or error. Confirmed via a bit-identical train/loss_ema
-    trajectory, from step 0, between a real data.z_train_source=analytic run
-    and one launched with the "tabicl-split" typo. generate_pit_dataset.py's
-    on-disk pipeline already validates this (see its own z_train_source
-    parsing); this brings the live-generation path to parity.
-    """
+    """Raise ValueError if data.z_train_source is not a recognized value."""
     if z_train_source not in _VALID_Z_TRAIN_SOURCES:
         raise ValueError(
             f"Unknown data.z_train_source {z_train_source!r}; expected "
@@ -119,120 +56,29 @@ def _validate_z_train_source(z_train_source: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Shared-GPU-aware sizing for live-generation's TabICL DataLoader workers
-# ---------------------------------------------------------------------------
-# Each live_tabicl_num_workers worker holds its own frozen-TabICL CUDA
-# context, entirely separate from the training process's own allocator pool
-# (see train.py::_reserve_gpu_headroom_for_live_tabicl, which imports these
-# same constants so the two stay in sync). A worker's per-call VRAM scales
-# with group_size = batch_size * live_tabicl_group_multiplier (that many
-# episodes go through TabICL K-fold PIT in one generate_gp_batch call) -- NOT
-# a flat per-worker figure, confirmed by directly measuring per-worker VRAM
-# (standalone build_live_train_loader benchmark, RTX A5000 24GB / 8 CPU
-# cores, 2026-08-25, data.z_train_tabicl_k_folds=5,
-# training.live_tabicl_group_multiplier=3, workers=2 held fixed) across
-# batch_size: 16 (group_size=48) -> 1.3GB/worker, 64 (group_size=192) ->
-# 3.4GB/worker, 128 (group_size=384) -> 7.0GB/worker -- an almost 5.5x swing
-# entirely from batch_size, at fixed worker count. The old flat
-# _LIVE_TABICL_WORKER_HEADROOM_GB=1.4 (calibrated only at the then-fixed
-# batch_size=16) would silently under-reserve by that much if batch_size
-# were ever raised -- kept as a group_size-aware formula (rather than
-# reverted to flat) since it's strictly more correct at the repo's actual
-# default (batch_size=16, group_size=48) too: fixed=0.5 + 0.02*48=0.96 ~=
-# 1.46GB/worker, matching the old flat constant almost exactly.
-#
-# batch_size=32 (2x the default) was investigated 2026-08-25 as an
-# auto-sizing candidate and reverted (see conf/model/copula_nano.yaml) after
-# real end-to-end runs at that group_size crashed 3 times with "DataLoader
-# worker ... is killed by signal: Aborted" -- a hard OS-level kill (not a
-# catchable torch.cuda.OutOfMemoryError, so train.py's per-step OOM-skip
-# path can't recover from it) from multiple workers loading their own
-# frozen-TabICL checkpoint CONCURRENTLY at startup, at the same time
-# train.py's own main process is ALSO loading its own frozen-TabICL copies
-# for the z_train diagnostic/kernel_fit cache/era5 probes (deliberately
-# overlapped for wall-clock -- see train.py::main). This transient startup
-# spike is NOT the same as the steady-state generation cost the per-episode
-# formula above models, and padding the reserve alone did not reliably fix
-# it across three attempts (only reducing group_multiplier did) -- so the
-# constants below are calibrated for the repo's actual default group_size
-# (48, batch_size=16) only. Raising batch_size/group_multiplier well beyond
-# that is NOT proven safe by this formula alone; re-validate with a real
-# end-to-end run (not just this module's isolated worker-VRAM benchmark,
-# which has no competing main-process load and didn't catch this) before
-# relying on it.
+# Per-worker VRAM estimate for GPU generation workers:
+# _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB + _LIVE_TABICL_WORKER_PER_EPISODE_GB *
+# group_size. Calibrated at batch_size=16, group_size=48; larger group sizes
+# are not validated.
 _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB = 0.5
 _LIVE_TABICL_WORKER_PER_EPISODE_GB = 0.02
-# Flat allowance on top of the per-worker figure above, for each worker's own
-# CUDA context overhead (not activation memory, so it doesn't scale with
-# batch/fold count) plus a general safety margin.
+# Per-worker CUDA context overhead plus margin.
 _LIVE_TABICL_FLAT_HEADROOM_GB = 1.0
-# Default VRAM reserved for the training process's OWN use (model, optimizer
-# state, activations) when auto-sizing live_tabicl_num_workers below -- a
-# floor, not a measurement of any specific run's actual footprint (unknowable
-# before the model is even built), chosen conservatively so auto-sizing
-# doesn't starve training on a small card. Overridable via
-# training.live_tabicl_main_process_reserve_gb (see conf/config.yaml) --
-# e.g. conf/model/copula_nano.yaml sets it much lower, since the frozen
-# TabICL loaded by each WORKER is the same fixed checkpoint regardless of
-# which copula-transformer preset is being trained (so
-# _LIVE_TABICL_WORKER_HEADROOM_GB above must stay model-agnostic), but the
-# MAIN process's own footprint (the model actually being trained) scales
-# with the preset -- nano's few-hundred-K-param backbone needs nowhere near
-# 8GB, so the flat default starves it of workers it could safely have.
+# Default VRAM reserved for the training process when auto-sizing workers
+# (training.live_tabicl_main_process_reserve_gb overrides it).
 _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB = 8.0
-# Empirically validated range for the worker-count auto-sizing below
-# (standalone build_live_train_loader throughput benchmark, RTX A5000 24GB /
-# 8 CPU cores, 2026-08-24, data.z_train_tabicl_k_folds=5,
-# training.live_tabicl_group_multiplier=2): batches/s barely moves (2.8-3.6)
-# across 2-10 concurrent workers -- this GPU's TabICL compute, not worker
-# count, was the binding constraint in that range -- then jumps to a clear
-# peak at 12 workers (4.3 batches/s, mean per-batch wait 234ms vs ~295ms at
-# 6-10 workers) before 14/16 fall back into the 2-10 range's noise band and
-# 20 outright crashes (a DataLoader worker gets OOM-killed -- this node only
-# has 8 CPU cores, so 20 spawned worker processes oversubscribes it 2.5x).
-# 12 is therefore both the measured throughput optimum AND comfortably under
-# the CPU-oversubscription failure mode observed at 20; unlike the old
-# RTX-6000-Ada-benchmarked figure this replaces, treat 12 as tied to an
-# 8-core node -- a node with substantially more CPU cores might sustain
-# higher without the oversubscription risk, but this hasn't been measured.
+# Upper bound on auto-sized workers (throughput peak measured on an 8-core RTX A5000 node).
 _LIVE_TABICL_AUTO_WORKERS_MIN = 1
 _LIVE_TABICL_AUTO_WORKERS_MAX = 12
 
 
 def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
-    """Resolve training.live_tabicl_num_workers, auto-detecting from
-    CURRENTLY FREE (not total) GPU memory when left unset (null in config).
+    """Number of GPU generation workers: training.live_tabicl_num_workers, or auto-sized.
 
-    Using free rather than total device memory is the important part: it's
-    what makes this safe on a node where multiple jobs (this one plus
-    others, possibly with no coordination between them) share one physical
-    GPU. A worker count tuned/hardcoded against one card's FULL VRAM would
-    either starve this run or risk OOM-ing everyone once another job is
-    already holding memory on the same device -- reading free memory at
-    call time naturally shrinks the auto-picked count when that's the case
-    (and grows it back on an idle card), without needing to know anything
-    about what else is running. It only reflects occupancy AT STARTUP,
-    though -- a second job launched on the same GPU after this one has
-    already sized itself is a real, unmitigated risk either way; explicit
-    training.live_tabicl_num_workers (set deliberately low) is the correct
-    tool for a node you know will run several such jobs concurrently.
-
-    Also naturally adapts across GPU models with different VRAM (e.g. a
-    32GB RTX 5000 Ada vs a 48GB RTX 6000 Ada) without per-node tuning, since
-    it's driven by how much memory is actually free, not a name/model
-    lookup.
-
-    Explicit training.live_tabicl_num_workers in config always wins over
-    auto-detection (e.g. to force a known-safe number by hand on a node
-    running several such jobs by agreement).
-
-    training.live_tabicl_main_process_reserve_gb (default
-    _LIVE_TABICL_AUTO_MAIN_PROCESS_RESERVE_GB) overrides how much VRAM is set
-    aside for the main process's own use -- see that constant's docstring
-    for why a smaller model preset (e.g. copula_nano) should lower this to
-    unlock more auto-sized workers instead of being capped by a reserve
-    sized for the largest preset.
+    Auto-sizing divides the currently free GPU memory, minus
+    training.live_tabicl_main_process_reserve_gb and a flat headroom, by the
+    per-worker estimate for this group size, clamped to
+    [_LIVE_TABICL_AUTO_WORKERS_MIN, _LIVE_TABICL_AUTO_WORKERS_MAX].
     """
     configured = t.get("live_tabicl_num_workers", None)
     if configured is not None:
@@ -263,50 +109,14 @@ def resolve_live_tabicl_num_workers(t: DictConfig, device: str) -> int:
 
 
 class LiveGPDataset(IterableDataset):
-    """Infinite stream of GP episodes generated on the fly via generate_gp_batch.
+    """Infinite stream of GP episodes from generate_gp_batch(cfg, group_size, ...).
 
-    Each step of __iter__ advances a per-worker call counter and calls
-    generate_gp_batch(cfg, group_size, device="cpu") — the exact generation
-    code path the disk pipeline and the in-training kernel probes already use.
-
-    IMPORTANT — group_size must be a multiple of the DataLoader's batch_size
-    (build_live_train_loader enforces this; do not construct this class
-    directly with an arbitrary group_size). generate_gp_batch samples
-    kernel/P/N/active_dims *and, for variable-d configs, d_features itself*
-    once per call, shared by every episode in that call — the same homogeneity
-    a disk shard has. collate_fn cannot pad across a mismatched feature axis
-    (unlike P/N), so if a batch straddled two groups with different sampled d,
-    collation would fail exactly the way it does for the disk path's
-    variable-d datasets without ShardHomogeneousBatchSampler. Keeping
-    group_size a multiple of batch_size guarantees every batch comes from
-    exactly one call, so this can't happen — the live-generation equivalent of
-    that sampler, enforced structurally instead of by a separate sampler class.
-
-    generate_gp_batch also has ~1s of fixed per-call overhead (kernel/
-    hyperparameter sampling), so group_size == batch_size (benchmarked ~0.03
-    s/episode at group=32) is both the correctness floor and close to the
-    throughput ceiling — group_size=1 measured ~1.2s/episode, too slow to keep
-    the GPU fed. Cross-batch diversity comes from multiple DataLoader workers
-    each running independently-seeded streams — the live-generation analogue
-    of ShardBlockSampler mixing across shards (traded off against the
-    single-task-per-batch price the disk path already accepts for variable-d
-    datasets — see ShardHomogeneousBatchSampler's docstring in dataset.py).
-
-    Seeding: _generate_gp_batch_raw reseeds torch/numpy/random globally from
-    cfg.seed on every call (data_gen.py), so two calls sharing a cfg.seed are
-    byte-identical. Every (worker_id, call_idx) pair gets its own seed via a
-    hash-like combination of base_seed/worker_id/call_idx, so distinct workers
-    (separate processes — safe to mutate global RNG state independently) and
-    distinct calls within one worker never repeat the same episodes.
-
-    kernel_weights (optional): a `data_gen._COMPOSABLE_KERNELS`-ordered
-    torch.Tensor created with .share_memory_() by build_live_train_loader
-    (see training.adaptive_kernel_sampling). Passed straight through to every
-    generate_gp_batch call — since it's shared memory allocated before the
-    DataLoader forks its workers, the main training loop can mutate it in
-    place (train.py, after each validate() call) and every worker picks up
-    the update on its very next draw, with no explicit IPC. None (default)
-    means unweighted/uniform sampling, unchanged from before this feature.
+    group_size must be a multiple of the loader's batch_size (enforced by
+    build_live_train_loader) so every batch comes from one call and shares d.
+    Each (worker, call) pair gets its own seed (worker_seed). kernel_weights and
+    tabicl_mix_weights are shared-memory tensors that the main process may update
+    after the workers start. With device set, each worker lazily loads its own
+    TabICL (or marginal backend) and generates on that device.
     """
 
     def __init__(
@@ -320,53 +130,17 @@ class LiveGPDataset(IterableDataset):
         marginal_device: Optional[str] = None,
         marginal_probs_n: int = 99,
     ):
-        # Deep-copy so mutating .seed per call never touches the caller's cfg
-        # (and so pickling this Dataset to worker processes doesn't drag along
-        # anything unexpected the caller's cfg object might reference later).
+        # Deep copy so per-call seed changes don't touch the caller's cfg.
         self._cfg = copy.deepcopy(cfg)
         self._base_seed = int(getattr(cfg, "seed", None) or 0)
         self.group_size = group_size
-        # NOT deep-copied: must stay the same shared-memory tensor the main
-        # process updates post-fork (see class docstring above).
+        # Shared-memory tensor, not copied.
         self.kernel_weights = kernel_weights
-        # None (default): every episode generated on CPU, exactly as before
-        # this knob existed -- data.z_train_source=analytic's only supported
-        # live-generation path. A device string ("cuda"): data.z_train_source
-        # is tabicl/tabicl_split, and build_live_train_loader has already
-        # verified `device=="cuda"` and switched the DataLoader to
-        # multiprocessing_context="spawn" (see its docstring for why fork
-        # can't be used here). Each worker process loads its OWN frozen
-        # TabICL copy onto this device, lazily, once, the first time __iter__
-        # runs in that process -- a loaded CUDA model can't be handed to a
-        # worker via fork's copy-on-write (no such mechanism exists across
-        # process boundaries for CUDA memory) or safely pickled through
-        # spawn's IPC without real complexity, so each worker pays its own
-        # one-time checkpoint-load cost instead (~5s, benchmarked) rather
-        # than sharing one instance.
+        # None: generate on CPU. "cuda": each worker loads its own TabICL lazily.
         self.tabicl_device = tabicl_device
-        # NOT deep-copied, same reasoning as kernel_weights above: a
-        # `_COMPOSABLE_KERNELS`-ordered, .share_memory_()'d per-family
-        # mixing-fraction tensor (see data.z_train_tabicl_mix_* in
-        # conf/data/gp_tasks.yaml and train.py::_tabicl_gap_to_mix_frac),
-        # forwarded straight through to every generate_gp_batch call below.
-        # Unlike kernel_weights, this is set ONCE before the training loop
-        # starts and never mutated again during training (the TabICL-vs-
-        # analytic z_train gap it's derived from doesn't move with the
-        # model) — but it still needs to be shared memory rather than
-        # deep-copied, since it's written by the main process AFTER this
-        # Dataset is constructed but BEFORE the DataLoader is first
-        # iterated (workers fork/spawn lazily on first __iter__), same
-        # ordering constraint kernel_weights's docstring above describes.
-        # None (default) reproduces pre-feature behavior exactly (see
-        # _tabicl_mix_prob_for_kernel's docstring in data_gen.py).
+        # Shared-memory tensor, not copied (written once before workers start).
         self.tabicl_mix_weights = tabicl_mix_weights
-        # "exaone"/"tabpfn" (see _GENERIC_MARGINAL_BACKENDS): each worker
-        # builds its own eval/spatial/marginal_backends.make_regressor(...)
-        # instance lazily on first __iter__, exactly mirroring tabicl_model's
-        # per-worker-copy pattern above -- same reasoning (a loaded CUDA
-        # model can't cross a process boundary via fork/spawn cheaply, so
-        # each worker pays its own one-time load). None (default) leaves
-        # z_train_source=analytic/tabicl/tabicl_split behavior untouched.
+        # Non-TabICL backend: each worker builds its own regressor lazily.
         self.marginal_backend = marginal_backend
         self.marginal_device = marginal_device
         self.marginal_probs_n = marginal_probs_n
@@ -377,20 +151,10 @@ class LiveGPDataset(IterableDataset):
         cfg = copy.deepcopy(self._cfg)
         configure_tabicl_inference_amp(bool(cfg.training.get("tabicl_inference_amp", True)))
         call_idx = 0
-        # data_gen.py warns (RuntimeWarning) on every degenerate-episode
-        # discard — a routine, expected event at this call rate (every worker,
-        # every call, for the whole training run), unlike the disk pipeline's
-        # one-shot generate_pit_dataset.py run where the same warnings are
-        # informative. Episodes are still discarded regardless; only the
-        # console spam is silenced here.
+        # Silence per-call degenerate-episode warnings.
         warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-        # z_train_source override setup — done ONCE per worker process,
-        # before the infinite generation loop, not per-call: loading TabICL
-        # (~5s, benchmarked) on every generate_gp_batch call would dominate
-        # runtime. Mirrors generate_pit_dataset.py's "load once up front,
-        # thread through every call" pattern, just scoped to a worker process
-        # instead of the whole run.
+        # Load the marginal once per worker, before the generation loop.
         z_train_source = z_train_source_of(cfg)
         _validate_z_train_source(z_train_source)
         raw_y_override = z_train_source in _RAW_Y_SOURCES
@@ -422,13 +186,7 @@ class LiveGPDataset(IterableDataset):
                 f"for {reason} on {self.tabicl_device}: {ckpt}"
             )
             tabicl_model = load_tabicl(ckpt, self.tabicl_device)
-            # Generation itself (kernel/Cholesky/feature warps, not just the
-            # PIT override) also moves to this device: _generate_gp_batch_raw
-            # takes one device for the whole call, and x_norm_train/
-            # y_train_scaled must already be on tabicl_model's device before
-            # the override call anyway. Measured faster than CPU generation
-            # too (5.7ms/episode GPU vs 117ms/episode CPU at group_size=32),
-            # so this is a net win, not just a requirement.
+            # Generation runs on the same device as the marginal.
             gen_device = self.tabicl_device
 
         marginal_regressor = None
@@ -458,27 +216,13 @@ class LiveGPDataset(IterableDataset):
 
 
 def worker_seed(base_seed: int, worker_id: int, call_idx: int) -> int:
-    """Per-(worker, call) seed in [0, 2**32), the range np.random.seed accepts."""
+    """Per-(worker, call) seed in [0, 2**32)."""
     raw = (base_seed + 1) * 1_000_003 + worker_id * 1_000_000_007 + call_idx
     return raw % (2**32)
 
 
 def _limit_worker_threads(_worker_id: int) -> None:
-    """DataLoader worker_init_fn: pin each live-generation worker to a single
-    CPU thread.
-
-    generate_gp_batch runs GP kernel construction + Cholesky (LOO PIT) on CPU
-    inside every worker (device="cpu"). Left unset, each worker process
-    defaults to torch/BLAS intra-op parallelism sized to the *whole* machine's
-    core count, so live_num_workers processes each fan out over every core --
-    e.g. 8 workers x 20 threads on a 20-core node, ~8x oversubscription. That
-    thrash is consistent with the highly variable step "data=" wait times
-    observed in practice (a few ms up to several hundred ms on the same run):
-    contention severity depends on which other workers happen to be doing CPU
-    work at that instant. One thread per worker lets live_num_workers workers
-    run truly in parallel across the available cores instead of fighting each
-    other for them.
-    """
+    """DataLoader worker_init_fn: one intra-op thread per worker."""
     torch.set_num_threads(1)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -487,70 +231,19 @@ def _limit_worker_threads(_worker_id: int) -> None:
 def build_live_train_loader(
     cfg: DictConfig, t: DictConfig, device: str
 ) -> Tuple[DataLoader, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Training DataLoader backed by LiveGPDataset instead of an on-disk
-    CopulaDataset. Mirrors the disk path's DataLoader kwargs (train.py) so
-    downstream code — batch dict shape, the non_blocking .to(device) call, the
-    train_iter/StopIteration re-creation loop — is unaffected. LiveGPDataset
-    never raises StopIteration, so that re-creation branch simply never fires.
+    """Training DataLoader over LiveGPDataset.
 
-    data.z_train_source (see conf/data/gp_tasks.yaml) analytic (default):
-    every worker generates on CPU, exactly as before this knob existed.
-    tabicl/tabicl_split: each worker instead generates on `device` (must be
-    "cuda" -- there is no viable CPU path, see below) with its own
-    lazily-loaded frozen TabICL copy (LiveGPDataset.__iter__), and the
-    DataLoader is forced onto multiprocessing_context="spawn" instead of the
-    platform default (fork on Linux).
+    Analytic z_train: CPU workers (live_num_workers, capped by available CPUs).
+    TabICL or batched-backend z_train: few CUDA workers (see
+    resolve_live_tabicl_num_workers), each with its own model copy, using the
+    "spawn" start method; device must be "cuda".
 
-    Why spawn is required for GPU workers: fork()'d worker processes inherit
-    the parent's already-initialized CUDA context, which CUDA does not
-    support re-using from a child process ("Cannot re-initialize CUDA in
-    forked subprocess"). spawn re-executes this module fresh in each worker
-    instead of copy-on-write duplicating the parent, so each worker
-    initializes its own CUDA context cleanly -- standard PyTorch guidance for
-    CUDA-using DataLoader workers. Requires train.py's entrypoint to sit
-    behind `if __name__ == "__main__":` (verified -- see bottom of train.py);
-    without that guard spawn would re-execute the whole training script in
-    every worker.
-
-    Why CPU-only TabICL workers were rejected (benchmarked, not assumed):
-    even the cheaper tabicl_split path measured 766ms/episode on CPU with 1
-    thread (matching _limit_worker_threads's constraint) vs 9.75ms/episode on
-    GPU -- ~79x slower, easily enough to stall the GPU waiting on data. K-fold
-    was 4381ms/episode, worse still. Separately, TabICL's own InferenceManager
-    (tabicl_upstream/src/tabicl/_model/inference.py) auto-selects
-    exe_device="cuda" at MODEL CONSTRUCTION time whenever CUDA is visible in
-    the process, independent of the model's own .to(device) placement -- so a
-    naive "just call load_tabicl(ckpt, 'cpu')" in a process that can still see
-    a GPU silently mismatches internal buffers against CPU parameters and
-    crashes; genuine CPU-only execution would additionally require hiding
-    CUDA from the worker (os.environ["CUDA_VISIBLE_DEVICES"] = "") before
-    ever constructing the model. Moot given the throughput gap above, so not
-    implemented.
-
-    VRAM: each GPU worker holds its own TabICL copy (~120MB resident,
-    measured peak ~1.4GB during a tabicl_split call at batch_size=32) on the
-    SAME physical GPU the training job itself uses -- unlike CPU workers,
-    which only needed many of them to make up for slow single-threaded
-    inference, GPU workers are individually fast enough that few are needed
-    (see live_tabicl_num_workers below), so this stays a modest addition to
-    the training job's own VRAM footprint rather than an unbounded one.
-
-    Returns (loader, kernel_weights, tabicl_mix_weights): kernel_weights is a
-    `_COMPOSABLE_KERNELS`-ordered, .share_memory_()'d tensor of per-family
-    sampling weights when t.adaptive_kernel_sampling is true, else None.
-    tabicl_mix_weights is a `_COMPOSABLE_KERNELS`-ordered, .share_memory_()'d
-    tensor of per-family real-TabICL-z_train mixing fractions when
-    data.z_train_tabicl_mix_enabled is true, else None (see
-    data.z_train_tabicl_mix_* in conf/data/gp_tasks.yaml and train.py::
-    _tabicl_gap_to_mix_frac -- unlike kernel_weights, its values are
-    initialized to the floor fraction here and overwritten ONCE from the
-    measured TabICL-vs-analytic z_train gap before training starts, not
-    updated repeatedly during training). Both must be created before the
-    loader is first iterated (i.e. before workers fork/spawn) for the
-    shared-memory update path in train.py to reach the workers — see
-    LiveGPDataset's docstring. share_memory_() tensors use a
-    file-descriptor-based reduction (torch.multiprocessing), not fork's
-    copy-on-write, so this still works unchanged under spawn.
+    Returns:
+        (loader, kernel_weights, tabicl_mix_weights). kernel_weights is a
+        shared-memory _COMPOSABLE_KERNELS-ordered tensor when
+        training.adaptive_kernel_sampling is on, else None. tabicl_mix_weights is
+        one initialized to the floor fraction when data.z_train_tabicl_mix_enabled,
+        else None.
     """
     batch_size = int(t.batch_size)
 
@@ -558,36 +251,11 @@ def build_live_train_loader(
     _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_live_enabled = mix_enabled or z_train_source in TABICL_Z_TRAIN_SOURCES
-    # "exaone"/"tabpfn": eval/spatial/exaone_batched.py / tabpfn_batched.py's
-    # genuine multi-episode batched forwards (data_gen.py's marginal_backend
-    # override) -- fused into ONE forward per k-fold across the whole
-    # group_size call, the same shape of speedup pit.py::run_pit_batched
-    # gives tabicl (see those two modules' docstrings for how each backend
-    # exposes a batchable forward and how it was verified equivalent to the
-    # per-episode fallback). Genuinely the SAME batched-GPU-worker pattern as
-    # tabicl_live_enabled now (not true before exaone_batched.py/
-    # tabpfn_batched.py existed), so this shares every knob below with it
-    # instead of getting its own -- see _batched_marginal_worker_enabled.
+    # Batched non-TabICL backends use the same GPU-worker setup as TabICL.
     generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS
-    # Both paths now need identical worker/device/spawn handling -- one flag
-    # covers both rather than repeating `tabicl_live_enabled or
-    # generic_marginal_enabled` at every call site below. Mutually exclusive
-    # by construction (_VALID_Z_TRAIN_SOURCES is a single string, and
-    # mix_enabled's data.z_train_tabicl_mix_* config is documented as
-    # tabicl-only), so this is never double-counting.
     batched_marginal_worker_enabled = tabicl_live_enabled or generic_marginal_enabled
 
-    # Dedicated group-size knob for the batched GPU-worker path, distinct
-    # from live_group_multiplier (which stays analytic-CPU-worker-only,
-    # unaffected by this default): benchmarked 2026-08-23 that batching 2
-    # training batches' worth of episodes into one generate_gp_batch call
-    # meaningfully helps tabicl amortize its own per-call cost, and the same
-    # reasoning applies to exaone/tabpfn now that they batch too (a bigger
-    # group_size means fewer, larger fused forwards) -- while the analytic
-    # path's docstring already established group_size=1 is close to ITS OWN
-    # throughput ceiling, so bumping the shared knob would help nothing there
-    # and only add cross-batch-diversity risk (see LiveGPDataset's
-    # docstring).
+    # Group-size multiplier for GPU workers (live_group_multiplier is for CPU workers).
     if batched_marginal_worker_enabled:
         group_multiplier = max(1, int(t.get("live_tabicl_group_multiplier", 2)))
     else:
@@ -612,34 +280,12 @@ def build_live_train_loader(
     marginal_device = device if generic_marginal_enabled else None
 
     if batched_marginal_worker_enabled:
-        # Few, fast GPU workers instead of many, slow CPU ones -- see the
-        # VRAM paragraph above. Auto-sized from currently-free GPU memory
-        # when training.live_tabicl_num_workers is left unset (null) -- see
-        # resolve_live_tabicl_num_workers's docstring for why free (not
-        # total) memory matters on a node where this GPU might be shared
-        # with other jobs, and how it adapts across GPU models/VRAM sizes.
-        # SHARED with exaone/tabpfn below despite the name and the formula's
-        # constants being calibrated against TabICL's own per-worker VRAM
-        # footprint specifically -- no dedicated exaone/tabpfn benchmark
-        # exists yet, so this is a reasonable common starting point rather
-        # than a validated per-backend figure. Set
-        # training.live_tabicl_num_workers explicitly once you've measured
-        # your own node/backend/context-size combination.
+        # GPU workers: count from resolve_live_tabicl_num_workers (TabICL-calibrated
+        # for every backend).
         num_workers = resolve_live_tabicl_num_workers(t, device)
     else:
         num_workers = int(t.get("live_num_workers", 8))
-        # live_num_workers=16 is tuned for a 44-core node (see conf/config.yaml);
-        # on a smaller cpuset (e.g. an OAR/Grid5000 job allocated 8 cores) that
-        # oversubscribes CPU 2x and has been observed to OOM-kill workers/the main
-        # process outright — every job in a same-sized 12-job sweep died this way
-        # on 2026-08-06 (one crashed inside a Muon torch.compile trace with a
-        # confusing "RuntimeError when making fake tensor call" that was actually
-        # a killed worker surfacing mid-compile). Clamp to what this process can
-        # actually schedule onto. Not applied to the GPU-worker path above: those
-        # workers are CPU-thread-light (only feature warps/Python-loop overhead
-        # run on CPU, everything else offloaded to the GPU), so CPU oversubscription
-        # isn't the binding constraint there — VRAM is, and num_workers is already
-        # small by default for that reason.
+        # Cap CPU workers at the CPUs available to this process.
         try:
             available_cpus = len(os.sched_getaffinity(0))
         except AttributeError:
@@ -659,13 +305,7 @@ def build_live_train_loader(
     tabicl_mix_weights = None
     if mix_enabled:
         n = len(_COMPOSABLE_KERNELS)
-        # Initialized to the floor fraction uniformly; train.py overwrites
-        # this in place (.copy_()) with the measured per-family gap-driven
-        # fraction once, before the training loop starts (see this
-        # function's Returns docstring above) -- floor here is just a safe
-        # value for the brief window before that happens (e.g. if a worker
-        # somehow drew a batch before the main process finishes the
-        # gap-measurement pass).
+        # Floor fraction until train.py writes the measured values.
         floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
         tabicl_mix_weights = torch.full((n,), floor_frac, dtype=torch.float32).share_memory_()
     marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
@@ -675,11 +315,7 @@ def build_live_train_loader(
         marginal_backend=z_train_source if generic_marginal_enabled else None,
         marginal_device=marginal_device, marginal_probs_n=marginal_probs_n,
     )
-    # Spawn (not fork) is required for ANY CUDA-resident per-worker model --
-    # not tabicl-specific, see build_live_train_loader's docstring above for
-    # why fork can't be reused across a CUDA context. batched_marginal_worker_
-    # enabled always means CUDA now (the device!=="cuda" branch above already
-    # raised otherwise), so this always needs spawn when it's set.
+    # CUDA-resident worker models require spawn.
     loader = DataLoader(
         live_ds,
         batch_size=t.batch_size,
@@ -697,57 +333,16 @@ def build_live_train_loader(
 def build_fixed_live_val_batches(
     cfg: DictConfig, t: DictConfig, device: str = "cpu",
 ) -> Tuple[List[dict], List[List[dict]]]:
-    """Fixed, once-generated validation set for live-generation training.
+    """Fixed validation set for live-generation training.
 
-    Generated once here with fixed, deterministic seeds (distinct from the
-    training seed stream), then cached as plain collated (CPU) batches. Every
-    validate() call iterates this same list instead of resampling, so val
-    metrics track only model changes across training — the live-mode analogue
-    of the disk path's held-out val_indices (train.py) and the existing
-    kernel_fit probes' fixed-seed generation (_build_synthetic_kernel_batches).
+    n_batches generate_gp_batch calls with fixed seeds (each batch is one kernel
+    family and shape), collated on CPU. For TabICL / backend z_train sources a
+    marginal is loaded once in the main process. Episodes keep kernel metadata
+    (with _L_ff/_alpha moved to CPU) for posterior scoring in validate().
 
-    One generate_gp_batch call per batch (not one big call for the whole val
-    set): a single call shares kernel/P/N/active_dims/d_features across all its
-    episodes (see LiveGPDataset), so one call for the full val set would make
-    every validation episode the same task — a much narrower probe than the
-    disk path's val_indices, which stride across many shards/configs. Per-
-    batch calls with distinct fixed seeds keep each batch internally
-    homogeneous (required for collate_fn) while spanning many different
-    kernels/configs across the val set as a whole.
-
-    data.z_train_source=tabicl/tabicl_split: loads its own frozen TabICL copy
-    on `device` (must be "cuda"), used for every val batch, then freed before
-    returning — this runs once in the MAIN process (not a worker), a bounded
-    number of calls (n_batches, typically ~16), so unlike the training-stream
-    workers above this needs no spawn/CPU-throughput considerations. A
-    separate load from train.py's own "z_train sim-to-real diagnostic" copy
-    (different purpose/lifetime) rather than a shared instance, trading one
-    extra ~5s startup load for not threading a loaded model through an
-    unrelated code path.
-
-    Requests return_kernel_metadata=True from every generate_gp_batch call
-    (cheap: extra per-episode fields + the _L_ff/_alpha Cholesky factors
-    already computed as a byproduct of sampling y_train, not new compute) so
-    validate() can run pit.gp_analytical_posterior directly on these SAME
-    episodes instead of needing a separately-drawn probe
-    (train.py::_build_posterior_probe_batches, still used as the disk-mode
-    fallback since CopulaDataset's on-disk shards never carry this metadata).
-    _L_ff/_alpha are moved to CPU before being cached here regardless of
-    gen_device, mirroring _build_posterior_probe_batches's own
-    always-device="cpu" choice — these episodes live for the entire training
-    run, so any risk of them pinning persistent VRAM (when
-    z_train_source=tabicl/tabicl_split puts gen_device="cuda") is worth
-    avoiding even though the tensors themselves are small.
-
-    Returns (batches, episodes_by_batch): batches is the plain list of
-    collated CPU batch dicts (unchanged contract, see below);
-    episodes_by_batch[i] is the raw per-episode list (kernel metadata intact)
-    for batches[i], same order, for validate()'s oracle-posterior scoring.
-
-    Returned as a plain list (not a DataLoader): validate() only ever does
-    ``for batch_idx, batch in enumerate(val_loader)`` and moves each batch to
-    device itself, so a list of CPU batch dicts satisfies that contract with
-    no changes to validate() regardless of z_train_source.
+    Returns:
+        (batches, episodes_by_batch): the collated batches, and for each the list
+        of raw episode dicts.
     """
     n_val = int(t.get("val_episodes", 500))
     val_seed = int(t.get("live_val_seed", 20260723))
@@ -784,13 +379,7 @@ def build_fixed_live_val_batches(
         tabicl_model = load_tabicl(ckpt, device)
         gen_device = device
 
-    # "exaone"/"tabpfn" (see _GENERIC_MARGINAL_BACKENDS): built once here in
-    # the main process, same as tabicl_model above -- this is a bounded
-    # number of calls (n_batches), not the persistent training-stream
-    # workers, so it needs none of build_live_train_loader's spawn/worker-
-    # count handling. gen_device stays "cpu" (GP synthesis itself never runs
-    # on the regressor's device, see LiveGPDataset.__iter__'s equivalent
-    # branch); only marginal_regressor's own forward pass uses marginal_device.
+    # Build the backend regressor once in the main process; GP synthesis stays on CPU.
     marginal_regressor = None
     marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     if generic_marginal_enabled:
@@ -802,10 +391,7 @@ def build_fixed_live_val_batches(
     batches = []
     episodes_by_batch: List[List[dict]] = []
     with warnings.catch_warnings(), limited_main_process_threads():
-        # Same degenerate-episode discard warnings as LiveGPDataset.__iter__
-        # above, silenced here too (scoped to this call, not process-global,
-        # since this runs once in the main process rather than a dedicated
-        # live-generation worker).
+        # Silence degenerate-episode warnings for this call.
         warnings.filterwarnings("ignore", category=RuntimeWarning)
         for i in range(n_batches):
             val_cfg = copy.deepcopy(cfg)

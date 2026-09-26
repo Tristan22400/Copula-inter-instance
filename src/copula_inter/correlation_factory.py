@@ -1,32 +1,9 @@
-"""correlation_factory.py — low-rank correlation-matrix parametrizations.
+"""Low-rank correlation parametrizations.
 
-Every builder below maps raw, unconstrained instance-encoder outputs to a
-valid low-rank-plus-diagonal correlation matrix
-
-    R = U U^T + diag(D),   U in R^{B x d x r},   D in R^{B x d},   D_ii > 0
-
-and returns a ``LowRankCorrelationFactor`` wrapping ``(U, D)`` rather than
-the dense ``R`` itself, so downstream code can choose between:
-
-  - ``.dense()``            — materialize R (B, d, d); what the existing
-    training pipeline consumes today (it runs dense Cholesky on Sigma,
-    which is fine for d <= ~100 — see loss.py's N<=100 comment).
-  - ``.log_det()``           — O(d r^2), Matrix Determinant Lemma.
-  - ``.solve(z)`` / ``.quad_form(z)`` — O(d r^2), Woodbury identity; the
-    actual operation an NLL needs and the only one that avoids ever
-    forming a dense (d, d) tensor.
-  - ``.inverse()``           — dense (B, d, d) precision matrix, built via
-    Woodbury. NOTE: writing out a dense d x d result is inherently O(d^2 r)
-    (d^2 output entries), not O(d r^2) — the O(d r^2) bound only holds for
-    log_det()/solve(), which never materialize the dense inverse. Kept here
-    because it is the natural thing to unit-test against
-    ``torch.linalg.inv(dense())``.
-
-Symmetry and strict positive-definiteness are structural: R is symmetric by
-construction (U U^T is symmetric, D is diagonal) and D_ii > 0 is enforced by
-every builder below (softplus, or an analytic 1 - ||u_i||^2 with ||u_i|| < 1
-strictly), so R = U U^T + D is always strictly PD (sum of a PSD and a
-strictly-PD diagonal matrix).
+Each builder maps unconstrained outputs to R = U U^T + diag(D) with D > 0
+(strictly positive definite) and returns a LowRankCorrelationFactor, which
+provides dense(), log_det() and solve()/quad_form() in O(d r^2), and a dense
+inverse().
 """
 
 from __future__ import annotations
@@ -125,11 +102,6 @@ class LowRankCorrelationFactor:
         return R_inv
 
 
-# ---------------------------------------------------------------------------
-# Parametrization 1: Covariance Normalization (CovNorm)
-# ---------------------------------------------------------------------------
-
-
 def covnorm_correlation(W: Tensor, v: Tensor, eps: float = _EPS) -> LowRankCorrelationFactor:
     """CovNorm: raw W W^T + softplus diagonal, normalized to unit diagonal.
 
@@ -150,11 +122,6 @@ def covnorm_correlation(W: Tensor, v: Tensor, eps: float = _EPS) -> LowRankCorre
     return LowRankCorrelationFactor(U=U, D=D)
 
 
-# ---------------------------------------------------------------------------
-# Parametrization 2: L2-Normalized Cosine Similarity (CosSim)
-# ---------------------------------------------------------------------------
-
-
 def cossim_correlation(V: Tensor, g: Tensor, eps: float = _EPS) -> LowRankCorrelationFactor:
     """CosSim: unit-sphere row directions, scaled by a sigmoid gate.
 
@@ -173,11 +140,6 @@ def cossim_correlation(V: Tensor, g: Tensor, eps: float = _EPS) -> LowRankCorrel
     return LowRankCorrelationFactor(U=U, D=D)
 
 
-# ---------------------------------------------------------------------------
-# Parametrization 3: Tanh Row-Norm Projection (TanhNorm)
-# ---------------------------------------------------------------------------
-
-
 def tanhnorm_correlation(W: Tensor, eps: float = _EPS) -> LowRankCorrelationFactor:
     """TanhNorm: clamp each row's magnitude through tanh, keep its direction.
 
@@ -192,11 +154,6 @@ def tanhnorm_correlation(W: Tensor, eps: float = _EPS) -> LowRankCorrelationFact
     U = scale * W / (n + eps)  # (B, d, r)
     D = 1.0 - (U * U).sum(-1)  # (B, d), strictly > 0
     return LowRankCorrelationFactor(U=U, D=D)
-
-
-# ---------------------------------------------------------------------------
-# Parametrization 4: Sparse Covariance Normalization (SparseCovNorm)
-# ---------------------------------------------------------------------------
 
 
 def sparse_covnorm_correlation(

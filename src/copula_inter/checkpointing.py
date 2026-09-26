@@ -4,20 +4,6 @@ from __future__ import annotations
 
 import os
 
-# P/N (hence attention sequence length T=P+N) are sampled per-shard from a wide
-# range (see conf/data/gp_tasks.yaml P_min/P_max, N_min/N_max), so batches vary
-# a lot in size while batch_size stays fixed — some shards get much closer to
-# the VRAM ceiling than others. When that happens, PyTorch's caching allocator
-# can fail a small allocation despite reserved-but-unallocated memory being
-# nominally sufficient, because it's fragmented into pieces too small to
-# satisfy the request (see the OOM message's "reserved but unallocated"
-# figure). expandable_segments avoids this by growing/shrinking allocations
-# in-place instead of requiring a fresh contiguous chunk. Must be set before
-# the CUDA caching allocator initializes (i.e. before any CUDA call), so this
-# goes at the top of the file, before `import torch`. setdefault so an
-# explicit environment override still wins.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 
 import matplotlib
 
@@ -27,8 +13,6 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 from torch.amp import GradScaler
 
-# eval/ (regions.py, spatial-correlation probe helpers -- see
-# _build_era5_val_batches below) lives at the repo root, not under src/.
 from copula_inter.artifacts import atomic_torch_save
 
 
@@ -58,21 +42,10 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     scaler: GradScaler | None = None,
 ) -> int:
-    """Restore model weights and optimizer/scaler state from a checkpoint.
+    """Restore model weights and optimizer/scaler state; return the saved step (0 if absent).
 
-    Optimizer moments (Adam/Muon) and the AMP grad scaler state are restored
-    so the run doesn't have to relearn gradient statistics from scratch.
-    Returns the step the checkpoint was saved at (0 for legacy checkpoints
-    without a "step" key), which the caller uses to decide where the LR
-    schedule resumes — see the `resume_reset_schedule` handling in train().
-
-    If the checkpoint predates an architecture change (e.g. a head gaining
-    extra layers), its state_dict keys won't match the live model 1:1. We
-    load non-strict in that case (matching tensors restored, new ones keep
-    their random init) and skip restoring optimizer state entirely — Muon/
-    Adam match state to params by position in the flattened param list, and
-    an inserted/removed tensor shifts every param after it, which would
-    silently apply the wrong param's moments downstream of the changed layer.
+    If the state dict does not match the model exactly, load non-strictly and
+    skip optimizer state (its entries are matched by parameter position).
     """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")

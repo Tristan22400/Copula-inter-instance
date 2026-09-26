@@ -1,38 +1,7 @@
-"""copula_backbones.py — per-architecture COPULA backbone adapter.
+"""Copula backbones: build the trunk, strip its quantile decoder, and expose any auxiliary loss.
 
-This is the copula-side analogue of ``src/copula_inter/marginal_backbones.py``: that
-module lets Phase A fine-tune a standalone marginal on a choice of tabular
-foundation model, and this one lets ``src/copula_inter/model.py``'s CopulaTabICL wrap a
-choice of backbone as its frozen-or-finetuned feature extractor. The two are
-INDEPENDENT choices — ``cfg.model.backbone`` (this module) selects the
-copula's own trunk, while ``cfg.data.z_train_source``/Phase-A's
-``marginal.backbone`` (marginal_backbones.py) select the marginal used for
-PIT. A run can mix them freely, e.g. a TabLDM copula backbone scored against
-a frozen TabICL marginal (the default combination — see below).
-
-WHY ONLY THESE TWO, and why the interface is this narrow: everything
-architecture-specific CopulaTabICL needs is:
-
-  1. how to build the pretrained (or from-scratch) trunk,
-  2. how to strip its quantile decoder so it emits raw features instead
-     (the "feature-extractor" pattern the whole model is built on), and
-  3. an optional auxiliary loss term the trunk itself wants added (MoE
-     load-balance/z-loss — only TabLDM has one).
-
-TabICL and Xiaomi-TabLDM are the only two backbones registered here because
-they are the only two with a strippable ``icl_predictor.decoder``: TabLDM
-forks TabICL's architecture wholesale (same col_embedder/row_interactor/
-icl_predictor stages, same decoder shape ``Sequential(Linear, GELU,
-Linear)``, same ``forward(X, y_train) -> (B, N_test, feature_dim)``
-contract — verified empirically, not assumed: stripping the decoder and
-running a loss backward through the result reaches 642/643 parameter
-tensors). EXAONE/TabPFN (marginal_backbones.py's other two) have no such
-swappable stage — EXAONE's attention holds raw Parameters instead of a
-child module, and neither exposes a col/row/icl three-stage split — so
-neither is a copula-backbone candidate; they stay marginal-only.
-
-RECOMPUTE (gradient checkpointing) is handled differently for the two
-backbones — see ``_load_tabldm``'s docstring for why.
+cfg.model.backbone selects "tabicl" or "tabldm" (both have a strippable
+icl_predictor.decoder). This is independent of the marginal used for the PIT.
 """
 
 from __future__ import annotations
@@ -59,17 +28,8 @@ __all__ = [
 BACKBONE_NAMES: tuple[str, ...] = COPULA_BACKBONES
 
 
-# ---------------------------------------------------------------------------
-# TabICL — moved verbatim from model.py (byte-identical behaviour).
-# ---------------------------------------------------------------------------
 def _load_pretrained_tabicl(ckpt_name: str, recompute: bool = False) -> TabICL:
-    # ``ckpt_name`` is either a filename inside the ``jingang/TabICL`` HF repo
-    # (the historical contract) or a path to a local ``.ckpt``/``.pt`` file --
-    # e.g. a Phase-A fine-tuned marginal, which conf/model/copula_prod.yaml's
-    # tabicl.ckpt now defaults to. Mirrors pit.py::load_tabicl's same check,
-    # which is why that path has worked offline all along while this one
-    # (used only when tabicl.pretrained=true selects the copula's own trunk)
-    # didn't.
+    # ckpt is a jingang/TabICL HF filename or a local .ckpt/.pt path.
     if os.path.isfile(ckpt_name):
         ckpt_path = ckpt_name
     else:
@@ -77,16 +37,7 @@ def _load_pretrained_tabicl(ckpt_name: str, recompute: bool = False) -> TabICL:
 
         ckpt_path = hf_hub_download(repo_id="jingang/TabICL", filename=ckpt_name)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    # The checkpoint's saved config carries whatever `recompute` value the
-    # original TabICL training run used (checkpointing is a training-time-only
-    # memory/compute tradeoff, so it's almost always False in a saved config).
-    # Override it here rather than after construction: `recompute` is threaded
-    # through TabICL.__init__ into col_embedder/row_interactor/icl_predictor
-    # and further down into their own nested encoders, each capturing its own
-    # `self.recompute` at construction time — flipping an attribute post-hoc
-    # on only the top-level submodules would miss those nested copies. It adds
-    # no parameters (pure torch.utils.checkpoint control flow), so this has no
-    # effect on `load_state_dict` compatibility below.
+    # Set recompute in the config before construction (nested modules copy it at init).
     ckpt_config = dict(ckpt["config"])
     if recompute:
         ckpt_config["recompute"] = True
@@ -127,48 +78,12 @@ def _build_tabicl_scratch(cfg: DictConfig) -> TabICL:
     )
 
 
-# ---------------------------------------------------------------------------
-# Xiaomi-TabLDM — reuse eval/spatial/marginal_backends.py's loader, not a
-# reimplementation (the same "REUSE, NOT REIMPLEMENTATION" reasoning
-# eval/spatial/tabldm_batched.py's module docstring gives): the real class is
-# TabLDMSparseMoE with a swapped-in ColEmbeddingDualStream column embedder
-# and a dropped dense FFN, none of which this repo should re-derive.
-# ---------------------------------------------------------------------------
+# Xiaomi-TabLDM, loaded through eval/spatial/marginal_backends.
 def _load_tabldm(cfg: DictConfig) -> nn.Module:
-    """Load the pretrained Xiaomi-TabLDM trunk (occams/Xiaomi-TabLDM on HF).
+    """Load the pretrained Xiaomi-TabLDM trunk (no from-scratch option).
 
-    No from-scratch path exists: unlike TabICL, there is no published
-    architecture spec independent of the released checkpoint's own saved
-    config, so ``cfg.tabicl.pretrained=false`` combined with
-    ``cfg.model.backbone=tabldm`` raises rather than silently building
-    something the checkpoint's config happens to describe.
-
-    RECOMPUTE override — deliberately asymmetric, unlike TabICL's:
-    empirically (read off the loaded module, not assumed), the released
-    checkpoint's own saved config already enables gradient checkpointing on
-    two of its three stages (``row_interactor.encoder_prefix.recompute`` and
-    ``icl_predictor.tf_icl.recompute`` both True out of the box) and leaves
-    the third off (``col_embedder.tf_col.recompute`` False — TabLDMRegressor.
-    _load_model hardcodes ``recompute=False`` when it rebuilds
-    ColEmbeddingDualStream post-load, regardless of the checkpoint's own
-    config value). All three attributes are read fresh at every forward
-    call (``if self.recompute: checkpoint(...)`` — plain mutable instance
-    state, not baked into a closure at construction), so flipping them
-    post-hoc is safe.
-
-    Given that, ``cfg.tabicl.recompute=true`` here means "escalate": force
-    every discovered ``.recompute`` flag to True (useful under CUDA OOM,
-    trading compute for the extra activation memory this 71M-param backbone
-    needs relative to TabICL's 28.5M). Leaving it at the shared config
-    group's default (False) is a no-op — it does NOT downgrade the
-    checkpoint's own already-True row/icl settings back to False, unlike
-    TabICL's symmetric override. An explicit False would be equally
-    surprising to silently honour (it would undo an upstream author's own
-    tuning for the two heaviest stages), so this module simply never wires
-    "false" to do anything: the only way to make things worse than the
-    shipped checkpoint would be to overwrite it, and the config default
-    used across every model preset (see conf/model/copula_prod.yaml's
-    ``tabicl.recompute: false``) does not opt into that.
+    cfg.tabicl.recompute=true enables gradient checkpointing on every stage;
+    false keeps the checkpoint's own settings.
     """
     if not bool(cfg.tabicl.get("pretrained", True)):
         raise ValueError(
@@ -196,20 +111,8 @@ def _load_tabldm(cfg: DictConfig) -> nn.Module:
     return module
 
 
-# ---------------------------------------------------------------------------
-# Shared, architecture-agnostic operations
-# ---------------------------------------------------------------------------
 def load_raw_backbone(name: str, cfg: DictConfig) -> nn.Module:
-    """Build the requested backbone's trunk, BEFORE decoder-stripping.
-
-    Reads cfg.tabicl.* regardless of ``name`` — that config group is shared
-    across backbones (pretrained/ckpt/recompute/arch for tabicl; pretrained/
-    recompute only for tabldm, which has no ckpt/arch of its own). It is
-    also read independently by the frozen marginal/PIT path (pit.py,
-    live_dataset.py, era5_live_dataset.py) — those are UNAFFECTED by
-    ``name``, which only selects the copula's own trunk (see this module's
-    docstring).
-    """
+    """Build the named backbone before decoder stripping, from cfg.tabicl.*."""
     if name == "tabicl":
         pretrained = bool(cfg.tabicl.get("pretrained", True))
         recompute = bool(cfg.tabicl.get("recompute", False))
@@ -222,15 +125,7 @@ def load_raw_backbone(name: str, cfg: DictConfig) -> nn.Module:
 
 
 def strip_decoder(module: nn.Module) -> int:
-    """Replace ``module.icl_predictor.decoder`` with ``nn.Identity()``.
-
-    Both backbones share this shape (``icl_predictor.decoder ==
-    Sequential(Linear(feature_dim, hidden), GELU, Linear(hidden,
-    num_quantiles))`` — verified equal in structure for TabICL and TabLDM,
-    just different `feature_dim`/`hidden`/`num_quantiles` numbers), so one
-    function serves both. Returns the discovered ``feature_dim`` (the first
-    Linear's ``in_features``) so the caller can size ``copula_head``.
-    """
+    """Replace module.icl_predictor.decoder with nn.Identity and return feature_dim (the decoder's input size)."""
     decoder = module.icl_predictor.decoder
     first_linear = decoder[0]  # nn.Sequential(Linear, GELU, Linear)
     in_features = first_linear.in_features
@@ -239,19 +134,7 @@ def strip_decoder(module: nn.Module) -> int:
 
 
 def moe_aux_loss(name: str, module: nn.Module) -> Optional[Tensor]:
-    """This backbone's own auxiliary training loss, or None.
-
-    Only TabLDM has one: its Mixture-of-Experts routing carries a built-in
-    z-loss + load-balance term (``icl_predictor.moe_aux_loss()``, already
-    weighted by the checkpoint's own ``moe_router_z_loss_coef``/
-    ``moe_load_balance_loss_coef`` — confirmed grad-carrying, e.g.
-    ``tensor(0.0100, grad_fn=<MeanBackward0>)`` after a real train-mode
-    forward). Dropping this term when fine-tuning the trunk end-to-end risks
-    expert collapse/imbalance with no training signal correcting it, so
-    ``model.py``'s forward surfaces it in the output dict for train.py to
-    add to the total loss (see training.moe_aux_weight). TabICL has no MoE
-    and returns None unconditionally.
-    """
+    """The backbone's auxiliary loss: TabLDM's MoE z-loss + load-balance term, None for TabICL."""
     if name == "tabldm":
         return module.icl_predictor.moe_aux_loss()
     return None

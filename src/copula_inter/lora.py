@@ -1,21 +1,9 @@
-"""
-lora.py — LoRA adapters for the TabICL backbone inside CopulaTabICL.
+"""LoRA adapters for TabICL-style backbones.
 
-Design
-------
-TabICL's MultiheadAttention stores in_proj_weight (shape 3D×D) as a raw
-nn.Parameter and calls multi_head_attention_forward() with it directly.
-Standard PEFT libraries can't wrap this; we handle it ourselves.
-
-LoRAMultiheadAttention is a drop-in replacement for tabicl's
-MultiheadAttention.  It keeps the pretrained weights frozen as buffers
-and adds trainable A/B matrices per target projection (q/k/v/o).
-At forward time it computes W_eff = W_frozen + (B @ A) * scale and
-passes it to the same multi_head_attention_forward() function.
-
-apply_lora() walks the feature_extractor tree, replaces every
-MultiheadAttention found inside the requested stage(s), and freezes
-everything else so only LoRA parameters + the copula head are trained.
+LoRAMultiheadAttention replaces a MultiheadAttention (whose in_proj_weight is
+a raw Parameter) with frozen base weights plus trainable A/B matrices:
+W_eff = W + (B @ A) * alpha / rank. apply_lora swaps them in per stage;
+apply_lora_all_layers instead adds a LoRA parametrization to every 2-D weight.
 """
 
 from __future__ import annotations
@@ -29,28 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-# ---------------------------------------------------------------------------
-# Lazy import of upstream symbols (avoids circular deps / path issues)
-# ---------------------------------------------------------------------------
 
 def _get_mha_class():
-    """Every MultiheadAttention class LoRAMultiheadAttention is a valid
-    drop-in for, as a tuple suitable for ``isinstance``.
-
-    Xiaomi-TabLDM forks TabICL's attention stack: as of tabldm 0.1.0,
-    ``inspect.getsource`` of tabldm._model.layers.MultiheadAttention,
-    _model.attention.multi_head_attention_forward, _model.rope.
-    RotaryEmbedding and _model.kv_cache.KVCacheEntry are all BYTE-IDENTICAL
-    to TabICL's (asserted by tests/test_lora_tabldm_compat.py, so a future
-    upstream divergence fails loudly here instead of silently installing
-    adapters whose forward no longer matches). They are still distinct class
-    OBJECTS, so a lone `isinstance(child, tabicl_MHA)` silently matched
-    nothing on a TabLDM backbone and apply_lora raised "found 0
-    MultiheadAttention modules" -- tier >= 1 was unreachable for TabLDM for
-    that reason alone, not for any architectural one.
-
-    tabldm is optional: absent, this degrades to the TabICL-only tuple.
-    """
+    """Tuple of MultiheadAttention classes LoRAMultiheadAttention can replace (TabICL's, plus TabLDM's if installed)."""
     from tabicl._model.layers import MultiheadAttention  # type: ignore[import]
 
     classes = [MultiheadAttention]
@@ -75,26 +44,17 @@ def _get_kv_types():
     return KVCacheEntry, RotaryEmbedding
 
 
-# ---------------------------------------------------------------------------
-# LoRAMultiheadAttention
-# ---------------------------------------------------------------------------
-
 class LoRAMultiheadAttention(nn.Module):
-    """Drop-in replacement for tabicl's MultiheadAttention with LoRA adapters.
+    """MultiheadAttention with LoRA adapters on the selected projections.
 
-    Frozen pretrained weights are stored as buffers (no gradient).
-    LoRA A/B matrices for the selected projections are stored as Parameters.
-
-    W_eff = W_frozen + scale * (B @ A),   scale = alpha / rank
-
-    B is zero-initialised so the adapter is a no-op at the start of training.
-    A is kaiming-uniform-initialised (standard LoRA practice).
+    W_eff = W_frozen + (B @ A) * alpha / rank; frozen weights are buffers, A is
+    Kaiming-uniform and B zero-initialized.
 
     Args:
-        mha   : the original frozen MultiheadAttention to wrap
-        rank  : LoRA rank r
-        alpha : LoRA scaling alpha (scale = alpha/rank)
-        target: string of projection letters to adapt, subset of "qkvo"
+        mha: the MultiheadAttention to wrap.
+        rank: LoRA rank r.
+        alpha: scaling (scale = alpha / rank).
+        target: projections to adapt, a subset of "qkvo".
     """
 
     def __init__(
@@ -134,9 +94,7 @@ class LoRAMultiheadAttention(nn.Module):
             for p in self.ssmax_layer.parameters():
                 p.requires_grad_(False)
 
-        # --- Trainable LoRA matrices ---
-        # A: (rank, D),  B: (D, rank)
-        # B zero-init → delta = B@A = 0 at start → exact pretrained behaviour
+        # Trainable A: (rank, D), B: (D, rank); B = 0 so the delta starts at zero.
         for proj in ("q", "k", "v", "o"):
             if proj in target:
                 A = nn.Parameter(torch.empty(rank, D, device=mha.in_proj_weight.device))
@@ -145,9 +103,6 @@ class LoRAMultiheadAttention(nn.Module):
                 setattr(self, f"lora_A_{proj}", A)
                 setattr(self, f"lora_B_{proj}", B)
 
-    # ------------------------------------------------------------------
-    # Effective weights (frozen base + LoRA delta)
-    # ------------------------------------------------------------------
 
     def _effective_in_proj_weight(self) -> Tensor:
         W = self.in_proj_weight          # (3D, D) buffer
@@ -168,9 +123,6 @@ class LoRAMultiheadAttention(nn.Module):
             return W + self.scaling * (self.lora_B_o @ self.lora_A_o)
         return W
 
-    # ------------------------------------------------------------------
-    # Forward — identical interface to tabicl's MultiheadAttention
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -220,10 +172,6 @@ class LoRAMultiheadAttention(nn.Module):
             need_kv=need_kv,
         )
 
-
-# ---------------------------------------------------------------------------
-# apply_lora — walk the backbone and replace MultiheadAttention modules
-# ---------------------------------------------------------------------------
 
 _STAGE_KEYWORDS = {
     "col": "col_embedder",
@@ -278,36 +226,20 @@ def set_trainable(
     backbone: nn.Module,
     also_trainable: Sequence[str] = (),
 ) -> int:
-    r"""Freeze every backbone parameter except LoRA adapters and the allowlist.
-
-    The single place that decides what Phase-A / LoRA runs optimize, so
-    ``apply_lora`` and the tier routing in ``src/copula_inter/finetune_marginal.py`` cannot
-    drift apart on the predicate.
+    """Freeze every backbone parameter except LoRA adapters and parameters matching also_trainable.
 
     Args:
-        backbone       : module to freeze in place.
-        also_trainable : regex patterns (``re.search`` against each
-                         ``named_parameters()`` key); a match keeps the
-                         parameter trainable alongside the LoRA adapters.
-                         Regex rather than plain substrings because the
-                         useful selections are conjunctive -- "the norms
-                         inside the ICL stack, but not the identically-named
-                         norms in col_embedder/row_interactor" is
-                         ``r"^icl_predictor\.tf_icl\.blocks\.\d+\.norm[12]\."``
-                         and has no substring spelling. A pattern with no
-                         metacharacters still behaves as a substring match, so
-                         plain names work unchanged. Empty (the default)
-                         reproduces the historical LoRA-only behaviour exactly.
+        backbone: module, frozen in place.
+        also_trainable: regex patterns (re.search on named_parameters() keys)
+            kept trainable. A parametrization's frozen .original never is.
 
     Returns:
-        Number of parameter *tensors* left trainable.
+        Number of trainable parameter tensors.
     """
     regexes = [re.compile(pat) for pat in also_trainable]
     n_trainable = 0
     for name, param in backbone.named_parameters():
-        # A parametrization's `.original` is the frozen base weight by
-        # construction; never let an allowlist pattern unfreeze it (see
-        # is_parametrized_original).
+        # Never unfreeze a parametrization's frozen .original.
         allow = not is_parametrized_original(name) and any(r.search(name) for r in regexes)
         keep = is_lora_param_name(name) or allow
         param.requires_grad_(keep)
@@ -323,31 +255,21 @@ def apply_lora(
     stages: Sequence[str] = ("icl", "row", "col"),
     also_trainable: Sequence[str] = (),
 ) -> int:
-    """Replace MultiheadAttention modules inside *backbone* with LoRA-augmented versions.
+    """Replace the MultiheadAttention modules in the given stages with LoRA versions and freeze the rest.
 
-    After replacement:
-    - All parameters in *backbone* that are NOT LoRA A/B matrices are frozen,
-      except those matching ``also_trainable``.
-    - Only ``lora_A_*``/``lora_B_*`` parameters plus the ``also_trainable``
-      allowlist inside the backbone are trainable.
-
-    ``rank <= 0`` or an empty ``stages`` degrades cleanly to "no adapters,
-    allowlist only" (0 replacements, no error) — this is what makes a
-    Tier-0-style run (norms/label-path/decoder, no attention adaptation)
-    expressible through the same call as a LoRA tier, instead of needing a
-    separate freeze path that could disagree with this one.
+    rank <= 0 or empty stages installs no adapters (only also_trainable stays
+    trainable).
 
     Args:
-        backbone       : the TabICL backbone (nn.Module)
-        rank           : LoRA rank r; ``<= 0`` disables adapters entirely
-        alpha          : LoRA scaling (scale = alpha / rank)
-        target         : subset of "qkvo" — which projections to adapt
-        stages         : stage names; valid values: "col", "row", "icl"
-        also_trainable : regex patterns kept trainable on top of the adapters
-                         (see ``set_trainable``)
+        backbone: TabICL-style backbone.
+        rank: LoRA rank; <= 0 disables adapters.
+        alpha: scaling (scale = alpha / rank).
+        target: subset of "qkvo".
+        stages: subset of "col", "row", "icl".
+        also_trainable: regex patterns kept trainable (see set_trainable).
 
     Returns:
-        Number of MultiheadAttention modules replaced (0 when adapters are off).
+        Number of modules replaced.
     """
     stages = list(stages)
     adapters_requested = int(rank) > 0 and len(stages) > 0
@@ -368,16 +290,8 @@ def apply_lora(
     return n_replaced
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint helpers — save / load only the lightweight LoRA weights
-# ---------------------------------------------------------------------------
-
 def lora_state_dict(model: nn.Module) -> dict:
-    """Return the minimal state dict needed to restore a LoRA-tuned model.
-
-    Includes only parameters that require gradients (LoRA A/B + copula head).
-    This is typically <1 % of the full model size.
-    """
+    """State dict of the parameters that require gradients (LoRA A/B and the copula head)."""
     return {
         k: v.detach().cpu()
         for k, v in model.state_dict().items()
@@ -394,17 +308,8 @@ def load_lora_state_dict(model: nn.Module, state: dict, strict: bool = True) -> 
             raise RuntimeError(f"Unexpected missing keys: {non_lora_missing}")
 
 
-# ---------------------------------------------------------------------------
-# Merge LoRA weights into the frozen base for zero-overhead inference
-# ---------------------------------------------------------------------------
-
 def merge_lora_weights(model: nn.Module) -> None:
-    """Bake LoRA adapters into the frozen buffers and zero out A/B matrices.
-
-    After calling this, the model behaves identically but LoRAMultiheadAttention
-    forward paths are slightly cheaper (no extra matmul).  The operation is
-    in-place.  Not reversible without reloading the original checkpoint.
-    """
+    """Fold the LoRA deltas into the frozen weights in place and zero A/B."""
     for module in model.modules():
         if not isinstance(module, LoRAMultiheadAttention):
             continue
@@ -430,26 +335,10 @@ def merge_lora_weights(model: nn.Module) -> None:
 
 
 def merged_base_state_dict(backbone: nn.Module) -> dict:
-    """State dict of *backbone* with LoRA deltas baked in and the ORIGINAL
-    (adapter-free) TabICL key names restored.
+    """State dict with LoRA deltas merged and the original TabICL parameter names restored.
 
-    ``apply_lora`` swaps each ``MultiheadAttention`` for a
-    ``LoRAMultiheadAttention``, which renames the pretrained tensors
-    (``attn.out_proj.weight`` becomes the buffer ``attn.out_proj_weight``) and
-    adds ``lora_A_*``/``lora_B_*``. A checkpoint written from that state dict
-    is therefore NOT loadable by a plain ``tabicl._model.tabicl.TabICL``, which
-    breaks the whole point of Phase A: its output must be a drop-in
-    replacement for ``tabicl.pit_ckpt``, consumable by every existing call
-    site through one config line.
-
-    This walks the tree, computes ``W + (alpha/r)*B@A`` for every adapted
-    projection, and re-emits it under the name the base model expects, so
-    ``TabICL(**config).load_state_dict(merged_base_state_dict(bb))`` succeeds
-    strictly. Non-adapted parameters pass through untouched. Unlike
-    ``merge_lora_weights`` this is non-destructive -- the live module keeps its
-    adapters and can go on training after an intermediate checkpoint write.
-
-    Returns CPU tensors (detached clones), ready for ``torch.save``.
+    Loads strictly into a stock TabICL; the live module keeps its adapters.
+    Returns detached CPU tensors.
     """
     lora_paths = [
         name for name, m in backbone.named_modules()
@@ -477,35 +366,13 @@ def merged_base_state_dict(backbone: nn.Module) -> dict:
     return sd
 
 
-# ---------------------------------------------------------------------------
-# Universal (all-layers) LoRA
-#
-# LoRAMultiheadAttention above adapts attention by SWAPPING the module. That
-# only reaches architectures whose attention is a swappable nn.Module, which
-# made coverage wildly uneven across the marginal backbones: ~91% of TabLDM's
-# parameters sit in Linear/MultiheadAttention children, but ~98% of EXAONE's
-# are raw nn.Parameters inside custom TensorAttention/FeedForward modules
-# (query_weight/key_weight/value_weight/output_weight, 106 modules) with no
-# submodule to replace and no way to intercept their forward.
-#
-# torch.nn.utils.parametrize adapts the PARAMETER instead of the module: after
-# registration, every read of `module.weight` returns W + (B@A)*scale, so the
-# owning module's forward is untouched and needs to know nothing. That makes
-# "every weight matrix, same rank, every architecture" achievable uniformly --
-# including for modules this repo does not own and must not edit.
-# ---------------------------------------------------------------------------
+# All-layer LoRA via torch.nn.utils.parametrize: adapts parameters rather than
+# modules, so it covers architectures without swappable attention (EXAONE).
 class LoRAParametrization(nn.Module):
-    """``W -> W + (B @ A) * (alpha / rank)`` as a torch parametrization.
+    """Parametrization W -> W + (B @ A) * alpha / rank.
 
-    A/B are held in float32 even when the base weight is float16 (EXAONE's
-    released weights are), and the delta is computed in float32 before being
-    cast back. Optimizer state on fp16 parameters is where small updates
-    silently round to zero; the cast back is required anyway, since
-    register_parametrization refuses to change a tensor's dtype.
-
-    B is zero-initialised, so the adapted weight is EXACTLY the pretrained one
-    at step 0 -- adding adapters never perturbs a pretrained model before any
-    training happens (asserted in tests/test_lora_all_layers.py).
+    A/B and the delta are float32, cast back to W's dtype. B is zero-initialized,
+    so the weight is unchanged at step 0.
     """
 
     def __init__(self, weight: Tensor, rank: int, alpha: float):
@@ -526,15 +393,7 @@ class LoRAParametrization(nn.Module):
 
 
 def is_parametrized_original(name: str) -> bool:
-    """True for the frozen base weight a parametrization hides.
-
-    ``register_parametrization`` renames ``foo.weight`` to
-    ``foo.parametrizations.weight.original``. That name still matches
-    prefix-style tier-0 patterns (``^icl_predictor\\.decoder\\.``), so without
-    this guard set_trainable would unfreeze the full pretrained matrix
-    alongside its adapter -- i.e. quietly full-fine-tune the very layers LoRA
-    was installed on.
-    """
+    """True for the frozen base weight hidden behind a parametrization ("...parametrizations.<name>.original")."""
     return ".parametrizations." in name and name.endswith(".original")
 
 
@@ -545,29 +404,16 @@ def apply_lora_all_layers(
     also_trainable: Sequence[str] = (),
     skip_patterns: Sequence[str] = (),
 ) -> int:
-    """Install a LoRA parametrization on EVERY 2-D weight matrix in *backbone*.
+    """Add a LoRA parametrization to every 2-D weight parameter of backbone; return how many.
 
-    Uniform by construction: one ``rank`` for every layer and every
-    architecture, rather than a per-model subset determined by which modules
-    happen to be swappable. Returns the number of adapted matrices.
-
-    Only ``dim() == 2`` parameters are adapted -- a low-rank factorisation of a
-    1-D tensor is meaningless, so norms and biases are untouched here and stay
-    covered by the tier-0 allowlist (``also_trainable``), which is where they
-    were already handled.
-
-    Attention modules already swapped by ``apply_lora`` are skipped: their
-    pretrained weights live in buffers, not parameters, so they are invisible
-    to this walk and cannot be double-adapted.
+    Attention modules already replaced by apply_lora are skipped (their weights
+    are buffers).
     """
     import torch.nn.utils.parametrize as P
 
     skip = [re.compile(p) for p in skip_patterns]
 
-    # Materialise the target list BEFORE registering anything. Registration
-    # inserts a `parametrizations` ModuleDict holding a LoRAParametrization,
-    # whose own A/B are 2-D parameters -- walking a live tree would adapt the
-    # adapters, and then their adapters, until the recursion limit.
+    # Collect targets before registering, so the adapters' own A/B are not adapted.
     targets = [
         (mod_name, module)
         for mod_name, module in backbone.named_modules()
@@ -590,13 +436,7 @@ def apply_lora_all_layers(
 
 
 def merged_base_state_dict_parametrized(backbone: nn.Module) -> dict:
-    """``merged_base_state_dict``'s counterpart for parametrized adapters.
-
-    Returns the state dict under the ORIGINAL parameter names with each
-    adapted weight replaced by its effective ``W + (B@A)*scale``, so the file
-    loads into a stock model. Non-destructive: the live module keeps its
-    adapters and training continues after an intermediate checkpoint write.
-    """
+    """merged_base_state_dict for parametrized adapters: effective weights under the original names."""
     import torch.nn.utils.parametrize as P
 
     effective = {}
@@ -617,16 +457,7 @@ def merged_base_state_dict_parametrized(backbone: nn.Module) -> dict:
 
 
 def merged_base_state_dict_any(backbone: nn.Module) -> dict:
-    """``merged_base_state_dict`` for whichever adapter style is installed.
-
-    A Phase-A checkpoint has to load into a stock model regardless of how it
-    was adapted, and the two styles rename tensors differently: module
-    replacement turns ``attn.out_proj.weight`` into a buffer
-    ``attn.out_proj_weight``, parametrization turns ``foo.weight`` into
-    ``foo.parametrizations.weight.original``. Callers should not have to know
-    which was used -- picking the wrong merger writes a file that fails
-    ``load_state_dict`` at the next run, long after the training spend.
-    """
+    """merged_base_state_dict for whichever adapter style is installed."""
     import torch.nn.utils.parametrize as P
 
     has_parametrized = any(P.is_parametrized(m) for m in backbone.modules())

@@ -1,37 +1,15 @@
-"""finetune_marginal.py — Phase A entry point.
+"""Phase A: fine-tune a standalone TabICL marginal (quantile decoder intact).
 
-Fine-tunes a STANDALONE TabICL (quantile decoder intact) so its marginal
-posterior predictive is correct for the GP prior the copula is trained on, then
-writes it in TabICL's own checkpoint schema so the copula run picks it up with:
+Trains the marginal's posterior predictive on GP episodes (optionally mixed
+with real ERA5) and writes a TabICL-schema checkpoint usable as
+tabicl.pit_ckpt:
 
-    python -m copula_inter.train tabicl.pit_ckpt=<checkpoints/marginal_finetune/...pt>
+    python -m copula_inter.train tabicl.pit_ckpt=<checkpoint>
 
-Usage
------
+Usage:
     python -m copula_inter.finetune_marginal
     python -m copula_inter.finetune_marginal marginal.tier=1 training.lr=2e-5
-    python -m copula_inter.finetune_marginal wandb.mode=disabled training.steps=20   # smoke
-
-A real Hydra application, not an argparse -> override translator that shells out
-to train.py the way ``src/copula_inter/finetune_era5.py`` does: the Phase-A objective needs
-its own model construction, its own loss and its own validation, so there is no
-train.py invocation to translate INTO. Every knob is therefore a normal Hydra
-override and the composed config is snapshotted into each checkpoint.
-
-Why this is a separate loop rather than a ``training.objective: marginal`` branch
-inside ``src/copula_inter/train.py``: that file's ~3000-line ``main`` is built end to end
-around the copula path — live GP/ERA5 DataLoaders whose workers each hold their
-own frozen TabICL, the copula head, z_train collation, Sigma diagnostics,
-correlogram probes, Muon param groups. Phase A shares none of it: no DataLoader
-at all (the trainable marginal must live in the MAIN process, since gradients do
-not cross process boundaries and nothing can push updated weights into spawned
-workers), no copula head, no z. Threading a second objective through that main
-would mean touching model construction, data, loss, validation and
-checkpointing, putting the working copula path at risk for no reuse. What IS
-shared is shared by import — ``pit`` (the PIT forward), ``data_gen`` (the prior),
-``lora`` (the freeze predicate), ``train.cosine_lr_lambda`` (the schedule) and
-``eval.spatial.sweep_core`` (the ERA5 probe geometry) — so there is no duplicated
-logic, only a duplicated ``for step in range(...)``.
+    python -m copula_inter.finetune_marginal wandb.mode=disabled training.steps=20
 """
 
 from __future__ import annotations
@@ -79,48 +57,12 @@ from copula_inter.pit import (
     run_pit_batched_grad,
 )
 
-# ===========================================================================
-# Deliverable 1 — parameter adaptation and routing
-# ===========================================================================
 
-# Tier 0: the label path, the norms of the stage that does in-context
-# learning, and the module that literally emits the marginal.
-#
-# Routing rationale (checkpoint tabicl-regressor-v2-20260212: col_embedder
-# 0.875M @ width 128, row_interactor 0.397M @ width 128, icl_predictor 27.27M @
-# width 512, of which decoder 1.55M):
-#   * col_embedder / row_interactor only ever see x. They are structurally
-#     uninvolved in mapping *labels* to a predictive law -- the one exception is
-#     col_embedder.y_encoder, which is how context labels enter at all under
-#     col_target_aware=True, hence its inclusion here.
-#   * icl_predictor is where in-context learning happens: it ingests context
-#     labels through its own y_encoder, attends across rows, and decodes the
-#     predictive. Marginal correctness lives there.
-#
-# These are exactly the modules whose INPUT DISTRIBUTION changed (the label
-# path), the ones that renormalize it (the norms), and the one that emits the
-# thing being corrected (the decoder). ~1.56M params, 5.5% of 28.5M.
-#
-# Regex, not substrings: "the norms inside the ICL stack" has no substring
-# spelling that excludes the identically-named norms in col_embedder and
-# row_interactor.
-# Per-architecture, in src/copula_inter/marginal_backbones.py -- TabICL's entry there is
-# character-for-character the tuple that used to live here. Re-exported so
-# existing importers of finetune_marginal.TIER0_PATTERNS keep working.
+# Tier 0: the label path, the ICL-stage norms and the decoder (per architecture
+# in marginal_backbones.py; re-exported here).
 TIER0_PATTERNS: tuple[str, ...] = _BACKBONE_TIER0["tabicl"]
 
-# Tier ladder. Deliberately a ladder and not a guess: Tier 0 can only rescale
-# and remap what the trunk already computes; it cannot change *how much context
-# row j influences query row i*. Posterior contraction with context density is
-# an attention-pattern property, so whether the pretrained attention already
-# implements a good enough GP-like aggregation is an empirical question,
-# answered by climbing this ladder and watching the NLL gap to the analytic
-# oracle plateau (or not).
-#
-# Full fine-tuning is deliberately absent: src/copula_inter/muon.py self-declares Muon "may
-# not work well for finetuning pretrained models", and full FT risks
-# catastrophic forgetting of the general tabular marginal that is the entire
-# reason a TabICL marginal transfers to real ERA5/UCI data at all.
+# Tier ladder: tier 0 plus LoRA on successively more attention stages. No full fine-tuning.
 TIER_SPECS: dict[int, dict] = {
     0: {
         "lora_stages": [],
@@ -152,38 +94,24 @@ def apply_tier(
     backbone_name: str = "tabicl",
     all_layers: bool = False,
 ) -> dict:
-    """Route Phase-A trainability over *backbone* according to ``tier``.
+    """Make the backbone's parameters trainable for the given tier (tier-0 allowlist, plus LoRA for tier >= 1 or all-layer LoRA).
 
-    Every tier keeps the Tier-0 allowlist trainable; tiers >= 1 additionally
-    install LoRA adapters on the listed stages' attention. Both go through
-    ``lora.apply_lora``/``lora.set_trainable``, so the freeze predicate is
-    defined in exactly one place and a tier can never disagree with what a LoRA
-    run does.
-
-    Returns a report dict (also the thing to log as ``n_trainable_params`` so
-    the ladder is visible in the wandb run table).
+    Returns trainable_param_report(backbone) plus the tier and LoRA settings.
     """
     if tier not in TIER_SPECS:
         raise ValueError(f"Unknown tier {tier}; expected one of {sorted(TIER_SPECS)}.")
-    # Raises (rather than clamping) when this architecture cannot reach the
-    # requested tier -- see marginal_backbones.resolve_tier for why.
+    # Raises when the architecture cannot reach the requested tier.
     if not all_layers:
-        # The stage ladder can only reach architectures whose attention is a
-        # swappable module; all_layers below is uniform across all of them, so
-        # it is exempt from that ceiling.
+        # all_layers LoRA is not limited by the stage ladder.
         resolve_tier(backbone_name, tier)
     spec = TIER_SPECS[tier]
     stages = list(spec["lora_stages"])
     patterns = tuple(_BACKBONE_TIER0[backbone_name]) + tuple(extra_patterns)
-    # Fail loudly if an upstream rename has made a tier-0 pattern match
-    # nothing, instead of quietly training a smaller set than we report.
+    # Fail if a tier-0 pattern matches nothing.
     assert_patterns_match(backbone, _BACKBONE_TIER0[backbone_name])
 
     if all_layers:
-        # Every 2-D weight matrix in the model, one shared rank, regardless of
-        # architecture -- see lora.apply_lora_all_layers for why this uses
-        # parametrization rather than module replacement (EXAONE has almost no
-        # swappable modules to replace).
+        # LoRA on every 2-D weight matrix at one shared rank (via parametrization).
         n_replaced = apply_lora_all_layers(
             backbone=backbone,
             rank=int(lora_rank),
@@ -215,7 +143,7 @@ def apply_tier(
 
 
 def trainable_param_report(module: nn.Module) -> dict:
-    """``{n_trainable_params, n_total_params, trainable_frac, n_trainable_tensors}``."""
+    """{n_trainable_params, n_total_params, trainable_frac, n_trainable_tensors}."""
     n_train = sum(p.numel() for p in module.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in module.parameters())
     return {
@@ -224,11 +152,6 @@ def trainable_param_report(module: nn.Module) -> dict:
         "trainable_frac": float(n_train / max(n_total, 1)),
         "n_trainable_tensors": int(sum(1 for p in module.parameters() if p.requires_grad)),
     }
-
-
-# ===========================================================================
-# Analytic targets — the exact marginal posterior predictive
-# ===========================================================================
 
 
 def analytic_marginal_targets(
@@ -241,41 +164,21 @@ def analytic_marginal_targets(
     nugget: Optional[float] = None,
     use_cached_full_context: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact ``N(mu_i, sigma_i^2)`` for the OBSERVABLE target at ``x_qry``,
-    conditioned on ``(x_ctx, y_ctx)``.
+    """Exact N(mu_i, sigma_i^2) of the observed target at x_qry given (x_ctx, y_ctx).
 
-    This is the Phase-A regression target. It differs from
-    ``pit.gp_analytical_posterior`` in three ways, each deliberate:
-
-    * **arbitrary context subset.** ``gp_analytical_posterior`` always conditions
-      on the episode's full ``x_norm_train``. Phase A must condition on whatever
-      the model actually saw in that forward — the K-1 folds for a K-fold query
-      row, all P rows for a test row — because the whole thing being taught is
-      how the predictive contracts with context.
-    * **diagonal only.** The marginal needs ``diag(Sigma_post)``, not the (N,N)
-      matrix. Computed as ``k(x,x) + nugget - ||L^-1 K_fs||^2`` columnwise, so
-      cost is O(P^3 + P^2 N) with no N^2 term.
-    * **observable y, not latent f.** ``nugget`` is added to the query diagonal.
-      ``data_gen.gp_posterior`` defaults to ``latent=True`` (posterior over f*,
-      noise excluded); using that here would make every target systematically
-      over-sharp and teach the head to be overconfident. The nugget is also the
-      hard lower bound on the variance — ``Sigma_post = Cov(f|D) + nugget*I``
-      with the first term PSD — so it doubles as the clamp floor, exactly as
-      ``gp_analytical_posterior`` argues.
-
-    Linear algebra runs in float64 (kernel evaluation stays in the kernel's
-    native float32), matching every other analytic path in ``pit.py``.
+    sigma^2 = k(x, x) + nugget - ||L^{-1} K_fs||^2 (diagonal only, float64),
+    floored at the nugget.
 
     Args:
-        task      : episode dict with ``return_kernel_metadata=True`` fields.
-        x_ctx     : (P_c, d) context features, normalized space.
-        y_ctx     : (P_c,)   context targets, RAW scale.
-        x_qry     : (M, d)   query features.
-        kernel_fn : reconstructed kernel; recomputed from ``task`` if omitted.
-        nugget    : observation-noise variance; read from ``task`` if omitted.
+        task: episode dict with kernel metadata.
+        x_ctx: (P_c, d) context features.
+        y_ctx: (P_c,) raw context targets.
+        x_qry: (M, d) query features.
+        kernel_fn: kernel; rebuilt from task if omitted.
+        nugget: noise variance; read from task if omitted.
 
     Returns:
-        ``(mu, sigma)``, both (M,) float32, on ``x_qry``'s device, RAW scale.
+        (mu, sigma), each (M,) float32 on x_qry's device, raw scale.
     """
     if kernel_fn is None or nugget is None:
         kernel_fn, nugget = _kernel_fn_from_task(task)
@@ -315,20 +218,10 @@ def episode_fold_targets(
     *,
     device: str | torch.device = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Analytic ``(mu, sigma)`` for the K-fold training-query rows in
-    ``query_idx``, each conditioned on ITS OWN fold's context.
+    """Analytic (mu, sigma) for the training rows in query_idx, each conditioned on the other folds.
 
-    ``query_idx`` is the ``train_query_idx`` a fold-subsetted
-    ``pit.run_pit_batched_grad`` returns: the concatenation, in fold order, of
-    the contiguous index blocks it actually scored. The fold membership is
-    re-derived here from the SAME ``fold_size = ceil(P/K)`` rule rather than
-    being passed in, so the target's conditioning set is provably the model's
-    conditioning set — if that rule ever changes in ``pit.py``, this must be
-    updated with it, and the ``tests/test_marginal_finetune.py`` fold-agreement
-    test is what catches the drift.
-
-    Returns ``(mu, sigma)``, both ``(len(query_idx),)``, RAW scale, in
-    ``query_idx``'s own order.
+    Folds are pit.py's contiguous ceil(P/K) blocks. Returns (mu, sigma) in
+    query_idx order, raw scale.
     """
     x_train = task["x_norm_train"].to(device)
     y_train = task["y_train"].to(device)
@@ -352,9 +245,8 @@ def episode_fold_targets(
         qry_rows = query_idx[sel]
         start, end = k * fold_size, min((k + 1) * fold_size, P)
         if cached:
-            # For a joint Gaussian with full precision Lambda and
-            # alpha=Lambda@(y-mean), conditioning q on the complement gives
-            # precision Lambda_qq and mean y_q-Lambda_qq^-1 alpha_q.
+            # With precision Lambda and alpha = Lambda (y - mean), conditioning q on the
+            # complement gives precision Lambda_qq and mean y_q - Lambda_qq^{-1} alpha_q.
             fold_rows = torch.arange(start, end, device=device)
             eye_q = torch.zeros(P, fold_rows.numel(), dtype=torch.float64, device=device)
             eye_q[fold_rows, torch.arange(fold_rows.numel(), device=device)] = 1.0
@@ -381,23 +273,8 @@ def episode_fold_targets(
     return mu_out, sig_out
 
 
-# ===========================================================================
-# Deliverable 3b — the Phase A objective
-# ===========================================================================
-
-
 class MarginalLossWeights:
-    """Weights for the marginal fine-tuning loss terms.
-
-    ``distill`` is the dense analytic-quantile diagnostic; ``pinball`` is the
-    production, strictly consistent sample quantile score; ``nll`` and
-    distribution-based ``crps`` are available as opt-in ablations;
-    ``anchor`` is the anti-forgetting pull toward the pretrained weights.
-
-    Set ``distill=0`` and ``pinball>0`` on a batch with no analytic target
-    (the real-ERA5 mixture fraction). Pinball is higher variance than exact
-    distillation but remains statistically consistent for every quantile.
-    """
+    """Weights of the Phase-A loss terms: distill (analytic quantiles), pinball, nll, crps and anchor (L2 to pretrained weights)."""
 
     def __init__(
         self,
@@ -421,19 +298,7 @@ class MarginalLossWeights:
 def quantile_level_weights(
     alpha_levels: torch.Tensor, tail_power: float = 0.5
 ) -> torch.Tensor:
-    """``w_k ∝ (alpha_k (1-alpha_k))^tail_power``, normalized to mean 1.
-
-    De-emphasizes the extreme levels in the distillation term. Two reasons, not
-    one: ``Phi^-1(0.001) = -3.09`` so the outermost levels carry the largest
-    residuals and would dominate a uniformly-weighted loss; and the outer 20
-    levels in each tail are exactly what
-    ``QuantileDistribution``'s ``TAIL_QUANTILES_FOR_ESTIMATION = 20`` uses to
-    fit its parametric tail, i.e. they are consumed by an extrapolation model
-    rather than read off directly, so forcing them to the analytic Gaussian
-    value is both the hardest ask and the least load-bearing one.
-
-    ``tail_power=0`` gives uniform weights (the ablation).
-    """
+    """Weights w_k proportional to (alpha_k (1 - alpha_k))^tail_power, normalized to mean 1 (tail_power=0 is uniform)."""
     a = alpha_levels.clamp(1e-9, 1 - 1e-9)
     w = (a * (1.0 - a)) ** float(tail_power)
     return w / w.mean()
@@ -454,56 +319,25 @@ def marginal_objective(
     target_mask: Optional[torch.Tensor] = None,
     alpha_levels: Optional[torch.Tensor] = None,
 ) -> dict:
-    """Phase-A loss on ``M`` query rows, all in ``normalize_targets`` space.
+    """Phase-A loss on M query rows, in normalize_targets space.
 
-        L = w_q * Huber( q_ik, mu_i + sigma_i Phi^-1(alpha_k) )       [distillation]
-          + w_p * pinball(alpha_k, y_i - q_ik)                       [quantile score]
-          + w_n * ( -log f(y_i) )                                    [NLL,  proper]
-          + w_c * CRPS( f, y_i )                                     [CRPS, proper]
+        L = w_q * Huber(q_ik, mu_i + sigma_i Phi^{-1}(alpha_k))   [distillation]
+          + w_p * pinball(alpha_k, y_i - q_ik)
+          + w_n * (-log f(y_i))
+          + w_c * CRPS(f, y_i)
 
-    The analytic term is direct quantile regression in ``normalize_targets``
-    space.  An earlier version standardized each prediction error by the
-    *posterior* ``sigma_i``.  Although that has the same pointwise optimum, its
-    gradient is proportional to ``1 / sigma_i`` and made nearly deterministic
-    GP rows dominate every clipped optimizer step.  On a fixed validation set,
-    that objective made both GP and ERA5 NLL worse while direct ERA5 pinball
-    improved both.  The inputs and targets here have already been normalized by
-    the context target standard deviation, so a second, per-query scale division
-    is neither needed nor desirable.
-
-    The terms have the same population optimum, but not comparable decoder
-    gradients. ``QuantileDistribution.log_prob`` first locates the two knots
-    surrounding the single observed ``y`` with ``searchsorted`` and then
-    differentiates only through that local interval. With 999 decoder outputs,
-    this makes the NLL gradient both extremely sparse and orders of magnitude
-    larger per active knot than the dense CRPS/distillation gradients. In
-    practice it teaches the raw decoder to permute/collapse knots; the
-    distribution's sorting step hides that from the training NLL until held-out
-    NLL and calibration deteriorate. Distribution-based CRPS also sees sorted
-    knots, making it invariant to raw-output permutations. Therefore ``nll``
-    and ``crps`` are opt-in diagnostic weights (zero in the shipped
-    configuration), while both are always computed and reported. Direct
-    pinball loss preserves quantile identities on real data, and analytic
-    quantile distillation does so on synthetic data.
+    nll and crps are always computed and reported even at weight 0.
 
     Args:
-        q             : (M, Q) raw decoder quantile values, scaled space.
-        y             : (M,)   observed targets, scaled space.
-        quantile_dist : the model's ``QuantileToDistribution`` module.
-        mu, sigma     : (M,) analytic targets, scaled space. Omit to skip the
-                        distillation term (real-data mixture batches).
-        target_mask   : (M,) bool; rows with a usable analytic target. Rows
-                        outside it still contribute configured sample scores;
-                        a kernel family this repo cannot reconstruct
-                        (``_kernel_fn_from_task`` raising) is a missing dense
-                        target, not a missing observation, so dropping the
-                        whole episode would throw away potentially valid
-                        sample-score signal. ``None`` means "all rows".
-        alpha_levels  : (Q,) nominal levels; taken from ``quantile_dist`` if
-                        omitted.
+        q: (M, Q) raw decoder quantiles.
+        y: (M,) targets.
+        quantile_dist: the model's QuantileToDistribution module.
+        mu, sigma: (M,) analytic targets; omit to skip distillation.
+        target_mask: (M,) bool, rows with an analytic target (None = all).
+        alpha_levels: (Q,) levels; read from quantile_dist if omitted.
 
-    Returns a dict of scalar tensors: ``loss`` plus each term unweighted, so
-    the logger can show what is actually moving.
+    Returns:
+        dict of scalar tensors: loss and each unweighted term.
     """
     if alpha_levels is None:
         alpha_levels = quantile_dist.alpha_levels.to(q.device, dtype=q.dtype)
@@ -519,9 +353,7 @@ def marginal_objective(
         "crps": crps.mean(),
         "pinball": pinball.mean(),
     }
-    # Do not spell this as ``0 * nll``: apart from retaining the pathological
-    # sparse NLL graph, IEEE arithmetic would let a diagnostic NaN contaminate
-    # an otherwise finite objective even when its configured weight is zero.
+    # Skip zero-weight terms rather than multiplying by 0 (a NaN would still propagate).
     loss = q.sum() * 0.0
     if weights.nll != 0.0:
         loss = loss + weights.nll * out["nll"]
@@ -555,18 +387,7 @@ def marginal_objective(
 
 
 class AnchorPenalty:
-    """L2 pull of the trainable parameters toward their pretrained values.
-
-    The anti-forgetting term. A TabICL marginal is worth fine-tuning precisely
-    because it transfers to real tabular/ERA5 data with non-Gaussian marginals;
-    the GP prior has Gaussian marginals, so an unconstrained run can improve
-    synthetic nats by collapsing the head toward "always Gaussian" and destroy
-    exactly the property that made it useful. This, the low LR, the tier
-    topology, the real-ERA5 mixture and the ``run_benchmarks.py`` regression
-    gate are five independent guards on that one failure mode.
-
-    Snapshots only the trainable tensors (Tier 0 is ~1.6M floats, ~6MB).
-    """
+    """L2 penalty pulling the trainable parameters toward their initial (pretrained) values."""
 
     def __init__(self, module: nn.Module) -> None:
         self.ref = {
@@ -588,19 +409,8 @@ class AnchorPenalty:
         return total
 
 
-# ===========================================================================
-# Metrics — marginal only. No Sigma, no copula term, nothing correlation-shaped.
-# ===========================================================================
-
-
 def ks_uniform(u: np.ndarray) -> float:
-    """Kolmogorov-Smirnov statistic of ``u`` against Uniform(0,1).
-
-    ``u = F(y)`` is uniform iff the predictive law is correct, so this is the
-    single most direct scalar test of marginal calibration. Computed by hand
-    (rather than ``scipy.stats.kstest``) to keep the two-sided sup over both
-    ECDF branches explicit and avoid a scipy import in the training loop.
-    """
+    """Kolmogorov-Smirnov statistic of u against Uniform(0, 1)."""
     u = np.sort(np.asarray(u, dtype=float).ravel())
     n = u.size
     if n == 0:
@@ -610,13 +420,7 @@ def ks_uniform(u: np.ndarray) -> float:
 
 
 def rank_histogram(u: np.ndarray, n_bins: int = 20) -> np.ndarray:
-    """Normalized rank histogram of ``u = F(y)``.
-
-    Flat = calibrated. U-shaped = over-sharp (observations fall in the tails too
-    often). Dome-shaped = under-sharp. This is the diagnostic that says *how* a
-    non-flat PIT is wrong, which a single KS number cannot; no rank-histogram
-    code existed in the repo before this.
-    """
+    """Normalized histogram of u = F(y): flat is calibrated, U-shaped over-sharp, dome-shaped under-sharp."""
     counts, _ = np.histogram(np.asarray(u, dtype=float).ravel(), bins=n_bins, range=(0.0, 1.0))
     total = counts.sum()
     return counts / total if total else counts.astype(float)
@@ -633,16 +437,11 @@ def marginal_metrics(
     eps: float = 1e-6,
     n_rank_bins: int = 20,
 ) -> dict:
-    """Marginal-only calibration metrics for ``M`` query rows.
+    """Marginal calibration metrics for M query rows.
 
-    ``q``/``y`` are in ``normalize_targets`` space. ``log_std``/``y_std`` are
-    that normalization's own scale, used to report RAW-y units:
-    ``log p_raw(y) = log p_scaled(y_s) - log(std)`` (so ``nll_raw = nll_scaled +
-    log std``) and ``crps_raw = crps_scaled * std`` — the same Jacobian
-    convention ``train.py::_tabicl_pit_batch`` and ``data_gen`` already use, so
-    these numbers are directly comparable to ``val/y_nll_marginal``.
-
-    ECE, KS and the rank histogram are scale-free and identical in either space.
+    q and y are in normalize_targets space; log_std/y_std convert NLL and CRPS to
+    raw-y units (nll_raw = nll + log std, crps_raw = crps * std). ECE, KS and the
+    rank histogram are scale-free.
     """
     from eval.spatial.calibration import compute_quantile_ece
 
@@ -677,34 +476,14 @@ def marginal_metrics(
 def oracle_marginal_nll(
     y: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor
 ) -> float:
-    """``-log N(y; mu, sigma^2)`` averaged — the analytic floor the model's own
-    marginal NLL is measured against.
-
-    The gap ``nll_model - nll_oracle`` in nats/point is the headline number for
-    this whole workstream and the acceptance criterion for a Phase-A run: it is
-    the part of the joint NLL that ``y_space_nll``'s marginal term currently
-    cannot improve because that term has no trainable parameters at all.
-    """
+    """Mean -log N(y; mu, sigma^2): the analytic floor for the model's marginal NLL."""
     var = sigma.clamp(min=1e-12) ** 2
     nll = 0.5 * (torch.log(2 * math.pi * var) + (y - mu) ** 2 / var)
     return float(nll.mean())
 
 
-# ===========================================================================
-# One training step's worth of work on a batch of synthetic GP episodes
-# ===========================================================================
-
-
 def stack_episodes(episodes: Sequence[dict], device: str | torch.device) -> dict:
-    """Collate ``data_gen.generate_gp_batch``'s per-episode dicts into the
-    (B, ...) tensors ``pit.run_pit_batched*`` wants, plus the per-episode
-    ``normalize_targets`` scale.
-
-    No padding and no masks: every episode from one ``generate_gp_batch`` call
-    shares P and N by construction (that is the precondition
-    ``run_pit_batched`` documents), which is exactly why Phase A generates
-    batch-at-a-time instead of sampling episodes independently.
-    """
+    """Stack same-shape generate_gp_batch episodes into (B, ...) tensors plus each episode's normalize_targets scale."""
     x_train = torch.stack([e["x_norm_train"] for e in episodes]).to(device)   # (B,P,d)
     y_train = torch.stack([e["y_train"] for e in episodes]).to(device)        # (B,P)
     x_test = torch.stack([e["x_norm_test"] for e in episodes]).to(device)     # (B,N,d)
@@ -742,39 +521,13 @@ def phase_a_batch_loss(
     timings: Optional[dict[str, float]] = None,
     marginal_probs_n: "int | None" = None,
 ) -> dict:
-    """One Phase-A training step's forward + loss on a batch of GP episodes.
+    """Forward and loss of one Phase-A step on a batch of GP episodes.
 
-    Query rows are scored under exactly the conditioning deployment uses:
-    ``N`` test rows against the full ``P``-row context, plus ``folds_per_step``
-    of the ``K`` contiguous training folds against their own ``K-1``-fold
-    context. Both are conditioned on the context that forward actually saw, so
-    there is no train/serve skew in context size or fold geometry — and because
-    ``P`` is resampled per batch by ``generate_gp_batch``, the model sees a
-    range of context densities rather than memorizing one.
-
-    ``folds_per_step`` (default: all ``K``) subsamples the fold rotation. Phase
-    A never needs a complete ``z_train`` — it scores each query row's own
-    predictive density, not its PIT residual — so scoring a random subset is an
-    unbiased estimate of the same objective at 1/K the forward cost, with the
-    fold geometry untouched.
-
-    Episodes whose kernel family cannot be reconstructed
-    (``NotImplementedError``/``KeyError`` from ``_kernel_fn_from_task``, e.g.
-    whole-chain outer sign modulation) have no distillation target rather than
-    crashing the run. They still contribute any configured sample-score terms;
-    with the shipped pinball loss they still provide valid sample supervision.
-    The precedent ``gp_analytical_posterior``'s callers already set.
-
-    ``tabicl`` may be a raw TabICL module (the original path, scored through
-    pit.py::run_pit_batched_grad at TabICL's native quantile levels) or a
-    ``MarginalBackbone`` (src/copula_inter/marginal_backbones.py). For a non-TabICL
-    backbone the forward instead goes through
-    ``marginal_backbones.kfold_quantiles_grad``, which reproduces pit.py's
-    CONTIGUOUS-block fold geometry exactly -- that geometry is what
-    ``episode_fold_targets`` conditions its analytic targets on, so a
-    different partition would score every training row against a target built
-    from the wrong context. Everything after the forward (targets, objective,
-    oracle gap) is architecture-agnostic and shared verbatim.
+    Scores the N test rows against the full context and folds_per_step of the K
+    training folds against their K-1-fold context (default all K). Episodes
+    whose kernel cannot be rebuilt get no distillation target but still
+    contribute sample-score terms. tabicl is a TabICL module or a
+    MarginalBackbone (marginal_backbones.kfold_quantiles_grad, same fold geometry).
     """
     def _mark(name: str, started: float) -> float:
         if timings is not None:
@@ -794,12 +547,7 @@ def phase_a_batch_loss(
     P = batch["x_train"].shape[1]
     K = max(2, min(int(k_folds), P))
 
-    # Only the folds that are actually non-empty are eligible. pit.py splits P
-    # into ceil(P/K)-sized contiguous blocks, so for P=16, K=10 the block size
-    # is 2 and folds 8 and 9 cover nothing -- sampling from range(K) would then
-    # request an empty fold and score no rows at all. This is not hypothetical:
-    # Phase A deliberately draws P from a wide range (conf/data/
-    # gp_tasks_marginal.yaml), so small-P batches with P < K are routine.
+    # Sample only non-empty folds (for P < K some ceil(P/K) blocks are empty).
     fold_size = math.ceil(P / K)
     n_folds_eff = math.ceil(P / fold_size)
     if folds_per_step is None or folds_per_step >= n_folds_eff:
@@ -811,10 +559,7 @@ def phase_a_batch_loss(
 
     is_backbone = isinstance(tabicl, MarginalBackbone) and tabicl.name != "tabicl"
     if is_backbone:
-        # None => the model's native decoder grid (999 levels for every
-        # backbone here, TabICL included). That is what the TabICL path has
-        # always scored, so leaving it native keeps the objective comparable
-        # across backbones instead of scoring a resampling of one of them.
+        # None: score the model's native decoder grid (999 levels).
         probs = (
             None if marginal_probs_n is None
             else np.linspace(
@@ -861,10 +606,7 @@ def phase_a_batch_loss(
     sig_all = torch.ones(B, M, device=q_test.device)
     mask_all = torch.zeros(B, M, dtype=torch.bool, device=q_test.device)
     n_ok = 0
-    # These are fixed supervision targets, never trainable quantities. gpytorch
-    # kernel objects own requires-grad parameters by default, so without this
-    # guard autograd retains and traverses their entire Cholesky/solve graph
-    # even though those ephemeral parameters are absent from the optimizer.
+    # Compute analytic targets without autograd.
     with torch.no_grad():
         for b, ep in enumerate(episodes):
             try:
@@ -900,10 +642,7 @@ def phase_a_batch_loss(
         q_flat, y_flat, quantile_dist, weights,
         mu=mu_flat, sigma=sig_flat, target_mask=mask_flat,
     )
-    # QuantileDistribution sorts raw decoder outputs before scoring them. That
-    # is useful at inference, but can conceal a decoder collapse during
-    # training. Keep the pre-sort crossing rate visible in every train/val
-    # record; the failed NLL-optimized run climbed from ~0.6% to ~49%.
+    # Report the pre-sort quantile crossing rate (a decoder collapse shows up here).
     res["raw_crossing_frac"] = float(
         (q_flat[:, 1:] < q_flat[:, :-1]).float().mean().detach()
     )
@@ -914,47 +653,17 @@ def phase_a_batch_loss(
         if n_ok
         else float("nan")
     )
-    # The headline number: how many nats/point the model's marginal is above the
-    # analytic floor on exactly these query rows, under exactly this
-    # conditioning. This is what a Phase-A run has to drive toward zero.
+    # Gap of the model's marginal NLL to the analytic floor on these rows.
     res["nll_gap_to_oracle"] = float(res["nll"].detach()) - res["oracle_nll"]
     return res
 
 
-# ===========================================================================
-# Deliverable 3d — validation on real ERA5 regions, MARGINAL METRICS ONLY
-# ===========================================================================
-
-
 def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
-    """Fixed per-region real-ERA5 probes for Phase-A validation, carrying RAW
-    ``(x, y)`` only.
+    """Fixed per-region real-ERA5 probes for Phase-A validation, holding raw (x, y).
 
-    Same geometry as the copula run's own ERA5 validation
-    (``train.py::_build_era5_val_batches`` -> ``sweep_core.build_era5_probe``):
-    the five ``baselines.era5_regions``, ``era5_grid_size``, ``era5_n_context``,
-    the same fixed per-region seed. Reusing that geometry is the point — it
-    makes a Phase-A run's real-data numbers directly comparable to the copula
-    run's, on the same points.
-
-    Two deliberate differences:
-
-    * **``tabicl_marginal=None``.** ``build_era5_probe`` would otherwise PIT the
-      context ONCE here and cache ``z_train``. That caching is valid only
-      because the marginal is frozen in the copula run; in Phase A the marginal
-      changes every step, so a cached PIT would silently freeze the validation
-      metric at its step-0 value. Passing None skips it, and this function keeps
-      the raw values instead — the fetch/crop cost stays a one-off, only the
-      forward repeats.
-    * **no correlogram, no GP baseline, no Sigma.** Phase A is marginal-only;
-      ``rho_emp``/``pair_counts``/``gp_baseline_nll`` are copula diagnostics and
-      are dropped here rather than computed and ignored.
-
-    The probes come from ``eval/data/fetch_era5.py``, whose ``start_date``
-    defaults to ``2023-01-01`` — the same held-out year as
-    ``eval/data/cache/era5_global_val/``, and disjoint from the 2013-2022
-    ``era5_global_train/`` months the training mixture draws from. Validation is
-    therefore on genuinely unseen time by construction, not by convention.
+    Same geometry and seeds as the copula run's ERA5 probes
+    (sweep_core.build_era5_probe with tabicl_marginal=None), without correlation
+    or GP-baseline fields. Data comes from the held-out 2023 period.
     """
     from eval.configs.regions import REGIONS as ERA5_REGIONS
     from eval.spatial.sweep_core import build_era5_probe
@@ -973,12 +682,7 @@ def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
     for region in region_names:
         if region not in ERA5_REGIONS:
             continue  # not a registered eval/configs/regions.py entry
-        # zlib.crc32, not hash(): Python's str hash is salted per process
-        # (PYTHONHASHSEED), so hash() here would draw a DIFFERENT context
-        # sample every run and make the validation curve incomparable across
-        # runs -- and incomparable with the copula run's own era5_fit probes.
-        # This is byte-identical to train.py::_name_seed, deliberately, so both
-        # phases validate on exactly the same points.
+        # zlib.crc32 seed, same as probe_batches._name_seed, so both phases use the same points.
         seed = base_seed + (zlib.crc32(region.encode()) % 10_000)
         probe = build_era5_probe(
             region, grid_size, n_days_fetch, n_days_probe, n_context,
@@ -1006,19 +710,10 @@ def validate_era5_marginal(
     eps: float = 1e-6,
     marginal_probs_n: "int | None" = None,
 ) -> dict:
-    """Marginal-only metrics per region, plus across-region means.
+    """Marginal metrics per ERA5 region and their means: val_marginal/<region>/{nll, crps, ece, ks, clamp_frac}, val_marginal/mean_*.
 
-    Emits ``val_marginal/<region>/{nll,crps,ece,ks,clamp_frac}`` and
-    ``val_marginal/mean_*``. Nothing correlation-shaped: no Sigma, no copula
-    term, no comparison of anything to an oracle ``R_star`` — per this repo's
-    standing rule that TabICL's PIT distorts z-space, so only full predictive
-    densities are valid comparisons.
-
-    The query points are held out by construction (``build_era5_probe`` draws
-    them from the never-in-context remainder), so this uses
-    ``fold_subset=[]``: one forward with the full context, no leakage-avoiding
-    fold rotation needed. It still goes through ``run_pit_batched_grad`` so the
-    forward/CDF/log_prob path is byte-identical to training's.
+    Query points are outside the context, so one full-context forward
+    (fold_subset=[]) is used.
     """
     per_region: dict[str, dict] = {}
     is_backbone = isinstance(tabicl, MarginalBackbone) and tabicl.name != "tabicl"
@@ -1063,8 +758,7 @@ def validate_era5_marginal(
             q = out["q_test"].squeeze(2)                                  # (days, N, Q)
             quantile_dist = module.quantile_dist
 
-        # Per-day std, broadcast over that day's query rows, so the raw-nats
-        # Jacobian is each day's own -- days are normalized independently.
+        # Per-day std for the raw-nats conversion.
         n_q = q.shape[1]
         log_std = std_t.log().unsqueeze(1).expand(-1, n_q).reshape(-1)
         y_std = std_t.unsqueeze(1).expand(-1, n_q).reshape(-1)
@@ -1096,21 +790,8 @@ def validate_synthetic_marginal(
     device: str | torch.device = "cuda",
     marginal_probs_n: "int | None" = None,
 ) -> dict:
-    """Synthetic-GP counterpart of the ERA5 pass: the analytic headroom.
-
-    ``val_marginal/gp/nll`` vs ``val_marginal/gp/nll_oracle`` and their
-    difference ``val_marginal/gp/nll_gap_to_oracle`` — the number this whole
-    workstream exists to drive toward zero, and the one that says whether a run
-    that looks good on ERA5 is actually learning the posterior or just learning
-    to be blurry.
-
-    Watch it against the ERA5 block: a run that improves synthetic-GP nats while
-    ``val_marginal/mean_nll``/``mean_ece`` degrade is overfitting to the GP
-    prior's Gaussianity and should be stopped.
-    """
-    # Report the actual synthetic training objective on the fixed validation
-    # episodes too. Previously validation only reported density scores, so a
-    # run could not distinguish poor loss generalization from a broken update.
+    """Marginal metrics on the fixed GP validation set: val_marginal/gp/nll, nll_oracle, nll_gap_to_oracle and the training objective."""
+    # Also report the training objective on the validation episodes.
     metric_w = MarginalLossWeights(distill=1.0, nll=0.0, crps=0.0)
     nlls, crpss, distills, oracles, crossings = [], [], [], [], []
     for episodes in episode_batches:
@@ -1139,11 +820,6 @@ def validate_synthetic_marginal(
     return out
 
 
-# ===========================================================================
-# Checkpointing — TabICL-native, so the output IS a pit_ckpt
-# ===========================================================================
-
-
 def save_marginal_checkpoint(
     path: str,
     backbone: nn.Module,
@@ -1153,17 +829,9 @@ def save_marginal_checkpoint(
     cfg=None,
     extra: Optional[dict] = None,
 ) -> None:
-    """Write a Phase-A checkpoint in TabICL's OWN ``{"config", "state_dict"}``
-    schema, with LoRA deltas merged into the base weights.
+    """Write a TabICL-schema checkpoint ({"config", "state_dict"}, LoRA merged) that pit.load_tabicl can read.
 
-    Deliberately not ``train.py::save_checkpoint``'s schema. That one is for
-    copula checkpoints, whose consumer is ``eval/configs/checkpoints.py`` and
-    the eval runners. A Phase-A artifact's consumer is ``pit.load_tabicl``,
-    which constructs ``TabICL(**checkpoint["config"])`` and calls
-    ``load_state_dict`` strictly — so the file has to carry a ``config`` key and
-    adapter-free parameter names, or the "drop-in ``tabicl.pit_ckpt``" promise
-    is false. ``step``/``cfg``/``extra`` ride along beside them for provenance;
-    ``load_tabicl`` ignores extra keys.
+    step, cfg and extra are stored alongside.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     payload = {
@@ -1180,11 +848,6 @@ def save_marginal_checkpoint(
     atomic_torch_save(payload, path)
 
 
-# ---------------------------------------------------------------------------
-# Data sources
-# ---------------------------------------------------------------------------
-
-
 def _resolve_device(spec: str) -> str:
     if spec != "auto":
         return spec
@@ -1199,17 +862,7 @@ def _seed_everything(seed: int) -> None:
 
 
 class ERA5EpisodeSampler:
-    """Draws batches of real-ERA5 episodes that share P and N.
-
-    ``run_pit_batched`` can only fold a batch into TabICL's own batch axis when
-    every episode shares P/N, so this uses the corpus's
-    ``sample_episode_fixed_shape`` (exact grid_size / n_context, redraw on a
-    degenerate box) rather than ``sample_episode``'s ranges — the same reason
-    ``src/copula_inter/era5_live_dataset.py`` groups its draws.
-
-    Region, day and box width still vary per episode, so a batch is a genuine
-    spread of real spatial fields at one shape, not one field repeated.
-    """
+    """Batches of real-ERA5 episodes with one shared P and N (sample_episode_fixed_shape); region, day and box vary."""
 
     def __init__(self, corpus, *, grid_size: int, n_context: int,
                  box_deg_range: tuple[float, float], seed: int) -> None:
@@ -1248,14 +901,7 @@ class ERA5EpisodeSampler:
 
 
 def _gp_cfg(cfg: DictConfig) -> DictConfig:
-    """The shape ``data_gen.generate_gp_batch`` expects: a top-level config with
-    a ``data`` group and a ``seed``, not the ``data`` group on its own.
-
-    ``generate_gp_batch`` reads ``cfg.data.*`` for the prior and
-    ``getattr(cfg, "seed")`` for reproducibility, so handing it ``cfg.data``
-    directly raises ``Missing key data``. Built once and re-seeded per call
-    rather than reconstructed, since the prior block is large.
-    """
+    """A config with the data group and a seed, as generate_gp_batch expects."""
     return OmegaConf.create(
         {"data": OmegaConf.to_container(cfg.data, resolve=True), "seed": int(cfg.seed)}
     )
@@ -1264,13 +910,7 @@ def _gp_cfg(cfg: DictConfig) -> DictConfig:
 def _generate_phase_a_gp_batch(
     gp_cfg: DictConfig, batch_size: int, device: str, *, max_rounds: int = 20
 ) -> list[dict]:
-    """Generate a shape-homogeneous batch even when GP episodes are discarded.
-
-    ``generate_gp_batch`` guarantees the requested count, but its numerical-
-    failure top-ups intentionally resample P/N because its usual consumers pad
-    rows in a DataLoader. Phase A stacks directly for one batched TabICL call,
-    so after the first returned shape is chosen, retries must pin P, N and d.
-    """
+    """generate_gp_batch with P, N and d pinned after the first call, so every episode has the same shape."""
     episodes = generate_gp_batch(
         gp_cfg, batch_size, device, return_kernel_metadata=True
     )
@@ -1303,13 +943,7 @@ def _generate_phase_a_gp_batch(
 
 
 def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
-    """A FIXED synthetic-GP validation set, drawn once with its own seed.
-
-    Fixed rather than freshly sampled per call so that a change in
-    ``val_marginal/gp/nll_gap_to_oracle`` between two validations is the model
-    moving, not the episodes changing — the gap is a few nats on a quantity with
-    real per-episode spread, so resampling would bury the signal in draw noise.
-    """
+    """Fixed synthetic GP validation batches, drawn once with their own seed."""
     gp_cfg = _gp_cfg(cfg)
     batches = []
     for i in range(int(cfg.validation.gp_n_batches)):
@@ -1320,11 +954,6 @@ def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
             )
         )
     return batches
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 
 @hydra.main(config_path=config_dir(__file__), config_name="finetune_marginal", version_base=None)
@@ -1385,9 +1014,7 @@ def main(cfg: DictConfig) -> None:
         huber_delta=float(cfg.marginal.loss.huber_delta),
         tail_power=float(cfg.marginal.loss.tail_power),
     )
-    # Both sources use raw quantile-index-aware pinball in the shipped config.
-    # Synthetic weights remain separate because exact-target distillation is a
-    # useful opt-in diagnostic there, while ERA5 has no analytic target.
+    # Separate loss weights for synthetic and ERA5 batches.
     era5_loss_cfg = cfg.marginal.era5.loss
     era5_weights = MarginalLossWeights(
         distill=0.0,
@@ -1399,14 +1026,7 @@ def main(cfg: DictConfig) -> None:
     )
     anchor = AnchorPenalty(trainable_module) if weights.anchor > 0 else None
 
-    # ---- optimizer -------------------------------------------------------
-    # AdamW, one group, no ndim split. Two reasons this is not train.py's
-    # Muon setup: src/copula_inter/muon.py's own header warns Muon "may not work well for
-    # finetuning pretrained models", which is precisely this; and train.py's
-    # positional optimizer-state restore (load_checkpoint matches Adam/Muon
-    # moments to params by position in the flattened list) is a hazard the
-    # moment param groups change, which a tier ladder does by construction.
-    # A single group over `requires_grad` params has no positional ambiguity.
+    # AdamW over all trainable parameters in one group.
     params = [p for p in trainable_module.parameters() if p.requires_grad]
     if not params:
         raise RuntimeError("Tier routing left no trainable parameters.")
@@ -1438,8 +1058,7 @@ def main(cfg: DictConfig) -> None:
     def _has_sample_objective(w: MarginalLossWeights) -> bool:
         return any(value != 0.0 for value in (w.distill, w.nll, w.crps, w.pinball))
 
-    # Fail loudly instead of launching an expensive run whose loss is exactly
-    # zero. This also catches misspelled/partial Hydra loss overrides early.
+    # Fail if every loss weight is zero.
     if mix_frac < 1.0 and not _has_sample_objective(weights):
         raise ValueError("Synthetic batches have no non-zero marginal loss weight.")
     if mix_frac > 0.0 and not _has_sample_objective(era5_weights):
@@ -1529,9 +1148,7 @@ def main(cfg: DictConfig) -> None:
         tier_extra = {"tier_report": {k: v for k, v in report.items()
                                       if isinstance(v, (int, float, str))}}
         if isinstance(tabicl, MarginalBackbone):
-            # Non-TabICL backbones have no published loader for TabICL's
-            # schema; MarginalBackbone.save writes theirs, and
-            # marginal_backends.make_regressor(..., ckpt=path) reads it back.
+            # Non-TabICL backbones write their own checkpoint format.
             tabicl.save(path, step=step, cfg=cfg, extra=tier_extra)
         else:
             save_marginal_checkpoint(
@@ -1559,8 +1176,7 @@ def main(cfg: DictConfig) -> None:
     selection_min_delta = float(cfg.training.get("selection_min_delta", 0.0))
 
     def _snapshot_trainable() -> dict[str, torch.Tensor]:
-        # Frozen base tensors never change. Keeping only trainable tensors makes
-        # validation selection cheap even for the full pretrained backbone.
+        # Keep only the trainable tensors for best-checkpoint selection.
         return {
             name: p.detach().cpu().clone()
             for name, p in trainable_module.named_parameters()

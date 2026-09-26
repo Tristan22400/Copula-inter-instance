@@ -1,53 +1,14 @@
-"""
-loss.py — Loss functions for Gaussian copula models.
+"""Losses and metrics for Gaussian copula models.
 
-Includes:
-  - copula_nll      : inter-instance copula NLL via Woodbury + det lemma (O(N r²))
-  - woodbury_nll    : intra-instance low-rank MVN NLL (O(d r²)) [kept for compat]
-  - indep_normal_nll, marginal_nll, energy_score, kl_gaussian
-
-copula_nll takes W_tilde ∈ R^{N×(r+1)} from the CopulaHead (unit row norms)
-and computes:
-
-    R_ε = ε I + W_tilde @ W_tilde^T          (ε = jitter, R_ii ≈ 1 + ε)
-
-    log|R_ε| = N log(ε) + log|M|             (Matrix Determinant Lemma)
-               where M = I_{r+1} + (1/ε) W^T W  is (r+1)×(r+1)
-
-    R_ε^{-1} z = (1/ε)[z - W M^{-1} (W^T z / ε)]   (Woodbury identity)
-
-    L_copula = 0.5 * (log|R_ε| + z^T R_ε^{-1} z - z^T z) / N
-
-This is O(N(r+1)²) per task — independent of N for the expensive Cholesky.
-
-Original docstring follows:
-------------------------------------------------------------------------
-Woodbury-identity Negative Log-Likelihood for low-rank Gaussians.
-
-For a LowRankMultivariateNormal with covariance
-
-    Sigma = diag(D) + V V^T       (D > 0, V ∈ R^{d×r})
-
-the NLL can be computed in O(d r^2 + r^3) using the Woodbury identity
-instead of the naive O(d^3) Cholesky on the full d×d covariance.
-
-The formula (per §4 of the research spec) is:
-
-    NLL_i = 0.5 * [ d·log(2π) + log|D_i| + log|M_i|
-                    + r_i^T D_i^{-1} r_i
-                    - (V_i^T D_i^{-1} r_i)^T M_i^{-1} (V_i^T D_i^{-1} r_i) ]
-
-where M_i = I_r + V_i^T D_i^{-1} V_i  is the r×r capacitance matrix,
-and  r_i = y_i - μ_i  is the residual.
-
-The log-determinant uses the Sylvester/Matrix Determinant Lemma:
-
-    log|diag(D)+VV^T| = log|D| + log|M|
-
-All operations are fully batched and differentiable w.r.t. μ, D, V.
-
-Additionally, utility functions `energy_score` and `kl_gaussian` are provided
-for evaluation (not used during training).
+    copula_nll: inter-instance copula NLL for R = eps I + W W^T, via the Matrix
+        Determinant Lemma and Woodbury, O(N r^2):
+            log|R| = N log(eps) + log|M|,  M = I + W^T W / eps
+            R^{-1} z = (z - W M^{-1} W^T z / eps) / eps
+            L = 0.5 (log|R| + z^T R^{-1} z - z^T z) / N
+    y_space_nll: Sklar total = copula NLL + marginal NLL, dense or low-rank.
+    woodbury_nll: NLL of N(mu, diag(D) + V V^T), O(d r^2).
+    indep_normal_nll, marginal_nll, oracle_copula_nll, gp_oracle_y_nll,
+    energy_score, kl_gaussian, plot_prediction_comparison.
 """
 
 from __future__ import annotations
@@ -59,36 +20,24 @@ import torch
 
 from copula_inter.correlation_factory import LowRankCorrelationFactor
 
-# ---------------------------------------------------------------------------
-# Numerically stable Cholesky
-# ---------------------------------------------------------------------------
-
 
 def _safe_cholesky(K: torch.Tensor, max_attempts: int = 8) -> torch.Tensor:
-    """Cholesky decomposition with adaptive jitter.
+    """Cholesky of K + jitter I with adaptive jitter.
 
-    Handles two failure modes:
-      1. Non-finite entries (NaN/Inf) — jitter is useless here; the offending
-         matrix slice is replaced with identity before factorization.
-      2. Slightly non-PSD due to floating-point asymmetry — symmetrize first,
-         then retry with progressively larger jitter (1e-6 → 1e-1).
+    Non-finite matrix slices are replaced by identity; otherwise K is symmetrized
+    and jitter grows from 1e-6 towards 1e-1 until the factorization succeeds.
 
     Args:
-        K            : (..., n, n) symmetric PSD matrix (before jitter).
-        max_attempts : number of jitter doublings before giving up.
+        K: (..., n, n) symmetric matrix.
+        max_attempts: number of jitter increases.
 
     Returns:
-        L : (..., n, n) lower-triangular Cholesky factor of K + jitter * I.
+        (..., n, n) lower-triangular factor.
     """
     n = K.shape[-1]
     eye = torch.eye(n, dtype=K.dtype, device=K.device)
 
-    # Replace non-finite matrix slices with identity, entirely on-GPU (no
-    # CPU sync from .item()/bool()). A blocking `if not K.isfinite().all()`
-    # check is unsafe here anyway: for a batched K, torch.linalg.cholesky can
-    # succeed without raising even though one slice is NaN/Inf (e.g. Inf on
-    # the diagonal, or one corrupted slice among otherwise-PD batch slices),
-    # so an eager check on the *input* wouldn't even catch every case.
+    # Replace non-finite slices with identity on-device (no host sync).
     finite = torch.isfinite(K).flatten(-2).all(-1)[..., None, None]
     K = torch.where(finite, K, eye)
 
@@ -108,26 +57,19 @@ def _safe_cholesky(K: torch.Tensor, max_attempts: int = 8) -> torch.Tensor:
     )
 
 
-# ---------------------------------------------------------------------------
-# Woodbury NLL
-# ---------------------------------------------------------------------------
-
-
 def woodbury_nll(
     y: torch.Tensor,
     mu: torch.Tensor,
     D: torch.Tensor,
     V: torch.Tensor,
 ) -> torch.Tensor:
-    """Negative log-likelihood for LowRankMultivariateNormal via Woodbury identity.
-
-    Computes the mean NLL over all (batch, instance) pairs.
+    """Mean NLL of N(mu, diag(D) + V V^T) via Woodbury.
 
     Args:
-        y  : (B, N, d)     — observed targets
-        mu : (B, N, d)     — predicted mean
-        D  : (B, N, d)     — diagonal variances  (must be strictly positive)
-        V  : (B, N, d, r)  — low-rank factor
+        y: (B, N, d) targets.
+        mu: (B, N, d) mean.
+        D: (B, N, d) positive diagonal variances.
+        V: (B, N, d, r) low-rank factor.
 
     Returns:
         Scalar NLL averaged over B*N instances.
@@ -135,8 +77,7 @@ def woodbury_nll(
     r_vec = y - mu  # (B, N, d)
     r = V.shape[-1]  # rank
 
-    # Early NaN/Inf detection — if D or V are non-finite, M will inherit the
-    # corruption and _safe_cholesky's fallback will hide the root cause.
+    # Fail early on non-finite D or V.
     if not (torch.isfinite(D).all() and torch.isfinite(V).all()):
         import warnings
 
@@ -155,9 +96,7 @@ def woodbury_nll(
     # D^{-1} V  — reused in the capacitance matrix
     D_inv_V = V / D.unsqueeze(-1)  # (B, N, d, r)
 
-    # Capacitance matrix M = I_r + V^T D^{-1} V            # (B, N, r, r)
-    # Symmetrize explicitly: batched matmuls can introduce tiny asymmetry that
-    # breaks Cholesky even when M is mathematically PSD.
+    # Capacitance M = I_r + V^T D^{-1} V, symmetrized.
     M_raw = torch.matmul(V.transpose(-2, -1), D_inv_V)  # (B, N, r, r)
     M = torch.eye(r, dtype=V.dtype, device=V.device) + 0.5 * (
         M_raw + M_raw.transpose(-2, -1)
@@ -168,8 +107,7 @@ def woodbury_nll(
     # V^T D^{-1} r = V^T (D_inv_r)                         # (B, N, r)
     VT_Dinv_r = torch.matmul(V.transpose(-2, -1), D_inv_r.unsqueeze(-1)).squeeze(-1)
 
-    # M^{-1} (V^T D^{-1} r) via two triangular solves
-    # torch.cholesky_solve is missing sm_75 kernels in PyTorch 2.11+cu130
+    # M^{-1} (V^T D^{-1} r) via two triangular solves (cholesky_solve lacks sm_75 kernels in PyTorch 2.11+cu130).
     rhs = VT_Dinv_r.unsqueeze(-1)  # (B, N, r, 1)
     tmp = torch.linalg.solve_triangular(L_M, rhs, upper=False)
     Minv_VT_Dinv_r = torch.linalg.solve_triangular(
@@ -196,42 +134,19 @@ def woodbury_nll(
     return nll.mean()
 
 
-# ---------------------------------------------------------------------------
-# Independent standard-normal NLL — Jacobian correction for copula reporting
-# ---------------------------------------------------------------------------
-
-
 def indep_normal_nll(z: torch.Tensor) -> torch.Tensor:
-    """Mean NLL of i.i.d. N(0,1) at z.  Subtract from woodbury_nll to get the
-    true Gaussian copula NLL as derived from Sklar's theorem:
+    """Mean NLL of z under i.i.d. N(0, 1): d/2 log(2 pi) + ||z||^2 / 2.
 
-        copula_nll = woodbury_nll(z; mu=0, R) - indep_normal_nll(z)
-
-    Derivation: the Gaussian copula density is
-
-        c(u) = phi_R(z) / prod_j phi(z_j)
-
-    so  -log c(u) = -log phi_R(z) + sum_j log phi(z_j)
-                  = woodbury_nll(z; 0, R) - d/2 log(2pi) - 1/2 ||z||^2.
-
-    The subtracted term equals indep_normal_nll(z) = d/2 log(2pi) + 1/2 ||z||^2.
-    It is constant w.r.t. model parameters (z is fixed after the PIT), so
-    woodbury_nll and copula_nll yield identical gradients — this function is
-    for reporting only.
+    copula_nll = woodbury_nll(z; 0, R) - indep_normal_nll(z).
 
     Args:
-        z : (B, N, d) or (B, d) — Z-space observations (probit-PIT outputs).
+        z: (B, N, d) or (B, d).
 
     Returns:
-        Scalar averaged over all instances.
+        Scalar averaged over instances.
     """
     d_size = z.shape[-1]
     return 0.5 * (d_size * math.log(2.0 * math.pi) + (z**2).sum(-1)).mean()
-
-
-# ---------------------------------------------------------------------------
-# Marginal NLL  (diagonal-only baseline, V ignored)
-# ---------------------------------------------------------------------------
 
 
 def marginal_nll(
@@ -239,16 +154,10 @@ def marginal_nll(
     mu: torch.Tensor,
     D: torch.Tensor,
 ) -> torch.Tensor:
-    """NLL assuming independent marginals — ignores V entirely.
-
-    Equivalent to woodbury_nll with V = 0, i.e. the covariance is purely
-    diagonal diag(D).  Used as a baseline to quantify how much the low-rank
-    component improves predictive performance.
+    """Mean NLL under independent marginals N(mu, diag(D)) (woodbury_nll with V = 0).
 
     Args:
-        y  : (B, N, d) — observed targets
-        mu : (B, N, d) — predicted mean
-        D  : (B, N, d) — diagonal variances (must be strictly positive)
+        y, mu, D: (B, N, d).
 
     Returns:
         Scalar NLL averaged over B*N instances.
@@ -258,11 +167,6 @@ def marginal_nll(
     quad_form = ((y - mu) ** 2 / D).sum(dim=-1)  # (B, N)
     nll = 0.5 * (d_size * math.log(2.0 * math.pi) + log_det_D + quad_form)
     return nll.mean()
-
-
-# ---------------------------------------------------------------------------
-# Covariance comparison plot  (evaluation utility)
-# ---------------------------------------------------------------------------
 
 
 def plot_prediction_comparison(
@@ -276,25 +180,21 @@ def plot_prediction_comparison(
     n_instances: int = 3,
     mu_tabicl: torch.Tensor | None = None,
 ):
-    """Compare predicted vs oracle mean and covariance for multiple instances.
+    """Plot predicted vs oracle covariance and mean for n_instances instances of one batch element.
 
-    One row per instance, five columns:
-      0 — Oracle  Sigma* heatmap
-      1 — Predicted Sigma hat heatmap
-      2 — |Sigma* - Sigma hat| heatmap
-      3 — mu* vs mu hat (+ TabICL base) bar chart
-      4 — |mu* - mu hat| bar chart
+    Columns: oracle Sigma, predicted Sigma, |difference|, mu (with optional
+    TabICL base), |mu difference|.
 
     Args:
-        mu_pred, mu_true : (B, N, d)    — conditional means
-        D_pred, D_true   : (B, N, d)    — diagonal variances
-        V_pred, V_true   : (B, N, d, r) — low-rank factors
-        batch_idx        : which batch element to visualise
-        n_instances      : number of instances (rows) to plot
-        mu_tabicl        : (B, N, d) optional — base TabICL scalar predictions
+        mu_pred, mu_true: (B, N, d).
+        D_pred, D_true: (B, N, d).
+        V_pred, V_true: (B, N, d, r).
+        batch_idx: batch element to plot.
+        n_instances: rows to plot.
+        mu_tabicl: optional (B, N, d) TabICL predictions.
 
     Returns:
-        matplotlib Figure with n_instances × 5 subplots.
+        matplotlib Figure.
     """
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -438,11 +338,6 @@ def plot_prediction_comparison(
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Energy Score  (evaluation metric, not used for training)
-# ---------------------------------------------------------------------------
-
-
 def energy_score(
     mu: torch.Tensor,
     D: torch.Tensor,
@@ -450,22 +345,17 @@ def energy_score(
     y_ref: torch.Tensor,
     n_samples: int = 100,
 ) -> torch.Tensor:
-    """Compute the Energy Score for a predicted LowRankMultivariateNormal.
-
-    ES(P, y) = E_P[||Y - y||] - 0.5 * E_P[||Y - Y'||]
-
-    where Y, Y' ~ P (the predicted distribution) and y is a reference
-    sample from the true distribution.  Lower is better.
+    """Energy score of N(mu, diag(D) + V V^T) at y_ref: E||Y - y|| - 0.5 E||Y - Y'||.
 
     Args:
-        mu       : (d,)   — predicted mean
-        D        : (d,)   — diagonal variances
-        V        : (d, r) — low-rank factor
-        y_ref    : (d,)   — single reference / ground-truth sample
-        n_samples: M      — number of MC samples from predicted distribution
+        mu: (d,).
+        D: (d,).
+        V: (d, r).
+        y_ref: (d,).
+        n_samples: Monte Carlo samples.
 
     Returns:
-        Scalar Energy Score.
+        Scalar energy score (lower is better).
     """
     d = mu.shape[-1]
     r = V.shape[-1]
@@ -487,11 +377,6 @@ def energy_score(
     return term1 - 0.5 * term2
 
 
-# ---------------------------------------------------------------------------
-# KL divergence between two multivariate Gaussians (Gaussian approx of ref)
-# ---------------------------------------------------------------------------
-
-
 def kl_gaussian(
     mu_q: torch.Tensor,
     D_q: torch.Tensor,
@@ -499,27 +384,17 @@ def kl_gaussian(
     mu_p: torch.Tensor,
     Sigma_p: torch.Tensor,
 ) -> torch.Tensor:
-    """KL( Q || P ) where Q is LowRankMVN and P is a dense MVN.
-
-    Used during evaluation to compare the predicted distribution Q against
-    a reference posterior P (approximated from MCMC / reference samples).
-
-    KL(Q||P) = 0.5 * [ log|Sigma_p| - log|Sigma_q| - d
-                        + tr(Sigma_p^{-1} Sigma_q)
-                        + (mu_p - mu_q)^T Sigma_p^{-1} (mu_p - mu_q) ]
-
-    The trace term is computed as  ||L_p^{-1} L_q||_F^2  where L_p, L_q are
-    the Cholesky factors of Sigma_p and Sigma_q respectively.
+    """KL(Q || P) for Q = N(mu_q, diag(D_q) + V_q V_q^T) and dense P = N(mu_p, Sigma_p).
 
     Args:
-        mu_q    : (d,)    — Q mean
-        D_q     : (d,)    — Q diagonal variances
-        V_q     : (d, r)  — Q low-rank factor
-        mu_p    : (d,)    — P mean
-        Sigma_p : (d, d)  — P covariance (dense, estimated from reference samples)
+        mu_q: (d,).
+        D_q: (d,).
+        V_q: (d, r).
+        mu_p: (d,).
+        Sigma_p: (d, d).
 
     Returns:
-        Scalar KL divergence (nats).
+        Scalar KL in nats.
     """
     d = mu_q.shape[0]
 
@@ -536,8 +411,7 @@ def kl_gaussian(
     # log|Sigma_q| = 2 * sum log diag(L_q)
     log_det_q = 2.0 * L_q.diagonal().log().sum()
 
-    # tr(Sigma_p^{-1} Sigma_q) = ||L_p^{-1} L_q||_F^2
-    # Solve L_p A = L_q  →  A = L_p^{-1} L_q
+    # tr(Sigma_p^{-1} Sigma_q) = ||L_p^{-1} L_q||_F^2.
     A = torch.linalg.solve_triangular(L_p, L_q, upper=False)  # (d, d)
     trace_term = (A * A).sum()
 
@@ -550,32 +424,21 @@ def kl_gaussian(
     return kl
 
 
-# ---------------------------------------------------------------------------
-# Inter-instance Copula NLL (Woodbury + Matrix Determinant Lemma)
-# ---------------------------------------------------------------------------
-
-
 def copula_nll(
     W_tilde: torch.Tensor,
     z_test: torch.Tensor,
     test_mask: torch.Tensor,
     eps: float = 1e-4,
 ) -> torch.Tensor:
-    """Gaussian copula NLL using the Woodbury identity and Matrix Determinant Lemma.
+    """Gaussian copula NLL for R = eps I + W_tilde W_tilde^T, via Woodbury.
 
-    Correlation matrix:  R_ε = ε I + W_tilde @ W_tilde^T
-    (PSD, approximately unit-diagonal since ||w̃_j|| = 1 → R_ii = ε + 1)
-
-    Loss (per test instance, averaged over batch):
-        L = 0.5 * (log|R_ε| + z^T R_ε^{-1} z - z^T z) / N
-
-    Complexity: O(N (r+1)²) per task — the Cholesky is on (r+1)×(r+1), not N×N.
+        L = 0.5 (log|R| + z^T R^{-1} z - z^T z) / N
 
     Args:
-        W_tilde  : (B, N_max, r+1) — unit-row-norm factor from CopulaHead
-        z_test   : (B, N_max)      — test z-scores (0 for padding)
-        test_mask: (B, N_max)      — BoolTensor, True for valid test instances
-        eps      : diagonal jitter (R_ε = eps*I + W W^T)
+        W_tilde: (B, N_max, r+1) unit-row-norm factor.
+        z_test: (B, N_max), 0 on padding.
+        test_mask: (B, N_max) bool.
+        eps: diagonal jitter.
 
     Returns:
         Scalar mean loss.
@@ -601,8 +464,7 @@ def copula_nll(
         log_det_M = 2.0 * L_M.diagonal().log().sum()
         log_det = N * math.log(eps) + log_det_M
 
-        # Woodbury: R_ε^{-1} z = (1/ε)[z - W M^{-1} (W^T z / ε)]
-        # Use solve_triangular — cholesky_solve is missing sm_75 kernels in PyTorch 2.11+cu130.
+        # Woodbury: R^{-1} z = (z - W M^{-1} W^T z / eps) / eps (solve_triangular; see woodbury_nll).
         WTz = W.T @ z  # (r+1,)
         rhs_v = (WTz / eps).unsqueeze(-1)
         tmp_v = torch.linalg.solve_triangular(L_M, rhs_v, upper=False)
@@ -626,13 +488,10 @@ def oracle_copula_nll(
 ) -> torch.Tensor:
     """Copula NLL under the oracle correlation R_star (dense Cholesky).
 
-    Used for evaluation only — computes the lower bound achievable by a
-    perfect model.  R_star is dense (N×N) so this uses _safe_cholesky directly.
-
     Args:
-        R_star   : (B, N_max, N_max) — oracle correlation matrices
-        z_test   : (B, N_max)
-        test_mask: (B, N_max)
+        R_star: (B, N_max, N_max).
+        z_test: (B, N_max).
+        test_mask: (B, N_max).
     """
     B, N_max, _ = R_star.shape
     n_test = test_mask.sum(-1).float()  # (B,)
@@ -656,41 +515,26 @@ def oracle_copula_nll(
     return losses[valid].mean()
 
 
-# ---------------------------------------------------------------------------
-# Y-space NLL via Sklar (Copula NLL + Marginal NLL)
-# ---------------------------------------------------------------------------
-
-
 def y_space_nll(
     Sigma: torch.Tensor,
     z_test: torch.Tensor,
     log_pdf_test: torch.Tensor,
     test_mask: torch.Tensor,
 ) -> dict:
-    """Negative log-likelihood of Y under Sklar's theorem.
+    """Negative log-likelihood of Y by Sklar's theorem: copula NLL + marginal NLL.
 
-        −log p(Y) = Copula_NLL(Z; Σ) + Marginal_NLL(Y)
-
-    where
-        Copula_NLL = 0.5 * log|Σ| + 0.5 * z^T (Σ^{-1} − I) z
-        Marginal_NLL = − Σ_i log p̂(y_i | x_i, ctx)
-
-    ``Sigma`` is either the dense N×N correlation matrix from
-    ``low_rank_correlation`` (dense Cholesky, O(N³)), or the same Σ in
-    factored form Σ = U U^T + diag(D) from ``low_rank_correlation_factor``
-    (Matrix Determinant Lemma + Woodbury, O(N r²) -- see
-    ``_y_space_nll_lowrank``). Both return the same numbers.
+        copula = 0.5 log|Sigma| + 0.5 z^T (Sigma^{-1} - I) z
+        marginal = -sum_i log p(y_i | x_i, context)
 
     Args:
-        Sigma         : (B, N_max, N_max) or LowRankCorrelationFactor
-        z_test        : (B, N_max)        (0 on padding)
-        log_pdf_test  : (B, N_max)        TabICL marginal log-densities at Y_test
-        test_mask     : (B, N_max) bool
+        Sigma: (B, N_max, N_max) dense correlation, or a LowRankCorrelationFactor
+            (computed by _y_space_nll_lowrank; same result).
+        z_test: (B, N_max), 0 on padding.
+        log_pdf_test: (B, N_max) marginal log-densities at y_test.
+        test_mask: (B, N_max) bool.
 
-    Returns dict with mean-per-instance values (averaged over batch):
-        total      : copula + marginal
-        copula     : copula NLL term
-        marginal   : marginal NLL term
+    Returns:
+        dict with total, copula and marginal, per-instance means averaged over the batch.
     """
     if isinstance(Sigma, LowRankCorrelationFactor):
         return _y_space_nll_lowrank(Sigma, z_test, log_pdf_test, test_mask)
@@ -698,10 +542,8 @@ def y_space_nll(
     B, N_max, _ = Sigma.shape
     n_test = test_mask.sum(-1).float()  # (B,)
 
-    # Pad masked blocks to identity — batched Cholesky works without any Python loop.
-    # Correctness relies on collate_fn zero-padding z_test and log_pdf_test:
-    #   padded L-diagonal = 1  →  log(1) = 0  (no contribution to log-det)
-    #   padded z_test     = 0  →  quadratic terms vanish for padded positions
+    # Masked blocks become identity; with zero-padded z_test and log_pdf_test the
+    # padded positions contribute nothing.
     mask_2d = test_mask.unsqueeze(-1) & test_mask.unsqueeze(-2)  # (B, N_max, N_max)
     eye = torch.eye(N_max, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
     S_safe = torch.where(mask_2d, Sigma, eye)
@@ -738,22 +580,14 @@ def _y_space_nll_lowrank(
     log_pdf_test: torch.Tensor,
     test_mask: torch.Tensor,
 ) -> dict:
-    """``y_space_nll`` for Σ = U U^T + diag(D) without ever forming Σ.
+    """y_space_nll for Sigma = U U^T + diag(D) without forming Sigma.
 
-    With Ũ = D^{-1/2} U, z̃ = D^{-1/2} z and the r×r capacitance
-    M = I_r + Ũ^T Ũ = L L^T:
+    With U~ = D^{-1/2} U, z~ = D^{-1/2} z and M = I_r + U~^T U~ = L L^T:
 
-        log|Σ|        = Σ_i log D_i + log|M|           (Matrix Determinant Lemma)
-        z^T Σ^{-1} z  = ||z̃||² − ||L^{-1} Ũ^T z̃||²    (Woodbury identity)
+        log|Sigma| = sum_i log D_i + log|M|
+        z^T Sigma^{-1} z = ||z~||^2 - ||L^{-1} U~^T z~||^2
 
-    O(N r² + r³) per episode instead of O(N³). Padded rows get U=0, D=1,
-    z=0, so they contribute log 1 = 0 and nothing to the quadratic form.
-
-    Runs in float64: D can be as small as ~jitter, so both Woodbury terms
-    are O(||z||²/jitter) and their difference is O(N) -- fp32 (let alone
-    the TF32 matmuls train.py enables) cannot resolve that cancellation.
-    The dense path has no such cancellation. The float64 work is only the
-    O(N r²) capacitance products, a small cost next to the forward pass.
+    Padded rows have U=0, D=1, z=0. Computed in float64.
     """
     out_dtype = factor.U.dtype
     mask = test_mask.bool()
@@ -802,21 +636,18 @@ def gp_oracle_y_nll(
     y_test: torch.Tensor,
     test_mask: torch.Tensor,
 ) -> dict:
-    """Exact GP NLL  −log N(y_test | mu_star, Sigma_star)  per instance.
+    """Exact GP NLL -log N(y_test | mu_star, Sigma_star), per instance.
 
-        NLL/N = 0.5/N · [ log|Σ*| + (y−μ*)^T Σ*^{-1} (y−μ*) + N log(2π) ]
-
-    Decomposed as total = copula + marginal, where marginal is the NLL under
-    the diagonal of Σ* (independent marginals) and copula is the remainder.
+    marginal is the NLL under diag(Sigma_star); copula = total - marginal.
 
     Args:
-        Sigma_star : (B, N_max, N_max)
-        mu_star    : (B, N_max)
-        y_test     : (B, N_max)
-        test_mask  : (B, N_max) bool
+        Sigma_star: (B, N_max, N_max).
+        mu_star: (B, N_max).
+        y_test: (B, N_max).
+        test_mask: (B, N_max) bool.
 
     Returns:
-        Dict with keys "total", "copula", "marginal" — scalar means over batch.
+        dict with total, copula, marginal: scalar means over the batch.
     """
     B, N_max, _ = Sigma_star.shape
     log_2pi = math.log(2.0 * math.pi)
