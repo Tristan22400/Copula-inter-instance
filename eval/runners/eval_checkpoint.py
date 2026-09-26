@@ -20,6 +20,7 @@ import contextlib
 import copy
 import os
 import random
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator
 
 import hydra
@@ -60,7 +61,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
 from copula_inter.artifacts import artifact_identity, atomic_json_save  # noqa: E402
-from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES, GENERIC_MARGINAL_BACKENDS  # noqa: E402
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS  # noqa: E402
 from copula_inter.config_path import config_dict  # noqa: E402
 from copula_inter.config_path import config_dir as project_config_dir  # noqa: E402
 from copula_inter.data_gen import generate_gp_batch  # noqa: E402
@@ -78,13 +79,10 @@ from copula_inter.pit import (  # noqa: E402
     run_pit,
 )
 from eval.baselines.autoregressive import (  # noqa: E402
-    AR_CONDITIONINGS,
-    AR_ORDERS,
     ar_parts_from_log_pdf,
     autoregressive_log_pdf,
 )
 from eval.baselines.classical import (  # noqa: E402
-    GP_VAL_SELECT_MODES,
     assert_shared_z_test,
     baseline_fingerprint,
     corr_nll_single,
@@ -95,12 +93,7 @@ from eval.baselines.classical import (  # noqa: E402
 )
 from eval.configs.checkpoints import (  # noqa: E402
     DEFAULT_MARGINAL_FAMILY,
-    resolve_checkpoint,
     resolve_marginal_checkpoint,
-)
-from eval.configs.constants import N_CONTEXT  # noqa: E402
-from eval.data.era5_episodes import (  # noqa: E402
-    DEFAULT_CORPUS_DIR as ERA5_DEFAULT_CORPUS_DIR,
 )
 from eval.data.era5_episodes import (
     build_era5_eval_episodes,
@@ -121,6 +114,7 @@ from eval.results import (  # noqa: E402
 from eval.results import (
     save_results_cache as _save_results_cache,
 )
+from eval.runners.eval_args import _validate_eval_spec, parse_eval_spec  # noqa: E402
 from eval.viz.correlation_plots import plot_corr_grid  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
 
@@ -414,590 +408,6 @@ def _live_generate_alternating(
     return episodes
 
 
-def parse_eval_spec(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse and validate CLI settings without loading checkpoints or data."""
-    parser = argparse.ArgumentParser(
-        description="Evaluate ICL checkpoint vs baselines on inter-instance copula episodes"
-    )
-    parser.add_argument(
-        "--config",
-        default="conf/config.yaml",
-        help="Hydra config defining the eval-episode-generating "
-        "distribution (cfg.data) for --live_generate, "
-        "resolved through its own defaults list — "
-        "independent of --ckpt's saved training cfg. "
-        "Keeping this fixed is what lets the baseline "
-        "cache survive switching checkpoints.",
-    )
-    parser.add_argument("--ckpt", required=True, help="Checkpoint path, or a CHECKPOINT_FAMILIES name[:step].")
-    parser.add_argument(
-        "--dataset_dir",
-        default=None,
-        help="Episode directory to evaluate on (overrides "
-        "training.dataset_dir from --config). Passing "
-        "this disables --live_generate by default.",
-    )
-    parser.add_argument(
-        "--live_generate",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Generate evaluation episodes on the fly via "
-        "data_gen.generate_gp_batch(..., return_kernel_metadata=True) "
-        "instead of loading a pre-built PIT dataset directory. Default: "
-        "True unless --dataset_dir is given. --episode_idx is ignored "
-        "in this mode (episodes are freshly sampled, not indexed).",
-    )
-    parser.add_argument(
-        "--alternate_noncomposite",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Force every even live synthetic episode to a single elementary "
-        "kernel for mixed-distribution coverage. Disable for a pure "
-        "systematic-composition benchmark.",
-    )
-    # Real-ERA5 episodes (--era5): same baselines and tables, no oracle rows;
-    # the shared z_test is the TabICL PIT. --z_train_source=oracle is rejected.
-    parser.add_argument(
-        "--era5",
-        action="store_true",
-        help="Evaluate on real ARCO-ERA5 episodes instead of synthetic "
-        "GP draws. Mutually exclusive with --dataset_dir; forces "
-        "--live_generate off.",
-    )
-    parser.add_argument(
-        "--era5_corpus_dir",
-        default=ERA5_DEFAULT_CORPUS_DIR,
-        help="Cached global-ERA5 monthly NetCDF directory (populate with "
-        "eval/data/fetch_era5_global.py). Defaults to the held-out "
-        "era5_global_val corpus, deliberately disjoint from the "
-        "era5_global_train years finetuning draws from.",
-    )
-    parser.add_argument(
-        "--era5_grid_size",
-        type=int,
-        default=24,
-        help="Points per side of each sampled region (D = grid_size^2 "
-        "total). 24 matches conf/config.yaml's baselines.era5_grid_size "
-        "and eval/configs/regions.py's grid_resolution convention.",
-    )
-    parser.add_argument(
-        "--era5_n_context",
-        type=int,
-        default=N_CONTEXT,
-        help="In-context points P per episode (eval.configs.constants."
-        "N_CONTEXT). The remaining grid_size^2 - P points are all "
-        "held-out targets, so N=546 at the defaults.",
-    )
-    parser.add_argument("--era5_box_deg_min", type=float, default=5.0)
-    parser.add_argument(
-        "--era5_box_deg_max",
-        type=float,
-        default=25.0,
-        help="Region box width in degrees, drawn per episode. Boxes too "
-        "small to hold a full grid_size^2 block of native 0.25deg "
-        "points are redrawn, not clipped.",
-    )
-    parser.add_argument(
-        "--era5_vary_geometry",
-        action="store_true",
-        help="Draw grid_size/context-fraction per episode from era5_live's "
-        "training ranges instead of the fixed --era5_grid_size/"
-        "--era5_n_context. Costs the batched PIT (P/N stop being "
-        "homogeneous) and makes per-episode NLLs N-heterogeneous.",
-    )
-    parser.add_argument(
-        "--era5_pit_batch",
-        type=int,
-        default=8,
-        help="Episodes PIT'd per run_pit_batched call (fixed geometry "
-        "only). Higher is faster until TabICL's activations stop "
-        "fitting in VRAM.",
-    )
-    parser.add_argument(
-        "--era5_standardize_y",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Z-score each episode's ERA5 target by its own training "
-        "mean/std before fitting the classical baselines, then add "
-        "log(std) per point back to their marginal/total Y-space "
-        "NLLs so the printed table stays in raw Kelvin nats. On by "
-        "default: ERA5 targets are absolute Kelvin (~280) while "
-        "eval/baselines/classical.py's GP hyperpriors are calibrated "
-        "for data_gen.py's O(1) draws, and the ICL model under test "
-        "normalizes internally via its TabICL PIT — so leaving the "
-        "baselines on raw y handicaps them on units alone. Pass "
-        "--no-era5_standardize_y to fit on raw Kelvin instead.",
-    )
-    # ---- Autoregressive (chain-rule) marginal row --------------------------
-    parser.add_argument(
-        "--autoregressive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Add the 'Autoregressive marginal (chain rule)' row to the "
-        "total Y-space NLL table: the SAME marginal, but revealing "
-        "the test points one at a time so each prediction conditions "
-        "on the ones already revealed (eval/baselines/"
-        "autoregressive.py). An exact factorization of a joint "
-        "density, so it is directly comparable to every other row, "
-        "and it is the copula-free reference the copula head has to "
-        "beat. On by default for the TabICL marginal on every episode "
-        "source; it costs one marginal forward pass per test point.",
-    )
-    parser.add_argument(
-        "--ar_order",
-        default="random",
-        choices=list(AR_ORDERS),
-        help="Order the chain reveals test points in. An in-context "
-        "learner is not a coherent joint, so the chain-rule total "
-        "really does depend on this. 'random' (default) is a seeded "
-        "per-episode permutation; 'natural' is the grid's row-major "
-        "order, which hands almost every step a just-revealed "
-        "neighbour and reads as a best case rather than a typical one.",
-    )
-    parser.add_argument(
-        "--ar_conditioning",
-        default="teacher_forcing",
-        choices=list(AR_CONDITIONINGS),
-        help="What to append to the context at each step. "
-        "'teacher_forcing' (default) appends the TRUE y, which is "
-        "what makes the printed number an exact joint log-density "
-        "and a proper scoring rule. 'sample' appends a draw from "
-        "that step's predictive instead — ancestral sampling from "
-        "the model's implied joint, useful for generating fields, "
-        "but its log-density sum is then taken along a SAMPLED "
-        "conditioning path and is NOT a density of y_test. Do not "
-        "compare a 'sample' number to the other rows.",
-    )
-    parser.add_argument(
-        "--ar_max_context",
-        type=int,
-        default=None,
-        help="Cap the chain's context at this many rows (the episode's "
-        "own P are always kept; the oldest revealed points are "
-        "dropped first). None (default) keeps every revealed point, "
-        "which at the --era5 defaults grows the context 30 -> 576.",
-    )
-    parser.add_argument(
-        "--ar_n_episodes",
-        type=int,
-        default=None,
-        help="Run the chain on only the first N episodes (None = all). "
-        "The row then averages over those episodes and the rest "
-        "contribute nan, same convention as every other partially "
-        "available row.",
-    )
-    parser.add_argument(
-        "--era5_max_months",
-        type=int,
-        default=None,
-        help="Cap the corpus to its most recent N monthly files (smaller "
-        "date range). None reads everything cached. NOTE this is not "
-        "a RAM knob and can cost RAM: GlobalERA5Corpus picks "
-        "memory-mapped reading only when it sees >60 files, and the "
-        "cap is applied first, so capping a 396-month corpus to 60 "
-        "makes it load ~7.5 GB eagerly instead of ~100 MB lazily.",
-    )
-    parser.add_argument("--n_episodes", type=int, default=30)
-    parser.add_argument("--episode_idx", type=int, default=0)
-    parser.add_argument(
-        "--n_steps_mle",
-        type=int,
-        default=1000,
-        help="Adam steps for GP kernel MLE fitting (also used for ARD variants)",
-    )
-    parser.add_argument("--lr_mle", type=float, default=0.05, help="Learning rate for GP MLE Adam")
-    parser.add_argument(
-        "--n_restarts_mle",
-        type=int,
-        default=5,
-        help="Independent random restarts per GP-MLE kernel fit (each "
-        "initialised by sampling from the same LogNormal/Gamma "
-        "hyperpriors data_gen.py's generative process uses); keeps "
-        "whichever restart reaches the best final training loss.",
-    )
-    parser.add_argument(
-        "--zeromean_gp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Fit the 'Marginal + Zero Mean GP (RBF/Matern32)' baselines "
-        "directly on marginal_pit['z_train'] -- the same real "
-        "(non-oracle) marginal input the ICL model conditions on -- "
-        "instead of the raw y-space GP-MLE/DKL baselines above (see "
-        "eval.baselines.classical.fit_zero_mean_gp_on_marginal's "
-        "module docstring). Only 2 kernels (RBF, Matern32) by design, "
-        "to keep this cheap. Automatically a no-op for episodes with "
-        "no real marginal available (--z_train_source=oracle, or "
-        "fewer than 2 training points).",
-    )
-    parser.add_argument(
-        "--n_steps_zeromean_gp",
-        type=int,
-        default=500,
-        help="Adam steps for each Zero-Mean GP z-space fit. Needs far "
-        "fewer than --n_steps_mle's 1000: profiled on a real episode "
-        "(P=32/N=256/d_x=11, RBF/Matern32, 1 CPU thread), the fit "
-        "NLL plateaus by step 500 (rbf -0.0252, matern32 -0.0386) and "
-        "barely moves by step 1000 (-0.0251/-0.0386) -- unlike raw "
-        "y-space GP-MLE, there is no separate mean/scale to also "
-        "discover here, just 2-3 kernel hyperparameters against an "
-        "already marginally-standardized target, so it converges much "
-        "faster. Chosen on that convergence plateau, not trimmed for "
-        "speed (see the module docstring's Runtime note on why "
-        "--n_steps_mle itself must never be tuned that way).",
-    )
-    parser.add_argument(
-        "--lr_zeromean_gp", type=float, default=0.05, help="Learning rate for the Zero-Mean GP Adam fits"
-    )
-    parser.add_argument(
-        "--n_restarts_zeromean_gp",
-        type=int,
-        default=2,
-        help="Random restarts per Zero-Mean GP kernel fit -- fewer than "
-        "--n_restarts_mle's 5 by design. Profiled on the same episode: "
-        "restart 2 clearly beats restart 1 (rbf -0.0301 -> -0.0251, "
-        "matern32 -0.0442 -> -0.0386) but a 3rd restart finds nothing "
-        "further (identical NLL to 2), so 2 is the measured sweet spot "
-        "rather than a guess.",
-    )
-    parser.add_argument(
-        "--n_steps_dkl", type=int, default=5000, help="Adam steps for Deep Kernel Learning (MLP+GP) fitting"
-    )
-    parser.add_argument("--lr_dkl", type=float, default=0.01, help="Learning rate for DKL Adam")
-    parser.add_argument(
-        "--n_restarts_dkl",
-        type=int,
-        default=2,
-        help="Independent random restarts per DKL kernel fit -- each "
-        "restart gets a FRESH feature-extractor MLP (not the same "
-        "instance re-trained further), since a shared instance would "
-        "carry its already-updated weights from one restart into the "
-        "next and silently defeat the point of restarting (see "
-        "fit_and_eval_gpytorch's docstring). Was hardcoded to 1 "
-        "(no restart loop at all) until this option existed: DKL's "
-        "joint MLP+kernel landscape is harder and more init-sensitive "
-        "than plain GP-MLE's, so a single unlucky random MLP init had "
-        "no chance to recover, and diagnostics traced z-space copula "
-        "NLL swinging from ~5 to >100 nats/pt across episodes purely "
-        "on that one seed's luck. Measured on 4 held-out episodes "
-        "(dkl_rbf/dkl_dot_product, n_steps=2000): restart 2 roughly "
-        "halves the median z-space copula NLL vs. restart 1 (rbf "
-        "45.5 -> 18.9, dot_product 69.5 -> 55.9 nats/pt), a 3rd "
-        "restart found nothing further in every one of the 8 "
-        "(kernel, episode) combinations tried -- same restart-2-"
-        "suffices pattern as --n_restarts_zeromean_gp. DKL still ends "
-        "up well behind GP-MLE/Marginal+ZeroMean-GP even at restart 2: "
-        "unlike those, its kernel operates on a LEARNED feature space, "
-        "so the same rescale-to-defeat-the-lengthscale-prior "
-        "identifiability issue the module docstring already describes "
-        "for the held-out-NLL guard applies to the restarts here too "
-        "-- restarts pick a better basin, they do not fix the "
-        "underlying identifiability gap. (A LayerNorm on the MLP "
-        "output was tried as a fix and made things WORSE -- median "
-        "NLL 18.9 -> 57.0 for rbf, 55.9 -> 341.7 for dot_product on "
-        "the same episodes -- because per-sample normalisation erases "
-        "exactly the relative-magnitude information RBF/dot_product "
-        "need between different points; not applied.)",
-    )
-    parser.add_argument("--n_steps_per_ep", type=int, default=5000, help="Training steps for PerEpisodeTransformer")
-    parser.add_argument(
-        "--patience_per_ep", type=int, default=500, help="Early stopping patience for PerEpisodeTransformer"
-    )
-    parser.add_argument(
-        "--z_train_source",
-        default="tabicl",
-        choices=EVAL_Z_TRAIN_SOURCES,
-        help="What the ICL model conditions on for each episode's z_train. "
-        "'tabicl' (default): a K-fold cross-fitted PIT estimate from the "
-        "frozen TabICL marginal (pit.py::run_pit) — the same proxy "
-        "real-world deployment is stuck with, so this is the setting "
-        "that makes _print_total_nll_table's icl row (the genuinely "
-        "cross-method-comparable total marginal+copula NLL) populate; "
-        "adds the cost of one extra frozen TabICL forward pass per fold "
-        "per episode. 'oracle': the episode's exact GP-LOO PIT residual "
-        "(R&W Eq. 5.12) computed from the true generating kernel — "
-        "unavailable on real data, an idealized upper bound only; under "
-        "this mode the icl row of _print_total_nll_table is NaN (no "
-        "learned marginal to score a total NLL against). icl_nll under "
-        "either source is unaffected in every other respect: z_test, "
-        "R_oracle, and every baseline still score/fit against the "
-        "episode's true values — use both to measure the sim-to-real "
-        "gap. 'exaone'/'tabpfn'/'tabldm': the same non-oracle idea with "
-        "a different tabular foundation model supplying the marginal "
-        "(eval/spatial/marginal_backends.py), through the identical "
-        "batched PIT module the training pipelines use — so an eval "
-        "scores exactly the marginal a run trained against. These need "
-        "no --tabicl_ckpt; --tabicl_pit_k_folds still sets K, and "
-        "--marginal_probs_n sets their quantile-grid size.",
-    )
-    parser.add_argument(
-        "--marginal_probs_n",
-        type=int,
-        default=99,
-        help="Quantile grid size for --z_train_source=exaone/tabpfn/tabldm "
-        "(ignored for oracle/tabicl, which use their own native grids). "
-        "Mirrors data.z_train_marginal_probs_n in conf/data/gp_tasks.yaml; "
-        "a proportional lever on those backends' per-episode cost.",
-    )
-    parser.add_argument(
-        "--tabicl_ckpt",
-        default=None,  # path OR a MARGINAL_FAMILIES name
-        help="TabICL checkpoint filename for --z_train_source=tabicl. Default: read from --config's cfg.tabicl.ckpt.",
-    )
-    parser.add_argument(
-        "--tabicl_pit_k_folds",
-        type=int,
-        default=None,
-        help="K-fold count for --z_train_source=tabicl's run_pit call. "
-        f"Default: cfg.tabicl.pit_k_folds, falling back to "
-        f"pit.DEFAULT_K_FOLDS ({DEFAULT_K_FOLDS}).",
-    )
-    parser.add_argument(
-        "--tabicl_amp",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="AMP (float16 autocast) for the frozen TabICL marginal's "
-        "forward passes under --z_train_source=tabicl (pit.py::"
-        "configure_tabicl_inference_amp). Disabled by default for "
-        "float32 quantile-grid precision; pass --tabicl_amp to enable "
-        "AMP, or --no-tabicl_amp to keep it disabled. This matters "
-        "more for eval's log_pdf_test/marginal-NLL fidelity than for "
-        "live-generation throughput.",
-    )
-    parser.add_argument(
-        "--plot_episode", type=int, default=0, help="Local episode index to generate the corr_grid plot for"
-    )
-    parser.add_argument(
-        "--out_dir", default=os.path.join(_REPO_ROOT, "eval", "results"), help="Directory for saved corr_grid figure"
-    )
-    parser.add_argument(
-        "--dump_episodes",
-        default=None,
-        help="Write per-episode NLLs (all_nlls + all_total_nlls, keyed by "
-        "ep_i, plus each episode's kernel label) to this JSON path. "
-        "Two runs (e.g. different --ckpt) sharing --config/--seed/"
-        "--live_generate see identical episodes (see "
-        "_live_generate_alternating), so their dumps can be joined on "
-        "ep_i for a PAIRED per-episode comparison — far lower variance "
-        "than comparing the two runs' printed Mean/Std NLL as independent "
-        "samples, since episode-to-episode difficulty (kernel, "
-        "lengthscale, N) cancels in the per-episode difference instead "
-        "of inflating each run's own across-episode std.",
-    )
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--n_folds",
-        type=int,
-        default=5,
-        help="Number of folds for nested (leave-one-fold-out) "
-        "cross-validation of the per-episode best_baseline pick: "
-        "each fold's held-out NLL is scored using a baseline "
-        "selected (argmin NLL) on the other K-1 folds only, and "
-        "the K fold NLLs are pooled — instead of argmin-ing "
-        "directly over z_test, which lets the winner peek at the "
-        "very data it's scored on (see _select_best_baseline_cv). "
-        "Actual K is capped at n_test // 3 per episode, so small-N "
-        "episodes automatically use fewer folds. The fold split is "
-        "deterministic per episode (seeded from --seed + episode "
-        "index) and never touches icl/oracle or any individual "
-        "baseline's own diagnostic row, which keep scoring against "
-        "the full test set as before.",
-    )
-    parser.add_argument(
-        "--min_fold_size",
-        type=int,
-        default=20,
-        help="Minimum points required on both sides of every "
-        "leave-one-fold-out split (a fold's own size, and its "
-        "(K-1)-fold val complement) before a candidate baseline's "
-        "NLL there is trusted enough to base a selection on. Below "
-        "this, ranking ~12 candidate kernels by NLL on a handful of "
-        "points is closer to a coin flip than a real comparison, and "
-        "an occasional spurious pick of a blow-up-prone candidate "
-        "(e.g. dot_product/polynomial kernels, whose NLL is "
-        "unbounded above when misspecified) can drag the averaged "
-        "best_baseline mean above even a single steady fixed kernel "
-        "used for every episode. Effective K per episode is "
-        "min(--n_folds, n_test // min_fold_size); episodes where "
-        "that's < 2 report best_baseline=nan (excluded from its "
-        "mean/std, not silently zero) instead of forcing a low-"
-        "confidence selection.",
-    )
-    parser.add_argument(
-        "--min_test_points",
-        type=int,
-        default=None,
-        help="Floor on eval episodes' test-point count N, so every episode "
-        "is valid for the nested-CV best_baseline selection (see "
-        "--min_fold_size: _select_best_baseline_cv needs n_test // "
-        "min_fold_size >= 2 folds, i.e. n_test >= 2 * min_fold_size, "
-        "or it reports best_baseline=nan for that episode — silently "
-        "excluding it from the summary table's best_baseline mean while "
-        "every other row's mean still includes it). Default: "
-        "2 * --min_fold_size (40 under the argparse defaults). For "
-        "--live_generate (the default), this raises cfg.data.N_min for "
-        "this run only — conf/data/gp_tasks.yaml's own N_min=8, and "
-        "hence training's distribution, is untouched. For --dataset_dir, "
-        "episode sizes are fixed by the pre-built dataset and can't be "
-        "regenerated, so episodes below this floor are skipped instead.",
-    )
-    parser.add_argument(
-        "--oracle_mode",
-        default=None,
-        choices=["prior", "posterior"],
-        help="How R_star was built for this dataset. Determines whether "
-        "GP-MLE/DKL score the fitted kernel's posterior (conditioned "
-        "on X_train) or its raw prior covariance at X_test. Default: "
-        "read from the checkpoint's own saved training config "
-        "(cfg.data.oracle_mode), falling back to 'prior' if absent.",
-    )
-    parser.add_argument(
-        "--baseline_cache",
-        default="./baseline_cache.pt",
-        help="Path to a cache file storing every classical baseline's fitted "
-        "NLL/correlation results, keyed per-episode. These are the "
-        "expensive, checkpoint-independent part of the comparison; the "
-        "ICL model + oracle are always recomputed fresh since they're "
-        "what actually changes between runs. A cache entry is only "
-        "reused when the episode-generating config and every baseline-"
-        "fitting hyperparameter below match exactly what produced it "
-        "(see eval.baselines.classical.baseline_fingerprint) — otherwise "
-        "it's recomputed and the cache updated in place.",
-    )
-    parser.add_argument(
-        "--no_baseline_cache",
-        action="store_true",
-        help="Disable baseline caching entirely: always recompute, never read or write --baseline_cache.",
-    )
-    parser.add_argument(
-        "--refresh_baselines",
-        action="store_true",
-        help="Recompute every baseline even if a matching cache entry "
-        "exists, overwriting it (still writes --baseline_cache unless "
-        "--no_baseline_cache is also given).",
-    )
-    parser.add_argument(
-        "--results_cache",
-        default="./eval_results_partial.json",
-        help="Per-episode SCORED results (every table this script "
-        "prints), written after each episode and reused on a "
-        "restart. --baseline_cache only spares the classical "
-        "fitting; the ICL forward pass, the marginal PIT and the "
-        "nested-CV best_baseline pick lived only in memory until "
-        "the summary tables, so an interrupted run used to re-score "
-        "every episode. Unlike --baseline_cache this key INCLUDES "
-        "the checkpoint and every marginal/CV setting (results "
-        "depend on --ckpt; baseline fits deliberately do not), so "
-        "pointing two different checkpoints at one path makes the "
-        "second ignore the first's entries rather than report them "
-        "— give concurrent runs distinct paths.",
-    )
-    parser.add_argument(
-        "--no_results_cache",
-        action="store_true",
-        help="Disable the scored-results cache: always re-score every episode and never read or write --results_cache.",
-    )
-    parser.add_argument(
-        "--gp_val_select",
-        choices=GP_VAL_SELECT_MODES,
-        default="ard",
-        help="Which GP-MLE kernels pick their fit on a held-out 20%% "
-        "split of the episode's training points -- both which step "
-        "within a restart and which of --n_restarts_mle restarts -- "
-        "instead of running to --n_steps_mle and keeping the lowest "
-        "TRAINING loss. 'ard' (default) applies it to the ARD "
-        "kernels only, 'always' to every kernel, 'never' restores "
-        "the pre-v3 behaviour. ARD needs it: it fits one lengthscale "
-        "per input dimension (9 from P=32 points), the LogNormal "
-        "prior does not hold them, and they run away unbounded -- "
-        "ard_rbf ends up +6.06 nats/point worse at 1000 steps than "
-        "at its own optimum (10 steps). The non-ARD kernels do not: "
-        "with 2-3 hyperparameters the prior regularises them "
-        "adequately, so the split is pure data loss (dot_product, a "
-        "linear kernel with nothing to overfit, measures +0.36 "
-        "nats/point WORSE under 'always'). See "
-        "eval.baselines.classical._resolve_val_select for the "
-        "per-kernel numbers.",
-    )
-    parser.add_argument(
-        "--baseline_device",
-        default="cpu",
-        choices=["cpu", "cuda", "auto"],
-        help="Device for fitting the classical baselines (GP-MLE/DKL/"
-        "per_ep_transformer) only — the ICL model, TabICL marginal "
-        "and oracle always run on --device. Defaults to cpu because "
-        "it is measurably FASTER here: episodes have P=32 training "
-        "points, so each of the ~85,000 Adam steps per episode is a "
-        "32x32 Cholesky whose launch latency dwarfs its arithmetic. "
-        "Measured same-seed, same-steps against a TITAN-RTX-class "
-        "GPU, one CPU thread runs GP-MLE rbf in 2.98 s vs 7.50 s and "
-        "DKL rbf in 20.23 s vs 38.54 s, for identical NLLs. 'auto' "
-        "follows --device; pass cuda to reproduce the old behaviour.",
-    )
-    parser.add_argument(
-        "--baseline_workers",
-        type=int,
-        default=0,
-        help="Worker processes for fitting baselines, which are perfectly "
-        "independent across episodes. 0 (default) = auto: one per "
-        "PHYSICAL core this process is allowed to use "
-        "(os.sched_getaffinity, so an OAR allocation is respected; "
-        "hyperthread siblings are not counted twice because they add "
-        "well under a core here), capped at 32. 1 fits serially "
-        "in-process, as before. Only "
-        "used with --baseline_device=cpu: spreading GPU fits across "
-        "processes just contends for one device. Combined with the "
-        "cpu default this is the main speedup — ~2x from the device, "
-        "the rest from cores. Scaling tracks PHYSICAL cores: measured "
-        "78.6 s/episode vs 649 s on GPU (~8x) where the 8 allocated "
-        "logical CPUs were only 4 physical ones, so ask the scheduler "
-        "for real cores, not threads.",
-    )
-    parser.add_argument(
-        "--episode_offset",
-        type=int,
-        default=0,
-        help="Global index of the first live-generated episode (ignored "
-        "unless --live_generate). Lets one episode stream be split "
-        "across OAR array jobs: --n_episodes 100 with "
-        "--episode_offset 0/100/200/300 evaluates the same 400 "
-        "episodes as a single --n_episodes 400 run, bit-identically "
-        "(generating seed, non-composite parity, cache key and "
-        "nested-CV holdout seed all key off the global index — see "
-        "_live_generate_alternating). Give each shard its own "
-        "--baseline_cache; the resulting files share a fingerprint "
-        "and can be merged by concatenating their 'entries' dicts.",
-    )
-    parser.add_argument(
-        "--min_icl_coverage",
-        type=float,
-        default=0.0,
-        help="Fail after scoring unless this fraction of attempted episodes has a finite ICL total NLL.",
-    )
-    args = parser.parse_args(argv)
-    args.ckpt = resolve_checkpoint(args.ckpt)
-    try:
-        _validate_eval_spec(args)
-    except ValueError as exc:
-        parser.error(str(exc))
-    return args
-
-
-def _validate_eval_spec(args: argparse.Namespace) -> None:
-    if not 0 <= args.min_icl_coverage <= 1:
-        raise ValueError("--min_icl_coverage must lie in [0, 1]")
-    if args.min_icl_coverage and args.z_train_source == "oracle":
-        raise ValueError("--min_icl_coverage requires a learned marginal")
-
-    # The autoregressive chain needs the TabICL marginal.
-    if args.autoregressive and args.z_train_source != "tabicl":
-        raise ValueError(
-            "--autoregressive requires --z_train_source=tabicl: the chain needs "
-            "a marginal callable with a growing context. Re-run with "
-            "--no-autoregressive for this marginal backend."
-        )
-
-
 def _report_results(
     all_episode_meta: list[dict],
     all_nlls: list[dict[str, float]],
@@ -1255,6 +665,440 @@ def _load_models(
     return icl_model, icl_rank, marginal_backend, marginal_regressor, tabicl_ckpt, tabicl_marginal, tabicl_pit_k_folds
 
 
+def _resolve_episode_source(args: argparse.Namespace, cfg: DictConfig) -> tuple[bool, bool, str | None]:
+    """(era5, live_generate, dataset_dir) from --era5, --dataset_dir and --live_generate."""
+    era5 = bool(args.era5)
+    if era5:
+        if args.dataset_dir is not None:
+            raise ValueError("--era5 and --dataset_dir are mutually exclusive episode sources.")
+        if args.live_generate:
+            raise ValueError("--era5 and --live_generate are mutually exclusive episode sources.")
+        if args.z_train_source == "oracle":
+            raise ValueError(
+                "--era5 has no oracle marginal: real ERA5 has no generating GP to take "
+                "an exact LOO-PIT residual from. Use --z_train_source=tabicl (default) "
+                "or one of exaone/tabpfn/tabldm."
+            )
+        live_generate = False
+    else:
+        live_generate = args.live_generate if args.live_generate is not None else (args.dataset_dir is None)
+    return era5, live_generate, _dataset_dir_for_eval(args, cfg, live_generate, era5)
+
+
+# (local index, global episode index, baseline cache key, episode, baseline fit seed)
+_PlannedEpisode = tuple[int, int, str, dict, int]
+
+
+def _plan_episodes(
+    args: argparse.Namespace,
+    *,
+    era5: bool,
+    live_generate: bool,
+    dataset_dir: str | None,
+    dataset: CopulaDataset | None,
+    live_episodes: list[dict] | None,
+    n_available: int | None,
+    min_test_points: int,
+) -> list[_PlannedEpisode]:
+    """Every episode to evaluate, with its cache key; skips out-of-range or too-small dataset episodes."""
+    episode_plan: list[_PlannedEpisode] = []
+    for local_i in range(args.n_episodes):
+        if era5:
+            assert live_episodes is not None
+            # ERA5 may return fewer episodes; use each episode's own global index.
+            if local_i >= len(live_episodes):
+                continue
+            ep = live_episodes[local_i]
+            ep_i = int(ep["era5_meta"]["ep_i"])
+        elif live_generate:
+            assert live_episodes is not None
+            # Global index (offset + local index).
+            ep_i = args.episode_offset + local_i
+            ep = live_episodes[local_i]
+        else:
+            assert dataset is not None and n_available is not None
+            ep_i = args.episode_idx + local_i
+            if ep_i >= n_available:
+                print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")
+                continue
+            ep = dataset[ep_i]
+            n_test = ep["z_test"].shape[0]
+            if n_test < min_test_points:
+                print(
+                    f"  [ep {ep_i}] only {n_test} test points (< --min_test_points="
+                    f"{min_test_points}), skipping — best_baseline needs enough for "
+                    ">=2 nested-CV folds"
+                )
+                continue
+        cache_key = episode_cache_key(
+            live_generate,
+            dataset_dir,
+            args.seed,
+            ep_i,
+            source="era5" if era5 else None,
+        )
+        episode_plan.append((local_i, ep_i, cache_key, ep, _baseline_fit_seed(args.seed, cache_key)))
+    return episode_plan
+
+
+def _baseline_worker_count(args: argparse.Namespace, baseline_device: torch.device) -> int:
+    """--baseline_workers, defaulting to one per physical core (capped at 32); 1 on a GPU."""
+    n_workers = args.baseline_workers
+    try:
+        _aff = os.sched_getaffinity(0)
+    except AttributeError:  # pragma: no cover - non-Linux
+        _aff = set(range(os.cpu_count() or 1))
+    n_physical = _count_physical_cores(_aff)
+    if n_workers <= 0:
+        n_workers = max(1, min(32, n_physical or len(_aff)))
+    if n_physical and n_physical < len(_aff):
+        print(
+            f"  [prefit] note: the {len(_aff)} allocated logical CPUs are only "
+            f"{n_physical} physical core(s) ({len(_aff) // n_physical} threads each) — "
+            "expect scaling closer to the physical count; request more cores "
+            "from the scheduler for a proportionally faster run"
+        )
+    if baseline_device.type != "cpu" and n_workers > 1:
+        print(
+            f"  [prefit] --baseline_device={baseline_device.type}: forcing "
+            "--baseline_workers=1 (parallel processes would just contend for one GPU)"
+        )
+        n_workers = 1
+    return n_workers
+
+
+@dataclass
+class _EvalContext:
+    """Settings, models and cache identities shared by every scored episode."""
+
+    args: argparse.Namespace
+    device: torch.device
+    baseline_device: torch.device
+    icl_model: CopulaTabICL
+    tabicl_marginal: TabICLLike | None
+    marginal_backend: str | None
+    marginal_regressor: Any
+    tabicl_pit_k_folds: int
+    oracle_mode: str
+    prior_cfg: dict
+    fit_kwargs: dict[str, Any]
+    use_cache: bool
+    fingerprint: dict
+
+
+def _prefit_baselines(ctx: _EvalContext, episode_plan: list[_PlannedEpisode], cache_entries: dict) -> dict[str, dict]:
+    """Baselines available before scoring: valid cache entries, plus parallel fits of the rest."""
+    args = ctx.args
+    n_workers = _baseline_worker_count(args, ctx.baseline_device)
+    fitted: dict[str, dict] = {}
+    if ctx.use_cache and not args.refresh_baselines:
+        for _, ep_i, cache_key, _, _ in episode_plan:
+            entry = _valid_cached_entry(cache_entries, cache_key, ep_i)
+            if entry is not None:
+                fitted[cache_key] = entry
+
+    pending = [(cache_key, fit_seed, ep) for _, _, cache_key, ep, fit_seed in episode_plan if cache_key not in fitted]
+    print(
+        f"\nBaselines: {len(fitted)} episode(s) reused from cache, "
+        f"{len(pending)} to fit on {ctx.baseline_device.type}"
+        + (f" across {n_workers} worker process(es)" if n_workers > 1 else " serially")
+    )
+    if pending and n_workers > 1:
+        _prefit_baselines_parallel(
+            pending,
+            ctx.fit_kwargs,
+            n_workers,
+            args.baseline_cache,
+            ctx.fingerprint,
+            fitted,
+            ctx.use_cache,
+        )
+    return fitted
+
+
+# (copula NLL per method, correlation matrix per method, Y-space parts per method)
+_BaselineResults = tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]
+
+
+def _episode_baselines(
+    ctx: _EvalContext, entry: dict | None, ep: dict, cache_key: str, fit_seed: int
+) -> _BaselineResults:
+    """The episode's baseline results: from its prefit entry, or fitted here and cached."""
+    device, baseline_device = ctx.device, ctx.baseline_device
+    if entry is not None:
+        return entry["nlls"], {k: v.to(device) for k, v in entry["R_dict"].items()}, entry["y_nlls"]
+    # Serial fitting (one worker or a GPU baseline device): results moved to the
+    # evaluation device; RNG saved/restored and one BLAS thread, matching the pool.
+    with _snapshot_rng_and_threads(cpu_threads=1 if baseline_device.type == "cpu" else None):
+        baseline_nlls, baseline_R, baseline_y_nlls = eval_baselines_episode(
+            ep={k: (v.to(baseline_device) if isinstance(v, Tensor) else v) for k, v in ep.items()},
+            device=baseline_device,
+            fit_seed=fit_seed,
+            **ctx.fit_kwargs,
+        )
+    baseline_R = {k: v.to(device) for k, v in baseline_R.items()}
+    if ctx.use_cache:
+        save_baseline_entry(
+            ctx.args.baseline_cache,
+            ctx.fingerprint,
+            cache_key,
+            {
+                "nlls": baseline_nlls,
+                "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
+                "y_nlls": baseline_y_nlls,
+            },
+        )
+    return baseline_nlls, baseline_R, baseline_y_nlls
+
+
+def _episode_marginal_pit(ctx: _EvalContext, ep: dict, ep_i: int) -> dict[str, Tensor] | None:
+    """The episode's own PIT (ERA5), else the loaded marginal's; None falls back to the oracle z_train."""
+    marginal_pit = ep.get("marginal_pit")
+    if marginal_pit is None and (ctx.tabicl_marginal is not None or ctx.marginal_regressor is not None):
+        marginal_pit = _marginal_pit(
+            ep=ep,
+            tabicl_marginal=ctx.tabicl_marginal,
+            k_folds=ctx.tabicl_pit_k_folds,
+            device=ctx.device,
+            marginal_backend=ctx.marginal_backend,
+            marginal_regressor=ctx.marginal_regressor,
+            marginal_probs_n=ctx.args.marginal_probs_n,
+            seed=ep_i,
+        )
+        if marginal_pit is None:
+            print(f"  [ep {ep_i}] fewer than 2 training points — falling back to oracle z_train for this episode")
+    return marginal_pit
+
+
+def _add_autoregressive_log_pdf(ctx: _EvalContext, ep: dict, local_i: int, ep_i: int) -> None:
+    """Store the teacher-forced autoregressive chain's log-densities in ep (ERA5 precomputes them)."""
+    args = ctx.args
+    if not args.autoregressive or "ar_log_pdf" in ep:
+        return
+    if args.ar_n_episodes is not None and local_i >= args.ar_n_episodes:
+        return
+    if ctx.tabicl_marginal is None:
+        raise RuntimeError("autoregressive scoring needs the loaded TabICL marginal")
+    device = ctx.device
+    ep["ar_log_pdf"] = (
+        autoregressive_log_pdf(
+            ctx.tabicl_marginal,
+            ep["x_norm_train"].to(device).unsqueeze(0),
+            ep["y_train"].to(device).unsqueeze(0),
+            ep["x_norm_test"].to(device).unsqueeze(0),
+            ep["y_test"].to(device).unsqueeze(0),
+            order=args.ar_order,
+            conditioning=args.ar_conditioning,
+            max_context=args.ar_max_context,
+            seed=args.seed,
+            episode_indices=[ep_i],
+        )["log_pdf"][0]
+        .detach()
+        .cpu()
+    )
+
+
+def _with_zero_mean_gp(
+    ctx: _EvalContext, ep: dict, marginal_pit: dict[str, Tensor], fit_seed: int, baselines: _BaselineResults
+) -> _BaselineResults:
+    """Add the zero-mean GP baselines on the marginal's z_train, fitted here (not cached).
+
+    Seeded from fit_seed with the RNG restored and one thread.
+    """
+    args = ctx.args
+    with _snapshot_rng_and_threads(
+        seed=fit_seed + 1,
+        cpu_threads=1 if ctx.baseline_device.type == "cpu" else None,
+    ):
+        zm_nlls, zm_R, zm_y_nlls = _eval_zero_mean_gp_baselines(
+            ep=ep,
+            marginal_pit=marginal_pit,
+            device=ctx.baseline_device,
+            n_steps=args.n_steps_zeromean_gp,
+            lr=args.lr_zeromean_gp,
+            n_restarts=args.n_restarts_zeromean_gp,
+            oracle_mode=ctx.oracle_mode,
+            prior_cfg=ctx.prior_cfg,
+        )
+    baseline_nlls, baseline_R, baseline_y_nlls = baselines
+    return (
+        {**baseline_nlls, **zm_nlls},
+        {**baseline_R, **{k: v.to(ctx.device) for k, v in zm_R.items()}},
+        {**baseline_y_nlls, **zm_y_nlls},
+    )
+
+
+def _total_nll_rows(
+    ep: dict,
+    baseline_y_nlls: dict[str, dict[str, float]],
+    icl_y_parts: dict[str, float],
+    y_space_nlls: dict[str, dict[str, float]],
+    marginal_pit: dict[str, Tensor] | None,
+) -> dict[str, dict[str, float]]:
+    """Per-point total/marginal/copula Y-space NLL for every row of the TOTAL table."""
+    n_test = ep["z_test"].shape[0]
+    # Episodes with rescaled targets carry a per-point Jacobian shift, applied to the
+    # baselines' marginal and total (not the copula).
+    _shift = float(ep.get("y_log_std", 0.0))
+    if _shift:
+        baseline_y_nlls = {
+            k: {
+                "total": v["total"] + _shift,
+                "marginal": v["marginal"] + _shift,
+                "copula": v["copula"],
+            }
+            for k, v in baseline_y_nlls.items()
+        }
+    # Autoregressive row (already in raw nats).
+    ar_log_pdf = ep.get("ar_log_pdf")
+    ar_parts = (
+        ar_parts_from_log_pdf(ar_log_pdf, marginal_pit["log_pdf_test"].cpu())
+        if ar_log_pdf is not None and marginal_pit is not None
+        else _NAN_PARTS.copy()
+    )
+    marginal_only = {
+        "total": icl_y_parts["marginal"],
+        "marginal": icl_y_parts["marginal"],
+        "copula": 0.0 if not np.isnan(icl_y_parts["marginal"]) else float("nan"),
+    }
+    total_nlls = {
+        **baseline_y_nlls,
+        "icl": icl_y_parts,
+        "independence_marginal": marginal_only,
+        "autoregressive": ar_parts,
+        "oracle_prior": {k: v / n_test for k, v in y_space_nlls["prior"].items()},
+        "oracle_posterior": {k: v / n_test for k, v in y_space_nlls["posterior"].items()},
+    }
+    gp_totals = [
+        total_nlls.get(k, _NAN_PARTS)["total"]
+        for k in _GP_TOTAL_KEYS
+        if not np.isnan(total_nlls.get(k, _NAN_PARTS)["total"])
+    ]
+    total_nlls["best_gp_total"] = {
+        "total": min(gp_totals) if gp_totals else float("nan"),
+        "marginal": float("nan"),
+        "copula": float("nan"),
+    }
+    return total_nlls
+
+
+def _print_episode(
+    ep: dict,
+    ep_i: int,
+    nlls: dict[str, float],
+    total_nlls: dict[str, dict[str, float]],
+    best_nll: float,
+    fold_details: list[dict],
+) -> None:
+    """Per-episode summary: shared-z_test copula NLLs, the TOTAL rows, best baseline and top 5."""
+    icl_nll = nlls.get("icl", float("nan"))
+    ora_nll = nlls.get("oracle", float("nan"))
+    ranked_baselines = sorted(
+        ((k, v) for k, v in nlls.items() if k not in _NON_FITTED_EXCLUDED),
+        key=lambda kv: kv[1],
+    )
+    top5 = ranked_baselines[:5]
+    print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
+    # Per-point numbers against the shared z_test.
+    print(
+        f"    icl(shared_marginal)={icl_nll:.4f}  "
+        f"oracle_prior(shared_marginal, z-space copula)={ora_nll:.4f}  "
+        f"GP-oracle-y-space-total(prior={total_nlls['oracle_prior']['total']:.4f}, "
+        f"posterior={total_nlls['oracle_posterior']['total']:.4f})"
+    )
+    print(
+        f"    total Y-space NLL, own marginal (total = marginal + copula): "
+        f"icl=(cop={total_nlls['icl']['copula']:.4f}, "
+        f"marg={total_nlls['icl']['marginal']:.4f}, "
+        f"tot={total_nlls['icl']['total']:.4f})  "
+        f"oracle_prior=(cop={total_nlls['oracle_prior']['copula']:.4f}, "
+        f"marg={total_nlls['oracle_prior']['marginal']:.4f}, "
+        f"tot={total_nlls['oracle_prior']['total']:.4f})  "
+        f"oracle_posterior=(cop={total_nlls['oracle_posterior']['copula']:.4f}, "
+        f"marg={total_nlls['oracle_posterior']['marginal']:.4f}, "
+        f"tot={total_nlls['oracle_posterior']['total']:.4f})"
+    )
+    if fold_details:
+        fold_summary = ", ".join(
+            f"fold{fd['fold']}={_METHOD_LABELS.get(fd['selected'], fd['selected'])}" for fd in fold_details
+        )
+        print(f"    best_baseline (nested {len(fold_details)}-fold CV, pooled test NLL)={best_nll:.4f}")
+        print(f"      per-fold picks: {fold_summary}")
+    else:
+        print("    best_baseline: unavailable (too few test points for nested CV)")
+    print(
+        "    top-5 baselines (ranked by shared-ground-truth-marginal copula "
+        "NLL, diagnostic only — not the selection used for best_baseline "
+        "above; 'own' columns are this baseline's OWN fitted marginal, "
+        "NOT the same copula quantity as the ranking column — see "
+        "eval_baselines_episode's docstring):"
+    )
+    for key, val in top5:
+        own = total_nlls.get(key, _NAN_PARTS)
+        print(
+            f"      {_METHOD_LABELS.get(key, key):<28}"
+            f"shared_copula={val:.4f}  "
+            f"own(cop={own['copula']:.4f}, marg={own['marginal']:.4f}, "
+            f"tot={own['total']:.4f})"
+        )
+
+
+@dataclass
+class _EpisodeScore:
+    nlls: dict[str, float]  # copula NLL per method (shared z_test), incl. best_baseline
+    total_nlls: dict[str, dict[str, float]]  # TOTAL-table rows
+    y_space_nlls: dict[str, dict[str, float]]  # oracle Y-space parts
+    meta: dict
+    R_dict: dict[str, Tensor]  # correlation per method
+    R_oracle: Tensor | None
+    best_key: str | None  # method nested CV picked (for the plot)
+
+
+def _score_episode(
+    ctx: _EvalContext,
+    ep: dict,
+    local_i: int,
+    ep_i: int,
+    fit_seed: int,
+    baselines: _BaselineResults,
+) -> _EpisodeScore:
+    """Score one episode: the ICL model, the oracle and every baseline, then the nested-CV best baseline."""
+    args, device = ctx.args, ctx.device
+    marginal_pit = _episode_marginal_pit(ctx, ep, ep_i)
+    _add_autoregressive_log_pdf(ctx, ep, local_i, ep_i)
+    if args.zeromean_gp and marginal_pit is not None:
+        baselines = _with_zero_mean_gp(ctx, ep, marginal_pit, fit_seed, baselines)
+    baseline_nlls, baseline_R, baseline_y_nlls = baselines
+
+    icl_nlls, icl_R, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
+        ep=ep,
+        icl_model=ctx.icl_model,
+        device=device,
+        marginal_pit=marginal_pit,
+    )
+    total_nlls = _total_nll_rows(ep, baseline_y_nlls, icl_y_parts, y_space_nlls, marginal_pit)
+    meta = {
+        "ep_i": ep_i,
+        "n_test": ep["z_test"].shape[0],
+        "kernel": _kernel_composition_label(ep),
+    }
+    nlls = {**baseline_nlls, **icl_nlls}
+    R_dict = {**baseline_R, **icl_R}
+
+    # Best fitted baseline per episode, selected by nested CV over the test points.
+    holdout_seed = (args.seed * 1_000_003 + ep_i) % (2**31 - 1)
+    best_nll, mode_key, fold_details = _select_best_baseline_cv(
+        baseline_R,
+        ep["z_test"].to(device),
+        args.n_folds,
+        args.min_fold_size,
+        holdout_seed,
+    )
+    _print_episode(ep, ep_i, nlls, total_nlls, best_nll, fold_details)
+    nlls["best_baseline"] = best_nll
+    return _EpisodeScore(nlls, total_nlls, y_space_nlls, meta, R_dict, R_oracle, mode_key)
+
+
 def run_evaluation(args: argparse.Namespace) -> None:
     """Score one validated evaluation specification."""
     _validate_eval_spec(args)
@@ -1287,34 +1131,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     print(f"GP-MLE restarts: {args.n_restarts_mle}")
     print(f"DKL restarts: {args.n_restarts_dkl}")
 
-    # Episode source: --era5, --dataset_dir, or live generation (default).
-    era5 = bool(args.era5)
-    if era5:
-        if args.dataset_dir is not None:
-            raise ValueError("--era5 and --dataset_dir are mutually exclusive episode sources.")
-        if args.live_generate:
-            raise ValueError("--era5 and --live_generate are mutually exclusive episode sources.")
-        if args.z_train_source == "oracle":
-            raise ValueError(
-                "--era5 has no oracle marginal: real ERA5 has no generating GP to take "
-                "an exact LOO-PIT residual from. Use --z_train_source=tabicl (default) "
-                "or one of exaone/tabpfn/tabldm."
-            )
-        live_generate = False
-    else:
-        live_generate = args.live_generate if args.live_generate is not None else (args.dataset_dir is None)
-    dataset_dir = _dataset_dir_for_eval(args, cfg, live_generate, era5)
-
-    n_ep = args.n_episodes
-    all_nlls: list[dict[str, float]] = []
-    all_y_space_nlls: list[dict[str, dict[str, float]]] = []
-    all_total_nlls: list[dict[str, dict[str, float]]] = []
-    # Per-episode metadata for --dump_episodes.
-    all_episode_meta: list[dict] = []
-    plot_R_dict: dict[str, Tensor] | None = None
-    plot_R_oracle: Tensor | None = None
-    plot_best_key: str | None = None
-    plot_best_R: Tensor | None = None
+    era5, live_generate, dataset_dir = _resolve_episode_source(args, cfg)
 
     # Minimum test points (default 2 * --min_fold_size).
     min_test_points = args.min_test_points if args.min_test_points is not None else 2 * args.min_fold_size
@@ -1329,7 +1146,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         marginal_backend=marginal_backend,
         marginal_regressor=marginal_regressor,
         min_test_points=min_test_points,
-        n_ep=n_ep,
+        n_ep=args.n_episodes,
         tabicl_marginal=tabicl_marginal,
         tabicl_pit_k_folds=tabicl_pit_k_folds,
     )
@@ -1393,146 +1210,66 @@ def run_evaluation(args: argparse.Namespace) -> None:
         # Refitting also rescores.
         results_entries = {}
 
-    baseline_device = torch.device(str(device) if args.baseline_device == "auto" else args.baseline_device)
-    fit_kwargs = dict(
-        icl_rank=icl_rank,
-        n_steps_mle=args.n_steps_mle,
-        lr_mle=args.lr_mle,
-        n_steps_dkl=args.n_steps_dkl,
-        lr_dkl=args.lr_dkl,
-        n_steps_per_ep=args.n_steps_per_ep,
-        patience_per_ep=args.patience_per_ep,
+    ctx = _EvalContext(
+        args=args,
+        device=device,
+        baseline_device=torch.device(str(device) if args.baseline_device == "auto" else args.baseline_device),
+        icl_model=icl_model,
+        tabicl_marginal=tabicl_marginal,
+        marginal_backend=marginal_backend,
+        marginal_regressor=marginal_regressor,
+        tabicl_pit_k_folds=tabicl_pit_k_folds,
         oracle_mode=oracle_mode,
         prior_cfg=prior_cfg,
-        n_restarts_mle=args.n_restarts_mle,
-        n_restarts_dkl=args.n_restarts_dkl,
-        gp_val_select=args.gp_val_select,
+        fit_kwargs=dict(
+            icl_rank=icl_rank,
+            n_steps_mle=args.n_steps_mle,
+            lr_mle=args.lr_mle,
+            n_steps_dkl=args.n_steps_dkl,
+            lr_dkl=args.lr_dkl,
+            n_steps_per_ep=args.n_steps_per_ep,
+            patience_per_ep=args.patience_per_ep,
+            oracle_mode=oracle_mode,
+            prior_cfg=prior_cfg,
+            n_restarts_mle=args.n_restarts_mle,
+            n_restarts_dkl=args.n_restarts_dkl,
+            gp_val_select=args.gp_val_select,
+        ),
+        use_cache=use_cache,
+        fingerprint=fingerprint,
     )
-
-    # Episode plan: every evaluated episode and its cache key.
-    episode_plan: list[tuple[int, int, str, dict, int]] = []
-    for local_i in range(n_ep):
-        if era5:
-            assert live_episodes is not None
-            # ERA5 may return fewer episodes; use each episode's own global index.
-            if local_i >= len(live_episodes):
-                continue
-            ep = live_episodes[local_i]
-            ep_i = int(ep["era5_meta"]["ep_i"])
-        elif live_generate:
-            assert live_episodes is not None
-            # Global index (offset + local index).
-            ep_i = args.episode_offset + local_i
-            ep = live_episodes[local_i]
-        else:
-            assert dataset is not None and n_available is not None
-            ep_i = args.episode_idx + local_i
-            if ep_i >= n_available:
-                print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")
-                continue
-            ep = dataset[ep_i]
-            n_test = ep["z_test"].shape[0]
-            if n_test < min_test_points:
-                print(
-                    f"  [ep {ep_i}] only {n_test} test points (< --min_test_points="
-                    f"{min_test_points}), skipping — best_baseline needs enough for "
-                    ">=2 nested-CV folds"
-                )
-                continue
-        cache_key = episode_cache_key(
-            live_generate,
-            dataset_dir,
-            args.seed,
-            ep_i,
-            source="era5" if era5 else None,
-        )
-        episode_plan.append((local_i, ep_i, cache_key, ep, _baseline_fit_seed(args.seed, cache_key)))
-
-    # Fit the uncached baselines in parallel before the scoring loop.
-    n_workers = args.baseline_workers
-    try:
-        _aff = os.sched_getaffinity(0)
-    except AttributeError:  # pragma: no cover - non-Linux
-        _aff = set(range(os.cpu_count() or 1))
-    n_physical = _count_physical_cores(_aff)
-    # Default workers: one per physical core (capped); override with --baseline_workers.
-    if n_workers <= 0:
-        n_workers = max(1, min(32, n_physical or len(_aff)))
-    if n_physical and n_physical < len(_aff):
-        print(
-            f"  [prefit] note: the {len(_aff)} allocated logical CPUs are only "
-            f"{n_physical} physical core(s) ({len(_aff) // n_physical} threads each) — "
-            "expect scaling closer to the physical count; request more cores "
-            "from the scheduler for a proportionally faster run"
-        )
-    if baseline_device.type != "cpu" and n_workers > 1:
-        print(
-            f"  [prefit] --baseline_device={baseline_device.type}: forcing "
-            "--baseline_workers=1 (parallel processes would just contend for one GPU)"
-        )
-        n_workers = 1
-
-    # Baselines available for this run: cached entries plus pool fits.
-    fitted: dict[str, dict] = {}
-    if use_cache and not args.refresh_baselines:
-        for _, ep_i, cache_key, _, _ in episode_plan:
-            entry = _valid_cached_entry(cache_entries, cache_key, ep_i)
-            if entry is not None:
-                fitted[cache_key] = entry
-
-    pending = [(cache_key, fit_seed, ep) for _, _, cache_key, ep, fit_seed in episode_plan if cache_key not in fitted]
-    print(
-        f"\nBaselines: {len(fitted)} episode(s) reused from cache, "
-        f"{len(pending)} to fit on {baseline_device.type}"
-        + (f" across {n_workers} worker process(es)" if n_workers > 1 else " serially")
+    episode_plan = _plan_episodes(
+        args,
+        era5=era5,
+        live_generate=live_generate,
+        dataset_dir=dataset_dir,
+        dataset=dataset,
+        live_episodes=live_episodes,
+        n_available=n_available,
+        min_test_points=min_test_points,
     )
-    if pending and n_workers > 1:
-        _prefit_baselines_parallel(
-            pending,
-            fit_kwargs,
-            n_workers,
-            args.baseline_cache,
-            fingerprint,
-            fitted,
-            use_cache,
-        )
+    fitted = _prefit_baselines(ctx, episode_plan, cache_entries)
 
+    all_nlls: list[dict[str, float]] = []
+    all_y_space_nlls: list[dict[str, dict[str, float]]] = []
+    all_total_nlls: list[dict[str, dict[str, float]]] = []
+    # Per-episode metadata for --dump_episodes.
+    all_episode_meta: list[dict] = []
+    plot_R_dict: dict[str, Tensor] | None = None
+    plot_R_oracle: Tensor | None = None
+    plot_best_key: str | None = None
+    plot_best_R: Tensor | None = None
     for local_i, ep_i, cache_key, ep, fit_seed in episode_plan:
         # pop: each entry holds large N x N matrices and is used once.
         entry = fitted.pop(cache_key, None)
         cache_entries.pop(cache_key, None)
-        if entry is not None:
-            baseline_nlls = entry["nlls"]
-            baseline_R = {k: v.to(device) for k, v in entry["R_dict"].items()}
-            baseline_y_nlls = entry["y_nlls"]
-        else:
-            # Serial fitting (one worker or a GPU baseline device): results moved to the
-            # evaluation device; RNG saved/restored and one BLAS thread, matching the pool.
-            with _snapshot_rng_and_threads(cpu_threads=1 if baseline_device.type == "cpu" else None):
-                baseline_nlls, baseline_R, baseline_y_nlls = eval_baselines_episode(
-                    ep={k: (v.to(baseline_device) if isinstance(v, Tensor) else v) for k, v in ep.items()},
-                    device=baseline_device,
-                    fit_seed=fit_seed,
-                    **fit_kwargs,
-                )
-            baseline_R = {k: v.to(device) for k, v in baseline_R.items()}
-            if use_cache:
-                save_baseline_entry(
-                    args.baseline_cache,
-                    fingerprint,
-                    cache_key,
-                    {
-                        "nlls": baseline_nlls,
-                        "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
-                        "y_nlls": baseline_y_nlls,
-                    },
-                )
+        baselines = _episode_baselines(ctx, entry, ep, cache_key, fit_seed)
 
-        # Reuse an episode's cached scored results.
+        # Reuse an episode's cached scored results; the plotted episode is always
+        # rescored (the cache keeps no R matrices).
         want_plot = local_i == args.plot_episode
         res_cached = results_entries.get(str(ep_i)) if use_results_cache else None
         if res_cached is not None and not want_plot:
-            # The plotted episode is always rescored (the cache keeps no R matrices).
             all_y_space_nlls.append(res_cached["y_space_nlls"])
             all_total_nlls.append(res_cached["total_nlls"])
             all_episode_meta.append(res_cached["meta"])
@@ -1540,212 +1277,27 @@ def run_evaluation(args: argparse.Namespace) -> None:
             print(f"  ep {ep_i:04d}: reusing scored results (--results_cache)")
             continue
 
-        # Use the episode's own PIT when it has one (ERA5).
-        marginal_pit = ep.get("marginal_pit")
-        if marginal_pit is None and (tabicl_marginal is not None or marginal_regressor is not None):
-            marginal_pit = _marginal_pit(
-                ep=ep,
-                tabicl_marginal=tabicl_marginal,
-                k_folds=tabicl_pit_k_folds,
-                device=device,
-                marginal_backend=marginal_backend,
-                marginal_regressor=marginal_regressor,
-                marginal_probs_n=args.marginal_probs_n,
-                seed=ep_i,
-            )
-            if marginal_pit is None:
-                print(f"  [ep {ep_i}] fewer than 2 training points — falling back to oracle z_train for this episode")
-
-        # Teacher-forced autoregressive chain (ERA5 precomputes it).
-        if (
-            args.autoregressive
-            and "ar_log_pdf" not in ep
-            and (args.ar_n_episodes is None or local_i < args.ar_n_episodes)
-        ):
-            if tabicl_marginal is None:
-                raise RuntimeError("autoregressive scoring needs the loaded TabICL marginal")
-            ep["ar_log_pdf"] = (
-                autoregressive_log_pdf(
-                    tabicl_marginal,
-                    ep["x_norm_train"].to(device).unsqueeze(0),
-                    ep["y_train"].to(device).unsqueeze(0),
-                    ep["x_norm_test"].to(device).unsqueeze(0),
-                    ep["y_test"].to(device).unsqueeze(0),
-                    order=args.ar_order,
-                    conditioning=args.ar_conditioning,
-                    max_context=args.ar_max_context,
-                    seed=args.seed,
-                    episode_indices=[ep_i],
-                )["log_pdf"][0]
-                .detach()
-                .cpu()
-            )
-
-        # Zero-mean GP baselines on the marginal's z_train, fitted here (not cached),
-        # seeded from fit_seed with the RNG restored and one thread.
-        if args.zeromean_gp and marginal_pit is not None:
-            with _snapshot_rng_and_threads(
-                seed=fit_seed + 1,
-                cpu_threads=1 if baseline_device.type == "cpu" else None,
-            ):
-                zm_nlls, zm_R, zm_y_nlls = _eval_zero_mean_gp_baselines(
-                    ep=ep,
-                    marginal_pit=marginal_pit,
-                    device=baseline_device,
-                    n_steps=args.n_steps_zeromean_gp,
-                    lr=args.lr_zeromean_gp,
-                    n_restarts=args.n_restarts_zeromean_gp,
-                    oracle_mode=oracle_mode,
-                    prior_cfg=prior_cfg,
-                )
-            baseline_nlls = {**baseline_nlls, **zm_nlls}
-            baseline_R = {**baseline_R, **{k: v.to(device) for k, v in zm_R.items()}}
-            baseline_y_nlls = {**baseline_y_nlls, **zm_y_nlls}
-
-        icl_nlls, icl_R, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
-            ep=ep,
-            icl_model=icl_model,
-            device=device,
-            marginal_pit=marginal_pit,
-        )
-        all_y_space_nlls.append(y_space_nlls)
-
-        n_test = ep["z_test"].shape[0]
-        # Per-point oracle rows. Episodes with rescaled targets carry a per-point
-        # Jacobian shift, applied to the baselines' marginal and total (not the copula).
-        _shift = float(ep.get("y_log_std", 0.0))
-        if _shift:
-            baseline_y_nlls = {
-                k: {
-                    "total": v["total"] + _shift,
-                    "marginal": v["marginal"] + _shift,
-                    "copula": v["copula"],
-                }
-                for k, v in baseline_y_nlls.items()
-            }
-        # Autoregressive row (already in raw nats).
-        ar_log_pdf = ep.get("ar_log_pdf")
-        ar_parts = (
-            ar_parts_from_log_pdf(ar_log_pdf, marginal_pit["log_pdf_test"].cpu())
-            if ar_log_pdf is not None and marginal_pit is not None
-            else _NAN_PARTS.copy()
-        )
-        marginal_only = {
-            "total": icl_y_parts["marginal"],
-            "marginal": icl_y_parts["marginal"],
-            "copula": 0.0 if not np.isnan(icl_y_parts["marginal"]) else float("nan"),
-        }
-        total_nlls = {
-            **baseline_y_nlls,
-            "icl": icl_y_parts,
-            "independence_marginal": marginal_only,
-            "autoregressive": ar_parts,
-            "oracle_prior": {k: v / n_test for k, v in y_space_nlls["prior"].items()},
-            "oracle_posterior": {k: v / n_test for k, v in y_space_nlls["posterior"].items()},
-        }
-        gp_totals = [
-            total_nlls.get(k, _NAN_PARTS)["total"]
-            for k in _GP_TOTAL_KEYS
-            if not np.isnan(total_nlls.get(k, _NAN_PARTS)["total"])
-        ]
-        total_nlls["best_gp_total"] = {
-            "total": min(gp_totals) if gp_totals else float("nan"),
-            "marginal": float("nan"),
-            "copula": float("nan"),
-        }
-        all_total_nlls.append(total_nlls)
-        all_episode_meta.append(
-            {
-                "ep_i": ep_i,
-                "n_test": n_test,
-                "kernel": _kernel_composition_label(ep),
-            }
-        )
-
-        nlls = {**baseline_nlls, **icl_nlls}
-        R_dict = {**baseline_R, **icl_R}
-
-        icl_nll = nlls.get("icl", float("nan"))
-        ora_nll = nlls.get("oracle", float("nan"))
-        ranked_baselines = sorted(
-            ((k, v) for k, v in nlls.items() if k not in _NON_FITTED_EXCLUDED),
-            key=lambda kv: kv[1],
-        )
-        top5 = ranked_baselines[:5]
-        # Best fitted baseline per episode, selected by nested CV over the test points.
-        holdout_seed = (args.seed * 1_000_003 + ep_i) % (2**31 - 1)
-        best_nll, mode_key, fold_details = _select_best_baseline_cv(
-            baseline_R,
-            ep["z_test"].to(device),
-            args.n_folds,
-            args.min_fold_size,
-            holdout_seed,
-        )
-        nlls["best_baseline"] = best_nll
-        all_nlls.append(nlls)
-
-        # Persist this episode's scored results.
+        score = _score_episode(ctx, ep, local_i, ep_i, fit_seed, baselines)
+        all_y_space_nlls.append(score.y_space_nlls)
+        all_total_nlls.append(score.total_nlls)
+        all_episode_meta.append(score.meta)
+        all_nlls.append(score.nlls)
         if use_results_cache:
             results_entries[str(ep_i)] = _jsonable(
                 {
-                    "nlls": nlls,
-                    "total_nlls": total_nlls,
-                    "y_space_nlls": y_space_nlls,
-                    "meta": all_episode_meta[-1],
+                    "nlls": score.nlls,
+                    "total_nlls": score.total_nlls,
+                    "y_space_nlls": score.y_space_nlls,
+                    "meta": score.meta,
                 }
             )
             _save_results_cache(args.results_cache, results_fp, results_entries)
-
-        if local_i == args.plot_episode:
-            plot_R_dict = R_dict
-            plot_R_oracle = R_oracle
-            if mode_key is not None:
-                plot_best_key = mode_key
-                plot_best_R = R_dict[mode_key]
-
-        print(f"  ep {ep_i:04d}: kernel={_kernel_composition_label(ep)}")
-        # Per-point numbers against the shared z_test.
-        print(
-            f"    icl(shared_marginal)={icl_nll:.4f}  "
-            f"oracle_prior(shared_marginal, z-space copula)={ora_nll:.4f}  "
-            f"GP-oracle-y-space-total(prior={total_nlls['oracle_prior']['total']:.4f}, "
-            f"posterior={total_nlls['oracle_posterior']['total']:.4f})"
-        )
-        print(
-            f"    total Y-space NLL, own marginal (total = marginal + copula): "
-            f"icl=(cop={total_nlls['icl']['copula']:.4f}, "
-            f"marg={total_nlls['icl']['marginal']:.4f}, "
-            f"tot={total_nlls['icl']['total']:.4f})  "
-            f"oracle_prior=(cop={total_nlls['oracle_prior']['copula']:.4f}, "
-            f"marg={total_nlls['oracle_prior']['marginal']:.4f}, "
-            f"tot={total_nlls['oracle_prior']['total']:.4f})  "
-            f"oracle_posterior=(cop={total_nlls['oracle_posterior']['copula']:.4f}, "
-            f"marg={total_nlls['oracle_posterior']['marginal']:.4f}, "
-            f"tot={total_nlls['oracle_posterior']['total']:.4f})"
-        )
-        if fold_details:
-            fold_summary = ", ".join(
-                f"fold{fd['fold']}={_METHOD_LABELS.get(fd['selected'], fd['selected'])}" for fd in fold_details
-            )
-            print(f"    best_baseline (nested {len(fold_details)}-fold CV, pooled test NLL)={best_nll:.4f}")
-            print(f"      per-fold picks: {fold_summary}")
-        else:
-            print("    best_baseline: unavailable (too few test points for nested CV)")
-        print(
-            "    top-5 baselines (ranked by shared-ground-truth-marginal copula "
-            "NLL, diagnostic only — not the selection used for best_baseline "
-            "above; 'own' columns are this baseline's OWN fitted marginal, "
-            "NOT the same copula quantity as the ranking column — see "
-            "eval_baselines_episode's docstring):"
-        )
-        for key, val in top5:
-            own = total_nlls.get(key, _NAN_PARTS)
-            print(
-                f"      {_METHOD_LABELS.get(key, key):<28}"
-                f"shared_copula={val:.4f}  "
-                f"own(cop={own['copula']:.4f}, marg={own['marginal']:.4f}, "
-                f"tot={own['total']:.4f})"
-            )
+        if want_plot:
+            plot_R_dict = score.R_dict
+            plot_R_oracle = score.R_oracle
+            if score.best_key is not None:
+                plot_best_key = score.best_key
+                plot_best_R = score.R_dict[score.best_key]
 
     _report_results(
         all_episode_meta=all_episode_meta,
@@ -1756,7 +1308,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         dataset_dir=dataset_dir,
         era5=era5,
         live_generate=live_generate,
-        n_ep=n_ep,
+        n_ep=args.n_episodes,
         plot_R_dict=plot_R_dict,
         plot_R_oracle=plot_R_oracle,
         plot_best_R=plot_best_R,

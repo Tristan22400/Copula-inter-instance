@@ -13,11 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from eval.runners.eval_checkpoint import (  # noqa: E402
-    _ar_note,
-    _print_table,
-    _print_total_nll_table,
-)
+from eval.runners.eval_tables import _ar_note, _print_table, _print_total_nll_table  # noqa: E402
 
 
 def summarize(path: str, era5: bool | None = None, max_episodes: int | None = None) -> None:

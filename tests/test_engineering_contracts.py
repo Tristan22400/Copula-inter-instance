@@ -30,12 +30,8 @@ from eval.results import (
     require_coverage,
     save_results_cache,
 )
-from eval.runners.eval_checkpoint import (
-    _dataset_dir_for_eval,
-    _load_full_config,
-    _results_fingerprint,
-    parse_eval_spec,
-)
+from eval.runners.eval_args import parse_eval_spec
+from eval.runners.eval_checkpoint import _dataset_dir_for_eval, _load_full_config, _results_fingerprint
 from eval.spatial.marginal_backends import BACKEND_NAMES, _exaone_capture_quantile_bank
 
 
