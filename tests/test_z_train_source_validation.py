@@ -169,3 +169,11 @@ def test_generate_pit_dataset_rejects_y_train_on_disk():
     with pytest.raises(ValueError, match="only supported under training.live_generation"):
         _reject_disk_unsupported_z_train_source("y_train")
     _reject_disk_unsupported_z_train_source("analytic")  # must not raise
+
+
+def test_missing_z_train_source_defaults_to_tabicl():
+    from backend_registry import z_train_source
+
+    assert z_train_source(OmegaConf.create({"data": {}})) == "tabicl"
+    assert z_train_source(OmegaConf.create({})) == "tabicl"
+    assert z_train_source(OmegaConf.create({"data": {"z_train_source": "analytic"}})) == "analytic"

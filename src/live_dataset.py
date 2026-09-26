@@ -32,6 +32,7 @@ from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
 from pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
 from backend_registry import GENERIC_MARGINAL_BACKENDS, Z_TRAIN_SOURCES
+from backend_registry import z_train_source as z_train_source_of
 
 # Thread count for generate_gp_batch calls made directly in the MAIN process
 # (build_fixed_live_val_batches below, train.py's z_train-gap diagnostic) --
@@ -400,7 +401,7 @@ class LiveGPDataset(IterableDataset):
         # runtime. Mirrors generate_pit_dataset.py's "load once up front,
         # thread through every call" pattern, just scoped to a worker process
         # instead of the whole run.
-        z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+        z_train_source = z_train_source_of(cfg)
         _validate_z_train_source(z_train_source)
         raw_y_override = z_train_source in _RAW_Y_SOURCES
         tabicl_model = None
@@ -557,7 +558,7 @@ def build_live_train_loader(
     """
     batch_size = int(t.batch_size)
 
-    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
@@ -757,7 +758,7 @@ def build_fixed_live_val_batches(
     batch_size = int(t.batch_size)
     n_batches = max(1, (n_val + batch_size - 1) // batch_size)
 
-    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
     tabicl_live_enabled = z_train_source in ("tabicl", "tabicl_split")
     generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS

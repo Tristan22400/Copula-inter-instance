@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from argparse import Namespace
@@ -223,6 +224,7 @@ def test_training_core_import_does_not_load_reporting_or_era5() -> None:
          "assert not any(name == 'wandb' or name.startswith(('matplotlib', 'eval.data.era5')) "
          "for name in sys.modules)"],
         check=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
     )
 
 

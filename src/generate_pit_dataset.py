@@ -94,6 +94,7 @@ from dataset_manifest import (
     verified_shard_digest,
 )
 from live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
+from backend_registry import z_train_source as z_train_source_of
 
 
 _MAX_CUSOLVER_RETRIES = 8
@@ -332,7 +333,7 @@ def main(cfg: DictConfig) -> None:
     # checkpoint -- they only differ in how pit.py scores the train set
     # against it (K-fold rotation vs. a one-pass calibration split; see
     # tabicl_split_calib_frac below).
-    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
     _reject_disk_unsupported_z_train_source(z_train_source)
     tabicl_model = None

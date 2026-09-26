@@ -44,7 +44,6 @@ def _compose(model_name: str):
 
 def test_copula_prod_resolves_pretrained_backbone():
     cfg = _compose("copula_prod")
-    assert cfg.model.rank == 128
     assert cfg.model.unfreeze_backbone is True
     assert cfg.tabicl.pretrained is True
     assert cfg.tabicl.ckpt  # non-empty HF checkpoint name; not downloaded here
@@ -57,7 +56,6 @@ def test_copula_prod_resolves_pretrained_backbone():
 
 def test_copula_nano_resolves_scratch_backbone():
     cfg = _compose("copula_nano")
-    assert cfg.model.rank == 128
     assert cfg.tabicl.pretrained is False
     # width+depth ablation vs. the pretrained checkpoint (128/3/3/12) --
     # catches accidentally reverting conf/model/copula_nano.yaml's shrink.

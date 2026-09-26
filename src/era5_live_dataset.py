@@ -40,6 +40,7 @@ if _REPO_ROOT not in sys.path:
 
 from live_dataset import resolve_live_tabicl_num_workers
 from pit import configure_tabicl_inference_amp, load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
+from backend_registry import z_train_source as z_train_source_of
 
 from eval.data.era5_global_corpus import GlobalERA5Corpus, load_shared_corpus_arrays
 
@@ -119,7 +120,7 @@ def _resolve_marginal(cfg) -> Tuple[Optional[str], int]:
     """
     from live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
 
-    z_train_source = str(cfg.data.get("z_train_source", "analytic")) if "data" in cfg else "analytic"
+    z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
     backend = z_train_source if z_train_source in _GENERIC_MARGINAL_BACKENDS else None
     probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99)) if "data" in cfg else 99

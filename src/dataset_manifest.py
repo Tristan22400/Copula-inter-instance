@@ -11,6 +11,7 @@ import torch
 from omegaconf import OmegaConf
 
 from artifacts import artifact_identity, canonical_digest, file_digest
+from backend_registry import z_train_source as z_train_source_of
 
 SCHEMA = 1
 
@@ -25,7 +26,7 @@ def generation_spec(cfg, marginal_checkpoint: str | None) -> dict:
         "data": data,
         "tabicl": (
             OmegaConf.to_container(cfg.tabicl, resolve=True)
-            if str(cfg.data.get("z_train_source", "analytic")) in ("tabicl", "tabicl_split")
+            if z_train_source_of(cfg) in ("tabicl", "tabicl_split")
             and "tabicl" in cfg else None
         ),
         "marginal": artifact_identity(marginal_checkpoint),

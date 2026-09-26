@@ -29,6 +29,13 @@ BACKENDS = {
 GENERIC_MARGINAL_BACKENDS = tuple(name for name, spec in BACKENDS.items() if spec.batched_pit)
 Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", *GENERIC_MARGINAL_BACKENDS, "y_train")
 COPULA_BACKBONES = tuple(name for name, spec in BACKENDS.items() if spec.copula_backbone)
+DEFAULT_Z_TRAIN_SOURCE = "tabicl"
+
+
+def z_train_source(cfg) -> str:
+    """The configured ``data.z_train_source``, defaulting to TabICL."""
+    data = cfg.get("data") if hasattr(cfg, "get") else None
+    return str((data or {}).get("z_train_source", DEFAULT_Z_TRAIN_SOURCE))
 
 
 def require_capability(name: str, capability: str) -> Backend:

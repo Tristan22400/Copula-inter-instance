@@ -104,6 +104,7 @@ from live_dataset import (
 from loss import _safe_cholesky, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation_factor
 from muon import Muon
+from backend_registry import z_train_source as z_train_source_of
 from pit import (
     DEFAULT_K_FOLDS,
     gaussian_corr_kl,
@@ -224,7 +225,7 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     build_live_train_loader treating every batched-GPU-worker backend
     identically for worker/group-size sizing too.
     """
-    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     batched_marginal_worker_enabled = (
@@ -2774,10 +2775,10 @@ def main(cfg: DictConfig) -> None:
     # than a gap. Cheap: one triangular solve per episode, once, at startup,
     # reusing the _L_ff/_alpha factors the episodes already carry.
     analytic_val_z: dict = {}
-    if val_episodes_meta is not None and str(cfg.data.get("z_train_source", "analytic")) != "analytic":
+    if val_episodes_meta is not None and z_train_source_of(cfg) != "analytic":
         print(
             "[train] Building the exact analytic-GP PIT cache for oracle_diag/* "
-            f"(data.z_train_source={cfg.data.get('z_train_source')} puts the val "
+            f"(data.z_train_source={z_train_source_of(cfg)} puts the val "
             "batches in TabICL's z-space)..."
         )
         analytic_val_z = _build_analytic_val_z(val_loader, val_episodes_meta, device)
@@ -2817,7 +2818,7 @@ def main(cfg: DictConfig) -> None:
         # tabicl.pit_k_folds still governs everywhere the fold count is a free
         # choice (kernel_fit probes, the z_train mix-gap measurement).
         val_pit_k_folds = pit_k_folds
-        if str(cfg.data.get("z_train_source", "analytic")) in ("tabicl", "tabicl_split"):
+        if z_train_source_of(cfg) in ("tabicl", "tabicl_split"):
             val_pit_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", pit_k_folds))
             if val_pit_k_folds != pit_k_folds:
                 print(

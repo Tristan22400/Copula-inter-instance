@@ -82,6 +82,7 @@ from model import build_copula_transformer
 from muon import Muon
 from pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
 from training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
+from backend_registry import z_train_source as z_train_source_of
 from train import (
     _sigma_stats,
     load_checkpoint,
@@ -211,7 +212,7 @@ def main(cfg: DictConfig) -> None:
         print(f"[train_fast] training.steps={int(t.steps)} looks like the production default -- capping to 60 for this debug run (pass training.steps=N to override).")
         t.steps = 60
 
-    z_train_source = str(cfg.data.get("z_train_source", "analytic"))
+    z_train_source = z_train_source_of(cfg)
     tabicl_model = None
     gen_device = "cpu"
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
