@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 import random
 import warnings
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import gpytorch
@@ -261,6 +262,537 @@ def _evaluate_kernel_dense(kernel_obj: gpytorch.kernels.Kernel, x_norm: Tensor) 
     return kernel_obj(x_norm).to_dense()
 
 
+@dataclass
+class _CallShape:
+    """Settings every episode of one generation call shares."""
+
+    d: int
+    kernel_name: str
+    systematic: bool
+    chain_names: List[str]
+    chain_ops: List[str]
+    P: int
+    N: int
+    P_C: int  # calibration-only points (tabicl_split), after train and test
+    B: int
+    kernel_cols: Optional[List[int]]  # None = every column
+
+    @property
+    def T(self) -> int:
+        return self.P + self.N + self.P_C
+
+    @property
+    def k(self) -> int:
+        return self.d if self.kernel_cols is None else len(self.kernel_cols)
+
+
+def _sample_call_shape(
+    cfg: HasDataConfig,
+    B: int,
+    device: Device,
+    d_override: Optional[int],
+    kernel_weights: Optional[Tensor],
+    tabicl_split_calib_frac: float,
+) -> _CallShape:
+    """Draw the call-shared kernel, feature count, (P, N) and active dims; cap B to fit memory."""
+    # d_override pins d across generate_gp_batch's top-up calls.
+    d = d_override if d_override is not None else _sample_d_features(cfg)
+
+    # systematic_composition samples a chain instead of cfg.data.kernel(s).
+    systematic = bool(getattr(cfg.data, "systematic_composition", False))
+    chain_names: List[str] = []
+    chain_ops: List[str] = []
+    if systematic:
+        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg, kernel_weights=kernel_weights)
+    else:
+        kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
+    P = random.randint(cfg.data.P_min, cfg.data.P_max)
+    N = random.randint(cfg.data.N_min, cfg.data.N_max)
+    # Calibration-only points for tabicl_split_calib_frac > 0, placed after train and
+    # test so the train/test sample does not depend on them.
+    P_C = max(1, round(tabicl_split_calib_frac * P)) if tabicl_split_calib_frac > 0 else 0
+    # Cap B so the (B, T, T) buffers fit in free memory.
+    B = _max_batch_for_context(B, P + N + P_C, device)
+
+    # periodic is capped to k=1 (the period is not identifiable in higher dimensions).
+    kernel_cols: Optional[List[int]]
+    if _kernel_needs_scalar_input(kernel_name) or "periodic" in kernel_name:
+        kernel_cols = [random.randint(0, d - 1)]
+    elif kernel_name == "dot_product":
+        # dot_product uses every column.
+        kernel_cols = None
+    else:
+        kernel_cols = _sample_active_dims(d, cfg)
+    return _CallShape(d, kernel_name, systematic, chain_names, chain_ops, P, N, P_C, B, kernel_cols)
+
+
+@dataclass
+class _EpisodePriors:
+    """Per-episode kernel, hyperparameters, noise and mean function (B independent draws)."""
+
+    kernel_obj: gpytorch.kernels.Kernel
+    params: Dict[str, Tensor]
+    component_params: List[Dict[str, Tensor]]  # systematic chains only
+    likelihood: gpytorch.likelihoods.GaussianLikelihood
+    mean_module: gpytorch.means.Mean
+    mean_params: Dict[str, Tensor]
+
+
+def _sample_episode_priors(cfg: HasDataConfig, shape: _CallShape, device: Device) -> _EpisodePriors:
+    """Draw every episode's kernel hyperparameters, noise and mean function."""
+    B = shape.B
+    component_params: List[Dict[str, Tensor]] = []
+    if shape.systematic:
+        kernel_obj, component_params, outer_sign_params = _build_kernel_chain(
+            cfg,
+            shape.chain_names,
+            shape.chain_ops,
+            shape.k,
+            B,
+            device,
+            active_dims=shape.kernel_cols,
+            d_total=shape.d,
+        )
+        # Chains fill the flat schema with 0.0 (per-component values are in
+        # component_params); outer sign-modulation params stay in the flat schema.
+        params = {
+            key: torch.zeros(B, device=device)
+            for key in (
+                "l",
+                "alpha2",
+                "period",
+                "rq_alpha",
+                "power",
+                "l_b",
+                "alpha2_b",
+                "period_b",
+                "rq_alpha_b",
+                "power_b",
+            )
+        }
+        params.update(outer_sign_params)
+    else:
+        kernel_obj, params = _sample_episode_kernel(
+            cfg, shape.kernel_name, shape.k, B, device, active_dims=shape.kernel_cols, d_total=shape.d
+        )
+    likelihood = _build_likelihood(cfg, shape.kernel_name, B, device)
+    mean_module, mean_params = _sample_mean_module(cfg, shape.d, B, device)
+    return _EpisodePriors(kernel_obj, params, component_params, likelihood, mean_module, mean_params)
+
+
+@dataclass
+class _Features:
+    x_norm: Tensor  # (B, T, d) model-visible, z-scored per episode
+    x_kernel: Tensor  # (B, T, d) what the kernel and mean see (hidden warp of x_norm)
+    mlp_mixed: Optional[Tensor]  # (B,) gates, only with kernel metadata
+    kernel_hidden_applied: Optional[Tensor]
+
+
+def _sample_features(cfg: HasDataConfig, shape: _CallShape, device: Device, with_gates: bool) -> _Features:
+    """Features (B, T, d) ~ N(0, 1), warped and normalised per episode, plus the kernel's hidden view."""
+    x_raw = torch.randn(shape.B, shape.T, shape.d, device=device)
+    x_raw = tabiclv2_warp_features(x_raw)
+    x_raw = apply_structural_feature_warp(x_raw, cfg, device)
+    mlp_mixed = kernel_hidden_applied = None
+    if with_gates:
+        x_raw, mlp_mixed = apply_mlp_feature_mixing(x_raw, cfg, device, return_gate=True)
+    else:
+        x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
+    x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
+
+    # The kernel and mean are evaluated on x_kernel, a hidden transform of x_norm
+    # (identity unless kernel_hidden_enabled); the model sees x_norm.
+    if with_gates:
+        x_kernel, kernel_hidden_applied = apply_kernel_hidden_warp(x_norm, cfg, device, return_gate=True)
+    else:
+        x_kernel = apply_kernel_hidden_warp(x_norm, cfg, device)
+    return _Features(x_norm, x_kernel, mlp_mixed, kernel_hidden_applied)
+
+
+@dataclass
+class _GPDraw:
+    """One joint GP sample per episode and its exact (analytic) oracle and PIT."""
+
+    x_norm_train: Tensor  # (B, P, d)
+    x_norm_test: Tensor  # (B, N, d)
+    x_norm_calib: Tensor  # (B, P_C, d), tabicl_split PIT context only
+    x_kernel_train: Tensor  # oracle-only, never returned
+    x_kernel_test: Tensor
+    y_train: Tensor  # (B, P)
+    y_test: Tensor  # (B, N)
+    y_calib: Tensor  # (B, P_C)
+    L_ff: Tensor  # (B, P, P) Cholesky of the training covariance
+    alpha: Tensor  # (B, P) K_ff^{-1} (y_train - mean_train)
+    mu_star: Tensor  # (B, N) prior mean at the test points
+    sigma_star: Tensor  # (B, N) prior std
+    R_star: Tensor  # (B, N, N) prior correlation
+    R_prior: Tensor  # (B, N, N) same as R_star, kept for the schema
+    Sigma_full: Tensor  # (B, N, N) R_star rescaled by sigma_star
+    z_train: Tensor  # (B, P) exact LOO PIT
+    z_test: Tensor  # (B, N) exact posterior PIT
+    log_pdf_test: Tensor  # (B, N)
+    discard: Tensor  # (B,) bool, Cholesky failures
+
+
+def _draw_gp(
+    cfg: HasDataConfig, shape: _CallShape, priors: _EpisodePriors, feats: _Features, device: Device
+) -> Optional[_GPDraw]:
+    """Sample y jointly from each episode's GP; None when kernel evaluation fails for the whole batch."""
+    B, P, N, T = shape.B, shape.P, shape.N, shape.T
+    x_norm, x_kernel = feats.x_norm, feats.x_kernel
+    likelihood, mean_module = priors.likelihood, priors.mean_module
+
+    # Joint prior covariance (B, T, T): dense kernel + nugget on the diagonal. Only
+    # kernel evaluation can raise; factorization happens per episode in
+    # _psd_safe_batch.
+    with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
+        try:
+            K_full_dense = _evaluate_kernel_dense(priors.kernel_obj, x_kernel)  # (B, T, T), no nugget yet
+        except (NotPSDError, torch.linalg.LinAlgError):
+            warnings.warn(
+                f"_generate_gp_batch_raw: kernel evaluation for this "
+                f"{B}-episode batch (kernel={shape.kernel_name!r}) raised NotPSDError "
+                f"or LinAlgError; discarding the whole batch and resampling.",
+                RuntimeWarning,
+            )
+            return None
+    nugget_eye = torch.eye(T, device=device, dtype=K_full_dense.dtype).expand(B, T, T)
+    K_all_raw = K_full_dense + likelihood.noise.reshape(B, 1, 1) * nugget_eye
+
+    # K_all = L_all L_all^T from a PSD-repaired Cholesky, so the sample y_all and the
+    # reported covariances come from the same PSD matrix.
+    L_all, failed_all = _psd_safe_batch(K_all_raw)
+    K_all = L_all @ L_all.mT  # (B, T, T), PSD by construction
+    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero-mean GP sample
+    # Add the mean function (evaluated on x_kernel).
+    y_all = y_all + mean_module(x_kernel)
+
+    x_kernel_train = x_kernel[:, :P]
+    x_kernel_test = x_kernel[:, P : P + N]
+    y_train = y_all[:, :P]
+    y_test = y_all[:, P : P + N]
+
+    # --- Sub-matrices of K_all (nugget already on diagonal) ---
+    K_ff = K_all[:, :P, :P]  # (B, P, P) -- P_C never enters K_ff/LOO/oracle
+    K_ss = K_all[:, P : P + N, P : P + N]  # (B, N, N)
+
+    # LOO PIT needs L_ff and alpha = K_ff^{-1} (y_train - mean_train).
+    L_ff, failed_ff = _batched_cholesky(K_ff)
+    mean_train = mean_module(x_kernel_train)  # (B, P)
+    alpha = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L_ff).squeeze(-1)  # (B, P)
+
+    oracle_mode = getattr(cfg.data, "oracle_mode", "prior")
+    if oracle_mode == "prior":
+        # Prior oracle: R_star is the prior correlation of the test block of K_all.
+        # The copula target is the posterior correlation R_post (see z_test below).
+        mu_star = mean_module(x_kernel_test)
+        Sigma_star = K_ss
+    else:
+        raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; only 'prior' is supported.")
+    Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
+
+    # sigma_to_correlation (batched)
+    var_diag = Sigma_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10)  # (B, N)
+    sigma_star = var_diag.sqrt()
+    inv_s = var_diag.rsqrt()
+    R_star = Sigma_star * inv_s.unsqueeze(1) * inv_s.unsqueeze(2)  # (B, N, N)
+    d_diag = R_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
+    R_star = R_star / (d_diag.unsqueeze(1) * d_diag.unsqueeze(2))
+
+    # Prior correlation among the test points (same as R_star; kept for the schema).
+    prior_var = K_ss.diagonal(dim1=1, dim2=2).clamp(min=1e-10)  # (B, N)
+    prior_inv = prior_var.rsqrt()
+    R_prior = K_ss * prior_inv.unsqueeze(1) * prior_inv.unsqueeze(2)  # (B, N, N)
+    pd_diag = R_prior.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
+    R_prior = R_prior / (pd_diag.unsqueeze(1) * pd_diag.unsqueeze(2))
+
+    # LOO PIT for z_train; diag(K_ff^{-1}) is the column-wise squared norm of L_ff^{-1}.
+    eye_P = torch.eye(P, device=device)
+    L_inv = torch.linalg.solve_triangular(L_ff, eye_P.unsqueeze(0).expand(B, -1, -1), upper=False)  # (B, P, P)
+    K_inv_diag = (L_inv**2).sum(dim=1).clamp(min=1e-12)  # (B, P)
+    z_train = alpha * K_inv_diag.rsqrt()  # (B, P)
+
+    # Posterior PIT for z_test: standardize by the GP posterior marginals
+    # N(mu_post_i, Sigma_post_ii), matching what a TabICL marginal conditioned on
+    # the context gives. mu_star/sigma_star stay prior quantities. Only diag of the
+    # Schur complement is used (each entry >= nugget).
+    K_sf = K_all[:, P : P + N, :P]  # (B, N, P)
+    V_sf = torch.linalg.solve_triangular(L_ff, K_sf.mT, upper=False)  # (B, P, N)
+    mu_post = mu_star + torch.bmm(K_sf, alpha.unsqueeze(-1)).squeeze(-1)  # (B, N)
+    var_post = K_ss.diagonal(dim1=1, dim2=2) - (V_sf**2).sum(dim=1)  # (B, N)
+    var_post = var_post.clamp(min=likelihood.noise.reshape(B, 1).clamp(min=1e-10))
+    sig_c = var_post.sqrt()
+    z_test = (y_test - mu_post) / sig_c  # (B, N)
+    log_pdf_test = -0.5 * math.log(2.0 * math.pi) - sig_c.log() - 0.5 * z_test**2  # (B, N)
+
+    # Full prior covariance at the test points (for the Y-space oracle).
+    Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)  # (B, N, N)
+
+    return _GPDraw(
+        x_norm_train=x_norm[:, :P],
+        x_norm_test=x_norm[:, P : P + N],
+        x_norm_calib=x_norm[:, P + N :],
+        x_kernel_train=x_kernel_train,
+        x_kernel_test=x_kernel_test,
+        y_train=y_train,
+        y_test=y_test,
+        y_calib=y_all[:, P + N :],
+        L_ff=L_ff,
+        alpha=alpha,
+        mu_star=mu_star,
+        sigma_star=sigma_star,
+        R_star=R_star,
+        R_prior=R_prior,
+        Sigma_full=Sigma_full,
+        z_train=z_train,
+        z_test=z_test,
+        log_pdf_test=log_pdf_test,
+        discard=failed_all | failed_ff,
+    )
+
+
+def _degenerate_episodes(draw: _GPDraw, shape: _CallShape, x_norm: Tensor) -> Tensor:
+    """(B,) bool: episodes with a degenerate LOO z or whose every active kernel column is near-constant."""
+    B = shape.B
+    non_finite = ~torch.isfinite(draw.z_train).all(dim=1)
+    z_std = draw.z_train.std(dim=1)
+    degen = non_finite | (z_std < 0.1) | (z_std > 3.0)
+    if degen.any():
+        warnings.warn(
+            f"generate_gp_batch: {int(degen.sum())}/{B} episodes have degenerate LOO z "
+            f"({int(non_finite.sum())} non-finite) and will be discarded.",
+            RuntimeWarning,
+        )
+
+    # Every active kernel dimension collapsed to a constant would make R_star constant.
+    active_cols = shape.kernel_cols if shape.kernel_cols is not None else list(range(shape.d))
+    active_stds = x_norm[:, :, active_cols].std(dim=1)  # (B, len(active_cols))
+    degenerate_active_col = (active_stds.max(dim=1).values) < 1e-4
+    if degenerate_active_col.any():
+        warnings.warn(
+            f"generate_gp_batch: {int(degenerate_active_col.sum())}/{B} episodes have a "
+            f"degenerate (near-constant) active kernel column and will be discarded.",
+            RuntimeWarning,
+        )
+    return degen | degenerate_active_col
+
+
+def _backend_pit_per_episode(
+    cfg: HasDataConfig,
+    draw: _GPDraw,
+    shape: _CallShape,
+    device: Device,
+    marginal_backend: str,
+    marginal_regressor: Any,
+    k_folds: int,
+    probs_n: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """K-fold PIT, episode by episode, through a backend without a batched module (slow)."""
+    from eval.metrics.joint_nll import compute_pit
+    from eval.spatial.marginal_backends import loo_pit as _backend_loo_pit
+    from eval.spatial.marginal_backends import quantiles as _backend_quantiles
+
+    B, P, N = shape.B, shape.P, shape.N
+    y_train, y_test = draw.y_train, draw.y_test
+    y_mean = y_train.mean(dim=1, keepdim=True)
+    y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+    probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
+    base_seed = int(getattr(cfg, "seed", None) or 0)
+    z_train_np = np.empty((B, P), dtype=np.float32)
+    z_test_np = np.empty((B, N), dtype=np.float32)
+    log_pdf_np = np.empty((B, N), dtype=np.float32)
+    for b in range(B):
+        xc = draw.x_norm_train[b].detach().cpu().numpy()
+        xq = draw.x_norm_test[b].detach().cpu().numpy()
+        y_std_b = float(y_std[b])
+        yc = ((y_train[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
+        yq = ((y_test[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
+        seed_b = (base_seed + b) % (2**31)
+        z_train_np[b] = _backend_loo_pit(
+            marginal_backend,
+            marginal_regressor,
+            xc,
+            yc,
+            probs,
+            k_folds=k_folds,
+            seed=seed_b,
+        )
+        q_test = _backend_quantiles(marginal_backend, marginal_regressor, xc, yc, xq, probs, seed=seed_b)
+        z_test_b, log_pdf_b = compute_pit(q_test, probs, yq)
+        z_test_np[b] = z_test_b
+        # Jacobian back to raw-y nats.
+        log_pdf_np[b] = log_pdf_b - math.log(y_std_b)
+    return (
+        torch.from_numpy(z_train_np).to(device=device),
+        torch.from_numpy(z_test_np).to(device=device),
+        torch.from_numpy(log_pdf_np).to(device=device),
+    )
+
+
+def _marginal_pit(
+    cfg: HasDataConfig,
+    draw: _GPDraw,
+    shape: _CallShape,
+    device: Device,
+    *,
+    apply_tabicl: bool,
+    tabicl_model: Optional[TabICLLike],
+    tabicl_k_folds: int,
+    tabicl_split_calib_frac: float,
+    marginal_backend: Optional[str],
+    marginal_regressor: Any,
+    marginal_probs_n: int,
+    raw_y_override: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """(z_train, z_test, log_pdf_test): the exact PIT, or its replacement by a marginal model.
+
+    Targets are z-scored per episode before a marginal model sees them, and its
+    log-densities are converted back to raw-y nats.
+    """
+    z_train, z_test, log_pdf_test = draw.z_train, draw.z_test, draw.log_pdf_test
+    y_train, y_test, y_calib = draw.y_train, draw.y_test, draw.y_calib
+    if raw_y_override:
+        # "y_train": z_train is the z-scored target; z_test/log_pdf_test stay analytic.
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        z_train = ((y_train - y_mean) / y_std).detach()
+    elif marginal_backend in _BATCHED_MARGINAL_BACKENDS:
+        # Batched PIT for a non-TabICL backend: (k_folds + 1) fused forwards for the call.
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_s = ((y_train - y_mean) / y_std).detach().cpu().numpy()
+        y_test_s = ((y_test - y_mean) / y_std).detach().cpu().numpy()
+        x_train_np = draw.x_norm_train.detach().cpu().numpy()
+        x_test_np = draw.x_norm_test.detach().cpu().numpy()
+        base_seed = int(getattr(cfg, "seed", None) or 0)
+        _run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
+        out = _run_batched(
+            marginal_regressor,
+            x_train_np,
+            y_train_s,
+            x_test_np,
+            y_test_s,
+            k_folds=tabicl_k_folds,
+            probs_n=marginal_probs_n,
+            seed=base_seed,
+        )
+        z_train = torch.from_numpy(out["z_train"]).to(device=device)
+        z_test = torch.from_numpy(out["z_test"]).to(device=device)
+        # Jacobian back to raw-y nats.
+        log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
+    elif marginal_backend is not None and marginal_backend != "tabicl":
+        z_train, z_test, log_pdf_test = _backend_pit_per_episode(
+            cfg, draw, shape, device, marginal_backend, marginal_regressor, tabicl_k_folds, marginal_probs_n
+        )
+    elif apply_tabicl and tabicl_split_calib_frac > 0:
+        # "tabicl_split": one forward with the calibration points as context.
+        from copula_inter.pit import run_pit_calib_split_batched  # local: pit.py imports from this module
+
+        assert tabicl_model is not None
+
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
+        y_calib_scaled = ((y_calib - y_mean) / y_std).unsqueeze(-1)  # (B, P_C, 1)
+        split_pit = run_pit_calib_split_batched(
+            tabicl_model,
+            draw.x_norm_train,
+            y_train_scaled,
+            draw.x_norm_calib,
+            y_calib_scaled,
+            Y_query_raw=y_train.unsqueeze(-1),
+            Y_calib_raw=y_calib.unsqueeze(-1),
+        )
+        z_train = split_pit["z_train"].squeeze(-1)  # (B, P)
+    elif apply_tabicl:
+        # "tabicl": K-fold PIT on the training points and a full-context PIT on the
+        # real test points; z_train, z_test and log_pdf_test all come from TabICL.
+        from copula_inter.pit import run_pit_batched  # local: pit.py imports from this module
+
+        assert tabicl_model is not None
+
+        y_mean = y_train.mean(dim=1, keepdim=True)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
+        y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)  # (B, N, 1)
+        tabicl_pit = run_pit_batched(
+            tabicl_model,
+            draw.x_norm_train,
+            y_train_scaled,
+            draw.x_norm_test,
+            y_test_scaled,
+            k_folds=tabicl_k_folds,
+            Y_train_raw=y_train.unsqueeze(-1),
+        )
+        z_train = tabicl_pit["z_train"].squeeze(-1)  # (B, P)
+        z_test = tabicl_pit["z_test"].squeeze(-1)  # (B, N)
+        # Jacobian back to raw-y nats: log p_raw = log p_scaled - log(std).
+        log_pdf_test = tabicl_pit["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast
+    return z_train, z_test, log_pdf_test
+
+
+# Flat per-episode hyperparameter keys saved with kernel metadata.
+_FLAT_KERNEL_KEYS = [
+    "l",
+    "alpha2",
+    "period",
+    "rq_alpha",
+    "power",
+    "l_b",
+    "alpha2_b",
+    "period_b",
+    "rq_alpha_b",
+    "power_b",
+    "sign_applied_outer",
+    "sign_w_outer",
+    "sign_b_outer",
+    "sign_a_outer",
+]
+_MEAN_KEYS = (
+    "mean_weight",
+    "mean_bias",
+    "mean_nonzero",
+    "mean_family",
+    "mean_linear",
+    "mean_exp_direction",
+    "mean_exp_rate",
+    "mean_exp_scale",
+    "mean_anomaly_direction",
+    "mean_anomaly_threshold",
+    "mean_anomaly_magnitude",
+)
+
+
+def _kernel_metadata(
+    shape: _CallShape, priors: _EpisodePriors, feats: _Features, draw: _GPDraw
+) -> tuple[Dict[str, Tensor], Dict[str, object]]:
+    """Per-episode hyperparameters and factors, plus the call-shared kernel name and active dims."""
+    flat_keys = list(_FLAT_KERNEL_KEYS)
+    if not shape.systematic:
+        # Chains carry per-component sign fields in kernel_component_params instead.
+        flat_keys += ["sign_applied", "sign_w", "sign_b", "sign_a"]
+        if _parse_composite(shape.kernel_name) is not None:
+            flat_keys += ["sign_applied_b", "sign_w_b", "sign_b_b", "sign_a_b"]
+    assert feats.mlp_mixed is not None and feats.kernel_hidden_applied is not None
+    tensors = {key: priors.params[key].cpu() for key in flat_keys}
+    tensors["nugget"] = priors.likelihood.noise.reshape(shape.B).cpu()  # name kept for the saved schema
+    tensors["mlp_mixed"] = feats.mlp_mixed.cpu()
+    tensors["kernel_hidden_applied"] = feats.kernel_hidden_applied.cpu()
+    tensors["x_kernel_train"] = draw.x_kernel_train.cpu()
+    tensors["x_kernel_test"] = draw.x_kernel_test.cpu()
+    for key in _MEAN_KEYS:
+        tensors[key] = priors.mean_params[key].cpu()
+    tensors["_L_ff"] = draw.L_ff
+    tensors["_alpha"] = draw.alpha
+    extra: Dict[str, object] = {
+        "kernel": shape.kernel_name,
+        "kernel_feature_indices": torch.tensor(
+            shape.kernel_cols if shape.kernel_cols is not None else list(range(shape.d)), dtype=torch.long
+        ),
+    }
+    return tensors, extra
+
+
 @torch.no_grad()
 def _generate_gp_batch_raw(
     cfg: HasDataConfig,
@@ -313,419 +845,80 @@ def _generate_gp_batch_raw(
     if seed is not None:
         seed_everything(seed)
 
-    # d_override pins d across generate_gp_batch's top-up calls.
-    d = d_override if d_override is not None else _sample_d_features(cfg)
+    shape = _sample_call_shape(cfg, B, device, d_override, kernel_weights, tabicl_split_calib_frac)
+    priors = _sample_episode_priors(cfg, shape, device)
+    feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)
+    draw = _draw_gp(cfg, shape, priors, feats, device)
+    if draw is None:
+        return []
+    discard = draw.discard | _degenerate_episodes(draw, shape, feats.x_norm)
 
-    # Shared settings for this batch. systematic_composition samples a chain instead of cfg.data.kernel(s).
-    systematic = bool(getattr(cfg.data, "systematic_composition", False))
-    if systematic:
-        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg, kernel_weights=kernel_weights)
-    else:
-        kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
-    P = random.randint(cfg.data.P_min, cfg.data.P_max)
-    N = random.randint(cfg.data.N_min, cfg.data.N_max)
-    # Calibration-only points for tabicl_split_calib_frac > 0, placed after train and
-    # test so the train/test sample does not depend on them.
-    P_C = max(1, round(tabicl_split_calib_frac * P)) if tabicl_split_calib_frac > 0 else 0
-    T = P + N + P_C
-    # Cap B so the (B, T, T) buffers fit in free memory.
-    B = _max_batch_for_context(B, T, device)
-
-    # active_dims (and k) are shared by all episodes in the call. periodic is capped
-    # to k=1 (the period is not identifiable in higher dimensions).
-    kernel_cols: Optional[List[int]]
-    if _kernel_needs_scalar_input(kernel_name) or "periodic" in kernel_name:
-        kernel_cols = [random.randint(0, d - 1)]
-    elif kernel_name == "dot_product":
-        # dot_product uses every column.
-        kernel_cols = None
-    else:
-        kernel_cols = _sample_active_dims(d, cfg)
-    k = d if kernel_cols is None else len(kernel_cols)
-
-    # --- Per-episode hyperparameters + noise (B independent draws in one call) ---
-    if systematic:
-        kernel_obj, component_params, outer_sign_params = _build_kernel_chain(
-            cfg, chain_names, chain_ops, k, B, device, active_dims=kernel_cols, d_total=d
-        )
-        # Chains fill the flat schema with 0.0 (per-component values are in
-        # component_params); outer sign-modulation params stay in the flat schema.
-        params = {
-            key: torch.zeros(B, device=device)
-            for key in (
-                "l",
-                "alpha2",
-                "period",
-                "rq_alpha",
-                "power",
-                "l_b",
-                "alpha2_b",
-                "period_b",
-                "rq_alpha_b",
-                "power_b",
-            )
-        }
-        params.update(outer_sign_params)
-    else:
-        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols, d_total=d)
-    likelihood = _build_likelihood(cfg, kernel_name, B, device)
-    nugget = likelihood.noise.reshape(B)  # "nugget" name kept for the saved-metadata schema
-
-    # Mean function, one per episode.
-    mean_module, mean_params = _sample_mean_module(cfg, d, B, device)
-
-    # --- Features (B, T, d) ~ N(0, 1), warped, normalised per episode ---
-    x_raw = torch.randn(B, T, d, device=device)
-    x_raw = tabiclv2_warp_features(x_raw)
-    x_raw = apply_structural_feature_warp(x_raw, cfg, device)
-    if return_kernel_metadata:
-        x_raw, mlp_mixed = apply_mlp_feature_mixing(x_raw, cfg, device, return_gate=True)
-    else:
-        x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
-    x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
-
-    # The kernel and mean are evaluated on x_kernel, a hidden transform of x_norm
-    # (identity unless kernel_hidden_enabled); the model sees x_norm.
-    if return_kernel_metadata:
-        x_kernel, kernel_hidden_applied = apply_kernel_hidden_warp(x_norm, cfg, device, return_gate=True)
-    else:
-        x_kernel = apply_kernel_hidden_warp(x_norm, cfg, device)
-
-    # Joint prior covariance (B, T, T): dense kernel + nugget on the diagonal. Only
-    # kernel evaluation can raise; factorization happens per episode in
-    # _psd_safe_batch.
-    with gpytorch.settings.max_cholesky_size(_MAX_CHOLESKY):
-        try:
-            K_full_dense = _evaluate_kernel_dense(kernel_obj, x_kernel)  # (B, T, T), no nugget yet
-        except (NotPSDError, torch.linalg.LinAlgError):
-            warnings.warn(
-                f"_generate_gp_batch_raw: kernel evaluation for this "
-                f"{B}-episode batch (kernel={kernel_name!r}) raised NotPSDError "
-                f"or LinAlgError; discarding the whole batch and resampling.",
-                RuntimeWarning,
-            )
-            return []
-    nugget_eye = torch.eye(T, device=device, dtype=K_full_dense.dtype).expand(B, T, T)
-    K_all_raw = K_full_dense + likelihood.noise.reshape(B, 1, 1) * nugget_eye
-
-    # K_all = L_all L_all^T from a PSD-repaired Cholesky, so the sample y_all and the
-    # reported covariances come from the same PSD matrix.
-    L_all, failed_all = _psd_safe_batch(K_all_raw)
-    K_all = L_all @ L_all.mT  # (B, T, T), PSD by construction
-    y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero-mean GP sample
-    # Add the mean function (evaluated on x_kernel).
-    y_all = y_all + mean_module(x_kernel)
-
-    x_norm_train = x_norm[:, :P]  # (B, P, d) -- model-visible, saved/returned below
-    x_norm_test = x_norm[:, P : P + N]  # (B, N, d)
-    x_norm_calib = x_norm[:, P + N :]  # (B, P_C, d) -- tabicl_split PIT context only
-    x_kernel_train = x_kernel[:, :P]  # (B, P, d) -- oracle-only, never saved/returned
-    x_kernel_test = x_kernel[:, P : P + N]  # (B, N, d)
-    y_train = y_all[:, :P]  # (B, P)
-    y_test = y_all[:, P : P + N]  # (B, N)
-    y_calib = y_all[:, P + N :]  # (B, P_C)
-
-    # --- Sub-matrices of K_all (nugget already on diagonal) ---
-    K_ff = K_all[:, :P, :P]  # (B, P, P) -- P_C never enters K_ff/LOO/oracle
-    K_ss = K_all[:, P : P + N, P : P + N]  # (B, N, N)
-
-    # LOO PIT needs L_ff and alpha = K_ff^{-1} (y_train - mean_train).
-    L_ff, failed_ff = _batched_cholesky(K_ff)
-    mean_train = mean_module(x_kernel_train)  # (B, P)
-    alpha = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L_ff).squeeze(-1)  # (B, P)
-
-    # Episodes whose Cholesky failed are dropped at the end.
-    discard = failed_all | failed_ff
-
-    oracle_mode = getattr(cfg.data, "oracle_mode", "prior")
-    if oracle_mode == "prior":
-        # Prior oracle: R_star is the prior correlation of the test block of K_all.
-        # The copula target is the posterior correlation R_post (see z_test below).
-        mu_star = mean_module(x_kernel_test)
-        Sigma_star = K_ss
-    else:
-        raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; only 'prior' is supported.")
-    Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
-
-    # sigma_to_correlation (batched)
-    var_diag = Sigma_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10)  # (B, N)
-    sigma_star = var_diag.sqrt()
-    inv_s = var_diag.rsqrt()
-    R_star = Sigma_star * inv_s.unsqueeze(1) * inv_s.unsqueeze(2)  # (B, N, N)
-    d_diag = R_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
-    R_star = R_star / (d_diag.unsqueeze(1) * d_diag.unsqueeze(2))
-
-    # Prior correlation among the test points (same as R_star; kept for the schema).
-    prior_var = K_ss.diagonal(dim1=1, dim2=2).clamp(min=1e-10)  # (B, N)
-    prior_inv = prior_var.rsqrt()
-    R_prior = K_ss * prior_inv.unsqueeze(1) * prior_inv.unsqueeze(2)  # (B, N, N)
-    pd_diag = R_prior.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
-    R_prior = R_prior / (pd_diag.unsqueeze(1) * pd_diag.unsqueeze(2))
-
-    # LOO PIT for z_train; diag(K_ff^{-1}) is the column-wise squared norm of L_ff^{-1}.
-    eye_P = torch.eye(P, device=device)
-    L_inv = torch.linalg.solve_triangular(L_ff, eye_P.unsqueeze(0).expand(B, -1, -1), upper=False)  # (B, P, P)
-    K_inv_diag = (L_inv**2).sum(dim=1).clamp(min=1e-12)  # (B, P)
-    z_train = alpha * K_inv_diag.rsqrt()  # (B, P)
-
-    # Posterior PIT for z_test: standardize by the GP posterior marginals
-    # N(mu_post_i, Sigma_post_ii), matching what a TabICL marginal conditioned on
-    # the context gives. mu_star/sigma_star stay prior quantities. Only diag of the
-    # Schur complement is used (each entry >= nugget).
-    K_sf = K_all[:, P : P + N, :P]  # (B, N, P)
-    V_sf = torch.linalg.solve_triangular(L_ff, K_sf.mT, upper=False)  # (B, P, N)
-    mu_post = mu_star + torch.bmm(K_sf, alpha.unsqueeze(-1)).squeeze(-1)  # (B, N)
-    var_post = K_ss.diagonal(dim1=1, dim2=2) - (V_sf**2).sum(dim=1)  # (B, N)
-    var_post = var_post.clamp(min=likelihood.noise.reshape(B, 1).clamp(min=1e-10))
-    sig_c = var_post.sqrt()
-    z_test = (y_test - mu_post) / sig_c  # (B, N)
-    log_pdf_test = -0.5 * math.log(2.0 * math.pi) - sig_c.log() - 0.5 * z_test**2  # (B, N)
-
-    # Discard episodes whose z_train is non-finite or has degenerate spread.
-    non_finite = ~torch.isfinite(z_train).all(dim=1)
-    z_std = z_train.std(dim=1)
-    degen = non_finite | (z_std < 0.1) | (z_std > 3.0)
-    if degen.any():
-        warnings.warn(
-            f"generate_gp_batch: {int(degen.sum())}/{B} episodes have degenerate LOO z "
-            f"({int(non_finite.sum())} non-finite) and will be discarded.",
-            RuntimeWarning,
-        )
-    discard = discard | degen
-
-    # Discard episodes whose every active kernel dimension collapsed to a constant
-    # (R_star would then be constant).
-    active_cols = kernel_cols if kernel_cols is not None else list(range(d))
-    active_stds = x_norm[:, :, active_cols].std(dim=1)  # (B, len(active_cols))
-    degenerate_active_col = (active_stds.max(dim=1).values) < 1e-4
-    if degenerate_active_col.any():
-        warnings.warn(
-            f"generate_gp_batch: {int(degenerate_active_col.sum())}/{B} episodes have a "
-            f"degenerate (near-constant) active kernel column and will be discarded.",
-            RuntimeWarning,
-        )
-    discard = discard | degenerate_active_col
-
-    # Reconstruct full posterior covariance (for Y-space oracle)
-    Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)  # (B, N, N)
-
-    # z_train override from a marginal model (z_train_source tabicl / tabicl_split /
-    # backends), after the degenerate-episode checks. Targets are z-scored per
-    # episode first. With tabicl_mix_weights the override applies with the
-    # kernel's mix probability.
+    # With tabicl_mix_weights the TabICL override applies with the kernel's mix probability.
     if tabicl_mix_weights is not None:
         apply_tabicl = tabicl_model is not None and (
-            random.random() < _tabicl_mix_prob_for_kernel(kernel_name, tabicl_mix_weights)
+            random.random() < _tabicl_mix_prob_for_kernel(shape.kernel_name, tabicl_mix_weights)
         )
     else:
         apply_tabicl = tabicl_model is not None
-
-    if raw_y_override:
-        # "y_train": z_train is the z-scored target; z_test/log_pdf_test stay analytic.
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        z_train = ((y_train - y_mean) / y_std).detach()
-    elif marginal_backend in _BATCHED_MARGINAL_BACKENDS:
-        # Batched PIT for a non-TabICL backend: (k_folds + 1) fused forwards for the call.
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        y_train_s = ((y_train - y_mean) / y_std).detach().cpu().numpy()
-        y_test_s = ((y_test - y_mean) / y_std).detach().cpu().numpy()
-        x_train_np = x_norm_train.detach().cpu().numpy()
-        x_test_np = x_norm_test.detach().cpu().numpy()
-        base_seed = int(getattr(cfg, "seed", None) or 0)
-        _run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
-        out = _run_batched(
-            marginal_regressor,
-            x_train_np,
-            y_train_s,
-            x_test_np,
-            y_test_s,
-            k_folds=tabicl_k_folds,
-            probs_n=marginal_probs_n,
-            seed=base_seed,
-        )
-        z_train = torch.from_numpy(out["z_train"]).to(device=device)
-        z_test = torch.from_numpy(out["z_test"]).to(device=device)
-        # Jacobian back to raw-y nats.
-        log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
-    elif marginal_backend not in (None, "tabicl"):
-        # Per-episode K-fold PIT for backends without a batched module (slow).
-        assert marginal_backend is not None
-        from eval.metrics.joint_nll import compute_pit
-        from eval.spatial.marginal_backends import loo_pit as _backend_loo_pit
-        from eval.spatial.marginal_backends import quantiles as _backend_quantiles
-
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        probs = np.linspace(1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n)
-        base_seed = int(getattr(cfg, "seed", None) or 0)
-        z_train_np = np.empty((B, P), dtype=np.float32)
-        z_test_np = np.empty((B, N), dtype=np.float32)
-        log_pdf_np = np.empty((B, N), dtype=np.float32)
-        for b in range(B):
-            xc = x_norm_train[b].detach().cpu().numpy()
-            xq = x_norm_test[b].detach().cpu().numpy()
-            y_std_b = float(y_std[b])
-            yc = ((y_train[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
-            yq = ((y_test[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
-            seed_b = (base_seed + b) % (2**31)
-            z_train_np[b] = _backend_loo_pit(
-                marginal_backend,
-                marginal_regressor,
-                xc,
-                yc,
-                probs,
-                k_folds=tabicl_k_folds,
-                seed=seed_b,
-            )
-            q_test = _backend_quantiles(marginal_backend, marginal_regressor, xc, yc, xq, probs, seed=seed_b)
-            z_test_b, log_pdf_b = compute_pit(q_test, probs, yq)
-            z_test_np[b] = z_test_b
-            # Jacobian back to raw-y nats.
-            log_pdf_np[b] = log_pdf_b - math.log(y_std_b)
-        z_train = torch.from_numpy(z_train_np).to(device=device)
-        z_test = torch.from_numpy(z_test_np).to(device=device)
-        log_pdf_test = torch.from_numpy(log_pdf_np).to(device=device)
-    elif apply_tabicl and tabicl_split_calib_frac > 0:
-        # "tabicl_split": one forward with the calibration points as context.
-        from copula_inter.pit import run_pit_calib_split_batched  # local: pit.py imports from this module
-
-        assert tabicl_model is not None
-
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
-        y_calib_scaled = ((y_calib - y_mean) / y_std).unsqueeze(-1)  # (B, P_C, 1)
-        split_pit = run_pit_calib_split_batched(
-            tabicl_model,
-            x_norm_train,
-            y_train_scaled,
-            x_norm_calib,
-            y_calib_scaled,
-            Y_query_raw=y_train.unsqueeze(-1),
-            Y_calib_raw=y_calib.unsqueeze(-1),
-        )
-        z_train = split_pit["z_train"].squeeze(-1)  # (B, P)
-    elif apply_tabicl:
-        # "tabicl": K-fold PIT on the training points and a full-context PIT on the
-        # real test points; z_train, z_test and log_pdf_test all come from TabICL.
-        from copula_inter.pit import run_pit_batched  # local: pit.py imports from this module
-
-        assert tabicl_model is not None
-
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
-        y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)  # (B, N, 1)
-        tabicl_pit = run_pit_batched(
-            tabicl_model,
-            x_norm_train,
-            y_train_scaled,
-            x_norm_test,
-            y_test_scaled,
-            k_folds=tabicl_k_folds,
-            Y_train_raw=y_train.unsqueeze(-1),
-        )
-        z_train = tabicl_pit["z_train"].squeeze(-1)  # (B, P)
-        z_test = tabicl_pit["z_test"].squeeze(-1)  # (B, N)
-        # Jacobian back to raw-y nats: log p_raw = log p_scaled - log(std).
-        log_pdf_test = tabicl_pit["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast
-
+    z_train, z_test, log_pdf_test = _marginal_pit(
+        cfg,
+        draw,
+        shape,
+        device,
+        apply_tabicl=apply_tabicl,
+        tabicl_model=tabicl_model,
+        tabicl_k_folds=tabicl_k_folds,
+        tabicl_split_calib_frac=tabicl_split_calib_frac,
+        marginal_backend=marginal_backend,
+        marginal_regressor=marginal_regressor,
+        marginal_probs_n=marginal_probs_n,
+        raw_y_override=raw_y_override,
+    )
     # Optional z_train corruption, skipped when this call used the adaptive TabICL mix.
     if not (tabicl_mix_weights is not None and apply_tabicl):
         z_train = corrupt_z_train(z_train, cfg.data)
 
     # --- Pack into list of dicts (single D→H transfer) ---
     tensors = {
-        "x_norm_train": x_norm_train.cpu(),
-        "x_norm_test": x_norm_test.cpu(),
-        "y_train": y_train.cpu(),
-        "y_test": y_test.cpu(),
+        "x_norm_train": draw.x_norm_train.cpu(),
+        "x_norm_test": draw.x_norm_test.cpu(),
+        "y_train": draw.y_train.cpu(),
+        "y_test": draw.y_test.cpu(),
         "z_train": z_train.cpu(),
         "z_test": z_test.cpu(),
         "log_pdf_test": log_pdf_test.cpu(),
-        "R_star": R_star.cpu(),
-        "R_prior": R_prior.cpu(),
-        "Sigma_star": Sigma_full.cpu(),
-        "mu_star": mu_star.cpu(),
-        "sigma_star": sigma_star.cpu(),
+        "R_star": draw.R_star.cpu(),
+        "R_prior": draw.R_prior.cpu(),
+        "Sigma_star": draw.Sigma_full.cpu(),
+        "mu_star": draw.mu_star.cpu(),
+        "sigma_star": draw.sigma_star.cpu(),
     }
 
     # Discard any episode with a non-finite saved field.
-    non_finite = torch.zeros(B, dtype=torch.bool)
+    non_finite = torch.zeros(shape.B, dtype=torch.bool)
     for _t in tensors.values():
         non_finite = non_finite | ~_t.reshape(_t.shape[0], -1).isfinite().all(dim=1)
     if non_finite.any():
         warnings.warn(
-            f"generate_gp_batch: {int(non_finite.sum())}/{B} episodes contain "
+            f"generate_gp_batch: {int(non_finite.sum())}/{shape.B} episodes contain "
             f"NaN/Inf in a saved field and will be discarded.",
             RuntimeWarning,
         )
     discard = discard | non_finite.to(discard.device)
 
-    n_tr = torch.tensor(P)
-    n_te = torch.tensor(N)
-    extra: Dict[str, object] = {"n_train": n_tr, "n_test": n_te}
-
+    extra: Dict[str, object] = {"n_train": torch.tensor(shape.P), "n_test": torch.tensor(shape.N)}
     if return_kernel_metadata:
-        # Per-episode hyperparameters and factors plus the call-shared kernel name and
-        # active_dims. Chains carry per-component sign fields in kernel_component_params.
-        flat_keys = [
-            "l",
-            "alpha2",
-            "period",
-            "rq_alpha",
-            "power",
-            "l_b",
-            "alpha2_b",
-            "period_b",
-            "rq_alpha_b",
-            "power_b",
-            "sign_applied_outer",
-            "sign_w_outer",
-            "sign_b_outer",
-            "sign_a_outer",
-        ]
-        if not systematic:
-            flat_keys += ["sign_applied", "sign_w", "sign_b", "sign_a"]
-            if _parse_composite(kernel_name) is not None:
-                flat_keys += ["sign_applied_b", "sign_w_b", "sign_b_b", "sign_a_b"]
-        for key in flat_keys:
-            tensors[key] = params[key].cpu()
-        tensors["nugget"] = nugget.cpu()
-        tensors["mlp_mixed"] = mlp_mixed.cpu()
-        tensors["kernel_hidden_applied"] = kernel_hidden_applied.cpu()
-        tensors["x_kernel_train"] = x_kernel_train.cpu()
-        tensors["x_kernel_test"] = x_kernel_test.cpu()
-        for key in (
-            "mean_weight",
-            "mean_bias",
-            "mean_nonzero",
-            "mean_family",
-            "mean_linear",
-            "mean_exp_direction",
-            "mean_exp_rate",
-            "mean_exp_scale",
-            "mean_anomaly_direction",
-            "mean_anomaly_threshold",
-            "mean_anomaly_magnitude",
-        ):
-            tensors[key] = mean_params[key].cpu()
-        tensors["_L_ff"] = L_ff
-        tensors["_alpha"] = alpha
-        extra["kernel"] = kernel_name
-        extra["kernel_feature_indices"] = torch.tensor(
-            kernel_cols if kernel_cols is not None else list(range(d)), dtype=torch.long
-        )
+        meta_tensors, meta_extra = _kernel_metadata(shape, priors, feats, draw)
+        tensors.update(meta_tensors)
+        extra.update(meta_extra)
 
     # Drop discarded episodes from the per-episode tensors (the extra fields are call-shared).
-    return assemble_episodes(
-        tensors,
-        extra,
-        discard,
-        (chain_names, chain_ops, component_params) if return_kernel_metadata and systematic else None,
+    chains = (
+        (shape.chain_names, shape.chain_ops, priors.component_params)
+        if return_kernel_metadata and shape.systematic
+        else None
     )
+    return assemble_episodes(tensors, extra, discard, chains)
 
 
 def generate_gp_batch(
