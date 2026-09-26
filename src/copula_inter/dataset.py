@@ -1,17 +1,8 @@
-"""
-dataset.py — CopulaDataset and collate_fn for inter-instance copula training.
+"""CopulaDataset and collate_fn for on-disk episodes.
 
-Supports two on-disk layouts (auto-detected):
-
-  Individual files   task_XXXXXX.pt   — one episode per file (legacy)
-  Sharded files      shard_XXXXXX.pt  — list of B episodes per file (new)
-
-The sharded layout is produced by generate_pit_dataset.py and is much faster
-on NFS because it reduces file-metadata operations by a factor of B.
-A small LRU shard cache (default 4 shards) keeps recently accessed shards
-memory-mapped (torch.load(..., mmap=True), not eagerly copied into RAM) to
-amortise repeated random accesses within a DataLoader while keeping each
-worker's RSS low.
+Layouts (auto-detected): task_XXXXXX.pt (one episode per file) or
+shard_XXXXXX.pt (a list of episodes per file, with meta.pt). Shards are loaded
+with mmap into a small per-worker LRU cache.
 """
 
 from __future__ import annotations
@@ -27,12 +18,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 from copula_inter.episode_contracts import validate_episode
 
-# Keys checked for NaN/Inf before an episode is handed to the model. Datasets
-# generated before the data_gen.py LOO-PIT degeneracy fix (near-singular
-# K_ff producing a non-finite z_train that only tripped a warning, not a
-# discard) can still have a handful of these baked into already-written
-# shards; regenerating a multi-hundred-GB dataset just to drop a few episodes
-# isn't worth it, so this validates at load time and skips forward instead.
+# Keys checked for NaN/Inf when an episode is loaded (older shards may contain some).
 _FINITE_CHECK_KEYS = ("z_train", "z_test", "y_train", "y_test")
 
 
@@ -41,17 +27,7 @@ def _episode_is_finite(ep: dict) -> bool:
 
 
 def _add_derived_fields(ep: dict) -> dict:
-    """Reconstruct R_prior/Sigma_star when a shard was written without them.
-
-    generate_pit_dataset.py stops persisting these two N_max x N_max fields:
-    with oracle_mode="prior" (the only supported mode) they're exact
-    functions of R_star/sigma_star, which ARE stored -- R_prior == R_star,
-    and Sigma_star == R_star * outer(sigma_star, sigma_star) (see
-    data_gen.py's oracle_mode="prior" branch). Recomputing here is lossless
-    and keeps every downstream consumer (collate_fn, train.py, loss.py)
-    unaware of which schema a given shard was written with. Shards that DO
-    carry these keys (written before this change) are left untouched.
-    """
+    """Add R_prior (= R_star) and Sigma_star (= R_star * sigma_star sigma_star^T) when a shard omits them."""
     if "Sigma_star" not in ep:
         sigma = ep["sigma_star"]
         ep["Sigma_star"] = ep["R_star"] * sigma.unsqueeze(0) * sigma.unsqueeze(1)
@@ -61,10 +37,7 @@ def _add_derived_fields(ep: dict) -> dict:
 
 
 class CopulaDataset(Dataset):
-    """Dataset of pre-computed PIT episodes.
-
-    Auto-detects individual (task_*.pt) or sharded (shard_*.pt + meta.pt) layout.
-    """
+    """Dataset of saved PIT episodes (individual files or shards)."""
 
     _SHARD_CACHE_SIZE = 4   # default shards kept in memory per worker process
 
@@ -74,10 +47,7 @@ class CopulaDataset(Dataset):
         file_list: Optional[List[str]] = None,
         shard_cache_size: Optional[int] = None,
     ):
-        # Override the default cache size — needed so it can be sized to hold
-        # a full ShardBlockSampler block (otherwise the 4-slot default
-        # thrashes against a larger block, since each worker still touches
-        # every shard in the active block).
+        # Cache size (size it to hold a ShardBlockSampler block).
         if shard_cache_size is not None:
             self._SHARD_CACHE_SIZE = shard_cache_size
 
@@ -103,9 +73,6 @@ class CopulaDataset(Dataset):
                 )
             self._init_individual(indiv_files)
 
-    # ------------------------------------------------------------------
-    # Initialisation helpers
-    # ------------------------------------------------------------------
 
     def _init_individual(self, files: List[str]) -> None:
         self._mode  = "individual"
@@ -151,9 +118,6 @@ class CopulaDataset(Dataset):
                 raise ValueError(f"shard counts disagree with {meta_path}")
         self._shard_cache: OrderedDict[str, list] = OrderedDict()
 
-    # ------------------------------------------------------------------
-    # Dataset protocol
-    # ------------------------------------------------------------------
 
     @property
     def shard_size(self) -> int:
@@ -172,9 +136,6 @@ class CopulaDataset(Dataset):
             return self._get_individual(idx)
         return self._get_sharded(idx)
 
-    # ------------------------------------------------------------------
-    # Individual-file loading
-    # ------------------------------------------------------------------
 
     def _get_individual(self, idx: int) -> dict:
         try:
@@ -189,9 +150,6 @@ class CopulaDataset(Dataset):
             )
         return _add_derived_fields(ep)
 
-    # ------------------------------------------------------------------
-    # Sharded loading with LRU cache
-    # ------------------------------------------------------------------
 
     _MAX_INVALID_RETRIES = 8
 
@@ -214,38 +172,11 @@ class CopulaDataset(Dataset):
         shard     = self._shard_cache[shard_path]
         if local_idx >= len(shard):
             raise ValueError(f"shard {shard_path} has fewer episodes than its metadata declares")
-        # Derive R_prior/Sigma_star on a shallow copy instead of caching them
-        # on the shard itself: computing eagerly for all shard_size episodes
-        # up front (and retaining them for the shard's whole time in the LRU
-        # cache) re-materializes in RAM the exact bytes generate_pit_dataset.py
-        # stopped persisting to disk (they're each an N_max x N_max float32
-        # matrix, ~2/3 of a shard's pre-fix size) -- times shard_cache_size x
-        # num_workers resident shards, this was pushing RSS to the cgroup cap
-        # on large-N_max datasets (e.g. systematic-composition-all-base).
-        # Deriving per-episode and returning a shallow copy leaves the cached
-        # shard holding only the cheap mmap-backed raw fields; the derived
-        # matrices are freed once collate_fn consumes them instead of staying
-        # pinned for the shard's entire cache lifetime.
+        # Derive R_prior/Sigma_star on a shallow copy so the cached shard stays mmap-only.
         return _add_derived_fields(dict(shard[local_idx]))
 
     def _get_sharded(self, idx: int) -> dict:
-        # Non-finite z_train/y_train (see _episode_is_finite) shouldn't reach
-        # the model — that's what crashes training much later inside TabICL's
-        # column embedder with an opaque "cannot convert float NaN to
-        # integer". Skip forward to the next episode instead, same "warn AND
-        # exclude" convention data_gen.py uses for its own degenerate
-        # episodes, just applied at load time for shards written before that
-        # fix existed.
-        #
-        # The skip must stay within idx's own shard: variable-d_features
-        # datasets store a different feature count per shard, and
-        # ShardHomogeneousBatchSampler guarantees every batch stays within one
-        # shard on the assumption that __getitem__ never crosses that
-        # boundary either. Wrapping globally (mod self._n_total) broke that
-        # guarantee whenever the non-finite episode was last in its shard —
-        # the skip would land in the next shard, silently handing back an
-        # episode with a different d_features and blowing up collate_fn with
-        # a "mixed feature counts" error much later.
+        # Skip non-finite episodes, to the next episode in the same shard.
         shard_size  = self._shard_size
         shard_start = (idx // shard_size) * shard_size
         shard_len   = min(shard_size, self._n_total - shard_start)
@@ -270,27 +201,14 @@ class CopulaDataset(Dataset):
 
 
 def collate_fn(samples: List[dict]) -> dict:
-    """Pad a batch of variable-length tasks.
+    """Pad a batch of episodes to the batch's max P and N.
 
-    Returns (all padded to batch-max P, N):
-        x_train      : (B, P_max, d_x)
-        x_test       : (B, N_max, d_x)
-        y_train      : (B, P_max)
-        y_test       : (B, N_max)
-        z_train      : (B, P_max)
-        z_test       : (B, N_max)
-        log_pdf_test : (B, N_max)        (0 for padding → log(1)=0 contributes nothing)
-        train_mask   : BoolTensor (B, P_max)
-        test_mask    : BoolTensor (B, N_max)
-        R_star       : (B, N_max, N_max)
-        R_prior      : (B, N_max, N_max)  (only if episodes carry it — the
-                       sampling-prior correlation corr(K_ss); absent for older
-                       datasets generated before it was added)
-        Sigma_star   : (B, N_max, N_max)
-        mu_star      : (B, N_max)
-        sigma_star   : (B, N_max)
-        n_train      : LongTensor (B,)
-        n_test       : LongTensor (B,)
+    Returns:
+        x_train (B, P_max, d_x), x_test (B, N_max, d_x), y_train, z_train
+        (B, P_max), y_test, z_test, log_pdf_test (B, N_max; 0 on padding),
+        train_mask (B, P_max) and test_mask (B, N_max) bool, R_star and
+        Sigma_star (B, N_max, N_max), R_prior when present, mu_star and
+        sigma_star (B, N_max), n_train and n_test (B,).
     """
     if not samples:
         raise ValueError("collate_fn requires at least one episode")
@@ -299,13 +217,7 @@ def collate_fn(samples: List[dict]) -> dict:
     B   = len(samples)
     d_x = samples[0]["x_norm_train"].shape[-1]
 
-    # Variable-d_features datasets store a different feature count per shard
-    # (data_gen.py::_sample_d_features), and every column feeds TabICL as one
-    # (B, T, d_x) tensor — the row masks do not cover the feature axis. A batch
-    # that straddles shards of different d cannot be stacked; fail loudly here
-    # instead of the opaque "expanded size ... must match" from the assignment
-    # below. Use ShardHomogeneousBatchSampler (see train.py) to keep every batch
-    # within a single shard.
+    # Episodes with different d_features cannot be stacked (use ShardHomogeneousBatchSampler).
     if any(s["x_norm_train"].shape[-1] != d_x for s in samples):
         d_set = sorted({int(s["x_norm_train"].shape[-1]) for s in samples})
         raise RuntimeError(
@@ -333,9 +245,7 @@ def collate_fn(samples: List[dict]) -> dict:
     Sigma_star   = torch.zeros(B, N_max, N_max)
     mu_star      = torch.zeros(B, N_max)
     sigma_star   = torch.zeros(B, N_max)
-    # R_prior (sampling-prior correlation) is optional — only datasets generated
-    # after it was added carry it (data_gen.py). Emit it only when present so
-    # older shards still collate.
+    # R_prior is optional.
     has_prior    = "R_prior" in samples[0]
     R_prior      = torch.zeros(B, N_max, N_max) if has_prior else None
 
@@ -382,21 +292,10 @@ def collate_fn(samples: List[dict]) -> dict:
 
 
 class ShardBlockSampler(Sampler[int]):
-    """Epoch sampler for sharded datasets: shuffles at shard-block granularity
-    instead of globally, so at most ``block_shards`` shards need to be
-    resident at once (avoids one-full-shard-load-per-sample thrashing on
-    network storage when the dataset spans thousands of shards).
+    """Epoch sampler that shuffles at shard-block granularity (at most block_shards shards resident).
 
-    Still yields a true permutation of ``range(len(subset_indices))`` each
-    epoch — every position is produced exactly once, nothing is skipped or
-    repeated — identical contract to ``shuffle=True``. Only the *order* is
-    weaker: fully random within a block of ``block_shards`` shards, but not
-    reshuffled across blocks.
-
-    ``subset_indices`` maps each local position (what the sampler yields,
-    i.e. what a wrapping ``Subset`` expects) to its *global* dataset index,
-    used only to look up which shard that position lives in. Pass
-    ``train_dataset.indices`` when wrapping a ``torch.utils.data.Subset``.
+    Yields a permutation of range(len(subset_indices)); subset_indices maps
+    positions to global dataset indices.
     """
 
     def __init__(self, subset_indices: Sequence[int], shard_size: int, block_shards: int = 16):
@@ -423,26 +322,11 @@ class ShardBlockSampler(Sampler[int]):
 
 
 class ShardHomogeneousBatchSampler(Sampler[List[int]]):
-    """Batch sampler that keeps every minibatch within a single shard.
+    """Batch sampler whose batches never span shards (needed when d_features varies per shard).
 
-    Variable-``d_features`` datasets store a different feature count per shard
-    (data_gen.py::_sample_d_features), so ``collate_fn`` can only stack episodes
-    that share a shard — a batch straddling two shards has mismatched feature
-    columns and cannot be padded (the row masks do not cover the feature axis,
-    and TabICL consumes one (B, T, d) tensor). This sampler groups positions by
-    shard and emits chunks of ``batch_size`` *within* each shard, so batches are
-    always feature-homogeneous regardless of whether ``batch_size`` divides
-    ``shard_size``. Because a shard's episodes also share kernel/P/N/active_dims
-    (see generate_gp_batch), each batch is single-task — the price of variable-d.
-
-    Keeping a shard's batches contiguous also means at most one shard is resident
-    at a time (cache-friendly on network storage).
-
-    Yields lists of *local* positions (indices into a wrapping ``Subset``), so
-    pass ``subset.indices`` — same convention as ShardBlockSampler. Covers every
-    position exactly once per epoch. With ``shuffle=True`` the shard order and
-    the within-shard order are re-randomised each epoch; the final batch of each
-    shard may be smaller than ``batch_size`` unless ``drop_last``.
+    Yields lists of local positions (subset_indices as for ShardBlockSampler),
+    covering each once per epoch; shuffle randomizes shard and within-shard
+    order. A shard's last batch may be short unless drop_last.
     """
 
     def __init__(

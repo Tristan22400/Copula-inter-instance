@@ -1,22 +1,12 @@
-"""
-diag_kernels.py — Quick sanity check: does each kernel produce meaningful R_star?
+"""Sanity check that each kernel produces a meaningful R_star.
 
-Generates N_PER_KERNEL tasks per kernel, prints per-task stats and a summary,
-then (Stage 3) pools the off-diagonal R_star entries across N_STAGE3 tasks per
-kernel to check the family isn't collapsing toward independence (screening
-effect) or degenerating toward triviality (near-1 correlations everywhere).
-Run from the project root:
+Generates tasks per kernel, prints per-task statistics, then (stage 3) pools
+off-diagonal R_star entries per kernel to flag collapse toward independence or
+saturation near +-1. tests/test_diag_kernels.py reuses these checks.
+
     python -m copula_inter.diag_kernels
-    python -m copula_inter.diag_kernels --n-stage3 200   # smaller/faster batch
-    python -m copula_inter.diag_kernels --skip-stage3    # per-task checks only
-
-DataCfg/Cfg/check_task/batch_off_diagonal_stats below are also imported
-directly by tests/test_diag_kernels.py, which turns this same per-task/
-Stage-3 health check into real pytest assertions (parametrized over
-ALL_KERNELS) so a regression like a kernel family losing PSD-ness is caught
-by the test suite instead of only a manually-run script. Everything below
-this module's "Main" section only runs under `if __name__ == "__main__":`,
-so importing this module (e.g. from a test) has no side effects.
+    python -m copula_inter.diag_kernels --n-stage3 200
+    python -m copula_inter.diag_kernels --skip-stage3
 """
 from __future__ import annotations
 
@@ -31,9 +21,7 @@ import torch
 
 from copula_inter.data_gen import generate_gp_task, ALL_KERNELS  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Minimal cfg stub (mirrors gp_tasks.yaml defaults)
-# ---------------------------------------------------------------------------
+# Minimal config (mirrors gp_tasks.yaml defaults).
 
 @dataclass
 class DataCfg:
@@ -65,10 +53,6 @@ class DataCfg:
 class Cfg:
     data: DataCfg = field(default_factory=DataCfg)
 
-
-# ---------------------------------------------------------------------------
-# Checks
-# ---------------------------------------------------------------------------
 
 def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
     R = task["R_star"]        # (N, N)
@@ -131,23 +115,14 @@ def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
         "od_abs_mean": od_abs,
         "N": N,
         "P": task["n_train"].item(),
-        # scalar, unless the episode was generated ARD (cfg.data.ard=True),
-        # in which case l is a per-dimension lengthscale vector (k,) —
-        # report its mean here.
+        # Mean lengthscale for ARD episodes.
         "l": task["l"].mean().item() if task["l"].numel() > 1 else task["l"].item(),
         "alpha2": task["alpha2"].item(),
         "nugget": task["nugget"].item(),
     }
 
 
-# ---------------------------------------------------------------------------
-# Stage 3 — information-theoretic bounds on the off-diagonal distribution
-# ---------------------------------------------------------------------------
-# The task is only learnable if the training context P leaves a meaningful
-# residual dependence in R_star at the test points N: too little (posterior
-# collapses toward independence — the "screening effect") and the model just
-# learns to predict I_N; too much (R_star saturates near +-1 everywhere) and
-# the task is trivially degenerate (test instances are basically identical).
+# Stage 3: pooled off-diagonal R_star distribution per kernel (neither ~0 nor ~+-1 everywhere).
 
 COLLAPSE_THRESHOLD   = 0.01  # E[|R*_offdiag|] below this -> screening effect
 DEGENERATE_THRESHOLD = 0.95  # E[|R*_offdiag|] above this -> trivial task
@@ -276,10 +251,6 @@ def run_stage3(cfg: "Cfg", n_tasks: int) -> bool:
     print(f"\n  STAGE 3: {'ALL FAMILIES HEALTHY' if all_healthy else '*** SOME FAMILIES OUT OF BAND ***'}")
     return all_healthy
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 N_PER_KERNEL = 5
 SEED = 42

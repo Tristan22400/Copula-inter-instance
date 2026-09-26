@@ -1,59 +1,14 @@
-"""marginal_backbones.py — per-architecture adapter layer for Phase-A
-marginal fine-tuning (src/copula_inter/finetune_marginal.py).
+"""Per-architecture adapters for Phase-A marginal fine-tuning.
 
-Phase A fine-tunes a STANDALONE tabular foundation model so its marginal
-predictive density is better calibrated, then hands the result to a copula
-run. It was written for TabICL, and everything architecture-specific about
-it lives in four places:
+For each backbone: which parameters each tier trains, a gradient-carrying
+quantile forward, the checkpoint format and how it is loaded back.
 
-  1. which parameters a tier makes trainable,
-  2. how to get a GRADIENT-CARRYING quantile forward out of the model,
-  3. what a checkpoint looks like, and
-  4. how a later run loads that checkpoint back.
+    tabicl  tiers 0-3 (pit.run_pit_batched_grad).
+    tabldm  tiers 0-3 (TabICL-identical attention; different tier-0 names).
+    exaone  tier 0 only (attention holds raw Parameters; no swappable module).
+    tabpfn  tier 0 only; patterns untested (weights are licence-gated).
 
-This module is those four things per architecture, so finetune_marginal.py
-holds the training loop and the loss (both architecture-agnostic: the loss
-is defined on a quantile grid and the targets, see marginal_objective) and
-nothing else.
-
-WHAT EACH ARCHITECTURE SUPPORTS, and why it differs -- this is a real
-structural difference, not an implementation gap left for later:
-
-  "tabicl"  tiers 0-3. The original. Routed through pit.py::
-            run_pit_batched_grad, unchanged.
-  "tabldm"  tiers 0-3. Xiaomi-TabLDM forks TabICL's architecture: its
-            top-level modules are the same col_embedder / row_interactor /
-            icl_predictor, so lora.py's _STAGE_KEYWORDS already address it,
-            and its whole attention stack is BYTE-IDENTICAL to TabICL's
-            (tests/test_lora_tabldm_compat.py), so LoRAMultiheadAttention is
-            a valid drop-in. Only the tier-0 parameter NAMES differ (its ICL
-            blocks are `layers.N.{attn,mlp}_norm`, TabICL's are
-            `blocks.N.norm[12]`), which is what TIER0_PATTERNS below encodes.
-  "exaone"  tier 0 only. EXAONE-Tabular is NOT a TabICL derivative: it has
-            no col_embedder/row_interactor/icl_predictor stages for
-            _STAGE_KEYWORDS to match, no affine norm parameters at all, and
-            -- the blocking one -- its attention holds raw Parameters
-            (`transformer.layers.N.item_attention.output_weight`) rather
-            than swappable nn.Module attention children, so there is nothing
-            for apply_lora to replace. Tier 0 is well-defined and useful
-            (label path + the 999-quantile head, ~459K/21.1M = 2.2%,
-            comparable to TabICL's tier-0 5.5%); tier >= 1 would need a
-            Parameter-level LoRA, which lora.py does not implement. Asking
-            for it raises rather than silently training tier 0.
-  "tabpfn"  tier 0 only, and NOT execution-verified here -- PriorLabs gates
-            the weights behind a licence + TABPFN_TOKEN which this
-            environment does not have, so its patterns below are written
-            from TabPFN's published module layout and have never been run.
-            Same caveat eval/spatial/tabpfn_batched.py already carries. Set
-            TABPFN_TOKEN and run tests/test_marginal_backbones.py before
-            relying on it.
-
-Gradient flow was verified per architecture, not assumed: a loss on the
-quantile output reaches 639/647 parameter tensors for TabLDM and 363/365
-for EXAONE (both models' forwards are ordinary autograd graphs; the
-`torch.no_grad()`/`torch.inference_mode()` that normally wraps them lives in
-the inference wrappers this module deliberately bypasses, exactly as
-pit.py::run_pit_batched_grad bypasses run_pit_batched's decorator).
+All-layer LoRA (lora.apply_lora_all_layers) works for every backbone.
 """
 
 from __future__ import annotations
@@ -79,17 +34,9 @@ __all__ = [
 
 BACKBONE_NAMES: tuple[str, ...] = tuple(BACKENDS)
 
-# Tier-0 = "the label path, the norms the trunk's output is rescaled by, and
-# the decoder that turns trunk features into a quantile grid" -- the parts
-# that can recalibrate what the frozen trunk already computes. Every pattern
-# below was read off the real fitted module's named_parameters(), not guessed
-# from the paper (tests/test_marginal_backbones.py asserts each one still
-# matches at least one parameter, so an upstream rename fails loudly instead
-# of silently training nothing).
+# Tier-0 parameter patterns per backbone: the label path, output norms and the
+# quantile decoder (tests/test_marginal_backbones.py checks each matches).
 TIER0_PATTERNS: dict[str, tuple[str, ...]] = {
-    # Unchanged from finetune_marginal.TIER0_PATTERNS -- kept here so all
-    # four architectures are described in one place; that module now imports
-    # this one.
     "tabicl": (
         r"^icl_predictor\.y_encoder\.",
         r"^col_embedder\.y_encoder\.",
@@ -97,10 +44,7 @@ TIER0_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^icl_predictor\.tf_icl\.blocks\.\d+\.norm[12]\.",
         r"^icl_predictor\.decoder\.",
     ),
-    # Same shape as TabICL's, retargeted at TabLDM's names: its ICL trunk is
-    # `tf_icl.layers.N.{attn,mlp}_norm` (TabICL: `tf_icl.blocks.N.norm[12]`)
-    # and it additionally carries the attention-residual norms that give
-    # AttnResLightRMSNorm its name.
+    # TabLDM's ICL norms are tf_icl.layers.N.{attn,mlp}_norm, plus its attention-residual norms.
     "tabldm": (
         r"^icl_predictor\.y_encoder\.",
         r"^col_embedder\.y_encoder\.",
@@ -109,44 +53,24 @@ TIER0_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^icl_predictor\.tf_icl\.attn_res_norms\.\d+\.",
         r"^icl_predictor\.decoder\.",
     ),
-    # EXAONE has no affine norms; its tier-0 analogue is the label path plus
-    # the head that emits the 999-level quantile bank. feature_summary_tokens
-    # /item_summary_tokens are deliberately EXCLUDED: they are learned trunk
-    # inputs, not output recalibration, so they belong to a tier that can
-    # change how context is aggregated -- which is exactly what tier 0 is
-    # defined not to do.
+    # EXAONE has no affine norms: the label path and the quantile head.
     "exaone": (
         r"^label_encoder\.",
         r"^transformer\.classification_heads\.",
     ),
-    # From TabPFN v3's published layout; see the module docstring's caveat --
-    # unverified in this environment.
+    # From TabPFN v3's published layout (untested here).
     "tabpfn": (
         r"^y_encoder\.",
         r"^decoder_dict\.",
     ),
 }
 
-# Tiers >= 1 install LoRA on attention MODULES (lora.apply_lora). Only
-# architectures whose attention is a swappable nn.Module that
-# LoRAMultiheadAttention can stand in for can climb that ladder -- see the
-# module docstring.
-#
-# This ceiling applies ONLY to the stage ladder. The default path,
-# marginal.lora_all_layers=true (lora.apply_lora_all_layers), adapts every 2-D
-# weight matrix by PARAMETRIZATION rather than module replacement, is uniform
-# across all four architectures at one shared rank, and is exempt from
-# MAX_TIER entirely.
+# Highest tier (stage LoRA) per backbone. All-layer LoRA is not limited by this.
 MAX_TIER: dict[str, int] = {name: spec.max_tier for name, spec in BACKENDS.items()}
 
 
 def resolve_tier(backbone_name: str, tier: int) -> int:
-    """Validate ``tier`` for ``backbone_name``, or raise with the reason.
-
-    Raising beats silently clamping: a run launched at tier 1 that quietly
-    trained tier 0 would look like "the ladder didn't help" in wandb, which
-    is precisely the wrong conclusion to draw.
-    """
+    """Return tier if backbone_name supports it, else raise ValueError."""
     if backbone_name not in MAX_TIER:
         raise ValueError(
             f"Unknown marginal backbone {backbone_name!r}; expected one of {list(BACKBONE_NAMES)}."
@@ -166,14 +90,7 @@ def resolve_tier(backbone_name: str, tier: int) -> int:
 
 @dataclass
 class MarginalBackbone:
-    """One fine-tunable marginal, with everything Phase A needs from it.
-
-    ``module`` is the nn.Module whose parameters get trained (and whose
-    state_dict is saved). ``handle`` is the library-level wrapper it came
-    from -- the sklearn regressor for exaone/tabpfn/tabldm, None for tabicl
-    -- kept because those wrappers own the preprocessing that has to run
-    per episode before the trunk sees anything.
-    """
+    """A fine-tunable marginal: module (the trained nn.Module) and handle (the library regressor, None for tabicl)."""
 
     name: str
     module: nn.Module
@@ -209,13 +126,7 @@ class MarginalBackbone:
 
     @property
     def native_quantile_count(self) -> int:
-        """How many quantile levels this model's decoder actually emits.
-
-        All of them are 999, and not by coincidence: TabLDM's decoder is
-        literally the same shape as TabICL's ((999, 1024) + bias), and EXAONE's
-        manifest reports output_width=999 / quantile_count=999. Phase A should
-        score the grid the model produces, not a resampling of it.
-        """
+        """Number of quantile levels the decoder emits (999 for every backbone here)."""
         own = getattr(self.module, "quantile_dist", None)
         levels = getattr(own, "alpha_levels", None) if own is not None else None
         if levels is not None:
@@ -226,14 +137,7 @@ class MarginalBackbone:
 
     @property
     def native_probs(self) -> np.ndarray:
-        """The alpha levels of that native grid.
-
-        ``QuantileToDistribution``'s own default is
-        ``linspace(0, 1, n + 2)[1:-1]``, i.e. exactly this repo's
-        ``linspace(1/(n+1), n/(n+1), n)`` convention -- verified equal on the
-        loaded models, so a native grid and an explicitly-requested grid of the
-        same size are the same numbers.
-        """
+        """Alpha levels of the native grid: linspace(1/(n+1), n/(n+1), n)."""
         n = self.native_quantile_count
         return np.linspace(1.0 / (n + 1), n / (n + 1), n)
 
@@ -242,37 +146,16 @@ class MarginalBackbone:
         self, X_context: Sequence[np.ndarray], y_context: Sequence[np.ndarray],
         X_query: Sequence[np.ndarray], probs: "np.ndarray | None" = None,
     ) -> torch.Tensor:
-        """(B, n_query, Q) quantiles in RAW y-units, WITH gradients.
+        """(B, n_query, Q) quantiles in raw y units, with gradients.
 
-        Same contract as eval/spatial/_batched_pit.py's ``bank_fn``, except
-        it returns a grad-carrying torch.Tensor instead of a detached numpy
-        array -- the Phase-A loss is defined on these outputs, so the graph
-        back to the trunk must survive.
-
-        ``probs=None`` (the default, and what Phase A uses) reads the model's
-        NATIVE decoder grid: TabLDM via ``output_type="raw_quantiles"``, EXAONE
-        via its raw 999-level bank with no interpolation. That is both more
-        faithful and cheaper than requesting an arbitrary grid -- TabLDM would
-        otherwise run its spline/GPD inverse-CDF once per requested level, and
-        EXAONE would compute all 999 and then discard most of them. Passing an
-        explicit ``probs`` re-enables resampling as a cost lever.
+        probs=None returns the native decoder grid; explicit probs are interpolated.
         """
         return _QUANTILE_FORWARDS[self.name](self, X_context, y_context, X_query, probs)
 
     def quantile_dist_module(self, probs: "np.ndarray | None" = None) -> nn.Module:
-        """The parameterless quantile-grid -> distribution head Phase A's loss
-        scores through, matched to the grid ``quantile_forward`` produced.
+        """Quantile-grid-to-distribution module for the grid quantile_forward(probs) returns.
 
-        ``probs=None`` means the native grid, so the model's OWN
-        ``quantile_dist`` is used where it has one (tabicl, tabldm) -- that
-        instance is constructed with exactly these levels. EXAONE has no such
-        module, but the mapping is architecture-agnostic and holds no
-        parameters, so it borrows TabICL's class on EXAONE's own 999 levels.
-
-        A mismatch here is loud but LATE: handing a 999-level head a 99-level
-        grid raises inside its spline setup ("size of tensor a (18) must match
-        tensor b (998)"). The grid and the head are therefore derived from the
-        same argument rather than chosen independently.
+        The model's own quantile_dist for the native grid (TabICL's class for EXAONE).
         """
         from tabicl._model.quantile_dist import QuantileToDistribution
 
@@ -287,14 +170,7 @@ class MarginalBackbone:
 
     # -- checkpointing ---------------------------------------------------------
     def save(self, path: str, *, step: int, cfg=None, extra: Optional[dict] = None) -> None:
-        """Write a Phase-A checkpoint in this architecture's own schema.
-
-        For tabicl that is TabICL's ``{"config","state_dict"}`` (consumed by
-        pit.load_tabicl, so `tabicl.pit_ckpt=<path>` keeps working). The
-        others have no equivalent published loader, so they get the same
-        shape plus a ``backbone`` tag, and are loaded back through
-        eval/spatial/marginal_backends.py::make_regressor(..., ckpt=path).
-        """
+        """Write a Phase-A checkpoint: TabICL's {"config", "state_dict"} for tabicl (loadable by pit.load_tabicl), the same plus a "backbone" tag otherwise."""
         from copula_inter.lora import merged_base_state_dict_any
 
         payload = {
@@ -312,16 +188,8 @@ class MarginalBackbone:
         atomic_torch_save(payload, path)
 
 
-# ---------------------------------------------------------------------------
-# Per-architecture gradient-carrying quantile forwards.
-#
-# Each mirrors its eval/spatial/*_batched.py sibling's preprocessing exactly
-# -- same regressor calls, same order -- and differs only in NOT wrapping the
-# trunk call in no_grad/inference_mode. Keeping them next to each other here
-# (rather than adding a grad flag to those modules) preserves the property
-# that every existing caller of the inference modules cannot accidentally
-# start building an autograd graph, the same reasoning pit.py gives for
-# having a separate run_pit_batched_grad.
+# Gradient-carrying quantile forwards, one per architecture (same preprocessing
+# as the eval/spatial/*_batched.py inference versions, without no_grad).
 def _patch_tabldm_inference_manager() -> None:
     try:
         from tabldm._model.inference import InferenceManager, flash_attn3_toggle
@@ -378,19 +246,7 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
 def _exaone_grad_forward(
     bb, support: torch.Tensor, label: torch.Tensor, query: torch.Tensor, chunk_size: Optional[int] = None
 ) -> torch.Tensor:
-    """Memory-efficient forward pass for EXAONE under autograd.
-
-    EXAONE's built-in _forward_chunked relies on _InferenceExecutor, which
-    assumes inference mode and builds support-only KV caches across forward calls.
-    In autograd training (Phase A), that executor's cache causes state conflicts
-    across steps and retains all intermediate transformer activations in memory,
-    causing out-of-memory errors on 24GB GPUs when scoring multi-fold batches.
-
-    This function calls the underlying model directly without KV-cache side-effects,
-    applies activation checkpointing (torch.utils.checkpoint.checkpoint) so
-    activations are not held across multiple folds/passes, and chunks along the
-    batch axis (dim 0) to bound peak VRAM during the backward pass.
-    """
+    """EXAONE forward for training: calls the model directly (no inference KV cache), with activation checkpointing, chunked along the batch axis."""
     from torch.nn.utils import parametrize
     from torch.utils.checkpoint import checkpoint
 
@@ -402,10 +258,7 @@ def _exaone_grad_forward(
     query_chunk_size = query.shape[1]
 
     def _model_call(sub_s, sub_l, sub_q):
-        # EXAONE validates and reads each raw weight repeatedly. Materialize
-        # each LoRA weight once per model call, keeping its autograd graph.
-        # This scope MUST be inside the checkpointed function: recomputation
-        # needs a fresh cache, and nothing may survive an optimizer update.
+        # Materialize each LoRA weight once per call, inside the checkpointed function.
         with parametrize.cached():
             return bb.handle.model(
                 sub_s,
@@ -474,8 +327,7 @@ def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
     if probs is None:
         return bank  # already the native 999-level grid
 
-    # EXAONE emits a fixed native grid; interpolate onto the caller's probs
-    # the differentiable way (torch, not np.interp -- which would detach).
+    # Interpolate EXAONE's native grid onto probs differentiably.
     native_n = bank.shape[-1]
     native = torch.linspace(
         1.0 / (native_n + 1), native_n / (native_n + 1), native_n,
@@ -485,12 +337,7 @@ def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
 
 
 def _interp_last_dim(values: torch.Tensor, xp: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Differentiable 1-D linear interpolation along the last axis.
-
-    np.interp's autograd-safe equivalent: gradients must reach ``values``,
-    which a numpy round-trip would silently sever (producing a Phase-A run
-    whose loss never moves the trunk).
-    """
+    """Differentiable linear interpolation along the last axis (torch equivalent of np.interp)."""
     idx = torch.searchsorted(xp, x.contiguous()).clamp(1, xp.numel() - 1)
     lo, hi = idx - 1, idx
     x_lo, x_hi = xp[lo], xp[hi]
@@ -517,19 +364,8 @@ _QUANTILE_FORWARDS: dict[str, Callable] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Construction
-# ---------------------------------------------------------------------------
 def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda") -> MarginalBackbone:
-    """Build a fine-tunable backbone, optionally resuming from a Phase-A
-    checkpoint this module wrote.
-
-    Every non-tabicl backbone is constructed through
-    eval/spatial/marginal_backends.py::make_regressor, so Phase A trains
-    exactly the object the eval/generation paths use at inference -- same
-    ensemble settings, same device policy -- rather than a second,
-    separately-configured copy that could drift.
-    """
+    """Build a fine-tunable backbone via eval/spatial/marginal_backends.make_regressor, optionally loading a Phase-A checkpoint."""
     if name not in BACKBONE_NAMES:
         raise ValueError(f"Unknown marginal backbone {name!r}; expected one of {list(BACKBONE_NAMES)}.")
 
@@ -565,8 +401,7 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
 
 
 def _trainable_module(name: str, regressor) -> nn.Module:
-    """The nn.Module inside a fitted/constructed regressor whose parameters
-    Phase A trains. Each library hangs it off a different attribute."""
+    """The nn.Module inside a regressor whose parameters Phase A trains."""
     if name == "tabldm":
         if getattr(regressor, "model_", None) is None:
             regressor._load_model()
@@ -579,12 +414,7 @@ def _trainable_module(name: str, regressor) -> nn.Module:
 
 
 def assert_patterns_match(module: nn.Module, patterns: Sequence[str]) -> dict[str, int]:
-    """{pattern: n_matching_parameter_tensors}, raising if any matches none.
-
-    Phase A's failure mode without this is silent: a renamed parameter makes
-    a tier-0 pattern match nothing, the run trains a smaller set than its
-    logs claim, and the only symptom is a worse curve.
-    """
+    """{pattern: number of matching parameter tensors}; raise if any pattern matches none."""
     names = [n for n, _ in module.named_parameters()]
     counts, missing = {}, []
     for pat in patterns:
@@ -601,28 +431,15 @@ def assert_patterns_match(module: nn.Module, patterns: Sequence[str]) -> dict[st
     return counts
 
 
-# ---------------------------------------------------------------------------
-# K-fold rotation for the generic backends
-# ---------------------------------------------------------------------------
 def kfold_quantiles_grad(
     backbone: "MarginalBackbone", x_train: torch.Tensor, y_train_scaled: torch.Tensor,
     x_test: torch.Tensor, y_test_scaled: torch.Tensor, *, k_folds: int,
     probs: "np.ndarray | None" = None, fold_subset: Optional[Sequence[int]] = None,
 ) -> dict:
-    """Phase-A's ``run_pit_batched_grad`` for a non-TabICL backbone.
+    """run_pit_batched_grad for non-TabICL backbones: returns q_test, q_train and train_query_idx.
 
-    Returns ``{"q_test", "q_train", "train_query_idx"}`` with exactly the
-    shapes and the fold GEOMETRY pit.py::_run_pit_batched_impl produces --
-    ``fold_size = ceil(P/K)`` CONTIGUOUS blocks, folds taken in ascending
-    order, ``train_query_idx`` listing the scored rows in returned order.
-
-    Matching that convention is not cosmetic. finetune_marginal.py pairs
-    these quantiles with ``episode_fold_targets(ep, train_idx, K, ...)``,
-    whose analytic target for a row is conditioned on that row's own fold
-    complement. A different partition (e.g. eval/spatial/_batched_pit.py's
-    random-permutation split, which the INFERENCE path uses) would silently
-    score every training row against a target computed from the wrong
-    context -- a loss that still decreases, toward the wrong marginal.
+    Uses pit.py's fold geometry (contiguous ceil(P/K) blocks in ascending order),
+    which episode_fold_targets assumes.
     """
     import math
 

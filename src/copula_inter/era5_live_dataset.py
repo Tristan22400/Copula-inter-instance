@@ -1,24 +1,9 @@
-"""era5_live_dataset.py — real-world analogue of live_dataset.py: an infinite
-stream of training episodes drawn from real ARCO-ERA5 2m-temperature data
-(eval/data/era5_global_corpus.py) instead of synthetic GP kernels
-(data_gen.py), for finetuning a checkpoint on real worldwide spatial data
-across many regions and grid resolutions.
+"""Live training episodes from real ARCO-ERA5 2 m temperature (eval/data/era5_global_corpus.py).
 
-Enabled via training.live_generation=true training.live_source=era5 (see
-src/copula_inter/train.py) — everything else about the training loop (optimizer,
-scheduler, AMP, logging, checkpointing, training.resume_ckpt) is unchanged;
-only the DataLoader construction differs from live_dataset.py's GP path.
-
-Unlike LiveGPDataset, there is no oracle Sigma_star/R_star for real data (no
-known generative kernel), so episodes here carry only the ingredients
-y_space_nll needs (z_train/z_test/log_pdf_test/masks) — training.
-aux_mae_weight must be 0 for this source (src/copula_inter/train.py enforces this, same
-constraint _build_era5_val_batches already documents for the era5_fit
-validation probes). z_train/z_test/log_pdf_test come from the SAME frozen
-TabICL K-fold PIT machinery (src/copula_inter/pit.py::run_pit) the data.z_train_source=
-tabicl live-generation path already uses for synthetic data — there is no
-"analytic" oracle-PIT option for real data, so a TabICL checkpoint is always
-required here (unlike LiveGPDataset, where tabicl_device is optional).
+Enabled with training.live_generation=true training.live_source=era5. There
+is no oracle correlation, so episodes carry only what y_space_nll needs
+(training.aux_mae_weight must be 0). z_train/z_test/log_pdf_test come from a
+frozen TabICL (or another marginal backend) PIT, so a checkpoint is required.
 """
 
 from __future__ import annotations
@@ -40,16 +25,7 @@ __all__ = ["build_era5_train_loader", "build_era5_fixed_val_batches", "era5_coll
 
 
 def era5_collate_fn(samples: List[dict]) -> dict:
-    """Pad a batch of variable-P/N real-ERA5 episodes. Deliberately a
-    stripped-down sibling of dataset.collate_fn: no R_star/Sigma_star/
-    R_prior/mu_star/sigma_star (no oracle exists for real data). Still
-    carries y_train/y_test (raw, unscaled) alongside the PIT'd z_train/
-    z_test/log_pdf_test — _forward_and_loss (aux_mae_weight forced 0 for
-    this source) never reads y_train/y_test, but validate()'s TabICL
-    sim-to-real diagnostic (_build_tabicl_val_z -> _tabicl_pit_batch) runs
-    unconditionally over every val_loader batch regardless of live_source
-    and requires them; dropping them would KeyError the very first
-    validate() call."""
+    """Pad a batch of variable-P/N ERA5 episodes: x, y (raw), z_train, z_test, log_pdf_test and masks (no oracle fields)."""
     B = len(samples)
     d_x = samples[0]["x_norm_train"].shape[-1]
     P_list = [int(s["x_norm_train"].shape[0]) for s in samples]
@@ -93,15 +69,7 @@ def era5_collate_fn(samples: List[dict]) -> dict:
 
 
 def _resolve_marginal(cfg) -> Tuple[Optional[str], int]:
-    """(marginal_backend, marginal_probs_n) for the ERA5 path, read from the
-    SAME data.z_train_source knob the synthetic path uses.
-
-    Returns backend=None for "tabicl"/"tabicl_split"/"analytic", i.e. keep the
-    frozen-TabICL run_pit machinery. "analytic" has no meaning on real data
-    (there is no generating GP to take an exact LOO residual from), so it is
-    treated as TabICL here rather than silently producing oracle z -- the
-    same thing this module did before any backend was selectable.
-    """
+    """(marginal_backend, marginal_probs_n) from data.z_train_source; backend None means TabICL ("analytic" is treated as TabICL)."""
     from copula_inter.live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
 
     z_train_source = z_train_source_of(cfg)
@@ -116,14 +84,7 @@ def _backend_pit_batched(
     y_test_scaled: torch.Tensor, *, backend: str, regressor, k_folds: int,
     probs_n: int, seed: int,
 ) -> dict:
-    """Run one of the generic marginal backends' batched PIT over a (B, ...)
-    group of ERA5 episodes, returning torch tensors on x_train's device.
-
-    The batched modules take/return numpy and expect y ALREADY scaled, with
-    log_pdf_test left in those scaled units for the caller to correct -- the
-    same contract data_gen.py's marginal_backend branch uses, so the Jacobian
-    is applied by _pit_group/_pit_episode below exactly as for TabICL.
-    """
+    """Batched PIT of a group of ERA5 episodes through a non-TabICL backend; returns tensors on x_train's device."""
     from copula_inter.data_gen import _BATCHED_MARGINAL_BACKENDS
 
     run_batched = _BATCHED_MARGINAL_BACKENDS[backend]()
@@ -142,17 +103,12 @@ def _pit_episode(
     tabicl_model, k_folds: int, *, marginal_backend: Optional[str] = None,
     marginal_regressor=None, marginal_probs_n: int = 99, seed: int = 0,
 ) -> Optional[dict]:
-    """z_train/z_test/log_pdf_test for one (x_train, y_train, x_test, y_test)
-    real-ERA5 episode, via the same run_pit + normalize_targets convention
-    src/copula_inter/train.py::_tabicl_pit_batch uses per-episode inside its batch loop.
-    Returns None if there's too little context for run_pit's fold split."""
+    """PIT of one ERA5 episode (z_train, z_test, log_pdf_test in raw nats), or None with too little context."""
     if x_train.shape[0] < 2 or x_test.shape[0] < 1:
         return None
     y_train_scaled, y_test_scaled, _, std = normalize_targets(y_train, y_test)
     if marginal_backend is not None:
-        # One episode through the same batched module the group path uses,
-        # with a leading singleton axis -- there is no separate per-episode
-        # entry point to keep in sync, and B=1 costs nothing.
+        # One episode through the batched path with a leading singleton axis.
         out = _backend_pit_batched(
             x_train.unsqueeze(0), y_train_scaled.unsqueeze(0),
             x_test.unsqueeze(0), y_test_scaled.unsqueeze(0),
@@ -173,8 +129,7 @@ def _pit_episode(
     return {
         "z_train": pit_out["z_train"].squeeze(-1),
         "z_test": pit_out["z_test"].squeeze(-1),
-        # Jacobian correction back to raw-nats units — see _tabicl_pit_batch's
-        # docstring for why (log p_raw = log p_scaled - log(std)).
+        # Jacobian back to raw nats.
         "log_pdf_test": pit_out["log_pdf_test"].squeeze(-1) - std.log(),
     }
 
@@ -184,22 +139,15 @@ def _pit_group(
     tabicl_model, k_folds: int, *, marginal_backend: Optional[str] = None,
     marginal_regressor=None, marginal_probs_n: int = 99, seed: int = 0,
 ) -> Optional[dict]:
-    """Batched sibling of `_pit_episode`: PITs a whole *group* of B episodes
-    that all share P/N (see LiveERA5Dataset.__iter__'s grouped sampling) in
-    ONE run_pit_batched call instead of B separate run_pit calls -- mirrors
-    src/copula_inter/live_dataset.py::LiveGPDataset's group_size mechanism, cutting
-    TabICL's own per-call Python/CUDA-launch overhead from B*(k_folds+1)
-    invocations to k_folds+1 (see run_pit_batched's docstring).
-
-    Unlike normalize_targets (single episode, unconditional .mean()/.std()
-    reduction), each of the B episodes needs its OWN mean/std computed over
-    its own P training points -- reduce over dim=-1 with keepdim instead.
+    """Batched PIT of B episodes that share P and N, each normalized by its own training targets.
 
     Args:
-        x_train/y_train : (B, P, p_x) / (B, P)
-        x_test/y_test   : (B, N, p_x) / (B, N)
-    Returns dict of (B, P)/(B, N)/(B, N) z_train/z_test/log_pdf_test, or
-    None if there's too little context for run_pit_batched's fold split.
+        x_train, y_train: (B, P, p_x), (B, P).
+        x_test, y_test: (B, N, p_x), (B, N).
+
+    Returns:
+        dict of z_train (B, P), z_test (B, N), log_pdf_test (B, N), or None with
+        too little context.
     """
     if x_train.shape[1] < 2 or x_test.shape[1] < 1:
         return None
@@ -233,38 +181,12 @@ def _pit_group(
 
 
 class LiveERA5Dataset(IterableDataset):
-    """Infinite stream of real-ERA5 episodes: each worker attaches to a
-    corpus another process already loaded into shared memory (see
-    `shared_corpus`/era5_global_corpus.py::load_shared_corpus_arrays) and
-    loads its own frozen TabICL copy on `tabicl_device` the first time
-    __iter__ runs — mirrors LiveGPDataset's one-time-per-worker TabICL load.
-    Requires tabicl_device="cuda" unconditionally (there is no CPU-worker
-    path here, same throughput argument live_dataset.py's
-    build_live_train_loader docstring makes for data.z_train_source=tabicl).
+    """Infinite stream of real-ERA5 episodes.
 
-    `shared_corpus` MUST be built (load_shared_corpus_arrays) in the main
-    process before this Dataset's DataLoader spawns workers -- same
-    ordering constraint LiveGPDataset's kernel_weights/tabicl_mix_weights
-    docstring describes for its own share_memory_() tensors. Every worker
-    then attaches to that SAME physical memory (GlobalERA5Corpus.from_shared)
-    instead of each re-reading and holding its own ~15GB private copy of the
-    corpus, which is what used to force live_tabicl_num_workers down to a
-    RAM-bound 1 on a system-RAM-constrained job even when the GPU had
-    headroom for several — see build_era5_train_loader.
-
-    Episodes are drawn in *groups* of `group_size` sharing one P/N each (see
-    __iter__): every call rolls its own grid_size/n_context once, shared by
-    the whole group, and draws region/day/box_deg independently per episode
-    within it via GlobalERA5Corpus.sample_episode_fixed_shape — the same
-    P/N-homogeneous-group, everything-else-free-to-vary trade LiveGPDataset's
-    group_size already makes for synthetic data (see its docstring), applied
-    here to amortize TabICL's per-call PIT overhead across the group via
-    run_pit_batched instead of one run_pit call per episode (benchmarked
-    ~40x fewer Python-level TabICL invocations per episode). d_x=2 (lon,
-    lat) is fixed regardless of region/resolution, so — unlike the synthetic
-    path, where group_size must also equal a multiple of d_features — P/N
-    can still vary freely *across* groups/batches; era5_collate_fn pads
-    exactly like dataset.collate_fn already does for that.
+    Workers attach to a corpus loaded into shared memory by the main process
+    (shared_corpus) and each load their own marginal on tabicl_device ("cuda").
+    Episodes come in groups of group_size that share one grid size / context
+    size (region, day and box vary), PIT'd in one batched call.
     """
 
     def __init__(
@@ -292,9 +214,7 @@ class LiveERA5Dataset(IterableDataset):
         self.base_seed = base_seed
         self.group_size = group_size
         self.tabicl_inference_amp = bool(tabicl_inference_amp)
-        # None => the frozen-TabICL run_pit path (tabicl_ckpt above);
-        # otherwise one of live_dataset._GENERIC_MARGINAL_BACKENDS, built
-        # per worker in __iter__ exactly like the TabICL copy is.
+        # None: TabICL run_pit; otherwise a generic backend built per worker.
         self.marginal_backend = marginal_backend
         self.marginal_probs_n = int(marginal_probs_n)
 
@@ -323,10 +243,7 @@ class LiveERA5Dataset(IterableDataset):
             rng = np.random.default_rng(worker_seed(self.base_seed, worker_id, call_idx))
             call_idx += 1
 
-            # Roll grid_size/n_context ONCE per group -- every episode in
-            # the group shares P/N (region/day/box_deg still vary per draw),
-            # required for the single run_pit_batched call below. See
-            # sample_episode_fixed_shape's docstring.
+            # One grid size / context size per group.
             grid_size = int(rng.integers(self.grid_size_range[0], self.grid_size_range[1] + 1))
             D = grid_size * grid_size
             n_context_frac = float(rng.uniform(*self.n_context_frac_range))
@@ -341,9 +258,7 @@ class LiveERA5Dataset(IterableDataset):
                 if ep is not None:
                     raw_eps.append(ep)
             if len(raw_eps) < self.group_size:
-                # Pathological draw (e.g. grid_size too large for
-                # box_deg_range to ever satisfy) -- redraw the whole group
-                # with a fresh grid_size/n_context on the next call_idx.
+                # No valid box for this shape: redraw the group next call.
                 continue
 
             x_train = torch.as_tensor(
@@ -384,11 +299,7 @@ def _resolve_era5_cfg(cfg: DictConfig) -> dict:
     val_corpus_dir = e.get("val_corpus_dir", None)
     return {
         "corpus_dir": str(e.get("corpus_dir", "./eval/data/cache/era5_global")),
-        # Separate cache dir (e.g. a held-out year fetched into its own
-        # directory via fetch_era5_global.py) for the fixed validation set
-        # below. None (default) falls back to corpus_dir -- the pre-existing
-        # behavior of validating on a different random seed's slice of the
-        # SAME date range training draws from, not a temporally disjoint one.
+        # Optional separate corpus for the fixed validation set.
         "val_corpus_dir": str(val_corpus_dir) if val_corpus_dir else None,
         "grid_size_range": (int(e.get("grid_size_min", 8)), int(e.get("grid_size_max", 28))),
         "box_deg_range": (float(e.get("box_deg_min", 5.0)), float(e.get("box_deg_max", 25.0))),
@@ -399,18 +310,7 @@ def _resolve_era5_cfg(cfg: DictConfig) -> dict:
 
 
 def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> DataLoader:
-    """Training DataLoader backed by LiveERA5Dataset. Mirrors
-    live_dataset.py::build_live_train_loader's tabicl-worker path exactly
-    (spawn context, few GPU workers, per-worker thread pinning, GPU-headroom
-    -bound worker count via resolve_live_tabicl_num_workers) — this source
-    has no CPU-only path at all, so there's no analyticGP-style branch to
-    pick between. Unlike that function's OWN docstring caveat for the
-    synthetic-GP path (no on-disk corpus there), era5 DOES have one; loading
-    it once here into shared memory (load_shared_corpus_arrays) BEFORE the
-    DataLoader spawns workers is what makes it safe to size num_workers off
-    GPU headroom alone instead of a separate system-RAM-aware cap — see
-    LiveERA5Dataset's docstring.
-    """
+    """Training DataLoader over LiveERA5Dataset: shared-memory corpus loaded here, spawn start method, GPU workers sized by resolve_live_tabicl_num_workers."""
     if device != "cuda":
         raise ValueError(
             f"training.live_source=era5 requires device='cuda' (got {device!r}) — "
@@ -430,16 +330,11 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
     ecfg = _resolve_era5_cfg(cfg)
     k_folds = int(cfg.tabicl.get("pit_k_folds", 10))
     base_seed = int(getattr(cfg, "seed", None) or 0)
-    # Reuse live_dataset.py's dedicated tabicl-GPU-worker group knob (default
-    # 2, benchmarked there for the synthetic-GP path) rather than adding a
-    # separate era5-specific one -- same TabICL-per-call-overhead problem,
-    # same fix. See LiveERA5Dataset's docstring for what grouping buys here.
+    # Group size from training.live_tabicl_group_multiplier.
     group_multiplier = max(1, int(t.get("live_tabicl_group_multiplier", 2)))
     group_size = int(t.batch_size) * group_multiplier
 
-    # Load once, HERE in the main process, before the DataLoader below spawns
-    # any workers -- see LiveERA5Dataset's docstring for why this is what
-    # lets every worker attach to one shared copy instead of holding its own.
+    # Load the corpus into shared memory before workers spawn.
     print(f"[era5_live_dataset] loading global ERA5 corpus into shared memory from {ecfg['corpus_dir']}")
     shared_corpus = load_shared_corpus_arrays(ecfg["corpus_dir"])
 
@@ -457,9 +352,7 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         marginal_backend=marginal_backend,
         marginal_probs_n=marginal_probs_n,
     )
-    # GPU-headroom-bound only, same as the synthetic-GP tabicl path -- no
-    # longer separately RAM-capped, since every worker shares one corpus
-    # copy instead of holding its own (see LiveERA5Dataset's docstring).
+    # Worker count bound by GPU headroom (the corpus is shared).
     num_workers = resolve_live_tabicl_num_workers(t, device)
     loader = DataLoader(
         live_ds,
@@ -476,25 +369,9 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
 
 
 def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "cpu") -> List[dict]:
-    """Fixed, once-generated real-ERA5 validation set — analogue of
-    live_dataset.py::build_fixed_live_val_batches. Uses a val-specific seed
-    (era5_live.val_seed) distinct from the training seed stream, computed
-    once in the main process, so val/... tracks only model changes across
-    training, same rationale as the GP path's fixed val batches.
+    """Fixed ERA5 validation batches, drawn once with era5_live.val_seed.
 
-    This is separate from — and complements — the era5_fit/<region>
-    validation probes (src/copula_inter/train.py::_build_era5_val_batches, cfg.baselines.
-    era5_*): those score a handful of fixed, curated named regions; this is
-    the live-training-loop's own held-out slice of the worldwide random
-    corpus distribution the model is being finetuned on.
-
-    era5_live.val_corpus_dir (None by default) points this at a SEPARATE
-    corpus directory instead of corpus_dir -- e.g. one calendar year fetched
-    into its own cache via fetch_era5_global.py, disjoint from the years the
-    training corpus covers -- so val/era5_live_* tracks genuine held-out-year
-    generalization rather than a different random seed's slice of the same
-    date range training already draws from. Falls back to corpus_dir when
-    unset (the original same-range behavior).
+    Uses era5_live.val_corpus_dir (e.g. a held-out year) when set, else corpus_dir.
     """
     import numpy as np
 

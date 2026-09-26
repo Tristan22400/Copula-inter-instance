@@ -1,13 +1,10 @@
-""" Muon optimizer for UNet
-Original code copied from:
-    https://github.com/toothacher17/Megatron-LM/blob/moonshot/distributedmuon-impl/megatron/core/optimizer/muon.py
-Then we apply the following changes:
-    * Remove everything related to distributed training (as we run on single GPU)
-    * Reshape all weights to 2D, before Newton-Schulz, and then reshape back.
-    (ref: https://github.com/KellerJordan/cifar10-airbench/blob/master/airbench94_muon.py)
-    * Batch Newton-Schulz iterations across all params of the same shape.
-    * Fuse momentum buffer updates via torch._foreach_* ops (2 kernel launches vs 306).
-    * @torch.compile on the NS kernel for fused GPU execution.
+"""Muon optimizer.
+
+Adapted from
+https://github.com/toothacher17/Megatron-LM/blob/moonshot/distributedmuon-impl/megatron/core/optimizer/muon.py:
+single-GPU only, weights reshaped to 2-D for Newton-Schulz, Newton-Schulz
+batched across parameters of the same shape, fused momentum updates
+(torch._foreach_*), and a torch.compile'd Newton-Schulz kernel.
 """
 import torch
 import math
@@ -44,24 +41,9 @@ def adjust_lr_wd_for_muon(lr, matched_adamw_rms, param_shape):
 
 
 class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+    """Muon: SGD-momentum whose update for each 2-D parameter is replaced by the nearest orthogonal matrix (Newton-Schulz, bfloat16).
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Optimisations vs the reference implementation:
-    - Momentum buffer updates are fused with torch._foreach_mul_ / _foreach_add_
-      (2 GPU kernel launches instead of 2×n_params sequential launches).
-    - Newton-Schulz is batched across all params sharing the same 2D shape
-      (O(n_shapes) batched matmuls instead of O(n_params) sequential calls).
-    - @torch.compile on the NS kernel fuses the inner matmul/elementwise ops.
-
-    Some warnings:
-    - We believe this optimizer is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    May work poorly with small batches or for fine-tuning pretrained models.
     """
 
     def __init__(self,

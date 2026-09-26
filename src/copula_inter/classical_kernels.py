@@ -1,34 +1,11 @@
-"""Bank of classical GP kernels evaluated as fixed baselines in the validation loop.
+"""Fixed classical GP kernels used as correlation baselines in validation.
 
-Each kernel turns an episode's *test* features ``x_test`` (B, N, d) directly into an
-inter-instance correlation matrix (B, N, N) — the same object the transformer
-predicts as ``Sigma``. Scoring these fixed kernels against the oracle ``R_star``
-(and via the copula NLL on ``z_test``) tells us how much of the inter-instance
-structure is recoverable by a plain distance kernel on the features, i.e. how much
-the learned model actually buys over a classical baseline.
-
-Kernel families (each available with and without ARD):
-    dot_product         — linear kernel <x_i, x_j>, normalised to cosine similarity
-    rbf                 — squared exponential  exp(-r²/2)
-    matern12            — Matérn ν=1/2         exp(-r)
-    matern32            — Matérn ν=3/2         (1+√3 r) exp(-√3 r)
-    matern52            — Matérn ν=5/2         (1+√5 r + 5r²/3) exp(-√5 r)
-    rational_quadratic  — (1 + r²/(2α))^(−α)
-
-Lengthscales are *fixed* (not learned) via the median heuristic, computed per
-episode so the baseline adapts to each task's feature scale without any training:
-    isotropic : ℓ  = median pairwise Euclidean distance over the valid points
-    ARD       : ℓ_d = median pairwise |Δ| along dimension d (one per feature)
-
-The kernels themselves are the real gpytorch kernel objects (``RBFKernel``,
-``MaternKernel(nu=…)``, ``RQKernel``, ``LinearKernel``) — the same families
-``data_gen.py`` uses to *generate* the data — so the baseline math stays a single
-source of truth with the generating side. Each family is built batched
-(``batch_shape=[B]``) so every episode gets its own median-heuristic lengthscale
-in one ``kernel(x).to_dense()`` call. The resulting Gram matrix K is normalised to
-a correlation matrix ``D^{-1/2} K D^{-1/2}`` so it has a unit diagonal and is a
-drop-in for ``R_star`` / ``Sigma`` (a no-op for the unit-variance stationary
-kernels; meaningful for dot_product).
+Each kernel maps test features x_test (B, N, d) to a (B, N, N) correlation
+matrix D^{-1/2} K D^{-1/2}. Families (each with and without ARD):
+dot_product (cosine), rbf, matern12, matern32, matern52, rational_quadratic.
+Lengthscales use the per-episode median heuristic (isotropic: median pairwise
+distance; ARD: median |difference| per dimension). Kernels are gpytorch
+objects built with batch_shape=[B].
 """
 
 from __future__ import annotations

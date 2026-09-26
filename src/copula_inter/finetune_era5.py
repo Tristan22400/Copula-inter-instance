@@ -1,30 +1,14 @@
-"""finetune_era5.py — finetune an existing copula-model checkpoint on real,
-worldwide ARCO-ERA5 data (many geographic regions, many grid resolutions)
-instead of the synthetic-GP live-generation stream train.py normally trains
-on.
+"""Fine-tune a copula checkpoint on real ARCO-ERA5 data by running copula_inter.train with ERA5 overrides.
 
-This is a thin argparse -> Hydra-override translation over
-`python -m copula_inter.train` (training.resume_ckpt=... training.live_generation=true
-training.live_source=era5 ...) — no duplicated training loop; every
-optimizer/scheduler/AMP/logging/checkpointing behavior is exactly train.py's
-own (see src/copula_inter/era5_live_dataset.py for the actual real-data episode source
-this switches in).
-
-Prerequisite: a local ERA5 corpus. Fetch one first:
-  python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
+Runs python -m copula_inter.train training.resume_ckpt=... 
+training.live_generation=true training.live_source=era5 .... Needs a local
+corpus (python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24).
 
 Usage:
-  python -m copula_inter.finetune_era5 --ckpt checkpoints/kernel-sweep-all-tabicl-retrain-15k/step_0015000.pt
-
-  # See the exact command without running it:
-  python -m copula_inter.finetune_era5 --ckpt <path> --dry-run
-
-  # Finetune against a non-TabICL marginal (see data.z_train_source in
-  # conf/data/gp_tasks.yaml, and era5_live_dataset.py::_resolve_marginal):
-  python -m copula_inter.finetune_era5 --ckpt <path> --marginal tabldm
-
-  # Forward arbitrary extra Hydra overrides verbatim:
-  python -m copula_inter.finetune_era5 --ckpt <path> -- era5_live.grid_size_max=32 wandb.entity=me
+    python -m copula_inter.finetune_era5 --ckpt kernel-sweep-all-tabicl-retrain-15k
+    python -m copula_inter.finetune_era5 --ckpt <path> --dry-run
+    python -m copula_inter.finetune_era5 --ckpt <path> --marginal tabldm
+    python -m copula_inter.finetune_era5 --ckpt <path> -- era5_live.grid_size_max=32 wandb.entity=me
 """
 
 from __future__ import annotations
