@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10"]
+dev = ["pytest>=8,<10", "pytest-xdist>=3.6,<4", "ruff>=0.16,<0.17", "mypy>=1.11,<2"]
 cpu = ["torch>=2.5,<3"]
 gpu = ["torch>=2.5,<3"]
 era5 = ["netCDF4>=1.7,<2"]
@@ -90,3 +90,22 @@ markers = [
   "external_data: requires datasets outside this checkout",
   "slow: exceeds the fast CPU budget",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["tabicl_upstream", "*_upstream", ".claude/worktrees", ".codex"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["eval", "inference", "conf", "tabicl"]
+
+[tool.mypy]
+mypy_path = ["src", ".", "tabicl_upstream/src"]
+python_version = "3.12"
+ignore_missing_imports = true
+follow_imports = "silent"
+check_untyped_defs = false
+exclude = ["tabicl_upstream/", "_upstream/"]

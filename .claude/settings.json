@@ -2,12 +2,13 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit|Write",
+        "matcher": "Edit|Write|MultiEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "json=$(cat); f=$(echo \"$json\" | jq -r '.tool_input.file_path // .tool_response.filePath // empty'); [[ \"$f\" == *.py ]] && /home/mtristan/miniconda3/envs/multivariate_ICL/bin/ruff format \"$f\" && /home/mtristan/miniconda3/envs/multivariate_ICL/bin/ruff check --fix --select I \"$f\" 2>/dev/null || true",
-            "statusMessage": "Formatting with ruff..."
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/check_python.sh",
+            "timeout": 90,
+            "statusMessage": "ruff format + lint, mypy on changed lines..."
           }
         ]
       }
