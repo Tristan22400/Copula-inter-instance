@@ -1,39 +1,16 @@
-"""
-model.py — CopulaTabICL: a tabular ICL backbone as a frozen/finetuned
-feature extractor + copula head.
+"""CopulaTabICL: a tabular ICL backbone used as a feature extractor, plus a copula head.
 
-Despite the class name (kept for state-dict/call-site stability — see
-copula_backbones.py's docstring for why only two backbones qualify), the
-backbone is a CHOICE: ``cfg.model.backbone`` selects "tabicl" (default) or
-"tabldm" (Xiaomi-TabLDM), dispatched through src/copula_inter/copula_backbones.py. All
-architecture-specific construction (pretrained/scratch loading, decoder
-discovery+stripping, an optional MoE auxiliary loss) lives there; this
-module only holds the feature-extractor pattern and the copula head itself,
-both backbone-agnostic.
+The backbone (cfg.model.backbone: "tabicl" or "tabldm") is built by
+copula_backbones.py with its quantile decoder replaced by nn.Identity, so it
+emits per-test-row features of size feature_dim. copula_head maps each row to
+(w_i in R^r, s_i), and the default "covnorm" parametrization builds
 
-Pattern (ResNet/feature-extractor style):
-  1. Load the pretrained backbone (TabICL or TabLDM).
-  2. STRIP its final quantile decoder by replacing it with ``nn.Identity()``
-     — the backbone now emits raw test-instance features of dimension
-     ``feature_dim`` (== embed_dim * row_num_cls for both backbones)
-     instead of quantile logits.
-  3. Add our own ``copula_head : R^{feature_dim} → R^{r+1}`` as a SEPARATE
-     module.  Output splits into ``(w_i ∈ R^r, s_i ∈ R)``.
+    S = W W^T + diag(softplus(s))
+    R = L^{-1/2} S L^{-1/2},               L = diag(diag(S))
+    Sigma = G^{-1/2} (R + jitter I) G^{-1/2},  G = diag(diag(R + jitter I))
 
-Correlation projection (unconstrained), default "covnorm" parametrization:
-
-    D = diag(softplus(s_i))
-    S = W W^T + D
-    R = Λ^{-1/2} S Λ^{-1/2},                 Λ = diag(diag(S))
-    Σ = Γ^{-1/2} (R + jitter·I) Γ^{-1/2},    Γ = diag(diag(R + jitter·I))
-
-(the second congruence transform renormalizes the jittered matrix back to a
-unit diagonal -- see model._renormalize_to_unit_diagonal)
-
-Three alternative parametrizations ("cossim", "tanhnorm", "sparse_covnorm",
-selected via cfg.model.correlation_parametrization) live in
-correlation_factory.py and are dispatched through low_rank_correlation()/
-build_sigma() below.
+The other parametrizations ("cossim", "tanhnorm", "sparse_covnorm") live in
+correlation_factory.py.
 """
 
 from __future__ import annotations
@@ -55,30 +32,12 @@ from copula_inter.correlation_factory import (
     tanhnorm_correlation,
 )
 
-# Parametrizations whose copula_head output has no trailing scalar column
-# (W only, no s) — see CopulaTabICL.__init__.
+# Parametrizations whose copula_head emits W only (no s column).
 _NO_SCALAR_COLUMN = {"tanhnorm"}
 
 
-# ---------------------------------------------------------------------------
-# Correlation projection
-# ---------------------------------------------------------------------------
-
-
 def _renormalize_to_unit_diagonal(M: Tensor) -> Tensor:
-    """Rescale a symmetric PSD matrix so its diagonal is exactly 1.
-
-    Every parametrization below already builds a unit-diagonal R before
-    ``jitter`` is added, but ``R + jitter*I`` shifts the diagonal to
-    ``1 + jitter`` while leaving the off-diagonal entries untouched -- so the
-    jittered matrix is no longer a valid correlation matrix (R_ii != 1). This
-    reapplies the same Λ^{-1/2} (·) Λ^{-1/2} congruence transform used to
-    build R in the first place, using the post-jitter diagonal Λ. Off- and
-    on-diagonal entries shrink by the same factor (exactly ``1/(1+jitter)``
-    when the pre-jitter diagonal was exactly 1), which keeps M PSD -- a
-    congruence transform by a positive diagonal matrix preserves
-    positive-semidefiniteness.
-    """
+    """Rescale a symmetric PSD matrix to unit diagonal: M -> L^{-1/2} M L^{-1/2}, L = diag(diag(M))."""
     diag = M.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
     inv_sqrt = diag.rsqrt()
     return M * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
@@ -92,30 +51,20 @@ def low_rank_correlation(
     parametrization: str = "covnorm",
     lam: Optional[Tensor] = None,
 ) -> Tensor:
-    """Build per-batch correlation matrices Σ from raw copula-head outputs.
+    """Build per-batch correlation matrices Sigma from raw copula-head outputs.
 
     Args:
-        W      : (B, N, r)
-        s      : (B, N) raw scalars — meaning depends on ``parametrization``:
-                 softplus(s) diagonal variance for "covnorm"/"sparse_covnorm",
-                 a sigmoid gate for "cossim", unused for "tanhnorm".
-        test_mask : unused inside; caller slices N_b out of Σ before Cholesky
-        jitter : added to the diagonal of Σ for numerical stability, applied
-                 uniformly after building Σ regardless of parametrization,
-                 then renormalized back to a unit diagonal (see Returns)
-        parametrization : one of "covnorm" (default — original behaviour,
-                 byte-identical to the pre-existing implementation),
-                 "cossim", "tanhnorm", "sparse_covnorm". See
-                 correlation_factory.py for the exact math of each.
-        lam    : (B,) or (1,) raw threshold, required only for
-                 "sparse_covnorm" (see correlation_factory.sparse_covnorm_correlation)
+        W: (B, N, r) low-rank factor.
+        s: (B, N) per-row scalar: softplus(s) diagonal variance for
+            "covnorm"/"sparse_covnorm", a sigmoid gate for "cossim", unused for
+            "tanhnorm".
+        test_mask: unused.
+        jitter: added to the diagonal, then renormalized back to unit diagonal.
+        parametrization: "covnorm", "cossim", "tanhnorm" or "sparse_covnorm".
+        lam: (B,) or (1,) raw soft threshold, required for "sparse_covnorm".
 
     Returns:
-        Sigma : (B, N, N) symmetric PD, unit diagonal EXACTLY (jitter is
-                folded in and then renormalized back out via
-                ``_renormalize_to_unit_diagonal`` -- see that function's
-                docstring for why the naive ``R + jitter*I`` is not itself a
-                valid correlation matrix).
+        (B, N, N) symmetric positive-definite Sigma with unit diagonal.
     """
     B, N, _ = W.shape
     eye = torch.eye(N, device=W.device, dtype=W.dtype).expand(B, N, N)
@@ -149,23 +98,14 @@ def low_rank_correlation_factor(
     parametrization: str = "covnorm",
     lam: Optional[Tensor] = None,
 ) -> LowRankCorrelationFactor:
-    """The SAME Σ as ``low_rank_correlation``, kept in factored form.
+    """The same Sigma as low_rank_correlation, as a low-rank-plus-diagonal factor.
 
-    Every parametrization's Σ is low-rank plus diagonal, and so is its
-    jittered, renormalized version: with R = U U^T + diag(D),
-
-        Σ = Γ^{-1/2} (U U^T + diag(D + jitter)) Γ^{-1/2},   Γ = ||U_i||² + D_i + jitter
-          = U' U'^T + diag(D'),   U' = Γ^{-1/2} U,   D' = (D + jitter) / Γ
-
-    so the NLL can use the Matrix Determinant Lemma + Woodbury on (U', D')
-    (O(N r²)) instead of a dense N×N Cholesky (O(N³)). ``.dense()`` of the
-    result equals ``low_rank_correlation(...)`` up to float rounding
-    (tests/test_lowrank_nll.py pins that).
+    With R = U U^T + diag(D) and G = ||U_i||^2 + D_i + jitter,
+    Sigma = U' U'^T + diag(D') where U' = G^{-1/2} U and D' = (D + jitter) / G.
+    The result's .dense() equals low_rank_correlation(...) up to rounding.
     """
     if parametrization == "covnorm":
-        # Mirrors low_rank_correlation's covnorm branch exactly (softplus(s)
-        # with no +eps, diag clamped at 1e-12) -- NOT correlation_factory's
-        # covnorm_correlation, which differs by an eps on the diagonal.
+        # Same diagonal as low_rank_correlation's covnorm branch (softplus(s), clamp 1e-12).
         D_raw = F.softplus(s)
         c = ((W * W).sum(-1) + D_raw).clamp_min(1e-12)
         U = W * c.rsqrt().unsqueeze(-1)
@@ -194,14 +134,7 @@ def build_sigma(
     jitter: float = 1e-4,
     test_mask: Optional[Tensor] = None,
 ) -> Tensor:
-    """Dense Σ from a CopulaTabICL forward-pass dict, dispatched by
-    ``cfg.model.correlation_parametrization``.
-
-    Single choke point so call sites don't need to know per-parametrization
-    argument differences (tanhnorm's ``out`` has no "s" key; sparse_covnorm's
-    has an extra "lam" key) — they just call ``build_sigma(out, cfg, ...)``
-    instead of ``low_rank_correlation(out["W"], out["s"], ...)`` directly.
-    """
+    """Dense Sigma from a CopulaTabICL forward-pass dict, using cfg.model.correlation_parametrization."""
     parametrization = cfg.model.get("correlation_parametrization", "covnorm")
     return low_rank_correlation(
         out["W"],
@@ -213,28 +146,12 @@ def build_sigma(
     )
 
 
-# ---------------------------------------------------------------------------
-# CopulaTabICL — feature-extractor + copula head
-# ---------------------------------------------------------------------------
-
-
 class CopulaTabICL(nn.Module):
-    """A tabular ICL backbone (TabICL or TabLDM) stripped of its quantile
-    decoder, with a copula head bolted on. Class name kept for state-dict/
-    call-site stability — see model.py's module docstring; the actual
-    backbone is a choice, resolved by copula_backbones.py.
+    """Tabular ICL backbone without its quantile decoder, plus a copula head.
 
-    The backbone instance is held as ``self.feature_extractor`` and used as
-    a black box: calling it returns (B, N_test, feature_dim) — raw features
-    for each test instance — because we have replaced its ICL decoder with
-    ``nn.Identity()``.
-
-    ``self.copula_head`` then projects to (W, s) — or just W for
-    "tanhnorm", which needs no extra scalar column (see
-    correlation_factory.py). "sparse_covnorm" additionally carries a single
-    learned soft-threshold shared across the batch (``self.sparse_lambda_raw``)
-    — the spec's λ ∈ R^{B×1} is a global learned scalar, not data-conditional,
-    so it lives on the module rather than as an extra head output.
+    feature_extractor maps a batch to (B, N_test, feature_dim) test-row features.
+    copula_head projects them to (W, s), or to W alone for "tanhnorm".
+    "sparse_covnorm" also learns one global soft threshold, sparse_lambda_raw.
     """
 
     def __init__(
@@ -245,9 +162,7 @@ class CopulaTabICL(nn.Module):
         backbone_name: str = "tabicl",
     ):
         super().__init__()
-        # 1. Discover the feature dimension, then strip the final quantile
-        #    decoder — feature-extractor pattern, shared by both backbones
-        #    (see copula_backbones.strip_decoder's docstring).
+        # Discover the feature dimension, then replace the quantile decoder with Identity.
         in_features = copula_backbones.strip_decoder(base)
 
         # 2. Save the (now feature-only) backbone.
@@ -257,43 +172,30 @@ class CopulaTabICL(nn.Module):
         self.feature_dim = in_features
         self.correlation_parametrization = correlation_parametrization
 
-        # 3. Our own copula head — completely separate module. Output width
-        #    varies per parametrization: tanhnorm needs only the r-dim raw
-        #    factor, the others also need one trailing scalar column.
+        # Copula head: r columns for W, plus one for s unless tanhnorm.
         head_out_dim = rank if correlation_parametrization in _NO_SCALAR_COLUMN else rank + 1
         self.copula_head = nn.Linear(in_features, head_out_dim)
         nn.init.normal_(self.copula_head.weight, std=0.02)
         nn.init.zeros_(self.copula_head.bias)
 
         if correlation_parametrization == "sparse_covnorm":
-            # softplus(-6) ~= 0.0025, far below copula_head's ~0.02-std initial
-            # W scale, so the soft-threshold starts near-inactive (W_tilde ~= W,
-            # matching CovNorm's warm start) instead of zeroing every entry out
-            # from step 0. Initializing at 0 (softplus(0) ~= 0.69) is a dead
-            # unit: relu's zero-gradient region blocks all gradient to both W
-            # and lambda simultaneously, so the threshold could never learn to
-            # shrink back down.
+            # softplus(-6) ~= 0.0025 starts the threshold near-inactive; at 0 the relu has no gradient.
             self.sparse_lambda_raw = nn.Parameter(torch.full((1,), -6.0))
 
     def forward(self, batch: dict) -> dict:
-        """Forward over a padded batch from ``dataset.collate_fn``.
+        """Forward over a padded batch from dataset.collate_fn.
 
-        Returns dict(W=(B, N_max, r)), plus "s"=(B, N_max) unless
-        correlation_parametrization=="tanhnorm", plus "lam"=(1,) iff
-        correlation_parametrization=="sparse_covnorm".
+        Returns a dict with W: (B, N_max, r), plus s: (B, N_max) unless the
+        parametrization is "tanhnorm", plus lam: (1,) for "sparse_covnorm", plus
+        moe_aux_loss when the backbone emits one.
         """
         x_train = batch["x_train"]            # (B, P_max, d_x)
         x_test = batch["x_test"]              # (B, N_max, d_x)
         z_train = batch["z_train"]            # (B, P_max) — Z-space context labels
 
         X = torch.cat([x_train, x_test], dim=1)            # (B, T, d_x)
-        # Backbone in training/eval mode returns (B, N_test, out_dim). With
-        # decoder replaced by Identity, out_dim == feature_dim.
         features = self.feature_extractor(X, z_train)      # (B, N_max, feature_dim)
-        # Pretrained TabICL inference can return float16 features even when
-        # the copula model runs on CPU without autocast. Match the head's
-        # parameter dtype at this boundary; autocast still controls the
-        # actual linear precision on supported devices.
+        # Cast backbone features to the head's dtype (TabICL may return float16).
         features = features.to(dtype=self.copula_head.weight.dtype)
         head_out = self.copula_head(features)              # (B, N_max, head_out_dim)
         W = head_out[..., : self.rank]                      # (B, N_max, r)
@@ -304,56 +206,19 @@ class CopulaTabICL(nn.Module):
         if self.correlation_parametrization == "sparse_covnorm":
             out["lam"] = self.sparse_lambda_raw
 
-        # Backbone's own auxiliary loss (MoE z-loss + load-balance, TabLDM
-        # only — see copula_backbones.moe_aux_loss). Surfaced here, the
-        # single choke point over this backbone's forward, rather than
-        # requiring train.py to know which backbone is loaded.
+        # Backbone auxiliary loss (TabLDM MoE only).
         aux = copula_backbones.moe_aux_loss(self.backbone_name, self.feature_extractor)
         if aux is not None:
             out["moe_aux_loss"] = aux
         return out
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-
 def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
-    """Construct CopulaTabICL with the selected backbone.
+    """Construct CopulaTabICL from cfg.
 
-    Reads:
-        cfg.model.backbone             (default "tabicl"; one of
-                                         copula_backbones.BACKBONE_NAMES —
-                                         "tabicl" | "tabldm". See
-                                         src/copula_inter/copula_backbones.py for the
-                                         per-architecture construction this
-                                         dispatches to.)
-        cfg.model.rank
-        cfg.model.correlation_parametrization
-                                        (default "covnorm"; one of "covnorm",
-                                         "cossim", "tanhnorm", "sparse_covnorm"
-                                         — see correlation_factory.py)
-        cfg.tabicl.pretrained          (default True; tabldm has no
-                                         from-scratch path and raises if
-                                         this is False)
-        cfg.tabicl.ckpt                (tabicl only, only when pretrained=True)
-        cfg.tabicl.recompute           (default False; gradient checkpointing
-                                         through the backbone — trades
-                                         ~20-30% extra compute for a large cut
-                                         in peak activation memory, useful when
-                                         large N_max/P_max push attention
-                                         length T=P+N close to the VRAM
-                                         ceiling. For tabldm this is an
-                                         escalate-only override — see
-                                         copula_backbones._load_tabldm.)
-        cfg.tabicl.arch.*              (tabicl only, only when pretrained=False)
-        cfg.model.unfreeze_backbone    (default True)
-        cfg.lora.enabled               (default False)
-        cfg.lora.rank                  (default 8)
-        cfg.lora.alpha                 (default 16.0)
-        cfg.lora.target                (default "qkvo")
-        cfg.lora.stages                (default ["icl", "row", "col"])
+    Reads cfg.model.{backbone, rank, correlation_parametrization,
+    unfreeze_backbone}, cfg.tabicl.{pretrained, ckpt, recompute, arch} and
+    cfg.lora.{enabled, rank, alpha, target, stages}.
     """
     backbone_name = str(cfg.model.get("backbone", "tabicl"))
     if backbone_name not in copula_backbones.BACKBONE_NAMES:

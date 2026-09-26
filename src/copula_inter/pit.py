@@ -1,32 +1,11 @@
-"""
-pit.py — Probability Integral Transform via the frozen TabICL marginal CDF.
+"""Probability integral transform (PIT) through a TabICL marginal, and the exact-GP equivalent.
 
-For each target dimension j, TabICL's quantile head provides a conditional
-predictive distribution over y given (x, context).  Evaluating that
-distribution's CDF at the true target maps observations to Uniform(0, 1):
-
-    u_{i,j} = F̂_j(y_{i,j} | x_i, context)
-
-and a probit transform sends them to standard normal Z-space:
-
-    z_{i,j} = Φ⁻¹(u_{i,j}).
-
-Leakage prevention for the training instances is done by **K-fold
-partitioning**: the train set is split into K disjoint folds, and for each
-fold the held-out points are queried against TabICL using the remaining
-K−1 folds as context.  K is small and fixed (default 10) — true LOO
-(K = P) is much more accurate but ~K_loo / K_default times slower at
-dataset-generation time.  The test instances use the entire training set
-as context (single forward pass).
-
-``run_pit_calib_split_batched`` offers a cheaper alternative to the K-fold
-rotation: leakage is instead avoided by drawing a separate calibration point
-set that is disjoint from the training set by construction (never a K-fold
-rotation of the same pool), so every training point can be scored against it
-in a single forward pass. See its docstring for the cost/quality trade-off.
-
-This file makes **no modifications** to ``tabicl_upstream`` — leakage is
-handled purely by which points are passed in which forward call.
+TabICL's quantile head gives F(y | x, context); the PIT maps each target to
+z = Phi^{-1}(F(y)). Training points are scored with K-fold partitioning (each
+fold against the other K-1 as context); test points use the full training set
+as context. run_pit_calib_split_batched instead scores a query set against a
+separate, disjoint calibration set in one pass. gp_analytical_* compute the
+same quantities in closed form from an episode's saved GP kernel.
 """
 
 from __future__ import annotations
@@ -44,20 +23,12 @@ from tabicl._model.inference_config import InferenceConfig  # noqa: E402
 
 DEFAULT_K_FOLDS = 10
 
-# ``None`` preserves TabICL's historical default (AMP enabled on CUDA).  The
-# training entrypoint sets this once from ``training.tabicl_inference_amp``;
-# DataLoader workers inherit it before they start generating PITs.
+# None keeps TabICL's default (AMP on CUDA); set once by the entrypoint and inherited by workers.
 _TABICL_INFERENCE_CONFIG: Optional[InferenceConfig] = None
 
 
 def configure_tabicl_inference_amp(use_amp: bool) -> None:
-    """Set the inference precision used by every PIT TabICL forward.
-
-    This is intentionally process-global: PIT calls occur in the live-data
-    workers as well as in validation, and the workers inherit the setting when
-    they are spawned.  ``use_amp=False`` keeps the marginal's quantile grid in
-    float32, which is required for stable quantile derivatives/log densities.
-    """
+    """Set the process-global inference precision for every PIT TabICL forward (None = TabICL default)."""
     global _TABICL_INFERENCE_CONFIG
     _TABICL_INFERENCE_CONFIG = InferenceConfig(
         COL_CONFIG={"use_amp": bool(use_amp)},
@@ -74,24 +45,14 @@ def tabicl_forward(tabicl: nn.Module, X: torch.Tensor, y_train: torch.Tensor, **
 
 
 def _optional_param(t: torch.Tensor):
-    """Unpack a possibly-ARD-vector task hyperparameter (see data_gen's 0.0
-    "not applicable" sentinel convention): None if every entry is the
-    sentinel, else a python float (scalar) or the raw tensor (ARD vector)."""
+    """None if every entry is the 0.0 "not applicable" sentinel, else a float (scalar) or the tensor (ARD vector)."""
     if torch.all(t == 0.0):
         return None
     return t.item() if t.numel() == 1 else t
 
 
 def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
-    """Reconstruct mean_module(x) from a task dict's saved mean-bank params
-    (see data_gen._MeanFunctionBank / _sample_mean_module) -- same formula,
-    unbatched. Needed so gp_analytical_pit's LOO alpha can be residualized
-    against the same mean the episode was actually generated with (see
-    data_gen._generate_gp_batch_raw's alpha computation for why: R&W Eq.
-    5.12 is derived for a zero-mean joint Gaussian). Older tasks saved before
-    "mean_*" existed default to an all-zero (no-op) mean, same convention as
-    the sign-modulation fields above.
-    """
+    """Evaluate the episode's saved mean function at x_train (all-zero when the task has no mean_* fields)."""
     zero = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
     if not bool(task.get("mean_nonzero", torch.tensor(False)).item()):
         return zero
@@ -113,31 +74,10 @@ def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unknown mean_family {family}; expected 0, 1, or 2.")
 
 
-# ---------------------------------------------------------------------------
-# TabICL loader
-# ---------------------------------------------------------------------------
-
-
 def resolve_pit_ckpt(cfg) -> str | None:
-    """Which checkpoint (if any) to load as a frozen TabICL marginal for
-    PIT-ing episodes the way real (non-GP) deployment data would be seen.
+    """The TabICL checkpoint to load as the frozen PIT marginal, or None.
 
-    Shared by every caller that needs this resolution (train.py's z_train
-    sim-to-real diagnostic, generate_pit_dataset.py's data.z_train_source=
-    tabicl/tabicl_split, live_dataset.py's live-generation equivalent) — was
-    previously train.py-local (train.py::_resolve_pit_ckpt), moved here so
-    live_dataset.py can reuse it without importing from train.py (which
-    itself imports live_dataset.py, so the reverse import would cycle).
-
-    This is a separate model instance from the backbone a given run actually
-    trains, so its checkpoint is its own knob (tabicl.pit_ckpt) rather than
-    reusing tabicl.pretrained/tabicl.ckpt (which describe that run's own
-    backbone) — a from-scratch backbone (tabicl.pretrained=false, e.g.
-    copula_nano) can still opt in by setting pit_ckpt explicitly, since
-    PIT-ing episodes with a released checkpoint's quantile head doesn't
-    depend on the run's own architecture. Defaults to tabicl.ckpt when the
-    backbone itself is pretrained (copula_prod's original behaviour), else
-    None (diagnostic/override off) unless pit_ckpt is set explicitly.
+    tabicl.pit_ckpt if set; otherwise tabicl.ckpt when tabicl.pretrained is true.
     """
     pit_ckpt = cfg.tabicl.get("pit_ckpt", None)
     if pit_ckpt is None and bool(cfg.tabicl.get("pretrained", True)):
@@ -148,30 +88,15 @@ def resolve_pit_ckpt(cfg) -> str | None:
 def load_tabicl(
     ckpt_name: str, device: str, trainable: bool = False, return_config: bool = False
 ) -> nn.Module:
-    """Load a TabICL regressor, frozen and in eval mode by default.
+    """Load a TabICL regressor.
 
-    ``ckpt_name`` is either a filename inside the ``jingang/TabICL`` HF repo
-    (the historical contract — downloaded and cached on first use) or a path to
-    a local ``.ckpt``/``.pt`` file carrying the same ``{"config", "state_dict"}``
-    schema. The local branch is what makes a Phase-A fine-tuned marginal
-    (``src/copula_inter/finetune_marginal.py``) a genuine drop-in for ``tabicl.pit_ckpt``:
-    every consumer — offline dataset generation, live workers, ERA5 finetuning,
-    the eval runners — reaches the marginal through this one function, so
-    accepting a path here is the whole integration.
-
-    ``trainable=True`` skips the ``requires_grad_(False)`` sweep and leaves the
-    module in ``.train()`` mode. Both matter for Phase A: gradients obviously,
-    and train mode because TabICL's ``.eval()`` routes into
-    ``_inference_forward``/``InferenceManager`` with its own float16 autocast,
-    which produces NaN here (the same reason ``train.py::validate()`` never
-    calls ``model.eval()``; see ``_train_mode`` below). TabICL has no dropout,
-    so train mode is numerically identical to eval mode's non-autocast path.
-
-    ``return_config=True`` returns ``(model, config)`` instead of just the
-    model. The architecture dict is needed verbatim to write a checkpoint this
-    same function can read back (see
-    ``marginal_finetune.save_marginal_checkpoint``), and re-reading a ~120MB
-    file just to recover it would be silly.
+    Args:
+        ckpt_name: a filename in the jingang/TabICL HF repo, or a local .ckpt/.pt
+            path with the same {"config", "state_dict"} schema.
+        device: torch device.
+        trainable: keep gradients and train mode (for fine-tuning); otherwise
+            frozen and in eval mode.
+        return_config: also return the architecture config dict.
     """
     from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
@@ -198,7 +123,7 @@ def load_tabicl(
 
 
 def _probit(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Clamp u to (eps, 1-eps) then apply Φ⁻¹ via erfinv."""
+    """Clamp u to (eps, 1-eps) and apply Phi^{-1}."""
     u = u.clamp(eps, 1.0 - eps)
     return torch.erfinv(2.0 * u - 1.0) * math.sqrt(2.0)
 
@@ -206,33 +131,15 @@ def _probit(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 def normalize_targets(
     y_train: torch.Tensor, y_test: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-    """Z-score targets to the scale the frozen TabICL quantile head expects.
-
-    ``run_pit`` (and the raw TabICL module it wraps) does no target scaling
-    of its own — unlike ``tabicl.TabICLRegressor.fit()``, which always fits
-    a fresh StandardScaler on y before calling this same underlying model
-    (see ``tabicl_upstream/.../_sklearn/regressor.py``). Every call site
-    that hands ``y`` to ``run_pit`` (or the raw module directly) must
-    replicate that scaling first, or absolute-scale targets (e.g. real-world
-    units, or a synthetic draw with a random GammaPrior-drawn outputscale)
-    saturate the frozen quantile head's CDF into its extreme tail for every
-    point alike, collapsing the returned PIT residuals'/quantiles' spread
-    instead of reflecting the true per-point rank.
-
-    ``y_test``, if given, is scaled with ``y_train``'s own mean/std (never
-    its own) — mirrors ``TabICLRegressor.fit()``, which fits its scaler on
-    training data only, and matches every real deployment where test
-    targets are unknown at normalization time.
+    """Z-score targets with y_train's mean and std (y_test uses y_train's moments).
 
     Args:
-        y_train : (P,) training targets, raw scale.
-        y_test  : optional (N,) test targets, raw scale.
+        y_train: (P,) raw targets.
+        y_test: optional (N,) raw targets.
 
     Returns:
-        (y_train_scaled, y_test_scaled_or_None, mean, std). ``mean``/``std``
-        are needed to un-scale any raw-y-unit output (e.g. a quantile
-        value) or Jacobian-correct any log-density output computed from the
-        scaled call: ``log p_raw(y) = log p_scaled(y_scaled) - log(std)``.
+        (y_train_scaled, y_test_scaled or None, mean, std). Log densities of the
+        scaled call convert back as log p_raw(y) = log p_scaled(y_scaled) - log(std).
     """
     mean = y_train.mean()
     std = y_train.std().clamp(min=1e-8)
@@ -242,25 +149,13 @@ def normalize_targets(
 
 
 def _scale_fold_targets(y_context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Standardize one fold using only its context labels, along the last axis.
-
-    The PIT drivers use full-context scaling for test-side prediction. Their
-    fold side uses raw labels when supplied; otherwise re-standardizing the
-    caller's affine scale gives the same coordinates when context variance is
-    nonzero and at least two context labels are available.
-    A singleton context has no sample standard deviation; use unit scale.
-    """
+    """Standardize one fold using only its context labels (unit scale for a single context row)."""
     mean = y_context.mean(dim=-1, keepdim=True)
     std = (
         y_context.std(dim=-1, keepdim=True).clamp(min=1e-8)
         if y_context.shape[-1] > 1 else torch.ones_like(mean)
     )
     return (y_context - mean) / std, mean, std
-
-
-# ---------------------------------------------------------------------------
-# Single-task PIT
-# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -274,29 +169,21 @@ def run_pit(
     eps: float = 1e-6,
     Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
-    """Run the Probability Integral Transform on one task.
+    """PIT for one task.
 
     Args:
-        tabicl  : frozen TabICL regressor (max_classes=0)
-        X_train : (P, p_x)
-        Y_train : (P, d), on the caller's full-context target scale. Each
-                  training fold is re-standardized using only its context
-                  labels before TabICL sees them or its held-out CDF is scored.
-        X_test  : (N, p_x)
-        Y_test  : (N, d)
-        k_folds : number of disjoint folds for the training-set PIT.
-                  Bounded above by P; clamp into [2, P].
-                  Set to P explicitly for true leave-one-out (slow).
-        eps     : clamp before probit.
-        Y_train_raw : optional (P, d) raw labels. Supply this when Y_train
-                      was scaled with full-context moments. Fold scaling then
-                      uses raw labels, including when a fold has one context
-                      row or nearly constant labels.
+        tabicl: TabICL regressor (max_classes=0).
+        X_train: (P, p_x).
+        Y_train: (P, d) on the caller's full-context target scale; each fold is
+            re-standardized on its own context labels.
+        X_test: (N, p_x).
+        Y_test: (N, d).
+        k_folds: number of folds for the training-set PIT, clamped to [2, P].
+        eps: probit clamp.
+        Y_train_raw: optional (P, d) raw labels used for fold scaling.
 
-    Returns dict with:
-        z_train      : (P, d)
-        z_test       : (N, d)
-        log_pdf_test : (N, d)   marginal log-densities at Y_test
+    Returns:
+        dict with z_train (P, d), z_test (N, d), log_pdf_test (N, d).
     """
     device = X_train.device
     P, p_x = X_train.shape
@@ -306,20 +193,13 @@ def run_pit(
     K = max(2, min(int(k_folds), P))
     fold_targets = Y_train if Y_train_raw is None else Y_train_raw
 
-    # ------------------------------------------------------------------ #
-    # A) Test instances: one forward over the full train context, fused #
-    #    across the d target dimensions on the batch axis.                #
-    # ------------------------------------------------------------------ #
+    # A) Test instances: one forward over the full train context, d targets on the batch axis.
     X_concat = torch.cat([X_train, X_test], dim=0)                       # (P+N, p_x)
     X_test_batch = X_concat.unsqueeze(0).expand(d, -1, -1).contiguous()  # (d, P+N, p_x)
     y_train_batch = Y_train.permute(1, 0).contiguous()                   # (d, P)
 
     logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)         # (d, N, Q)
-    # TabICL's InferenceManager auto-batches large forward calls and, under
-    # low free GPU memory, may offload its output to CPU regardless of the
-    # input device (see inference.py's _resolve_offload_mode) -- re-sync
-    # onto `device` so quantile_dist's internal tensors never end up on a
-    # different device than y_test_flat/y_qry_flat below.
+    # TabICL may return its output on CPU under memory pressure; move it back to `device`.
     logits = logits.to(device)
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(d * N, Q))
@@ -328,9 +208,7 @@ def run_pit(
     u_test = dist.cdf(y_test_flat).reshape(d, N).permute(1, 0)           # (N, d)
     log_pdf_test = dist.log_prob(y_test_flat).reshape(d, N).permute(1, 0)  # (N, d)
 
-    # ------------------------------------------------------------------ #
-    # B) Training instances: K disjoint folds (fixed K, ≪ P)              #
-    # ------------------------------------------------------------------ #
+    # B) Training instances: K disjoint folds.
     fold_size = math.ceil(P / K)
     u_train = torch.empty(P, d, device=device, dtype=Y_train.dtype)
     indices = torch.arange(P, device=device)
@@ -373,35 +251,14 @@ def run_pit(
     }
 
 
-# ---------------------------------------------------------------------------
-# Batch-of-episodes PIT (dataset-generation use)
-# ---------------------------------------------------------------------------
-
-
 def _alpha_levels_of(tabicl: nn.Module, device) -> "torch.Tensor | None":
-    """The nominal quantile levels a TabICL's decoder emits, or None.
-
-    Real TabICL exposes these on its ``QuantileToDistribution`` submodule. Test
-    doubles (``tests/test_pit_batched.py``'s fakes) implement ``quantile_dist``
-    as a plain method with no levels attached, and the levels are pure metadata
-    for the caller -- so absence is reported as None rather than raised, which
-    keeps the fold-geometry tests runnable against a fake and avoids making a
-    diagnostic field into a hard dependency of the forward path.
-    """
+    """The quantile levels the model's decoder emits, or None if it exposes none."""
     levels = getattr(getattr(tabicl, "quantile_dist", None), "alpha_levels", None)
     return None if levels is None else levels.to(device)
 
 
 class _train_mode:
-    """Context manager forcing ``module`` into ``.train()`` for its body.
-
-    TabICL's ``.eval()`` routes ``forward`` into ``_inference_forward``, which
-    runs under ``InferenceManager``'s own float16 autocast on CUDA and produces
-    NaN for this codebase's inputs -- the same hazard that makes
-    ``train.py::validate()`` deliberately never call ``model.eval()``. The
-    grad-enabled PIT path must therefore stay in train mode. TabICL has no
-    dropout, so this changes nothing numerically.
-    """
+    """Context manager that keeps module in train mode (TabICL's eval-mode forward uses float16 autocast)."""
 
     def __init__(self, module: nn.Module) -> None:
         self.module = module
@@ -430,35 +287,12 @@ def _run_pit_batched_impl(
     fuse_folds: bool = False,
     Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
-    """Shared body of ``run_pit_batched`` / ``run_pit_batched_grad``.
+    """Shared body of run_pit_batched and run_pit_batched_grad.
 
-    Kept private and parameterised rather than duplicated so the no-grad
-    inference path and the grad-enabled fine-tuning path cannot drift: the
-    fold geometry, the batch-axis folding and the probit clamp are defined
-    exactly once. Callers pick the gradient policy (and, for the grad path,
-    the train-mode guard) around this call.
-
-    ``fold_subset`` restricts the K-fold loop to the listed fold indices. The
-    fold GEOMETRY is untouched -- ``fold_size = ceil(P/K)`` contiguous blocks,
-    identical to a full run -- only some of the blocks go unscored, so a caller
-    that does not need a complete ``z_train`` (Phase-A marginal fine-tuning
-    scores a query row's own predictive density, never its PIT residual) can
-    pay one forward instead of K per step and still train under exactly the
-    fold conditioning deployment uses. When set, the return dict carries
-    ``train_query_idx`` (the scored rows, in returned order) and its
-    ``z_train``/``u_train``/``q_train`` are indexed by THAT, not by the full P
-    -- there is no complete z_train to return, so none is claimed.
-
-    ``return_quantiles=True`` additionally returns the raw quantile *values*
-    TabICL's decoder emits -- for ``max_classes=0`` the model's output IS the
-    999-quantile vector at ``tabicl.quantile_dist.alpha_levels`` -- plus the
-    pre-probit CDF values and probit-clamp saturation fractions. Phase-A
-    marginal fine-tuning (``src/copula_inter/finetune_marginal.py``) needs the quantiles to
-    build its own ``QuantileDistribution`` for NLL/CRPS/distillation without a
-    second forward pass. Fold quantiles are mapped back to the caller's target
-    scale so they can be scored alongside test quantiles. The saturation
-    fractions are the silent-failure counters the marginal calibration runner
-    reports.
+    fold_subset scores only the listed folds (same fold geometry); the result then
+    carries train_query_idx and z_train/u_train/q_train are indexed by it.
+    return_quantiles also returns the decoder quantiles (on the caller's target
+    scale), the pre-probit CDF values and the probit-clamp saturation fractions.
     """
     if not compute_pit and not return_quantiles:
         raise ValueError("compute_pit=False requires return_quantiles=True")
@@ -474,9 +308,7 @@ def _run_pit_batched_impl(
         full_mean = Y_train_raw.mean(dim=1).unsqueeze(-1).unsqueeze(-1)
         full_std = Y_train_raw.std(dim=1).clamp(min=1e-8).unsqueeze(-1).unsqueeze(-1)
 
-    # ------------------------------------------------------------------ #
-    # A) Test instances: one forward, batch axis = B*d.                   #
-    # ------------------------------------------------------------------ #
+    # A) Test instances: one forward, batch axis = B*d.
     X_concat = torch.cat([X_train, X_test], dim=1)                              # (B, P+N, p_x)
     X_test_batch = (
         X_concat.unsqueeze(1).expand(B, d, P + N, p_x).reshape(B * d, P + N, p_x).contiguous()
@@ -484,8 +316,7 @@ def _run_pit_batched_impl(
     y_train_batch = Y_train.permute(0, 2, 1).reshape(B * d, P).contiguous()     # (B*d, P)
 
     logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)                # (B*d, N, Q)
-    # See run_pit's offload-mode comment: TabICL's InferenceManager can return
-    # its output on CPU under GPU memory pressure regardless of input device.
+    # TabICL may return its output on CPU under memory pressure.
     logits = logits.to(device)
     Q = logits.shape[-1]
     if compute_pit:
@@ -500,10 +331,7 @@ def _run_pit_batched_impl(
     if return_quantiles:
         q_test = logits.reshape(B, d, N, Q).permute(0, 2, 1, 3)                 # (B, N, d, Q)
 
-    # ------------------------------------------------------------------ #
-    # B) Training instances: K disjoint folds (fixed K, << P), batch axis #
-    #    = B*d, fold membership shared across the batch since P is.       #
-    # ------------------------------------------------------------------ #
+    # B) Training instances: K disjoint folds, batch axis = B*d.
     fold_size = math.ceil(P / K)
     u_train_parts: list = []
     q_train_parts: list = []
@@ -516,9 +344,7 @@ def _run_pit_batched_impl(
         end = min(start + fold_size, P)
         if start >= end:
             continue  # empty trailing fold (K > P after clamping) -- not an
-            # early exit: with an explicit fold_subset the wanted folds are
-            # not necessarily contiguous from 0, so `break` would silently
-            # drop valid later folds.
+            # fold_subset folds need not be contiguous, so skip rather than break.
 
         qry_idx = indices[start:end]
         ctx_mask = torch.ones(P, dtype=torch.bool, device=device)
@@ -528,11 +354,7 @@ def _run_pit_batched_impl(
 
         fold_specs.append((qry_idx, ctx_idx, F))
 
-    # Folds with equal query size also have equal context/input shapes.  Phase
-    # A can therefore concatenate them into TabICL's table-batch axis and pay
-    # one better-utilized launch rather than one small launch per fold.  Keep
-    # the default unfused for historical inference callers, where a full
-    # K-fold pass could otherwise multiply peak memory by K.
+    # Folds with equal query size share shapes and can be fused into one launch.
     fold_groups: list[list[tuple[torch.Tensor, torch.Tensor, int]]] = []
     if fuse_folds:
         by_size: dict[int, list[tuple[torch.Tensor, torch.Tensor, int]]] = {}
@@ -586,12 +408,7 @@ def _run_pit_batched_impl(
                 f"run_pit_batched: no folds were scored (K={K}, P={P}, "
                 f"fold_subset={fold_subset}). Every requested fold was empty."
             )
-        # fold_subset=[] is the deliberate "test rows only" request: one
-        # forward with the full P-row context and nothing else. Used by the
-        # Phase-A ERA5 validation pass, where the query points are held out by
-        # construction (never in context) so no leakage-avoiding fold rotation
-        # is needed -- going through this function anyway keeps that pass on
-        # the exact same forward/CDF/log_prob code the training path uses.
+        # fold_subset=[]: test rows only, one forward with the full P-row context.
         out = {"train_query_idx": torch.empty(0, dtype=torch.long, device=device)}
         if compute_pit:
             out.update({"z_test": _probit(u_test, eps), "log_pdf_test": log_pdf_test})
@@ -617,10 +434,7 @@ def _run_pit_batched_impl(
     if compute_pit:
         u_train = torch.cat([uf for _, uf in u_train_parts], dim=1)            # (B, P', d)
     if fold_subset is None:
-        # Full pass: the scored rows are all P of them, so restore the
-        # caller's row order (folds are contiguous blocks, concatenated in
-        # fold order, which is already sorted -- argsort makes that explicit
-        # and independent of the loop's iteration order).
+        # Full pass: restore the caller's row order.
         inv = torch.argsort(order)
         if compute_pit:
             u_train = u_train[:, inv, :]
@@ -675,40 +489,22 @@ def run_pit_batched(
     return_quantiles: bool = False,
     Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
-    """``run_pit``, vectorised over a leading batch-of-episodes axis B.
-
-    Only valid when every episode in the batch shares the same P and N --
-    true for one ``data_gen._generate_gp_batch_raw`` call (all B episodes in
-    a shard-generation batch share P/N by construction), which is the
-    intended caller. The B and target-dim (d) axes are folded together into
-    TabICL's own batch axis (mirrors how ``run_pit`` already folds d alone),
-    so this costs one (B*d)-batched forward pass per fold instead of B
-    separate single-episode ``run_pit`` calls -- B*(K+1)x fewer Python-level
-    TabICL invocations, though the K-fold loop's iteration count (and hence
-    wall-clock scaling in K) is unchanged.
+    """run_pit over a batch of episodes that share P and N.
 
     Args:
-        tabicl  : frozen TabICL regressor (max_classes=0)
-        X_train : (B, P, p_x)
-        Y_train : (B, P, d), on the caller's full-context target scale.
-                  Training folds are re-standardized on their context labels.
-        X_test  : (B, N, p_x)
-        Y_test  : (B, N, d)
-        k_folds : as in ``run_pit`` -- clamped into [2, P], shared by every
-                  episode in the batch since P is shared.
-        eps     : clamp before probit.
-        return_quantiles : also return the raw decoder quantiles, pre-probit
-                  CDF values and probit-clamp fractions (see
-                  ``_run_pit_batched_impl``). Off by default so the historical
-                  callers' return dict is byte-for-byte unchanged.
-        Y_train_raw : optional (B, P, d) raw labels for fold-specific scaling.
-                  Production callers pass this alongside globally scaled
-                  Y_train; fold quantiles are returned on Y_train's scale.
+        tabicl: TabICL regressor (max_classes=0).
+        X_train: (B, P, p_x).
+        Y_train: (B, P, d) on the caller's full-context target scale.
+        X_test: (B, N, p_x).
+        Y_test: (B, N, d).
+        k_folds: as in run_pit.
+        eps: probit clamp.
+        return_quantiles: also return decoder quantiles, CDF values and clamp
+            fractions (see _run_pit_batched_impl).
+        Y_train_raw: optional (B, P, d) raw labels for fold scaling.
 
-    Returns dict with:
-        z_train      : (B, P, d)
-        z_test       : (B, N, d)
-        log_pdf_test : (B, N, d)   marginal log-densities at Y_test
+    Returns:
+        dict with z_train (B, P, d), z_test (B, N, d), log_pdf_test (B, N, d).
     """
     return _run_pit_batched_impl(
         tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
@@ -731,20 +527,7 @@ def run_pit_batched_grad(
     fuse_folds: bool = False,
     Y_train_raw: Optional[torch.Tensor] = None,
 ) -> dict:
-    """Gradient-carrying ``run_pit_batched`` -- same body, no ``no_grad``.
-
-    The public ``run_pit_batched`` above is hard-decorated ``@torch.no_grad()``
-    because every historical caller (dataset generation, live workers,
-    validation) wants exactly that. Phase-A marginal fine-tuning
-    (``src/copula_inter/finetune_marginal.py``) is the one caller that must backprop THROUGH
-    the PIT into the TabICL weights, so it gets its own entry point rather than
-    a mutable flag on the shared one -- a ``no_grad=False`` default would
-    silently make every existing call site build an autograd graph.
-
-    Forces ``tabicl.train()`` for the duration (see ``_train_mode``) and
-    defaults ``return_quantiles=True``, since the fine-tuning objective is
-    defined on the decoder's quantile outputs.
-    """
+    """run_pit_batched with gradients enabled and the model in train mode; returns quantiles by default."""
     with _train_mode(tabicl):
         return _run_pit_batched_impl(
             tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
@@ -752,11 +535,6 @@ def run_pit_batched_grad(
             compute_pit=compute_pit, fuse_folds=fuse_folds,
             Y_train_raw=Y_train_raw,
         )
-
-
-# ---------------------------------------------------------------------------
-# Calibration-split PIT (single forward pass, no K-fold rotation)
-# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -770,38 +548,19 @@ def run_pit_calib_split_batched(
     Y_query_raw: Optional[torch.Tensor] = None,
     Y_calib_raw: Optional[torch.Tensor] = None,
 ) -> dict:
-    """One-pass alternative to ``run_pit_batched``'s K-fold query-side PIT.
-
-    ``X_calib``/``Y_calib`` is a *separate* point set (disjoint from
-    ``X_query`` by construction, e.g. extra points drawn from the same
-    episode's generating process but never part of the official training
-    set) used as TabICL's context. Every query point is then scored against
-    that single context in one forward pass — no leakage, since a query
-    point was never a member of its own context, so no fold rotation is
-    needed. This is exactly ``run_pit_batched``'s part A (the test-side PIT,
-    which already scores ``X_test`` against the full ``X_train`` context in
-    one pass), generalised to an arbitrary context/query pair.
-
-    Cost: 1 forward pass total, vs. ``k_folds`` for ``run_pit_batched``'s
-    K-fold query-side PIT. Trade-off: every query point shares the same,
-    fixed-size context, rather than K-fold's near-full-pool context per
-    point — quality depends on how large/informative ``X_calib`` is (see
-    ``conf/data/gp_tasks.yaml``'s ``z_train_split_calib_frac``).
+    """PIT of a query set against a separate calibration set, in one forward pass.
 
     Args:
-        tabicl  : frozen TabICL regressor (max_classes=0)
-        X_query : (B, P_Q, p_x)
-        Y_query : (B, P_Q, d) — only used to evaluate the CDF, never
-                  passed to TabICL as context.
-        X_calib : (B, P_C, p_x)
-        Y_calib : (B, P_C, d)
-        eps     : clamp before probit.
-        Y_query_raw, Y_calib_raw : optional raw labels for context-only
-                  scaling. Supply both when the inputs were pre-scaled using
-                  query-set moments.
+        tabicl: TabICL regressor (max_classes=0).
+        X_query: (B, P_Q, p_x).
+        Y_query: (B, P_Q, d), used only to evaluate the CDF.
+        X_calib: (B, P_C, p_x) context, disjoint from the query set.
+        Y_calib: (B, P_C, d).
+        eps: probit clamp.
+        Y_query_raw, Y_calib_raw: optional raw labels for context-only scaling.
 
-    Returns dict with:
-        z_train : (B, P_Q, d)
+    Returns:
+        dict with z_train (B, P_Q, d).
     """
     device = X_query.device
     B, P_Q, p_x = X_query.shape
@@ -820,8 +579,7 @@ def run_pit_calib_split_batched(
     y_calib_batch = y_calib_scaled.reshape(B * d, P_C).contiguous()          # (B*d, P_C)
 
     logits = tabicl_forward(tabicl, X_batch, y_calib_batch)                  # (B*d, P_Q, Q)
-    # See run_pit's offload-mode comment: TabICL's InferenceManager can return
-    # its output on CPU under GPU memory pressure regardless of input device.
+    # TabICL may return its output on CPU under memory pressure.
     logits = logits.to(device)
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(B * d * P_Q, Q))
@@ -834,27 +592,10 @@ def run_pit_calib_split_batched(
     return {"z_train": z_train}
 
 
-# ---------------------------------------------------------------------------
-# Analytical GP PIT (no model inference required)
-# ---------------------------------------------------------------------------
-
-
 def _sign_triple(d: dict, applied_key: str, w_key: str, b_key: str, a_key: str):
-    """(sign_w, sign_b, sign_a) from a dict's sign_applied* 0.0/1.0 sentinel,
-    or (None, None, None) if not applied -- shared by _kernel_fn_from_task's
-    flat schema and _kernel_fn_from_chain_task's per-component schema (see
-    data_gen.SignModulatedKernel / cfg.data.sign_modulation_component_prob /
-    sign_modulation_outer_prob). Gated on the explicit sign_applied* sentinel
-    rather than an "all entries are 0.0" check, since sign_w is a random
-    N(0, I_k) draw that isn't guaranteed nonzero even when applied (unlike
-    l/period/etc., whose priors never actually produce exactly 0). Absent
-    entirely for episodes saved before this feature existed -- d.get(...)
-    defaults to "not applied". sign_a (the tanh sharpness) may itself be
-    absent even when sign_applied*==1.0, for datasets saved by the earlier
-    hard-sign() version of this feature (no sharpness knob yet);
-    data_gen._wrap_concrete_sign_modulated substitutes a very large `a` in
-    that case, numerically recovering the hard sign() those episodes were
-    actually generated with.
+    """(sign_w, sign_b, sign_a) from a dict's sign-modulation fields, or (None, None, None) if not applied.
+
+    sign_a may be None for datasets saved before the sharpness parameter existed.
     """
     applied = d.get(applied_key)
     if applied is None or applied.item() == 0.0:
@@ -863,33 +604,11 @@ def _sign_triple(d: dict, applied_key: str, w_key: str, b_key: str, a_key: str):
 
 
 def _kernel_fn_from_chain_task(task: dict):
-    """Reconstruct (kernel_fn, nugget) for a systematic-composition chain
-    episode (cfg.data.systematic_composition=True, this repo's default —
-    see data_gen.py's "Systematic composition" docstring section and
-    generate_gp_batch's return_kernel_metadata handling).
+    """Rebuild (kernel_fn, nugget) for a systematic-composition chain episode.
 
-    Builds each chain link as its own single-component build_kernel_fn call
-    from task["kernel_component_params"][i] (one dict per component, already
-    per-episode-indexed — see _build_kernel_chain/_build_kernel_component),
-    then combines the resulting dense kernel matrices left-to-right per
-    task["kernel_ops"] ("+"/"*") — the exact same left-to-right dense
-    combination data_gen._DenseComposedKernel used to build the kernel this
-    episode was actually generated from, just replayed here as plain tensor
-    ops instead of a gpytorch Kernel object.
-
-    Component param dicts only carry the keys relevant to that component's
-    kernel type (see data_gen._build_scaled_kernel: "period"/"rq_alpha" are
-    present only when that kernel family uses them, no 0.0-sentinel filler
-    the way the flat/non-systematic schema does) — handled below via `in`
-    checks before falling back to build_kernel_fn's own None defaults.
-
-    Raises NotImplementedError if the whole-chain "outer" sign-modulation
-    wrap (cfg.data.sign_modulation_outer_prob, applied once to the fully
-    composed chain — see data_gen.SignModulatedKernel /
-    _wrap_concrete_sign_modulated) was actually used for this episode: that
-    wrap needs applying AFTER combination, which isn't implemented here.
-    Defaults to 0.0 (off) in every existing config, so this only fires for
-    episodes deliberately generated with that feature turned on.
+    Each component comes from task["kernel_component_params"][i]; the dense
+    kernels are combined left to right by task["kernel_ops"] ("+" or "*").
+    Raises NotImplementedError when whole-chain (outer) sign modulation was applied.
     """
     names = task["kernel_components"]
     ops = task["kernel_ops"]
@@ -936,41 +655,22 @@ def _kernel_fn_from_chain_task(task: dict):
 
 
 def _kernel_fn_from_task(task: dict):
-    """Reconstruct (kernel_fn, nugget) from a task dict's saved kernel
-    metadata (return_kernel_metadata=True schema — see data_gen.generate_gp_task
-    / generate_gp_batch's return_kernel_metadata handling). Shared by
-    gp_analytical_pit (train-side LOO) and gp_analytical_posterior (test-side
-    Schur-complement conditioning) so both reconstruct the exact same kernel.
-
-    Dispatches to _kernel_fn_from_chain_task for systematic-composition
-    chain episodes (identified by "kernel_components" in task) — those don't
-    fit the flat l/alpha2/l_b/alpha2_b schema handled below at all.
-    """
+    """Rebuild (kernel_fn, nugget) from a task's saved kernel metadata (flat or chain schema)."""
     if "kernel_components" in task:
         return _kernel_fn_from_chain_task(task)
 
     kernel_name = task["kernel"]
-    # scalar, unless the episode was generated ARD (cfg.data.ard=True for
-    # rbf/matern32/periodic/rational_quadratic), in which case l is a
-    # per-dimension lengthscale vector (k,) — see data_gen._build_scaled_kernel.
+    # Scalar, or a (k,) lengthscale vector for ARD episodes.
     l_tensor = task["l"]
     l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
     alpha2 = task["alpha2"].item()
     nugget = task["nugget"].item()
-    # 0.0 sentinel means the param is not applicable for this kernel. period
-    # is likewise a per-dimension vector under periodic+ARD (gpytorch's
-    # PeriodicKernel ties period_length's ard_num_dims to lengthscale's).
+    # 0.0 means not applicable; period is a vector under periodic+ARD.
     period   = _optional_param(task["period"])
     rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
-    # "polynomial"'s integer degree — same 0.0 sentinel convention (its own
-    # default is never 0, see data_gen's poly_power_min/max).
+    # Polynomial degree (0.0 = not applicable).
     power    = task["power"].item() if task["power"].item() != 0.0 else None
-    # Composite ("A+B"/"A*B") kernels' second component — same 0.0 sentinel
-    # convention. Omitting these previously made build_kernel_fn silently
-    # reconstruct composites with l_b/alpha2_b=None, crashing with a
-    # TypeError as soon as component B's kernel function tried to use them.
-    # l_b/period_b can be ARD vectors too, same as l/period above, whenever
-    # component B is one of the ARD-eligible base kernels under cfg.data.ard.
+    # Second component of a composite ("A+B"/"A*B") kernel; may be ARD vectors.
     l_b        = _optional_param(task["l_b"])
     alpha2_b   = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
     period_b   = _optional_param(task["period_b"])
@@ -983,10 +683,7 @@ def _kernel_fn_from_task(task: dict):
         task, "sign_applied_outer", "sign_w_outer", "sign_b_outer", "sign_a_outer"
     )
 
-    # active_dims (gpytorch's own kernel kwarg) lets kernel_fn take the
-    # full-width x_norm_train straight through and select its k active
-    # columns internally — same mechanism data_gen.generate_gp_task uses,
-    # so no manual column slicing is needed here either.
+    # active_dims lets kernel_fn select its columns from the full-width inputs.
     cols = task["kernel_feature_indices"].tolist()
     kernel_fn = build_kernel_fn(
         kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
@@ -1001,58 +698,23 @@ def _kernel_fn_from_task(task: dict):
 
 @torch.no_grad()
 def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
-    """Exact PIT from GP LOO (train) and posterior (test) marginals.
+    """Exact PIT from the episode's GP: LOO for training points, posterior marginals for test points.
 
-    Since all data is generated from a GP with known hyperparameters, the
-    marginal CDFs are available in closed form — no learned regressor needed.
-
-    Test instances — the exact GP POSTERIOR marginals, conditioned on the
-    realized (x_train, y_train):
-        mu_post[i]  = mean(x_test[i]) + [K_sf K_ff^-1 (y_train - mean_train)]_i
-        var_post[i] = (K_ss)_ii - [K_sf K_ff^-1 K_fs]_ii
-        y_test[i] | D_train ~ N(mu_post[i], var_post[i])   (exact)
-        z_test[i]  = (y_test[i] - mu_post[i]) / sqrt(var_post[i])
-
-    NOT (mu_star, sigma_star): under data.oracle_mode="prior" -- the only
-    supported mode (data_gen.py's oracle_mode branch) -- those are the PRIOR
-    mean/std, which is a different distribution. This function is the exact-GP
-    stand-in for what a frozen TabICL supplies, and run_pit (above) calls
-    TabICL with the context labels in-context, so its z_test/log_pdf_test are
-    POSTERIOR PREDICTIVE quantities; standardizing by the prior here would make
-    z_train_source="analytic" and "tabicl" two different problems rather than
-    two estimates of the same z. It also changes the copula head's training
-    target from the conditional correlation R_post to the context-blind prior
-    correlation R_star -- see data_gen._generate_gp_batch_raw's "Posterior PIT
-    for z_test" comment for that derivation.
-
-    Only the DIAGONAL of the Schur complement is used, so this does not
-    reintroduce the PSD failure that retired oracle_mode="posterior":
-    Sigma_post = Cov(f|train) + nugget*I with the first term PSD, hence every
-    diagonal entry is >= nugget > 0 with no eigenvalue repair needed.
-
-    Training instances — exact GP LOO (Rasmussen & Williams, GPML Eq. 5.12),
-    derived for a zero-mean joint Gaussian, so alpha uses the mean-residual
-    (y_train - mean_train), not y_train directly, whenever the episode's
-    mean bank (see data_gen._MeanFunctionBank) is non-zero:
-        sigma²_i^LOO  = 1 / [K_ff⁻¹]_ii
-        z_train[i]    = alpha_i / sqrt([K_ff⁻¹]_ii)
-        where alpha = K_ff⁻¹ (y_train - mean_train), mean_train = mean_module(x_train)
-
-    Cost: one O(P³) Cholesky per episode vs. O(K × P × forward_pass) for
-    the TabICL K-fold approach.
+    Test points:
+        mu_post = mean(x_test) + K_sf K_ff^{-1} (y_train - mean_train)
+        var_post = diag(K_ss - K_sf K_ff^{-1} K_fs)
+        z_test = (y_test - mu_post) / sqrt(var_post)
+    Training points (Rasmussen & Williams Eq. 5.12), with
+    alpha = K_ff^{-1} (y_train - mean_train):
+        z_train_i = alpha_i / sqrt([K_ff^{-1}]_ii)
 
     Args:
-        task: raw task dict returned by generate_gp_task (must contain
-              kernel, l, alpha2, nugget, period, rq_alpha, power, l_b,
-              alpha2_b, period_b, rq_alpha_b, power_b, kernel_feature_indices,
-              x_norm_train, x_norm_test, y_train, y_test, mu_star, and the
-              mean_* fields from data_gen._sample_mean_module — see
-              _mean_train_from_task). mu_star is read as the PRIOR mean at
-              the test points (mean_module(x_norm_test)), the same way
-              gp_analytical_posterior reads it.
-        eps:  unused (kept for API symmetry with run_pit).
+        task: task dict with kernel metadata (return_kernel_metadata=True),
+            x_norm_train/test, y_train/test, mu_star and the mean_* fields.
+        eps: unused.
 
-    Returns dict with z_train (P,), z_test (N,), log_pdf_test (N,).
+    Returns:
+        dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
     x_k_train = task.get("x_kernel_train", task["x_norm_train"])   # (P, d_features)
@@ -1061,10 +723,7 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
     y_test     = task["y_test"]                   # (N,)
     mu_star    = task["mu_star"]                  # (N,) PRIOR mean at the test points
 
-    # --- L_ff / alpha: needed by BOTH the test-side posterior marginals and
-    # the train-side LOO, so resolved once up front. Reuse the factors
-    # generate_gp_task cached when available (no double Cholesky); fall back to
-    # kernel reconstruction for tasks loaded from disk.
+    # L_ff / alpha, shared by the test posterior and the train LOO; reuse cached factors when present.
     P = y_train.shape[0]
     if "_L_ff" in task and "_alpha" in task:
         L     = task["_L_ff"]
@@ -1075,10 +734,7 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         mean_train = _mean_train_from_task(task, x_k_train)
         alpha      = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L).squeeze(-1)  # (P,)
 
-    # --- Test: exact GP posterior marginals (see the docstring) ---
-    # Same block conventions as gp_analytical_posterior: K_sf noise-free,
-    # K_ss with the nugget on its diagonal. Only diag(K_ss - K_sf K_ff^-1 K_fs)
-    # is formed, and it is bounded below by the nugget by construction.
+    # Test: exact GP posterior marginals (K_sf noise-free, nugget on K_ss's diagonal).
     x_ref     = x_k_test.to(L.device)
     K_sf      = kernel_fn(x_ref, x_k_train.to(L.device))                       # (N, P)
     K_ss_diag = (
@@ -1095,8 +751,7 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         - 0.5 * z_test**2
     )
 
-    # --- Train: exact GP LOO (R&W Eq. 5.12) ---
-    # diag(K_ff^{-1}) = column-wise squared-norm of L^{-1}
+    # Train: exact GP LOO; diag(K_ff^{-1}) is the column-wise squared norm of L^{-1}.
     L_inv      = torch.linalg.solve_triangular(
         L, torch.eye(P, device=L.device, dtype=L.dtype), upper=False
     )                                                                      # (P, P)
@@ -1107,16 +762,7 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
 
 
 def mvn_nll(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> float:
-    """Full multivariate-normal negative log-likelihood of ``y`` under
-    ``N(mean, Sigma)``, in raw-y units, run in float64 for the Cholesky
-    solve (matches every other linear-algebra call site in this file).
-
-    For any jointly-Gaussian predictive (mean, Sigma) — e.g. a fitted GP's
-    own posterior/prior — this single formula already equals
-    marginal-NLL + copula-NLL (Sklar's decomposition collapses to one term
-    when the marginals are Gaussian), so callers with a Gaussian predictive
-    don't need to split it via PIT/z-scoring at all.
-    """
+    """Negative log-likelihood of y under N(mean, Sigma), in raw-y units (float64 Cholesky)."""
     y, mean, Sigma = y.double(), mean.double(), Sigma.double()
     L = _safe_cholesky(Sigma)
     resid = (y - mean).unsqueeze(-1)
@@ -1128,17 +774,9 @@ def mvn_nll(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> float:
 
 
 def mvn_nll_parts(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> dict:
-    """Same quantity as mvn_nll, additionally split into its Sklar
-    marginal/copula components (raw-sum units, i.e. NOT divided by n — same
-    unnormalized convention as mvn_nll itself and as gp_analytical_posterior's
-    nll_prior/nll_post; contrast with loss.gp_oracle_y_nll, the batched,
-    per-point-normalized equivalent used for the GP-MLE/DKL baselines).
+    """mvn_nll split into Sklar parts: dict(total, marginal, copula), unnormalized sums.
 
-    marginal is the sum of each dimension's own univariate Gaussian NLL
-    under (mean_i, Sigma_ii); copula is defined as total - marginal, which
-    is exact by construction (Sklar's theorem collapses to one term for a
-    jointly-Gaussian predictive — see mvn_nll's docstring), not a
-    separately-verified quantity.
+    marginal is the sum of univariate N(mean_i, Sigma_ii) NLLs; copula = total - marginal.
     """
     total = mvn_nll(y, mean, Sigma)
     y64, mean64 = y.double(), mean.double()
@@ -1150,101 +788,21 @@ def mvn_nll_parts(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> d
 
 @torch.no_grad()
 def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
-    """Exact GP posterior correlation among test points, conditioned on the
-    realized (x_train, y_train) via the Schur complement -- the "mechanism 2"
-    term cfg.data.oracle_mode="prior" (data_gen.py's only supported mode)
-    deliberately leaves out of R_star: R_star there is the raw/unconditional
-    kernel correlation K_ss, never K_ss - K_sf K_ff^-1 K_fs. This function
-    computes that missing conditioned quantity directly, for use as a true
-    Bayes-optimal reference at EVAL time (see
-    eval/runners/eval_checkpoint.py's "GP oracle total NLL (Y-space)"
-    prior-vs-posterior report, printed by _print_y_space_oracle) — it does
-    not touch training data generation or cfg.data.oracle_mode at all.
+    """Exact GP posterior over the test points, conditioned on (x_train, y_train).
 
-    Reuses the exact kernel _kernel_fn_from_task reconstructs (same one
-    gp_analytical_pit's LOO z_train uses), and, when the task carries them
-    (return_kernel_metadata=True — see generate_gp_batch), the same
-    _L_ff/_alpha Cholesky factors gp_analytical_pit reuses, so this never
-    repeats the O(P^3) factorization already paid for elsewhere.
+    Sigma_post = K_ss - K_sf K_ff^{-1} K_fs (noise on K_ss's diagonal), computed in
+    float64. Eigenvalues are floored at max(eig_floor * max|diag(Sigma_post)|,
+    nugget) before converting to a correlation matrix. Raises NotImplementedError
+    for chain episodes with outer sign modulation.
 
-    Supports both the flat and systematic-composition-chain kernel schemas
-    (via _kernel_fn_from_task's dispatch) — raises NotImplementedError only
-    for the rare case of whole-chain outer sign modulation on a chain
-    episode (see _kernel_fn_from_chain_task's docstring; off by default in
-    every existing config). Callers should catch NotImplementedError/KeyError
-    and report "unavailable" rather than crash a whole eval run over one
-    episode's kernel family.
-
-    All linear algebra (the Schur complement itself, plus the eigendecomposition
-    used for the PSD repair below) runs in float64 -- kernel evaluation stays
-    in the kernel's native float32, matching every other call site in this
-    file. This is the fix for the numerical gap that got cfg.data.oracle_mode
-    ="posterior" removed from data_gen.py: that removed implementation *did*
-    already use float64 for the Schur complement (then cast back to float32),
-    yet still occasionally left the minimum eigenvalue of the result below
-    the PSD floor for composite kernels, because nothing ever checked for
-    it. Here, any residual eigenvalue below eig_floor is explicitly detected
-    and clamped up (an eigenvalue-floor repair, not a discard) before
-    converting to a correlation matrix, since an eval script wants a number
-    for every episode, not a silently dropped one.
-
-    eig_floor is RELATIVE to Sigma_post's own diagonal scale, not an
-    absolute eigenvalue cutoff -- see the repair below. Non-stationary
-    kernels (e.g. "polynomial", k = alpha2*(x1.x2+c)^d) can put K_ss's
-    diagonal anywhere from O(1e3) to O(1e11) within a single episode; an
-    absolute floor of 1e-6 -- fine for an O(1)-scale RBF/Matern posterior --
-    is an absurdly overconfident "we know this to 1e-6 out of 1e11" claim
-    once the repair fires on such an episode, and blows the Gaussian NLL's
-    residual^2/(2*eigenvalue) term up by many orders of magnitude (this is
-    what was producing oracle_diag/gap_nll around -109 / y_nll_oracle_posterior
-    around 110 nats/point in training logs -- an artifact of this repair, not
-    a real property of the posterior).
-
-    The effective floor is actually max(eig_floor * scale, nugget), not the
-    relative term alone. Reason: y_test = f_test + eps with eps ~ iid
-    N(0, nugget) independent of training (see generate_gp_batch's K_all =
-    K_full + likelihood.noise * I, the same nugget this function reads off
-    the task below) -- so Sigma_post = Cov(f_test | train) + nugget*I, and
-    since Cov(f_test | train) is itself PSD, EVERY eigenvalue of the true
-    Sigma_post is provably >= nugget. This is a hard lower bound, not a
-    heuristic, and it catches a failure mode the scale-relative term alone
-    misses: a composite/chain kernel whose Sigma_post has small overall
-    scale (so eig_floor*scale is tiny) can still develop a numerically
-    near-zero or slightly negative eigenvalue from Schur-complement
-    cancellation (K_ss - V.T @ V, two O(1)-ish quantities subtracted) even
-    though the true eigenvalue can't be below nugget -- flooring only to
-    eig_floor*scale there reintroduces the exact same
-    residual^2/(2*eigenvalue) blowup this repair exists to prevent, just at
-    a smaller absolute scale. Motivated by a z_train_source=tabicl
-    live-generation run whose fixed 208-episode val set scored
-    val/y_nll_oracle_posterior ~68 nats/point (oracle_diag/gap_nll ~-67,
-    almost entirely in the copula term) even with the scale-relative-only
-    floor in place -- the exact offending episode wasn't recovered (CUDA's
-    RNG stream isn't reproducible process-to-process, see
-    live_dataset.py's fixed-val-set seeding), so this fix is the
-    mathematical guarantee above applied proactively rather than a
-    confirmed root cause for that specific run.
-
-    Returns dict with mu_post (N,), Sigma_post (N,N), R_post (N,N) — all
-    float32 — plus min_eig (float, pre-repair, for diagnostics), repaired
-    (bool, whether the eigenvalue floor actually fired), and nll_prior/
-    nll_post (float, the total Y-space multivariate-normal NLL of y_test
-    under the unconditioned prior N(mean_test, K_ss) vs. the conditioned
-    posterior N(mu_post, Sigma_post) — see the comment above the
-    `mvn_nll_parts` calls below for why THESE two numbers, not
-    corr_nll_single(R_post, z_test), are the correct prior-vs-posterior
-    comparison), plus nll_prior_marginal/nll_prior_copula and
-    nll_post_marginal/nll_post_copula (float, mvn_nll_parts' Sklar split of
-    the two totals above, same raw-sum units).
+    Returns:
+        dict with mu_post (N,), Sigma_post (N, N), R_post (N, N) (float32);
+        min_eig (pre-repair) and repaired (bool); nll_prior and nll_post, the
+        Y-space NLL of y_test under N(mean_test, K_ss) and N(mu_post, Sigma_post);
+        and their marginal/copula splits nll_{prior,post}_{marginal,copula}.
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
-    # x_norm_train/test are always .cpu()'d before being packed into an
-    # episode dict (see generate_gp_batch's tensors dict), but _L_ff/_alpha
-    # are deliberately left device-resident for reuse (see that same
-    # function's comment) — mismatched whenever the episode was
-    # live-generated on GPU, so move x/y onto whatever device _L_ff/_alpha
-    # already live on (falling back to x_train's own device when absent,
-    # i.e. the recompute-from-scratch branch below, which never leaves CPU).
+    # Run on the device of the cached _L_ff/_alpha (x_train's device when absent).
     x_train_raw = task.get("x_kernel_train", task["x_norm_train"])
     x_test_raw  = task.get("x_kernel_test", task["x_norm_test"])
     ref_device = task["_L_ff"].device if "_L_ff" in task else x_train_raw.device
@@ -1264,13 +822,7 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
             (y_train - mean_train).double().unsqueeze(-1), L_ff
         ).squeeze(-1)
 
-    # K_sf carries no noise term (measurement noise is independent across
-    # distinct points, train vs. test included); K_ss does, on its diagonal
-    # only, matching K_ff's own convention above and data_gen.py's K_all
-    # (nugget added once to the full (T,T) diagonal before slicing out the
-    # K_ff/K_ss blocks) — so this is the posterior over noisy y_test, the
-    # same quantity oracle_mode="prior"'s R_star (also a K_ss slice of that
-    # same K_all) already represents unconditionally.
+    # K_sf has no noise term; K_ss has the nugget on its diagonal.
     K_sf = kernel_fn(x_test, x_train).double()                                              # (N, P)
     K_ss = (kernel_fn(x_test, x_test) + nugget * torch.eye(N, device=x_test.device)).double()  # (N, N)
 
@@ -1278,24 +830,11 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     Sigma_post = K_ss - V.T @ V
     Sigma_post = 0.5 * (Sigma_post + Sigma_post.T)
 
-    # mu_star under oracle_mode="prior" is exactly mean_module(x_test) (see
-    # data_gen.py's oracle_mode branch: "mu_star = mean_module(x_norm_test)")
-    # -- directly reusable as the prior mean term here, no separate
-    # mean_module reconstruction needed.
+    # mu_star is the prior mean mean_module(x_test).
     mean_test = task["mu_star"].to(ref_device).double()
     mu_post = mean_test + K_sf @ alpha
 
-    # eig_floor scales with Sigma_post's own diagonal magnitude (see the
-    # docstring) rather than acting as a fixed absolute cutoff -- otherwise
-    # a non-stationary kernel whose K_ss diagonal legitimately spans many
-    # orders of magnitude (e.g. "polynomial") gets floored to a fixed 1e-6
-    # regardless of scale, which manufactures an enormous, meaningless
-    # nll_post once any residual falls along that floored direction. Also
-    # floored at `nugget` itself (see the docstring's PSD-decomposition
-    # argument: Sigma_post = Cov(f_test|train) + nugget*I with the first
-    # term PSD, so nugget is a hard, non-heuristic lower bound on every
-    # eigenvalue) -- catches small-overall-scale composite kernels where
-    # eig_floor*scale alone would floor below that hard bound.
+    # Eigenvalue floor: relative to Sigma_post's diagonal scale, and never below the nugget.
     scale = Sigma_post.diagonal().abs().max().clamp(min=1e-12).item()
     eig_floor_eff = max(eig_floor * scale, nugget)
     eigvals = torch.linalg.eigvalsh(Sigma_post)
@@ -1308,27 +847,7 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
 
     R_post, _ = sigma_to_correlation(Sigma_post.float())
 
-    # --- Total (marginal + copula) Y-space NLL, prior vs. posterior -------
-    # Deliberately NOT scored via corr_nll_single(R_post, z_test): z_test is
-    # standardized under the PRIOR's own (mu_star, sigma_star) (see
-    # data_gen.py's oracle_mode="prior" branch), so it has unit marginal
-    # variance only under the prior, not under the posterior -- Var(z_test |
-    # x_train, y_train) = diag(Sigma_post)/sigma_star_prior^2 is generally
-    # < 1 once conditioned, since conditioning shrinks variance (R&W §2.2).
-    # Reusing that same unit-variance-assuming z against R_post's copula
-    # formula (which assumes z ~ N(0, R) with unit marginal variance) scores
-    # a distribution nothing was actually drawn from, and is NOT guaranteed
-    # to be a lower bound relative to the prior's own z-space score -- this
-    # was verified empirically (it comes out *worse*, i.e. a higher NLL,
-    # than the prior on a real smoke test episode, the opposite of a true
-    # lower bound). The full multivariate-normal log density below has no
-    # such assumption -- N(mu, Sigma) at y_test is valid for ANY (mu, Sigma)
-    # pair, prior or posterior alike -- so this is the sound version of
-    # "posterior is a true lower bound": E[nll_post] <= E[nll_prior] holds
-    # here because Bayesian conditioning on (x_train, y_train) is exactly
-    # the NLL-minimizing update given that information (Bayes-optimality of
-    # the posterior predictive under log-loss), with no unit-variance
-    # assumption anywhere to violate.
+    # Total Y-space NLL under the prior and the posterior (full MVN density).
     y_test = task["y_test"].to(ref_device).double()
 
     K_ss_sym = 0.5 * (K_ss + K_ss.T)
@@ -1343,10 +862,7 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
         "repaired":   repaired,
         "nll_prior":  prior_parts["total"],
         "nll_post":   post_parts["total"],
-        # Marginal/copula split of the two totals above (same raw-sum units,
-        # see mvn_nll_parts) — lets callers show the same per-episode
-        # breakdown for the oracle that eval_baselines_episode/_eval_icl_episode
-        # now expose for every fitted baseline and the ICL model.
+        # Marginal/copula split of both totals.
         "nll_prior_marginal": prior_parts["marginal"],
         "nll_prior_copula":   prior_parts["copula"],
         "nll_post_marginal":  post_parts["marginal"],
@@ -1355,25 +871,11 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
 
 
 def gaussian_corr_kl(R_model: torch.Tensor, R_post: torch.Tensor) -> float:
-    """KL( N(0, R_post) || N(0, R_model) ) per point -- a correlation-only
-    divergence with a true zero floor.
+    """Per-point KL(N(0, R_post) || N(0, R_model)) between two correlation matrices.
 
-        corr_kl/n = 0.5 * [ tr(R_model^-1 R_post) - n + log|R_model| - log|R_post| ] / n
+        KL / n = 0.5 * [tr(R_model^{-1} R_post) - n + log|R_model| - log|R_post|] / n
 
-    >= 0, and == 0 iff R_model == R_post.
-
-    Why this exists alongside oracle_diag/gap_nll. gap_nll is a Monte-Carlo
-    estimate of KL(true posterior || model predictive) from ONE realized
-    y_test, so it carries sampling noise and its per-episode value can be
-    negative. This is a functional of the two matrices alone -- no y_test, no
-    noise -- so it isolates the copula head's correlation error exactly, and a
-    zero here means the predicted correlation IS the posterior correlation.
-
-    Both arguments must be correlation matrices (unit diagonal): R_model comes
-    from model.low_rank_correlation (unit diagonal by construction, plus
-    jitter) and R_post from gp_analytical_posterior. Returns +inf rather than
-    raising when R_model is not positive definite even after that jitter --
-    one bad episode must never take down a validation pass.
+    Zero iff R_model == R_post. Returns +inf if R_model is not positive definite.
     """
     A = R_model.double()
     B = R_post.double()
