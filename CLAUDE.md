@@ -10,7 +10,7 @@
   #    deployment) so the total marginal+copula NLL table is populated;
   #    pass --z_train_source oracle for the exact-GP-LOO idealized upper bound,
   #    or exaone/tabpfn/tabldm to score against the marginal a run trained with.
-  python eval/runners/eval_checkpoint.py --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
+  python eval/runners/eval_checkpoint.py --ckpt kernel-sweep-all-tabicl-retrain-15k
 
   # 3a. SAME comparison, REAL data: the identical baseline table on real
   #     ARCO-ERA5 2m-temperature episodes instead of synthetic GP draws
@@ -30,7 +30,7 @@
   #       python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 \
   #           --cache-dir ./eval/data/cache/era5_global_val
   python eval/runners/eval_checkpoint.py --era5 --n_episodes 400 \
-      --ckpt ./checkpoints/copula_transformer/step_0029999_final.pt
+      --ckpt kernel-sweep-all-tabicl-retrain-15k
   oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt <ckpt>"   # on Grid5000
   #     Baseline fitting is ~98% of the runtime and is checkpoint-independent,
   #     so a SECOND checkpoint over the same episodes/geometry reuses the whole
@@ -77,7 +77,7 @@
   #    (random geographic region + random grid resolution every episode,
   #    instead of synthetic GP kernels). One-time corpus fetch first, then:
   python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
-  python src/finetune_era5.py --ckpt ./checkpoints/copula-tabicl/step_0029999_final.pt
+  python src/finetune_era5.py --ckpt kernel-sweep-all-tabicl-retrain-15k
 
 Marginal fine-tuning (Phase A) — make the MARGINAL branch correct, separately from
 the copula. The loss is copula + marginal (Sklar), but the marginal comes from a

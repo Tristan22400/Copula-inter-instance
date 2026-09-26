@@ -40,7 +40,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt", required=True, help="Checkpoint to finetune (path saved by train.py's save_checkpoint()).")
+    p.add_argument("--ckpt", required=True, help="Checkpoint to finetune: a path, or a CHECKPOINT_FAMILIES name[:step].")
     p.add_argument("--corpus-dir", default="./eval/data/cache/era5_global", help="Local global-ERA5 corpus dir (see eval/data/fetch_era5_global.py).")
     p.add_argument(
         "--val-corpus-dir", default=None,
@@ -76,6 +76,11 @@ def main() -> None:
     p.add_argument("overrides", nargs=argparse.REMAINDER, help="Extra raw Hydra overrides, e.g. -- wandb.entity=me")
     args = p.parse_args()
 
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    from eval.configs.checkpoints import resolve_checkpoint
+
+    args.ckpt = os.path.abspath(resolve_checkpoint(args.ckpt))
     if not os.path.exists(args.ckpt):
         raise FileNotFoundError(f"--ckpt not found: {args.ckpt}")
     if not os.path.isdir(args.corpus_dir) or not os.listdir(args.corpus_dir):

@@ -42,6 +42,7 @@ tabicl:
   # point) and, for `pretrained`, by that separate marginal path.
   pretrained: true   # tabldm has NO from-scratch path -- false raises here.
   ckpt: tabicl-regressor-v2-20260212.ckpt  # the frozen MARGINAL's checkpoint (unrelated to the tabldm copula backbone, which has its own HF checkpoint baked into the `tabldm` pip package)
+  pit_ckpt: null  # frozen PIT marginal; null = tabicl.ckpt
   # Xiaomi-TabLDM's released checkpoint already ships with gradient
   # checkpointing ON for its two heaviest stages (row_interactor,
   # icl_predictor) and OFF for col_embedder -- see

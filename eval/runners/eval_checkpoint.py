@@ -152,6 +152,7 @@ from dataset import CopulaDataset  # noqa: E402
 
 from eval.configs.checkpoints import (  # noqa: E402
     DEFAULT_MARGINAL_FAMILY,
+    resolve_checkpoint,
     resolve_marginal_checkpoint,
 )
 from eval.configs.constants import N_CONTEXT  # noqa: E402
@@ -1433,7 +1434,8 @@ def parse_eval_spec(argv: list[str] | None = None) -> argparse.Namespace:
                              "independent of --ckpt's saved training cfg. "
                              "Keeping this fixed is what lets the baseline "
                              "cache survive switching checkpoints.")
-    parser.add_argument("--ckpt",         required=True)
+    parser.add_argument("--ckpt",         required=True,
+                        help="Checkpoint path, or a CHECKPOINT_FAMILIES name[:step].")
     parser.add_argument("--dataset_dir",  default=None,
                         help="Episode directory to evaluate on (overrides "
                              "training.dataset_dir from --config). Passing "
@@ -1835,6 +1837,7 @@ def parse_eval_spec(argv: list[str] | None = None) -> argparse.Namespace:
         help="Fail after scoring unless this fraction of attempted episodes has a finite ICL total NLL.",
     )
     args = parser.parse_args(argv)
+    args.ckpt = resolve_checkpoint(args.ckpt)
     try:
         _validate_eval_spec(args)
     except ValueError as exc:
