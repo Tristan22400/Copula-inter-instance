@@ -18,20 +18,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import DebugConfig, add_common_args, build_config
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
 P_SWEEP_DEFAULT = [16, 32, 64, 128, 256]
 

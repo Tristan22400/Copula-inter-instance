@@ -8,14 +8,12 @@ Reuses:
   - inference/copula_inference.py: load_copula_model, normalize_features —
     the repo's single canonical checkpoint loader / feature-normalization
     convention, not reimplemented here.
-  - src/pit.py: load_tabicl + run_pit — the same frozen-TabICL-quantile-head
+  - src/copula_inter/pit.py: load_tabicl + run_pit — the same frozen-TabICL-quantile-head
     K-fold LOO PIT used to build z_train for real (non-GP-oracle) data.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -23,12 +21,6 @@ from scipy.special import gamma as gamma_fn, kv as bessel_k
 
 from eval.data.era5_io import safe_cholesky
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 __all__ = [
     "compute_persistence_residuals",
@@ -154,7 +146,7 @@ def sample_copula_residual_fields(
     import torch
 
     from inference.copula_inference import normalize_features
-    from pit import normalize_targets
+    from copula_inter.pit import normalize_targets
 
     x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
 
@@ -210,7 +202,7 @@ def load_marginal_tabicl(cfg, device: str):
     oracle for the PIT transform in extract_model_context_correlation — NOT
     the same object as the CopulaTabICL backbone in load_copula_model.
 
-    Resolves which checkpoint via src/pit.py::resolve_pit_ckpt — the same
+    Resolves which checkpoint via src/copula_inter/pit.py::resolve_pit_ckpt — the same
     resolver eval/spatial/sweep_core.py::run_real_config uses to build its
     qgrid, so the two never silently disagree on which marginal a given
     checkpoint means (they used to: run_real_config hardcoded a module-
@@ -226,7 +218,7 @@ def load_marginal_tabicl(cfg, device: str):
     reference marginal is never worth killing a whole sweep/diagnose run
     over; the caller falls back to naive z_train standardization either
     way."""
-    from src.pit import load_tabicl, resolve_pit_ckpt
+    from copula_inter.pit import load_tabicl, resolve_pit_ckpt
 
     source = resolve_pit_ckpt(cfg)
     if source is None:
@@ -248,7 +240,7 @@ def _forward_correlation(model, device, x_train_norm: np.ndarray, z_train: np.nd
     the dummy-context and real-context extractions below."""
     import torch
 
-    from src.model import low_rank_correlation
+    from copula_inter.model import low_rank_correlation
 
     x_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device).unsqueeze(0)
     x_test_t = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device).unsqueeze(0)
@@ -281,13 +273,13 @@ def compute_context_z_train(
 ) -> np.ndarray:
     """K-fold leave-one-out PIT z_train for a real in-context sample
     (`x_train_norm` already through `normalize_features`), under
-    `tabicl_marginal`'s own predicted marginal distribution (src/pit.py::run_pit):
+    `tabicl_marginal`'s own predicted marginal distribution (src/copula_inter/pit.py::run_pit):
     u_i = F_hat(y_i), z_i = Phi^-1(u_i) — the real-data analogue of how
     z_train is defined during training (data_gen.py's GP-oracle LOO PIT).
     Falls back to naive standardization if `tabicl_marginal` is None.
 
     Shared by extract_model_context_correlation (checkpoint-sweep diagnostics,
-    below) and src/train.py's era5_fit validation probe — both need this same
+    below) and src/copula_inter/train.py's era5_fit validation probe — both need this same
     context-PIT step, split out from the model forward pass that follows it
     so the training loop can freeze z_train once while re-running the forward
     pass on the currently-training model every validate() call.
@@ -299,8 +291,8 @@ def compute_context_z_train(
 
     import torch
 
-    from pit import normalize_targets
-    from src.pit import run_pit
+    from copula_inter.pit import normalize_targets
+    from copula_inter.pit import run_pit
 
     X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
     context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
@@ -369,7 +361,7 @@ def sample_simple_kernel_covariance(
     cfg, coordinates: np.ndarray, kernel_name: "str | None" = None, seed: "int | None" = None,
 ) -> "tuple[np.ndarray, str]":
     """Ground-truth covariance for synthetic mode: samples ONE elementary
-    (non-composite) kernel from src/data_gen.py's registry (random choice if
+    (non-composite) kernel from src/copula_inter/data_gen.py's registry (random choice if
     `kernel_name` is None, else the given one — e.g. for constants.SYNTHETIC_SWEEP_KERNELS
     sweeps), with hyperparameters drawn from the SAME LogNormal/Gamma
     hyperpriors training episodes use.
@@ -385,7 +377,7 @@ def sample_simple_kernel_covariance(
     import torch
     from omegaconf import OmegaConf
 
-    from data_gen import _build_kernel_component, _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS
+    from copula_inter.data_gen import _build_kernel_component, _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS
 
     if seed is not None:
         _random.seed(seed)
@@ -442,7 +434,7 @@ def build_synthetic_grid_task(
     """
     import torch
 
-    from data_gen import sigma_to_correlation
+    from copula_inter.data_gen import sigma_to_correlation
 
     rng = np.random.default_rng(seed)
     axis = np.linspace(-1000.0, 1000.0, grid_size)

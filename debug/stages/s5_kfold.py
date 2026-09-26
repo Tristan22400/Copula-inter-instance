@@ -23,21 +23,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import DebugConfig, add_common_args, build_config
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
 K_SWEEP_DEFAULT = [2, 5, 10]  # "P" (true K-fold LOO through TabICL) is appended in run()
 
@@ -47,7 +39,7 @@ def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
     replicating data_gen.py's own y-scaling convention exactly (per-episode
     y_train mean/std, y_test/log_pdf_test corrected the same way) so a
     frozen checkpoint sees the same input distribution it was trained on."""
-    from pit import run_pit_batched
+    from copula_inter.pit import run_pit_batched
 
     x_train = torch.stack([ep["x_norm_train"] for ep in episodes]).to(device)
     x_test = torch.stack([ep["x_norm_test"] for ep in episodes]).to(device)
@@ -67,9 +59,9 @@ def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
 
 
 def _score_variant(model, episodes: list[dict], z_train, z_test, log_pdf_test, posts, cfg, device):
-    from dataset import collate_fn
-    from loss import y_space_nll
-    from model import build_sigma
+    from copula_inter.dataset import collate_fn
+    from copula_inter.loss import y_space_nll
+    from copula_inter.model import build_sigma
 
     variant_eps = []
     for i, ep in enumerate(episodes):

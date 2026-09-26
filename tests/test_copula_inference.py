@@ -19,12 +19,6 @@ import torch
 from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_TESTS)
-_SRC = os.path.join(_REPO_ROOT, "src")
-_TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
-for _p in (_REPO_ROOT, _SRC, _TABICL_SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from tabicl._model.quantile_dist import QuantileDistribution  # noqa: E402
 
@@ -34,7 +28,7 @@ from inference.copula_inference import (  # noqa: E402
     normalize_features,
     sample_trajectories,
 )
-from model import low_rank_correlation  # noqa: E402
+from copula_inter.model import low_rank_correlation  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # PIT / interpolation sanity check (hand-built quantile grid, no live model)

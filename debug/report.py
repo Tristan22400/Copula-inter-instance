@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_ROOT = os.path.join(_HERE, "results")

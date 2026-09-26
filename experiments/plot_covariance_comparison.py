@@ -21,20 +21,13 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from pit import normalize_targets, run_pit  # noqa: E402
+from copula_inter.pit import normalize_targets, run_pit  # noqa: E402
 
 from experiments.experiment_b_quantitative import _compute_r_true, _sample_one_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402

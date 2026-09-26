@@ -3,7 +3,7 @@ test_tabicl_z_diagnostic.py — Sanity checks for the z_train sim-to-real
 validation diagnostic (train.py::_build_tabicl_val_z).
 
 This diagnostic re-runs the model on each val episode conditioned on
-TabICL's own K-fold PIT z_train (src/pit.py::run_pit) instead of the exact
+TabICL's own K-fold PIT z_train (src/copula_inter/pit.py::run_pit) instead of the exact
 GP-LOO one, to check whether the correlation prediction holds up against the
 same approximate PIT real (non-GP) deployment data would produce — not just
 the closed-form oracle it's trained on almost everywhere else.
@@ -33,8 +33,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from pit import resolve_pit_ckpt as _resolve_pit_ckpt
-from train import _build_tabicl_val_z
+from copula_inter.pit import resolve_pit_ckpt as _resolve_pit_ckpt
+from copula_inter.train import _build_tabicl_val_z
 
 
 class FakeTabICL(nn.Module):

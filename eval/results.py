@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 from torch import Tensor
-from artifacts import atomic_json_save
+from copula_inter.artifacts import atomic_json_save
 
 NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
 

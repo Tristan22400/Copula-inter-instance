@@ -20,7 +20,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import (
+from copula_inter.data_gen import (
     ALL_KERNELS,
     _CATEGORY_OPS,
     _DEFAULT_CATEGORY_WEIGHTS,
@@ -40,7 +40,7 @@ from data_gen import (
     sigma_to_correlation,
     tabiclv2_warp_features,
 )
-from dataset import CopulaDataset, _add_derived_fields, collate_fn
+from copula_inter.dataset import CopulaDataset, _add_derived_fields, collate_fn
 
 # ---------------------------------------------------------------------------
 # tabiclv2_warp_features tests
@@ -238,7 +238,7 @@ def test_r_star_values_in_minus1_1(small_cfg):
         assert R.abs().max() <= 1.0 + 1e-5
 
 
-# Goldilocks band (mirrors src/diag_kernels.py's Stage-3 thresholds): R_star
+# Goldilocks band (mirrors src/copula_inter/diag_kernels.py's Stage-3 thresholds): R_star
 # must reflect real dependence — not collapsed toward independence (screening
 # effect) and not saturated near +-1 everywhere (trivial task).
 _COLLAPSE_THRESHOLD = 0.01
@@ -428,7 +428,7 @@ def test_ard_samples_per_dimension_lengthscale(small_cfg, kernel_name):
     shared isotropic scalar, and the analytical-PIT kernel reconstruction
     (pit.gp_analytical_pit -> data_gen.build_kernel_fn) round-trips it
     correctly (matches the cached _L_ff/_alpha result from generation)."""
-    from pit import gp_analytical_pit
+    from copula_inter.pit import gp_analytical_pit
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -628,8 +628,7 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     ShardHomogeneousBatchSampler's per-shard-homogeneous-d invariant
     (regression: a real dataset run produced a shard with 254 episodes at
     d=16 and 2 stragglers at d=31 from an unpinned top-up round)."""
-    import data_gen as dg
-
+    from copula_inter import data_gen as dg
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
@@ -670,9 +669,8 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
     d=5 and d=9), each later crashing training with collate_fn's "mixed
     feature counts" error -- ShardHomogeneousBatchSampler assumes every
     shard is feature-homogeneous and doesn't verify it."""
-    import generate_pit_dataset as gpd
-    import data_gen as dg
-
+    from copula_inter import generate_pit_dataset as gpd
+    from copula_inter import data_gen as dg
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
@@ -721,8 +719,7 @@ def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeyp
     _generate_gp_batch_raw) is kept as defence in depth regardless, and this
     test poisons that seam directly rather than relying on triggering a
     genuine LAPACK failure."""
-    import data_gen as dg
-
+    from copula_inter import data_gen as dg
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.seed = 11
@@ -761,8 +758,7 @@ def test_is_transient_cusolver_error_covers_tabicl_contention_errors():
     killed the process; the worker was still dead hours later since
     scripts/generate_dataset.sh's outer restart budget (5 attempts) was
     exhausted by the repeated crash."""
-    import generate_pit_dataset as gpd
-
+    from copula_inter import generate_pit_dataset as gpd
     assert gpd._is_transient_cusolver_error(
         RuntimeError(
             "CPU memory allocation failed (CUDA error: invalid argument) "
@@ -794,8 +790,7 @@ def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
     dataset.py's `CopulaDataset` load-time guard for the equivalent safety
     net over datasets generated before this fix.
     """
-    import data_gen as dg
-
+    from copula_inter import data_gen as dg
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.seed = 7
@@ -843,8 +838,7 @@ def test_degenerate_active_kernel_column_is_discarded_not_leaked(small_cfg, kern
     tabiclv2_warp_features directly (collapsing every column of one episode)
     instead of relying on any single op's failure probability, so this stays
     a regression net regardless of which upstream stage is the cause."""
-    import data_gen as dg
-
+    from copula_inter import data_gen as dg
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.systematic_composition = False
@@ -885,8 +879,7 @@ def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeyp
     3-of-4 active-dims subset via monkeypatching _sample_active_dims (rather
     than relying on the random inactive_frac draw), then poisons all three
     active columns of episode 0 to a constant."""
-    import data_gen as dg
-
+    from copula_inter import data_gen as dg
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -928,8 +921,7 @@ def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch
     kernels still produce a non-constant R_star through their remaining
     active dims. This must NOT be discarded, unlike the fully-collapsed case
     above and the k=1 periodic/cosine case."""
-    import data_gen as dg
-
+    from copula_inter import data_gen as dg
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -972,7 +964,7 @@ def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name):
     the real batched kernel produced at generation time — same pattern as
     test_ard_samples_per_dimension_lengthscale, but for polynomial's offset
     and (batch-shared) power instead of an ARD lengthscale vector."""
-    from pit import gp_analytical_pit
+    from copula_inter.pit import gp_analytical_pit
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -2114,7 +2106,7 @@ def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg, family_prob
     linear -- guards data_gen._sample_mean_module's exp/anomaly params
     actually round-tripping through the saved task dict and pit._mean_train_from_task
     reconstructing the same mean_module(x_train) used at generation time."""
-    from pit import gp_analytical_pit
+    from copula_inter.pit import gp_analytical_pit
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
@@ -2152,7 +2144,7 @@ def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg):
 
 def test_gp_posterior_helper():
     """gp_posterior should return correct shapes and PSD Sigma_star."""
-    from data_gen import build_kernel_fn
+    from copula_inter.data_gen import build_kernel_fn
     P, N, d = 20, 8, 1
     x_train = torch.randn(P, d)
     y_train = torch.randn(P)

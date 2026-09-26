@@ -4,27 +4,27 @@ instead of the synthetic-GP live-generation stream train.py normally trains
 on.
 
 This is a thin argparse -> Hydra-override translation over
-`python src/train.py` (training.resume_ckpt=... training.live_generation=true
+`python -m copula_inter.train` (training.resume_ckpt=... training.live_generation=true
 training.live_source=era5 ...) — no duplicated training loop; every
 optimizer/scheduler/AMP/logging/checkpointing behavior is exactly train.py's
-own (see src/era5_live_dataset.py for the actual real-data episode source
+own (see src/copula_inter/era5_live_dataset.py for the actual real-data episode source
 this switches in).
 
 Prerequisite: a local ERA5 corpus. Fetch one first:
   python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
 
 Usage:
-  python src/finetune_era5.py --ckpt checkpoints/kernel-sweep-all-tabicl-retrain-15k/step_0015000.pt
+  python -m copula_inter.finetune_era5 --ckpt checkpoints/kernel-sweep-all-tabicl-retrain-15k/step_0015000.pt
 
   # See the exact command without running it:
-  python src/finetune_era5.py --ckpt <path> --dry-run
+  python -m copula_inter.finetune_era5 --ckpt <path> --dry-run
 
   # Finetune against a non-TabICL marginal (see data.z_train_source in
   # conf/data/gp_tasks.yaml, and era5_live_dataset.py::_resolve_marginal):
-  python src/finetune_era5.py --ckpt <path> --marginal tabldm
+  python -m copula_inter.finetune_era5 --ckpt <path> --marginal tabldm
 
   # Forward arbitrary extra Hydra overrides verbatim:
-  python src/finetune_era5.py --ckpt <path> -- era5_live.grid_size_max=32 wandb.entity=me
+  python -m copula_inter.finetune_era5 --ckpt <path> -- era5_live.grid_size_max=32 wandb.entity=me
 """
 
 from __future__ import annotations
@@ -35,9 +35,9 @@ import subprocess
 import sys
 import time
 
-from backend_registry import MARGINAL_BACKENDS
+from copula_inter.backend_registry import MARGINAL_BACKENDS
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def main() -> None:
@@ -78,8 +78,6 @@ def main() -> None:
     p.add_argument("overrides", nargs=argparse.REMAINDER, help="Extra raw Hydra overrides, e.g. -- wandb.entity=me")
     args = p.parse_args()
 
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
     from eval.configs.checkpoints import resolve_checkpoint
 
     args.ckpt = os.path.abspath(resolve_checkpoint(args.ckpt))
@@ -129,7 +127,7 @@ def main() -> None:
     extra = [o for o in args.overrides if o != "--"]
     overrides.extend(extra)
 
-    cmd = [sys.executable, "src/train.py", *overrides]
+    cmd = [sys.executable, "-m", "copula_inter.train", *overrides]
     print("[finetune_era5] " + " ".join(cmd))
     if args.dry_run:
         return

@@ -42,10 +42,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from data_gen import build_kernel_fn, gp_posterior
-from finetune_marginal import _generate_phase_a_gp_batch
-from lora import merged_base_state_dict
-from finetune_marginal import (
+from copula_inter.data_gen import build_kernel_fn, gp_posterior
+from copula_inter.finetune_marginal import _generate_phase_a_gp_batch
+from copula_inter.lora import merged_base_state_dict
+from copula_inter.finetune_marginal import (
     TIER0_PATTERNS,
     AnchorPenalty,
     MarginalLossWeights,
@@ -59,7 +59,7 @@ from finetune_marginal import (
     quantile_level_weights,
     rank_histogram,
 )
-from pit import _probit, run_pit_batched, run_pit_batched_grad
+from copula_inter.pit import _probit, run_pit_batched, run_pit_batched_grad
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -70,7 +70,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch):
-    import finetune_marginal as entrypoint
+    from copula_inter import finetune_marginal as entrypoint
     from omegaconf import OmegaConf
 
     calls = []
@@ -395,7 +395,7 @@ def test_fold_subset_rows_match_a_full_pit_pass():
     part = run_pit_batched(tab, Xtr, Ytr, Xte, Yte, k_folds=K, return_quantiles=True)
     assert torch.allclose(full["z_train"], part["z_train"])
 
-    from pit import _run_pit_batched_impl
+    from copula_inter.pit import _run_pit_batched_impl
 
     sub = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, K, 1e-6,
                                 return_quantiles=True, fold_subset=[1, 3])
@@ -407,7 +407,7 @@ def test_fold_subset_rows_match_a_full_pit_pass():
 
 def test_fold_subset_empty_returns_test_only():
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
-    from pit import _run_pit_batched_impl
+    from copula_inter.pit import _run_pit_batched_impl
 
     torch.manual_seed(0)
     tab = RowIndependentFakeTabICL(q=5)
@@ -423,7 +423,7 @@ def test_fold_subset_empty_returns_test_only():
 
 def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output():
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
-    from pit import _run_pit_batched_impl
+    from copula_inter.pit import _run_pit_batched_impl
 
     torch.manual_seed(0)
     tab = RowIndependentFakeTabICL(q=7)
@@ -445,7 +445,7 @@ def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output():
 
 def test_fused_fold_forward_matches_separate_forwards():
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
-    from pit import _run_pit_batched_impl
+    from copula_inter.pit import _run_pit_batched_impl
 
     torch.manual_seed(0)
     tab = RowIndependentFakeTabICL(q=7)

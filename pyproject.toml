@@ -54,30 +54,17 @@ explicit = true
 
 [tool.setuptools]
 include-package-data = true
-py-modules = [
-  "artifacts", "backend_registry",
-  "classical_kernels", "config_path", "copula_backbones", "correlation_factory", "data_gen",
-  "dataset", "dataset_manifest", "diag_kernels", "episode_contracts",
-  "feature_transforms",
-  "era5_live_dataset", "finetune_era5", "finetune_marginal",
-  "generate_pit_dataset", "live_dataset", "lora", "loss",
-  "marginal_backbones", "model", "muon", "pit",
-  "train", "training_core",
-]
 
 [tool.setuptools.package-dir]
-"" = "src"
-eval = "eval"
-inference = "inference"
+copula_inter = "src/copula_inter"
 tabicl = "tabicl_upstream/src/tabicl"
-conf = "conf"
 
 [tool.setuptools.package-data]
 conf = ["*.yaml", "data/*.yaml", "model/*.yaml"]
 
 [tool.setuptools.packages.find]
-where = [".", "tabicl_upstream/src"]
-include = ["conf*", "eval*", "inference*", "tabicl*"]
+where = [".", "src", "tabicl_upstream/src"]
+include = ["copula_inter*", "conf*", "eval*", "inference*", "debug*", "experiments*", "tabicl*"]
 namespaces = false
 
 [tool.pytest.ini_options]

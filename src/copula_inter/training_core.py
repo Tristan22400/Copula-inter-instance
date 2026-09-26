@@ -8,8 +8,8 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.utils.flop_counter import FlopCounterMode
 
-from loss import y_space_nll
-from model import low_rank_correlation_factor
+from copula_inter.loss import y_space_nll
+from copula_inter.model import low_rank_correlation_factor
 
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
     if step < warmup:
@@ -23,7 +23,6 @@ def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> 
     return lr_min_frac + (1.0 - lr_min_frac) * 0.5 * (
         1.0 + math.cos(math.pi * progress)
     )
-
 
 
 def _forward_and_loss(
@@ -105,7 +104,6 @@ def _forward_and_loss(
     return out, Sigma, parts, loss, aux_mae
 
 
-
 def _measure_step_flops(
     *,
     model: nn.Module,
@@ -147,7 +145,6 @@ def _measure_step_flops(
         loss.backward()
     model.zero_grad(set_to_none=True)
     return flop_ctr.get_total_flops()
-
 
 
 def _run_train_step(

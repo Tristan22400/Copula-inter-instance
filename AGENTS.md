@@ -1,13 +1,13 @@
 # Repository map
 
-- `src/data_gen.py`: GP kernels and raw episode sampling;
-  `src/feature_transforms.py`: input and hidden feature warps; `src/pit.py`:
-  PIT conversion; `src/episode_contracts.py`: raw/PIT/padded shapes and boundary
-  checks; `src/dataset.py` and `src/generate_pit_dataset.py`: on-disk episodes,
+- `src/copula_inter/data_gen.py`: GP kernels and raw episode sampling;
+  `src/copula_inter/feature_transforms.py`: input and hidden feature warps; `src/copula_inter/pit.py`:
+  PIT conversion; `src/copula_inter/episode_contracts.py`: raw/PIT/padded shapes and boundary
+  checks; `src/copula_inter/dataset.py` and `src/copula_inter/generate_pit_dataset.py`: on-disk episodes,
   shard loading, and manifests.
-- `src/training_core.py`: schedule, loss, and optimizer step shared by training
-  entrypoints; `src/train.py`: training orchestration and checkpointing.
-- `src/backend_registry.py`: supported marginal and copula backbones and
+- `src/copula_inter/training_core.py`: schedule, loss, and optimizer step shared by training
+  entrypoints; `src/copula_inter/train.py`: training orchestration and checkpointing.
+- `src/copula_inter/backend_registry.py`: supported marginal and copula backbones and
   their capabilities. Add a backend here, then implement its adapter under
   `eval/spatial/` or `src/` and run the relevant backend tests.
 - `eval/runners/eval_checkpoint.py`: evaluation CLI and orchestration;

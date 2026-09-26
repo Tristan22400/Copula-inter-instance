@@ -281,7 +281,7 @@ def set_trainable(
     r"""Freeze every backbone parameter except LoRA adapters and the allowlist.
 
     The single place that decides what Phase-A / LoRA runs optimize, so
-    ``apply_lora`` and the tier routing in ``src/finetune_marginal.py`` cannot
+    ``apply_lora`` and the tier routing in ``src/copula_inter/finetune_marginal.py`` cannot
     drift apart on the predicate.
 
     Args:

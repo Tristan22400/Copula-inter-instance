@@ -7,12 +7,12 @@ specific to TabICL's own PIT or shows up with any real (non-oracle)
 marginal.
 
 Originally scoped as a debug-local comparison trainer rather than a
-src/data_gen.py production knob, since TabPFN/EXAONE's API is per-task
+src/copula_inter/data_gen.py production knob, since TabPFN/EXAONE's API is per-task
 sklearn fit/predict (K-fold PIT means K separate .fit()+.predict() calls per
 episode, see eval/spatial/marginal_backends.py::quantiles), not a single
 batched GPU forward like TabICL's. That promotion has since happened:
 cfg.data.z_train_source now accepts "exaone"/"tabpfn" directly in
-src/train.py/live_dataset.py/data_gen.py (see data_gen.py::
+src/copula_inter/train.py/live_dataset.py/data_gen.py (see data_gen.py::
 _generate_gp_batch_raw's marginal_backend arg and conf/data/gp_tasks.yaml),
 10-100x slower per episode and all -- this stage remains useful as a
 smaller, reduced-scale, single-process comparison good enough to read gap
@@ -30,24 +30,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import DebugConfig, add_common_args, build_config
-from stages.s5_kfold import _pit_at_k
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
+from debug.stages.s5_kfold import _pit_at_k
 
 DEFAULT_PROBS_N = 99  # coarser than TabICL's 999 -- TabPFN's per-fold .fit()+.predict() dominates wall-clock
 
@@ -82,7 +74,7 @@ def _generic_pit_episode(backend: str, regressor, ep: dict, k_folds: int, probs_
 
 def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offset: int, tabicl_model=None,
                               regressor=None, k_folds: int = 5, probs_n: int = DEFAULT_PROBS_N):
-    from dataset import collate_fn
+    from copula_inter.dataset import collate_fn
 
     episodes = common.generate_episodes(dcfg, n, tabicl_model=None, seed_offset=seed_offset)
     if backend == "tabicl":
@@ -102,8 +94,8 @@ def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offse
 
 def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: int, lr: float,
                         eval_every: int, n_eval: int, k_folds: int, probs_n: int):
-    from loss import y_space_nll
-    from model import build_copula_transformer, build_sigma
+    from copula_inter.loss import y_space_nll
+    from copula_inter.model import build_copula_transformer, build_sigma
 
     torch.manual_seed(dcfg.seed)  # same init across backends for a fair comparison
     model = build_copula_transformer(dcfg.cfg).to(dcfg.device)

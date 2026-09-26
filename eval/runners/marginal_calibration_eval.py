@@ -50,28 +50,21 @@ import argparse
 import json
 import math
 import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src"),
-           os.path.join(_REPO_ROOT, "tabicl_upstream", "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from data_gen import generate_gp_batch  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch  # noqa: E402
 from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
 from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
-from finetune_marginal import (  # noqa: E402
+from copula_inter.finetune_marginal import (  # noqa: E402
     analytic_marginal_targets,
     ks_uniform,
     oracle_marginal_nll,
     rank_histogram,
 )
-from pit import (  # noqa: E402
+from copula_inter.pit import (  # noqa: E402
     DEFAULT_K_FOLDS,
     _kernel_fn_from_task,
     gp_analytical_pit,

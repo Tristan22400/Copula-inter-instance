@@ -27,19 +27,12 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from data_gen import _safe_cholesky, gp_posterior  # noqa: E402
+from copula_inter.data_gen import _safe_cholesky, gp_posterior  # noqa: E402
 
 from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402

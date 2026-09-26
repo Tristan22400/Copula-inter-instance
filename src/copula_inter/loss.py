@@ -57,7 +57,7 @@ import math
 import numpy as np
 import torch
 
-from correlation_factory import LowRankCorrelationFactor
+from copula_inter.correlation_factory import LowRankCorrelationFactor
 
 # ---------------------------------------------------------------------------
 # Numerically stable Cholesky

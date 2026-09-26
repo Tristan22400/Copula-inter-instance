@@ -1,10 +1,15 @@
- Workflow to run:
+ Environment: `source scripts/_env.sh` (conda env + this checkout's src/, root and
+tabicl_upstream/src first on PYTHONPATH -- works from any worktree), or
+`uv sync --extra dev --extra gpu` and use `.venv/bin/python`. Code lives in the
+`copula_inter` package (src/copula_inter/); no script edits sys.path.
+
+Workflow to run:
   # 1. Generate PIT episodes. data.z_train_source selects the marginal:
   #    analytic (oracle) | tabicl | tabicl_split | exaone | tabpfn | tabldm.
   #    Non-TabICL backends need no GPU here (unlike live generation), just time.
-  python src/generate_pit_dataset.py data.n_tasks=5000 data.dataset_dir=./data/pilot
+  python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.dataset_dir=./data/pilot
   # 2. Train
-  python src/train.py training.live_generation=false training.dataset_dir=./data/pilot/pit
+  python -m copula_inter.train training.live_generation=false training.dataset_dir=./data/pilot/pit
   # 3. Evaluate vs. classical baselines (synthetic GP episodes). Defaults to
   #    --z_train_source tabicl (K-fold TabICL PIT context, matching real
   #    deployment) so the total marginal+copula NLL table is populated;
@@ -77,13 +82,13 @@
   #    (random geographic region + random grid resolution every episode,
   #    instead of synthetic GP kernels). One-time corpus fetch first, then:
   python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
-  python src/finetune_era5.py --ckpt kernel-sweep-all-tabicl-retrain-15k
+  python -m copula_inter.finetune_era5 --ckpt kernel-sweep-all-tabicl-retrain-15k
 
 Marginal fine-tuning (Phase A) — make the MARGINAL branch correct, separately from
 the copula. The loss is copula + marginal (Sklar), but the marginal comes from a
 FROZEN TabICL, so its term has zero trainable parameters and no copula run can
 improve it. Phase A fine-tunes that standalone TabICL; the two phases meet only at
-a checkpoint path. src/model.py and conf/config.yaml are untouched.
+a checkpoint path. src/copula_inter/model.py and conf/config.yaml are untouched.
   # 1. Measure the defect first -- zero training, one table. The headline number is
   #    the marginal-NLL gap to the ANALYTIC GP oracle (y is a pure GP draw, so the
   #    correct marginal posterior is known in closed form).
@@ -91,14 +96,14 @@ a checkpoint path. src/model.py and conf/config.yaml are untouched.
   # 2. Fine-tune. Hydra-native (no argparse), own wandb project copula-inter-marginal.
   #    Tier 0 = label path + ICL norms + decoder (~1.6M/5.5%); escalate to tier 1
   #    (+ LoRA on icl_predictor) only if the oracle gap plateaus above zero.
-  python src/finetune_marginal.py                      # or: marginal.tier=1
+  python -m copula_inter.finetune_marginal                      # or: marginal.tier=1
   oarsub -S ./scripts/finetune_marginal.sh             # on Grid5000
   #    marginal.lora_all_layers=true (the DEFAULT) puts LoRA at ONE shared rank
   #    on every 2-D weight matrix of whichever backbone is selected, so the
   #    tier ladder above only matters as an ablation (lora_all_layers=false).
   #    Measured coverage at rank 8: tabicl 153 matrices / 854K trainable
   #    (2.91%), tabldm 295 / 2.00M (2.73%), exaone 360 / 1.43M (6.33%).
-  #    Other marginal backbones (src/marginal_backbones.py): tabpfn is wired
+  #    Other marginal backbones (src/copula_inter/marginal_backbones.py): tabpfn is wired
   #    but licence-gated and never executed here. Non-tabicl checkpoints are
   #    loaded back via marginal_backends.make_regressor(..., ckpt=<path>),
   #    not pit.load_tabicl.
@@ -106,17 +111,17 @@ a checkpoint path. src/model.py and conf/config.yaml are untouched.
   #    (marginal.probs_n=null) -- TabICL, TabLDM and EXAONE all emit 999, so
   #    the objective is comparable across backbones. Set probs_n=<int> only to
   #    resample onto a coarser grid.
-  python src/finetune_marginal.py marginal.backbone=tabldm
-  python src/finetune_marginal.py marginal.backbone=exaone
+  python -m copula_inter.finetune_marginal marginal.backbone=tabldm
+  python -m copula_inter.finetune_marginal marginal.backbone=exaone
   #    Stage-ladder ablation (only tabicl/tabldm can climb it -- exaone's
   #    attention has no swappable module, see marginal_backbones.MAX_TIER):
-  python src/finetune_marginal.py marginal.lora_all_layers=false marginal.tier=1
+  python -m copula_inter.finetune_marginal marginal.lora_all_layers=false marginal.tier=1
   # 3. Re-measure, then gate on real data (must not regress -- the whole point of a
   #    TabICL marginal is non-Gaussian tabular transfer, which GP-only training can
   #    destroy), then hand the result to a normal copula run:
   python eval/runners/marginal_calibration_eval.py --ckpt <the _final.pt>
   python eval/runners/run_benchmarks.py
-  python src/train.py tabicl.pit_ckpt=<the _final.pt>
+  python -m copula_inter.train tabicl.pit_ckpt=<the _final.pt>
 Phase A checkpoints for backbone=tabicl are plain TabICL ({"config","state_dict"});
 other backbones use the same shape plus a "backbone" tag. Both are registered in
 eval/configs/checkpoints.py::MARGINAL_FAMILIES -- a SEPARATE registry from

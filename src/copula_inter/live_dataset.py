@@ -28,11 +28,11 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
-from dataset import collate_fn
-from pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
-from backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, Z_TRAIN_SOURCES
-from backend_registry import z_train_source as z_train_source_of
+from copula_inter.data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
+from copula_inter.dataset import collate_fn
+from copula_inter.pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, Z_TRAIN_SOURCES
+from copula_inter.backend_registry import z_train_source as z_train_source_of
 
 # Thread count for generate_gp_batch calls made directly in the MAIN process
 # (build_fixed_live_val_batches below, train.py's z_train-gap diagnostic) --

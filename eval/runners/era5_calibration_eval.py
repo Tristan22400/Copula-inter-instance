@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -46,10 +45,6 @@ from scipy.stats import norm
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from eval.spatial import calibration as cal  # noqa: E402
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles  # noqa: E402

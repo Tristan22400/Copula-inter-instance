@@ -18,13 +18,13 @@
 # of this same preset.
 # ---------------------------------------------------------------------------
 model:
-  backbone: tabicl           # which src/copula_backbones.py backbone to use:
+  backbone: tabicl           # which src/copula_inter/copula_backbones.py backbone to use:
                               # tabicl (default) | tabldm. See
                               # conf/model/copula_prod_tabldm.yaml.
   rank: 128                  # low-rank dimension r in W ∈ R^{N×r}
   sigma_jitter: 1.0e-4     # added to diag(Σ) for Cholesky stability
   unfreeze_backbone: true  # train the backbone end-to-end alongside the head
-  # Which src/correlation_factory.py builder turns the copula head's raw
+  # Which src/copula_inter/correlation_factory.py builder turns the copula head's raw
   # output into a valid low-rank correlation matrix: covnorm (default,
   # matches the original hard-coded implementation) | cossim | tanhnorm |
   # sparse_covnorm. Override from CLI, e.g. model.correlation_parametrization=cossim.
@@ -32,7 +32,7 @@ model:
 
 tabicl:
   pretrained: true   # false → randomly-initialised backbone (uses arch section below)
-  # Phase A ERA5 fine-tune of the frozen TabICL marginal (src/finetune_marginal.py),
+  # Phase A ERA5 fine-tune of the frozen TabICL marginal (src/copula_inter/finetune_marginal.py),
   # swapped in for the pretrained HF checkpoint above. Same {"config","state_dict"}
   # schema, so it's a drop-in backbone init (pretrained=true) and a drop-in
   # --tabicl_ckpt default for eval_checkpoint.py's z_train_source=tabicl.
@@ -45,7 +45,7 @@ tabicl:
   # conf/data/gp_tasks.yaml N_max/P_max) dominates that memory; turn this on
   # instead of shrinking N_max/P_max/batch_size when hitting CUDA OOM.
   recompute: false
-  # K-fold PIT (src/pit.py::run_pit) used only by the z_train sim-to-real
+  # K-fold PIT (src/copula_inter/pit.py::run_pit) used only by the z_train sim-to-real
   # validation diagnostic (train.py::_build_tabicl_val_z) — a second, frozen
   # TabICL copy with its native quantile head PITs each val episode's own
   # (x_train, y_train) the same way real (non-GP) data would be, so the

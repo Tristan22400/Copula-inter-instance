@@ -8,8 +8,7 @@
 set -euo pipefail
 
 # Navigate to project root
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/.."
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
 FORBIDDEN_GPU_REGEX="${FORBIDDEN_GPU_REGEX:-TITAN[[:space:]]*RTX|TitanRTX|Quadro[[:space:]]*RTX[[:space:]]*8000|(^|[^0-9A-Za-z])L4($|[^0-9A-Za-z])}"
 
@@ -77,22 +76,6 @@ configure_cuda_devices() {
 
 configure_cuda_devices
 
-# Setup environment
-CONDA_BASE="$HOME/thoth_storage/miniconda3"
-CONDA_ENV="$CONDA_BASE/envs/multivariate-icl"
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-else
-    source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
-fi
-export PYTHONNOUSERSITE=1
-if [[ -n "${PYTHONPATH:-}" ]]; then
-    export PYTHONPATH="$PYTHONPATH:$(pwd)"
-else
-    export PYTHONPATH="$(pwd)"
-fi
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # The frozen-TabICL-marginal load (z_train sim-to-real diagnostic) does a HEAD
 # request to huggingface.co to check for updates even though the checkpoint is
 # already fully cached locally; that request has been taking 60-100s+ on this
@@ -113,8 +96,8 @@ fi
 
 echo "Starting Training... (Job ID: ${OAR_JOB_ID:-local})"
 if [[ "${TRAIN_SH_DRY_RUN:-0}" == "1" ]]; then
-    echo "[train.sh] Dry run; command would be: python src/train.py $*"
+    echo "[train.sh] Dry run; command would be: python -m copula_inter.train $*"
     exit 0
 fi
-python src/train.py "$@"
+python -m copula_inter.train "$@"
 echo "Training complete."

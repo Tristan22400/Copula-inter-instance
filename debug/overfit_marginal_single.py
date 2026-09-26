@@ -17,24 +17,20 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 import torch
 from hydra import compose, initialize_config_dir
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-for _path in (_ROOT, os.path.join(_ROOT, "src"), os.path.join(_ROOT, "tabicl_upstream", "src")):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
 
-from finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg  # noqa: E402
-from finetune_marginal import (  # noqa: E402
+from copula_inter.finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg  # noqa: E402
+from copula_inter.finetune_marginal import (  # noqa: E402
     MarginalLossWeights,
     apply_tier,
     phase_a_batch_loss,
 )
-from pit import load_tabicl  # noqa: E402
+from copula_inter.pit import load_tabicl  # noqa: E402
 
 
 def _args() -> argparse.Namespace:

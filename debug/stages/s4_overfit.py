@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -59,24 +58,19 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, TensorDataset
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
 _ROOT = _REPO_ROOT  # kept for the --model/config path joins below
-for _p in (_SRC, os.path.join(_REPO_ROOT, "tabicl_upstream", "src"), os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from data_gen import generate_gp_batch
-from dataset import collate_fn
-from loss import _safe_cholesky, oracle_copula_nll, y_space_nll
-from model import build_copula_transformer, build_sigma
+from copula_inter.data_gen import generate_gp_batch
+from copula_inter.dataset import collate_fn
+from copula_inter.loss import _safe_cholesky, oracle_copula_nll, y_space_nll
+from copula_inter.model import build_copula_transformer, build_sigma
 
-import common  # noqa: E402 -- debug/common.py, added to sys.path above
-from stages.s1_rank_ceiling import fit_rank_ceiling  # noqa: E402
-from stages.s3_pit_floor import sample_and_pit  # noqa: E402
+from debug import common  # noqa: E402 -- debug/common.py, added to sys.path above
+from debug.stages.s1_rank_ceiling import fit_rank_ceiling  # noqa: E402
+from debug.stages.s3_pit_floor import sample_and_pit  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override cfg.model.correlation_parametrization (default: whatever "
         "the --model preset sets, normally 'covnorm'). One of covnorm, cossim, "
-        "tanhnorm, sparse_covnorm — see src/correlation_factory.py.",
+        "tanhnorm, sparse_covnorm — see src/copula_inter/correlation_factory.py.",
     )
     p.add_argument(
         "--target", choices=["prior", "posterior"], default="prior",

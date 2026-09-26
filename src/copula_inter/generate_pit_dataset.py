@@ -34,27 +34,27 @@ see CopulaDataset._get_sharded).
 
 Usage
 -----
-    python src/generate_pit_dataset.py data.n_tasks=5000
-    python src/generate_pit_dataset.py data.n_tasks=5000000 data.shard_size=512
+    python -m copula_inter.generate_pit_dataset data.n_tasks=5000
+    python -m copula_inter.generate_pit_dataset data.n_tasks=5000000 data.shard_size=512
 
     # z_train from the real frozen TabICL marginal's K-fold PIT instead of
     # the exact analytic GP-LOO residual (see data.z_train_source in
     # conf/data/gp_tasks.yaml) — substantially slower, pilot on a small
     # n_tasks first:
-    python src/generate_pit_dataset.py data.n_tasks=5000 data.z_train_source=tabicl
+    python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl
 
     # Same, but via a one-pass calibration split instead of K-fold rotation
     # (data.z_train_split_calib_frac controls the calibration pool size) —
     # ~(z_train_tabicl_k_folds + 1)x fewer TabICL forward passes than
     # z_train_source=tabicl, see run_pit_calib_split_batched's docstring in
     # pit.py for the cost/quality trade-off:
-    python src/generate_pit_dataset.py data.n_tasks=5000 data.z_train_source=tabicl_split
+    python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl_split
 
     # ... or any other tabular-foundation-model marginal backend
     # (eval/spatial/marginal_backends.py). Unlike training.live_generation
     # these do not require a GPU here -- offline generation may simply take
     # much longer on CPU. Pilot on a small n_tasks first.
-    python src/generate_pit_dataset.py data.n_tasks=500 data.z_train_source=tabldm
+    python -m copula_inter.generate_pit_dataset data.n_tasks=500 data.z_train_source=tabldm
 """
 
 from __future__ import annotations
@@ -62,7 +62,6 @@ from __future__ import annotations
 import gc
 import fcntl
 import os
-import sys
 import time
 import warnings
 
@@ -78,24 +77,21 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
 
-from data_gen import generate_gp_batch
-from artifacts import atomic_json_save, atomic_torch_save, file_digest
-from config_path import config_dir
-from episode_contracts import validate_episode
-from dataset_manifest import (
+from copula_inter.data_gen import generate_gp_batch
+from copula_inter.artifacts import atomic_json_save, atomic_torch_save, file_digest
+from copula_inter.config_path import config_dir
+from copula_inter.episode_contracts import validate_episode
+from copula_inter.dataset_manifest import (
     contiguous_shard_counts,
     ensure_manifest,
     generation_spec,
     shard_count_path,
     verified_shard_digest,
 )
-from live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
-from backend_registry import TABICL_Z_TRAIN_SOURCES
-from backend_registry import z_train_source as z_train_source_of
+from copula_inter.live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
+from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import z_train_source as z_train_source_of
 
 
 _MAX_CUSOLVER_RETRIES = 8
@@ -298,7 +294,7 @@ def _reject_disk_unsupported_z_train_source(z_train_source: str) -> None:
     if z_train_source == "y_train":
         raise ValueError(
             "data.z_train_source=y_train is only supported under "
-            "training.live_generation=true (src/live_dataset.py) -- no "
+            "training.live_generation=true (src/copula_inter/live_dataset.py) -- no "
             "on-disk generate_pit_dataset.py implementation exists."
         )
 
@@ -347,7 +343,7 @@ def main(cfg: DictConfig) -> None:
     )
     ckpt = None
     if z_train_source in TABICL_Z_TRAIN_SOURCES:
-        from pit import load_tabicl, resolve_pit_ckpt
+        from copula_inter.pit import load_tabicl, resolve_pit_ckpt
 
         ckpt = resolve_pit_ckpt(cfg)
         if ckpt is None:

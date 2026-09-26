@@ -41,7 +41,7 @@ NLL_PROBS = np.linspace(0.02, 0.98, 49)  # quantile-grid probability levels for 
 # Classical-GP-MLE baseline Y-space NLL on the same real-ERA5 held-out split
 # as N_NLL_TEST/nll_total above (eval/spatial/sweep_core.py::
 # _fit_gp_baseline_nll, via eval/baselines/classical.py::fit_and_eval_gpytorch
-# + src/loss.py::gp_oracle_y_nll) -- the real-ERA5 counterpart to the
+# + src/copula_inter/loss.py::gp_oracle_y_nll) -- the real-ERA5 counterpart to the
 # synthetic-episode classical-GP baselines in eval_checkpoint.py. Defaults
 # match eval_checkpoint.py's own --n_steps_mle/--lr_mle/--n_restarts_mle.
 GP_BASELINE_KERNELS = ["rbf", "matern12", "matern32", "matern52", "rational_quadratic"]
@@ -56,7 +56,7 @@ GP_N_RESTARTS_MLE = 5
 CURVE_FIT_LAWS = ["gaussian", "matern", "rational_quadratic"]
 
 # Kernel families sampled as synthetic-mode ground truth in `sweep --mode
-# synthetic` / `diagnose --mode synthetic` (src/data_gen.py's registry).
+# synthetic` / `diagnose --mode synthetic` (src/copula_inter/data_gen.py's registry).
 SYNTHETIC_SWEEP_KERNELS = ["rbf", "matern12", "matern32", "periodic", "rational_quadratic"]
 
 # Synthetic-mode analogue of regions.SWEEP_PROFILES["low_context_7config"]:

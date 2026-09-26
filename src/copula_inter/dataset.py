@@ -25,7 +25,7 @@ from typing import List, Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset, Sampler
-from episode_contracts import validate_episode
+from copula_inter.episode_contracts import validate_episode
 
 # Keys checked for NaN/Inf before an episode is handed to the model. Datasets
 # generated before the data_gen.py LOO-PIT degeneracy fix (near-singular
@@ -138,7 +138,7 @@ class CopulaDataset(Dataset):
                 manifest = json.load(source)
             if manifest.get("digest") != digest:
                 raise ValueError(f"manifest identity does not match {meta_path}")
-            from dataset_manifest import shard_count_path
+            from copula_inter.dataset_manifest import shard_count_path
 
             counts = []
             for path in expected:

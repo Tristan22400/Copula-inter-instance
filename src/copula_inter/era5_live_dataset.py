@@ -5,17 +5,17 @@ stream of training episodes drawn from real ARCO-ERA5 2m-temperature data
 across many regions and grid resolutions.
 
 Enabled via training.live_generation=true training.live_source=era5 (see
-src/train.py) — everything else about the training loop (optimizer,
+src/copula_inter/train.py) — everything else about the training loop (optimizer,
 scheduler, AMP, logging, checkpointing, training.resume_ckpt) is unchanged;
 only the DataLoader construction differs from live_dataset.py's GP path.
 
 Unlike LiveGPDataset, there is no oracle Sigma_star/R_star for real data (no
 known generative kernel), so episodes here carry only the ingredients
 y_space_nll needs (z_train/z_test/log_pdf_test/masks) — training.
-aux_mae_weight must be 0 for this source (src/train.py enforces this, same
+aux_mae_weight must be 0 for this source (src/copula_inter/train.py enforces this, same
 constraint _build_era5_val_batches already documents for the era5_fit
 validation probes). z_train/z_test/log_pdf_test come from the SAME frozen
-TabICL K-fold PIT machinery (src/pit.py::run_pit) the data.z_train_source=
+TabICL K-fold PIT machinery (src/copula_inter/pit.py::run_pit) the data.z_train_source=
 tabicl live-generation path already uses for synthetic data — there is no
 "analytic" oracle-PIT option for real data, so a TabICL checkpoint is always
 required here (unlike LiveGPDataset, where tabicl_device is optional).
@@ -23,24 +23,16 @@ required here (unlike LiveGPDataset, where tabicl_device is optional).
 
 from __future__ import annotations
 
-import os
-import sys
 from typing import List, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-_REPO_ROOT = os.path.dirname(_HERE)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
-from live_dataset import _limit_worker_threads, resolve_live_tabicl_num_workers, worker_seed
-from pit import configure_tabicl_inference_amp, load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
-from backend_registry import z_train_source as z_train_source_of
+from copula_inter.live_dataset import _limit_worker_threads, resolve_live_tabicl_num_workers, worker_seed
+from copula_inter.pit import configure_tabicl_inference_amp, load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
+from copula_inter.backend_registry import z_train_source as z_train_source_of
 
 from eval.data.era5_global_corpus import GlobalERA5Corpus, load_shared_corpus_arrays
 
@@ -110,7 +102,7 @@ def _resolve_marginal(cfg) -> Tuple[Optional[str], int]:
     treated as TabICL here rather than silently producing oracle z -- the
     same thing this module did before any backend was selectable.
     """
-    from live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
+    from copula_inter.live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
 
     z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
@@ -132,7 +124,7 @@ def _backend_pit_batched(
     same contract data_gen.py's marginal_backend branch uses, so the Jacobian
     is applied by _pit_group/_pit_episode below exactly as for TabICL.
     """
-    from data_gen import _BATCHED_MARGINAL_BACKENDS
+    from copula_inter.data_gen import _BATCHED_MARGINAL_BACKENDS
 
     run_batched = _BATCHED_MARGINAL_BACKENDS[backend]()
     out = run_batched(
@@ -152,7 +144,7 @@ def _pit_episode(
 ) -> Optional[dict]:
     """z_train/z_test/log_pdf_test for one (x_train, y_train, x_test, y_test)
     real-ERA5 episode, via the same run_pit + normalize_targets convention
-    src/train.py::_tabicl_pit_batch uses per-episode inside its batch loop.
+    src/copula_inter/train.py::_tabicl_pit_batch uses per-episode inside its batch loop.
     Returns None if there's too little context for run_pit's fold split."""
     if x_train.shape[0] < 2 or x_test.shape[0] < 1:
         return None
@@ -195,7 +187,7 @@ def _pit_group(
     """Batched sibling of `_pit_episode`: PITs a whole *group* of B episodes
     that all share P/N (see LiveERA5Dataset.__iter__'s grouped sampling) in
     ONE run_pit_batched call instead of B separate run_pit calls -- mirrors
-    src/live_dataset.py::LiveGPDataset's group_size mechanism, cutting
+    src/copula_inter/live_dataset.py::LiveGPDataset's group_size mechanism, cutting
     TabICL's own per-call Python/CUDA-launch overhead from B*(k_folds+1)
     invocations to k_folds+1 (see run_pit_batched's docstring).
 
@@ -491,7 +483,7 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
     training, same rationale as the GP path's fixed val batches.
 
     This is separate from — and complements — the era5_fit/<region>
-    validation probes (src/train.py::_build_era5_val_batches, cfg.baselines.
+    validation probes (src/copula_inter/train.py::_build_era5_val_batches, cfg.baselines.
     era5_*): those score a handful of fixed, curated named regions; this is
     the live-training-loop's own held-out slice of the worldwide random
     corpus distribution the model is being finetuned on.

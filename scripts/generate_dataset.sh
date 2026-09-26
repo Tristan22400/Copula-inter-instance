@@ -15,7 +15,7 @@
 #     oarsub -S "./scripts/generate_dataset.sh data.n_tasks=5000 data.kernel=cosine"
 #
 # GEN_WORKERS: how many generate_pit_dataset.py processes to run concurrently
-# against the single allocated GPU (data.py's src/data_gen.py::generate_gp_batch
+# against the single allocated GPU (data.py's src/copula_inter/data_gen.py::generate_gp_batch
 # spends much of its time on host-side Python/kernel-construction work between
 # GPU calls, so one process alone leaves the GPU idle a large fraction of the
 # time -- measured 0-45% utilization, <2GB of 24GB VRAM used, from a single
@@ -38,15 +38,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/.."
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
-# ----- Env -----
-source ~/thoth_storage/miniconda3/etc/profile.d/conda.sh
-conda activate multivariate-icl
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 DEFAULT_WORKERS=$(( $(nproc) / 2 ))
 [ "$DEFAULT_WORKERS" -lt 1 ] && DEFAULT_WORKERS=1
@@ -63,7 +56,7 @@ echo "[$(date +%H:%M:%S)] Generating PIT dataset with GEN_WORKERS=$GEN_WORKERS (
 echo "    overrides: $*"
 
 if [ "$GEN_WORKERS" -le 1 ]; then
-    python src/generate_pit_dataset.py "$@"
+    python -m copula_inter.generate_pit_dataset "$@"
     echo "[$(date +%H:%M:%S)] Generation complete."
     exit 0
 fi
@@ -82,10 +75,10 @@ run_worker() {
     local attempt=0
     while true; do
         if [ "$attempt" -eq 0 ]; then
-            python src/generate_pit_dataset.py "$@" worker_id="$worker_id" num_workers="$GEN_WORKERS" \
+            python -m copula_inter.generate_pit_dataset "$@" worker_id="$worker_id" num_workers="$GEN_WORKERS" \
                 >> "$out" 2>> "$err" && return 0
         else
-            python src/generate_pit_dataset.py "$@" worker_id="$worker_id" num_workers="$GEN_WORKERS" data.resume=true \
+            python -m copula_inter.generate_pit_dataset "$@" worker_id="$worker_id" num_workers="$GEN_WORKERS" data.resume=true \
                 >> "$out" 2>> "$err" && return 0
         fi
         attempt=$((attempt + 1))

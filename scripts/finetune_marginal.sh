@@ -7,8 +7,8 @@
 #
 # Phase A — fine-tune a standalone TabICL so its MARGINAL posterior predictive
 # is correct for the GP prior the copula is trained on
-# (src/finetune_marginal.py). This trains nothing jointly with the copula; the
-# output is a drop-in tabicl.pit_ckpt for a later src/train.py run.
+# (src/copula_inter/finetune_marginal.py). This trains nothing jointly with the copula; the
+# output is a drop-in tabicl.pit_ckpt for a later src/copula_inter/train.py run.
 #
 # Prerequisites:
 #   * the ERA5 mixture corpus (one-time, needs network not GPU -- run on a
@@ -30,21 +30,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/.."
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
-# ----- Env (mirrors scripts/finetune_era5.sh) -----
-CONDA_BASE="$HOME/thoth_storage/miniconda3"
-CONDA_ENV="$CONDA_BASE/envs/multivariate-icl"
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-else
-    source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
-fi
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # See scripts/train.sh: loading the TabICL marginal does a slow HF Hub HEAD
 # check even when fully cached. Skip it once cached.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
@@ -91,10 +78,10 @@ echo "[$(date +%H:%M:%S)] Checkpoint dir: ${CKPT_DIR:-default from conf (./check
 echo "[$(date +%H:%M:%S)] Phase A: marginal fine-tuning..."
 echo "    overrides: $*"
 
-python src/finetune_marginal.py "${EXTRA_OVERRIDES[@]}" "$@"
+python -m copula_inter.finetune_marginal "${EXTRA_OVERRIDES[@]}" "$@"
 
 echo "[$(date +%H:%M:%S)] Phase A complete."
 echo "Next:"
 echo "  1) re-measure:  python eval/runners/marginal_calibration_eval.py --ckpt <the _final.pt>"
 echo "  2) forgetting gate:  python eval/runners/run_benchmarks.py"
-echo "  3) Phase B:     python src/train.py tabicl.pit_ckpt=<the _final.pt>"
+echo "  3) Phase B:     python -m copula_inter.train tabicl.pit_ckpt=<the _final.pt>"

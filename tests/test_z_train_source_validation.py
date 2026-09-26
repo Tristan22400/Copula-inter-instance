@@ -43,13 +43,13 @@ from __future__ import annotations
 import pytest
 from omegaconf import OmegaConf
 
-from live_dataset import (
+from copula_inter.live_dataset import (
     _VALID_Z_TRAIN_SOURCES,
     _validate_z_train_source,
     build_fixed_live_val_batches,
     build_live_train_loader,
 )
-from train import _reserve_gpu_headroom_for_live_tabicl
+from copula_inter.train import _reserve_gpu_headroom_for_live_tabicl
 
 
 @pytest.mark.parametrize(
@@ -126,7 +126,7 @@ def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg):
     import torch
     from omegaconf import OmegaConf as OC
 
-    from data_gen import generate_gp_batch
+    from copula_inter.data_gen import generate_gp_batch
 
     cfg = OC.create(OC.to_container(small_cfg, resolve=True))
     cfg.data.P_min = cfg.data.P_max = 8
@@ -144,7 +144,7 @@ def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg):
     import torch
     from omegaconf import OmegaConf as OC
 
-    from data_gen import generate_gp_batch
+    from copula_inter.data_gen import generate_gp_batch
 
     cfg = OC.create(OC.to_container(small_cfg, resolve=True))
     cfg.data.P_min = cfg.data.P_max = 8
@@ -164,7 +164,7 @@ def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg):
 
 
 def test_generate_pit_dataset_rejects_y_train_on_disk():
-    from generate_pit_dataset import _reject_disk_unsupported_z_train_source
+    from copula_inter.generate_pit_dataset import _reject_disk_unsupported_z_train_source
 
     with pytest.raises(ValueError, match="only supported under training.live_generation"):
         _reject_disk_unsupported_z_train_source("y_train")
@@ -172,7 +172,7 @@ def test_generate_pit_dataset_rejects_y_train_on_disk():
 
 
 def test_missing_z_train_source_defaults_to_tabicl():
-    from backend_registry import z_train_source
+    from copula_inter.backend_registry import z_train_source
 
     assert z_train_source(OmegaConf.create({"data": {}})) == "tabicl"
     assert z_train_source(OmegaConf.create({})) == "tabicl"

@@ -13,11 +13,11 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from artifacts import atomic_torch_save
-from backend_registry import BACKENDS, COPULA_BACKBONES, GENERIC_MARGINAL_BACKENDS, require_capability
-from dataset import CopulaDataset, collate_fn
-from dataset_manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
-from episode_contracts import assemble_episodes, validate_episode
+from copula_inter.artifacts import atomic_torch_save
+from copula_inter.backend_registry import BACKENDS, COPULA_BACKBONES, GENERIC_MARGINAL_BACKENDS, require_capability
+from copula_inter.dataset import CopulaDataset, collate_fn
+from copula_inter.dataset_manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
+from copula_inter.episode_contracts import assemble_episodes, validate_episode
 from eval.results import (
     competition_ranks, load_results_cache, render_saved_totals,
     require_coverage, save_results_cache,
@@ -27,8 +27,8 @@ from eval.runners.eval_checkpoint import (
 )
 from eval.spatial.marginal_backends import _exaone_capture_quantile_bank
 from eval.spatial.marginal_backends import BACKEND_NAMES
-from generate_pit_dataset import _refresh_meta, _save_shard_atomic
-from marginal_backbones import TIER0_PATTERNS
+from copula_inter.generate_pit_dataset import _refresh_meta, _save_shard_atomic
+from copula_inter.marginal_backbones import TIER0_PATTERNS
 
 
 def _episode(p: int = 3, n: int = 2, d: int = 4) -> dict:
@@ -222,7 +222,7 @@ def test_backend_registry_capabilities() -> None:
 
 def test_training_core_import_does_not_load_reporting_or_era5() -> None:
     subprocess.run(
-        [sys.executable, "-c", "import sys, training_core; "
+        [sys.executable, "-c", "import sys, copula_inter.training_core; "
          "assert not any(name == 'wandb' or name.startswith(('matplotlib', 'eval.data.era5')) "
          "for name in sys.modules)"],
         check=True,

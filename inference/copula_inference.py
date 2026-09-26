@@ -1,7 +1,7 @@
 """copula_inference.py — reusable inference API for the copula inter-instance model.
 
-Thin wrappers around existing repo internals (``src/pit.py``, ``src/model.py``,
-``src/data_gen.py``) plus new code for sampling correlated trajectories and for
+Thin wrappers around existing repo internals (``src/copula_inter/pit.py``, ``src/copula_inter/model.py``,
+``src/copula_inter/data_gen.py``) plus new code for sampling correlated trajectories and for
 loading/querying the real PFN4BO baseline. No hardcoded paths or experiment
 logic lives here — every path is an argument.
 
@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from typing import Optional
 
 import numpy as np
@@ -51,14 +50,10 @@ from scipy.stats import norm
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
 _PFNS4BO_ROOT = os.path.join(_REPO_ROOT, "pfns4bo_upstream")
-for _p in (_SRC, _PFNS4BO_ROOT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from model import CopulaTabICL, build_copula_transformer, low_rank_correlation  # noqa: E402
-from pit import load_tabicl, normalize_targets, run_pit  # noqa: E402
+from copula_inter.model import CopulaTabICL, build_copula_transformer, low_rank_correlation  # noqa: E402
+from copula_inter.pit import load_tabicl, normalize_targets, run_pit  # noqa: E402
 
 __all__ = [
     "normalize_features",
@@ -76,12 +71,12 @@ __all__ = [
 def normalize_features(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Z-score features to match the training-time convention.
 
-    ``src/data_gen.py::generate_gp_batch`` standardizes ``x`` to zero-mean /
+    ``src/copula_inter/data_gen.py::generate_gp_batch`` standardizes ``x`` to zero-mean /
     unit-std **jointly over the full train+test sequence within one episode**
     (``x_norm = (x_raw - x_raw.mean(1)) / x_raw.std(1)``, computed before the
     train/test split) — neither TabICL's forward pass nor ``CopulaTabICL``
-    do any further normalization internally (``src/pit.py::run_pit`` and
-    ``src/model.py`` both take ``x`` as-is). Every other function in this
+    do any further normalization internally (``src/copula_inter/pit.py::run_pit`` and
+    ``src/copula_inter/model.py`` both take ``x`` as-is). Every other function in this
     module therefore expects its ``X_train``/``X_test`` arguments to already
     be on this scale; call this first if your raw features aren't already
     zero-mean/unit-std (e.g. a ``[0, 1]`` grid, or real-world units).
@@ -214,7 +209,7 @@ def loo_pit(
     Despite the name (kept for parity with the "leave-one-out" framing this
     is usually described with), the default is **K-fold** partitioning
     (``k_folds=10``), not true LOO — this matches the rest of the repo's
-    dataset-generation convention (``src/pit.py::DEFAULT_K_FOLDS``): true LOO
+    dataset-generation convention (``src/copula_inter/pit.py::DEFAULT_K_FOLDS``): true LOO
     (``k_folds=len(X_train)``) is more accurate but ~K_loo/k_folds times
     slower. Pass ``k_folds=len(X_train)`` for true LOO.
 

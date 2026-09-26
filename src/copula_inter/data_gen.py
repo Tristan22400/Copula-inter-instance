@@ -237,10 +237,9 @@ from gpytorch.utils.cholesky import psd_safe_cholesky
 from gpytorch.utils.errors import NanError, NotPSDError
 from torch import Tensor
 
-from loss import _safe_cholesky
-from episode_contracts import assemble_episodes
-from feature_transforms import (
-    _MLP_MIX_ACTIVATIONS, _apply_mlp_activation,
+from copula_inter.loss import _safe_cholesky
+from copula_inter.episode_contracts import assemble_episodes
+from copula_inter.feature_transforms import (
     apply_mlp_feature_mixing, apply_kernel_hidden_warp,
 )
 
@@ -264,7 +263,7 @@ _MAX_CHOLESKY = 8192
 # -- it falls through to the generic per-episode loop in _generate_gp_batch_raw
 # -- it is just orders of magnitude slower per episode, which matters for
 # live generation and not for offline dataset building.
-from backend_registry import batched_backend_factories
+from copula_inter.backend_registry import batched_backend_factories
 
 _BATCHED_MARGINAL_BACKENDS: Dict[str, Callable[[], Callable]] = batched_backend_factories()
 
@@ -2746,7 +2745,7 @@ def apply_structural_feature_warp(x: Tensor, cfg, device) -> Tensor:
 # diagnostic): CopulaTabICL is trained exclusively on the EXACT closed-form
 # GP-LOO whitened residual computed just below, but at deployment on any
 # dataset without a known generating kernel (e.g. real ERA5), z_train can
-# only be estimated via src/pit.py::run_pit's K-fold TabICL-marginal quantile
+# only be estimated via src/copula_inter/pit.py::run_pit's K-fold TabICL-marginal quantile
 # PIT -- measured to recover only a fraction of the correlation with the
 # true whitened residual, flat across k_folds (not a fold-size artifact).
 # The trained model turned out to have essentially zero tolerance for this:
@@ -3617,7 +3616,7 @@ def _generate_gp_batch_raw(
         # x_norm_calib/y_calib are never referenced again after this call,
         # so they're discarded (not packed into `tensors` below) simply by
         # falling out of scope.
-        from pit import run_pit_calib_split_batched  # local: pit.py imports from this module
+        from copula_inter.pit import run_pit_calib_split_batched  # local: pit.py imports from this module
 
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
@@ -3653,7 +3652,7 @@ def _generate_gp_batch_raw(
         # checkpoint). Unconditional now (previously gated behind a
         # data.z_train_matched_test flag defaulting to False, which would
         # have reproduced the bug for anyone who forgot to opt in).
-        from pit import run_pit_batched  # local: pit.py imports from this module
+        from copula_inter.pit import run_pit_batched  # local: pit.py imports from this module
 
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)

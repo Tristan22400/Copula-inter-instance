@@ -20,15 +20,12 @@ from __future__ import annotations
 
 import glob
 import os
-import sys
 import time
 
 import netCDF4
 import numpy as np
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
 
 from eval.data.fetch_era5_static import STATIC_VARS, fetch_static, load_static
 

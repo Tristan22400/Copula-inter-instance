@@ -24,7 +24,7 @@ Tests verify:
      the oracle values, unlike the plain "tabicl" path in (3) -- same
      never-perturbs-n_train guarantee as tabicl_k_folds's override.
   6. run_pit_batched_grad (the Phase-A marginal-finetuning entry point, see
-     src/finetune_marginal.py) is numerically identical to run_pit_batched --
+     src/copula_inter/finetune_marginal.py) is numerically identical to run_pit_batched --
      they share one private body precisely so they cannot drift, and this is
      what proves the sharing actually holds.
   7. return_quantiles=True is purely additive: it does not perturb z_train/
@@ -37,9 +37,9 @@ import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
-from data_gen import _generate_gp_batch_raw
+from copula_inter.data_gen import _generate_gp_batch_raw
 from inference.copula_inference import loo_pit
-from pit import (
+from copula_inter.pit import (
     _run_pit_batched_impl,
     run_pit,
     run_pit_batched,
@@ -580,7 +580,7 @@ def test_return_quantiles_is_additive_and_self_consistent():
     assert extra["q_test"].shape == (B, N, 1, 7)
     # u_test is the CDF the returned quantiles imply, so probit(u) must be the
     # z_test that came back alongside them.
-    from pit import _probit
+    from copula_inter.pit import _probit
 
     assert torch.allclose(_probit(extra["u_test"], 1e-6), extra["z_test"], atol=0)
     assert torch.allclose(_probit(extra["u_train"], 1e-6), extra["z_train"], atol=0)

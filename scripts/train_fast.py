@@ -14,7 +14,7 @@ e.g. debugging a run that looks stuck.
 This script builds the exact same Hydra config train.py would (same
 `model=`/`data=` groups and CLI overrides), the exact same model, optimizer
 (Muon), LR schedule, AMP setup, and per-step forward/loss/backward/clip/step
-logic — imported directly from src/train.py, not reimplemented, so a step
+logic — imported directly from src/copula_inter/train.py, not reimplemented, so a step
 here behaves identically to a step in the real run. It only diverges from
 train.py in what it skips: no baselines/era5 probes, no wandb, no persistent
 DataLoader workers, and a small in-process-generated validation set instead
@@ -64,27 +64,21 @@ os.environ.setdefault("WANDB_MODE", "disabled")
 # non-tty stdout. Without this, output can sit in the buffer indefinitely.
 sys.stdout.reconfigure(line_buffering=True)
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 
-from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
-from dataset import collate_fn
-from model import build_copula_transformer
-from muon import Muon
-from pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
-from training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
-from backend_registry import TABICL_Z_TRAIN_SOURCES
-from backend_registry import z_train_source as z_train_source_of
-from train import (
+from copula_inter.data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
+from copula_inter.dataset import collate_fn
+from copula_inter.model import build_copula_transformer
+from copula_inter.muon import Muon
+from copula_inter.pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
+from copula_inter.training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
+from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import z_train_source as z_train_source_of
+from copula_inter.train import (
     _sigma_stats,
     load_checkpoint,
     save_checkpoint,
@@ -243,7 +237,7 @@ def main(cfg: DictConfig) -> None:
                 f"max_frac={max_frac} needs the adaptive per-kernel-family gap "
                 "measurement train_fast.py deliberately skips -- set both to the same "
                 "fixed mixing fraction (e.g. 0.5 for a 50/50 alternation), or run "
-                "src/train.py directly for the adaptive version."
+                "src/copula_inter/train.py directly for the adaptive version."
             )
         tabicl_mix_weights = torch.full((len(_COMPOSABLE_KERNELS),), floor_frac, dtype=torch.float32)
 

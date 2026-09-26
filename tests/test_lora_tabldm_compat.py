@@ -1,7 +1,7 @@
 """test_lora_tabldm_compat.py — the assumption that lets Phase-A tier >= 1
 (LoRA) work on a Xiaomi-TabLDM backbone as well as a TabICL one.
 
-src/lora.py's LoRAMultiheadAttention is written against TabICL's
+src/copula_inter/lora.py's LoRAMultiheadAttention is written against TabICL's
 MultiheadAttention internals (in_proj_weight as one raw 3D x D Parameter,
 tabicl's own multi_head_attention_forward, its rope/kv-cache types). TabLDM
 forks that stack verbatim, so the adapter is a legitimate drop-in there --
@@ -20,17 +20,9 @@ unreachable for TabLDM for that reason alone.
 from __future__ import annotations
 
 import inspect
-import os
-import sys
 
 import pytest
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src"),
-           os.path.join(_REPO_ROOT, "tabicl_upstream", "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 pytest.importorskip("tabldm", reason="Xiaomi-TabLDM not installed")
 
@@ -53,14 +45,14 @@ def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path, symbo
     tabldm_sym = getattr(importlib.import_module(f"tabldm.{module_path}"), symbol)
     assert inspect.getsource(tabicl_sym) == inspect.getsource(tabldm_sym), (
         f"tabldm.{module_path}.{symbol} has diverged from tabicl's. "
-        "src/lora.py::_get_mha_class assumes they are identical -- either "
+        "src/copula_inter/lora.py::_get_mha_class assumes they are identical -- either "
         "port the difference into LoRAMultiheadAttention or drop TabLDM from "
         "that tuple."
     )
 
 
 def test_get_mha_class_includes_both():
-    from lora import _get_mha_class
+    from copula_inter.lora import _get_mha_class
 
     from tabicl._model.layers import MultiheadAttention as TabICLMHA
     from tabldm._model.layers import MultiheadAttention as TabLDMMHA
@@ -77,7 +69,7 @@ def test_apply_lora_installs_adapters_on_a_tabldm_backbone():
     import numpy as np
     from tabldm import TabLDMRegressor
 
-    from lora import apply_lora
+    from copula_inter.lora import apply_lora
 
     rng = np.random.default_rng(0)
     X = rng.normal(size=(20, 3)).astype(np.float32)

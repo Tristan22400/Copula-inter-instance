@@ -45,8 +45,8 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import generate_gp_batch
-from pit import gp_analytical_pit, gp_analytical_posterior
+from copula_inter.data_gen import generate_gp_batch
+from copula_inter.pit import gp_analytical_pit, gp_analytical_posterior
 
 
 def _episodes(small_cfg, b=24, seed=0):

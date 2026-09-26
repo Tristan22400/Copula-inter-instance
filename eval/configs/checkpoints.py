@@ -122,7 +122,7 @@ def all_family_names() -> list[str]:
 # ---------------------------------------------------------------------------
 #
 # These are plain TabICL checkpoints ({"config", "state_dict"}) produced by
-# src/finetune_marginal.py and consumed by pit.load_tabicl. CHECKPOINT_FAMILIES
+# src/copula_inter/finetune_marginal.py and consumed by pit.load_tabicl. CHECKPOINT_FAMILIES
 # above holds COPULA checkpoints, consumed by builders that construct a
 # CopulaTabICL and load a copula state dict into it. Putting a marginal entry in
 # that dict would make `sweep --checkpoints all` (which iterates

@@ -75,7 +75,7 @@ def main():
         try:
             run_command(
                 [
-                    "python", "src/generate_pit_dataset.py",
+                    "python", "-m", "copula_inter.generate_pit_dataset",
                     f"data.kernel={kernel}",
                     f"data.n_tasks={args.n_episodes}",
                     f"data.dataset_dir={dataset_dir}",

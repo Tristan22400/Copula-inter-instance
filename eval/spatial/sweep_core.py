@@ -37,7 +37,6 @@ from eval.spatial.diagnostics import (
     extract_model_context_correlation,
     extract_model_dummy_context_correlation,
     fit_theoretical_law,
-    get_ground_truth_observations,
     load_marginal_tabicl,
     pair_counts_by_distance,
     pool_yspace_samples_and_correlate,
@@ -45,8 +44,8 @@ from eval.spatial.diagnostics import (
 )
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import normalize_features
-from loss import gp_oracle_y_nll
-from pit import resolve_pit_ckpt
+from copula_inter.loss import gp_oracle_y_nll
+from copula_inter.pit import resolve_pit_ckpt
 
 __all__ = [
     "get_model", "run_real_config", "run_synthetic_config", "build_era5_probe",
@@ -65,7 +64,7 @@ _GP_BASELINE_CACHE: dict = {}
 # Separate from _MODEL_CACHE: a public sklearn-style TabICLRegressor used
 # ONLY for one-shot (non-K-fold) marginal quantile grids at held-out
 # joint-NLL test points in run_real_config -- a different interface from
-# `marginal` (src/pit.py::load_tabicl, K-fold PIT for context z_train), same
+# `marginal` (src/copula_inter/pit.py::load_tabicl, K-fold PIT for context z_train), same
 # tabicl_quantiles helper eval/runners/run_benchmarks.py already uses.
 _TABICL_REGRESSOR_CACHE: dict = {}
 
@@ -84,7 +83,7 @@ def get_model(ckpt: str, device: "str | None" = None):
 
 def _get_tabicl_regressor(source: "str | None", device: str):
     """Sklearn-wrapper TabICLRegressor for `source` (see
-    src/pit.py::resolve_pit_ckpt), cached per (source, device).
+    src/copula_inter/pit.py::resolve_pit_ckpt), cached per (source, device).
 
     `source` MUST be resolve_pit_ckpt(cfg) for whichever checkpoint's
     R_context this regressor's qgrid will be paired with in
@@ -174,7 +173,7 @@ def _fit_gp_baseline_nll(
     OWN-MARGINAL Sklar convention as the model's own real-ERA5 nll_total
     (see eval/metrics/joint_nll.py's "NAMING TRAP" note) — so the two are
     directly comparable. Reuses eval/baselines/classical.py::
-    fit_and_eval_gpytorch (GP-MLE+MAP-prior fit) + src/loss.py::
+    fit_and_eval_gpytorch (GP-MLE+MAP-prior fit) + src/copula_inter/loss.py::
     gp_oracle_y_nll (closed-form Gaussian Y-space NLL), the same machinery
     eval_checkpoint.py uses for the synthetic-episode path.
 
@@ -398,7 +397,7 @@ def run_synthetic_config(
     device: "str | None" = None, n_bins: int = N_BINS,
 ) -> dict:
     """Synthetic config: sample a KNOWN ground-truth covariance directly
-    from one src/data_gen.py kernel (exact, zero estimation noise) and score
+    from one src/copula_inter/data_gen.py kernel (exact, zero estimation noise) and score
     how well the checkpoint's context-conditioned forward pass recovers it.
     """
     model, cfg, resolved_device, marginal = get_model(ckpt, device)
@@ -450,7 +449,7 @@ def build_era5_probe(
     """Frozen real-ERA5 (context, target-grid, ground-truth correlogram)
     probe for `region_name` — the training-loop analogue of `run_real_config`
     above, split into a model-INDEPENDENT precompute step. Meant to be called
-    ONCE (see src/train.py::_build_era5_val_batches), not per validate() call.
+    ONCE (see src/copula_inter/train.py::_build_era5_val_batches), not per validate() call.
 
     Unlike a GP-generated episode, real ERA5 has no known oracle Sigma_star /
     R_star, so there is no NLL-GAP metric here (nothing to subtract a model
@@ -473,7 +472,7 @@ def build_era5_probe(
     train.py::_tabicl_pit_batch, built from this function's
     nll_test_idx/context_values_per_day/nll_test_values_per_day) both go
     through the same PIT machinery — eval.spatial.diagnostics.
-    compute_context_z_train / src/pit.py::run_pit — but only once per probe
+    compute_context_z_train / src/copula_inter/pit.py::run_pit — but only once per probe
     day here instead of once per validate() call: `tabicl_marginal` never
     changes during training, so re-running PIT on the same (context, values)
     every call would just recompute an identical result (mirrors

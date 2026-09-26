@@ -6,7 +6,7 @@ grid.
 This is what makes "different resolutions, different geographic space" a
 per-training-episode draw instead of a fixed handful of pre-fetched regions:
 once the global grid is on disk, every crop is pure in-memory numpy slicing
-(no GCS round-trip), so src/era5_live_dataset.py can afford to draw a fresh
+(no GCS round-trip), so src/copula_inter/era5_live_dataset.py can afford to draw a fresh
 region/resolution/day every single training episode.
 """
 
@@ -48,7 +48,7 @@ class GlobalERA5Corpus:
         Fine for a single-process use (e.g. build_era5_fixed_val_batches).
       - `GlobalERA5Corpus.from_shared(shared)`: attaches to arrays another
         process already loaded via `load_shared_corpus_arrays` and put in
-        shared memory -- what src/era5_live_dataset.py's DataLoader workers
+        shared memory -- what src/copula_inter/era5_live_dataset.py's DataLoader workers
         use, so `live_tabicl_num_workers` copies of this corpus don't each
         cost their own ~15GB of system RAM.
     """
@@ -256,9 +256,9 @@ class GlobalERA5Corpus:
         axis. That makes every successful draw's P (`n_context`) and N
         (`grid_size**2 - n_context`) identical, letting a caller collect a
         whole *group* of episodes (region/day/box_deg still vary per draw)
-        that share P/N -- required for src/pit.py::run_pit_batched, which
+        that share P/N -- required for src/copula_inter/pit.py::run_pit_batched, which
         can only PIT a batch of episodes in one TabICL call when they all
-        share P/N. Mirrors src/live_dataset.py::LiveGPDataset's group_size
+        share P/N. Mirrors src/copula_inter/live_dataset.py::LiveGPDataset's group_size
         mechanism (see its docstring: group_size=1 measured ~1.2s/episode of
         TabICL PIT overhead vs ~0.03s/episode grouped).
         """
@@ -323,13 +323,13 @@ def load_shared_corpus_arrays(cache_dir: str) -> dict:
     -- share_memory_() tensors created ahead of spawn are what let
     torch.multiprocessing's spawn-safe pickling hand out a shared-memory
     handle to each worker instead of serializing (copying) the full array,
-    exactly the pattern src/live_dataset.py::build_live_train_loader already
+    exactly the pattern src/copula_inter/live_dataset.py::build_live_train_loader already
     uses for kernel_weights/tabicl_mix_weights (see LiveGPDataset's
     docstring) -- applied here to O(10GB) corpus data instead of a
     handful-of-floats tensor. Removes the RAM-per-worker constraint that
     used to force live_tabicl_num_workers down to 1 regardless of GPU
     headroom: with one shared copy total regardless of worker count,
-    src/era5_live_dataset.py::build_era5_train_loader now sizes
+    src/copula_inter/era5_live_dataset.py::build_era5_train_loader now sizes
     live_tabicl_num_workers via live_dataset.py's plain GPU-only-bound
     resolve_live_tabicl_num_workers, same as the synthetic-GP path.
     """

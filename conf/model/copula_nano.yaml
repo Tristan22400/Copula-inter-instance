@@ -18,18 +18,18 @@
 # this width+depth cut.
 #
 # NOTE: previously held a dead d_model/n_heads/n_layers_s1/s2/s3/n_inducing/
-# n_cls/p_max/d_max schema that build_copula_transformer (src/model.py) never
+# n_cls/p_max/d_max schema that build_copula_transformer (src/copula_inter/model.py) never
 # read — orphaned since the repo's initial commit.
 #
 # Usage:
-#   python src/train.py model=copula_nano \
+#   python -m copula_inter.train model=copula_nano \
 #     data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \
 #     training.live_generation=true training.ckpt_dir=./checkpoints/copula_nano
 model:
   rank: 128                  # same head rank as copula_prod; backbone is smaller
   sigma_jitter: 1.0e-4
   unfreeze_backbone: true
-  # Which src/correlation_factory.py builder turns the copula head's raw
+  # Which src/copula_inter/correlation_factory.py builder turns the copula head's raw
   # output into a valid low-rank correlation matrix: covnorm (default,
   # matches the original hard-coded implementation) | cossim | tanhnorm |
   # sparse_covnorm. Override from CLI, e.g. model.correlation_parametrization=cossim.
@@ -85,13 +85,13 @@ training:
 tabicl:
   pretrained: false
   recompute: false
-  # z_train sim-to-real diagnostic (src/train.py::_build_tabicl_val_z) needs
+  # z_train sim-to-real diagnostic (src/copula_inter/train.py::_build_tabicl_val_z) needs
   # a frozen TabICL copy with its pretrained quantile head to PIT val
   # episodes — independent of this run's own from-scratch backbone above, so
   # it's set here explicitly rather than inherited from `pretrained: false`.
   # Same checkpoint copula_prod.yaml's backbone loads; only ever used frozen,
   # for validation, never trained. Phase A ERA5 fine-tune of the frozen
-  # TabICL marginal (src/finetune_marginal.py), swapped in for the pretrained
+  # TabICL marginal (src/copula_inter/finetune_marginal.py), swapped in for the pretrained
   # HF checkpoint.
   pit_ckpt: checkpoints/marginal/ablations/marginal_finetune_era5_run1/step_0177600_final.pt
   arch:

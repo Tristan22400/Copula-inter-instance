@@ -4,22 +4,22 @@ Fine-tunes a STANDALONE TabICL (quantile decoder intact) so its marginal
 posterior predictive is correct for the GP prior the copula is trained on, then
 writes it in TabICL's own checkpoint schema so the copula run picks it up with:
 
-    python src/train.py tabicl.pit_ckpt=<checkpoints/marginal_finetune/...pt>
+    python -m copula_inter.train tabicl.pit_ckpt=<checkpoints/marginal_finetune/...pt>
 
 Usage
 -----
-    python src/finetune_marginal.py
-    python src/finetune_marginal.py marginal.tier=1 training.lr=2e-5
-    python src/finetune_marginal.py wandb.mode=disabled training.steps=20   # smoke
+    python -m copula_inter.finetune_marginal
+    python -m copula_inter.finetune_marginal marginal.tier=1 training.lr=2e-5
+    python -m copula_inter.finetune_marginal wandb.mode=disabled training.steps=20   # smoke
 
 A real Hydra application, not an argparse -> override translator that shells out
-to train.py the way ``src/finetune_era5.py`` does: the Phase-A objective needs
+to train.py the way ``src/copula_inter/finetune_era5.py`` does: the Phase-A objective needs
 its own model construction, its own loss and its own validation, so there is no
 train.py invocation to translate INTO. Every knob is therefore a normal Hydra
 override and the composed config is snapshotted into each checkpoint.
 
 Why this is a separate loop rather than a ``training.objective: marginal`` branch
-inside ``src/train.py``: that file's ~3000-line ``main`` is built end to end
+inside ``src/copula_inter/train.py``: that file's ~3000-line ``main`` is built end to end
 around the copula path — live GP/ERA5 DataLoaders whose workers each hold their
 own frozen TabICL, the copula head, z_train collation, Sigma diagnostics,
 correlogram probes, Muon param groups. Phase A shares none of it: no DataLoader
@@ -39,7 +39,6 @@ from __future__ import annotations
 import math
 import os
 import random
-import sys
 import time
 
 import hydra
@@ -47,37 +46,31 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_HERE, _REPO_ROOT, os.path.join(_REPO_ROOT, "tabicl_upstream", "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from data_gen import generate_gp_batch  # noqa: E402
-from artifacts import atomic_torch_save
-from config_path import config_dir
-from marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0  # noqa: E402
-from marginal_backbones import MarginalBackbone  # noqa: E402
-from marginal_backbones import (  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch  # noqa: E402
+from copula_inter.artifacts import atomic_torch_save
+from copula_inter.config_path import config_dir
+from copula_inter.marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0  # noqa: E402
+from copula_inter.marginal_backbones import MarginalBackbone  # noqa: E402
+from copula_inter.marginal_backbones import (  # noqa: E402
     assert_patterns_match,
     kfold_quantiles_grad,
     load_backbone,
     resolve_tier,
 )
-from pit import load_tabicl  # noqa: E402
-from training_core import cosine_lr_lambda  # noqa: E402
-
+from copula_inter.pit import load_tabicl  # noqa: E402
+from copula_inter.training_core import cosine_lr_lambda  # noqa: E402
 
 
 import zlib
 from typing import Callable, Optional, Sequence
 import torch.nn as nn
-from lora import (
+from copula_inter.lora import (
     apply_lora,
     apply_lora_all_layers,
     merged_base_state_dict_any,
 )
-from pit import (
+from copula_inter.pit import (
     DEFAULT_K_FOLDS,
     _kernel_fn_from_task,
     _mean_train_from_task,
@@ -111,7 +104,7 @@ from pit import (
 # Regex, not substrings: "the norms inside the ICL stack" has no substring
 # spelling that excludes the identically-named norms in col_embedder and
 # row_interactor.
-# Per-architecture, in src/marginal_backbones.py -- TabICL's entry there is
+# Per-architecture, in src/copula_inter/marginal_backbones.py -- TabICL's entry there is
 # character-for-character the tuple that used to live here. Re-exported so
 # existing importers of finetune_marginal.TIER0_PATTERNS keep working.
 TIER0_PATTERNS: tuple[str, ...] = _BACKBONE_TIER0["tabicl"]
@@ -124,7 +117,7 @@ TIER0_PATTERNS: tuple[str, ...] = _BACKBONE_TIER0["tabicl"]
 # answered by climbing this ladder and watching the NLL gap to the analytic
 # oracle plateau (or not).
 #
-# Full fine-tuning is deliberately absent: src/muon.py self-declares Muon "may
+# Full fine-tuning is deliberately absent: src/copula_inter/muon.py self-declares Muon "may
 # not work well for finetuning pretrained models", and full FT risks
 # catastrophic forgetting of the general tabular marginal that is the entire
 # reason a TabICL marginal transfers to real ERA5/UCI data at all.
@@ -774,7 +767,7 @@ def phase_a_batch_loss(
 
     ``tabicl`` may be a raw TabICL module (the original path, scored through
     pit.py::run_pit_batched_grad at TabICL's native quantile levels) or a
-    ``MarginalBackbone`` (src/marginal_backbones.py). For a non-TabICL
+    ``MarginalBackbone`` (src/copula_inter/marginal_backbones.py). For a non-TabICL
     backbone the forward instead goes through
     ``marginal_backbones.kfold_quantiles_grad``, which reproduces pit.py's
     CONTIGUOUS-block fold geometry exactly -- that geometry is what
@@ -1212,7 +1205,7 @@ class ERA5EpisodeSampler:
     every episode shares P/N, so this uses the corpus's
     ``sample_episode_fixed_shape`` (exact grid_size / n_context, redraw on a
     degenerate box) rather than ``sample_episode``'s ranges — the same reason
-    ``src/era5_live_dataset.py`` groups its draws.
+    ``src/copula_inter/era5_live_dataset.py`` groups its draws.
 
     Region, day and box width still vary per episode, so a batch is a genuine
     spread of real spatial fields at one shape, not one field repeated.
@@ -1408,7 +1401,7 @@ def main(cfg: DictConfig) -> None:
 
     # ---- optimizer -------------------------------------------------------
     # AdamW, one group, no ndim split. Two reasons this is not train.py's
-    # Muon setup: src/muon.py's own header warns Muon "may not work well for
+    # Muon setup: src/copula_inter/muon.py's own header warns Muon "may not work well for
     # finetuning pretrained models", which is precisely this; and train.py's
     # positional optimizer-state restore (load_checkpoint matches Adam/Muon
     # moments to params by position in the flattened list) is a hazard the
@@ -1728,7 +1721,7 @@ def main(cfg: DictConfig) -> None:
     if final:
         print(
             "\nPhase A done. Use it as the copula run's marginal with:\n"
-            f"    python src/train.py tabicl.pit_ckpt={os.path.abspath(final)}\n"
+            f"    python -m copula_inter.train tabicl.pit_ckpt={os.path.abspath(final)}\n"
             "and measure it first with:\n"
             f"    python eval/runners/marginal_calibration_eval.py --ckpt {os.path.abspath(final)}"
         )

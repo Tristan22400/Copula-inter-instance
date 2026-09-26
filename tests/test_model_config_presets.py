@@ -31,8 +31,8 @@ import pytest
 import torch
 from conftest import make_batch
 
-from model import build_copula_transformer, build_sigma, low_rank_correlation
-from pit import resolve_pit_ckpt as _resolve_pit_ckpt
+from copula_inter.model import build_copula_transformer, build_sigma, low_rank_correlation
+from copula_inter.pit import resolve_pit_ckpt as _resolve_pit_ckpt
 
 _CONF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "conf")
 

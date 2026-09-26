@@ -18,20 +18,12 @@ Each test here guards a failure that is silent rather than loud:
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src"),
-           os.path.join(_REPO_ROOT, "tabicl_upstream", "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 RANK = 8
 BACKENDS = ["tabldm", "exaone"]
@@ -41,7 +33,7 @@ def _load(name):
     pytest.importorskip(
         {"tabldm": "tabldm", "exaone": "exaonetabular"}[name], reason=f"{name} not installed"
     )
-    from marginal_backbones import load_backbone
+    from copula_inter.marginal_backbones import load_backbone
 
     return load_backbone(name, device="cpu")
 
@@ -49,7 +41,7 @@ def _load(name):
 def test_adapters_are_identity_at_initialisation():
     """B is zero-initialised, so installing adapters must not move a single
     weight -- otherwise every run starts from a perturbed pretrained model."""
-    from lora import apply_lora_all_layers
+    from copula_inter.lora import apply_lora_all_layers
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 8), nn.ReLU(), nn.Linear(8, 4))
@@ -65,7 +57,7 @@ def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern():
     `0.parametrizations.weight.original`, which still matches a prefix-style
     tier-0 pattern. Without the guard that silently full-fine-tunes the layer
     LoRA was just installed on."""
-    from lora import apply_lora_all_layers
+    from copula_inter.lora import apply_lora_all_layers
 
     model = nn.Sequential(nn.Linear(6, 8))
     apply_lora_all_layers(model, rank=RANK, alpha=16.0, also_trainable=(r"^0\.",))
@@ -78,7 +70,7 @@ def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern():
 
 @pytest.mark.parametrize("name", BACKENDS)
 def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name):
-    from lora import apply_lora_all_layers
+    from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
     n_matrices = sum(1 for _, p in bb.module.named_parameters() if p.dim() == 2)
@@ -98,7 +90,7 @@ def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name):
 
 @pytest.mark.parametrize("name", BACKENDS)
 def test_only_adapters_train_and_gradients_reach_them(name):
-    from lora import apply_lora_all_layers
+    from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
     apply_lora_all_layers(bb.module, rank=RANK, alpha=16.0)
@@ -144,7 +136,7 @@ def test_only_adapters_train_and_gradients_reach_them(name):
 def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name, tmp_path):
     """The written file must carry the ORIGINAL names with deltas baked in,
     or the next run's strict load_state_dict fails."""
-    from lora import apply_lora_all_layers
+    from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
     stock_keys = set(bb.module.state_dict().keys())
@@ -165,7 +157,7 @@ def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name, tmp_path
     )
     assert not any(".parametrizations." in k for k in sd)
 
-    from marginal_backbones import load_backbone
+    from copula_inter.marginal_backbones import load_backbone
 
     fresh = load_backbone(name, device="cpu")
     base = fresh.module.state_dict()

@@ -12,7 +12,7 @@ synthetic BBO surrogates), compares three methods that all produce a
 
 All non-trivial inference logic (marginal quantiles, PIT, correlation query,
 trajectory sampling) is imported from inference/copula_inference.py; the
-joint-NLL/energy-score math is imported from src/loss.py via eval/metrics/.
+joint-NLL/energy-score math is imported from src/copula_inter/loss.py via eval/metrics/.
 This script is orchestration only.
 
 Usage:
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import traceback
 from collections import defaultdict
 
@@ -36,10 +35,6 @@ from omegaconf import OmegaConf
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from inference.copula_inference import (  # noqa: E402
     get_test_correlation,

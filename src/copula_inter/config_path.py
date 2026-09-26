@@ -7,5 +7,7 @@ from pathlib import Path
 
 
 def config_dir(caller_file: str) -> str:
-    checkout = Path(caller_file).resolve().parent.parent / "conf"
-    return str(checkout if checkout.is_dir() else files("conf"))
+    for parent in Path(caller_file).resolve().parents:
+        if (parent / "conf" / "config.yaml").is_file():
+            return str(parent / "conf")
+    return str(files("conf"))

@@ -6,16 +6,13 @@ values and gradients whether it is handed that Σ dense (O(N³) Cholesky) or
 factored (O(N r²)).
 """
 
-import os
-import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from loss import y_space_nll  # noqa: E402
-from model import low_rank_correlation, low_rank_correlation_factor  # noqa: E402
+from copula_inter.loss import y_space_nll  # noqa: E402
+from copula_inter.model import low_rank_correlation, low_rank_correlation_factor  # noqa: E402
 
 PARAMS = ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
 

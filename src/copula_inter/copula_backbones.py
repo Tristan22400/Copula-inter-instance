@@ -1,8 +1,8 @@
 """copula_backbones.py — per-architecture COPULA backbone adapter.
 
-This is the copula-side analogue of ``src/marginal_backbones.py``: that
+This is the copula-side analogue of ``src/copula_inter/marginal_backbones.py``: that
 module lets Phase A fine-tune a standalone marginal on a choice of tabular
-foundation model, and this one lets ``src/model.py``'s CopulaTabICL wrap a
+foundation model, and this one lets ``src/copula_inter/model.py``'s CopulaTabICL wrap a
 choice of backbone as its frozen-or-finetuned feature extractor. The two are
 INDEPENDENT choices — ``cfg.model.backbone`` (this module) selects the
 copula's own trunk, while ``cfg.data.z_train_source``/Phase-A's
@@ -38,7 +38,6 @@ backbones — see ``_load_tabldm``'s docstring for why.
 from __future__ import annotations
 
 import os
-import sys
 from typing import Optional
 
 import torch
@@ -46,16 +45,9 @@ import torch.nn as nn
 from omegaconf import DictConfig
 from torch import Tensor
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
-if _TABICL_SRC not in sys.path:
-    sys.path.insert(0, _TABICL_SRC)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 from tabicl._model.tabicl import TabICL  # type: ignore[import]
-from backend_registry import COPULA_BACKBONES
+from copula_inter.backend_registry import COPULA_BACKBONES
 
 __all__ = [
     "BACKBONE_NAMES",

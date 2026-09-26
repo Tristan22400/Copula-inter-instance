@@ -5,7 +5,7 @@ month at a time, cached locally as NetCDF3-classic files compatible with
 eval.data.era5_io.load_era5_data's schema (t2m/latitude/longitude/time).
 
 Why global + monthly instead of fetch_era5.py's per-region cache: this feeds
-src/era5_live_dataset.py's worldwide finetuning corpus (random region AND
+src/copula_inter/era5_live_dataset.py's worldwide finetuning corpus (random region AND
 random resolution sampled fresh every training episode, see
 eval/data/era5_global_corpus.py) — cropping/coarsening a fixed local global
 archive per-episode is far cheaper than a GCS round-trip per episode, and

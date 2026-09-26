@@ -33,8 +33,7 @@ import scipy.cluster.hierarchy as sch
 from omegaconf import OmegaConf
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(os.path.join(_ROOT, 'src'))
-from data_gen import generate_gp_batch, KERNEL_REGISTRY  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch, KERNEL_REGISTRY  # noqa: E402
 
 N_SAMPLES = 8  # print at least 8 generated posterior draws along the way
 N_PLOT = 4     # number of those draws to actually plot (raw + sorted each)

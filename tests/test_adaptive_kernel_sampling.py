@@ -20,10 +20,8 @@ from collections import Counter
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import _COMPOSABLE_KERNELS, _sample_kernel_chain_structure, _weights_for_pool
-import train
-
-
+from copula_inter.data_gen import _COMPOSABLE_KERNELS, _sample_kernel_chain_structure, _weights_for_pool
+from copula_inter import train
 def _uniform_weights() -> torch.Tensor:
     n = len(_COMPOSABLE_KERNELS)
     return torch.full((n,), 1.0 / n, dtype=torch.float32)

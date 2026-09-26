@@ -22,7 +22,6 @@ import random
 
 import pytest
 import torch
-from scipy import stats
 
 _DEFAULT_DIR = "./data/pit_cosine-new"
 

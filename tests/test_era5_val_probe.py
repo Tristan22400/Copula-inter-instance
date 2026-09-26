@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import math
 import os
-import sys
 
 import numpy as np
 import pytest
@@ -50,9 +49,6 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_TESTS)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 from eval.spatial.diagnostics import bin_correlation_by_distance  # noqa: E402
 from eval.spatial.sweep_core import (  # noqa: E402
@@ -61,9 +57,9 @@ from eval.spatial.sweep_core import (  # noqa: E402
     weighted_r2,
     weighted_rmse_bias,
 )
-from loss import y_space_nll  # noqa: E402
-from model import build_copula_transformer, build_sigma  # noqa: E402
-from train import _build_era5_val_batches  # noqa: E402
+from copula_inter.loss import y_space_nll  # noqa: E402
+from copula_inter.model import build_copula_transformer, build_sigma  # noqa: E402
+from copula_inter.train import _build_era5_val_batches  # noqa: E402
 
 _TINY_REGION = "western_europe"
 _TINY_GRID = 4

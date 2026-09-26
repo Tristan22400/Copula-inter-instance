@@ -1,5 +1,5 @@
 """test_copula_backbones.py — the copula backbone-selection surface added by
-src/copula_backbones.py + src/model.py's ``cfg.model.backbone`` dispatch.
+src/copula_inter/copula_backbones.py + src/copula_inter/model.py's ``cfg.model.backbone`` dispatch.
 
 Covers, per backbone (tabicl: scratch, fast; tabldm: real pretrained load,
 same HF weights the marginal side already caches):
@@ -32,8 +32,8 @@ import torch
 from conftest import make_batch
 from omegaconf import OmegaConf
 
-import copula_backbones
-from model import build_copula_transformer
+from copula_inter import copula_backbones
+from copula_inter.model import build_copula_transformer
 
 # ---------------------------------------------------------------------------
 # tabicl (scratch, fast) — sanity that the refactor didn't change anything
@@ -192,7 +192,7 @@ def test_tabldm_forward_and_loss_backprops(tabldm_model):
     _forward_and_loss call (train.py's own loss function) on a tabldm-backed
     model, checking the MoE aux term is folded into the scalar loss and
     backward() completes without error."""
-    from train import _forward_and_loss
+    from copula_inter.training_core import _forward_and_loss
 
     tabldm_model.train()
     batch = make_batch(B=2, P=4, N=2)

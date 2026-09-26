@@ -8,8 +8,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils import parametrize
 
-from lora import LoRAParametrization
-from marginal_backbones import MarginalBackbone, _exaone_grad_forward
+from copula_inter.lora import LoRAParametrization
+from copula_inter.marginal_backbones import MarginalBackbone, _exaone_grad_forward
 
 
 class RepeatedWeightModel(nn.Module):

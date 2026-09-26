@@ -12,13 +12,14 @@ The checked-in `uv.lock` pins the tested environment. The `cpu` extra selects
 the smaller PyTorch CPU wheel for local checks; use `--extra gpu` on a CUDA
 machine.
 A standard editable install is also supported with
-`python -m pip install -e '.[dev]'`.
+`python -m pip install -e '.[dev]'`. With the shared conda env, run
+`source scripts/_env.sh` instead so the current checkout is imported.
 
 To generate a small on-disk dataset and train from it:
 
 ```bash
-python src/generate_pit_dataset.py data.n_tasks=5000 data.dataset_dir=./data/pilot
-python src/train.py training.live_generation=false training.dataset_dir=./data/pilot/pit
+python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.dataset_dir=./data/pilot
+python -m copula_inter.train training.live_generation=false training.dataset_dir=./data/pilot/pit
 ```
 
 Generation with the default `data.z_train_source=tabicl` needs the configured
@@ -33,7 +34,7 @@ a different dataset. The training command is a full run; override
 Evaluate a trained checkpoint with:
 
 ```bash
-python eval/runners/eval_checkpoint.py --ckpt checkpoints/copula_transformer/step_0029999_final.pt
+python eval/runners/eval_checkpoint.py --ckpt kernel-sweep-all-tabicl-retrain-15k
 ```
 
 Use `--dump_episodes scores.json` during evaluation to save per-episode
@@ -43,6 +44,6 @@ loading either model.
 The CPU pull-request gate is `.github/workflows/ci.yml`. The full suite can
 require pretrained models, a GPU, or external ERA5 data; run those tests in
 the corresponding environment. Configuration lives in `conf/`; use
-`python src/train.py --cfg job` to inspect the composed settings without
+`python -m copula_inter.train --cfg job` to inspect the composed settings without
 starting training. See [AGENTS.md](AGENTS.md) for the code map and
 [CLAUDE.md](CLAUDE.md) for experiment-specific notes.

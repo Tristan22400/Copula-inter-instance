@@ -30,14 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from eval.runners.eval_checkpoint import (  # noqa: E402
     _ar_note,

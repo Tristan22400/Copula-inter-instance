@@ -33,17 +33,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 
 import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from eval.configs import constants  # noqa: E402
 from eval.configs import regions  # noqa: E402
@@ -171,7 +166,7 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
 
 def _diagnose_synthetic(ckpt_token: str, kernel: "str | None", grid_size: int, n_context: int, n_draws: int,
                          device: "str | None", seed: int, out_dir: str) -> None:
-    from data_gen import sigma_to_correlation
+    from copula_inter.data_gen import sigma_to_correlation
 
     ckpt = resolve_checkpoint(ckpt_token)
     model, cfg, resolved_device, marginal = get_model(ckpt, device)
@@ -335,7 +330,7 @@ def _baseline(mode: str, profile: str, laws: list, n_days: int, ckpt_token: "str
                 print(f"[{config_name}] {law}: r2={fits[law]}")
             out[config_name] = fits
     else:
-        from data_gen import sigma_to_correlation
+        from copula_inter.data_gen import sigma_to_correlation
 
         ckpt = resolve_checkpoint(ckpt_token or all_family_names()[-1])
         _, cfg, _, _ = get_model(ckpt, device)

@@ -9,7 +9,7 @@ Conditional Neural Process" construction).
 Both methods condition on the same synthetic GP episodes eval_checkpoint.py
 already generates (--live_generate) and are scored in the same raw-nats,
 per-point convention eval_checkpoint.py's _print_total_nll_table uses
-(src/loss.py::y_space_nll's "total" is already averaged over each episode's
+(src/copula_inter/loss.py::y_space_nll's "total" is already averaged over each episode's
 own N), so the two printed numbers are directly comparable.
 
 NLL uses TEACHER FORCING (the true past target is appended to the context at
@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 
 import numpy as np
@@ -39,13 +38,9 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from inference.copula_inference import load_copula_model  # noqa: E402
-from pit import (  # noqa: E402
+from copula_inter.pit import (  # noqa: E402
     DEFAULT_K_FOLDS,
     configure_tabicl_inference_amp,
     load_tabicl,
@@ -80,7 +75,7 @@ def _one_sample_pair(
     (fixed, shared context — the whole point of an explicit copula is not
     needing to grow the context), combined with the copula's own Sigma via
     Cholesky + a single shared white-noise vector (same pattern as
-    src/train.py::_era5_viz_field, generalized off its ERA5-specific bits).
+    src/copula_inter/train.py::_era5_viz_field, generalized off its ERA5-specific bits).
 
     Autoregressive marginal-chain: autoregressive_log_pdf's ancestral
     sampling (conditioning="sample"), in the episode's own test order.
@@ -98,7 +93,7 @@ def _one_sample_pair(
     marginal_dist = tabicl_marginal.quantile_dist(logits[0])
     # icdf treats a plain (n,) alpha as n shared quantile levels broadcast
     # across the whole batch (-> a (batch, n) grid), not one alpha per
-    # distribution -- an explicit trailing size-1 axis (src/train.py's
+    # distribution -- an explicit trailing size-1 axis (src/copula_inter/train.py's
     # _era5_viz_field:855-857) selects one quantile per distribution instead.
     y_copula_scaled = marginal_dist.icdf(u_copula.unsqueeze(-1)).squeeze(-1)
     y_copula_sample = (mean + std * y_copula_scaled).detach().cpu().numpy()

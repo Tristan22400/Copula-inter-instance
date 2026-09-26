@@ -31,22 +31,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import os
-import sys
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import DebugConfig, add_common_args, build_config
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
 
 @contextlib.contextmanager
@@ -56,8 +48,7 @@ def _cholesky_instrumentation():
     non-finite-input slices before it replaces them with identity) for the
     duration of the `with` block. Restores both on exit regardless of
     exceptions. No src/ files are edited."""
-    import loss as loss_mod
-
+    from copula_inter import loss as loss_mod
     counters = {"cholesky_calls": 0, "safe_cholesky_calls": 0, "escalated_calls": 0, "nonfinite_slices": 0}
     orig_cholesky = torch.linalg.cholesky
     orig_safe_cholesky = loss_mod._safe_cholesky
@@ -86,9 +77,9 @@ def _cholesky_instrumentation():
 
 
 def run(dcfg: DebugConfig) -> dict:
-    from dataset import collate_fn
-    from loss import y_space_nll
-    from model import low_rank_correlation
+    from copula_inter.dataset import collate_fn
+    from copula_inter.loss import y_space_nll
+    from copula_inter.model import low_rank_correlation
 
     model = common.load_model(dcfg)
     episodes = common.generate_episodes(dcfg, dcfg.n_episodes, tabicl_model=None)

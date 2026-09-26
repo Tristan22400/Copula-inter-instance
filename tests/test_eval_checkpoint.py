@@ -13,20 +13,14 @@ from __future__ import annotations
 
 import math
 import os
-import sys
 
 import pytest
 import torch
 from omegaconf import OmegaConf
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_TESTS)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from data_gen import generate_gp_batch  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch  # noqa: E402
 
 from eval.baselines.classical import (  # noqa: E402
     baseline_fingerprint,
@@ -42,7 +36,7 @@ from eval.runners.eval_checkpoint import (  # noqa: E402
     _pool_decode_tensors,
     _eval_icl_episode,
 )
-from pit import gp_analytical_posterior  # noqa: E402
+from copula_inter.pit import gp_analytical_posterior  # noqa: E402
 
 _TINY_DATA_CFG = {
     "d_features": 1,

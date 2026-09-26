@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 from contextlib import nullcontext
 
@@ -13,13 +12,10 @@ import torch
 from hydra import compose, initialize_config_dir
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for path in (ROOT, os.path.join(ROOT, "src"), os.path.join(ROOT, "tabicl_upstream", "src")):
-    if path not in sys.path:
-        sys.path.insert(0, path)
 
-from finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg, _seed_everything
-from finetune_marginal import MarginalLossWeights, apply_tier, phase_a_batch_loss
-from pit import load_tabicl
+from copula_inter.finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg, _seed_everything
+from copula_inter.finetune_marginal import MarginalLossWeights, apply_tier, phase_a_batch_loss
+from copula_inter.pit import load_tabicl
 
 
 def _sync() -> None:

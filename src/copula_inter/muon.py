@@ -9,7 +9,6 @@ Then we apply the following changes:
     * Fuse momentum buffer updates via torch._foreach_* ops (2 kernel launches vs 306).
     * @torch.compile on the NS kernel for fused GPU execution.
 """
-from typing import List, Tuple
 import torch
 import math
 from collections import defaultdict

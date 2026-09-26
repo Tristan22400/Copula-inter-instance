@@ -60,7 +60,7 @@ import os
 import types
 
 import numpy as np
-from backend_registry import BACKENDS, require_capability
+from copula_inter.backend_registry import BACKENDS, require_capability
 
 __all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
 
@@ -82,7 +82,7 @@ def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = 
     ``ckpt`` closes Phase A's loop for the non-TabICL backends. TabICL's
     Phase-A artifact is consumed by pit.load_tabicl via tabicl.pit_ckpt;
     these libraries publish no equivalent loader, so a fine-tune written by
-    src/marginal_backbones.py::MarginalBackbone.save is applied here, to the
+    src/copula_inter/marginal_backbones.py::MarginalBackbone.save is applied here, to the
     same nn.Module that module trained (marginal_backbones._trainable_module
     is the single place that mapping is defined). Without this a Phase-A run
     on exaone/tabldm would produce a file nothing could read back.
@@ -97,7 +97,7 @@ def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = 
 def _load_finetuned_weights(name: str, regressor, ckpt: str, device: "str | None") -> None:
     import torch
 
-    from marginal_backbones import _trainable_module
+    from copula_inter.marginal_backbones import _trainable_module
 
     payload = torch.load(ckpt, map_location=device or "cpu", weights_only=False)
     written_for = payload.get("backbone")

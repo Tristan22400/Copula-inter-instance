@@ -26,9 +26,9 @@ def make_tabicl_regressor(checkpoint: str | None = None, device: str | None = No
     (``checkpoint_version``, TabICLRegressor's own download-and-cache path)
     or a local ``.ckpt``/``.pt`` file (``model_path``, loaded directly) —
     dispatched on ``os.path.isfile``, the same local-path-first convention
-    ``src/pit.py::load_tabicl`` uses, so a checkpoint-specific marginal
+    ``src/copula_inter/pit.py::load_tabicl`` uses, so a checkpoint-specific marginal
     (e.g. a Phase-A-finetuned ``tabicl.pit_ckpt``, or anything
-    ``src/pit.py::resolve_pit_ckpt`` resolves) is a genuine drop-in here
+    ``src/copula_inter/pit.py::resolve_pit_ckpt`` resolves) is a genuine drop-in here
     too, not just for the low-level TabICL object ``load_marginal_tabicl``
     loads.
     """

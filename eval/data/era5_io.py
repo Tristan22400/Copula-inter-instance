@@ -51,7 +51,7 @@ def safe_cholesky(C: np.ndarray, jitter: float = 1e-6, max_tries: int = 6) -> np
     """Cholesky factor of C, adding diagonal jitter if it's not quite PSD.
 
     A real checkpoint's predicted correlation matrix is PSD by construction
-    (low-rank-plus-diagonal, see src/model.py:low_rank_correlation) but
+    (low-rank-plus-diagonal, see src/copula_inter/model.py:low_rank_correlation) but
     float32 round-trip can leave it *just* outside PSD, which
     np.linalg.cholesky rejects outright.
     """

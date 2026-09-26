@@ -4,7 +4,7 @@ Investigates why training with `data.z_train_source=tabicl` plateaus far from
 the oracle. Built as composable stages, each answering one question and
 writing `results/<run_id>/<stage>.json`, so the same measurements re-run
 after a change to the data prior (`conf/data/gp_tasks.yaml`) or the
-architecture (`src/model.py`, rank, parametrization) — pass `--baseline
+architecture (`src/copula_inter/model.py`, rank, parametrization) — pass `--baseline
 <old_run_id>` to `report.py` to see what moved.
 
 ## Quick start
@@ -93,10 +93,10 @@ undertraining. That's why S1 (rank ceiling) is the stage to run first.
 
 ## Reused, not reimplemented
 
-`src/pit.py::gp_analytical_posterior`, `src/loss.py::{y_space_nll,
-oracle_copula_nll, _safe_cholesky}`, `src/model.py::{low_rank_correlation,
-build_sigma}`, `src/data_gen.py::generate_gp_batch`,
-`src/dataset.py::collate_fn`, `src/pit.py::{load_tabicl, resolve_pit_ckpt,
+`src/copula_inter/pit.py::gp_analytical_posterior`, `src/copula_inter/loss.py::{y_space_nll,
+oracle_copula_nll, _safe_cholesky}`, `src/copula_inter/model.py::{low_rank_correlation,
+build_sigma}`, `src/copula_inter/data_gen.py::generate_gp_batch`,
+`src/copula_inter/dataset.py::collate_fn`, `src/copula_inter/pit.py::{load_tabicl, resolve_pit_ckpt,
 run_pit_batched, _probit}`, `eval/spatial/calibration.py::
 compute_quantile_ece`, `eval/spatial/marginal_backends.py`,
 `eval/metrics/joint_nll.py::{compute_pit, kfold_loo_pit}`,

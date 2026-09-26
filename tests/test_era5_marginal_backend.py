@@ -16,18 +16,10 @@ is needed.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import pytest
 import torch
 from omegaconf import OmegaConf
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 
 @pytest.mark.parametrize(
@@ -42,7 +34,7 @@ for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src")):
     ],
 )
 def test_resolve_marginal_maps_z_train_source(source, expected):
-    from era5_live_dataset import _resolve_marginal
+    from copula_inter.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": source}})
     backend, probs_n = _resolve_marginal(cfg)
@@ -51,7 +43,7 @@ def test_resolve_marginal_maps_z_train_source(source, expected):
 
 
 def test_resolve_marginal_reads_probs_n():
-    from era5_live_dataset import _resolve_marginal
+    from copula_inter.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": "tabldm", "z_train_marginal_probs_n": 33}})
     assert _resolve_marginal(cfg) == ("tabldm", 33)
@@ -61,7 +53,7 @@ def test_resolve_marginal_rejects_typo():
     """The z_train_source typo class that silently no-opped the synthetic
     path (see tests/test_z_train_source_validation.py) must not be able to
     silently no-op this one either."""
-    from era5_live_dataset import _resolve_marginal
+    from copula_inter.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": "tabicl-split"}})
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
@@ -73,7 +65,7 @@ def test_pit_group_and_episode_agree_under_backend(backend):
     """A selected backend reaches the PIT, and the grouped path agrees with
     the single-episode one it shares a batched module with."""
     pytest.importorskip(backend, reason=f"{backend} not installed")
-    from era5_live_dataset import _pit_episode, _pit_group
+    from copula_inter.era5_live_dataset import _pit_episode, _pit_group
     from eval.spatial.marginal_backends import make_regressor
 
     regressor = make_regressor(backend, device="cpu")

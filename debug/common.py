@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from typing import Optional
 
 import numpy as np
@@ -19,14 +18,10 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from omegaconf import OmegaConf
 
-from config import DebugConfig  # noqa: E402
+from debug.config import DebugConfig  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +44,7 @@ def load_model(dcfg: DebugConfig):
     trained weights (state_dict only — no optimizer/scheduler, this is for
     inference-only diagnostics). Falls back to a non-strict load on a
     key mismatch, same rationale as train.py::load_checkpoint."""
-    from model import build_copula_transformer
+    from copula_inter.model import build_copula_transformer
 
     model = build_copula_transformer(dcfg.cfg).to(dcfg.device)
     ckpt_path = resolve_ckpt_path(dcfg.ckpt)
@@ -71,7 +66,7 @@ def load_frozen_tabicl(dcfg: DebugConfig):
     """Frozen TabICL marginal for PIT, cached per (ckpt, device) — every
     stage that needs one (S2/S3/S5/S7) reuses the same loaded weights
     instead of re-downloading/re-loading per stage invocation."""
-    from pit import load_tabicl, resolve_pit_ckpt
+    from copula_inter.pit import load_tabicl, resolve_pit_ckpt
 
     ckpt = resolve_pit_ckpt(dcfg.cfg)
     if ckpt is None:
@@ -101,7 +96,7 @@ def generate_episodes(
     """Thin wrapper over data_gen.generate_gp_batch with the debug config's
     own seed. `P_override` temporarily patches cfg.data.P_min/P_max (used by
     S0's P-sweep) without mutating the caller's dcfg.cfg in place."""
-    from data_gen import generate_gp_batch
+    from copula_inter.data_gen import generate_gp_batch
 
     cfg = dcfg.cfg
     if P_override is not None:
@@ -140,7 +135,7 @@ def posterior_oracle(episode: dict):
     kernel schema (whole-chain outer sign modulation) — see its docstring.
     Every stage that needs R_post/nll_post_* goes through this, not a
     direct call, so the "skip, don't crash" convention is enforced once."""
-    from pit import gp_analytical_posterior
+    from copula_inter.pit import gp_analytical_posterior
 
     try:
         return gp_analytical_posterior(episode)
@@ -198,7 +193,7 @@ def _to_jsonable(obj):
 def save_stage_result(dcfg: DebugConfig, stage: str, result: dict) -> str:
     """Write results/<run_id>/<stage>.json, stamped with git SHA + overrides
     (see report.py, which reads exactly this format)."""
-    from config import _git_sha  # local import: avoid a cycle at module load
+    from debug.config import _git_sha  # local import: avoid a cycle at module load
 
     path = os.path.join(dcfg.run_dir, f"{stage}.json")
     payload = {

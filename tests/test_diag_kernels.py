@@ -1,5 +1,5 @@
 """
-test_diag_kernels.py — Automated version of src/diag_kernels.py's health check.
+test_diag_kernels.py — Automated version of src/copula_inter/diag_kernels.py's health check.
 
 diag_kernels.py is a manually-run script ("does each kernel produce a
 meaningful, valid R_star?"); this file runs the same checks as real pytest
@@ -22,8 +22,8 @@ import random
 import pytest
 import torch
 
-from data_gen import ALL_KERNELS, generate_gp_task
-from diag_kernels import Cfg, batch_off_diagonal_stats, check_task
+from copula_inter.data_gen import ALL_KERNELS, generate_gp_task
+from copula_inter.diag_kernels import Cfg, batch_off_diagonal_stats, check_task
 
 # ---------------------------------------------------------------------------
 # Per-task structural checks (NaN/Inf, unit diagonal, [-1,1] range, symmetry,

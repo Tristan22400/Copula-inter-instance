@@ -56,7 +56,7 @@ ALL_STAGES_NEEDS_CKPT = ["s5", "s6"]
 
 
 def _git_sha() -> str:
-    from config import _git_sha as gs
+    from debug.config import _git_sha as gs
 
     return gs(os.path.dirname(_HERE))
 
@@ -74,7 +74,7 @@ def main() -> None:
     args, extra = p.parse_known_args()
 
     if args.stage == "report":
-        from report import main as report_main
+        from debug.report import main as report_main
 
         sys.argv = ["report.py", *extra]
         report_main()
@@ -118,7 +118,7 @@ def main() -> None:
 
     print(f"\n{'=' * 70}\nrun_id={run_id}  stages_run={stages}  failures={failures or 'none'}\n{'=' * 70}")
     if not failures:
-        from report import build_report
+        from debug.report import build_report
 
         out_path = build_report(run_id)
         print(f"Report written -> {out_path}")
@@ -127,5 +127,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, _HERE)
     main()

@@ -124,7 +124,6 @@ import copy
 import multiprocessing as mp
 import os
 import random
-import sys
 import time
 import zlib
 from collections import Counter
@@ -140,16 +139,12 @@ from torch import Tensor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from backend_registry import EVAL_Z_TRAIN_SOURCES, GENERIC_MARGINAL_BACKENDS  # noqa: E402
-from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
-from artifacts import artifact_identity, atomic_json_save  # noqa: E402
-from config_path import config_dir as project_config_dir  # noqa: E402
-from dataset import CopulaDataset  # noqa: E402
+from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES, GENERIC_MARGINAL_BACKENDS  # noqa: E402
+from copula_inter.data_gen import _parse_composite, generate_gp_batch  # noqa: E402
+from copula_inter.artifacts import artifact_identity, atomic_json_save  # noqa: E402
+from copula_inter.config_path import config_dir as project_config_dir  # noqa: E402
+from copula_inter.dataset import CopulaDataset  # noqa: E402
 
 from eval.configs.checkpoints import (  # noqa: E402
     DEFAULT_MARGINAL_FAMILY,
@@ -169,9 +164,9 @@ from eval.data.era5_episodes import (  # noqa: E402
     era5_episode_fingerprint,
 )
 from inference.copula_inference import load_copula_model  # noqa: E402
-from loss import y_space_nll  # noqa: E402
-from model import low_rank_correlation  # noqa: E402
-from pit import (  # noqa: E402
+from copula_inter.loss import y_space_nll  # noqa: E402
+from copula_inter.model import low_rank_correlation  # noqa: E402
+from copula_inter.pit import (  # noqa: E402
     DEFAULT_K_FOLDS,
     configure_tabicl_inference_amp,
     gp_analytical_posterior,
@@ -422,7 +417,7 @@ def _marginal_pit(
     """K-fold PIT from a real (non-oracle) marginal, in place of the
     episode's exact GP-LOO/posterior PIT — the same "does the model's
     correlation prediction hold up against an estimated marginal instead of
-    the oracle one" check src/train.py's _build_tabicl_val_z runs during
+    the oracle one" check src/copula_inter/train.py's _build_tabicl_val_z runs during
     training, used here at eval time via --z_train_source.
 
     Two sources, one output contract. --z_train_source=tabicl uses the
@@ -483,7 +478,7 @@ def _marginal_pit(
         # Same batched module the training pipelines use, B=1 -- so eval and
         # training score the identical PIT recipe per backend rather than
         # this file growing its own per-backend copy.
-        from data_gen import _BATCHED_MARGINAL_BACKENDS
+        from copula_inter.data_gen import _BATCHED_MARGINAL_BACKENDS
 
         run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
         out = run_batched(

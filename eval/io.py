@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import os
 from collections import defaultdict
 
 import numpy as np
 from scipy.stats import norm
-from artifacts import atomic_json_save
+from copula_inter.artifacts import atomic_json_save
 
 __all__ = ["gp_to_quantile_and_R", "save_results_json", "print_markdown_summary"]
 

@@ -4,17 +4,12 @@
 from __future__ import annotations
 
 import os
-import sys
 
 import numpy as np
 import pytest
 import torch
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_TESTS)
-for _p in (os.path.join(_ROOT, "debug"), os.path.join(_ROOT, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +21,8 @@ def test_rank_ceiling_recovers_exact_low_rank_target():
     at rank r lies exactly inside the rank-r covnorm family -- fitting rank r
     to it should drive the ceiling loss (expected copula NLL vs. itself)
     down to ~0, not just "small"."""
-    from model import low_rank_correlation
-    from stages.s1_rank_ceiling import fit_rank_ceiling
+    from copula_inter.model import low_rank_correlation
+    from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
     torch.manual_seed(0)
     N, r = 24, 2
@@ -43,8 +38,8 @@ def test_rank_ceiling_monotone_in_rank():
     """A higher rank can only do at least as well: r=8's ceiling loss on a
     generic R must be <= r=2's (both fit to the SAME target, more capacity
     can't hurt the population-level optimum)."""
-    from model import low_rank_correlation
-    from stages.s1_rank_ceiling import fit_rank_ceiling
+    from copula_inter.model import low_rank_correlation
+    from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
     torch.manual_seed(1)
     N = 32
@@ -62,7 +57,7 @@ def test_rank_ceiling_monotone_in_rank():
 # ---------------------------------------------------------------------------
 
 def test_clamping_census_all_saturated():
-    from stages.s2_uspace import U_SPLINE_KNOT, _clamp_stats
+    from debug.stages.s2_uspace import U_SPLINE_KNOT, _clamp_stats
 
     n_points = 50
     u_fully_saturated = [np.full(n_points, U_SPLINE_KNOT / 2.0)]  # every point below the spline threshold
@@ -73,7 +68,7 @@ def test_clamping_census_all_saturated():
 
 
 def test_clamping_census_none_saturated():
-    from stages.s2_uspace import _clamp_stats
+    from debug.stages.s2_uspace import _clamp_stats
 
     n_points = 50
     u_uniform = [np.linspace(0.1, 0.9, n_points)]
@@ -86,8 +81,8 @@ def test_u_from_z_roundtrips_probit():
     """u_from_z is the exact inverse of pit.py::_probit -- round-tripping a
     non-saturated u through _probit -> u_from_z should recover it, and a
     saturated u should come back exactly at the clamp bound."""
-    from pit import _probit
-    from stages.s2_uspace import U_HARD_CLAMP, u_from_z
+    from copula_inter.pit import _probit
+    from debug.stages.s2_uspace import U_HARD_CLAMP, u_from_z
 
     u = torch.tensor([0.5, 0.1, 0.9, 1e-9, 1.0 - 1e-9])
     z = _probit(u)
@@ -101,7 +96,7 @@ def test_u_from_z_roundtrips_probit():
 # ---------------------------------------------------------------------------
 
 def test_build_config_applies_dotted_overrides():
-    from config import build_config
+    from debug.config import build_config
 
     dcfg = build_config(
         overrides=["data.P_min=17", "data.P_max=17", "model.rank=64"],
@@ -113,7 +108,7 @@ def test_build_config_applies_dotted_overrides():
 
 
 def test_build_config_rejects_malformed_override():
-    from config import build_config
+    from debug.config import build_config
 
     with pytest.raises(ValueError):
         build_config(overrides=["not_a_key_value_pair"], device="cpu")
@@ -128,8 +123,8 @@ def test_s0_posterior_signal_uses_per_point_normalization():
     points (not yet per-point); s0_signal.py must divide by n_test itself
     to match every other per-point metric in this pipeline -- this test
     guards that division against silently disappearing in a refactor."""
-    from stages.s0_signal import run_one_P
-    from config import build_config
+    from debug.stages.s0_signal import run_one_P
+    from debug.config import build_config
 
     dcfg = build_config(overrides=["data.P_min=8", "data.P_max=8"], n_episodes=2, device="cpu", seed=42)
     result = run_one_P(dcfg, P=8, n_episodes=2)

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from eval.spatial import tabldm_batched
-from marginal_backbones import _tabldm_quantile_forward
+from copula_inter.marginal_backbones import _tabldm_quantile_forward
 
 
 class Scaler:
@@ -39,7 +39,7 @@ def test_grouped_predictions_and_gradients_match_separate_episodes(monkeypatch, 
         for b, width in enumerate(widths)
     ]
     monkeypatch.setattr(tabldm_batched, '_episode_member_batch', lambda reg, x, y, q: episodes[x])
-    monkeypatch.setattr('marginal_backbones._patch_tabldm_inference_manager', lambda: None)
+    monkeypatch.setattr('copula_inter.marginal_backbones._patch_tabldm_inference_manager', lambda: None)
     model = Model()
     handle = SimpleNamespace(inference_config_=None)
     bb = SimpleNamespace(module=model, handle=handle)

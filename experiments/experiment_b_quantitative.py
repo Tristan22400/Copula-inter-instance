@@ -43,23 +43,16 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import sys
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 from scipy.stats import norm
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from data_gen import gp_posterior, sigma_to_correlation  # noqa: E402
-from loss import y_space_nll  # noqa: E402
-from pit import normalize_targets, run_pit  # noqa: E402
+from copula_inter.data_gen import gp_posterior, sigma_to_correlation  # noqa: E402
+from copula_inter.loss import y_space_nll  # noqa: E402
+from copula_inter.pit import normalize_targets, run_pit  # noqa: E402
 
 from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402

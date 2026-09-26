@@ -35,7 +35,7 @@ from __future__ import annotations
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw, _tabicl_mix_prob_for_kernel
+from copula_inter.data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw, _tabicl_mix_prob_for_kernel
 
 from test_pit_batched import RowIndependentFakeTabICL
 
@@ -183,9 +183,7 @@ def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg):
 
 
 def _import_train():
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-    import train
+    from copula_inter import train
     return train
 
 

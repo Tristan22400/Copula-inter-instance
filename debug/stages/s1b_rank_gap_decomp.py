@@ -44,22 +44,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug"), _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import add_common_args, build_config
-from s1_rank_ceiling import fit_rank_ceiling
+from debug import common
+from debug.config import add_common_args, build_config
+from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
 
 def oracle_nll(R: torch.Tensor) -> torch.Tensor:
@@ -95,7 +87,7 @@ def fit_decomposition(R_post: torch.Tensor, X: torch.Tensor, m: int, *,
                       device: str = "cpu"):
     """Fit the sparse-GP-Schur basis to R_post by the same exact expected
     copula NLL s1 minimizes. X: (B, N, d) test inputs."""
-    from loss import _safe_cholesky
+    from copula_inter.loss import _safe_cholesky
 
     B, N, _ = R_post.shape
     d = X.shape[-1]

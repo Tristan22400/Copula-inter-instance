@@ -10,8 +10,8 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
-from artifacts import artifact_identity, canonical_digest, file_digest
-from backend_registry import z_train_source as z_train_source_of
+from copula_inter.artifacts import artifact_identity, canonical_digest, file_digest
+from copula_inter.backend_registry import z_train_source as z_train_source_of
 
 SCHEMA = 1
 

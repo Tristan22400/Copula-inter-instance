@@ -3,9 +3,9 @@ eval/runners/eval_checkpoint.py evaluates, so a checkpoint can be scored
 against the same classical-baseline table on real worldwide 2m-temperature
 data instead of synthetic GP draws.
 
-This is the evaluation-side sibling of src/era5_live_dataset.py (which
+This is the evaluation-side sibling of src/copula_inter/era5_live_dataset.py (which
 serves the *training* loop): same corpus (eval/data/era5_global_corpus.py),
-same frozen-TabICL K-fold PIT convention (src/pit.py::run_pit /
+same frozen-TabICL K-fold PIT convention (src/copula_inter/pit.py::run_pit /
 run_pit_batched via era5_live_dataset's `_pit_group`, including its
 log-Jacobian correction back to raw nats), but materialized eagerly as
 a finite, seed-reproducible LIST rather than an infinite IterableDataset —
@@ -57,20 +57,14 @@ eval/data/fetch_era5_static.py::STATIC_VARS surface fields.
 from __future__ import annotations
 
 import os
-import sys
 from typing import Optional
 
 import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from pit import normalize_targets
+from copula_inter.pit import normalize_targets
 
 from eval.data.era5_global_corpus import GlobalERA5Corpus
 
@@ -229,7 +223,7 @@ def build_era5_eval_episodes(
     and its log_pdf_test already comes back Jacobian-corrected to raw nats), so
     this flag changes nothing about z_train/z_test/log_pdf_test.
     """
-    from era5_live_dataset import _pit_group
+    from copula_inter.era5_live_dataset import _pit_group
 
     from eval.baselines.autoregressive import autoregressive_log_pdf
 
@@ -243,7 +237,7 @@ def build_era5_eval_episodes(
         # The chain needs a module it can call one query at a time with a
         # growing context; the exaone/tabpfn/tabldm backends are reached only
         # through _BATCHED_MARGINAL_BACKENDS' fit-then-predict-a-whole-block
-        # interface (see src/marginal_backbones.py), which has no such entry
+        # interface (see src/copula_inter/marginal_backbones.py), which has no such entry
         # point. Fail here rather than silently dropping the row.
         raise NotImplementedError(
             f"--autoregressive is implemented for the TabICL marginal only, not "

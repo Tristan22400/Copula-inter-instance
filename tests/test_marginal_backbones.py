@@ -1,5 +1,5 @@
 """test_marginal_backbones.py — Phase-A fine-tuning support for the
-non-TabICL marginal backbones (src/marginal_backbones.py).
+non-TabICL marginal backbones (src/copula_inter/marginal_backbones.py).
 
 Three things have to hold for Phase A to mean anything on a new
 architecture, and all three fail SILENTLY if they break:
@@ -18,19 +18,11 @@ licence-gated and have never been loaded here.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src"),
-           os.path.join(_REPO_ROOT, "tabicl_upstream", "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 BACKENDS = ["tabldm", "exaone"]
 
@@ -41,7 +33,7 @@ def backbone(request):
         {"tabldm": "tabldm", "exaone": "exaonetabular"}[request.param],
         reason=f"{request.param} not installed",
     )
-    from marginal_backbones import load_backbone
+    from copula_inter.marginal_backbones import load_backbone
 
     return load_backbone(request.param, device="cpu")
 
@@ -55,7 +47,7 @@ def _episode(rng, n_ctx=12, n_qry=3, p_x=3):
 def test_tier0_patterns_match_real_parameters(backbone):
     """Guards the silent-shrink failure: every tier-0 pattern must address
     at least one parameter of the actual loaded model."""
-    from marginal_backbones import assert_patterns_match
+    from copula_inter.marginal_backbones import assert_patterns_match
 
     counts = assert_patterns_match(backbone.module, backbone.tier0_patterns)
     assert all(v > 0 for v in counts.values())
@@ -150,7 +142,7 @@ def test_quantile_forward_is_monotone_in_probs(backbone):
 
 
 def test_checkpoint_round_trips(backbone, tmp_path):
-    from marginal_backbones import load_backbone
+    from copula_inter.marginal_backbones import load_backbone
 
     path = str(tmp_path / f"{backbone.name}_phase_a.pt")
     backbone.save(path, step=123)
@@ -171,7 +163,7 @@ def test_checkpoint_rejects_a_different_architecture(backbone, tmp_path):
     """Loading a TabLDM Phase-A checkpoint into EXAONE (or vice versa) must
     fail loudly -- load_state_dict(strict=True) would too, but with a key
     diff rather than the actual reason."""
-    from marginal_backbones import load_backbone
+    from copula_inter.marginal_backbones import load_backbone
 
     path = str(tmp_path / "mislabelled.pt")
     backbone.save(path, step=1)
@@ -194,7 +186,7 @@ def test_resolve_tier_gates_the_ladder(name, tier, ok):
     """Tier >= 1 on an architecture with no swappable attention must raise,
     not silently fall back to tier 0 -- a run that logs tier=1 while training
     tier 0 would read as 'the ladder didn't help'."""
-    from marginal_backbones import resolve_tier
+    from copula_inter.marginal_backbones import resolve_tier
 
     if ok:
         assert resolve_tier(name, tier) == tier

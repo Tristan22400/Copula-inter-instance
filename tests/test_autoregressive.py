@@ -35,20 +35,12 @@ Tests verify:
 from __future__ import annotations
 
 import math
-import os
-import sys
 
 import pytest
 import torch
-import torch.nn as nn
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-for _p in (_ROOT, os.path.join(_ROOT, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from era5_live_dataset import _pit_group  # noqa: E402
+from copula_inter.era5_live_dataset import _pit_group  # noqa: E402
 from eval.baselines.autoregressive import (  # noqa: E402
     _orderings,
     ar_parts_from_log_pdf,

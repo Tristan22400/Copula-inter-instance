@@ -33,19 +33,13 @@ from __future__ import annotations
 
 import math
 import os
-import sys
 from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
-if _TABICL_SRC not in sys.path:
-    sys.path.insert(0, _TABICL_SRC)
 
-from data_gen import build_kernel_fn, _safe_cholesky, sigma_to_correlation  # noqa: E402
+from copula_inter.data_gen import build_kernel_fn, _safe_cholesky, sigma_to_correlation  # noqa: E402
 from tabicl._model.inference_config import InferenceConfig  # noqa: E402
 
 DEFAULT_K_FOLDS = 10
@@ -160,7 +154,7 @@ def load_tabicl(
     (the historical contract — downloaded and cached on first use) or a path to
     a local ``.ckpt``/``.pt`` file carrying the same ``{"config", "state_dict"}``
     schema. The local branch is what makes a Phase-A fine-tuned marginal
-    (``src/finetune_marginal.py``) a genuine drop-in for ``tabicl.pit_ckpt``:
+    (``src/copula_inter/finetune_marginal.py``) a genuine drop-in for ``tabicl.pit_ckpt``:
     every consumer — offline dataset generation, live workers, ERA5 finetuning,
     the eval runners — reaches the marginal through this one function, so
     accepting a path here is the whole integration.
@@ -459,7 +453,7 @@ def _run_pit_batched_impl(
     TabICL's decoder emits -- for ``max_classes=0`` the model's output IS the
     999-quantile vector at ``tabicl.quantile_dist.alpha_levels`` -- plus the
     pre-probit CDF values and probit-clamp saturation fractions. Phase-A
-    marginal fine-tuning (``src/finetune_marginal.py``) needs the quantiles to
+    marginal fine-tuning (``src/copula_inter/finetune_marginal.py``) needs the quantiles to
     build its own ``QuantileDistribution`` for NLL/CRPS/distillation without a
     second forward pass. Fold quantiles are mapped back to the caller's target
     scale so they can be scored alongside test quantiles. The saturation
@@ -742,7 +736,7 @@ def run_pit_batched_grad(
     The public ``run_pit_batched`` above is hard-decorated ``@torch.no_grad()``
     because every historical caller (dataset generation, live workers,
     validation) wants exactly that. Phase-A marginal fine-tuning
-    (``src/finetune_marginal.py``) is the one caller that must backprop THROUGH
+    (``src/copula_inter/finetune_marginal.py``) is the one caller that must backprop THROUGH
     the PIT into the TabICL weights, so it gets its own entry point rather than
     a mutable flag on the shared one -- a ``no_grad=False`` default would
     silently make every existing call site build an autograd graph.

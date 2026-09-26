@@ -1,6 +1,6 @@
 """_synthetic.py — shared synthetic-GP-function helpers for experiments A and B.
 
-Thin wrappers around ``src/data_gen.py``'s ``build_kernel_fn``/``gp_posterior``/
+Thin wrappers around ``src/copula_inter/data_gen.py``'s ``build_kernel_fn``/``gp_posterior``/
 ``sigma_to_correlation`` — no kernel math lives here, just the "draw one 1D
 test function + pick sparse train points" bookkeeping both experiment scripts
 need.
@@ -8,19 +8,12 @@ need.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
 
-from data_gen import _safe_cholesky, build_kernel_fn  # noqa: E402
+from copula_inter.data_gen import _safe_cholesky, build_kernel_fn  # noqa: E402
 
 OBS_NOISE_STD = 0.05
 

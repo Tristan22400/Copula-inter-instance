@@ -37,11 +37,11 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import generate_gp_batch
-from dataset import collate_fn
-from model import build_copula_transformer
-from pit import gp_analytical_pit
-from train import _build_analytic_val_z, validate
+from copula_inter.data_gen import generate_gp_batch
+from copula_inter.dataset import collate_fn
+from copula_inter.model import build_copula_transformer
+from copula_inter.pit import gp_analytical_pit
+from copula_inter.train import _build_analytic_val_z, validate
 
 
 # ---------------------------------------------------------------------------

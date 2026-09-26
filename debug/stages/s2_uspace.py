@@ -36,21 +36,13 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import DebugConfig, add_common_args, build_config
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
 U_HARD_CLAMP = 1e-6      # pit.py::_probit's clamp -- exactly |z| = 4.7534 beyond this
 U_SPLINE_KNOT = 1e-3     # TabICL's outermost quantile knot (num_quantiles=999 -> alpha in [.001,.999])

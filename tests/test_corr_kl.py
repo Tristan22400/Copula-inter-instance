@@ -21,7 +21,7 @@ import math
 import pytest
 import torch
 
-from pit import gaussian_corr_kl
+from copula_inter.pit import gaussian_corr_kl
 
 
 def _random_correlation(n, seed, rank=None):

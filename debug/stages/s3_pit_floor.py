@@ -52,22 +52,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import DebugConfig, add_common_args, build_config
-from stages.s1_rank_ceiling import fit_rank_ceiling
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
+from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
 
 def _build_quantile_dist(tabicl_model, x_train: torch.Tensor, y_train_scaled: torch.Tensor, x_test: torch.Tensor):
@@ -86,8 +78,8 @@ def _build_quantile_dist(tabicl_model, x_train: torch.Tensor, y_train_scaled: to
 def sample_and_pit(tabicl_model, episode: dict, post: dict, M: int, device: str) -> torch.Tensor:
     """Returns z_samples (N, M): M independent PIT'd z-vectors at this
     episode's N test points, from M draws of the true GP posterior."""
-    from loss import _safe_cholesky
-    from pit import _probit
+    from copula_inter.loss import _safe_cholesky
+    from copula_inter.pit import _probit
 
     x_train = episode["x_norm_train"].to(device)
     y_train = episode["y_train"].to(device)
@@ -126,7 +118,7 @@ def _shrunk_correlation(z_fit: torch.Tensor) -> tuple[torch.Tensor, float]:
 
 
 def run(dcfg: DebugConfig, M: int = 2048, m_fit: int = None, rank: int = 32) -> dict:
-    from loss import oracle_copula_nll
+    from copula_inter.loss import oracle_copula_nll
 
     m_fit = m_fit or M // 2
     tabicl_model = common.load_frozen_tabicl(dcfg)

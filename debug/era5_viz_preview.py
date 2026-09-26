@@ -28,15 +28,11 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 import matplotlib  # noqa: E402
 
@@ -62,8 +58,7 @@ def main() -> None:
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
-    import train as T
-
+    from copula_inter import train as T
     model, cfg, device, marginal = get_model(args.ckpt, args.device)
     OmegaConf.set_struct(cfg, False)
     cfg.baselines.era5_viz_n_days = args.n_days

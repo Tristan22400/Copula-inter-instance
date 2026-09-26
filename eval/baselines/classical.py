@@ -63,7 +63,6 @@ import copy
 import hashlib
 import math
 import os
-import sys
 import warnings
 from typing import Callable
 
@@ -84,17 +83,12 @@ from torch.optim import Adam
 # per restart per step.
 warnings.filterwarnings("ignore", category=NumericalWarning)
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
 
-from loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
-from artifacts import atomic_torch_save  # noqa: E402
-from dataset_manifest import dataset_identity  # noqa: E402
+from copula_inter.loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
+from copula_inter.artifacts import atomic_torch_save  # noqa: E402
+from copula_inter.dataset_manifest import dataset_identity  # noqa: E402
 from eval.results import NAN_PARTS as _NAN_PARTS  # noqa: E402
-from model import low_rank_correlation  # noqa: E402
+from copula_inter.model import low_rank_correlation  # noqa: E402
 
 __all__ = [
     "corr_nll_single",
@@ -245,7 +239,7 @@ def corr_nll_single(R: Tensor, z: Tensor) -> float:
 # nn.Parameters) just fine — no hand-rolled kernel math or NaN-safe distance
 # helpers needed.
 
-# Same nu convention as src/classical_kernels.py's _MATERN_NU / src/data_gen.py's
+# Same nu convention as src/copula_inter/classical_kernels.py's _MATERN_NU / src/copula_inter/data_gen.py's
 # _BASE_GPYTORCH_KERNEL_CLS matern12/32/52 entries.
 _MATERN_NU = {"matern12": 0.5, "matern32": 1.5, "matern52": 2.5}
 
@@ -791,11 +785,10 @@ def fit_and_eval_gpytorch(
             N, dtype=Sigma_post.dtype, device=Sigma_post.device
         )
 
-    from data_gen import sigma_to_correlation  # noqa: E402  (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
+    from copula_inter.data_gen import sigma_to_correlation  # noqa: E402  (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
 
     R, _ = sigma_to_correlation(Sigma_post)
     return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
-
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +870,7 @@ def fit_zero_mean_gp_on_marginal(
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
     """RBF prior correlation at test points with median bandwidth (no training data)."""
-    from data_gen import _sq_dist  # noqa: E402
+    from copula_inter.data_gen import _sq_dist  # noqa: E402
 
     sq = _sq_dist(X_test, X_test)
     h2 = torch.pdist(X_test).pow(2).median().clamp(min=1e-6)

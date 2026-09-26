@@ -15,7 +15,7 @@ import pytest
 import torch
 from conftest import make_batch
 
-from model import build_copula_transformer, low_rank_correlation
+from copula_inter.model import build_copula_transformer, low_rank_correlation
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -31,21 +31,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-import common
-from config import DebugConfig, add_common_args, build_config
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
 RANK_SWEEP_DEFAULT = [4, 8, 16, 32, 64, 128]
 
@@ -62,8 +54,8 @@ def fit_rank_ceiling(
     parametrization) and loss.py::_safe_cholesky (the real model's exact
     numerical-safety path) rather than reimplementing either.
     """
-    from loss import _safe_cholesky
-    from model import low_rank_correlation
+    from copula_inter.loss import _safe_cholesky
+    from copula_inter.model import low_rank_correlation
 
     B, N, _ = R_post.shape
     R_post = R_post.to(device)

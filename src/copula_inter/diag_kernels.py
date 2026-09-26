@@ -6,9 +6,9 @@ then (Stage 3) pools the off-diagonal R_star entries across N_STAGE3 tasks per
 kernel to check the family isn't collapsing toward independence (screening
 effect) or degenerating toward triviality (near-1 correlations everywhere).
 Run from the project root:
-    python src/diag_kernels.py
-    python src/diag_kernels.py --n-stage3 200   # smaller/faster batch
-    python src/diag_kernels.py --skip-stage3    # per-task checks only
+    python -m copula_inter.diag_kernels
+    python -m copula_inter.diag_kernels --n-stage3 200   # smaller/faster batch
+    python -m copula_inter.diag_kernels --skip-stage3    # per-task checks only
 
 DataCfg/Cfg/check_task/batch_off_diagonal_stats below are also imported
 directly by tests/test_diag_kernels.py, which turns this same per-task/
@@ -29,8 +29,7 @@ from typing import List
 
 import torch
 
-sys.path.insert(0, "src")
-from data_gen import generate_gp_task, ALL_KERNELS  # noqa: E402
+from copula_inter.data_gen import generate_gp_task, ALL_KERNELS  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Minimal cfg stub (mirrors gp_tasks.yaml defaults)

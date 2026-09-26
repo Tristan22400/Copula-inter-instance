@@ -1,5 +1,5 @@
 """marginal_backbones.py — per-architecture adapter layer for Phase-A
-marginal fine-tuning (src/finetune_marginal.py).
+marginal fine-tuning (src/copula_inter/finetune_marginal.py).
 
 Phase A fine-tunes a STANDALONE tabular foundation model so its marginal
 predictive density is better calibrated, then hands the result to a copula
@@ -65,8 +65,8 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
-from backend_registry import BACKENDS
-from artifacts import atomic_torch_save
+from copula_inter.backend_registry import BACKENDS
+from copula_inter.artifacts import atomic_torch_save
 
 __all__ = [
     "BACKBONE_NAMES",
@@ -156,9 +156,9 @@ def resolve_tier(backbone_name: str, tier: int) -> int:
         raise ValueError(
             f"marginal.tier={tier} is not available for backbone {backbone_name!r} "
             f"(max {top}). Tiers >= 1 install LoRA adapters on attention modules "
-            f"(src/lora.py), and {backbone_name}'s attention is not a swappable "
+            f"(src/copula_inter/lora.py), and {backbone_name}'s attention is not a swappable "
             "nn.Module this repo has an adapter for -- see "
-            "src/marginal_backbones.py's module docstring for the specifics. "
+            "src/copula_inter/marginal_backbones.py's module docstring for the specifics. "
             "Use marginal.tier=0, or add a Parameter-level LoRA to lora.py."
         )
     return int(tier)
@@ -295,7 +295,7 @@ class MarginalBackbone:
         shape plus a ``backbone`` tag, and are loaded back through
         eval/spatial/marginal_backends.py::make_regressor(..., ckpt=path).
         """
-        from lora import merged_base_state_dict_any
+        from copula_inter.lora import merged_base_state_dict_any
 
         payload = {
             "config": dict(self.config),
@@ -534,7 +534,7 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
         raise ValueError(f"Unknown marginal backbone {name!r}; expected one of {list(BACKBONE_NAMES)}.")
 
     if name == "tabicl":
-        from pit import load_tabicl
+        from copula_inter.pit import load_tabicl
 
         module, config = load_tabicl(ckpt, device, return_config=True) if ckpt else load_tabicl(ckpt, device)
         return MarginalBackbone(name=name, module=module, handle=None, config=config or {})
@@ -596,7 +596,7 @@ def assert_patterns_match(module: nn.Module, patterns: Sequence[str]) -> dict[st
         raise ValueError(
             f"tier-0 patterns matched no parameters: {missing}. The architecture's "
             "parameter names have changed -- update TIER0_PATTERNS in "
-            "src/marginal_backbones.py."
+            "src/copula_inter/marginal_backbones.py."
         )
     return counts
 

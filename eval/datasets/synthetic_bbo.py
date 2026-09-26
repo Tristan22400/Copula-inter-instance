@@ -19,21 +19,14 @@ own cfg in (see run_benchmarks.py) rather than the module-level default.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 from scipy.stats import qmc
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
 
-from data_gen import (  # noqa: E402
+from copula_inter.data_gen import (  # noqa: E402
     _build_kernel_chain,
     _build_likelihood,
     _kernel_needs_scalar_input,

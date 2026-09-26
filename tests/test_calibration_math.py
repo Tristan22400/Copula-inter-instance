@@ -17,16 +17,12 @@ Run directly:
 from __future__ import annotations
 
 import os
-import sys
 
 import numpy as np
 import pytest
 from scipy.stats import kstest, norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_TESTS)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 from eval.spatial import calibration as gp  # noqa: E402
 

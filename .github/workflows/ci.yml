@@ -31,8 +31,8 @@ jobs:
         run: uv sync --locked --extra dev --extra cpu
       - name: Syntax and import smoke
         run: |
-          uv run --no-sync python -m compileall -q src eval inference tests
-          uv run --no-sync python -c "import data_gen, train, eval.runners.eval_checkpoint, inference.copula_inference"
+          uv run --no-sync python -m compileall -q src eval inference debug tests
+          uv run --no-sync python -c "import copula_inter.data_gen, copula_inter.train, eval.runners.eval_checkpoint, inference.copula_inference"
       - name: Fast CPU regression tests
         run: |
           uv run --no-sync python -m pytest -q --disable-warnings --durations=15 \

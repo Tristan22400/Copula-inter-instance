@@ -20,7 +20,6 @@ import dataclasses
 import hashlib
 import os
 import subprocess
-import sys
 import time
 from typing import Optional
 
@@ -28,10 +27,6 @@ from omegaconf import OmegaConf
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 RESULTS_ROOT = os.path.join(_HERE, "results")
 

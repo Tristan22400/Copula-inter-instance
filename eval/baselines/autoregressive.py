@@ -2,7 +2,7 @@
 model alone, by the chain rule.
 
 The marginal branch of this repo's Sklar decomposition (a frozen/fine-tuned
-TabICL, see src/pit.py) predicts one test point at a time, conditioned only on
+TabICL, see src/copula_inter/pit.py) predicts one test point at a time, conditioned only on
 the episode's context. Scored that way it is an INDEPENDENCE model over the
 test set: its joint log-density is the sum of per-point terms and its copula
 term is exactly 0. The copula head is what is supposed to supply the missing
@@ -62,21 +62,13 @@ best case rather than a typical one.
 
 from __future__ import annotations
 
-import os
-import sys
 import zlib
 from typing import Optional
 
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from pit import tabicl_forward
+from copula_inter.pit import tabicl_forward
 
 __all__ = [
     "autoregressive_log_pdf",

@@ -8,9 +8,9 @@ selected by ``cfg.model.correlation_parametrization`` (see
 correlation_factory.py).
 
 Usage:
-    python src/train.py
-    python src/train.py training.steps=500 training.dataset_dir=./data/debug_latent
-    WANDB_MODE=disabled python src/train.py training.steps=200
+    python -m copula_inter.train
+    python -m copula_inter.train training.steps=500 training.dataset_dir=./data/debug_latent
+    WANDB_MODE=disabled python -m copula_inter.train training.steps=200
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ import traceback
 # explicit environment override still wins.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-import sys
 import time
 import zlib
 from glob import glob
@@ -48,29 +47,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
 import wandb
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
 
 # eval/ (regions.py, spatial-correlation probe helpers -- see
 # _build_era5_val_batches below) lives at the repo root, not under src/.
-_REPO_ROOT = os.path.dirname(_HERE)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
-from classical_kernels import DEFAULT_FAMILIES
-from artifacts import atomic_torch_save
-from config_path import config_dir
-from training_core import (
-    _forward_and_loss, _measure_step_flops, _run_train_step, cosine_lr_lambda,
+from copula_inter.classical_kernels import DEFAULT_FAMILIES
+from copula_inter.artifacts import atomic_torch_save
+from copula_inter.config_path import config_dir
+from copula_inter.training_core import (
+    _measure_step_flops, _run_train_step, cosine_lr_lambda,
 )
-from data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, _generate_gp_batch_raw, generate_gp_batch
-from dataset import (
+from copula_inter.data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, _generate_gp_batch_raw, generate_gp_batch
+from copula_inter.dataset import (
     CopulaDataset,
     ShardBlockSampler,
     ShardHomogeneousBatchSampler,
@@ -78,7 +71,7 @@ from dataset import (
 )
 from eval.configs.constants import GP_LR_MLE
 from eval.configs.regions import REGIONS as ERA5_REGIONS
-from era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
+from copula_inter.era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
 from eval.data.era5_io import load_era5_data, safe_cholesky
 from eval.data.fetch_era5 import fetch as fetch_era5
 from eval.spatial.diagnostics import compute_context_z_train
@@ -90,7 +83,7 @@ from eval.viz.correlation_plots import (
     plot_z_predictor_samples,
 )
 from inference.copula_inference import normalize_features
-from live_dataset import (
+from copula_inter.live_dataset import (
     _GENERIC_MARGINAL_BACKENDS,
     _LIVE_TABICL_FLAT_HEADROOM_GB,
     _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB,
@@ -101,12 +94,12 @@ from live_dataset import (
     limited_main_process_threads,
     resolve_live_tabicl_num_workers,
 )
-from loss import _safe_cholesky, y_space_nll
-from model import build_copula_transformer, build_sigma, low_rank_correlation_factor
-from muon import Muon
-from backend_registry import TABICL_Z_TRAIN_SOURCES
-from backend_registry import z_train_source as z_train_source_of
-from pit import (
+from copula_inter.loss import y_space_nll
+from copula_inter.model import build_copula_transformer, build_sigma
+from copula_inter.muon import Muon
+from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import z_train_source as z_train_source_of
+from copula_inter.pit import (
     DEFAULT_K_FOLDS,
     gaussian_corr_kl,
     gp_analytical_pit,
@@ -1575,8 +1568,6 @@ def _build_tabicl_kernel_fit_z(
     }
 
 
-
-
 def _fmt_run_value(value) -> str:
     if isinstance(value, bool):
         return str(value).lower()
@@ -2347,12 +2338,6 @@ def load_checkpoint(
     return int(ckpt.get("step", 0))
 
 
-
-
-
-
-
-
 @hydra.main(config_path=config_dir(__file__), config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.seed)
@@ -2365,7 +2350,7 @@ def main(cfg: DictConfig) -> None:
         # TF32 tensor-core matmul on Ampere+/Ada+/Hopper: NOT enabled by torch
         # by default, even though the model's own forward already runs under
         # bf16 autocast. What that autocast doesn't cover — Muon's Newton-
-        # Schulz orthogonalization (src/muon.py, fp32 grad-derived matmuls,
+        # Schulz orthogonalization (src/copula_inter/muon.py, fp32 grad-derived matmuls,
         # confirmed the single most expensive part of each step: bwd+opt time
         # is several times forward time in profiling) and y_space_nll's
         # Cholesky/logdet path — still runs fp32 matmuls at full CUDA-core

@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from omegaconf import OmegaConf
 
-from data_gen import corrupt_z_train
+from copula_inter.data_gen import corrupt_z_train
 
 
 def make_z_train(B: int = 200, P: int = 40, seed: int = 0):

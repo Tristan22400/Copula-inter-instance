@@ -1,6 +1,6 @@
 """joint_nll.py — Joint NLL under Sklar's theorem, for arbitrary (quantile_grid, probs, R).
 
-Thin wrapper around ``src/loss.py::y_space_nll`` — the copula-NLL + marginal-NLL
+Thin wrapper around ``src/copula_inter/loss.py::y_space_nll`` — the copula-NLL + marginal-NLL
 decomposition is NOT re-derived here; ``y_space_nll`` already implements it
 (dense Cholesky via ``_safe_cholesky``, masked padding) and is reused verbatim.
 The only new code is turning a generic ``(quantile_grid, probs)`` marginal
@@ -15,7 +15,7 @@ NAMING TRAP — two different "copula"/"marginal" conventions share the same
 key names across this codebase; grabbing one by key without checking which
 convention produced it silently mixes incomparable numbers:
 
-  1. OWN-MARGINAL (this module's ``compute_joint_nll``, ``src/loss.py::
+  1. OWN-MARGINAL (this module's ``compute_joint_nll``, ``src/copula_inter/loss.py::
      y_space_nll``, ``eval/baselines/classical.py``'s ``y_space_nlls``,
      ``eval/runners/eval_checkpoint.py``'s ``total_nlls``): each method
      supplies its OWN fitted/estimated marginal, so its own ``z`` differs
@@ -39,20 +39,13 @@ conventions are printed side by side.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 import torch
 from scipy.stats import norm
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
 
-from loss import y_space_nll  # noqa: E402
+from copula_inter.loss import y_space_nll  # noqa: E402
 
 __all__ = ["compute_joint_nll", "compute_pit", "kfold_loo_pit"]
 

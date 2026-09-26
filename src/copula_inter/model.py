@@ -5,7 +5,7 @@ feature extractor + copula head.
 Despite the class name (kept for state-dict/call-site stability — see
 copula_backbones.py's docstring for why only two backbones qualify), the
 backbone is a CHOICE: ``cfg.model.backbone`` selects "tabicl" (default) or
-"tabldm" (Xiaomi-TabLDM), dispatched through src/copula_backbones.py. All
+"tabldm" (Xiaomi-TabLDM), dispatched through src/copula_inter/copula_backbones.py. All
 architecture-specific construction (pretrained/scratch loading, decoder
 discovery+stripping, an optional MoE auxiliary loss) lives there; this
 module only holds the feature-extractor pattern and the copula head itself,
@@ -38,8 +38,6 @@ build_sigma() below.
 
 from __future__ import annotations
 
-import os
-import sys
 from typing import Optional
 
 import torch
@@ -48,16 +46,9 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch import Tensor
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
-if _TABICL_SRC not in sys.path:
-    sys.path.insert(0, _TABICL_SRC)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
-import copula_backbones
-from correlation_factory import (
+from copula_inter import copula_backbones
+from copula_inter.correlation_factory import (
     LowRankCorrelationFactor,
     cossim_correlation,
     sparse_covnorm_correlation,
@@ -335,7 +326,7 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
         cfg.model.backbone             (default "tabicl"; one of
                                          copula_backbones.BACKBONE_NAMES —
                                          "tabicl" | "tabldm". See
-                                         src/copula_backbones.py for the
+                                         src/copula_inter/copula_backbones.py for the
                                          per-architecture construction this
                                          dispatches to.)
         cfg.model.rank
@@ -381,7 +372,7 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
 
     lora_cfg = cfg.get("lora", {})
     if bool(lora_cfg.get("enabled", False)):
-        from lora import apply_lora  # type: ignore[import]
+        from copula_inter.lora import apply_lora  # type: ignore[import]
         n = apply_lora(
             backbone=model.feature_extractor,
             rank=int(lora_cfg.get("rank", 8)),

@@ -31,18 +31,11 @@ to not flake on ordinary kernel-selection noise.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 pytest.importorskip("exaonetabular", reason="exaonetabular not installed")
 

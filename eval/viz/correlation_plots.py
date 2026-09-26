@@ -205,7 +205,7 @@ def _plot_field_grid(
     and a Moran's I annotation (see eval.spatial.diagnostics.morans_i).
 
     `output_path=None` skips the save-to-disk step and returns the open
-    Figure instead (e.g. for src/train.py's live wandb.Image logging, which
+    Figure instead (e.g. for src/copula_inter/train.py's live wandb.Image logging, which
     has no use for an on-disk copy) -- otherwise behaves exactly as before:
     saves, closes, prints, returns None."""
     import matplotlib
@@ -314,7 +314,7 @@ def plot_residual_grid(
     correlation switched off (R replaced by the identity), isolating what
     the learned correlation structure itself adds on top of the per-point
     marginal. If `oracle_fields` is given, it is rendered ABOVE the model
-    rows as a reference predictor -- for src/train.py's val/era5_predictions
+    rows as a reference predictor -- for src/copula_inter/train.py's val/era5_predictions
     figure that is one draw from a fitted GP posterior on the same
     sparse context (see train.py::_era5_viz_gp_field), so the copula model's
     sample can be compared against what a classical GP actually produces on
@@ -329,7 +329,7 @@ def plot_residual_grid(
 
     `data["t2m"]` may be either the full (n_time, H, W) array `load_era5_data`
     returns (`days` then indexes positionally into it) or a plain
-    ``{day: (H, W) frame}`` dict covering just `days` (src/train.py's
+    ``{day: (H, W) frame}`` dict covering just `days` (src/copula_inter/train.py's
     validate() builds one of these instead of retaining every fetched day) --
     both support the same `data["t2m"][d]` lookup this function relies on.
 
@@ -384,7 +384,7 @@ def plot_mean_removed_grid(
     mean subtracted at each location before plotting -- the frozen TabICL
     marginal's mean field for the ground-truth/model/independent rows, the
     fitted GP's own posterior mean for the GP row (see
-    src/train.py::_era5_viz_fig, which builds `true_resid_fields` as
+    src/copula_inter/train.py::_era5_viz_fig, which builds `true_resid_fields` as
     ground_truth - TabICL_marginal_mean, and the predicted/independent/
     oracle rows the same way from each row's own generating mean).
 
