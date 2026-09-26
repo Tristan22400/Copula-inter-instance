@@ -1,60 +1,21 @@
-"""classical.py — every non-ICL baseline scored against a copula episode,
-fit together in one place so they always run under identical conventions
-(same oracle_mode, same hyperpriors, same y-space fitting target).
+"""Non-ICL baselines scored on a copula episode, all under the same conventions.
 
-Methods
--------
-  independence       : R = I_N (copula NLL = 0.0 always, reference point)
-  gp_prior_rbf       : RBF prior correlation at test points (median bandwidth,
-                       no conditioning on z_train)
-  gp_mle_rbf         : GP posterior with MLE-fitted RBF {l, alpha^2, sigma^2_n},
-                       fit in raw y-space
-  gp_mle_ard_rbf     : Same, with one lengthscale per input dimension (ARD)
-  gp_mle_matern32    : GP posterior with MLE-fitted Matern-3/2 kernel, fit in
-                       raw y-space
-  gp_mle_ard_matern32: Matern-3/2 with ARD lengthscales
-  gp_mle_periodic    : GP posterior with MLE-fitted Periodic kernel (+ period),
-                       fit in raw y-space
-  gp_mle_ard_periodic: Periodic with one lengthscale + period per input dimension (ARD)
-  gp_mle_rq          : GP posterior with MLE-fitted Rational Quadratic (+ rq_alpha),
-                       fit in raw y-space
-  gp_mle_ard_rq      : Rational Quadratic with ARD lengthscales
-  gp_mle_dot_product : GP posterior with MLE-fitted linear/dot-product kernel
-                       (variance + noise term fitted), fit in raw y-space
-  gp_mle_polynomial  : GP posterior with MLE-fitted Polynomial kernel,
-                       k(x1,x2) = alpha2 * (x1^Tx2 + c)^d — degree d searched
-                       over every value in [poly_power_min, poly_power_max]
-                       (gpytorch.kernels.PolynomialKernel takes it as a plain
-                       int, not a differentiable parameter, so each candidate
-                       is a separate fit; see _poly_degree_candidates), offset
-                       c + outputscale + noise fitted, fit in raw y-space
-  dkl_rbf/matern32/rq/dot_product :
-                       Deep Kernel Learning — MLP(d_x->32->16) feature extractor
-                       feeding a GP layer (chosen kernel), fit in raw y-space,
-                       trained jointly by maximising the marginal log-likelihood
-  per_ep_transformer : Small set-transformer trained from scratch on this episode,
-                       fit against a z-scored (no oracle kernel) transform of
-                       y_train, analogous to gp_mle/dkl's y-space fit
+Methods:
+    independence: R = I (copula NLL 0).
+    gp_prior_rbf: RBF prior correlation with a median bandwidth.
+    gp_mle_{rbf, matern32, periodic, rq, dot_product, polynomial} and ARD
+        variants (gp_mle_ard_*): GP posterior with MAP-fitted hyperparameters,
+        fitted on raw y; polynomial searches every degree in
+        [poly_power_min, poly_power_max].
+    dkl_{rbf, matern32, rq, dot_product}: deep kernel learning, an MLP
+        (d_x -> 32 -> 16) feeding a GP, trained on the marginal likelihood.
+    per_ep_transformer: small set transformer trained on the episode's
+        z-scored y_train.
 
-Entry point is ``eval_baselines_episode`` — everything else in this module is
-an implementation detail of one of the methods above. ``eval_checkpoint.py``
-calls it once per episode and merges the result with the ICL model's own
-score (which lives outside this file: it's the one thing that changes
-between runs, not a baseline).
-
-Baseline caching
-----------------
-GP-MLE (with restarts)/DKL/per_ep_transformer fitting dominates evaluation
-runtime and, unlike the ICL model under test, only depends on the
-episode-generating config and the fitting hyperparameters passed to
-``eval_baselines_episode`` — not on which checkpoint is being evaluated.
-``baseline_fingerprint`` + ``episode_cache_key`` + ``save_baseline_entry`` /
-``load_baseline_cache`` let a runner cache results per episode across
-repeated runs against new checkpoints; any change to a fitting
-hyperparameter or the episode config invalidates the cache automatically.
-Entries are written one file per episode, so a run that dies keeps every fit
-it finished (``save_baseline_cache`` writes the older single-file layout,
-which ``load_baseline_cache`` still reads).
+eval_baselines_episode is the entry point. baseline_fingerprint,
+episode_cache_key, save_baseline_entry and load_baseline_cache cache results
+per episode (one file each), keyed so that any change to the generating
+config or fitting settings invalidates them.
 """
 
 from __future__ import annotations
@@ -75,12 +36,7 @@ from omegaconf import OmegaConf
 from torch import Tensor
 from torch.optim import Adam
 
-# psd_safe_cholesky (called on every mll() step below) warns every time it
-# adds jitter to recover from a near-singular K during MLE optimisation —
-# routine and already handled (it retries with escalating jitter, only
-# raising NotPSDError, caught by fit_and_eval_gpytorch's restart loop, if
-# that fails outright), so it's silenced rather than spamming stdout once
-# per restart per step.
+# Silence psd_safe_cholesky's jitter warnings during fitting.
 warnings.filterwarnings("ignore", category=NumericalWarning)
 
 
@@ -108,16 +64,7 @@ __all__ = [
 
 
 def assert_shared_z_test(z_test: Tensor, ep: dict) -> None:
-    """Guard the SHARED-MARGINAL `nlls` table's one load-bearing invariant:
-    every method in that table (independence/gp_prior_rbf/GP-MLE/DKL/
-    per_ep_transformer here, icl/oracle in eval_checkpoint.py's
-    _eval_icl_episode) must be scored against the literally-identical
-    `ep["z_test"]` — only R differs between methods — or corr_nll_single's
-    ranking silently stops meaning what _print_table's header claims (see
-    corr_nll_single's docstring / the "NAMING TRAP" note in
-    eval/metrics/joint_nll.py). Cheap (one tensor compare per episode); call
-    right after deriving the local `z_test` a caller is about to score with,
-    before any corr_nll_single call."""
+    """Raise if the z_test being scored is not ep["z_test"] (the shared-marginal table needs one z_test for every method)."""
     ep_z_test = ep["z_test"].to(z_test.device, z_test.dtype)
     assert torch.equal(z_test, ep_z_test), (
         "z_test used for a shared-marginal copula-NLL score has diverged "
@@ -125,13 +72,7 @@ def assert_shared_z_test(z_test: Tensor, ep: dict) -> None:
         "ranking (see assert_shared_z_test's docstring)."
     )
 
-# Every key eval_baselines_episode is supposed to populate in its returned
-# nlls/R_dict — kept in sync by hand with the method bodies below (independence
-# + gp_prior_rbf + every _LABEL_MAP/_DKL_LABEL_MAP value + per_ep_transformer).
-# eval_checkpoint.py compares a cached episode's keys against this set: a
-# cache built before a new baseline (e.g. gp_mle_polynomial) was added here
-# would otherwise be missing that key forever (same episode/fingerprint, so
-# it looks "valid") and silently mean() to NaN instead of getting computed.
+# Keys eval_baselines_episode returns; cached entries missing any are refitted.
 EXPECTED_BASELINE_KEYS = frozenset(
     {"independence", "gp_prior_rbf", "per_ep_transformer"}
     | {
@@ -144,40 +85,7 @@ EXPECTED_BASELINE_KEYS = frozenset(
     | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
 )
 
-# Bump whenever a baseline's *fitting algorithm* changes in a way that
-# baseline_fingerprint's other inputs (gen_cfg.data, oracle_mode, step
-# counts, ...) wouldn't otherwise detect — e.g. gp_mle_polynomial switching
-# from a single fixed degree to searching every degree in
-# [poly_power_min, poly_power_max] (see _poly_degree_candidates) uses the
-# exact same gen_cfg.data as before, so without this the fingerprint would
-# match an old cache built under the old fixed-degree fit and silently keep
-# serving it as if it were still correct.
-#
-# v2: eval_baselines_episode takes `fit_seed` and reseeds torch from it, so a
-# fit depends only on (episode, hyperparameters) and no longer on how many
-# episodes happened to be drawn from the global RNG before it. v1 entries were
-# produced under the old order-dependent stream and are not reproducible
-# results of the current code, so they must not be served as if they were.
-#
-# v3: GP-MLE fits select on a held-out split (val_select) instead of running
-# to a fixed n_steps and keeping the lowest TRAINING loss -- see
-# fit_and_eval_gpytorch's docstring for the measured ARD overfitting this
-# fixes. v2 entries hold systematically over-fit ARD rows (up to +6 nats/pt).
-#
-# v4: DKL fixes two compounding bugs diagnosed by tracing a real fit (see
-# fit_and_eval_gpytorch's docstring): (1) the feature extractor was a single
-# nn.Module instance shared across n_restarts iterations, so a "restart"
-# never actually re-initialised the MLP -- moot before v4 anyway since DKL
-# was called with n_restarts=1 (no restart loop at all, so an unlucky single
-# random MLP init had no chance to recover); (2) the held-out-NLL check grid
-# (every n_steps//100 steps) is coarse enough to step over the genuine
-# optimum on the curve traced in that docstring (true min at step 90 vs. the
-# step-50/step-100 grid points bracketing it). v4 gives DKL real restarts
-# (a fresh MLP each time, via a factory) and a step grid dense enough near
-# the start of training to find that optimum. v3 entries hold DKL rows fit
-# from a single, frequently-bad random init and/or missing the true early
-# optimum -- both push the reported DKL NLL far worse than the method
-# actually supports.
+# Bump when a fitting algorithm changes in a way the fingerprint cannot detect.
 _BASELINE_ALGO_VERSION = 4
 
 
@@ -185,30 +93,9 @@ GP_VAL_SELECT_MODES = ("ard", "always", "never")
 
 
 def _resolve_val_select(mode: str, ard: bool) -> bool:
-    """Whether THIS kernel should pick its fit on a held-out split.
+    """Whether this kernel selects its fit on a held-out split.
 
-    Held-out selection buys protection against hyperparameter overfitting and
-    costs 20% of an already-small P (32 points) — so it is worth it exactly
-    where the free-parameter count is large relative to P, and a net loss
-    where it is not. Measured over 8 episodes on the posterior predictive at
-    the real y_test (nats/point, negative = better):
-
-        ard_rbf        -2.58      dot_product    +0.36
-        ard_rq         -2.72      rational_quad  -0.13
-        ard_matern32   -0.48      rbf            -0.01
-                                  matern32       -0.00
-                                  periodic       +0.00
-
-    ARD carries one lengthscale per input dimension (9 here), which the
-    LogNormal prior does not hold; the non-ARD kernels have 2-3
-    hyperparameters that the same prior regularises adequately, so for them
-    the split is pure data loss. dot_product is the clearest case — a linear
-    kernel with variance and noise and no lengthscale at all, nothing to
-    overfit, so it only pays the cost.
-
-    "ard" (default) follows that split; "always" applies it everywhere;
-    "never" restores the pre-v3 behaviour of running to n_steps and keeping
-    the lowest TRAINING loss.
+    "ard" (default): only ARD kernels; "always"; "never" (lowest training loss).
     """
     if mode == "always":
         return True
@@ -222,25 +109,15 @@ def _resolve_val_select(mode: str, ard: bool) -> bool:
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
-    """Copula NLL for a single (N, N) correlation matrix and (N,) z-vector.
-    SHARED-MARGINAL convention (z fixed across methods) — see the "NAMING
-    TRAP" note in eval/metrics/joint_nll.py's module docstring before
-    comparing this to y_space_nlls'/total_nlls' "copula" values below."""
+    """Copula NLL of an (N,) z under an (N, N) correlation matrix, with the shared z_test."""
     N = z.shape[0]
     mask = torch.ones(1, N, dtype=torch.bool, device=z.device)
     return oracle_copula_nll(R.unsqueeze(0), z.unsqueeze(0), mask).item()
 
 
-# ---------------------------------------------------------------------------
-# GP baselines (GPyTorch)
-# ---------------------------------------------------------------------------
-# ExactGP + ExactMarginalLogLikelihood + Adam(model.parameters()) backprops
-# through kernel hyperparameters (registered as ordinary constrained
-# nn.Parameters) just fine — no hand-rolled kernel math or NaN-safe distance
-# helpers needed.
+# GP baselines (gpytorch).
 
-# Same nu convention as src/copula_inter/classical_kernels.py's _MATERN_NU / src/copula_inter/data_gen.py's
-# _BASE_GPYTORCH_KERNEL_CLS matern12/32/52 entries.
+# Matern nu per kernel name.
 _MATERN_NU = {"matern12": 0.5, "matern32": 1.5, "matern52": 2.5}
 
 _ARD_ELIGIBLE = {
@@ -248,52 +125,26 @@ _ARD_ELIGIBLE = {
     "matern12": True,
     "matern32": True,
     "matern52": True,
-    # gpytorch.kernels.PeriodicKernel sums per-dimension sin^2 terms inside a
-    # single exp() (a product of per-dimension periodic kernels), which is
-    # PSD for any ard_num_dims.
+    # PeriodicKernel is PSD for any ard_num_dims.
     "periodic": True,
     "rational_quadratic": True,
     "dot_product": False,
-    # PolynomialKernel has no lengthscale at all (geometry comes from the raw
-    # dot product, same as dot_product) — no per-dimension axis to assign ARD
-    # lengthscales to.
+    # PolynomialKernel has no lengthscale.
     "polynomial": False,
 }
 
-# Fallback degree for the gp_mle_polynomial baseline, used only when a caller
-# builds an _ExactGPModel(kernel_name="polynomial") without specifying
-# poly_power explicitly. gpytorch.kernels.PolynomialKernel takes `power` as a
-# plain Python int baked into forward()'s .pow(self.power) call, not a
-# registered (constrained) Parameter — so unlike offset/outputscale/noise it
-# cannot be optimised by Adam and must be fixed ahead of fitting. 2 mirrors
-# data_gen.py's poly_power_min default (the low end of the
-# episode-generating poly_power_min/poly_power_max range). The actual
-# gp_mle_polynomial baseline below no longer uses this fallback: it searches
-# every degree in that same [poly_power_min, poly_power_max] range instead of
-# guessing one fixed degree — see _poly_degree_candidates.
+# Default polynomial degree when poly_power is not given (not trainable in gpytorch).
 _POLY_BASELINE_POWER = 2
 
 
 def _poly_degree_candidates(prior_cfg: dict) -> list[int]:
-    """Every integer degree data_gen.py's generative process can sample for a
-    polynomial-kernel episode: Uniform{poly_power_min, ..., poly_power_max}
-    (see data_gen.py's `if name == "polynomial":` branch). A real baseline
-    never has oracle access to which degree generated a given episode, so
-    gp_mle_polynomial fits one GP per candidate degree here (each with its
-    own n_restarts restarts — see fit_and_eval_gpytorch) and keeps whichever
-    reaches the best training loss, instead of assuming a single fixed
-    degree and being systematically misspecified whenever the true episode
-    used a different one.
-    """
+    """Integer degrees poly_power_min..poly_power_max that polynomial episodes can have."""
     power_min = int(prior_cfg.get("poly_power_min", 2))
     power_max = int(prior_cfg.get("poly_power_max", 4))
     return list(range(power_min, power_max + 1))
 
 
-# Default hyperprior constants, mirroring data_gen.py's _kernel_prior_spec /
-# _nugget_prior fallback defaults (the actual per-dataset values live in the
-# checkpoint's own saved cfg.data and are threaded in via prior_cfg — these
-# are only the fallback if a key happens to be missing there).
+# Fallback hyperprior constants (data_gen defaults), used when prior_cfg lacks a key.
 _DEFAULT_PRIOR_CFG: dict[str, float] = {
     "l_lognormal_loc": 0.0,
     "l_lognormal_scale": 0.7,
@@ -311,34 +162,15 @@ _DEFAULT_PRIOR_CFG: dict[str, float] = {
 
 
 def _kernel_priors(prior_cfg: dict, kernel_name: str, ard: bool = False) -> dict[str, Prior]:
-    """Build the same LogNormal/Gamma hyperpriors data_gen.py's generative
-    process samples ground-truth hyperparameters from, for MAP — instead of
-    plain MLE — fitting of the GP baselines here.
+    """LogNormal/Gamma hyperpriors matching data_gen's generative priors, for MAP fitting.
 
-    Plain MLE over an ARD lengthscale vector has no reason to prefer "large
-    lengthscale" (irrelevant dimension) over "small lengthscale" (active
-    dimension, poorly identified from limited context) when both explain the
-    P training points similarly well — the marginal-likelihood surface is
-    flat/multimodal in that direction. Registering these priors on the
-    kernel/likelihood makes ExactMarginalLogLikelihood add their log-density
-    automatically, pulling the fit toward the same hyperparameter regime the
-    episodes were actually generated from.
-
-    ard=True omits the lengthscale prior specifically: LogNormal(l_loc, l_scale)
-    describes the lengthscale of a dimension already known to be active — its
-    median-1 pull actively discourages the "grow arbitrarily large" behaviour
-    an ARD lengthscale needs to correctly flag a dimension as irrelevant.
-    Outputscale/noise priors showed no such conflict (they aren't asked to do
-    variable selection) and stay on unconditionally.
+    With ard=True the lengthscale prior is omitted.
     """
     cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
     if kernel_name == "dot_product":
         return {"variance_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"])}
     if kernel_name == "polynomial":
-        # Unlike dot_product, PolynomialKernel is still wrapped in a
-        # ScaleKernel (it has no built-in variance of its own — see
-        # _ExactGPModel), so it keeps the usual outputscale_prior on top of
-        # its own offset_prior.
+        # PolynomialKernel is wrapped in ScaleKernel, so it keeps the outputscale prior.
         return {
             "outputscale_prior": GammaPrior(cfg["alpha2_gamma_concentration"], cfg["alpha2_gamma_rate"]),
             "offset_prior": GammaPrior(cfg["poly_offset_gamma_concentration"], cfg["poly_offset_gamma_rate"]),
@@ -361,11 +193,7 @@ def _noise_prior(prior_cfg: dict) -> LogNormalPrior:
 
 
 def _lengthscale_init_prior(prior_cfg: dict) -> LogNormalPrior:
-    """Same LogNormal distribution _kernel_priors would've used for the
-    lengthscale prior — used here only to sample a fresh *initial* value per
-    restart when ard=True omits it as a registered MAP prior, so ARD restarts
-    still diversify their starting point instead of all beginning from
-    gpytorch's identical default init."""
+    """The lengthscale prior, used only to sample initial ARD lengthscales per restart."""
     cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
     return LogNormalPrior(cfg["l_lognormal_loc"], cfg["l_lognormal_scale"])
 
@@ -376,17 +204,9 @@ def _randomize_init(
     kernel_name: str,
     lengthscale_init_prior: Prior | None = None,
 ) -> None:
-    """Sample a fresh initial value for every registered prior's parameter —
-    called once per restart (before .train()/optimizer construction, so the
-    in-place `.initialize()` copy these setters do is safe) to diversify
-    restarts instead of re-running Adam from the same fixed gpytorch default
-    init every time.
-    """
+    """Sample a fresh initial value for every registered prior's parameter (once per restart)."""
     base = model.covar_module if kernel_name == "dot_product" else model.covar_module.base_kernel
-    # gpytorch's Kernel base class defines a `lengthscale` property on every
-    # kernel (returning None for kernels with has_lengthscale=False, e.g.
-    # LinearKernel) rather than raising AttributeError, so hasattr() alone
-    # can't distinguish "no lengthscale" from "has one" — check the value too.
+    # Kernels without a lengthscale return None for .lengthscale.
     has_lengthscale = getattr(base, "lengthscale", None) is not None
     device = base.lengthscale.device if has_lengthscale else next(model.parameters()).device
     ls_prior = kernel_priors.get("lengthscale_prior", lengthscale_init_prior)
@@ -405,8 +225,7 @@ def _randomize_init(
 
 
 class _ExactGPModel(gpytorch.models.ExactGP):
-    """ExactGP wrapper over one of the baseline kernels, optionally
-    preceded by a learned feature extractor (Deep Kernel Learning)."""
+    """ExactGP over one baseline kernel with a zero mean, optionally after a learned feature extractor (DKL)."""
 
     def __init__(
         self,
@@ -424,10 +243,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         self.mean_module = gpytorch.means.ZeroMean()
         kp = kernel_priors or {}
 
-        # PeriodicKernel reads `kwargs.get("ard_num_dims", 1)` directly rather
-        # than through the base Kernel class's None-handling, so passing
-        # ard_num_dims=None explicitly (vs. omitting it) breaks it. Omit the
-        # kwarg entirely rather than pass None, for every kernel uniformly.
+        # Omit ard_num_dims instead of passing None (PeriodicKernel does not accept None).
         ard_kw = {} if ard_num_dims is None else {"ard_num_dims": ard_num_dims}
 
         if kernel_name == "rbf":
@@ -451,11 +267,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         else:
             raise ValueError(f"Unknown kernel: {kernel_name}")
 
-        # LinearKernel already has its own learnable `variance` scale;
-        # wrapping it in ScaleKernel on top would just be a redundant,
-        # unidentifiable second scale factor. PolynomialKernel has no such
-        # built-in scale, so (unlike dot_product) it does get the ScaleKernel
-        # wrapper below.
+        # LinearKernel has its own variance, so no ScaleKernel; PolynomialKernel gets one.
         self.covar_module = (
             base if kernel_name == "dot_product"
             else gpytorch.kernels.ScaleKernel(base, outputscale_prior=kp.get("outputscale_prior"))
@@ -468,12 +280,7 @@ class _ExactGPModel(gpytorch.models.ExactGP):
 
 
 def _val_check_steps(n_steps: int) -> set[int]:
-    """Which training steps to evaluate held-out NLL at, for use_val's
-    early-stopping guard (see fit_and_eval_gpytorch's docstring for why a
-    flat every-(n_steps//100) grid is too coarse). Dense (every 10 steps)
-    through the first 500 steps, where DKL/ARD-GP-MLE's true validation
-    optimum has empirically landed, layered with the original coarse grid so
-    later-converging fits (e.g. non-ARD val_select) are still covered."""
+    """Steps at which to evaluate held-out NLL: every 10 steps up to 500, plus every n_steps // 100."""
     coarse_every = max(1, n_steps // 100)
     dense = range(0, min(n_steps, 500), 10)
     coarse = range(0, n_steps, coarse_every)
@@ -495,150 +302,21 @@ def fit_and_eval_gpytorch(
     n_restarts: int = 1,
     val_select: bool = False,
 ) -> dict[str, Tensor]:
-    """Fit a GP (optionally over a learned feature extractor, i.e. DKL) on the
-    raw y-space target by maximising the exact marginal log-likelihood, and
-    return {"R": correlation matrix, "mean": predictive mean, "Sigma":
-    predictive covariance} at X_test — R to compare against the episode's
-    oracle R_star (copula-only NLL), mean/Sigma (both raw y-units, the GP's
-    own fitted marginal) to score this baseline's total (marginal+copula)
-    Y-space NLL via gp_oracle_y_nll, the same way the ICL model can be
-    scored once it has a real (non-oracle) marginal (see
-    eval_checkpoint.py's --z_train_source=tabicl / _tabicl_pit).
+    """Fit a GP (or DKL) on raw y_train and return {"R", "mean", "Sigma"} at X_test.
 
-    Fits against y_train (not the PIT-transformed z_train) because z_train is
-    itself derived from the true generating kernel's own Cholesky factor —
-    feeding that into an independently fit "baseline" GP would leak oracle
-    kernel information a real baseline never has access to, and would fit
-    against a variable already whitened to unit variance, at odds with the
-    alpha2/nugget hyperpriors below (which mirror data_gen.py's own *y-space*
-    generative kernel-hyperparameter priors). The correlation matrix
-    (sigma_to_correlation) is coordinate-free, so scoring it against z_test
-    downstream is unaffected by y_train's absolute scale/mean — but mean/
-    Sigma are returned in that same raw y-scale on purpose, since the total
-    Y-space NLL needs real units, not a coordinate-free quantity.
-
-    oracle_mode must match how the episode's own R_star was built (see
-    data_gen.py's oracle_mode branch):
-      - "posterior": R_star conditions on (X_train, y_train), so we score the
-        fitted kernel's true GP posterior at X_test — likelihood(model(X_test))
-        folds observation noise into the returned covariance matrix, mirroring
-        data_gen.gp_posterior's latent=False convention (needed so
-        dot_product's rank-deficient K_ss — rank <= d_x, often < N — doesn't
-        come out singular).
-      - "prior": R_star ignores training conditioning entirely (raw kernel
-        structure among test points only). Scoring the conditioned posterior
-        here would answer a different question than what R_star asks — with P
-        up to several hundred context points and a small nugget, the posterior
-        shrinks off-diagonal correlation toward ~0 regardless of how well the
-        kernel hyperparameters were identified, a systematic bias specific to
-        GP-MLE/DKL (per_ep_transformer and the ICL model are trained
-        end-to-end against this same R_star target, so they don't have this
-        mismatch). Instead, evaluate the *fitted* kernel's own prior
-        covariance at X_test — model.forward(X_test) bypasses
-        ExactGP.__call__'s posterior conditioning and returns
-        mean_module/covar_module evaluated directly at X_test, then
-        likelihood(...) adds the fitted noise, exactly mirroring data_gen.py's
-        Sigma_star = K_ss (kernel + nugget, no conditioning).
-
-    prior_cfg / n_restarts: registers the same LogNormal/Gamma hyperpriors
-    data_gen.py's generative process uses (see _kernel_priors), turning plain
-    MLE into MAP, and repeats the fit from n_restarts independent random
-    inits (each sampled from those same priors — see _randomize_init),
-    keeping whichever restart reaches the best final training loss.
-
-    kernel_name="polynomial" additionally loops over every integer degree in
-    prior_cfg's [poly_power_min, poly_power_max] range (see
-    _poly_degree_candidates) — the one hyperparameter PolynomialKernel can't
-    expose to Adam — running the full n_restarts fit at each candidate degree
-    and keeping the overall best (degree, restart) combination. This makes
-    gp_mle_polynomial a spectrum-wide model-selection baseline covering the
-    same degree range the episodes are actually generated from, rather than
-    being systematically misspecified whenever an episode's true degree
-    differs from one hardcoded guess.
-
-    When feature_extractor_factory is given (DKL), training instead holds out
-    a 20% validation split of X_train/y_train and keeps whichever training
-    step's weights reached the best held-out predictive NLL, instead of just
-    running to n_steps and keeping the final weights. The plain (no
-    feature_extractor_factory) GP-MLE fit above has only 2-3 free
-    hyperparameters, already regularised by kernel_priors/noise_prior — but
-    DKL's MLP is unregularised and free to rescale its own output to defeat
-    those priors. Empirically this drives the fitted noise toward the
-    noise_constraint floor, near-interpolating y_train while collapsing every
-    X_test feature into a near-constant direction (off-diagonal correlation
-    -> ~1) — training loss keeps improving long after held-out NLL has turned
-    catastrophically worse than independence, so a fixed step count with no
-    validation signal silently picks the worst point on that curve.
-
-    DKL's feature extractor is built fresh EVERY restart via
-    feature_extractor_factory() rather than passed in as one already-
-    constructed module — a restart is supposed to give the optimiser an
-    independent chance to escape a bad basin, but _randomize_init only
-    re-samples the GP kernel's own hyperparameters, never the feature
-    extractor; a shared module instance would carry its Adam-updated weights
-    from one "restart" straight into the next, making the restart a no-op for
-    the one component (the MLP) most likely to have landed badly. Diagnosed
-    by tracing real fits (see the module docstring's DKL entry and
-    eval_baselines_episode's n_restarts_dkl): with the single fixed random
-    MLP init DKL used before this was fixed (n_restarts=1, unconditionally),
-    z-space copula NLL on 4 held-out episodes ranged from 4.9 to 102 nats/pt
-    depending purely on that one seed's luck — the held-out-NLL guard above
-    only ever gets to pick a training STEP, it cannot rescue a fit whose
-    single random init the optimiser never leaves. A step-by-step trace of
-    one such fit also showed the standard "held-out NLL decreases then rises
-    as training overfits" U-curve bottoming out inside the first ~100 of
-    5000 steps (true minimum: step 90, NLL 1.0011) — fine enough that the
-    OLD flat every-(n_steps//100) check grid (every 50 steps here) can miss
-    it entirely, landing one grid point away on a visibly worse checkpoint
-    (step 50, NLL 1.1088). _val_check_steps below checks densely (every 10
-    steps) through step 500 for exactly this reason, on top of the original
-    coarse grid for later steps.
-
-    val_select extends that same guard to the plain GP-MLE path, which needs
-    it for ARD. The reasoning just above — that plain GP-MLE "has only 2-3
-    free hyperparameters, already regularised by kernel_priors" — holds
-    without ARD and fails with it: ard_num_dims gives one lengthscale per
-    input dimension, i.e. 9 of them inferred from P=32 points, and the
-    LogNormal lengthscale prior does not hold them. Measured over 8 episodes,
-    one fit per kernel evaluated along its own trajectory, scoring the
-    posterior predictive at the real y_test (nats/point, median):
-
-        kernel          best step   NLL@best   NLL@1000   penalty
-        rbf (no ARD)          700      1.879      1.879     +0.000
-        matern32 (no ARD)    3000      1.794      1.795     +0.001
-        rq (no ARD)           400      1.705      1.708     +0.003
-        ard_matern32           25      1.813      2.664     +0.850
-        ard_rq                 25      1.796      3.091     +1.295
-        ard_rbf                10      1.964      8.025     +6.060
-
-    The training objective falls monotonically throughout and the fitted
-    noise stays at ~8e-3 (nowhere near its exp(-8) floor), so this is not
-    divergence — it is the ARD lengthscales running away unbounded (mean
-    1.3 -> 5.9 at step 1000 -> 8.9 at step 3000, still climbing, on
-    normalised inputs where ~9 is already a near-constant function). Every
-    ARD kernel at n_steps=1000 ends up worse than its own non-ARD sibling
-    (+0.87, +1.38, +6.15 nats/point), and ard_rbf degrades in 8 episodes
-    out of 8. Cutting n_steps is the wrong fix: it would tune a step count
-    to a pathology, and the non-ARD kernels genuinely want the steps.
-
-    Selecting on held-out NLL fixes both halves at once — which step is kept
-    within a restart, and (because final_loss then carries best_step_val
-    instead of the training loss) which restart is kept across n_restarts.
-
-    Skipped for P < 8 (too few points for a meaningful split); falls back to
-    training on the full set with no early stopping.
+    Maximizes the exact marginal likelihood plus the hyperpriors (MAP) from
+    n_restarts random initializations and keeps the best. oracle_mode="posterior"
+    returns the fitted posterior at X_test (with noise); "prior" returns the
+    fitted kernel's prior covariance at X_test (with noise). "polynomial" repeats
+    the fit for every candidate degree. With a feature extractor, or when
+    val_select applies, 20% of the training points are held out and the step
+    with the best held-out NLL is kept (not below P = 8). mean and Sigma are in
+    raw y units.
     """
     if kernel_name == "periodic" and feature_extractor_factory is not None:
         raise ValueError("kernel_name='periodic' is not PD in a >1D DKL latent space")
     if ard and feature_extractor_factory is not None:
-        # ard_num_dims below is derived from d_x (X_train's raw column count),
-        # but the base kernel actually sees feature_extractor(x) — a
-        # differently-shaped latent tensor. Silently using d_x here would
-        # either crash with a lengthscale/tensor shape mismatch, or (if d_x
-        # happens to equal the extractor's out_dim) silently "work" while
-        # tying each lengthscale to the wrong axis. Neither call site combines
-        # ard=True with a feature_extractor today; fail loudly instead of
-        # leaving this as a landmine for a future caller.
+        # ARD with a feature extractor is not supported.
         raise ValueError(
             "ard=True is not supported together with a feature_extractor: "
             "ARD lengthscale count must match the extractor's output "
@@ -663,9 +341,7 @@ def fit_and_eval_gpytorch(
     else:
         X_fit, y_fit = X_train, y_train
 
-    # Only "polynomial" has a degree to search: every other kernel_name gets
-    # a single-element list so the loop below is a no-op restructuring for
-    # them (poly_power is simply ignored by _ExactGPModel in that case).
+    # Only polynomial has degrees to search.
     poly_powers = _poly_degree_candidates(prior_cfg or {}) if kernel_name == "polynomial" else [_POLY_BASELINE_POWER]
 
     best_loss: float | None = None
@@ -675,30 +351,17 @@ def fit_and_eval_gpytorch(
     for poly_power in poly_powers:
         for _ in range(max(1, n_restarts)):
           try:
-            # Mirrors the previous hand-rolled code's log_noise clamp range
-            # (exp(-8)..exp(2)) — keeps optimisation stable / prevents noise
-            # collapsing to (near-)zero. Built fresh every restart: gpytorch's
-            # Interval holds its bounds as plain (non-parameter) tensors, so
-            # reusing one Interval instance across multiple GaussianLikelihoods
-            # in this loop means the *next* likelihood constructed from it
-            # inherits whatever device the *previous* iteration's `.to(device)`
-            # left those bounds on, in-place — a shared-mutable-state footgun
-            # that surfaces as a CPU/CUDA device-mismatch on restart 2+.
+            # Noise constraint exp(-8)..exp(2), built fresh each restart (its bounds are mutable tensors).
             noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
             likelihood = gpytorch.likelihoods.GaussianLikelihood(
                 noise_constraint=noise_constraint, noise_prior=noise_prior,
             )
-            # Sampled (not fixed at 0.1) so restarts are actually independent —
-            # clamped strictly inside noise_constraint's open interval.
+            # Random initial noise inside the constraint.
             likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(X_train.device).clamp(
                 min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
             )
 
-            # Built fresh every restart (not hoisted above the loop and
-            # reused), same reasoning as noise_constraint above: a shared
-            # feature_extractor instance would carry its Adam-updated
-            # weights from one "restart" into the next, silently defeating
-            # the whole point of restarting (see this function's docstring).
+            # Fresh feature extractor each restart.
             feature_extractor = (
                 feature_extractor_factory() if feature_extractor_factory is not None else None
             )
@@ -747,15 +410,7 @@ def fit_and_eval_gpytorch(
             if best_loss is None or final_loss < best_loss:
                 best_loss, best_model, best_likelihood = final_loss, model, likelihood
           except Exception as exc:
-            # Higher polynomial degrees raise the raw dot-product to a larger
-            # power, which can blow up K_ff's conditioning far more easily
-            # than degree 2 ever did (this loop previously only ever tried
-            # degree 2, so a NotPSDError here is a real consequence of now
-            # searching the full [poly_power_min, poly_power_max] range, not
-            # a pre-existing failure mode). One bad (degree, restart)
-            # combination shouldn't discard every other candidate that fit
-            # fine — skip it and keep searching; only actually failing every
-            # single one raises (via best_model still being None below).
+            # Skip a (degree, restart) whose kernel matrix is not PSD; raise only if all fail.
             print(f"  [gp_mle_polynomial power={poly_power}] restart failed: {exc}")
             continue
 
@@ -766,13 +421,7 @@ def fit_and_eval_gpytorch(
         )
     model, likelihood = best_model, best_likelihood
     if use_val:
-        # The val split only mattered for picking which training step's
-        # weights to keep; restore full-context conditioning for the final
-        # posterior/prior evaluation below (oracle_mode="posterior" needs the
-        # model literally conditioned on all of X_train — oracle_mode="prior"
-        # ignores stored train data entirely via model.forward(), so this is
-        # a no-op for that path). strict=False since the point count changes
-        # from len(fit_idx) to P.
+        # Condition on the full training set for the final evaluation.
         model.set_train_data(inputs=X_train, targets=y_train, strict=False)
     model.eval()
     likelihood.eval()
@@ -791,44 +440,12 @@ def fit_and_eval_gpytorch(
     return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
 
 
-# ---------------------------------------------------------------------------
-# Zero-Mean GP fit directly on a REAL (non-oracle) marginal's z_train
-# ---------------------------------------------------------------------------
-#
-# Every GP-MLE/DKL baseline above fits in raw y-space precisely because
-# fitting against the ORACLE z_train would leak the true generating kernel's
-# own Cholesky factor (see fit_and_eval_gpytorch's docstring). That concern
-# does not apply to a z_train produced by an independently-fit marginal model
-# (e.g. eval_checkpoint.py's --z_train_source=tabicl, run through a real —
-# possibly Phase-A-fine-tuned — TabICL): those PIT residuals carry no oracle
-# information, they are exactly the same (imperfect) conditioning input the
-# ICL copula head itself receives. Fitting a classical GP directly on that
-# input, with the mean forced to zero (z_train is already meant to be
-# marginally ~N(0,1) if the PIT is well calibrated — plain MLE, no separate
-# mean parameter to estimate), isolates the correlation-modelling question
-# from the marginal-modelling one: given the IDENTICAL real marginal input,
-# does a small classical GP recover the copula structure as well as the
-# learned ICL correlation head?
-#
-# Deliberately not one of eval_baselines_episode's cached, checkpoint-
-# independent baselines: this fit depends on which marginal produced
-# z_train (--z_train_source / --tabicl_ckpt), which eval_baselines_episode's
-# worker pool has no access to (it only ever sees the oracle episode dict).
-# eval_checkpoint.py fits it directly in the main per-episode loop, right
-# after computing that episode's marginal_pit.
+# Zero-mean GP fitted on a real marginal's z_train (not cached with the other
+# baselines, since it depends on the marginal).
 
 
 def zero_mean_gp_prior_cfg(prior_cfg: dict | None = None) -> dict:
-    """Hyperprior overrides for fitting on a marginal's z_train instead of raw
-    y_train: the y-space alpha2 (outputscale) prior has mean
-    alpha2_gamma_concentration / alpha2_gamma_rate ~= 1.33 under
-    _DEFAULT_PRIOR_CFG, tuned to data_gen.py's own y-space generative
-    hyperprior. z_train is instead expected to already be marginally unit-
-    variance (a well-calibrated PIT), so the outputscale prior is
-    recentred at mean 1 (Gamma(2, 2)) instead. Every other hyperprior
-    (lengthscale, noise) is coordinate-free w.r.t. the target's scale and is
-    left unchanged.
-    """
+    """Hyperprior overrides for fitting on a unit-variance z_train: outputscale prior Gamma(2, 2)."""
     cfg = dict(prior_cfg or {})
     cfg["alpha2_gamma_concentration"] = 2.0
     cfg["alpha2_gamma_rate"] = 2.0
@@ -847,19 +464,7 @@ def fit_zero_mean_gp_on_marginal(
     prior_cfg: dict | None = None,
     jitter: float = 1e-6,
 ) -> dict[str, Tensor]:
-    """Zero-mean GP-MLE fit on (X_train, z_train), z_train being a REAL
-    (non-oracle) marginal's PIT residual — see the module note above for why
-    this is a distinct, legitimate baseline from fit_and_eval_gpytorch's
-    y-space fits rather than the oracle-leakage case that function's
-    docstring warns against.
-
-    Thin wrapper: _ExactGPModel already forces gpytorch.means.ZeroMean()
-    unconditionally for every kernel, so no separate mean-function code path
-    is needed — only the outputscale prior changes (see
-    zero_mean_gp_prior_cfg). Same {"R", "mean", "Sigma"} return contract as
-    fit_and_eval_gpytorch; "mean"/"Sigma" are in z-space here, not raw
-    y-units.
-    """
+    """Zero-mean GP-MLE on (X_train, z_train), z_train being a real marginal's PIT; returns {"R", "mean", "Sigma"} in z space."""
     return fit_and_eval_gpytorch(
         X_train, z_train, X_test, kernel_name,
         n_steps=n_steps, lr=lr, ard=False, jitter=jitter,
@@ -869,7 +474,7 @@ def fit_zero_mean_gp_on_marginal(
 
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
-    """RBF prior correlation at test points with median bandwidth (no training data)."""
+    """RBF prior correlation at the test points with a median bandwidth."""
     from copula_inter.data_gen import _sq_dist  # noqa: E402
 
     sq = _sq_dist(X_test, X_test)
@@ -878,11 +483,6 @@ def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
     R = R / R.diagonal().clamp(min=1e-8).sqrt().unsqueeze(-1)
     R = R / R.diagonal().clamp(min=1e-8).sqrt().unsqueeze(-2)
     return R
-
-
-# ---------------------------------------------------------------------------
-# Per-episode small transformer + Deep Kernel Learning building blocks
-# ---------------------------------------------------------------------------
 
 
 class _MLP(nn.Module):
@@ -899,9 +499,7 @@ class _MLP(nn.Module):
         return self.net(x)
 
 
-# _MLP is already exactly Linear(d_x,32) -> SiLU -> Dropout -> Linear(32,16)
-# when instantiated with dropout=0.0 (a no-op) — reused here under a
-# descriptive alias rather than duplicating the class.
+# Feature extractor for DKL: Linear(d_x, 32) -> SiLU -> Linear(32, 16).
 DKLFeatureExtractor = _MLP
 
 
@@ -940,16 +538,10 @@ class _CrossAttn(nn.Module):
 
 
 class PerEpisodeTransformer(nn.Module):
-    """Small set-to-correlation transformer, trained from scratch on a single episode.
+    """Small set transformer trained from scratch on one episode.
 
-    Forward:
-        X_ctx : (n_sup, d_x),  z_ctx : (n_sup,)  — training context
-        X_qry : (n_qry, d_x)                     — query features
-        -> W  : (n_qry, r),   s : (n_qry,)
-
-    The (W, s) pair feeds into ``low_rank_correlation`` (from model.py) to produce
-    the (n_qry x n_qry) inter-instance correlation matrix, matching the CopulaTabICL
-    output convention.
+    forward(X_ctx (n_sup, d_x), z_ctx (n_sup,), X_qry (n_qry, d_x)) returns
+    W (n_qry, r) and s (n_qry,), fed to model.low_rank_correlation.
     """
 
     def __init__(
@@ -971,12 +563,7 @@ class PerEpisodeTransformer(nn.Module):
         self.cross_attn = _CrossAttn(m, n_heads, dropout)
         self.head = nn.Linear(m, r + 1)
 
-        # NOTE: zero-initializing head.weight is a dead end here — Sigma is
-        # built from W @ W.T (a bilinear form in the first r head outputs),
-        # so dSigma/dW ∝ W vanishes exactly at W=0, and the unit-diagonal
-        # normalization makes Sigma == I regardless of s when W=0. Both paths
-        # have zero gradient, so the model can never leave Sigma=I. Use a
-        # small random init to break the saddle point.
+        # Small random head init (W = 0 is a zero-gradient saddle at Sigma = I).
         nn.init.normal_(self.head.weight, std=1e-2)
         nn.init.zeros_(self.head.bias)
 
@@ -998,20 +585,7 @@ class PerEpisodeTransformer(nn.Module):
 
 
 def _standardize_y(y: Tensor) -> Tensor:
-    """Z-score y using only its own sample mean/std — no oracle kernel.
-
-    Unlike arbitrary real-world targets, data_gen.py's y_all is a direct
-    MultivariateNormal(0, K) + Gaussian-noise sample; tabiclv2_warp_features
-    only warps X, never y. So y's marginal is exactly Gaussian by
-    construction, and plain affine standardization already gives ~N(0,1)
-    margins — the exact PIT for a known-Gaussian family, unlike a rank-based
-    transform. This never touches the true generating kernel K_ff, so it
-    carries none of the oracle-kernel leakage fit_and_eval_gpytorch's
-    docstring warns about. Gives per_ep_transformer standard-normal-margin
-    inputs (required by oracle_copula_nll's Gaussian-copula density) without
-    the oracle shortcut, matching how gp_mle/dkl are fit against raw y_train
-    instead of z_train.
-    """
+    """Z-score y with its own sample mean and std."""
     return (y - y.mean()) / y.std(unbiased=True).clamp(min=1e-6)
 
 
@@ -1025,22 +599,15 @@ def train_per_episode(
     val_every: int = 10,
     device: torch.device = torch.device("cpu"),
 ) -> PerEpisodeTransformer:
-    """Train a PerEpisodeTransformer on one episode's training instances.
+    """Train a PerEpisodeTransformer on one episode.
 
-    Uses a fixed 20% val split for early stopping; the remaining 80% pool is
-    randomly split 80/20 into support/query at each training step.
+    A fixed 20% split is used for early stopping; the rest is split 80/20 into
+    support/query at every step. The rank is capped relative to P.
     """
     d_x = X_train.shape[1]
     P = X_train.shape[0]
 
-    # r is normally icl_rank (the pretrained model's rank, e.g. 32) — sized for
-    # a model pretrained across millions of episodes. Trained from scratch on a
-    # single episode's P instances (as few as ~13, ~8 after the support/query
-    # split below), that many free low-rank factors overfits badly: verified
-    # empirically that more training steps at r=32 makes some episodes *worse*
-    # (correlation matrix collapses to near-singular, off-the-charts NLL),
-    # while capping r relative to P keeps it stable. r=4 (the class default)
-    # is never exceeded for very small P.
+    # Cap the rank relative to P (large ranks overfit a single episode).
     r = max(2, min(r, P // 4))
 
     n_val = max(2, int(round(0.2 * P)))
@@ -1101,11 +668,6 @@ def train_per_episode(
     return model
 
 
-# ---------------------------------------------------------------------------
-# Per-episode evaluation — every baseline at once
-# ---------------------------------------------------------------------------
-
-
 def eval_baselines_episode(
     ep: dict,
     icl_rank: int,
@@ -1123,47 +685,16 @@ def eval_baselines_episode(
     fit_seed: int | None = None,
     gp_val_select: str = "ard",
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
-    """Evaluate every classical/fitted baseline (everything except the ICL
-    model and the oracle) on one episode, under identical conventions.
+    """Evaluate every baseline (all but the ICL model and the oracle) on one episode.
 
-    fit_seed, when given, reseeds torch at entry so this episode's fit depends
-    only on (episode, hyperparameters, fit_seed). Every stochastic choice in
-    here draws from the global torch RNG — GP-MLE's random restart inits
-    (_randomize_init, plus the sampled noise init), DKL's MLP init and its
-    validation split, per_ep_transformer's init and its support/query
-    resampling — so without it a fit also depends on how many episodes were
-    drawn from that stream beforehand. That order-dependence makes a cached
-    entry unreproducible, and is outright wrong once episodes are fitted
-    across worker processes (each with its own RNG) or split into shards.
-    Callers should derive it from the episode's GLOBAL index so the same
-    episode fits identically however the run was partitioned.
-
-    Split out from ICL/oracle evaluation so these (expensive: many Adam
-    restarts per GP-MLE kernel, DKL training, per-episode-transformer
-    training) results can be cached across repeated eval_checkpoint.py runs
-    that only change the checkpoint under test — see baseline_fingerprint /
-    save_baseline_entry / load_baseline_cache below.
+    fit_seed, when given, reseeds torch first so the fit depends only on the
+    episode and settings (derive it from the episode's global index).
 
     Returns:
-        nlls        : {method_name: copula_nll_float} — z-space, common
-                       oracle-standardized z_test (see corr_nll_single).
-        R_dict      : {method_name: (N, N) correlation tensor} — for plotting
-        y_space_nlls: {method_name: {"total", "marginal", "copula"}} — raw
-                       y-units, each method's OWN fitted marginal (mean/Sigma
-                       for GP-MLE/DKL, empirical train mean/std for
-                       per_ep_transformer), via gp_oracle_y_nll's own
-                       Sklar split — comparable across methods precisely
-                       because everyone supplies their own full predictive
-                       density scored at the same real y_test, unlike
-                       `nlls`' shared-marginal design. Note this "copula"
-                       entry is under each method's OWN fitted marginal
-                       (its own standardized residual, own correlation
-                       matrix), so it is NOT directly comparable to `nlls`'
-                       shared-ground-truth-marginal copula NLL — both are
-                       legitimate, different questions (see eval_checkpoint.py's
-                       per-episode print for both side by side).
-                       independence/gp_prior_rbf are unfit references, not
-                       included here (mirrors _NON_FITTED_EXCLUDED).
+        nlls: {method: copula NLL} against the shared z_test.
+        R_dict: {method: (N, N) correlation}.
+        y_space_nlls: {method: {total, marginal, copula}} in raw y units under
+            each fitted method's own marginal (not the unfitted references).
     """
     if fit_seed is not None:
         torch.manual_seed(fit_seed)
@@ -1216,9 +747,7 @@ def eval_baselines_episode(
         for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
             label = _LABEL_MAP[(kname, ard)]
             try:
-                # "ard" (the default) spends the held-out split only where the
-                # hyperparameter count is large relative to P — see
-                # _resolve_val_select.
+                # Held-out selection per _resolve_val_select.
                 fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
                                              n_steps=n_steps_mle, lr=lr_mle, ard=ard,
                                              oracle_mode=oracle_mode, prior_cfg=prior_cfg,
@@ -1234,8 +763,7 @@ def eval_baselines_episode(
                 R_dict[label] = R_I.clone()
                 y_space_nlls[label] = _NAN_PARTS.copy()
 
-    # --- Deep Kernel Learning (MLP + GP, jointly trained), across multiple kernels ---
-    # "periodic" excluded: not PD in the fixed 16-dim latent space at any dimensionality.
+    # DKL kernels (periodic excluded).
     _DKL_KERNELS = ["rbf", "matern32", "rational_quadratic", "dot_product"]
     _DKL_LABEL_MAP = {
         "rbf":                "dkl_rbf",
@@ -1261,23 +789,11 @@ def eval_baselines_episode(
             print(f"  [{label}] failed: {exc}")
             nlls[label] = float("nan")
             R_dict[label] = R_I.clone()
-            # _NAN_PARTS, not a bare nan: every other value in y_space_nlls is
-            # a {total, marginal, copula} dict, and a bare float here is both a
-            # crash waiting to happen downstream (eval_checkpoint's top-5 print
-            # indexes own["copula"]) and a permanently poisoned cache entry --
-            # _valid_cached_entry reads the non-dict as "predates the
-            # marginal/copula split" and refits the episode on EVERY run, which
-            # reproduces the same bare float, so it never stops refitting.
-            # Observed on episode 239 of a 400-episode run.
+            # Failed fits get _NAN_PARTS (a dict) so the cache entry stays valid.
             y_space_nlls[label] = _NAN_PARTS.copy()
 
-    # --- per-episode transformer ---
-    # Trained/queried against z_train_self (z-scored from y_train), not the
-    # oracle z_train — see _standardize_y's docstring. Scored against z_test
-    # (oracle) below, same as every other baseline. Its total Y-space NLL
-    # reuses that same empirical-Gaussian marginal (train mean/std,
-    # _standardize_y's own convention) rather than the oracle's — a crude
-    # but genuine (non-oracle) marginal, unlike gp_prior_rbf/independence.
+    # per_ep_transformer: fitted on z-scored y_train, scored against the shared z_test;
+    # its Y-space NLL uses the empirical Gaussian marginal.
     try:
         per_ep_model = train_per_episode(
             X_train, z_train_self, r=icl_rank,
@@ -1303,17 +819,7 @@ def eval_baselines_episode(
     return nlls, R_dict, y_space_nlls
 
 
-# ---------------------------------------------------------------------------
-# Baseline cache
-# ---------------------------------------------------------------------------
-#
-# GP-MLE (with restarts)/DKL/per_ep_transformer fitting dominates a
-# checkpoint-evaluation run's runtime and, unlike the ICL model under test,
-# is unaffected by which checkpoint we're evaluating — only by the
-# episode-generating config and the fitting hyperparameters below. Caching
-# those results to disk lets repeated "just check the new checkpoint" runs
-# skip straight to the ICL forward pass + oracle NLL for every episode,
-# instead of re-fitting ~15 baselines per episode from scratch.
+# Baseline cache.
 
 
 def baseline_fingerprint(
@@ -1333,23 +839,10 @@ def baseline_fingerprint(
     gp_val_select: str = "ard",
     n_restarts_dkl: int = 1,
 ) -> dict:
-    """Everything that determines the *baseline* fit results for an episode,
-    other than which episode it is (see episode_cache_key for that half).
+    """Digest of everything, besides the episode itself, that determines the baseline fits.
 
-    Includes gen_cfg.data (the generating distribution episodes are drawn
-    from, and the source of prior_cfg's hyperpriors) and icl_rank (sizes
-    per_ep_transformer's low-rank factor — see train_per_episode's docstring)
-    since both change what a "correct" baseline fit looks like, even though
-    neither is a baseline-fitting hyperparameter in the argparse sense.
-
-    gen_cfg is eval_checkpoint.main's fixed --config-derived cfg, not the
-    checkpoint's own saved training cfg — deliberately, so that switching
-    --ckpt between checkpoints trained under different cfg.data doesn't
-    invalidate the cache (episode content only depends on gen_cfg + seed).
-    Deliberately excludes the rest of gen_cfg (e.g. model architecture,
-    optimizer settings) — those affect the ICL model, not the baselines being
-    cached here, and including them would invalidate the cache every time an
-    unrelated training run tweaks something baselines never see.
+    Includes gen_cfg.data (the generating config, not the checkpoint's own),
+    icl_rank, oracle_mode and the fitting settings.
     """
     data_cfg = OmegaConf.select(gen_cfg, "data", default=None)
     return {
@@ -1380,27 +873,14 @@ def episode_cache_key(
     live_generate: bool, dataset_dir: str | None, seed: int, ep_i: int,
     *, source: str | None = None,
 ) -> str:
-    """Identifies which episode a cached baseline result belongs to.
+    """Cache key of one episode.
 
-    Three namespaces, all owned here because everything downstream of the key
-    is too: _shard_name hashes it, save_baseline_entry/load_baseline_cache
-    round-trip it, and the shard collision check compares it.
+        "{source}:seed{seed}:idx{ep_i}"   when source is given (e.g. "era5")
+        "live:seed{seed}:idx{ep_i}"       for live generation
+        "dataset:{dataset_dir}:idx{ep_i}" for an on-disk dataset
 
-      - "live:seed{seed}:idx{ep_i}"        -- live_generate, determined by (seed, ep_i)
-      - "dataset:{dataset_dir}:idx{ep_i}"  -- a pre-built dataset on disk
-      - "{source}:seed{seed}:idx{ep_i}"    -- any other generated source that is
-                                              also fully determined by (seed, ep_i);
-                                              eval_checkpoint.py --era5 passes
-                                              source="era5"
-
-    ep_i is the episode's GLOBAL index in every case, so a run that evaluates
-    a slice of one episode stream (eval_checkpoint.py's --episode_offset) keys
-    the same episode the same way as a run that starts at 0.
-
-    `source` takes precedence over live_generate/dataset_dir -- a source that
-    generates its own episodes has no dataset_dir to abspath (None would
-    raise), and calling it "live" would collide with the synthetic stream's
-    keys for the same seed."""
+    ep_i is the episode's global index.
+    """
     if source is not None:
         return f"{source}:seed{seed}:idx{ep_i}"
     if live_generate:
@@ -1409,36 +889,17 @@ def episode_cache_key(
 
 
 def _shard_dir(path: str) -> str:
-    """Directory holding this cache's per-episode shards."""
+    """Directory holding this cache's per-episode shards (<path>.d)."""
     return f"{path}.d"
 
 
 def _shard_name(cache_key: str) -> str:
-    """Filesystem-safe filename for one episode's shard.
-
-    Cache keys carry ':' and (for --dataset_dir) an absolute path, neither of
-    which belongs in a filename, so hash them. The key is stored inside the
-    shard too, so a collision would be detected on load rather than silently
-    serving the wrong episode.
-    """
+    """Filename of one episode's shard: a hash of its cache key (the key is also stored inside)."""
     return hashlib.sha1(cache_key.encode()).hexdigest() + ".pt"
 
 
 def save_baseline_entry(path: str, fingerprint: dict, cache_key: str, entry: dict) -> None:
-    """Persist ONE episode's fitted baselines, immediately.
-
-    Each episode gets its own small file under <path>.d/ rather than being
-    folded into one big blob. An episode's entry is ~4.3 MB (mostly the N x N
-    R matrices), so a single consolidated file reaches ~1.7 GB over 400
-    episodes and rewriting it per episode would cost more I/O than the fitting
-    it protects -- which is why saves used to be batched every N episodes, and
-    why a crash still threw away up to N episodes of work (observed: a job
-    killed at episode 72 had persisted only 50).
-
-    Writing a shard per episode makes the cost O(one episode) instead of
-    O(whole cache), so every completed fit survives immediately, and a run
-    that dies resumes having lost nothing.
-    """
+    """Write one episode's fitted baselines to its own shard under <path>.d/."""
     d = _shard_dir(path)
     os.makedirs(d, exist_ok=True)
     dest = os.path.join(d, _shard_name(cache_key))
@@ -1446,14 +907,9 @@ def save_baseline_entry(path: str, fingerprint: dict, cache_key: str, entry: dic
 
 
 def load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
-    """Load {episode_key: {"nlls": ..., "R_dict": ...}}, merging the
-    per-episode shards under <path>.d/ with the legacy single file at `path`.
+    """Load {episode_key: entry} from the per-episode shards and the legacy single file, keeping fingerprint matches.
 
-    Both are filtered on the fingerprint, so entries built under different
-    generation/fitting settings are ignored rather than served stale. Shards
-    win over the legacy file for the same key (they are what current runs
-    write). A shard that fails to load individually is skipped and refitted,
-    instead of discarding every other episode alongside it.
+    Shards win over the legacy file; unreadable shards are skipped.
     """
     entries: dict[str, dict] = {}
     n_stale = 0
@@ -1495,19 +951,6 @@ def load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
 
 
 def save_baseline_cache(path: str, fingerprint: dict, entries: dict[str, dict]) -> None:
-    """Write the whole cache to one file, atomically (temp + os.replace).
-
-    This is the LEGACY layout. Runners write save_baseline_entry shards
-    instead — one file per episode, so the cost of persisting a fit does not
-    grow with how many are already cached — and load_baseline_cache reads both.
-    Kept because caches in this format still exist on disk and must keep
-    loading; the round-trip test is what guards that path.
-
-    Atomic because a half-written file would be worse than no file at all:
-    load_baseline_cache would fail to torch.load it and silently refit
-    everything, throwing away exactly the hours this cache exists to protect.
-    os.replace is atomic on POSIX, so the previous save stays intact until the
-    new one is complete.
-    """
+    """Write the whole cache to one file atomically (legacy layout, still readable)."""
     atomic_torch_save({"fingerprint": fingerprint, "entries": entries}, path)
     print(f"  [baseline_cache] saved {len(entries)} episode(s) to {path}", flush=True)

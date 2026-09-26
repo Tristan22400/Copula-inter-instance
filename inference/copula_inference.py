@@ -1,40 +1,12 @@
-"""copula_inference.py — reusable inference API for the copula inter-instance model.
+"""Inference API for the copula model: marginals, PIT, correlation and sampling.
 
-Thin wrappers around existing repo internals (``src/copula_inter/pit.py``, ``src/copula_inter/model.py``,
-``src/copula_inter/data_gen.py``) plus new code for sampling correlated trajectories and for
-loading/querying the real PFN4BO baseline. No hardcoded paths or experiment
-logic lives here — every path is an argument.
+Features must be standardized first with normalize_features (jointly over
+train and test). Targets are z-scored internally before reaching TabICL.
 
-Callers must standardize their features with ``normalize_features`` (zero
-mean/unit std, jointly over train+test — matching ``data_gen.py``'s own
-convention) before calling anything else here; none of the functions below
-do this internally, since they generally don't see the full train+test set
-at once. Targets, by contrast, ARE z-scored internally wherever they reach
-the raw TabICL module (``get_marginal_quantiles``, ``loo_pit``) — via
-``pit.normalize_targets``, the same helper every other ``run_pit`` call
-site in the repo uses (``eval_checkpoint.py::_tabicl_z_train``,
-``train.py::_build_tabicl_val_z``) — since callers here only ever see one
-side (context or query) of the target split, never both at once the way
-they do for X.
-
-Two marginal backends are supported, with genuinely different conventions:
-
-  TabICL   — ``get_marginal_quantiles`` — emits its own fixed 999-point quantile
-             grid (``p_j = j/1001``); custom probability levels are obtained via
-             ``QuantileDistribution.icdf`` (spline + tail extrapolation), not
-             re-interpolation of the 999-grid.
-  PFN4BO   — ``get_marginal_quantiles_pfn4bo`` — a bucketed (bar) distribution
-             over a fixed y-support; quantiles at arbitrary probability levels
-             come from inverting the bucket CDF. PFN4BO expects x in [0,1]^d
-             (mapped here via the Gaussian CDF) and y power-transformed
-             (Yeo-Johnson, fit on context y only);
-             the returned quantile grid is inverse-transformed back to
-             original y-units before returning.
-
-Both marginal-query functions return ``(quantile_grid, probs)`` with
-``quantile_grid.shape == (n_query, len(probs))`` and
-``quantile_grid[i, j] = F_i^{-1}(probs[j])`` — the shared convention every
-other function in this module (and both experiment scripts) build on.
+Marginal backends, both returning (quantile_grid (n_query, Q), probs):
+    get_marginal_quantiles: TabICL (999-level grid, or icdf at given probs).
+    get_marginal_quantiles_pfn4bo: PFN4BO bar distribution (x mapped to
+        [0, 1] with the Gaussian CDF, y Yeo-Johnson transformed).
 """
 
 from __future__ import annotations
@@ -69,35 +41,14 @@ __all__ = [
 
 
 def normalize_features(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Z-score features to match the training-time convention.
-
-    ``src/copula_inter/data_gen.py::generate_gp_batch`` standardizes ``x`` to zero-mean /
-    unit-std **jointly over the full train+test sequence within one episode**
-    (``x_norm = (x_raw - x_raw.mean(1)) / x_raw.std(1)``, computed before the
-    train/test split) — neither TabICL's forward pass nor ``CopulaTabICL``
-    do any further normalization internally (``src/copula_inter/pit.py::run_pit`` and
-    ``src/copula_inter/model.py`` both take ``x`` as-is). Every other function in this
-    module therefore expects its ``X_train``/``X_test`` arguments to already
-    be on this scale; call this first if your raw features aren't already
-    zero-mean/unit-std (e.g. a ``[0, 1]`` grid, or real-world units).
-
-    Note: this does NOT replicate ``tabiclv2_warp_features`` (the random
-    per-column marginal-shape warp applied before z-scoring at training
-    time) — that's a training-time diversity augmentation over many
-    possible feature *shapes*, not a canonical transform real/query features
-    need to undergo. Only the mean/std standardization is a hard requirement
-    the model relies on.
+    """Z-score features with the joint train+test mean and std per column (the training convention).
 
     Args:
-        X_train : (P, d) training features, raw scale.
-        X_test  : (N, d) test features, raw scale.
+        X_train: (P, d) raw features.
+        X_test: (N, d) raw features.
 
     Returns:
-        (X_train_norm, X_test_norm), z-scored per column using the combined
-        train+test mean/std (matching ``data_gen.py``'s joint-episode
-        statistics — NOT train-only statistics, which would diverge from
-        training whenever the train and test marginal distributions of x
-        differ, e.g. a sparse train subset of a denser test grid).
+        (X_train_norm, X_test_norm).
     """
     X_train = np.asarray(X_train, dtype=np.float64)
     X_test = np.asarray(X_test, dtype=np.float64)
@@ -111,17 +62,8 @@ def normalize_features(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndar
     return norm_tr, norm_te
 
 
-# ---------------------------------------------------------------------------
-# TabICL marginal backend
-# ---------------------------------------------------------------------------
-
-
 def load_tabicl_marginal(ckpt_name: str, device: str) -> torch.nn.Module:
-    """Load a frozen TabICL regressor for marginal quantile queries.
-
-    Thin re-export of ``pit.load_tabicl`` — kept here so callers only need to
-    import from this module.
-    """
+    """Load a frozen TabICL regressor (pit.load_tabicl)."""
     return load_tabicl(ckpt_name, device)
 
 
@@ -133,38 +75,18 @@ def get_marginal_quantiles(
     X_query: np.ndarray,
     probs: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Query TabICL's predictive quantile grid at ``X_query``.
+    """TabICL's predictive quantiles at X_query.
 
     Args:
-        tabicl    : frozen TabICL regressor (e.g. from ``load_tabicl_marginal``).
-        X_context : (n_ctx, d) context features.
-        y_context : (n_ctx,) context targets, RAW scale — z-scored internally
-                    (see below) before reaching ``tabicl``.
-        X_query   : (n_q, d) query features.
-        probs     : optional (Q,) probability levels. If None, uses TabICL's
-                    own 999-level grid (``p_j = j/1001``) directly (no extra
-                    interpolation). If given, values are obtained via
-                    ``QuantileDistribution.icdf`` (spline/tail extrapolation)
-                    at exactly those levels — NOT by re-interpolating the
-                    999-grid, which would silently degrade tail accuracy.
+        tabicl: TabICL regressor.
+        X_context: (n_ctx, d).
+        y_context: (n_ctx,) raw targets (z-scored internally).
+        X_query: (n_q, d).
+        probs: optional (Q,) levels; None uses TabICL's 999-level grid,
+            otherwise QuantileDistribution.icdf at these levels.
 
     Returns:
-        quantile_grid : (n_q, len(probs)), RAW y-units — quantile_grid[i, j] = F_i^{-1}(probs[j])
-        probs         : (len(probs),) probability levels actually used.
-
-    ``y_context`` is z-scored via ``pit.normalize_targets`` before being
-    passed to ``tabicl`` and the returned quantile grid is un-scaled back to
-    raw y-units afterward — the same helper every other ``run_pit``/raw-
-    TabICL call site in the repo uses. This module's low-level ``tabicl``
-    (the raw ``TabICL`` class) does no target scaling of its own — unlike
-    ``tabicl.TabICLRegressor.fit()``, which fits a fresh ``StandardScaler``
-    on y before ever calling this same underlying model (see
-    ``tabicl_upstream/.../_sklearn/regressor.py``). Without replicating that
-    scaling here, absolute-scale targets (e.g. real-world units, not a
-    zero-mean/unit-std synthetic draw) saturate the frozen quantile head's
-    CDF into its extreme tail for every context point alike, collapsing the
-    returned quantile grid instead of reflecting the true conditional
-    spread.
+        quantile_grid (n_q, Q) in raw y units and the probs used.
     """
     device = next(tabicl.parameters()).device
     dtype = next(tabicl.parameters()).dtype
@@ -189,10 +111,7 @@ def get_marginal_quantiles(
         quantile_grid = dist.icdf(probs_t)[0]  # (n_q, len(probs))
         probs_out = probs_t
 
-    # dist.quantiles/icdf come back float16 regardless of tabicl's own float32
-    # parameters (QuantileDistribution's internal dtype) -- upcast before the
-    # un-scaling affine transform, or a real-scale y_mean/y_std (e.g. ~1e5 for
-    # a housing-price target) silently overflows float16's ~65504 max into inf.
+    # Upcast float16 quantiles before un-scaling (large y values overflow float16).
     quantile_grid = y_mean.double() + y_std.double() * quantile_grid.double()
     return quantile_grid.cpu().numpy(), probs_out.cpu().numpy()
 
@@ -204,39 +123,17 @@ def loo_pit(
     k_folds: int = 10,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    """Gaussianized PIT residuals for the training set, via TabICL's marginal CDF.
-
-    Despite the name (kept for parity with the "leave-one-out" framing this
-    is usually described with), the default is **K-fold** partitioning
-    (``k_folds=10``), not true LOO — this matches the rest of the repo's
-    dataset-generation convention (``src/copula_inter/pit.py::DEFAULT_K_FOLDS``): true LOO
-    (``k_folds=len(X_train)``) is more accurate but ~K_loo/k_folds times
-    slower. Pass ``k_folds=len(X_train)`` for true LOO.
-
-    Internally calls ``pit.run_pit`` with a single dummy "test" row (discarded)
-    since ``run_pit`` also computes a test-set PIT in the same call; the
-    training-set K-fold PIT this function returns does not depend on that
-    dummy row's value.
+    """K-fold PIT of the training set through TabICL (k_folds=len(X_train) for true LOO).
 
     Args:
-        tabicl  : frozen TabICL regressor.
-        X_train : (P, d) training features.
-        y_train : (P,) training targets, RAW scale — z-scored via
-                  ``pit.normalize_targets`` (see get_marginal_quantiles's
-                  docstring for why: the raw TabICL class does no target
-                  scaling of its own, unlike TabICLRegressor.fit()'s
-                  StandardScaler) before reaching ``tabicl``. No effect on
-                  the *contract* here (unlike get_marginal_quantiles) since
-                  Z_train is already a Gaussianized, unitless PIT residual —
-                  but it matters for correctness: on absolute-scale y, an
-                  unscaled call would saturate the quantile head's CDF for
-                  every point alike and collapse Z_train's spread instead of
-                  reflecting the true per-point rank.
-        k_folds : number of disjoint folds (see above).
-        eps     : clamp before the probit transform.
+        tabicl: TabICL regressor.
+        X_train: (P, d).
+        y_train: (P,) raw targets.
+        k_folds: number of folds.
+        eps: probit clamp.
 
     Returns:
-        Z_train : (P,) Gaussianized residuals.
+        (P,) Gaussianized residuals.
     """
     device = next(tabicl.parameters()).device
     dtype = next(tabicl.parameters()).dtype
@@ -253,18 +150,8 @@ def loo_pit(
     return out["z_train"].squeeze(-1).cpu().numpy()
 
 
-# ---------------------------------------------------------------------------
-# Copula model
-# ---------------------------------------------------------------------------
-
-
 def _resolve_copula_checkpoint(ckpt_path: str) -> str:
-    """Resolve a checkpoint file, accepting a training checkpoint directory.
-
-    A directory is resolved by numeric training step, not modification time:
-    this is deterministic and avoids selecting a copied or partially written
-    file. For equal steps, the conventional ``*_final.pt`` is preferred.
-    """
+    """Resolve a checkpoint file; for a directory, the highest step_<n>[_final].pt (final preferred on ties)."""
     if not os.path.isdir(ckpt_path):
         return ckpt_path
 
@@ -290,27 +177,15 @@ def load_copula_model(
     config_path: Optional[str] = None,
     device: str = "cpu",
 ) -> tuple[CopulaTabICL, DictConfig]:
-    """Load a trained CopulaTabICL checkpoint.
-
-    Used directly by ``eval/runners/eval_checkpoint.py``: reads the training
-    config saved inside the checkpoint (falling back to ``config_path`` if
-    given, or raising if neither is available), builds the model architecture
-    from it, then loads the state dict.
+    """Load a CopulaTabICL checkpoint.
 
     Args:
-        ckpt_path   : path to a checkpoint saved by ``train.py``'s
-                      ``save_checkpoint`` (has ``state_dict``/``model_state``
-                      and, normally, ``cfg``), or a directory containing
-                      ``step_<number>.pt`` files (the highest step is used).
-        config_path : Hydra config to use if the checkpoint has no saved
-                      ``cfg`` (older checkpoints). Ignored if the checkpoint
-                      does have one.
-        device      : torch device string.
+        ckpt_path: checkpoint file, or a directory of step_<n>.pt files.
+        config_path: config to use when the checkpoint has no saved cfg.
+        device: torch device.
 
     Returns:
-        (model, cfg) — the loaded ``CopulaTabICL`` in eval mode, and the
-        ``DictConfig`` it was built from (useful for reading e.g.
-        ``cfg.data.oracle_mode``).
+        (model in eval mode, cfg).
     """
     ckpt_path = _resolve_copula_checkpoint(ckpt_path)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -341,17 +216,13 @@ def get_test_correlation(
     Z_train: np.ndarray,
     X_test: np.ndarray,
 ) -> np.ndarray:
-    """Query the copula model's predicted test-test correlation matrix.
+    """The copula model's (N, N) test correlation, symmetrized with a unit diagonal.
 
     Args:
-        copula_model : loaded ``CopulaTabICL`` (e.g. from ``load_copula_model``).
-        X_train : (P, d) training features.
-        Z_train : (P,) Gaussianized training residuals (e.g. from ``loo_pit``).
-        X_test  : (N, d) test features.
-
-    Returns:
-        R_test : (N, N) — symmetrized, with the diagonal forced to exactly 1.0
-        (a neural-net output won't satisfy either exactly).
+        copula_model: loaded CopulaTabICL.
+        X_train: (P, d).
+        Z_train: (P,) Gaussianized residuals.
+        X_test: (N, d).
     """
     device = next(copula_model.parameters()).device
     dtype = next(copula_model.parameters()).dtype
@@ -370,18 +241,8 @@ def get_test_correlation(
     return R
 
 
-# ---------------------------------------------------------------------------
-# PFN4BO marginal backend
-# ---------------------------------------------------------------------------
-
-
 def _patch_pfns4bo_torch_compat() -> None:
-    """``pfns4bo_upstream/pfns4bo/layer.py`` does
-    ``from torch.nn.modules.transformer import ..., Optional, ...`` — a name
-    older torch versions re-exported from that module but current torch no
-    longer does. Patched here (not in ``pfns4bo_upstream``, which stays
-    pristine) before importing anything from ``pfns4bo``.
-    """
+    """Re-export typing.Optional from torch.nn.modules.transformer, which pfns4bo imports from there."""
     import typing
 
     import torch.nn.modules.transformer as _t
@@ -391,14 +252,7 @@ def _patch_pfns4bo_torch_compat() -> None:
 
 
 def load_pfn4bo(model_name: str = "hebo_plus_model", device: str = "cpu") -> torch.nn.Module:
-    """Load a pretrained PFN4BO checkpoint from ``pfns4bo_upstream``.
-
-    ``model_name`` is an attribute of the vendored ``pfns4bo`` package
-    (``hebo_plus_model``, ``hebo_plus_userprior_model``, or ``bnn_model``);
-    accessing it auto-downloads/unzips the weights on first use. The
-    checkpoint is a whole pickled ``TransformerModel`` (not a state dict),
-    with a ``.criterion`` attribute (a ``BarDistribution``) already attached.
-    """
+    """Load a pretrained PFN4BO model from pfns4bo_upstream by attribute name (downloads on first use)."""
     _patch_pfns4bo_torch_compat()
     import pfns4bo  # type: ignore[import]
 
@@ -410,20 +264,15 @@ def load_pfn4bo(model_name: str = "hebo_plus_model", device: str = "cpu") -> tor
 
 
 def _vectorized_bar_icdf(criterion, logits: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-    """Vectorized equivalent of ``BarDistribution.icdf`` over many probability
-    levels at once (upstream's own ``icdf`` only accepts a scalar
-    ``left_prob``; looping it 999 times is needlessly slow). Reimplements the
-    exact same searchsorted/linear-interpolation math against
-    ``criterion.borders`` without modifying ``pfns4bo_upstream``.
+    """BarDistribution.icdf at many probability levels at once.
 
     Args:
-        criterion : a ``BarDistribution`` (or subclass) — only ``.borders``
-                    and ``.num_bars`` are read.
-        logits    : (..., num_bars).
-        probs     : (Q,) probability levels.
+        criterion: BarDistribution (uses .borders and .num_bars).
+        logits: (..., num_bars).
+        probs: (Q,).
 
     Returns:
-        (..., Q) quantile values.
+        (..., Q) quantiles.
     """
     p = torch.softmax(logits, dim=-1)  # (..., B)
     cumprobs = torch.cumsum(p, dim=-1)  # (..., B)
@@ -445,16 +294,7 @@ def _vectorized_bar_icdf(criterion, logits: torch.Tensor, probs: torch.Tensor) -
 
 
 def _yeo_johnson_valid_domain(lam: float) -> tuple[float, float]:
-    """Valid domain of the transformed value `t` for Yeo-Johnson's INVERSE
-    transform at parameter ``lam`` (sklearn's ``PowerTransformer`` silently
-    returns NaN outside it — `(negative base)**(non-integer exponent)`).
-
-    Inverting `t = ((y+1)**lam - 1)/lam` for `y >= 0` requires `lam*t+1 >= 0`,
-    which only bounds `t` from above when `lam < 0` (t <= -1/lam).
-    Inverting `t = -((-y+1)**(2-lam) - 1)/(2-lam)` for `y < 0` requires
-    `(lam-2)*t + 1 >= 0`, which only bounds `t` from below when `lam > 2`
-    (t >= -1/(lam-2)).
-    """
+    """Interval of transformed values that the inverse Yeo-Johnson transform at lam accepts."""
     t_min = -1.0 / (lam - 2.0) if lam > 2.0 else -np.inf
     t_max = -1.0 / lam if lam < 0.0 else np.inf
     return t_min, t_max
@@ -468,33 +308,21 @@ def get_marginal_quantiles_pfn4bo(
     X_query: np.ndarray,
     probs: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Query PFN4BO's predictive quantile grid at ``X_query``.
+    """PFN4BO's predictive quantiles at X_query.
 
-    Handles PFN4BO's own input/output conventions, none of which match
-    TabICL's:
-      - x must lie in [0,1]^d — mapped here via the Gaussian CDF
-        (``torch.special.ndtr``). Feature padding up to the model's fixed
-        input width is handled automatically by its own
-        ``VariableNumFeaturesEncoder`` — no manual padding needed.
-      - y is power-transformed (Yeo-Johnson, fit on ``y_context`` only) before
-        being fed to the model; the returned quantile *values* are inverse-
-        transformed back to original y-units before returning (valid since
-        monotonic transforms commute with quantile functions).
-      - the model itself outputs bucketed ("bar distribution") logits, not
-        raw quantiles — inverted via ``_vectorized_bar_icdf``.
+    x is mapped to [0, 1]^d with the Gaussian CDF; y is Yeo-Johnson transformed
+    (fit on y_context) and the quantiles are transformed back, clipped to the
+    invertible domain and to a multiple of the context range.
 
     Args:
-        pfn4bo_model : loaded PFN4BO model (e.g. from ``load_pfn4bo``).
-        X_context    : (n_ctx, d) context features.
-        y_context    : (n_ctx,) context targets.
-        X_query      : (n_q, d) query features.
-        probs        : optional (Q,) probability levels; defaults to the
-                       same 999-level convention as ``get_marginal_quantiles``
-                       (``linspace(0, 1, 1001)[1:-1]``) for easy side-by-side use.
+        pfn4bo_model: loaded PFN4BO model.
+        X_context: (n_ctx, d).
+        y_context: (n_ctx,).
+        X_query: (n_q, d).
+        probs: optional (Q,) levels (default: the 999-level grid).
 
     Returns:
-        quantile_grid : (n_q, len(probs)), in original y-units.
-        probs         : (len(probs),) probability levels used.
+        quantile_grid (n_q, Q) in original y units and the probs used.
     """
     from sklearn.preprocessing import PowerTransformer
 
@@ -517,9 +345,7 @@ def get_marginal_quantiles_pfn4bo(
     x_full = torch.cat([x_ctx_t, x_qry_t], dim=0).to(device).unsqueeze(1)  # (T, 1, d_x)
     y_full = torch.as_tensor(y_ctx_transformed, dtype=torch.float32, device=device).unsqueeze(1)  # (P, 1)
 
-    # TransformerModel's decoder only runs on positions >= single_eval_pos
-    # (see transformer.py::_forward's out_range_start) — the returned tensor
-    # is already query-only, shape (n_q, 1, num_bars), NOT the full sequence.
+    # The output covers only the query positions: (n_q, 1, num_bars).
     logits = pfn4bo_model((None, x_full, y_full), single_eval_pos=n_ctx)  # (n_q, 1, num_bars)
     logits_query = logits[:, 0, :]  # (n_q, num_bars)
 
@@ -527,11 +353,7 @@ def get_marginal_quantiles_pfn4bo(
     probs_t = torch.as_tensor(probs, dtype=logits_query.dtype, device=device)
     quantile_grid_transformed = _vectorized_bar_icdf(criterion, logits_query, probs_t)  # (n_q, Q)
 
-    # Clip to Yeo-Johnson's invertible domain: BarDistribution's tail
-    # extrapolation can push extreme-probability quantiles (e.g. p=0.001)
-    # past the range any real y could have produced under the fitted
-    # transform, which sklearn's inverse_transform would otherwise silently
-    # turn into NaN (a fractional power of a negative base).
+    # Clip to the inverse transform's domain (outside it sklearn returns NaN).
     t_min, t_max = _yeo_johnson_valid_domain(float(pt.lambdas_[0]))
     margin = 1e-6
     flat = quantile_grid_transformed.cpu().numpy().reshape(-1, 1).astype(np.float64)
@@ -540,24 +362,12 @@ def get_marginal_quantiles_pfn4bo(
     n_q = quantile_grid_transformed.shape[0]
     quantile_grid = pt.inverse_transform(flat).reshape(n_q, -1)
 
-    # Even inside the invertible domain, the inverse Yeo-Johnson transform's
-    # derivative blows up near the domain boundary computed above, so
-    # extreme-tail probability levels (e.g. p=0.001) that BarDistribution's
-    # tail extrapolated far from the observed data can still invert to
-    # absurdly large finite y-values (dominating any downstream mean/std
-    # summary). Clip to a generous but finite multiple of the observed
-    # context range — same spirit as sample_trajectories' probability
-    # clipping: bound extrapolation rather than let it explode.
+    # Clip to a multiple of the context range.
     y_ctx_min, y_ctx_max = float(y_ctx.min()), float(y_ctx.max())
     y_range = max(y_ctx_max - y_ctx_min, 1e-6)
     quantile_grid = np.clip(quantile_grid, y_ctx_min - 10 * y_range, y_ctx_max + 10 * y_range)
 
     return quantile_grid, probs
-
-
-# ---------------------------------------------------------------------------
-# Sampling
-# ---------------------------------------------------------------------------
 
 
 def sample_trajectories(
@@ -568,37 +378,27 @@ def sample_trajectories(
     eps_reg: float = 1e-6,
     rng: Optional[np.random.Generator] = None,
 ) -> tuple[np.ndarray, int]:
-    """Sample correlated trajectories via shared Gaussian noise + quantile inversion.
+    """Sample correlated trajectories: z = chol(R + eps_reg I) eps, y_i = F_i^{-1}(Phi(z_i)).
 
-    For each sample k: draw ``eps_k ~ N(0, I)`` (dimension = n_test, one
-    shared draw per trajectory), ``z = L @ eps_k`` with
-    ``L = cholesky(R + eps_reg*I)``, ``p = Phi(z)`` (clipped to
-    ``[probs[0], probs[-1]]`` to avoid extrapolating past the quantile grid),
-    ``y_i = interp(p_i, probs, quantile_grid[i])``.
+    Probabilities are clipped to [probs[0], probs[-1]].
 
     Args:
-        quantile_grid : (n_test, Q) — quantile_grid[i, j] = F_i^{-1}(probs[j]).
-        probs         : (Q,) probability levels, shared across test points.
-        R             : (n_test, n_test) correlation matrix (pass
-                        ``np.eye(n_test)`` for the independent baseline).
-        n_samples     : number of trajectories to draw.
-        eps_reg       : jitter added to R's diagonal before Cholesky.
-        rng           : optional ``np.random.Generator`` for reproducibility.
+        quantile_grid: (n_test, Q), quantile_grid[i, j] = F_i^{-1}(probs[j]).
+        probs: (Q,) levels.
+        R: (n_test, n_test) correlation (np.eye for independence).
+        n_samples: number of trajectories.
+        eps_reg: diagonal jitter.
+        rng: optional np.random.Generator.
 
     Returns:
-        samples   : (n_samples, n_test).
-        n_clipped : total count of (sample, test-point) pairs whose implied
-                    probability fell outside ``[probs[0], probs[-1]]`` and had
-                    to be clipped — a diagnostic for how often the sampler
-                    extrapolated past the quantile grid's support.
+        samples (n_samples, n_test) and the number of clipped probabilities.
     """
     if rng is None:
         rng = np.random.default_rng()
 
     n_test = R.shape[0]
     R_safe = R + eps_reg * np.eye(n_test)
-    # Jitter improves numerical stability; renormalize so this covariance
-    # remains a correlation matrix with unit latent marginal variances.
+    # Add jitter, then renormalize to a unit diagonal.
     scale = np.sqrt(np.diag(R_safe))
     R_safe = R_safe / np.outer(scale, scale)
     L = np.linalg.cholesky(R_safe)
