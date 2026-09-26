@@ -1,7 +1,7 @@
 [project]
 name = "tabicl"
 dynamic = ["version"]
-description = "TabICL: A state-of-the-art tabular foundation model"
+description = "TabICL: An open tabular foundation model"
 readme = "README.md"
 authors = [
     { name = "Jingang Qu" },
@@ -52,7 +52,6 @@ doc = [
 ]
 forecast = [                                                                                                                                                                                                        
     "pandas>=2.1.2",
-    "gluonts>=0.16.0",  # calendar features
     "statsmodels>=0.14.5",  # seasonal detection
     "matplotlib>=3.10.3",  # plotting
 ]
@@ -73,6 +72,7 @@ finetune = [
 ]
 test = [
     "pandas",
+    "pytest",
 ]
 all = [
     "tabicl[doc,forecast,shap,pretrain,finetune,test]",
@@ -98,7 +98,7 @@ features = []
 [tool.hatch.envs.hatch-test]
 default-args = ["tests"]
 installer = "uv"
-features = ["test"]
+features = ["test", "forecast", "shap", "finetune"]
 
 [tool.hatch.envs.types]
 extra-dependencies = [
@@ -126,10 +126,11 @@ exclude_lines = [
 ]
 
 [tool.uv]
-# gluonts pins an old numpy version which is not available for Python 3.14. The
-# following override is a temporary workaround to avoid having uv build numpy
-# from source on Python 3.14 and later.
-override-dependencies = [
-    "numpy>=2.4; python_version >= '3.14'",
-    "numpy; python_version < '3.14'",
+# Cooldown period for PyPI releases to mitigate supply chain attacks.
+exclude-newer = "7 days"
+# Must resolve dependencies for major platforms in uv.lock
+required-environments = [
+    "sys_platform == 'darwin'",
+    "sys_platform == 'linux'",
+    "sys_platform == 'win32'",
 ]

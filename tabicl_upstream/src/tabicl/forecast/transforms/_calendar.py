@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import gluonts.time_feature
 
 from tabicl.forecast.transforms._base import TimeTransform
 
@@ -28,13 +27,31 @@ class IndexEncoder(TimeTransform):
         """
         return df.assign(running_index=range(len(df)))
 
+_SEASONAL_MAPPINGS = {
+    "second_of_minute": "second",
+    "minute_of_hour": "minute",
+    "hour_of_day": "hour",
+    "day_of_month": "day",
+    "month_of_year": "month",
+}
+_ZERO_INDEXED = {
+    "second",
+    "minute",
+    "hour",
+    "dayofweek",
+    "day_of_week",
+    "weekday",
+    "microsecond",
+    "nanosecond",
+}
+
 
 class DatetimeEncoder(TimeTransform):
     """Transform that creates calendar-based temporal features.
 
     Extracts calendar components (e.g., year) and encodes seasonal
     patterns (e.g., hour of day, day of week) as sin/cosine pairs using
-    ``gluonts.time_feature``.
+    ``pd.DatetimeIndex`` attributes.
 
     Parameters
     ----------
@@ -60,8 +77,8 @@ class DatetimeEncoder(TimeTransform):
             "hour_of_day": [24],
             "day_of_week": [7],
             "day_of_month": [30.5],
-            "day_of_year": [365],
-            "week_of_year": [52],
+            "day_of_year": [366],  # 366 to avoid collisions in leap years
+            "week_of_year": [53],  # 53 to avoid collisions in ISO week 53 years
             "month_of_year": [12],
         }
 
@@ -80,19 +97,25 @@ class DatetimeEncoder(TimeTransform):
         """
         df = df.copy()
         timestamps = df.index.get_level_values("timestamp")
+        assert isinstance(timestamps, pd.DatetimeIndex), "Index must have a 'timestamp' level of type DatetimeIndex"
 
         for component in self.components:
             df[component] = getattr(timestamps, component)
 
         for feature_name, periods in self.seasonal_features.items():
-            feature_func = getattr(gluonts.time_feature, f"{feature_name}_index")
-            feature = feature_func(timestamps).astype(np.int32)
+            if feature_name not in ["week_of_year", "week", "weekofyear"]:
+                feature_name_ = _SEASONAL_MAPPINGS.get(feature_name, feature_name)
+                feature = getattr(timestamps, feature_name_).astype(np.int32)
+                if feature_name_ not in _ZERO_INDEXED:
+                    feature -= 1  # Adjust for 0-based indexing
+            else:
+                feature = timestamps.isocalendar().week.to_numpy(dtype=np.int32)
+                feature -= 1  # Adjust for 0-based indexing
 
             if periods is not None:
                 for p in periods:
-                    adjusted = p - 1  # Adjust for 0-based indexing
-                    df[f"{feature_name}_sin"] = np.sin(2 * np.pi * feature / adjusted)
-                    df[f"{feature_name}_cos"] = np.cos(2 * np.pi * feature / adjusted)
+                    df[f"{feature_name}_sin"] = np.sin(2 * np.pi * feature / p)
+                    df[f"{feature_name}_cos"] = np.cos(2 * np.pi * feature / p)
             else:
                 df[feature_name] = feature
 

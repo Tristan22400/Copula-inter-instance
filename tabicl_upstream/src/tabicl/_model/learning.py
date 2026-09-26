@@ -83,6 +83,7 @@ class ICLearning(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         ssmax: Union[bool, str] = False,
+        zero_init: bool = True,
         recompute: bool = False,
     ):
         super().__init__()
@@ -100,6 +101,7 @@ class ICLearning(nn.Module):
             norm_first=norm_first,
             bias_free_ln=bias_free_ln,
             ssmax=ssmax,
+            zero_init=zero_init,
             recompute=recompute,
         )
         if self.norm_first:
@@ -265,6 +267,11 @@ class ICLearning(nn.Module):
             Ry_train = self.y_encoder(y_train.float())
         else:  # Regression
             Ry_train = self.y_encoder(y_train.unsqueeze(-1))
+        # When upstream modules are frozen (partial freezing, see #128), R is a
+        # no-grad view whose in-place mutation would conflict with autograd. Detach
+        # gives a fresh autograd leaf sharing the same storage — zero-copy.
+        if torch.is_grad_enabled() and not R.requires_grad:
+            R = R.detach()
         R[:, :train_size] = R[:, :train_size] + Ry_train
 
         src = self.tf_icl(R, train_size=train_size)

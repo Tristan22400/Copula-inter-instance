@@ -75,7 +75,7 @@ def _metrics(proba: np.ndarray, y_true: np.ndarray) -> tuple[float, float, float
 # ---------------------------
 #
 # Expected: draws the vertical split, smears the island.
-base = TabICLClassifier(n_estimators=4, random_state=0)
+base = TabICLClassifier(n_estimators=2, random_state=0)
 base.fit(X_train, y_train)
 base_proba = base.predict_proba(X_test)
 base_auc, base_ll, base_acc = _metrics(base_proba, y_test)
@@ -120,14 +120,16 @@ class _HistoryLogger:
         pass
 
 
+# n_estimators and epochs are kept low for fast doc builds;
+# for best results use n_estimators_inference=8, epochs=50+, patience=10.
 clf = FinetunedTabICLClassifier(
-    epochs=60,
+    epochs=30,
     learning_rate=1e-5,
     n_estimators_finetune=2,
     n_estimators_validation=2,
-    n_estimators_inference=4,
+    n_estimators_inference=2,
     early_stopping=True,
-    patience=10,
+    patience=5,
     eval_metric="roc_auc",
     random_state=0,
     verbose=True,
@@ -142,7 +144,7 @@ ft_proba = clf.predict_proba(X_test)
 ft_auc, ft_ll, ft_acc = _metrics(ft_proba, y_test)
 
 if is_main_process:
-    header = f"{'metric':<12}{'pretrained':>14}{'fine-tuned':>14}{'Δ':>14}"
+    header = f"{'metric':<12}{'pretrained':>14}{'fine-tuned':>14}{'delta':>14}"
     rule = "=" * len(header)
     print()
     print(rule)
@@ -150,10 +152,11 @@ if is_main_process:
     print(rule)
     print(header)
     print("-" * len(header))
-    print(f"{'ROC-AUC ↑':<12}{base_auc:>14.4f}{ft_auc:>14.4f}{ft_auc - base_auc:>+14.4f}")
-    print(f"{'log-loss ↓':<12}{base_ll:>14.4f}{ft_ll:>14.4f}{ft_ll - base_ll:>+14.4f}")
-    print(f"{'accuracy ↑':<12}{base_acc:>14.4f}{ft_acc:>14.4f}{ft_acc - base_acc:>+14.4f}")
+    print(f"{'ROC-AUC':<12}{base_auc:>14.4f}{ft_auc:>14.4f}{ft_auc - base_auc:>+14.4f}")
+    print(f"{'log-loss':<12}{base_ll:>14.4f}{ft_ll:>14.4f}{ft_ll - base_ll:>+14.4f}")
+    print(f"{'accuracy':<12}{base_acc:>14.4f}{ft_acc:>14.4f}{ft_acc - base_acc:>+14.4f}")
     print(rule)
+    print("higher is better: ROC-AUC, accuracy;  lower is better: log-loss")
 
 # %%
 # Figure 1 — Decision boundaries + probability contours
