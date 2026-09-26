@@ -1,18 +1,8 @@
-"""
-test_dataset_corr_uniform.py — Verify structural properties of R_star in a dataset folder.
+"""Structural checks of R_star (the prior test correlation) in a dataset folder.
 
-data_gen uses the GP *posterior* covariance K_ss + nugget·I − K_st K_ff⁻¹ K_ts as R_star.
-This gives:
-  - PSD (residual uncertainty after conditioning on training data)
-  - Unit diagonal: R_star is a proper correlation matrix
-  - Off-diagonal entries smaller than the prior (training data explains part of the correlation)
-  - Both positive and negative entries (oscillatory kernels like cosine)
-
-Run against a specific folder:
     DATASET_DIR=./data/pit_episodes pytest tests/test_dataset_corr_uniform.py -v
 
-The test is skipped when the folder does not exist or is empty.
-Default folder: ./data/pit_cosine-new (matches training config).
+Skipped when the folder is missing or empty (default ./data/pit_cosine-new).
 """
 
 from __future__ import annotations
@@ -31,21 +21,12 @@ def dataset_dir():
     return os.environ.get("DATASET_DIR", _DEFAULT_DIR)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 _N_EPISODES = 500   # episodes to sample
 _SEED = 0
 
 
 def _iter_episodes(folder: str, shuffle_seed: int | None = None):
-    """Yield episode dicts from a folder — handles both shard and individual layout.
-
-    Shard files are shuffled (not their contents) before reading, so callers that
-    only need the first *n* episodes can stop early without loading every shard —
-    important for datasets with hundreds of GB across many shards.
-    """
+    """Yield episode dicts from a folder (shards in shuffled order, or individual files)."""
     paths = sorted(
         os.path.join(folder, f)
         for f in os.listdir(folder)
@@ -81,11 +62,6 @@ def _load_episodes(folder: str, n: int, seed: int):
     return torch.cat(values), min_eigs
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture(scope="module")
 def episode_data(dataset_dir):
     if not os.path.isdir(dataset_dir):
@@ -106,11 +82,6 @@ def min_eigenvalues(episode_data):
     return episode_data[1]
 
 
-# ---------------------------------------------------------------------------
-# Tests — correlation values
-# ---------------------------------------------------------------------------
-
-
 def test_correlations_have_both_signs(off_diag):
     """Both positive and negative off-diagonal entries must exist."""
     assert off_diag.min().item() < -0.02, (
@@ -122,13 +93,7 @@ def test_correlations_have_both_signs(off_diag):
 
 
 def test_correlations_mean_near_zero(off_diag):
-    """Mean of off-diagonal R_star should not be extreme.
-
-    The cosine prior with l ~ U(1, 10) has a slight positive mean (~0.20) because
-    large l values keep 2π*dist/l small (near cos(0)=1). Threshold is 0.30 to
-    catch degenerate cases (e.g. all-ones or collapsed kernel) while tolerating
-    this natural bias.
-    """
+    """|mean off-diagonal R_star| < 0.30."""
     mean = off_diag.mean().item()
     assert abs(mean) < 0.30, f"Mean {mean:.3f} too far from 0 — distribution may be degenerate"
 
@@ -141,14 +106,7 @@ def test_correlations_negative_fraction(off_diag):
 
 
 def test_correlations_std_nonzero(off_diag):
-    """Standard deviation must be non-trivial — posterior R_star has residual structure.
-
-    With the GP posterior, off-diagonal correlations are shrunk by the Schur complement
-    (training data explains part of the prior correlation). Expected std ≈ 0.1–0.30
-    depending on the kernel and the P/N ratio. A value below 0.1 indicates the posterior
-    correlations have collapsed near zero (e.g. a rank-limited kernel like dot_product
-    with P >> d_features, where training data pins down the signal almost completely).
-    """
+    """The off-diagonal std is at least 0.1."""
     std = off_diag.std().item()
     assert std > 0.1, (
         f"Std {std:.4f} too low — posterior R_star correlations appear degenerate."
@@ -174,18 +132,8 @@ def test_unit_diagonal(dataset_dir):
         )
 
 
-# ---------------------------------------------------------------------------
-# Tests — numerical conditioning (latent=False guarantee)
-# ---------------------------------------------------------------------------
-
-
 def test_r_star_well_conditioned(min_eigenvalues):
-    """All R_star matrices must have minimum eigenvalue ≥ 0.0001.
-
-    With latent=False, the nugget noise floor in K_ss prevents R_star from
-    being rank-deficient. Near-singular R_star (min_eig ~ 1e-7) causes
-    oracle_copula_nll to blow up (z^T R^{-1} z >> 1).
-    """
+    """Every R_star has minimum eigenvalue >= 1e-4."""
     bad = [v for v in min_eigenvalues if v < 0.0001]
     assert len(bad) == 0, (
         f"{len(bad)}/{len(min_eigenvalues)} episodes have min_eig < 0.0001; "

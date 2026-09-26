@@ -1,34 +1,13 @@
-"""
-test_pit_batched.py — Tests for pit.py::run_pit_batched/
-run_pit_calib_split_batched and their wiring into
-data_gen.py::_generate_gp_batch_raw / generate_gp_batch (data.z_train_source
-= "tabicl"/"tabicl_split" in conf/data/gp_tasks.yaml).
+"""Tests for pit.run_pit_batched / run_pit_calib_split_batched / run_pit_batched_grad and their use in data_gen.
 
-Tests verify:
-  1. run_pit_batched(B=1) matches the existing single-episode run_pit exactly.
-  2. run_pit_batched(B>1) matches looping run_pit per episode -- the whole
-     point of the batched version is to fold episodes into TabICL's own
-     batch axis instead of a Python loop, so this must be bit-identical.
-  3. Passing tabicl_model into _generate_gp_batch_raw with the plain "tabicl"
-     (K-fold) path overrides z_train AND z_test/log_pdf_test (scored against
-     TabICL's own PIT at the real x_norm_test/y_test, matching what
-     train.py::validate's sim-to-real diagnostic later scores it against --
-     see conf/data/gp_tasks.yaml's z_train_source docstring for why, root-
-     caused 2026-08-24) -- every other, purely-GP-episode field stays
-     exactly the oracle/analytic values, and the override actually changes
-     z_train/z_test's values (not a silently inert no-op).
-  4. run_pit_calib_split_batched fits its target scale on calibration labels
-     alone, then matches run_pit_batched's test-side computation on that scale.
-  5. Passing tabicl_split_calib_frac > 0 into _generate_gp_batch_raw (the
-     "tabicl_split" path) overrides z_train only -- z_test/log_pdf_test stay
-     the oracle values, unlike the plain "tabicl" path in (3) -- same
-     never-perturbs-n_train guarantee as tabicl_k_folds's override.
-  6. run_pit_batched_grad (the Phase-A marginal-finetuning entry point, see
-     src/copula_inter/finetune_marginal.py) is numerically identical to run_pit_batched --
-     they share one private body precisely so they cannot drift, and this is
-     what proves the sharing actually holds.
-  7. return_quantiles=True is purely additive: it does not perturb z_train/
-     z_test/log_pdf_test. Fold quantiles are returned on the caller's scale.
+  1. run_pit_batched with B=1 matches run_pit.
+  2. B > 1 matches run_pit per episode.
+  3. The "tabicl" override replaces z_train, z_test and log_pdf_test and
+     leaves every other field unchanged.
+  4. run_pit_calib_split_batched scales on calibration labels only.
+  5. The "tabicl_split" override replaces z_train only.
+  6. run_pit_batched_grad matches run_pit_batched.
+  7. return_quantiles does not change z_train/z_test/log_pdf_test.
 """
 
 from __future__ import annotations
@@ -50,13 +29,7 @@ from copula_inter.pit import (
 
 
 class RowIndependentFakeTabICL(nn.Module):
-    """A FakeTabICL whose output for one (episode, target-dim) row depends
-    ONLY on that row's own (X, y) values -- unlike tests/test_tabicl_z_
-    diagnostic.py's FakeTabICL, which seeds off X.sum() over the WHOLE
-    batch axis (fine for that file's single-call-per-episode usage, but
-    wrong here: it would make a combined B*d-batched forward call produce
-    different results than B separate single-episode calls, which is
-    exactly the equivalence these tests check)."""
+    """Fake TabICL whose output for each (episode, target) row depends only on that row's (X, y)."""
 
     def __init__(self, q: int = 3):
         super().__init__()
@@ -106,8 +79,7 @@ def test_fold_target_scaling_uses_only_context_labels():
     z_changed = loo_pit(model, x.numpy(), changed.numpy(), k_folds=3)
     assert abs(z[0] - z_changed[0]) < 1e-5
 
-    # The B=1 path uses the same fold-local scale, even though its input was
-    # pre-scaled using all P labels for the full-context test-side forward.
+    # B=1 uses the fold-local scale even though the input was scaled with all P labels.
     for labels, expected in ((y, z), (changed, z_changed)):
         scaled, _, _, _ = normalize_targets(labels)
         out = run_pit_batched(
@@ -145,8 +117,7 @@ def test_single_context_fold_uses_raw_label_units():
         model, x, scaled[:, None], x[:1], scaled[:1, None],
         k_folds=2, Y_train_raw=y[:, None],
     )
-    # With one context label, its fold scale is one raw target unit. The
-    # held-out row 0 is therefore one unit below its context label.
+    # With one context label the fold scale is one raw unit.
     assert torch.allclose(out["z_train"][0, 0], torch.tensor(-1.), atol=1e-5)
 
 
@@ -241,9 +212,7 @@ def test_calibration_split_query_labels_do_not_scale_context():
     alt = run_pit_calib_split_batched(model, x_query, changed, x_calib, y_calib)
     assert torch.allclose(out["z_train"][0, 0], alt["z_train"][0, 0], atol=0)
 
-    # data_gen pre-scales both groups using the query pool's moments. Passing
-    # the raw labels must remove that dependency, including for a singleton
-    # calibration context whose standard deviation is undefined.
+    # Raw labels remove the dependency on the query pool's moments.
     one_calib = y_calib[:, :1]
     for query in (y_query, changed):
         mean = query.mean(dim=1, keepdim=True)
@@ -278,15 +247,7 @@ def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg):
 
     tabicl = RowIndependentFakeTabICL()
 
-    # Control uses the SAME tabicl_split_calib_frac (hence the same T = P +
-    # P_C + N, and the same per-episode x_norm normalisation, which is
-    # computed jointly over all T points -- see _generate_gp_batch_raw) but
-    # tabicl_model=None, so the override branch never fires and z_train stays
-    # the analytic LOO residual. This isolates the override's effect: unlike
-    # comparing against a tabicl_split_calib_frac=0 baseline (a different T,
-    # hence a different shared normalisation constant -- NOT a byte-for-byte
-    # comparable episode), every other field must now match exactly, since
-    # x_norm/K_all/oracle only depend on P_C's value, never on tabicl_model.
+    # Control: same calibration fraction (same T and normalization) without a model.
     analytic = _generate_gp_batch_raw(cfg, B=6, device="cpu", tabicl_split_calib_frac=1.0)
     with_split = _generate_gp_batch_raw(
         cfg, B=6, device="cpu", tabicl_model=tabicl, tabicl_split_calib_frac=1.0,
@@ -298,10 +259,7 @@ def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg):
         assert ep_t["n_train"] == ep_a["n_train"]
         # The override must actually change z_train's values...
         assert not torch.allclose(ep_a["z_train"], ep_t["z_train"])
-        # ...but leave everything else -- the test-side oracle fields in
-        # particular -- exactly as the analytic pipeline computed them (the
-        # calibration-only pool must never perturb x_norm_train/y_train or
-        # the test-side oracle, only feed the one-pass PIT call for z_train).
+        # Everything else is unchanged.
         for key in ("x_norm_train", "x_norm_test", "y_train", "y_test",
                     "z_test", "log_pdf_test", "R_star", "Sigma_star",
                     "mu_star", "sigma_star"):
@@ -309,8 +267,7 @@ def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg):
 
 
 def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg):
-    """z_train_split_calib_frac > 1.0 (calibration pool bigger than the
-    training set) must work -- not capped anywhere in the pipeline."""
+    """z_train_split_calib_frac > 1 works."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -327,8 +284,7 @@ def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg)
 
 
 def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg):
-    """tabicl_split_calib_frac=0.0 (the default) must fall back to the
-    K-fold path when tabicl_model is given, not silently do nothing."""
+    """tabicl_split_calib_frac=0 with a model uses the K-fold path."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -349,19 +305,7 @@ def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg):
 
 
 def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg):
-    """Plain "tabicl" (K-fold) override: z_train AND z_test/log_pdf_test are
-    replaced with TabICL's own PIT (at the real x_norm_test/y_test), while
-    every purely-GP-episode field stays exactly the analytic/oracle values.
-
-    Root-caused 2026-08-24: an earlier version of this override left z_test/
-    log_pdf_test at the oracle values (only z_train changed) -- training
-    against that clean target while conditioning on noisy TabICL z_train
-    taught an overconfident Sigma that scored badly (positive, worse-than-
-    independence copula NLL) once train.py::validate's sim-to-real
-    diagnostic (val/y_nll_copula) scored that same Sigma against TabICL's
-    own noisier z_test instead. See conf/data/gp_tasks.yaml's z_train_source
-    docstring for the full writeup and the A/B copula_nano confirmation.
-    """
+    """The "tabicl" override replaces z_train, z_test and log_pdf_test with TabICL's PIT and leaves every other field unchanged."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -384,19 +328,14 @@ def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg):
         assert not torch.allclose(ep_a["log_pdf_test"], ep_t["log_pdf_test"])
         assert torch.isfinite(ep_t["z_test"]).all()
         assert torch.isfinite(ep_t["log_pdf_test"]).all()
-        # ...but leave every purely-GP-episode field -- not derived from the
-        # PIT target -- exactly as the analytic pipeline computed it.
+        # Every other field is unchanged.
         for key in ("x_norm_train", "x_norm_test", "y_train", "y_test",
                     "R_star", "Sigma_star", "mu_star", "sigma_star"):
             assert torch.allclose(ep_a[key], ep_t[key], atol=1e-6), key
 
 
 def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(small_cfg):
-    """The override's z_test/log_pdf_test must equal calling run_pit_batched
-    directly on the episode's own (oracle-computed) x_norm_train/y_train/
-    x_norm_test/y_test with the same train-only y_mean/y_std scaling and
-    Jacobian correction -- pins down the exact formula, not just "it changed
-    something."."""
+    """The override's z_test/log_pdf_test equal run_pit_batched on the episode with train-only scaling and the Jacobian."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -427,8 +366,7 @@ def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(smal
 
 
 def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg):
-    """tabicl_model=None must not touch z_train, z_test, or log_pdf_test --
-    apply_tabicl gates the whole override on tabicl_model being given."""
+    """Without tabicl_model, z_train/z_test/log_pdf_test are unchanged."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -445,10 +383,7 @@ def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg):
 
 
 def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg):
-    """Unlike the plain "tabicl" K-fold path above, "tabicl_split"
-    (tabicl_split_calib_frac > 0) only overrides z_train -- z_test/
-    log_pdf_test stay the oracle values (this is a separate, narrower
-    override; see conf/data/gp_tasks.yaml's z_train_source docstring)."""
+    """"tabicl_split" replaces z_train only; z_test/log_pdf_test stay analytic."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -468,11 +403,6 @@ def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg):
             assert torch.allclose(ep_a[key], ep_s[key], atol=1e-6), key
 
 
-# ---------------------------------------------------------------------------
-# 6-7. Grad-enabled variant and the quantile extras
-# ---------------------------------------------------------------------------
-
-
 def _pit_inputs(B=2, P=9, N=4, seed=0):
     torch.manual_seed(seed)
     return (
@@ -482,10 +412,7 @@ def _pit_inputs(B=2, P=9, N=4, seed=0):
 
 
 def test_run_pit_batched_grad_matches_the_no_grad_version():
-    """The two entry points exist only to differ in gradient policy. Any
-    numerical difference means the shared _run_pit_batched_impl stopped being
-    shared -- which would silently let Phase A optimize a slightly different
-    PIT than the one deployment runs."""
+    """run_pit_batched_grad and run_pit_batched give identical results."""
     tabicl = RowIndependentFakeTabICL()
     Xtr, Ytr, Xte, Yte = _pit_inputs()
 
@@ -497,15 +424,7 @@ def test_run_pit_batched_grad_matches_the_no_grad_version():
 
 
 class GradProbeFakeTabICL(nn.Module):
-    """A differentiable fake that records the grad-enabled state and the
-    train/eval mode it was called under.
-
-    RowIndependentFakeTabICL above builds its output with a torch.Generator and
-    torch.empty, so nothing downstream of it can require grad no matter what
-    policy the caller set -- it cannot distinguish the two entry points. This
-    one produces its output from an actual Parameter, so requires_grad on the
-    result is a real signal.
-    """
+    """Differentiable fake (output from a Parameter) that records grad mode and train/eval mode."""
 
     def __init__(self, q: int = 3):
         super().__init__()
@@ -529,9 +448,7 @@ class GradProbeFakeTabICL(nn.Module):
 
 
 def test_run_pit_batched_grad_builds_a_graph_and_the_public_one_does_not():
-    """The whole point of the split: run_pit_batched is hard-decorated
-    @torch.no_grad() for its (many) inference callers, so a shared flag would
-    have silently made every one of them build an autograd graph."""
+    """Only run_pit_batched_grad builds an autograd graph."""
     Xtr, Ytr, Xte, Yte = _pit_inputs()
 
     frozen = GradProbeFakeTabICL()
@@ -549,11 +466,7 @@ def test_run_pit_batched_grad_builds_a_graph_and_the_public_one_does_not():
 
 
 def test_grad_pit_forces_train_mode_and_restores_it():
-    """TabICL's .eval() routes into _inference_forward/InferenceManager, whose
-    own fp16 autocast produces NaN for this codebase's inputs -- the documented
-    reason train.py::validate() never calls model.eval(). The grad path must
-    therefore force train mode, and must put it back so it is not a hidden
-    side effect on the caller's module."""
+    """The grad path runs in train mode and restores the module's mode."""
     Xtr, Ytr, Xte, Yte = _pit_inputs()
     probe = GradProbeFakeTabICL()
     probe.eval()
@@ -578,8 +491,7 @@ def test_return_quantiles_is_additive_and_self_consistent():
     N = Yte.shape[1]
     assert extra["q_train"].shape == (B, P, 1, 7)
     assert extra["q_test"].shape == (B, N, 1, 7)
-    # u_test is the CDF the returned quantiles imply, so probit(u) must be the
-    # z_test that came back alongside them.
+    # probit(u_test) equals the returned z_test.
     from copula_inter.pit import _probit
 
     assert torch.allclose(_probit(extra["u_test"], 1e-6), extra["z_test"], atol=0)
@@ -587,10 +499,7 @@ def test_return_quantiles_is_additive_and_self_consistent():
 
 
 def test_fold_subset_scores_only_the_requested_folds():
-    """Phase A never needs a complete z_train, so it subsets the fold rotation
-    to cut the per-step forward cost by ~K. The rows it does score must be
-    bit-identical to those rows of a full pass -- otherwise the fold geometry
-    changed and the training conditioning no longer matches deployment's."""
+    """fold_subset scores only its folds, bit-identical to the same rows of a full pass."""
     tabicl = RowIndependentFakeTabICL()
     Xtr, Ytr, Xte, Yte = _pit_inputs(B=2, P=12, N=3, seed=5)
     K = 4

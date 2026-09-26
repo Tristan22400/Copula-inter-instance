@@ -1,6 +1,4 @@
-"""tests/test_debug_pipeline.py — sanity checks for the debug/ pipeline
-(see debug/README.md). Fast, CPU-only, no TabICL/network dependency.
-"""
+"""Fast CPU checks for the debug/ pipeline."""
 from __future__ import annotations
 
 import os
@@ -12,15 +10,8 @@ import torch
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
 
-# ---------------------------------------------------------------------------
-# S1: rank-ceiling fitter
-# ---------------------------------------------------------------------------
-
 def test_rank_ceiling_recovers_exact_low_rank_target():
-    """A correlation matrix built with model.py's OWN covnorm parametrization
-    at rank r lies exactly inside the rank-r covnorm family -- fitting rank r
-    to it should drive the ceiling loss (expected copula NLL vs. itself)
-    down to ~0, not just "small"."""
+    """Fitting rank r to a rank-r covnorm matrix drives the ceiling loss to ~0."""
     from copula_inter.model import low_rank_correlation
     from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
@@ -35,9 +26,7 @@ def test_rank_ceiling_recovers_exact_low_rank_target():
 
 
 def test_rank_ceiling_monotone_in_rank():
-    """A higher rank can only do at least as well: r=8's ceiling loss on a
-    generic R must be <= r=2's (both fit to the SAME target, more capacity
-    can't hurt the population-level optimum)."""
+    """The rank-8 ceiling loss is <= the rank-2 one on the same target."""
     from copula_inter.model import low_rank_correlation
     from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
@@ -51,10 +40,6 @@ def test_rank_ceiling_monotone_in_rank():
     loss_r16, _ = fit_rank_ceiling(R_true, 16, steps=400, lr=0.05, device="cpu")
     assert loss_r16.item() <= loss_r2.item() + 1e-3
 
-
-# ---------------------------------------------------------------------------
-# S2: clamping census
-# ---------------------------------------------------------------------------
 
 def test_clamping_census_all_saturated():
     from debug.stages.s2_uspace import U_SPLINE_KNOT, _clamp_stats
@@ -78,9 +63,7 @@ def test_clamping_census_none_saturated():
 
 
 def test_u_from_z_roundtrips_probit():
-    """u_from_z is the exact inverse of pit.py::_probit -- round-tripping a
-    non-saturated u through _probit -> u_from_z should recover it, and a
-    saturated u should come back exactly at the clamp bound."""
+    """u_from_z inverts pit._probit (clamped values come back at the clamp)."""
     from copula_inter.pit import _probit
     from debug.stages.s2_uspace import U_HARD_CLAMP, u_from_z
 
@@ -90,10 +73,6 @@ def test_u_from_z_roundtrips_probit():
     expected = np.array([0.5, 0.1, 0.9, U_HARD_CLAMP, 1.0 - U_HARD_CLAMP])
     np.testing.assert_allclose(u_back, expected, atol=1e-4)
 
-
-# ---------------------------------------------------------------------------
-# config.py: override parser
-# ---------------------------------------------------------------------------
 
 def test_build_config_applies_dotted_overrides():
     from debug.config import build_config
@@ -114,15 +93,8 @@ def test_build_config_rejects_malformed_override():
         build_config(overrides=["not_a_key_value_pair"], device="cpu")
 
 
-# ---------------------------------------------------------------------------
-# S0: per-point normalization matches loss.py::oracle_copula_nll's own convention
-# ---------------------------------------------------------------------------
-
 def test_s0_posterior_signal_uses_per_point_normalization():
-    """gp_analytical_posterior's nll_post_copula is a raw sum over N test
-    points (not yet per-point); s0_signal.py must divide by n_test itself
-    to match every other per-point metric in this pipeline -- this test
-    guards that division against silently disappearing in a refactor."""
+    """S0 divides the posterior copula NLL by n_test."""
     from debug.stages.s0_signal import run_one_P
     from debug.config import build_config
 
@@ -130,7 +102,5 @@ def test_s0_posterior_signal_uses_per_point_normalization():
     result = run_one_P(dcfg, P=8, n_episodes=2)
     if result["n_episodes_scored"] == 0:
         pytest.skip("no episodes scored for this seed (rare unsupported kernel schema)")
-    # A per-point copula NLL for a handful of test points should be a small
-    # (O(1)-ish) number, not a raw sum over N~256 points (which would be
-    # orders of magnitude larger) -- catches a missing "/ n_test" directly.
+    # Per-point values are O(1), not a sum over N.
     assert abs(result["copula_nll_per_point"]["mean"]) < 50.0

@@ -1,34 +1,4 @@
-"""
-test_marginal_finetune.py — Phase A (marginal fine-tuning) unit tests.
-
-What these pin down, in the order the risk actually sits:
-
-  1. **Tier routing** selects the parameters it claims to and nothing else —
-     in particular the ICL stack's norms but NOT the identically-named norms in
-     col_embedder/row_interactor, which is the whole reason the allowlist is
-     regex rather than substrings.
-  2. **The LoRA export round-trips.** A tier >= 1 checkpoint is written from a
-     module whose attention has been structurally replaced; if
-     merged_base_state_dict does not reproduce plain-TabICL key names AND the
-     same forward output, the "drop-in tabicl.pit_ckpt" promise is silently
-     false and only discovered a training run later.
-  3. **The analytic target is the right quantity.** Two independent checks: it
-     matches a brute-force MVN conditional built from the joint covariance, and
-     it matches data_gen.gp_posterior(latent=False) — NOT latent=True. The
-     latent/observable distinction is a silent, systematic over-sharpening of
-     every target if it goes wrong, so it gets its own test.
-  4. **The fold conditioning the target uses is the fold the model saw.**
-     episode_fold_targets re-derives fold membership from ceil(P/K); this
-     asserts it agrees with pit.py's own loop, so a change to one without the
-     other fails here rather than quietly training against the wrong context.
-  5. **The distillation term bottoms out at the analytic optimum** (a loss that
-     is not zero at the thing it is distilling is not distilling it).
-  6. **The grad path matches the no-grad path** numerically and actually
-     produces finite gradients into the backbone.
-  7. **The ERA5 train/val corpora do not overlap.** Cheap now; catches a future
-     fetch_era5_global.py run landing overlapping months in both directories
-     and silently leaking validation data into training.
-"""
+"""Phase A (marginal fine-tuning) tests: tier routing, LoRA export, analytic targets, fold agreement, the objective, the grad path and ERA5 corpus disjointness."""
 
 from __future__ import annotations
 
@@ -64,11 +34,6 @@ from copula_inter.pit import _probit, run_pit_batched, run_pit_batched_grad
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch):
     from copula_inter import finetune_marginal as entrypoint
     from omegaconf import OmegaConf
@@ -94,12 +59,7 @@ def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch):
 
 
 def _tiny_tabicl(num_quantiles: int = 33) -> nn.Module:
-    """A structurally faithful but tiny TabICL (random init, no HF download).
-
-    Every stage/module name this module's routing and export logic keys off is
-    present — col_embedder.y_encoder, icl_predictor.{ln,y_encoder,decoder},
-    icl_predictor.tf_icl.blocks.N.norm{1,2} — just at toy widths.
-    """
+    """Tiny randomly initialized TabICL with the module names the routing and export logic use."""
     from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
     return TabICL(
@@ -122,17 +82,13 @@ def _tiny_tabicl(num_quantiles: int = 33) -> nn.Module:
 
 def _rbf_task(P: int = 12, N: int = 5, d: int = 2, ls: float = 0.7,
               alpha2: float = 1.3, nugget: float = 0.05, seed: int = 0) -> dict:
-    """A minimal episode dict carrying exactly the keys _kernel_fn_from_task
-    and _mean_train_from_task read, with a known RBF kernel and a genuine GP
-    draw for y (so the analytic posterior really is the data-generating law)."""
+    """Episode dict with a known RBF kernel and a genuine GP draw, carrying the keys _kernel_fn_from_task and _mean_train_from_task read."""
     g = torch.Generator().manual_seed(seed)
     x = torch.rand(P + N, d, generator=g) * 2 - 1
     kfn = build_kernel_fn("rbf", ls, alpha2, active_dims=list(range(d)))
     K = kfn(x, x) + nugget * torch.eye(P + N)
     L = torch.linalg.cholesky(K.double())
-    # A generated dataset is fixed supervision, not a differentiable function
-    # of the temporary gpytorch kernel parameters. Detaching also permits the
-    # same episode to be reused by the full-path overfit test below.
+    # Detach the generated episode (fixed supervision).
     y = (L @ torch.randn(P + N, 1, generator=g, dtype=torch.float64)).squeeze(-1).float().detach()
 
     zero = torch.tensor(0.0)
@@ -151,11 +107,6 @@ def _rbf_task(P: int = 12, N: int = 5, d: int = 2, ls: float = 0.7,
         "y_train": y[:P],
         "y_test": y[P:],
     }
-
-
-# ---------------------------------------------------------------------------
-# 1. Tier routing
-# ---------------------------------------------------------------------------
 
 
 def test_tier0_selects_label_path_norms_and_decoder_only():
@@ -215,11 +166,6 @@ def test_unknown_tier_rejected():
         apply_tier(_tiny_tabicl(), 99)
 
 
-# ---------------------------------------------------------------------------
-# 2. LoRA export round-trip — the "drop-in pit_ckpt" promise
-# ---------------------------------------------------------------------------
-
-
 def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward():
     from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
@@ -259,15 +205,8 @@ def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward():
     assert not torch.allclose(a, c, atol=1e-5), "adapter perturbation had no effect"
 
 
-# ---------------------------------------------------------------------------
-# 3. The analytic target is the right quantity
-# ---------------------------------------------------------------------------
-
-
 def test_analytic_marginal_matches_brute_force_mvn_conditional():
-    """mu_i, sigma_i against the textbook Gaussian conditional built from the
-    full joint covariance — an independent construction, not a rearrangement of
-    the same Cholesky."""
+    """analytic_marginal_targets matches the Gaussian conditional from the full joint covariance."""
     task = _rbf_task(P=10, N=4, seed=1)
     x_ctx, y_ctx = task["x_norm_train"], task["y_train"]
     x_qry = task["x_norm_test"]
@@ -289,10 +228,7 @@ def test_analytic_marginal_matches_brute_force_mvn_conditional():
 
 
 def test_analytic_target_is_observable_y_not_latent_f():
-    """The nugget must be IN the variance. gp_posterior defaults to latent=True
-    (posterior over f*, noise excluded); using that would make every Phase-A
-    target systematically over-sharp, which no downstream metric would flag as
-    anything other than 'the model is underconfident'."""
+    """The target variance includes the nugget (observed y, not latent f)."""
     task = _rbf_task(P=10, N=4, seed=2)
     kfn = build_kernel_fn("rbf", 0.7, 1.3, active_dims=[0, 1])
     nug = float(task["nugget"])
@@ -311,9 +247,7 @@ def test_analytic_target_is_observable_y_not_latent_f():
 
 
 def test_analytic_target_contracts_with_more_context():
-    """Posterior variance must shrink as context grows — the property Phase A
-    exists to teach, so a target that did not have it would be teaching the
-    wrong lesson."""
+    """The target variance shrinks as context grows."""
     task = _rbf_task(P=24, N=4, seed=3)
     x, y = task["x_norm_train"], task["y_train"]
     _, s_small = analytic_marginal_targets(task, x[:4], y[:4], task["x_norm_test"])
@@ -341,17 +275,9 @@ def test_cached_full_context_target_matches_direct_recomputation():
     assert torch.allclose(cached[1], direct[1], atol=1e-5, rtol=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# 4. Fold conditioning agreement between target and model
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("K", [3, 5, 10])
 def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K):
-    """The leakage guarantee, checked at the target side. A row's analytic
-    target must be conditioned on a context that does not contain that row —
-    otherwise the target is a memorization target and the model is rewarded for
-    leaking."""
+    """A row's target is conditioned on a context without that row."""
     P = 12
     task = _rbf_task(P=P, N=2, seed=4)
     idx = torch.arange(P)
@@ -379,10 +305,7 @@ def test_cached_precision_fold_targets_match_direct_conditioning(K):
 
 
 def test_fold_subset_rows_match_a_full_pit_pass():
-    """pit.run_pit_batched(fold_subset=...) must keep the fold GEOMETRY of a
-    full pass — the scored rows' values have to be bit-identical to the same
-    rows of a complete run, or Phase A trains under conditioning that does not
-    exist at deployment."""
+    """fold_subset rows equal the same rows of a full pass."""
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
     torch.manual_seed(0)
@@ -461,11 +384,6 @@ def test_fused_fold_forward_matches_separate_forwards():
     assert torch.equal(fused["q_test"], separate["q_test"])
 
 
-# ---------------------------------------------------------------------------
-# 5. The objective bottoms out where it should
-# ---------------------------------------------------------------------------
-
-
 def test_distillation_is_zero_at_the_analytic_optimum():
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
@@ -508,8 +426,7 @@ def test_distillation_respects_target_mask():
 
 
 def test_zero_nll_weight_excludes_nll_from_training_loss_but_still_reports_it():
-    """The shipped objective monitors density NLL without backpropagating its
-    sparse two-knot gradient into the raw 999-quantile decoder."""
+    """With nll weight 0 the NLL is reported but not in the loss."""
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
     alpha = qd.alpha_levels
@@ -532,8 +449,7 @@ def test_pinball_uses_raw_quantile_identity_and_penalizes_permutation():
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
     alpha = qd.alpha_levels
-    # Deterministic inverse-CDF samples make this a low-variance numerical
-    # approximation to the population score under N(0, 1).
+    # Deterministic inverse-CDF samples.
     y = _probit(torch.linspace(0.0005, 0.9995, 2001))
     q_star = _probit(alpha).expand(y.numel(), -1)
     q_reversed = q_star.flip(-1)
@@ -545,8 +461,7 @@ def test_pinball_uses_raw_quantile_identity_and_penalizes_permutation():
 
 
 def test_exact_distillation_can_overfit_one_predictive_distribution():
-    """A direct single-episode analogue at the decoder boundary: optimizing
-    the diagnostic loss must recover its known analytic quantiles."""
+    """Optimizing the distillation loss recovers the analytic quantiles."""
     torch.manual_seed(7)
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
@@ -570,9 +485,7 @@ def test_exact_distillation_can_overfit_one_predictive_distribution():
 
 
 def test_distillation_does_not_inverse_variance_weight_sharp_rows():
-    """Equal quantile errors should have equal gradients regardless of the
-    query's posterior sigma. The old z-standardized loss amplified the first
-    row by 1 / 0.05 and let sharp GP points dominate clipped updates."""
+    """Equal quantile errors give equal gradients regardless of the target sigma."""
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
     alpha = qd.alpha_levels
@@ -590,8 +503,7 @@ def test_distillation_does_not_inverse_variance_weight_sharp_rows():
 
 
 def test_full_phase_a_path_overfits_one_fixed_synthetic_episode():
-    """Exercise model -> folded PIT -> analytic target -> loss -> optimizer,
-    rather than only optimizing a free tensor at the decoder boundary."""
+    """The full path (model, PIT, targets, loss, optimizer) overfits one episode."""
     torch.manual_seed(11)
     model = _tiny_tabicl(num_quantiles=33)
     episode = _rbf_task(P=8, N=4, d=2, seed=19)
@@ -650,11 +562,6 @@ def test_anchor_penalty_is_zero_at_init_and_grows_with_drift():
     assert anchor(m).detach().item() > 0.0
 
 
-# ---------------------------------------------------------------------------
-# 6. Grad path
-# ---------------------------------------------------------------------------
-
-
 def test_grad_pit_matches_nograd_pit_and_produces_finite_grads():
     torch.manual_seed(0)
     m = _tiny_tabicl(num_quantiles=33)
@@ -688,11 +595,6 @@ def test_grad_path_leaves_train_mode_as_it_found_it():
     assert not m.training, "_train_mode must restore the module's original mode"
 
 
-# ---------------------------------------------------------------------------
-# 7. Calibration diagnostics
-# ---------------------------------------------------------------------------
-
-
 def test_ks_uniform_small_for_uniform_large_for_shifted():
     rng = np.random.default_rng(0)
     u = rng.uniform(size=4000)
@@ -707,11 +609,6 @@ def test_rank_histogram_flat_for_uniform():
     assert np.max(np.abs(h - 0.1)) < 0.02
 
 
-# ---------------------------------------------------------------------------
-# 8. ERA5 train/val corpus disjointness
-# ---------------------------------------------------------------------------
-
-
 def _corpus_months(dirname: str) -> set[str]:
     path = os.path.join(_REPO, "eval", "data", "cache", dirname)
     out = set()
@@ -723,11 +620,7 @@ def _corpus_months(dirname: str) -> set[str]:
 
 
 def test_era5_train_and_val_corpora_are_disjoint():
-    """Guard, not a split mechanism. The 2013-2022 / 2023 boundary already
-    exists on disk and Phase A keeps it; this catches a future
-    fetch_era5_global.py invocation landing overlapping months into both
-    directories, which would leak validation data into training with no other
-    visible symptom than a suspiciously good val curve."""
+    """The ERA5 train and val corpora share no months."""
     train = _corpus_months("era5_global_train")
     val = _corpus_months("era5_global_val")
     if not train or not val:

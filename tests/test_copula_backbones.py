@@ -1,28 +1,7 @@
-"""test_copula_backbones.py — the copula backbone-selection surface added by
-src/copula_inter/copula_backbones.py + src/copula_inter/model.py's ``cfg.model.backbone`` dispatch.
+"""Tests for the copula backbone choice (tabicl, tabldm): strip_decoder, build_copula_transformer, moe_aux_loss, LoRA, freezing, guardrails, recompute escalation and one loss/backward step.
 
-Covers, per backbone (tabicl: scratch, fast; tabldm: real pretrained load,
-same HF weights the marginal side already caches):
-  1. strip_decoder produces the expected feature_dim and an Identity decoder.
-  2. build_copula_transformer wires the backbone end-to-end (W/s shapes).
-  3. moe_aux_loss is None for tabicl, a grad-carrying scalar for tabldm, and
-     model.py's forward surfaces it in `out` only for tabldm.
-  4. LoRA (apply_lora) installs adapters on a tabldm backbone the same way
-     it already does for tabicl (see test_lora_tabldm_compat.py).
-  5. unfreeze_backbone=false freezes the tabldm trunk too.
-  6. Guardrails: an unknown backbone name raises; tabldm + tabicl.pretrained
-     =false raises (no from-scratch path exists for it).
-  7. The tabldm recompute=true escalation actually flips every discovered
-     `.recompute` submodule attribute.
-  8. A real _forward_and_loss/_run_train_step call on a tiny synthetic batch
-     backprops through a tabldm-backboned CopulaTabICL without error, with
-     the MoE aux term folded into the returned loss — the closest thing to
-     an actual training step this suite runs.
-
-The tabldm tests are real pretrained loads (network on first run, cached
-HF weights after — same convention as tests/test_lora_tabldm_compat.py and
-tests/test_tabldm_batched.py, no mocking), so they're the slow members of
-this file; kept in one module-scoped fixture to pay that cost once.
+The tabldm tests load the pretrained model (network on first run), once per
+module.
 """
 
 from __future__ import annotations
@@ -34,10 +13,6 @@ from omegaconf import OmegaConf
 
 from copula_inter import copula_backbones
 from copula_inter.model import build_copula_transformer
-
-# ---------------------------------------------------------------------------
-# tabicl (scratch, fast) — sanity that the refactor didn't change anything
-# ---------------------------------------------------------------------------
 
 
 def test_tabicl_strip_decoder(small_model_cfg):
@@ -54,8 +29,7 @@ def test_tabicl_moe_aux_loss_is_none(small_model_cfg):
 
 
 def test_build_copula_transformer_tabicl_default_backbone(small_model_cfg):
-    """model.backbone defaults to 'tabicl' when omitted — the explicit ask
-    that the pre-existing choice stays the default."""
+    """model.backbone defaults to "tabicl"."""
     assert "backbone" not in small_model_cfg.model
     model = build_copula_transformer(small_model_cfg)
     assert model.backbone_name == "tabicl"
@@ -69,11 +43,6 @@ def test_unknown_backbone_raises(small_model_cfg):
     cfg = OmegaConf.merge(small_model_cfg, {"model": {"backbone": "bogus"}})
     with pytest.raises(ValueError, match="Unknown cfg.model.backbone"):
         build_copula_transformer(cfg)
-
-
-# ---------------------------------------------------------------------------
-# tabldm (real pretrained load) — verifies the new backbone end to end
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -113,8 +82,7 @@ def test_tabldm_recompute_escalation(tabldm_cfg):
     assert len(flagged) > 0
     assert all(m.recompute is True for m in flagged)
 
-    # Default (recompute unset -> False) must NOT force these off -- see
-    # copula_backbones._load_tabldm's docstring: escalate-only semantics.
+    # Leaving recompute unset keeps the checkpoint's own settings.
     base_default = copula_backbones.load_raw_backbone("tabldm", tabldm_cfg)
     flagged_default = [m for m in base_default.modules() if hasattr(m, "recompute")]
     assert any(m.recompute for m in flagged_default), (
@@ -142,9 +110,7 @@ def test_tabldm_moe_aux_loss_present_and_carries_grad(tabldm_model):
     aux = out["moe_aux_loss"]
     assert aux.requires_grad
     aux.backward()
-    # The MoE routing loss lives entirely inside the backbone (it never
-    # passes through copula_head), so at least some backbone params should
-    # pick up a gradient from it alone.
+    # The MoE loss alone gives some backbone parameters a gradient.
     any_grad = any(p.grad is not None for p in tabldm_model.feature_extractor.parameters())
     assert any_grad, "moe_aux_loss did not reach any backbone parameter"
     tabldm_model.zero_grad(set_to_none=True)
@@ -182,23 +148,13 @@ def test_tabldm_lora_installs_adapters():
     assert all(p.requires_grad for p in model.copula_head.parameters())
 
 
-# ---------------------------------------------------------------------------
-# Full loss/backward step through train.py's own machinery
-# ---------------------------------------------------------------------------
-
-
 def test_tabldm_forward_and_loss_backprops(tabldm_model):
-    """The closest thing to an actual training step this suite runs: a real
-    _forward_and_loss call (train.py's own loss function) on a tabldm-backed
-    model, checking the MoE aux term is folded into the scalar loss and
-    backward() completes without error."""
+    """_forward_and_loss on a tabldm-backed model includes the MoE aux term and backpropagates."""
     from copula_inter.training_core import _forward_and_loss
 
     tabldm_model.train()
     batch = make_batch(B=2, P=4, N=2)
-    # y_space_nll additionally needs a marginal log-density per test
-    # instance -- arbitrary here (this test only checks the loss is finite
-    # and differentiable, not its value).
+    # Arbitrary marginal log-densities.
     batch["log_pdf_test"] = torch.randn(2, 2)
     out, Sigma, parts, loss, aux_mae = _forward_and_loss(
         model=tabldm_model,

@@ -1,18 +1,8 @@
-"""test_dataset_corr_nonneg.py — Verify R_star structure for non-negative kernels
-(rbf, matern32, rational_quadratic, periodic, dot_product).
+"""Structural checks of R_star for non-negative kernels (rbf, matern32, rational_quadratic, periodic, dot_product) in a dataset folder.
 
-Unlike cosine (oscillatory, tests/test_dataset_corr_uniform.py), these kernels have
-a non-negative prior: K(x1, x2) >= 0 everywhere. Posterior conditioning on training
-data pushes some entries negative (Simpson's-paradox-style explaining-away: two points
-both correlated with the training context can become negatively correlated once
-conditioned on it) — a total absence of negative entries would mean the training
-context isn't doing any conditioning at all. R_star should also be spread across
-[0, 1] rather than collapsed near 0 (no structure) or saturated near 1 (near-singular).
+    DATASET_DIR=<dataset>/pit pytest tests/test_dataset_corr_nonneg.py -v
 
-Run against a specific folder:
-    DATASET_DIR=./data/rbf-posterior-tuned/pit pytest tests/test_dataset_corr_nonneg.py -v
-
-The test is skipped when the folder does not exist or is empty.
+Skipped when the folder is missing or empty.
 """
 
 from __future__ import annotations
@@ -30,10 +20,6 @@ _DEFAULT_DIR = "./data/rbf-posterior-tuned/pit"
 def dataset_dir():
     return os.environ.get("DATASET_DIR", _DEFAULT_DIR)
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 _N_EPISODES = 500
 _SEED = 0
@@ -91,18 +77,8 @@ def min_eigenvalues(episode_data):
     return episode_data[1]
 
 
-# ---------------------------------------------------------------------------
-# Tests — correlation values
-# ---------------------------------------------------------------------------
-
-
 def test_correlations_have_negative_tail(off_diag):
-    """Posterior conditioning on a non-negative-prior kernel must produce some negative
-    entries (Simpson's-paradox-style explaining-away): two points both correlated with
-    the training context can become negatively correlated once conditioned on it. Zero
-    (or near-zero) negative entries means the posterior barely differs from the prior —
-    i.e. the training context isn't doing any conditioning at all.
-    """
+    """Some off-diagonal entries are negative."""
     neg_frac = (off_diag < -0.01).float().mean().item()
     assert neg_frac > 0.01, (
         f"Only {neg_frac:.1%} of entries are negative — posterior shows no explaining-away, "
@@ -117,7 +93,7 @@ def test_correlations_span_meaningful_range(off_diag):
 
 
 def test_correlations_not_saturated(off_diag):
-    """Off-diagonal values must not pile up near 1 — that means posterior is near-singular."""
+    """Off-diagonal values do not pile up near 1."""
     frac_sat = (off_diag > 0.9).float().mean().item()
     assert frac_sat < 0.05, f"{frac_sat:.1%} of entries > 0.9 — matrices look saturated near 1"
 
@@ -150,13 +126,8 @@ def test_unit_diagonal(dataset_dir):
         )
 
 
-# ---------------------------------------------------------------------------
-# Tests — numerical conditioning (latent=False guarantee)
-# ---------------------------------------------------------------------------
-
-
 def test_r_star_well_conditioned(min_eigenvalues):
-    """All R_star matrices must have minimum eigenvalue >= 0.001 (see test_dataset_corr_uniform.py)."""
+    """Every R_star has minimum eigenvalue >= 1e-3."""
     bad = [v for v in min_eigenvalues if v < 0.001]
     assert len(bad) == 0, (
         f"{len(bad)}/{len(min_eigenvalues)} episodes have min_eig < 0.001; "

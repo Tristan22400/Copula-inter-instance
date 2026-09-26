@@ -1,16 +1,4 @@
-"""test_adaptive_kernel_sampling.py — Regression tests for
-training.adaptive_kernel_sampling: the DoReMi/GroupDRO-style
-exponentiated-gradient reweighting of live-generation kernel-family sampling
-(train.py::_update_adaptive_kernel_weights, data_gen.py's
-_sample_kernel_chain_structure/_resolve_kernel_name kernel_weights param).
-
-Two things matter here: (1) the pure weight-update function biases toward
-worse-fit families as intended, respects the anti-starvation floor, and
-degrades gracefully on missing/NaN signal; (2) kernel_weights=None (every
-existing call site, and every family without a probe) reproduces today's
-uniform random.choices/random.choice behavior exactly — this feature must be
-a no-op unless explicitly opted into.
-"""
+"""Tests for adaptive kernel-family sampling: the weight update (_update_adaptive_kernel_weights) and weighted chain sampling (kernel_weights=None is uniform)."""
 
 from __future__ import annotations
 
@@ -27,11 +15,6 @@ def _uniform_weights() -> torch.Tensor:
     return torch.full((n,), 1.0 / n, dtype=torch.float32)
 
 
-# ---------------------------------------------------------------------------
-# _update_adaptive_kernel_weights
-# ---------------------------------------------------------------------------
-
-
 def test_update_weights_sums_to_one():
     prev = _uniform_weights()
     metrics = {
@@ -43,8 +26,7 @@ def test_update_weights_sums_to_one():
 
 
 def test_update_weights_biases_toward_worse_family():
-    """rbf has a much bigger posterior gap (0.45) than matern32 (0.05) ->
-    rbf should end up with strictly more weight."""
+    """A family with a larger gap gains more weight."""
     prev = _uniform_weights()
     metrics = {
         "oracle_diag/kernel_fit/rbf/gap_nll": 0.45,
@@ -58,9 +40,7 @@ def test_update_weights_biases_toward_worse_family():
 
 
 def test_update_weights_respects_floor():
-    """A family with a catastrophically negative gap (looks perfect, better
-    than the posterior ceiling) must not be driven below floor/N --
-    anti-starvation."""
+    """No family drops below floor / n_families."""
     n = len(_COMPOSABLE_KERNELS)
     prev = _uniform_weights()
     metrics = {
@@ -73,8 +53,7 @@ def test_update_weights_respects_floor():
 
 
 def test_update_weights_missing_or_nan_signal_is_neutral():
-    """Families absent from metrics (no probe) or reporting NaN get gap=0 —
-    no directional pressure, only the floor's pull toward uniform."""
+    """Missing or NaN gaps count as 0."""
     prev = _uniform_weights()
     metrics = {
         "oracle_diag/kernel_fit/rbf/gap_nll": float("nan"),
@@ -95,10 +74,7 @@ def test_update_weights_extreme_gap_does_not_overflow():
 
 
 def test_update_weights_ignores_excluded_family_gap():
-    """A family in `exclude` must not move off-uniform even with a huge
-    posterior gap and a probe present -- it's never in _sample_kernel_chain_
-    structure's post-exclude pool, so letting its weight track performance
-    is pure noise (see composite_exclude_kernels docs in gp_tasks.yaml)."""
+    """An excluded family stays uniform whatever its gap."""
     prev = _uniform_weights()
     metrics = {
         "oracle_diag/kernel_fit/periodic/gap_nll": 100.0,
@@ -111,21 +87,13 @@ def test_update_weights_ignores_excluded_family_gap():
         prev, metrics, lr=1.0, floor=0.05, exclude=None
     )
     i_periodic = _COMPOSABLE_KERNELS.index("periodic")
-    # Excluding periodic's gap keeps its weight far below what the same huge
-    # gap would otherwise drive it to.
+    # Excluded: periodic stays far below what its gap would give.
     assert out_excluded[i_periodic] < out_included[i_periodic]
     assert torch.isclose(out_excluded.sum(), torch.tensor(1.0), atol=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# signal="tabicl" (training.adaptive_kernel_signal)
-# ---------------------------------------------------------------------------
-
-
 def test_signal_tabicl_uses_tabicl_gap_not_oracle_gap():
-    """With signal='tabicl', a family whose oracle gap is small but whose
-    TabICL-marginal gap is large must still gain weight -- the tabicl key,
-    not the oracle_diag one, drives the update."""
+    """signal="tabicl" uses gap_nll_tabicl."""
     prev = _uniform_weights()
     metrics = {
         "oracle_diag/kernel_fit/rbf/gap_nll": 0.01,       # tiny under the oracle marginal
@@ -143,10 +111,7 @@ def test_signal_tabicl_uses_tabicl_gap_not_oracle_gap():
 
 
 def test_signal_tabicl_falls_back_to_oracle_gap_when_missing():
-    """A family with no kernel_fit/<family>/gap_nll_tabicl (e.g. no PIT
-    checkpoint configured this run) must fall back to its oracle_diag gap
-    instead of silently getting gap=0 -- signal='tabicl' shouldn't disable
-    the curriculum entirely just because the tabicl cache is empty."""
+    """signal="tabicl" falls back to the oracle gap where gap_nll_tabicl is missing."""
     prev = _uniform_weights()
     metrics_tabicl_missing = {
         "oracle_diag/kernel_fit/rbf/gap_nll": 0.45,
@@ -162,8 +127,7 @@ def test_signal_tabicl_falls_back_to_oracle_gap_when_missing():
 
 
 def test_signal_default_is_oracle():
-    """The `signal` kwarg defaults to 'oracle' -- unchanged behavior for
-    every existing call site that doesn't pass it explicitly."""
+    """signal defaults to "oracle"."""
     prev = _uniform_weights()
     metrics = {
         "oracle_diag/kernel_fit/rbf/gap_nll": 0.4,
@@ -174,11 +138,6 @@ def test_signal_default_is_oracle():
         prev, metrics, lr=1.0, floor=0.05, signal="oracle"
     )
     assert torch.equal(out_default, out_explicit_oracle)
-
-
-# ---------------------------------------------------------------------------
-# _sample_kernel_chain_structure weighting + no-op default
-# ---------------------------------------------------------------------------
 
 
 def _base_cfg(**data_overrides):
@@ -211,8 +170,7 @@ def test_sample_kernel_chain_skewed_weights_shift_frequency():
     for _ in range(500):
         names, _, _ = _sample_kernel_chain_structure(cfg, kernel_weights=weights)
         counts[names[0]] += 1
-    # With m pinned to 1, names[0] is the only draw per call -> the
-    # overwhelmingly-favored family should dominate the empirical frequency.
+    # With m=1 the favoured family dominates.
     assert counts[target] > 400
 
 

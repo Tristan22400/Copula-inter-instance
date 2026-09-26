@@ -1,17 +1,4 @@
-"""test_sample_copula_residual_fields.py — regression coverage for
-eval/spatial/diagnostics.py::sample_copula_residual_fields (the batched
-y-space sampler behind sweep_core.py::run_real_config's model_r2/shape_corr
-fix) and predict_copula_residual_field (now a thin K=1 wrapper around it).
-
-Exercises the tabicl_marginal=None (naive Gaussian fallback) path only —
-fast, deterministic, no network/model download. The tabicl_marginal-given
-path (the real TabICL QuantileDistribution.icdf, whose (*batch_shape, n)
-argument contract is stricter than torch.distributions.Normal's ordinary
-broadcasting, and does NOT match the FakeTabICL fixture other test files use
-for pit.py::run_pit) was verified manually against the real pretrained
-checkpoint instead of committed here as a fast unit test — see the PR/commit
-description.
-"""
+"""Tests for diagnostics.sample_copula_residual_fields and predict_copula_residual_field (Gaussian fallback marginal only)."""
 
 from __future__ import annotations
 
@@ -61,10 +48,7 @@ def test_batched_shape(toy_task):
 
 
 def test_batched_matches_single_sample_rowwise(toy_task):
-    """Each row of a K-sample batch must equal what
-    predict_copula_residual_field returns for that same z row — batching
-    must not change per-sample values, only amortize the (real-marginal-
-    only) forward pass across them."""
+    """Each row of a K-sample batch equals predict_copula_residual_field for that z."""
     K = 5
     z_batch = toy_task["rng"].standard_normal((K, toy_task["D"]))
     batch = sample_copula_residual_fields(
@@ -80,13 +64,7 @@ def test_batched_matches_single_sample_rowwise(toy_task):
 
 
 def test_naive_fallback_is_affine_in_z(toy_task):
-    """tabicl_marginal=None's naive fallback is y = y_mean + y_std * z_copula
-    -- a single shared (scalar) affine map applied identically to every
-    grid point, so the resulting SAMPLES' empirical correlation should
-    recover R_context (up to Monte Carlo noise) exactly like the z-space
-    correlation would, which is the whole point of the y-space fix relying
-    on many pooled draws (see run_real_config's N_YSPACE_MC_SAMPLES) rather
-    than a single sample."""
+    """With the Gaussian fallback, the pooled samples' correlation recovers R_context."""
     rng = np.random.default_rng(1)
     K = 4000  # enough draws for a stable empirical correlation at D=8
     z_batch = rng.standard_normal((K, toy_task["D"]))

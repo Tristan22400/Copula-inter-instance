@@ -17,24 +17,10 @@ from conftest import make_batch
 
 from copula_inter.model import build_copula_transformer, low_rank_correlation
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 
 @pytest.fixture(scope="module")
 def model_and_cfg(small_model_cfg):
-    """A scratch CopulaTabICL, warm-started with one optimizer step.
-
-    TabICL's attention/FF output projections are zero-initialized (a
-    ReZero-style stability trick, see tabicl_upstream _model/layers.py
-    MultiheadAttentionBlock.init_weights), so a freshly-constructed model is
-    an exact identity map: every attention block collapses to its residual
-    input, and row/test representations come out identical regardless of
-    per-row content. One dummy gradient step moves the projections off of
-    that degenerate fixed point so the structural properties below actually
-    probe the architecture instead of a constant function.
-    """
+    """Scratch CopulaTabICL after one optimizer step (a fresh model is an identity map: TabICL zero-initializes its output projections)."""
     torch.manual_seed(0)
     model = build_copula_transformer(small_model_cfg)
     model.train()  # eval() would route through TabICL's inference manager,
@@ -50,11 +36,6 @@ def model_and_cfg(small_model_cfg):
     opt.zero_grad()
 
     return model, small_model_cfg
-
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
 
 
 def permute_test(batch: dict, perm: list) -> dict:
@@ -75,11 +56,6 @@ def permute_train(batch: dict, perm: list) -> dict:
     return b
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
 def test_output_shape(model_and_cfg):
     model, cfg = model_and_cfg
     B, P, N = 2, 10, 5
@@ -96,8 +72,7 @@ def test_output_shape(model_and_cfg):
 
 
 def test_correlation_unit_diagonal(model_and_cfg):
-    """low_rank_correlation(W, s) must have Sigma_ii == 1 exactly (jitter is
-    renormalized back out -- see model._renormalize_to_unit_diagonal)."""
+    """low_rank_correlation(W, s) has an exactly unit diagonal."""
     model, _ = model_and_cfg
     batch = make_batch(B=2, P=10, N=5)
     with torch.no_grad():

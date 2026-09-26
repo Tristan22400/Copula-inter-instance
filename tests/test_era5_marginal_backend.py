@@ -1,18 +1,4 @@
-"""test_era5_marginal_backend.py — the real-ERA5 finetune path's marginal
-backend selection (era5_live_dataset.py::_resolve_marginal) and its PIT
-dispatch (_pit_group / _pit_episode).
-
-Before this, the ERA5 path was structurally TabICL-only: _pit_group called
-pit.py::run_pit_batched directly, so data.z_train_source had no effect there
-at all -- an ERA5 finetune launched with z_train_source=exaone silently
-trained against TabICL's marginal instead. These tests pin down both halves
-of the fix: that the knob is READ (and that TabICL-ish values still mean
-TabICL), and that a selected backend actually reaches the PIT.
-
-The corpus-dependent parts of the module are not exercised here -- these
-call the PIT helpers directly with synthetic tensors, so no ERA5 download
-is needed.
-"""
+"""Tests for the ERA5 path's marginal selection (_resolve_marginal) and PIT dispatch (_pit_group, _pit_episode), on synthetic tensors."""
 
 from __future__ import annotations
 
@@ -50,9 +36,7 @@ def test_resolve_marginal_reads_probs_n():
 
 
 def test_resolve_marginal_rejects_typo():
-    """The z_train_source typo class that silently no-opped the synthetic
-    path (see tests/test_z_train_source_validation.py) must not be able to
-    silently no-op this one either."""
+    """_resolve_marginal rejects unknown z_train_source values."""
     from copula_inter.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": "tabicl-split"}})
@@ -62,8 +46,7 @@ def test_resolve_marginal_rejects_typo():
 
 @pytest.mark.parametrize("backend", ["tabldm"])
 def test_pit_group_and_episode_agree_under_backend(backend):
-    """A selected backend reaches the PIT, and the grouped path agrees with
-    the single-episode one it shares a batched module with."""
+    """A backend reaches the PIT, and the grouped and single-episode paths agree."""
     pytest.importorskip(backend, reason=f"{backend} not installed")
     from copula_inter.era5_live_dataset import _pit_episode, _pit_group
     from eval.spatial.marginal_backends import make_regressor

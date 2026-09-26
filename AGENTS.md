@@ -1,20 +1,32 @@
 # Repository map
 
-- `src/copula_inter/data_gen.py`: GP kernels and raw episode sampling;
-  `src/copula_inter/feature_transforms.py`: input and hidden feature warps; `src/copula_inter/pit.py`:
-  PIT conversion; `src/copula_inter/episode_contracts.py`: raw/PIT/padded shapes and boundary
-  checks; `src/copula_inter/dataset.py` and `src/copula_inter/generate_pit_dataset.py`: on-disk episodes,
-  shard loading, and manifests.
-- `src/copula_inter/training_core.py`: schedule, loss, and optimizer step shared by training
-  entrypoints; `src/copula_inter/train.py`: training orchestration and checkpointing.
-- `src/copula_inter/backend_registry.py`: supported marginal and copula backbones and
-  their capabilities. Add a backend here, then implement its adapter under
-  `eval/spatial/` or `src/` and run the relevant backend tests.
-- `eval/runners/eval_checkpoint.py`: evaluation CLI and orchestration;
-  `eval/baselines/classical.py`: fitted baselines and their cache;
-  `eval/results.py`: result summaries and coverage rules.
-- `conf/`: Hydra configuration; `tests/`: focused CPU and optional integration
-  tests; `.github/workflows/ci.yml`: fast CPU gate.
+Code lives in the `copula_inter` package (`src/copula_inter/`); run entry points
+as `python -m copula_inter.<module>` with the checkout on `PYTHONPATH`
+(`source scripts/_env.sh`) or from its own `uv` venv. Nothing edits `sys.path`.
+
+- `data_gen.py`: GP kernels and episode sampling; `feature_transforms.py`: input
+  and hidden feature warps; `pit.py`: PIT conversion; `episode_contracts.py`:
+  episode shapes and boundary checks; `dataset.py`, `generate_pit_dataset.py`,
+  `dataset_manifest.py`: on-disk episodes, shards and manifests;
+  `live_dataset.py`, `era5_live_dataset.py`: live GP / ERA5 training data.
+- `model.py`, `copula_backbones.py`, `correlation_factory.py`: the copula model;
+  `loss.py`: NLLs and metrics.
+- `train.py`: `main()` (setup phases, then the training loop);
+  `training_core.py`: schedule, loss and optimizer step; `validation.py`:
+  `validate()`; `probe_batches.py`, `era5_probes.py`: fixed validation probes;
+  `adaptive_sampling.py`: kernel weights and TabICL mix; `checkpointing.py`.
+- `finetune_marginal.py`, `marginal_backbones.py`, `lora.py`: Phase-A marginal
+  fine-tuning.
+- `backend_registry.py`: supported marginal and copula backbones and their
+  capabilities. Add a backend here, then implement its adapter under
+  `eval/spatial/` or `src/copula_inter/` and run the relevant backend tests.
+- `eval/runners/eval_checkpoint.py`: evaluation CLI (`run_evaluation`);
+  `eval/baselines/classical.py`: baseline fits and their cache;
+  `eval/baselines/prefit.py`: parallel prefit and CV best-baseline;
+  `eval/runners/eval_tables.py`: printed tables; `eval/results.py`: summaries.
+- `conf/`: Hydra configuration; `scripts/`: OAR job scripts (`_env.sh` holds the
+  shared setup); `tests/`: CPU and optional integration tests;
+  `.github/workflows/ci.yml`: fast CPU gate.
 
 Use Python 3.12 and `uv sync --locked --extra dev --extra cpu` for CPU work.
 Run the focused tests

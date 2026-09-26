@@ -1,25 +1,8 @@
-"""test_model_config_presets.py — Verify the conf/model/*.yaml experiment presets.
+"""Tests composing the conf/model presets through Hydra.
 
-conf/model/copula_prod.yaml and conf/model/copula_nano.yaml each use Hydra
-`@package _global_` packaging to set both `model.*` (the copula head) and
-`tabicl.*` (the backbone) from a single file (see conf/config.yaml's
-defaults list). These tests compose the presets through real Hydra (not a
-hand-rolled dict, unlike conftest.py's small_model_cfg) so a typo or renamed
-key in either yaml file fails here instead of silently falling back to a
-default deep inside model.py.
-
-Tests verify:
-  1. copula_prod resolves to the pretrained backbone's expected schema.
-     Model construction itself is not exercised here — pretrained=true
-     downloads a checkpoint from HuggingFace (see model.py's
-     _load_pretrained_tabicl), which other tests avoid with a FakeTabICL
-     stand-in (test_tabicl_z_diagnostic.py, test_reliability_diagram.py).
-  2. copula_nano resolves to the from-scratch, width+depth-shrunk backbone,
-     and still opts into the z_train diagnostic via its own pit_ckpt knob
-     (see pit.py::resolve_pit_ckpt) despite training from scratch.
-  3. copula_nano is small enough to actually build + forward on CPU, so it
-     also exercises the real build_copula_transformer(cfg) codepath end to
-     end and checks the same structural properties as test_model.py.
+  1. copula_prod resolves to the pretrained backbone settings.
+  2. copula_nano resolves to the shrunk from-scratch backbone with a pit_ckpt.
+  3. copula_nano builds and runs a forward on CPU (per parametrization too).
 """
 
 from __future__ import annotations
@@ -49,34 +32,26 @@ def test_copula_prod_resolves_pretrained_backbone():
     assert cfg.tabicl.ckpt  # non-empty HF checkpoint name; not downloaded here
     assert cfg.tabicl.pit_k_folds == 10
     assert cfg.model.correlation_parametrization == "covnorm"
-    # z_train diagnostic (_resolve_pit_ckpt) falls back to the backbone's own
-    # pretrained checkpoint here -- no pit_ckpt override needed.
+    # No pit_ckpt: resolve_pit_ckpt uses tabicl.ckpt.
     assert _resolve_pit_ckpt(cfg) == cfg.tabicl.ckpt
 
 
 def test_copula_nano_resolves_scratch_backbone():
     cfg = _compose("copula_nano")
     assert cfg.tabicl.pretrained is False
-    # width+depth ablation vs. the pretrained checkpoint (128/3/3/12) --
-    # catches accidentally reverting conf/model/copula_nano.yaml's shrink.
+    # Shrunk width and depth.
     assert cfg.tabicl.arch.embed_dim == 32
     assert cfg.tabicl.arch.col_num_blocks == 1
     assert cfg.tabicl.arch.row_num_blocks == 1
     assert cfg.tabicl.arch.icl_num_blocks == 2
-    # Despite the from-scratch backbone, the z_train diagnostic still opts in
-    # via its own pit_ckpt knob (see _resolve_pit_ckpt in train.py) rather
-    # than being silently skipped because tabicl.pretrained is false.
+    # The scratch backbone still has a PIT marginal via pit_ckpt.
     assert cfg.tabicl.pit_ckpt
     assert _resolve_pit_ckpt(cfg) == cfg.tabicl.pit_ckpt
     assert cfg.model.correlation_parametrization == "covnorm"
 
 
 def test_copula_nano_builds_and_runs_forward():
-    """copula_nano is small enough to actually instantiate + forward on CPU --
-    exercises the real build_copula_transformer(cfg) codepath (not the
-    hand-rolled small_model_cfg fixture used by test_model.py), so it would
-    catch config/model.py drift the resolution-only test above cannot.
-    """
+    """copula_nano builds via build_copula_transformer and runs a CPU forward."""
     cfg = _compose("copula_nano")
     torch.manual_seed(0)
     model = build_copula_transformer(cfg)
@@ -121,13 +96,7 @@ def test_copula_head_accepts_half_precision_backbone_features():
     "parametrization", ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
 )
 def test_copula_nano_builds_and_runs_forward_per_parametrization(parametrization):
-    """Same CPU build+forward smoke test as
-    test_copula_nano_builds_and_runs_forward, swept over every
-    correlation_parametrization value — catches head-width / missing-key
-    mistakes (e.g. tanhnorm's copula_head having no trailing scalar column,
-    sparse_covnorm's extra learned lambda) before they reach a real
-    oarsub training job.
-    """
+    """copula_nano builds and runs for every correlation_parametrization."""
     cfg = _compose("copula_nano")
     cfg.model.correlation_parametrization = parametrization
     torch.manual_seed(0)

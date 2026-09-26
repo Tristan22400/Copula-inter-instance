@@ -1,21 +1,4 @@
-"""test_lora_tabldm_compat.py — the assumption that lets Phase-A tier >= 1
-(LoRA) work on a Xiaomi-TabLDM backbone as well as a TabICL one.
-
-src/copula_inter/lora.py's LoRAMultiheadAttention is written against TabICL's
-MultiheadAttention internals (in_proj_weight as one raw 3D x D Parameter,
-tabicl's own multi_head_attention_forward, its rope/kv-cache types). TabLDM
-forks that stack verbatim, so the adapter is a legitimate drop-in there --
-but "verbatim" is an empirical fact about tabldm 0.1.0, not a guarantee.
-These tests pin it down, so an upstream divergence fails HERE with an
-obvious message rather than silently installing adapters whose forward no
-longer matches the module they replaced.
-
-_get_mha_class returns both classes as a tuple for exactly this reason: the
-two are source-identical but distinct class OBJECTS, so the original
-`isinstance(child, tabicl_MHA)` matched nothing on a TabLDM backbone and
-apply_lora raised "found 0 MultiheadAttention modules" -- tier >= 1 was
-unreachable for TabLDM for that reason alone.
-"""
+"""Tests that TabLDM's attention stack is source-identical to TabICL's, so LoRAMultiheadAttention applies to TabLDM backbones."""
 
 from __future__ import annotations
 
@@ -37,8 +20,7 @@ pytest.importorskip("tabldm", reason="Xiaomi-TabLDM not installed")
     ],
 )
 def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path, symbol):
-    """If any of these diverge, LoRAMultiheadAttention is no longer a valid
-    drop-in for TabLDM and _get_mha_class must stop claiming it is."""
+    """TabLDM's attention classes and functions have the same source as TabICL's."""
     import importlib
 
     tabicl_sym = getattr(importlib.import_module(f"tabicl.{module_path}"), symbol)
@@ -64,8 +46,7 @@ def test_get_mha_class_includes_both():
 
 
 def test_apply_lora_installs_adapters_on_a_tabldm_backbone():
-    """The end the compatibility argument exists for: adapters actually get
-    installed, and only on the requested stage."""
+    """apply_lora installs adapters on a TabLDM backbone, only on the requested stage."""
     import numpy as np
     from tabldm import TabLDMRegressor
 

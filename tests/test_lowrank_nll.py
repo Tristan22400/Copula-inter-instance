@@ -1,10 +1,4 @@
-"""Low-rank (Matrix Determinant Lemma + Woodbury) y_space_nll vs the dense path.
-
-model.low_rank_correlation_factor must describe the SAME Σ as
-model.low_rank_correlation, and loss.y_space_nll must return the same
-values and gradients whether it is handed that Σ dense (O(N³) Cholesky) or
-factored (O(N r²)).
-"""
+"""Low-rank (Matrix Determinant Lemma + Woodbury) y_space_nll vs the dense path: same Sigma, values and gradients."""
 
 
 import pytest
@@ -18,11 +12,7 @@ PARAMS = ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
 
 
 def _exact_copula_nll(Sigma, z, mask):
-    """Jitter-free float64 reference: slogdet + solve per episode.
-
-    y_space_nll's dense path is NOT exact -- _safe_cholesky always adds 1e-6
-    to Σ, which moves the NLL by ~1e-6/min(D) (1% when D ~ jitter = 1e-4).
-    """
+    """Jitter-free float64 reference (slogdet + solve per episode)."""
     vals = []
     for b in range(Sigma.shape[0]):
         n = int(mask[b].sum())
@@ -85,9 +75,7 @@ def test_lowrank_nll_gradients_match_dense():
 
 
 def test_lowrank_nll_fp32_near_singular():
-    """Training runs the loss in fp32. With softplus(s) → 0 the diagonal of
-    Σ is ~jitter and the Woodbury terms cancel catastrophically; the float64
-    internals must still match a float64 dense reference."""
+    """fp32 inputs with a ~jitter diagonal still match a float64 dense reference."""
     W, s, _, z, log_pdf, mask = _inputs(N=60, r=4, seed=2)
     s = torch.full_like(s, -30.0)  # softplus ≈ 1e-13: Σ ≈ rank-4 + 1e-4 I
     ref = _exact_copula_nll(low_rank_correlation(W, s, jitter=1e-4), z, mask)

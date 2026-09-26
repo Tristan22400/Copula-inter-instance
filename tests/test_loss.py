@@ -15,10 +15,6 @@ import torch
 
 from copula_inter.loss import _safe_cholesky, copula_nll, oracle_copula_nll
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def make_w_and_z(B: int = 4, N: int = 10, rank: int = 2, seed: int = 0):
     torch.manual_seed(seed)
@@ -32,11 +28,6 @@ def make_w_and_z(B: int = 4, N: int = 10, rank: int = 2, seed: int = 0):
 def make_identity_w(B: int, N: int, rank: int):
     """W_tilde with eps=1 and W=0 gives R_eps = I + 0 = I (independence)."""
     return torch.zeros(B, N, rank + 1)
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 def test_copula_nll_is_finite():
@@ -123,9 +114,7 @@ def test_oracle_le_independence_on_average():
 
     mean_oracle = sum(oracle_losses) / len(oracle_losses)
     mean_indep = sum(pred_losses) / len(pred_losses)
-    # Oracle should generally be lower (oracle < independence when R ≠ I)
-    # This is not guaranteed for every single case, only in expectation
-    # (when R is actually correlated, oracle does better)
+    # Oracle beats independence in expectation, not in every case.
     assert mean_oracle < mean_indep + 1.0, (
         f"Oracle ({mean_oracle:.4f}) should be better than or comparable to "
         f"independence ({mean_indep:.4f}) on average"
@@ -173,11 +162,7 @@ def test_copula_nll_smaller_for_better_w():
 
 
 def test_woodbury_matches_direct_cholesky():
-    """copula_nll via Woodbury should match oracle_copula_nll when R=W_tilde@W_tilde^T+eps*I.
-
-    Use eps=0.5 to keep the matrix well-conditioned and avoid numerical drift
-    from the large ratio (1/eps) in the capacitance matrix.
-    """
+    """copula_nll (Woodbury) matches oracle_copula_nll for R = W W^T + eps I (eps=0.5 keeps it well-conditioned)."""
     torch.manual_seed(7)
     B, N, rank = 1, 8, 3
     # Use a moderate eps so R_eps is well-conditioned (min eigenvalue = eps, max ≈ eps+r+1)

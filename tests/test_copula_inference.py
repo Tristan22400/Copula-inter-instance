@@ -1,12 +1,4 @@
-"""
-test_copula_inference.py — unit tests for inference/copula_inference.py.
-
-No live checkpoints or network access required: the PIT/interpolation math is
-exercised via ``tabicl_upstream``'s own ``QuantileDistribution`` fed a
-hand-built exact quantile grid (not a real TabICL forward pass), and
-``get_test_correlation``'s post-processing is exercised via a tiny fake
-copula model rather than a real ``CopulaTabICL``.
-"""
+"""Tests for inference/copula_inference.py with hand-built quantile grids and a fake copula model."""
 
 from __future__ import annotations
 
@@ -30,10 +22,6 @@ from inference.copula_inference import (  # noqa: E402
 )
 from copula_inter.model import low_rank_correlation  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# PIT / interpolation sanity check (hand-built quantile grid, no live model)
-# ---------------------------------------------------------------------------
-
 
 def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path):
     """A checkpoint directory selects the last numerical training snapshot."""
@@ -54,9 +42,7 @@ def test_resolve_copula_checkpoint_file_is_unchanged(tmp_path):
 
 
 def test_pit_recovers_standard_normal_from_exact_quantile_grid():
-    """QuantileDistribution.cdf + probit on an EXACT Gaussian quantile grid
-    should recover ~N(0,1) Z-values — this is exactly the math loo_pit /
-    get_marginal_quantiles rely on internally."""
+    """cdf + probit on an exact Gaussian quantile grid recovers ~N(0, 1)."""
     rng = np.random.default_rng(0)
     probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
     mu, sigma = 2.0, 1.5
@@ -78,8 +64,7 @@ def test_pit_recovers_standard_normal_from_exact_quantile_grid():
 
 
 def test_pit_recovers_standard_normal_from_skewnorm_grid():
-    """Same check with a skew-normal marginal, to make sure the recovery
-    isn't an artifact of the Gaussian case being trivial."""
+    """Same with a skew-normal marginal."""
     from scipy.stats import skewnorm
 
     rng = np.random.default_rng(1)
@@ -100,11 +85,6 @@ def test_pit_recovers_standard_normal_from_skewnorm_grid():
 
     assert abs(z.mean()) < 0.15
     assert abs(z.std() - 1.0) < 0.15
-
-
-# ---------------------------------------------------------------------------
-# sample_trajectories
-# ---------------------------------------------------------------------------
 
 
 def _standard_normal_grid(n_test: int, probs: np.ndarray) -> np.ndarray:
@@ -152,8 +132,7 @@ def test_sample_trajectories_clip_diagnostic_flags_narrow_grid():
     n_test = 3
     R = np.eye(n_test)
 
-    # Narrow grid: most standard-normal draws map to probabilities outside
-    # the grid's support and must be clipped.
+    # Narrow grid: most probabilities are clipped.
     probs_narrow = np.linspace(0.3, 0.7, 50)
     grid_narrow = np.tile(np.linspace(-0.5, 0.5, 50), (n_test, 1))
     _, n_clipped_narrow = sample_trajectories(
@@ -171,15 +150,8 @@ def test_sample_trajectories_clip_diagnostic_flags_narrow_grid():
     assert n_clipped_wide < n_clipped_narrow
 
 
-# ---------------------------------------------------------------------------
-# get_test_correlation post-processing (symmetrize + unit diagonal)
-# ---------------------------------------------------------------------------
-
-
 class _FakeCopulaModel(torch.nn.Module):
-    """Stands in for CopulaTabICL: forward(batch) -> {"W": ..., "s": ...},
-    ignoring the batch contents entirely, so we can test get_test_correlation's
-    post-processing (symmetrize + force unit diagonal) without a real model."""
+    """Stands in for CopulaTabICL: forward(batch) -> {"W", "s"}, ignoring the batch."""
 
     def __init__(self, W: torch.Tensor, s: torch.Tensor):
         super().__init__()
@@ -211,9 +183,7 @@ def test_get_test_correlation_is_symmetric_and_unit_diagonal():
 
 
 def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing():
-    """Sanity-check that get_test_correlation is really just
-    low_rank_correlation + symmetrize + force-unit-diagonal, not some other
-    computation."""
+    """get_test_correlation is low_rank_correlation plus symmetrization and a unit diagonal."""
     torch.manual_seed(1)
     n_test, rank = 5, 3
     W = torch.randn(1, n_test, rank) * 0.5
@@ -248,11 +218,7 @@ def test_normalize_features_gives_zero_mean_unit_std_jointly_over_train_and_test
 
 
 def test_normalize_features_uses_joint_not_train_only_statistics():
-    """A train subset with a narrower range than the full test grid must be
-    standardized using the COMBINED train+test mean/std (matching
-    data_gen.py's convention), not train-only statistics — otherwise train
-    and test wouldn't share a common scale the way they do at training
-    time."""
+    """normalize_features uses the joint train+test mean and std."""
     X_test = np.linspace(0.0, 1.0, 50).reshape(-1, 1)
     X_train = X_test[:5]  # narrow, non-representative subset
 

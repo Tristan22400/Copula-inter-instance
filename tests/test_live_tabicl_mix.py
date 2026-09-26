@@ -1,33 +1,13 @@
-"""
-test_live_tabicl_mix.py — Tests for the adaptive real-TabICL z_train mixing
-feature (data.z_train_tabicl_mix_* in conf/data/gp_tasks.yaml):
-data_gen.py::_tabicl_mix_prob_for_kernel/_generate_gp_batch_raw's
-tabicl_mix_weights gate, and train.py::_tabicl_gap_to_mix_frac.
+"""Tests for the per-kernel-family TabICL z_train mix (data.z_train_tabicl_mix_*).
 
-Unlike z_train_source=tabicl/tabicl_split (test_pit_batched.py), which
-substitutes real TabICL z_train for EVERY episode of the whole run, this
-feature substitutes it for a per-kernel-family FRACTION of live-generation
-calls, driven by the measured TabICL-vs-analytic z_train gap for that
-family. Tests verify:
-  1. tabicl_mix_weights=None reproduces the legacy always-on override
-     exactly (_tabicl_mix_prob_for_kernel returns 1.0 unconditionally).
-  2. All-zero mixing weights are an exact no-op vs. tabicl_model=None (pure
-     analytic z_train), for every episode in a call.
-  3. All-one mixing weights reproduce the legacy always-on override exactly
-     (byte-for-byte, since tabicl_mix_weights=None short-circuits to the
-     same apply_tabicl=True decision without ever calling random.random()).
-  4. Over many independent single-episode calls, the empirical hit rate for
-     a single-family weight matches the configured fraction.
-  5. Composite/chain kernel names route through the MAX weight across their
-     component families (_tabicl_mix_prob_for_kernel's "weakest link"
-     rule), not e.g. the mean.
-  6. corrupt_z_train is skipped when a call's z_train came from the mixing
-     gate, but still applies (unchanged) to analytic-sourced calls and to
-     the legacy always-on path (tabicl_mix_weights=None).
-  7. train.py::_tabicl_gap_to_mix_frac's gap-to-fraction mapping: linear
-     interpolation between floor/max over the measured range, floor for
-     unmeasured families, and the degenerate (too few families / zero
-     spread) fallback to a uniform floor.
+  1. tabicl_mix_weights=None always applies the override.
+  2. All-zero weights equal tabicl_model=None.
+  3. All-one weights equal the always-on override exactly.
+  4. A single-family weight gives the configured hit rate.
+  5. Composite kernels use their components' maximum weight.
+  6. corrupt_z_train is skipped only for mix-sourced z_train.
+  7. _tabicl_gap_to_mix_frac: linear between floor and max, floor for
+     unmeasured families and for degenerate gaps.
 """
 
 from __future__ import annotations
@@ -60,8 +40,7 @@ def test_tabicl_mix_prob_for_kernel_bare_family():
 
 
 def test_tabicl_mix_prob_for_kernel_composite_uses_max():
-    # "weakest link": the harder-to-approximate component (periodic, 0.8)
-    # dominates over the easier one (rbf, 0.2), not their mean (0.5).
+    # Maximum component weight (periodic 0.8), not the mean.
     w = _mix_weights(rbf=0.2, periodic=0.8)
     assert abs(_tabicl_mix_prob_for_kernel("rbf*periodic", w) - 0.8) < 1e-6
     assert abs(_tabicl_mix_prob_for_kernel("rbf+periodic", w) - 0.8) < 1e-6
@@ -142,9 +121,7 @@ def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg):
     one_w = torch.ones(len(_COMPOSABLE_KERNELS))
     zero_w = torch.zeros(len(_COMPOSABLE_KERNELS))
 
-    # Mixing hit (weight=1): z_train is the real TabICL PIT, uncorrupted --
-    # must differ from a corrupted analytic run but match the uncorrupted
-    # TabICL override exactly.
+    # Mix hit: TabICL z_train, not corrupted.
     cfg.data.z_train_corruption_enabled = False
     uncorrupted_tabicl = _generate_gp_batch_raw(
         cfg, B=6, device="cpu", tabicl_model=tabicl, tabicl_k_folds=3, tabicl_mix_weights=one_w,
@@ -156,8 +133,7 @@ def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg):
     for ep_u, ep_h in zip(uncorrupted_tabicl, mix_hit_should_skip_corruption):
         assert torch.allclose(ep_u["z_train"], ep_h["z_train"], atol=1e-6)
 
-    # Mixing miss (weight=0): analytic z_train, corruption still applies --
-    # must differ from the uncorrupted analytic residual.
+    # Mix miss: analytic z_train, corrupted.
     cfg.data.z_train_corruption_enabled = False
     uncorrupted_analytic = _generate_gp_batch_raw(cfg, B=6, device="cpu")
     cfg.data.z_train_corruption_enabled = True
@@ -170,8 +146,7 @@ def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg):
     )
     assert any_diff
 
-    # Legacy always-on path (tabicl_mix_weights=None): corruption still
-    # applies on top, unchanged from before this feature existed.
+    # Always-on path (weights None): corrupted.
     legacy_corrupted = _generate_gp_batch_raw(
         cfg, B=6, device="cpu", tabicl_model=tabicl, tabicl_k_folds=3,
     )
@@ -188,18 +163,7 @@ def _import_train():
 
 
 def test_compute_tabicl_z_train_gap_runs_on_declared_device(small_cfg):
-    """Regression test: _compute_tabicl_z_train_gap must run BOTH paired
-    _generate_gp_batch_raw calls on the SAME device tabicl_marginal lives
-    on (its `device` arg), not a hardcoded "cpu" -- torch's CPU and CUDA
-    generators are separate RNG streams that don't reproduce each other's
-    draws from the same seed, so a device mismatch would silently break the
-    byte-identical-pairing guarantee the docstring promises (and, on a
-    machine with a GPU, crash outright once x_norm_train and TabICL's
-    cuda-resident weights disagree on device). Exercised here on CPU only
-    (no GPU required for the test suite), which is sufficient to catch a
-    hardcoded-device regression: passing device="cpu" explicitly must work
-    end to end and produce finite gaps.
-    """
+    """_compute_tabicl_z_train_gap runs both paired calls on the given device (CPU here) with finite gaps."""
     train = _import_train()
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.baselines = {

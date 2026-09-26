@@ -1,35 +1,12 @@
-"""
-test_autoregressive.py — Tests for eval/baselines/autoregressive.py, the
-chain-rule ("autoregressive") joint density built from the marginal alone,
-and for its wiring into eval_checkpoint.py's total Y-space NLL table.
+"""Tests for eval/baselines/autoregressive.py and its place in eval_checkpoint's tables.
 
-Tests verify:
-  1. STEP 0 IS THE ONE-SHOT MARGINAL. The chain's first prediction, with the
-     full test block still present in the table, reproduces the ordinary
-     K-fold PIT's log_pdf_test at that point. This is the identity the whole
-     marginal/copula split rests on -- "marginal" in the printed row is the
-     one-shot NLL and "copula" is total minus it, which is only meaningful if
-     the chain really does start from the one-shot model. It is also what the
-     module's "constant table, moving split" design exists to buy: dropping
-     the unrevealed queries would change the model's input distribution and
-     break this.
-  2. Teacher forcing appends the TRUTH, in visit order -- the property that
-     makes the summed log-density an exact joint density rather than a
-     sampled path.
-  3. --ar_conditioning=sample appends something OTHER than the truth, and
-     does so reproducibly for a fixed seed (a diagnostic nobody can rerun is
-     not a diagnostic).
-  4. Orderings are genuine permutations, are seeded from the episode's GLOBAL
-     index rather than its position in the batch (so shard k of a run agrees
-     with a single long run), and "natural" really is identity order.
-  5. max_context caps the number of context rows the model is actually
-     called with, and always keeps the episode's own P context points.
-  6. ar_parts_from_log_pdf's split is exactly total = marginal + copula, with
-     copula == 0 recovering independence -- the same sign and normalization
-     convention as loss.y_space_nll, since the two share a table.
-  7. "autoregressive" is in _TOTAL_NLL_ORDER but NOT in _METHOD_ORDER: it has
-     no correlation matrix, so it must not reach the z-space table or the
-     best-of-baselines ranking.
+  1. Step 0 reproduces the one-shot PIT's log_pdf_test.
+  2. Teacher forcing appends the true values in visit order.
+  3. conditioning="sample" appends draws, reproducibly for a seed.
+  4. Orderings are permutations seeded by global index; "natural" is identity.
+  5. max_context caps the context rows and keeps the P context points.
+  6. ar_parts_from_log_pdf: total = marginal + copula.
+  7. "autoregressive" is in _TOTAL_NLL_ORDER but not _METHOD_ORDER.
 """
 
 from __future__ import annotations
@@ -50,9 +27,7 @@ from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: E402
 
 
 class RecordingFakeTabICL(RowIndependentFakeTabICL):
-    """RowIndependentFakeTabICL that remembers the shape of every table it was
-    called with — the only way to assert on max_context, whose effect is on
-    what the model SEES and not on any returned value."""
+    """RowIndependentFakeTabICL that records the shape of every table it is called with."""
 
     def __init__(self, q: int = 3):
         super().__init__(q)
@@ -84,14 +59,11 @@ def test_ar_step0_matches_the_one_shot_marginal():
         conditioning="teacher_forcing", seed=0,
     )
 
-    # "natural" order visits test index 0 first, so that column is the one the
-    # chain evaluated before revealing anything. Both are in raw nats.
+    # Natural order visits test index 0 first.
     assert torch.allclose(
         ar["log_pdf"][:, 0], one_shot["log_pdf_test"][:, 0], atol=1e-5
     )
-    # ...and only that column: by index 1 the chain has conditioning the
-    # one-shot pass never had, so the two must have genuinely diverged
-    # (otherwise the chain is silently a no-op).
+    # Later points differ from the one-shot values.
     assert not torch.allclose(
         ar["log_pdf"][:, 1:], one_shot["log_pdf_test"][:, 1:], atol=1e-5
     )
@@ -132,8 +104,7 @@ def test_orderings_are_permutations_keyed_on_the_global_episode_index():
     assert torch.equal(o, again)
     shifted = _orderings(2, N, "random", seed=5, episode_indices=[101, 102])
     assert torch.equal(shifted, o[1:])
-    # Different global index -> different order (this is what makes an episode
-    # reproducible across shards rather than across batch slots).
+    # A different global index gives a different order.
     assert not torch.equal(
         _orderings(1, N, "random", seed=5, episode_indices=[100])[0],
         _orderings(1, N, "random", seed=5, episode_indices=[999])[0],
@@ -191,13 +162,9 @@ def test_autoregressive_is_a_total_table_row_only():
     )
 
     assert "autoregressive" in dict(_TOTAL_NLL_ORDER)
-    # No correlation matrix exists for it, so it must never reach the z-space
-    # copula table or the best-of-baselines ranking, both of which are driven
-    # by _METHOD_ORDER.
+    # No correlation matrix: not in the z-space table or best-baseline ranking.
     assert "autoregressive" not in dict(_METHOD_ORDER)
-    # Y-space ranks include the marginal-only independence comparator and the
-    # post-hoc best ordinary-GP diagnostic, but never place either in the
-    # correlation-only z-space competition.
+    # Y-space ranks include independence and the best GP, which are not z-space competitors.
     assert "independence_marginal" in dict(_TOTAL_RANK_ORDER)
     assert "best_gp_total" in dict(_TOTAL_RANK_ORDER)
 

@@ -1,16 +1,5 @@
-"""
-test_calibration_math.py — Null-hypothesis correctness checks for the
-multivariate spatial calibration metrics in eval/spatial/calibration.py
-(calc_kendall_pit, calc_mahalanobis_distances, calc_exceedance_probs,
-calc_spatial_coverage) before running them on real ERA5 data.
+"""Null-distribution checks for the calibration metrics in eval/spatial/calibration.py: Kendall PIT ~ Uniform(0, 1), Mahalanobis d^2 ~ chi^2_D, spatial coverage ~ c^D, and exceedance reliability on y = x.
 
-Each test constructs synthetic data under perfect calibration (H0: the
-declared independence-copula model matches the true generating process) and
-checks the metric's known closed-form null distribution -- Uniform(0, 1) for
-the Kendall PIT, chi^2_D for the Mahalanobis distance, and c^D for spatial
-coverage at nominal level c (independent Uniform(0, 1) marginals).
-
-Run directly:
     pytest tests/test_calibration_math.py -v
 """
 
@@ -65,8 +54,7 @@ def test_kendall_pit_detects_miscalibration():
     n, D = 4000, 5
 
     y = rng.standard_normal((n, D))
-    # Declare the marginals as N(0, 0.5^2) -- too narrow relative to the true
-    # N(0, 1) generating process -- so the model is miscalibrated.
+    # Declared marginals N(0, 0.5^2) vs true N(0, 1).
     cdf_values = norm.cdf(y, loc=0.0, scale=0.5)
 
     z = gp.calc_kendall_pit(cdf_values)

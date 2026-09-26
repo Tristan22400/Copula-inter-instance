@@ -1,20 +1,4 @@
-"""test_lora_all_layers.py — universal LoRA: one shared rank on every 2-D
-weight matrix, in every marginal backbone.
-
-The stage/tier ladder adapts swappable attention MODULES, which covers ~91%
-of TabLDM's parameters but ~2% of EXAONE's (its attention and feed-forward
-weights are raw nn.Parameters inside custom modules with no submodule to
-replace). ``apply_lora_all_layers`` uses torch parametrization instead, so
-coverage no longer depends on which library used nn.Module children.
-
-Each test here guards a failure that is silent rather than loud:
-  - adapters that perturb a pretrained model at step 0,
-  - the frozen base weight being unfrozen by a tier-0 pattern that still
-    matches its post-rename name (i.e. quiet full fine-tuning),
-  - rank drifting between architectures,
-  - a checkpoint written with the wrong merger, which only fails at the next
-    run's load_state_dict -- long after the training spend.
-"""
+"""Tests for all-layer LoRA (apply_lora_all_layers) on every marginal backbone: identity at init, frozen base weights, shared rank, and checkpoint merging to stock names."""
 
 from __future__ import annotations
 
@@ -39,8 +23,7 @@ def _load(name):
 
 
 def test_adapters_are_identity_at_initialisation():
-    """B is zero-initialised, so installing adapters must not move a single
-    weight -- otherwise every run starts from a perturbed pretrained model."""
+    """Installing adapters leaves every weight unchanged (B = 0)."""
     from copula_inter.lora import apply_lora_all_layers
 
     torch.manual_seed(0)
@@ -53,10 +36,7 @@ def test_adapters_are_identity_at_initialisation():
 
 
 def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern():
-    """register_parametrization renames `0.weight` to
-    `0.parametrizations.weight.original`, which still matches a prefix-style
-    tier-0 pattern. Without the guard that silently full-fine-tunes the layer
-    LoRA was just installed on."""
+    """A tier-0 pattern matching "...parametrizations.weight.original" does not unfreeze it."""
     from copula_inter.lora import apply_lora_all_layers
 
     model = nn.Sequential(nn.Linear(6, 8))
@@ -83,8 +63,7 @@ def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name):
             ranks.add(plist[0].A.shape[0])
             ranks.add(plist[0].B.shape[1])
     assert ranks == {RANK}, f"{name} has mixed LoRA ranks: {sorted(ranks)}"
-    # Essentially total coverage: every 2-D matrix that existed before is now
-    # behind an adapter (the count shifts because `.original` replaces it).
+    # Every former 2-D matrix is now behind an adapter.
     assert n_adapted == n_matrices, f"{name}: adapted {n_adapted} of {n_matrices} matrices"
 
 
@@ -110,18 +89,14 @@ def test_only_adapters_train_and_gradients_reach_them(name):
         return [n for n, p in bb.module.named_parameters()
                 if n.endswith(suffix) and p.grad is not None and p.grad.abs().sum() > 0]
 
-    # At initialisation B == 0, so d(loss)/dA = B^T @ grad is exactly zero:
-    # only the B factors move on the first step. This is standard LoRA
-    # behaviour, not a broken graph -- asserting "all adapters get gradient"
-    # here would be asserting something false.
+    # At init B == 0, so only the B factors get gradients.
     n_b = sum(1 for n, _ in bb.module.named_parameters() if n.endswith(".B"))
     assert len(_live(".B")) > 0.9 * n_b, (
         f"{name}: only {len(_live('.B'))}/{n_b} B factors received gradient"
     )
     assert not _live(".A"), "A should have zero gradient while B is still zero"
 
-    # After one step B is nonzero, so A becomes trainable too -- this is what
-    # proves the whole factorisation is live, not just half of it.
+    # After one step A gets gradients too.
     opt = torch.optim.SGD([p for p in bb.module.parameters() if p.requires_grad], lr=1e-2)
     opt.step()
     bb.module.zero_grad(set_to_none=True)
@@ -134,8 +109,7 @@ def test_only_adapters_train_and_gradients_reach_them(name):
 
 @pytest.mark.parametrize("name", BACKENDS)
 def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name, tmp_path):
-    """The written file must carry the ORIGINAL names with deltas baked in,
-    or the next run's strict load_state_dict fails."""
+    """The checkpoint uses the original parameter names with deltas merged."""
     from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)

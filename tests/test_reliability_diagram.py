@@ -1,23 +1,4 @@
-"""
-test_reliability_diagram.py — Sanity checks for the quantile reliability
-diagram code in eval/spatial/calibration.py.
-
-compute_quantile_ece is exercised on synthetic data with a controlled
-miscalibration bias (ECE should track the injected bias, and be ~0 for a
-perfectly calibrated forecaster).
-
-plot_era5_quantile_reliability is exercised with a fake TabICLRegressor
-(monkeypatching eval.spatial.calibration.make_tabicl_regressor) to
-regression-test two properties that are easy to silently break:
-  - context_idx locations must be excluded from the evaluated (y_true,
-    y_pred_quantiles) set (querying the model at its own context points would
-    let it condition on the true label it's scored against, inflating the
-    apparent coverage).
-  - all quantile levels for a given day come from a single fit()+predict()
-    call, not one fit() per quantile level (TabICL's quantile spline comes
-    from one backbone forward pass regardless of how many alphas are
-    requested).
-"""
+"""Tests for compute_quantile_ece and plot_era5_quantile_reliability (with a fake regressor): context points are excluded, and one fit per day serves all quantile levels."""
 
 from __future__ import annotations
 
@@ -71,10 +52,7 @@ def test_compute_quantile_ece_shape_validation():
 
 
 class _FakeTabICLRegressor:
-    """Deterministic stand-in for tabicl.TabICLRegressor: records call counts
-    instead of running the real pretrained backbone, so the leakage/batching
-    logic in plot_era5_quantile_reliability can be regression-tested cheaply.
-    """
+    """Deterministic stand-in for TabICLRegressor that counts calls."""
 
     def __init__(self):
         self.fit_calls = 0
