@@ -26,10 +26,14 @@ BACKENDS = {
     )
 }
 
+MARGINAL_BACKENDS = tuple(BACKENDS)
 GENERIC_MARGINAL_BACKENDS = tuple(name for name, spec in BACKENDS.items() if spec.batched_pit)
+TABICL_Z_TRAIN_SOURCES = ("tabicl", "tabicl_split")
 Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", *GENERIC_MARGINAL_BACKENDS, "y_train")
 COPULA_BACKBONES = tuple(name for name, spec in BACKENDS.items() if spec.copula_backbone)
 DEFAULT_Z_TRAIN_SOURCE = "tabicl"
+# Eval-side name for the exact-GP ground truth that training calls "analytic".
+EVAL_Z_TRAIN_SOURCES = ("oracle", *MARGINAL_BACKENDS)
 
 
 def z_train_source(cfg) -> str:

@@ -145,6 +145,7 @@ for _p in (_REPO_ROOT, _SRC):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from backend_registry import EVAL_Z_TRAIN_SOURCES, GENERIC_MARGINAL_BACKENDS  # noqa: E402
 from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from artifacts import artifact_identity, atomic_json_save  # noqa: E402
 from config_path import config_dir as project_config_dir  # noqa: E402
@@ -1634,7 +1635,7 @@ def parse_eval_spec(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patience_per_ep", type=int, default=500,
                         help="Early stopping patience for PerEpisodeTransformer")
     parser.add_argument("--z_train_source", default="tabicl",
-                        choices=["oracle", "tabicl", "exaone", "tabpfn", "tabldm"],
+                        choices=EVAL_Z_TRAIN_SOURCES,
                         help="What the ICL model conditions on for each episode's z_train. "
                              "'tabicl' (default): a K-fold cross-fitted PIT estimate from the "
                              "frozen TabICL marginal (pit.py::run_pit) — the same proxy "
@@ -1896,7 +1897,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     # K-fold-PIT each episode's z_train (see --z_train_source's help text) ----
     tabicl_marginal: nn.Module | None = None
     marginal_backend: str | None = (
-        args.z_train_source if args.z_train_source not in ("oracle", "tabicl") else None
+        args.z_train_source if args.z_train_source in GENERIC_MARGINAL_BACKENDS else None
     )
     marginal_regressor = None
     tabicl_pit_k_folds = DEFAULT_K_FOLDS

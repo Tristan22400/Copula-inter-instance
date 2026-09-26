@@ -82,6 +82,7 @@ from model import build_copula_transformer
 from muon import Muon
 from pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
 from training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
+from backend_registry import TABICL_Z_TRAIN_SOURCES
 from backend_registry import z_train_source as z_train_source_of
 from train import (
     _sigma_stats,
@@ -246,7 +247,7 @@ def main(cfg: DictConfig) -> None:
             )
         tabicl_mix_weights = torch.full((len(_COMPOSABLE_KERNELS),), floor_frac, dtype=torch.float32)
 
-    if z_train_source in ("tabicl", "tabicl_split") or mix_enabled:
+    if z_train_source in TABICL_Z_TRAIN_SOURCES or mix_enabled:
         ckpt = resolve_pit_ckpt(cfg)
         if ckpt is None:
             raise ValueError(

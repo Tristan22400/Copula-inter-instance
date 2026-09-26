@@ -104,6 +104,7 @@ from live_dataset import (
 from loss import _safe_cholesky, y_space_nll
 from model import build_copula_transformer, build_sigma, low_rank_correlation_factor
 from muon import Muon
+from backend_registry import TABICL_Z_TRAIN_SOURCES
 from backend_registry import z_train_source as z_train_source_of
 from pit import (
     DEFAULT_K_FOLDS,
@@ -229,7 +230,7 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     batched_marginal_worker_enabled = (
-        mix_enabled or z_train_source in ("tabicl", "tabicl_split") or z_train_source in _GENERIC_MARGINAL_BACKENDS
+        mix_enabled or z_train_source in TABICL_Z_TRAIN_SOURCES or z_train_source in _GENERIC_MARGINAL_BACKENDS
     )
     if not batched_marginal_worker_enabled or device != "cuda":
         return

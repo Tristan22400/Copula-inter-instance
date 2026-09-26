@@ -94,6 +94,7 @@ from dataset_manifest import (
     verified_shard_digest,
 )
 from live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
+from backend_registry import TABICL_Z_TRAIN_SOURCES
 from backend_registry import z_train_source as z_train_source_of
 
 
@@ -345,7 +346,7 @@ def main(cfg: DictConfig) -> None:
         float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
     )
     ckpt = None
-    if z_train_source in ("tabicl", "tabicl_split"):
+    if z_train_source in TABICL_Z_TRAIN_SOURCES:
         from pit import load_tabicl, resolve_pit_ckpt
 
         ckpt = resolve_pit_ckpt(cfg)

@@ -94,11 +94,11 @@ def resolve_checkpoint(name_or_path: str) -> str:
     """Resolve a `--ckpt`/`--checkpoints` token to a checkpoint file path.
 
     Accepts, in order:
-      - a raw path that exists on disk (returned unchanged)
+      - a path (exists, or ends in .pt/.ckpt, or contains a separator) -> unchanged
       - "family" -> CHECKPOINT_FAMILIES[family]'s dir + default_step
       - "family:step" -> CHECKPOINT_FAMILIES[family]'s dir + explicit step
     """
-    if os.path.exists(name_or_path):
+    if os.path.exists(name_or_path) or name_or_path.endswith((".pt", ".ckpt")) or os.sep in name_or_path:
         return name_or_path
     family, _, step_str = name_or_path.partition(":")
     if family not in CHECKPOINT_FAMILIES:

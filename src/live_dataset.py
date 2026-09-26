@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
 from pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
-from backend_registry import GENERIC_MARGINAL_BACKENDS, Z_TRAIN_SOURCES
+from backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, Z_TRAIN_SOURCES
 from backend_registry import z_train_source as z_train_source_of
 
 # Thread count for generate_gp_batch calls made directly in the MAIN process
@@ -98,7 +98,7 @@ _RAW_Y_SOURCES = ("y_train",)
 
 def _validate_z_train_source(z_train_source: str) -> None:
     """Fail loud on an unrecognized data.z_train_source instead of letting
-    every `z_train_source in ("tabicl", "tabicl_split")` gate in this module
+    every `z_train_source in TABICL_Z_TRAIN_SOURCES` gate in this module
     (and train.py::_reserve_gpu_headroom_for_live_tabicl) silently evaluate
     False and fall back to plain analytic generation.
 
@@ -561,7 +561,7 @@ def build_live_train_loader(
     z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
-    tabicl_live_enabled = mix_enabled or z_train_source in ("tabicl", "tabicl_split")
+    tabicl_live_enabled = mix_enabled or z_train_source in TABICL_Z_TRAIN_SOURCES
     # "exaone"/"tabpfn": eval/spatial/exaone_batched.py / tabpfn_batched.py's
     # genuine multi-episode batched forwards (data_gen.py's marginal_backend
     # override) -- fused into ONE forward per k-fold across the whole
@@ -760,7 +760,7 @@ def build_fixed_live_val_batches(
 
     z_train_source = z_train_source_of(cfg)
     _validate_z_train_source(z_train_source)
-    tabicl_live_enabled = z_train_source in ("tabicl", "tabicl_split")
+    tabicl_live_enabled = z_train_source in TABICL_Z_TRAIN_SOURCES
     generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS
     raw_y_override = z_train_source in _RAW_Y_SOURCES
     if (tabicl_live_enabled or generic_marginal_enabled) and device != "cuda":

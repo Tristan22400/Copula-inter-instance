@@ -35,6 +35,8 @@ import subprocess
 import sys
 import time
 
+from backend_registry import MARGINAL_BACKENDS
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -65,7 +67,7 @@ def main() -> None:
     )
     p.add_argument(
         "--marginal", default=None,
-        choices=["tabicl", "exaone", "tabpfn", "tabldm"],
+        choices=MARGINAL_BACKENDS,
         help="Marginal backend for the ERA5 PIT (default: leave data.z_train_source "
              "as configured, i.e. the frozen TabICL). Shorthand for the "
              "data.z_train_source=<v> Hydra override -- see "
