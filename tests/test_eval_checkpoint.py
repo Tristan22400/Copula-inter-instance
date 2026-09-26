@@ -29,7 +29,7 @@ from eval.baselines.prefit import (  # noqa: E402
     _PoolTensor,
     _prefit_baselines_parallel,
 )
-from eval.runners.eval_checkpoint import _eval_icl_episode  # noqa: E402
+from eval.runners.episode_scoring import _eval_icl_episode  # noqa: E402
 
 _TINY_DATA_CFG = {
     "d_features": 1,
