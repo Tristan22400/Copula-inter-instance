@@ -29,6 +29,10 @@ jobs:
           enable-cache: true
       - name: Install project
         run: uv sync --locked --extra dev --extra cpu
+      - name: Lint and format
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
       - name: Syntax and import smoke
         run: |
           uv run --no-sync python -m compileall -q src eval inference debug tests
