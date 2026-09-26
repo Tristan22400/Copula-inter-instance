@@ -17,6 +17,7 @@ worker's RSS low.
 from __future__ import annotations
 
 import os
+import json
 import random
 from collections import OrderedDict
 from glob import glob
@@ -24,6 +25,7 @@ from typing import List, Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset, Sampler
+from episode_contracts import validate_episode
 
 # Keys checked for NaN/Inf before an episode is handed to the model. Datasets
 # generated before the data_gen.py LOO-PIT degeneracy fix (near-singular
@@ -119,10 +121,34 @@ class CopulaDataset(Dataset):
 
     def _init_sharded(self, shard_files: List[str], meta_path: str) -> None:
         self._mode         = "sharded"
-        self._shard_files  = shard_files
         meta               = torch.load(meta_path, map_location="cpu", weights_only=True)
         self._n_total      = int(meta["n_total"])
         self._shard_size   = int(meta["shard_size"])
+        if self._n_total < 0 or self._shard_size <= 0:
+            raise ValueError(f"invalid shard metadata in {meta_path}")
+        needed = (self._n_total + self._shard_size - 1) // self._shard_size
+        directory = os.path.dirname(meta_path)
+        expected = [os.path.join(directory, f"shard_{i:06d}.pt") for i in range(needed)]
+        if any(not os.path.isfile(path) for path in expected):
+            raise ValueError(f"shard metadata in {meta_path} references missing or noncontiguous shards")
+        self._shard_files = expected
+        if digest := meta.get("manifest_digest"):
+            manifest_path = os.path.join(directory, "manifest.json")
+            with open(manifest_path, encoding="utf-8") as source:
+                manifest = json.load(source)
+            if manifest.get("digest") != digest:
+                raise ValueError(f"manifest identity does not match {meta_path}")
+            from dataset_manifest import shard_count_path
+
+            counts = []
+            for path in expected:
+                sidecar = shard_count_path(path)
+                if not sidecar.is_file():
+                    raise ValueError(f"manifest dataset shard lacks count sidecar: {path}")
+                with sidecar.open(encoding="utf-8") as source:
+                    counts.append(json.load(source)["count"])
+            if sum(counts) != self._n_total:
+                raise ValueError(f"shard counts disagree with {meta_path}")
         self._shard_cache: OrderedDict[str, list] = OrderedDict()
 
     # ------------------------------------------------------------------
@@ -170,7 +196,9 @@ class CopulaDataset(Dataset):
     _MAX_INVALID_RETRIES = 8
 
     def _load_shard_entry(self, idx: int) -> dict:
-        shard_idx  = min(idx // self._shard_size, len(self._shard_files) - 1)
+        if idx < 0 or idx >= self._n_total:
+            raise IndexError(idx)
+        shard_idx  = idx // self._shard_size
         local_idx  = idx  - shard_idx * self._shard_size
         shard_path = self._shard_files[shard_idx]
 
@@ -184,7 +212,8 @@ class CopulaDataset(Dataset):
             self._shard_cache.move_to_end(shard_path)
 
         shard     = self._shard_cache[shard_path]
-        local_idx = min(local_idx, len(shard) - 1)   # guard for last shard
+        if local_idx >= len(shard):
+            raise ValueError(f"shard {shard_path} has fewer episodes than its metadata declares")
         # Derive R_prior/Sigma_star on a shallow copy instead of caching them
         # on the shard itself: computing eagerly for all shard_size episodes
         # up front (and retaining them for the shard's whole time in the LRU
@@ -263,6 +292,10 @@ def collate_fn(samples: List[dict]) -> dict:
         n_train      : LongTensor (B,)
         n_test       : LongTensor (B,)
     """
+    if not samples:
+        raise ValueError("collate_fn requires at least one episode")
+    for sample in samples:
+        validate_episode(sample)
     B   = len(samples)
     d_x = samples[0]["x_norm_train"].shape[-1]
 
@@ -282,8 +315,8 @@ def collate_fn(samples: List[dict]) -> dict:
             "(auto-enabled for variable-d datasets)."
         )
 
-    P_list = [int(s["n_train"].item()) for s in samples]
-    N_list = [int(s["n_test"].item())  for s in samples]
+    P_list = [int(s["n_train"]) for s in samples]
+    N_list = [int(s["n_test"]) for s in samples]
     P_max  = max(P_list)
     N_max  = max(N_list)
 

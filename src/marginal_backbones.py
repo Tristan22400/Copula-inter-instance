@@ -58,7 +58,6 @@ pit.py::run_pit_batched_grad bypasses run_pit_batched's decorator).
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
@@ -66,6 +65,8 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+from backend_registry import BACKENDS
+from artifacts import atomic_torch_save
 
 __all__ = [
     "BACKBONE_NAMES",
@@ -76,7 +77,7 @@ __all__ = [
     "resolve_tier",
 ]
 
-BACKBONE_NAMES: tuple[str, ...] = ("tabicl", "exaone", "tabpfn", "tabldm")
+BACKBONE_NAMES: tuple[str, ...] = tuple(BACKENDS)
 
 # Tier-0 = "the label path, the norms the trunk's output is rescaled by, and
 # the decoder that turns trunk features into a quantile grid" -- the parts
@@ -136,7 +137,7 @@ TIER0_PATTERNS: dict[str, tuple[str, ...]] = {
 # weight matrix by PARAMETRIZATION rather than module replacement, is uniform
 # across all four architectures at one shared rank, and is exempt from
 # MAX_TIER entirely.
-MAX_TIER: dict[str, int] = {"tabicl": 3, "tabldm": 3, "exaone": 0, "tabpfn": 0}
+MAX_TIER: dict[str, int] = {name: spec.max_tier for name, spec in BACKENDS.items()}
 
 
 def resolve_tier(backbone_name: str, tier: int) -> int:
@@ -296,7 +297,6 @@ class MarginalBackbone:
         """
         from lora import merged_base_state_dict_any
 
-        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         payload = {
             "config": dict(self.config),
             "state_dict": merged_base_state_dict_any(self.module),
@@ -309,7 +309,7 @@ class MarginalBackbone:
             payload["cfg"] = OmegaConf.to_container(cfg, resolve=True)
         if extra:
             payload.update(extra)
-        torch.save(payload, path)
+        atomic_torch_save(payload, path)
 
 
 # ---------------------------------------------------------------------------

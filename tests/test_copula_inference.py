@@ -28,12 +28,35 @@ for _p in (_REPO_ROOT, _SRC, _TABICL_SRC):
 
 from tabicl._model.quantile_dist import QuantileDistribution  # noqa: E402
 
-from inference.copula_inference import get_test_correlation, normalize_features, sample_trajectories  # noqa: E402
+from inference.copula_inference import (  # noqa: E402
+    _resolve_copula_checkpoint,
+    get_test_correlation,
+    normalize_features,
+    sample_trajectories,
+)
 from model import low_rank_correlation  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # PIT / interpolation sanity check (hand-built quantile grid, no live model)
 # ---------------------------------------------------------------------------
+
+
+def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path):
+    """A checkpoint directory selects the last numerical training snapshot."""
+    (tmp_path / "step_0000010.pt").touch()
+    (tmp_path / "step_0000020.pt").touch()
+    final = tmp_path / "step_0000020_final.pt"
+    final.touch()
+    (tmp_path / "notes.pt").touch()
+
+    assert _resolve_copula_checkpoint(str(tmp_path)) == str(final)
+
+
+def test_resolve_copula_checkpoint_file_is_unchanged(tmp_path):
+    checkpoint = tmp_path / "arbitrary-name.pt"
+    checkpoint.touch()
+
+    assert _resolve_copula_checkpoint(str(checkpoint)) == str(checkpoint)
 
 
 def test_pit_recovers_standard_normal_from_exact_quantile_grid():

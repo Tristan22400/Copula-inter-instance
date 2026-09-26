@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from dataset import collate_fn
 from pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
+from backend_registry import GENERIC_MARGINAL_BACKENDS, Z_TRAIN_SOURCES
 
 # Thread count for generate_gp_batch calls made directly in the MAIN process
 # (build_fixed_live_val_batches below, train.py's z_train-gap diagnostic) --
@@ -85,8 +86,8 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS):
 # question from every other confound. live_generation-only (see
 # generate_pit_dataset.py's on-disk-path guard) -- no on-disk pipeline
 # support exists.
-_VALID_Z_TRAIN_SOURCES = ("analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train")
-_GENERIC_MARGINAL_BACKENDS = ("exaone", "tabpfn", "tabldm")
+_VALID_Z_TRAIN_SOURCES = Z_TRAIN_SOURCES
+_GENERIC_MARGINAL_BACKENDS = GENERIC_MARGINAL_BACKENDS
 # z_train_source values needing no marginal model loaded at all (unlike
 # _GENERIC_MARGINAL_BACKENDS/"tabicl"/"tabicl_split") -- the override is a
 # pure tensor op inside data_gen.py, gated by a plain bool thread through

@@ -57,15 +57,17 @@ import contextlib
 import dataclasses
 import logging
 import os
+import types
 
 import numpy as np
+from backend_registry import BACKENDS, require_capability
 
 __all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
 
 # Silence EXAONE's NNLS member-weighting fallback warning on small context sizes
 logging.getLogger("exaonetabular.regressor").setLevel(logging.ERROR)
 
-BACKEND_NAMES = ["tabicl", "tabpfn", "exaone", "tabldm"]
+BACKEND_NAMES = list(BACKENDS)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = 
     is the single place that mapping is defined). Without this a Phase-A run
     on exaone/tabldm would produce a file nothing could read back.
     """
+    require_capability(name, "name")
     regressor = _make_pretrained_regressor(name, device)
     if ckpt:
         _load_finetuned_weights(name, regressor, ckpt, device)
@@ -277,8 +280,8 @@ def quantiles(
 
 
 @contextlib.contextmanager
-def _exaone_capture_quantile_bank():
-    """Temporarily disables EXAONETabularRegressor._collapse_members'
+def _exaone_capture_quantile_bank(regressor):
+    """Temporarily disables this regressor's _collapse_members'
     reduction to a single point estimate, so .predict() returns the full
     (n_query, quantile_count) bank instead of one number per row.
 
@@ -301,9 +304,8 @@ def _exaone_capture_quantile_bank():
     (~20-30 row) K-fold contexts this pipeline uses.
     """
     import torch
-    from exaonetabular.regressor import EXAONETabularRegressor
-
-    original = EXAONETabularRegressor._collapse_members
+    original = regressor.__dict__.get("_collapse_members")
+    had_override = "_collapse_members" in regressor.__dict__
 
     def _passthrough(self, output, query_count):
         expected = (self.manifest.runtime.ensemble_count, query_count, self.manifest.output_width)
@@ -311,11 +313,14 @@ def _exaone_capture_quantile_bank():
             raise RuntimeError("model returned invalid regression quantiles")
         return torch.sort(output.float(), dim=-1).values
 
-    EXAONETabularRegressor._collapse_members = _passthrough
+    regressor._collapse_members = types.MethodType(_passthrough, regressor)
     try:
         yield
     finally:
-        EXAONETabularRegressor._collapse_members = original
+        if had_override:
+            regressor._collapse_members = original
+        else:
+            del regressor._collapse_members
 
 
 def _exaone_quantiles(
@@ -346,7 +351,7 @@ def _exaone_quantiles(
         )
     quantile_count = regressor.manifest.regression.quantile_count
     native_probs = np.linspace(1.0 / (quantile_count + 1), quantile_count / (quantile_count + 1), quantile_count)
-    with _exaone_capture_quantile_bank():
+    with _exaone_capture_quantile_bank(regressor):
         bank = np.asarray(regressor.predict(X_query))  # (n_query, quantile_count), raw y-units
 
     out = np.empty((bank.shape[0], len(probs)))

@@ -48,8 +48,10 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
         total = Sigma.square().mean()
         return {"total": total, "copula": total, "marginal": total}
 
-    monkeypatch.setattr(train, "low_rank_correlation_factor", fake_correlation)
-    monkeypatch.setattr(train, "y_space_nll", fake_nll)
+    import training_core
+
+    monkeypatch.setattr(training_core, "low_rank_correlation_factor", fake_correlation)
+    monkeypatch.setattr(training_core, "y_space_nll", fake_nll)
 
     def fail_step(*_args, **_kwargs):
         raise torch.cuda.OutOfMemoryError("synthetic OOM")

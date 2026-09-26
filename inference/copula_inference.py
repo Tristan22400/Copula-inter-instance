@@ -40,6 +40,7 @@ other function in this module (and both experiment scripts) build on.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import Optional
 
@@ -262,6 +263,33 @@ def loo_pit(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_copula_checkpoint(ckpt_path: str) -> str:
+    """Resolve a checkpoint file, accepting a training checkpoint directory.
+
+    A directory is resolved by numeric training step, not modification time:
+    this is deterministic and avoids selecting a copied or partially written
+    file. For equal steps, the conventional ``*_final.pt`` is preferred.
+    """
+    if not os.path.isdir(ckpt_path):
+        return ckpt_path
+
+    candidates = []
+    for name in os.listdir(ckpt_path):
+        match = re.fullmatch(r"step_(\d+)(?:_final)?\.pt", name)
+        path = os.path.join(ckpt_path, name)
+        if match and os.path.isfile(path):
+            candidates.append((int(match.group(1)), name.endswith("_final.pt"), path))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No checkpoint files named step_<number>.pt or step_<number>_final.pt "
+            f"found in directory '{ckpt_path}'."
+        )
+
+    _, _, resolved = max(candidates)
+    print(f"Resolved checkpoint directory '{ckpt_path}' to '{resolved}'.")
+    return resolved
+
+
 def load_copula_model(
     ckpt_path: str,
     config_path: Optional[str] = None,
@@ -277,7 +305,8 @@ def load_copula_model(
     Args:
         ckpt_path   : path to a checkpoint saved by ``train.py``'s
                       ``save_checkpoint`` (has ``state_dict``/``model_state``
-                      and, normally, ``cfg``).
+                      and, normally, ``cfg``), or a directory containing
+                      ``step_<number>.pt`` files (the highest step is used).
         config_path : Hydra config to use if the checkpoint has no saved
                       ``cfg`` (older checkpoints). Ignored if the checkpoint
                       does have one.
@@ -288,6 +317,7 @@ def load_copula_model(
         ``DictConfig`` it was built from (useful for reading e.g.
         ``cfg.data.oracle_mode``).
     """
+    ckpt_path = _resolve_copula_checkpoint(ckpt_path)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     cfg = ckpt.get("cfg")
@@ -571,7 +601,12 @@ def sample_trajectories(
         rng = np.random.default_rng()
 
     n_test = R.shape[0]
-    L = np.linalg.cholesky(R + eps_reg * np.eye(n_test))
+    R_safe = R + eps_reg * np.eye(n_test)
+    # Jitter improves numerical stability; renormalize so this covariance
+    # remains a correlation matrix with unit latent marginal variances.
+    scale = np.sqrt(np.diag(R_safe))
+    R_safe = R_safe / np.outer(scale, scale)
+    L = np.linalg.cholesky(R_safe)
 
     eps = rng.standard_normal((n_samples, n_test))
     z = eps @ L.T  # (n_samples, n_test)

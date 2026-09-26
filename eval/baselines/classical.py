@@ -91,6 +91,9 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
+from artifacts import atomic_torch_save  # noqa: E402
+from dataset_manifest import dataset_identity  # noqa: E402
+from eval.results import NAN_PARTS as _NAN_PARTS  # noqa: E402
 from model import low_rank_correlation  # noqa: E402
 
 __all__ = [
@@ -1110,9 +1113,6 @@ def train_per_episode(
 # ---------------------------------------------------------------------------
 
 
-_NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
-
-
 def eval_baselines_episode(
     ep: dict,
     icl_rank: int,
@@ -1365,6 +1365,10 @@ def baseline_fingerprint(
         "icl_rank": icl_rank,
         "live_generate": live_generate,
         "dataset_dir": os.path.abspath(dataset_dir) if (dataset_dir and not live_generate) else None,
+        "dataset_identity": (
+            dataset_identity(dataset_dir)
+            if dataset_dir and not live_generate and os.path.isdir(dataset_dir) else None
+        ),
         "seed": seed,
         "oracle_mode": oracle_mode,
         "n_steps_mle": n_steps_mle,
@@ -1445,9 +1449,7 @@ def save_baseline_entry(path: str, fingerprint: dict, cache_key: str, entry: dic
     d = _shard_dir(path)
     os.makedirs(d, exist_ok=True)
     dest = os.path.join(d, _shard_name(cache_key))
-    tmp = f"{dest}.tmp{os.getpid()}"
-    torch.save({"fingerprint": fingerprint, "cache_key": cache_key, "entry": entry}, tmp)
-    os.replace(tmp, dest)
+    atomic_torch_save({"fingerprint": fingerprint, "cache_key": cache_key, "entry": entry}, dest)
 
 
 def load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
@@ -1514,10 +1516,5 @@ def save_baseline_cache(path: str, fingerprint: dict, entries: dict[str, dict]) 
     os.replace is atomic on POSIX, so the previous save stays intact until the
     new one is complete.
     """
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tmp = f"{path}.tmp{os.getpid()}"
-    torch.save({"fingerprint": fingerprint, "entries": entries}, tmp)
-    os.replace(tmp, path)
+    atomic_torch_save({"fingerprint": fingerprint, "entries": entries}, path)
     print(f"  [baseline_cache] saved {len(entries)} episode(s) to {path}", flush=True)

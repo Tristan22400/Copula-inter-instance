@@ -35,7 +35,13 @@ from eval.baselines.classical import (  # noqa: E402
     load_baseline_cache,
     save_baseline_cache,
 )
-from eval.runners.eval_checkpoint import _eval_icl_episode  # noqa: E402
+from eval.runners.eval_checkpoint import (  # noqa: E402
+    _PoolTensor,
+    _episode_to_pool_payload,
+    _prefit_baselines_parallel,
+    _pool_decode_tensors,
+    _eval_icl_episode,
+)
 from pit import gp_analytical_posterior  # noqa: E402
 
 _TINY_DATA_CFG = {
@@ -75,6 +81,75 @@ def _assert_valid_correlation(R: torch.Tensor, n: int, atol: float = 1e-3):
     assert R.shape == (n, n)
     assert torch.allclose(R, R.T, atol=atol)
     assert torch.allclose(R.diagonal(), torch.ones(n), atol=1e-2)
+
+
+def _contains_tensor(value) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tensor(item) for item in value)
+    return False
+
+
+def test_pool_episode_payload_encodes_nested_metadata_tensors():
+    """Pool payloads must contain no Tensor, even below kernel metadata.
+
+    ``kernel_component_params`` is the production path that initially evaded
+    the shallow conversion and caused the pool's PyTorch reducer to exhaust
+    file descriptors during a large prefit.
+    """
+    episode = {
+        "x_norm_train": torch.tensor([[1.0]]),
+        "kernel_component_params": [
+            {"l": torch.tensor([0.5]), "nested": (torch.tensor([2.0]),)},
+        ],
+    }
+
+    payload = _episode_to_pool_payload(episode)
+
+    assert not _contains_tensor(payload)
+    assert isinstance(payload["x_norm_train"], _PoolTensor)
+    assert isinstance(payload["kernel_component_params"][0]["l"], _PoolTensor)
+
+    restored = _pool_decode_tensors(payload)
+    assert _contains_tensor(restored)
+    assert torch.equal(restored["x_norm_train"], episode["x_norm_train"])
+    assert torch.equal(
+        restored["kernel_component_params"][0]["nested"][0],
+        episode["kernel_component_params"][0]["nested"][0],
+    )
+
+
+def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode, tmp_path):
+    """Exercise the actual spawned-pool transport, not just its codec."""
+    episode = dict(tiny_episode)
+    episode["kernel_component_params"] = [{"l": torch.tensor([0.5])}]
+    fitted = {}
+    _prefit_baselines_parallel(
+        pending=[("nested-metadata", 7, episode)],
+        fit_kwargs={
+            "icl_rank": 2,
+            "n_steps_mle": 1,
+            "lr_mle": 0.1,
+            "n_steps_dkl": 1,
+            "lr_dkl": 0.1,
+            "n_steps_per_ep": 1,
+            "patience_per_ep": 1,
+            "oracle_mode": "prior",
+            "n_restarts_mle": 1,
+            "n_restarts_dkl": 1,
+        },
+        n_workers=1,
+        cache_path=str(tmp_path / "unused.pt"),
+        fingerprint={},
+        fitted=fitted,
+        use_cache=False,
+    )
+
+    assert "nested-metadata" in fitted
+    assert all(isinstance(R, torch.Tensor) for R in fitted["nested-metadata"]["R_dict"].values())
 
 
 def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode):

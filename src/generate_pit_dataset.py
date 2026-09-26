@@ -60,6 +60,7 @@ Usage
 from __future__ import annotations
 
 import gc
+import fcntl
 import os
 import sys
 import time
@@ -82,6 +83,16 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from data_gen import generate_gp_batch
+from artifacts import atomic_json_save, atomic_torch_save, file_digest
+from config_path import config_dir
+from episode_contracts import validate_episode
+from dataset_manifest import (
+    contiguous_shard_counts,
+    ensure_manifest,
+    generation_spec,
+    shard_count_path,
+    verified_shard_digest,
+)
 from live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
 
 
@@ -226,61 +237,47 @@ def _generate_shard_with_oom_retry(
     return episodes
 
 
-def _write_meta(pit_dir: str, n_total: int, shard_size: int) -> None:
-    """Atomically (write-temp + rename) refresh meta.pt so a concurrent
-    reader (e.g. train.py starting mid-generation) never observes a torn
-    file or an n_total ahead of the shards actually on disk."""
-    meta_path = os.path.join(pit_dir, "meta.pt")
-    tmp_path  = meta_path + f".tmp{os.getpid()}"
-    torch.save({"n_total": n_total, "shard_size": shard_size}, tmp_path)
-    os.replace(tmp_path, meta_path)
+def _write_meta(pit_dir: str, n_total: int, shard_size: int, manifest_digest: str) -> None:
+    atomic_torch_save(
+        {"n_total": n_total, "shard_size": shard_size, "manifest_digest": manifest_digest},
+        os.path.join(pit_dir, "meta.pt"),
+    )
 
 
 def _save_shard_atomic(episodes: list, out_path: str) -> None:
-    """torch.save then os.replace, never a direct save to out_path.
-
-    With a single writer this was already safe (nothing reads a shard until
-    meta.pt claims it exists). With multiple GEN_WORKERS processes writing
-    into the same pit_dir, another worker's meta.pt refresh (_scan_meta_total
-    below) globs shard_*.pt directly, and a torch.save() in progress on this
-    path is not atomic from a glob'ing reader's point of view -- rename on
-    the same filesystem is, so a reader only ever sees a fully-written file
-    or none at all.
-    """
-    tmp_path = out_path + f".tmp{os.getpid()}"
-    torch.save(episodes, tmp_path)
-    os.replace(tmp_path, out_path)
+    """Publish a shard, then its count sidecar for concurrent readers."""
+    for episode in episodes:
+        validate_episode(episode)
+    atomic_torch_save(episodes, out_path)
+    stat = os.stat(out_path)
+    atomic_json_save(
+        {"count": len(episodes), "sha256": file_digest(out_path),
+         "size": stat.st_size, "ctime_ns": stat.st_ctime_ns,
+         "mtime_ns": stat.st_mtime_ns, "inode": stat.st_ino},
+        shard_count_path(out_path),
+    )
 
 
 def _scan_meta_total(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int) -> int:
-    """Recompute n_total from the shard_*.pt files actually present on disk,
-    rather than a per-process running counter -- the only option once
-    multiple GEN_WORKERS processes are writing disjoint shard indices into
-    the same pit_dir (each process's own counter only knows about the shards
-    *it* wrote, not its siblings').
+    """Expose only a contiguous prefix, regardless of worker completion order."""
+    counts = contiguous_shard_counts(pit_dir, n_shards, shard_size)
+    if len(counts) == n_shards and sum(counts) != n_tasks:
+        raise ValueError("final shard count does not match requested n_tasks")
+    return sum(counts)
 
-    Every shard has exactly shard_size episodes except the single highest-
-    numbered one (index n_shards-1), which gets whatever remainder n_tasks
-    doesn't evenly divide by shard_size -- both worker and non-worker runs
-    compute n_this from shard_idx the same deterministic way (see main), so
-    this can size each present file from its filename alone without loading
-    it. Safe to call after any shard write regardless of which worker's turn
-    it is: it only ever reports shards that actually exist right now (same
-    "never claim a shard that isn't fully on disk yet" invariant as before),
-    and _save_shard_atomic's rename means a shard file is never counted
-    half-written.
-    """
-    last_shard_size = n_tasks - shard_size * (n_shards - 1)
-    total = 0
-    for fname in os.listdir(pit_dir):
-        if not (fname.startswith("shard_") and fname.endswith(".pt")):
-            continue
+
+def _refresh_meta(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int, digest: str) -> None:
+    # Scan and publish under one lock: concurrent writers must not replace a
+    # newer contiguous count with an older one. The lock file is persistent.
+    with open(os.path.join(pit_dir, "meta.lock"), "a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            idx = int(fname[len("shard_"):-len(".pt")])
-        except ValueError:
-            continue
-        total += shard_size if idx < n_shards - 1 else last_shard_size
-    return total
+            _write_meta(
+                pit_dir, _scan_meta_total(pit_dir, n_tasks, n_shards, shard_size),
+                shard_size, digest,
+            )
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _reject_disk_unsupported_z_train_source(z_train_source: str) -> None:
@@ -304,7 +301,7 @@ def _reject_disk_unsupported_z_train_source(z_train_source: str) -> None:
         )
 
 
-@hydra.main(config_path="../conf", config_name="config", version_base=None)
+@hydra.main(config_path=config_dir(__file__), config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     device  = "cuda" if torch.cuda.is_available() else "cpu"
     pit_dir = cfg.data.pit_dir
@@ -346,6 +343,7 @@ def main(cfg: DictConfig) -> None:
     tabicl_split_calib_frac = (
         float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
     )
+    ckpt = None
     if z_train_source in ("tabicl", "tabicl_split"):
         from pit import load_tabicl, resolve_pit_ckpt
 
@@ -378,6 +376,16 @@ def main(cfg: DictConfig) -> None:
         print(f"Building {z_train_source} marginal for data.z_train_source={z_train_source} on {device}")
         marginal_regressor = make_regressor(marginal_backend, device=device)
 
+    manifest = ensure_manifest(pit_dir, generation_spec(cfg, ckpt))
+    for name in os.listdir(pit_dir):
+        if name.startswith("shard_") and name.endswith(".pt"):
+            try:
+                index = int(name[6:-3])
+            except ValueError:
+                continue
+            if index < 0 or index >= n_shards:
+                raise ValueError(f"out-of-range shard in {pit_dir}: {name}")
+
     worker_shard_idxs = range(worker_id, n_shards, num_workers)
     n_tasks_this_worker = sum(min(B, n_tasks - i * B) for i in worker_shard_idxs)
 
@@ -394,7 +402,7 @@ def main(cfg: DictConfig) -> None:
     # was fine for a lone process starting fresh, but here it would stomp a
     # sibling worker's already-accurate count of shards it wrote before this
     # process (re)started. See _scan_meta_total.
-    _write_meta(pit_dir, _scan_meta_total(pit_dir, n_tasks, n_shards, B), B)
+    _refresh_meta(pit_dir, n_tasks, n_shards, B, manifest["digest"])
 
     with tqdm(total=n_tasks_this_worker, desc=f"episodes[w{worker_id}]", unit="ep") as pbar:
         for shard_idx in worker_shard_idxs:
@@ -406,8 +414,13 @@ def main(cfg: DictConfig) -> None:
             n_this = min(B, n_tasks - shard_idx * B)
 
             if cfg.data.resume and os.path.exists(out_path):
-                pbar.update(n_this)
-                continue
+                if shard_count_path(out_path).is_file():
+                    count, _ = verified_shard_digest(out_path, require_match=True)
+                    if count != n_this:
+                        raise ValueError(f"cannot resume {out_path}: expected {n_this} episodes, found {count}")
+                    pbar.update(n_this)
+                    continue
+                print(f"  [resume] {out_path} has no completed sidecar; regenerating it")
 
             # generate_gp_batch reads cfg.seed to seed torch's RNG; vary it per
             # shard so shards don't restart from the identical RNG state.
@@ -433,6 +446,8 @@ def main(cfg: DictConfig) -> None:
             for ep in episodes:
                 ep.pop("R_prior", None)
                 ep.pop("Sigma_star", None)
+            if len(episodes) != n_this:
+                raise ValueError(f"generator returned {len(episodes)} episodes; expected {n_this}")
             _save_shard_atomic(episodes, out_path)
 
             pbar.update(n_this)
@@ -440,7 +455,7 @@ def main(cfg: DictConfig) -> None:
             # n_total must never claim a shard that isn't fully on disk yet.
             # Rescanned from disk (not this worker's local n_this sum) so
             # sibling workers' concurrently-written shards are reflected too.
-            _write_meta(pit_dir, _scan_meta_total(pit_dir, n_tasks, n_shards, B), B)
+            _refresh_meta(pit_dir, n_tasks, n_shards, B, manifest["digest"])
 
             # Periodic cache trim: P/N (context length T) are resampled per
             # shard from wide, independent ranges, so the CUDA allocator sees

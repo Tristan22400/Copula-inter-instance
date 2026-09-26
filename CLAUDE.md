@@ -2,9 +2,9 @@
   # 1. Generate PIT episodes. data.z_train_source selects the marginal:
   #    analytic (oracle) | tabicl | tabicl_split | exaone | tabpfn | tabldm.
   #    Non-TabICL backends need no GPU here (unlike live generation), just time.
-  python src/generate_pit_dataset.py dataset.n_episodes=5000
+  python src/generate_pit_dataset.py data.n_tasks=5000 data.dataset_dir=./data/pilot
   # 2. Train
-  python src/train.py training.dataset_dir=./data/pit_episodes
+  python src/train.py training.live_generation=false training.dataset_dir=./data/pilot/pit
   # 3. Evaluate vs. classical baselines (synthetic GP episodes). Defaults to
   #    --z_train_source tabicl (K-fold TabICL PIT context, matching real
   #    deployment) so the total marginal+copula NLL table is populated;

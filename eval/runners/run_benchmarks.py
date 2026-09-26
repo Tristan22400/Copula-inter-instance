@@ -59,6 +59,7 @@ from eval.viz.correlation_plots import (  # noqa: E402
     plot_correlation_vs_distance,
 )
 from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_json  # noqa: E402
+from eval.results import require_coverage  # noqa: E402
 
 BENCHMARK_NAMES = ["spatial_housing", "sensor_imputation", "synthetic_bbo"]
 # TabICL's own native quantile-grid density (p_j = j/1001), used as the
@@ -174,7 +175,13 @@ def main() -> None:
     parser.add_argument("--benchmarks", default=",".join(BENCHMARK_NAMES))
     parser.add_argument("--out_dir", default=os.path.join(_REPO_ROOT, "eval", "results"))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--max_failed_fraction", type=float, default=0.0,
+        help="Maximum failed-episode fraction before exiting nonzero (1.0 allows exploratory partial runs).",
+    )
     args = parser.parse_args()
+    if not 0 <= args.max_failed_fraction <= 1:
+        parser.error("--max_failed_fraction must lie in [0, 1]")
 
     device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
         args.device if args.device != "auto" else "cpu"
@@ -200,6 +207,7 @@ def main() -> None:
     print(f"synthetic_bbo composite_exclude_kernels (from checkpoint cfg): {exclude_kernels}")
 
     all_records: list[dict] = []
+    failed_episodes = 0
     heatmap_saved: set[str] = set()
     results_path = os.path.join(args.out_dir, "benchmark_results.json")
 
@@ -214,9 +222,16 @@ def main() -> None:
                     benchmark_name, episode_seed, tabicl_reg, copula_model, args.n_samples, rng,
                     cfg,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 print(f"  [episode {ep}] FAILED:", flush=True)
                 traceback.print_exc()
+                failed_episodes += 1
+                all_records.append({
+                    "benchmark": benchmark_name, "seed": episode_seed,
+                    "method": "__episode__", "status": "failed",
+                    "error": repr(exc),
+                })
+                save_results_json(all_records, results_path)
                 continue
 
             all_records.extend(records)
@@ -248,6 +263,9 @@ def main() -> None:
 
     print()
     print_markdown_summary(all_records)
+    attempted = len(benchmark_names) * args.num_episodes
+    print(f"Episode completion: {attempted - failed_episodes}/{attempted}")
+    require_coverage(attempted - failed_episodes, attempted, 1 - args.max_failed_fraction)
 
 
 if __name__ == "__main__":

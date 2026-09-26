@@ -1,0 +1,45 @@
+name: CPU checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: cpu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      WANDB_MODE: disabled
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - name: Install project
+        run: uv sync --locked --extra dev --extra cpu
+      - name: Syntax and import smoke
+        run: |
+          uv run --no-sync python -m compileall -q src eval inference tests
+          uv run --no-sync python -c "import data_gen, train, eval.runners.eval_checkpoint, inference.copula_inference"
+      - name: Fast CPU regression tests
+        run: |
+          uv run --no-sync python -m pytest -q --disable-warnings --durations=15 \
+            tests/test_lowrank_nll.py tests/test_loss.py \
+            tests/test_correlation_factory.py tests/test_corr_kl.py \
+            tests/test_pit_batched.py tests/test_resume_checkpoint.py \
+            tests/test_train_oom_cleanup.py tests/test_eval_checkpoint.py \
+            tests/test_copula_inference.py tests/test_model_config_presets.py \
+            tests/test_z_train_source_validation.py tests/test_tabldm_shape_groups.py \
+            tests/test_calibration_math.py tests/test_engineering_contracts.py

@@ -54,6 +54,8 @@ for _p in (_HERE, _REPO_ROOT, os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
         sys.path.insert(0, _p)
 
 from data_gen import generate_gp_batch  # noqa: E402
+from artifacts import atomic_torch_save
+from config_path import config_dir
 from marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0  # noqa: E402
 from marginal_backbones import MarginalBackbone  # noqa: E402
 from marginal_backbones import (  # noqa: E402
@@ -63,7 +65,7 @@ from marginal_backbones import (  # noqa: E402
     resolve_tier,
 )
 from pit import load_tabicl  # noqa: E402
-from train import cosine_lr_lambda  # noqa: E402
+from training_core import cosine_lr_lambda  # noqa: E402
 
 
 
@@ -1182,7 +1184,7 @@ def save_marginal_checkpoint(
         payload["cfg"] = OmegaConf.to_container(cfg, resolve=True)
     if extra:
         payload.update(extra)
-    torch.save(payload, path)
+    atomic_torch_save(payload, path)
 
 
 # ---------------------------------------------------------------------------
@@ -1332,7 +1334,7 @@ def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
 # ---------------------------------------------------------------------------
 
 
-@hydra.main(config_path="../conf", config_name="finetune_marginal", version_base=None)
+@hydra.main(config_path=config_dir(__file__), config_name="finetune_marginal", version_base=None)
 def main(cfg: DictConfig) -> None:
     device = _resolve_device(str(cfg.training.device))
     torch.set_float32_matmul_precision(str(cfg.training.matmul_precision))

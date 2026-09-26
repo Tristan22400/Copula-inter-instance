@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import math
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -297,6 +296,7 @@ def plot_prediction_comparison(
     Returns:
         matplotlib Figure with n_instances × 5 subplots.
     """
+    import matplotlib.pyplot as plt
     import seaborn as sns
 
     print(mu_pred.shape, D_pred.shape, V_pred.shape, "pred")

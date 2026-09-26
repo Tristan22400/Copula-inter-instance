@@ -55,6 +55,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from tabicl._model.tabicl import TabICL  # type: ignore[import]
+from backend_registry import COPULA_BACKBONES
 
 __all__ = [
     "BACKBONE_NAMES",
@@ -63,7 +64,7 @@ __all__ = [
     "moe_aux_loss",
 ]
 
-BACKBONE_NAMES: tuple[str, ...] = ("tabicl", "tabldm")
+BACKBONE_NAMES: tuple[str, ...] = COPULA_BACKBONES
 
 
 # ---------------------------------------------------------------------------
