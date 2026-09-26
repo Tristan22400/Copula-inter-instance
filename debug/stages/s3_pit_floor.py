@@ -10,6 +10,7 @@ Usage:
     python debug/run_debug.py s3
     python debug/stages/s3_pit_floor.py --n-episodes 20 --m-samples 2048
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,9 +26,9 @@ from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 def _build_quantile_dist(tabicl_model, x_train: torch.Tensor, y_train_scaled: torch.Tensor, x_test: torch.Tensor):
     """One TabICL forward -> quantile distribution with batch_shape (N,)."""
     X_concat = torch.cat([x_train, x_test], dim=0).unsqueeze(0)  # (1, P+N, d_x)
-    y_train_batch = y_train_scaled.unsqueeze(0)                   # (1, P)
+    y_train_batch = y_train_scaled.unsqueeze(0)  # (1, P)
     with torch.no_grad():
-        logits = tabicl_model(X_concat, y_train_batch)            # (1, N, Q)
+        logits = tabicl_model(X_concat, y_train_batch)  # (1, N, Q)
     logits = logits.to(x_test.device)
     N, Q = logits.shape[1], logits.shape[-1]
     return tabicl_model.quantile_dist(logits.reshape(N, Q))
@@ -52,12 +53,12 @@ def sample_and_pit(tabicl_model, episode: dict, post: dict, M: int, device: str)
     N = mu_post.shape[0]
     L = _safe_cholesky(Sigma_post.unsqueeze(0)).squeeze(0)
     eps = torch.randn(N, M, device=device)
-    y_samples = mu_post.unsqueeze(-1) + L @ eps            # (N, M), raw y-space
+    y_samples = mu_post.unsqueeze(-1) + L @ eps  # (N, M), raw y-space
 
     y_samples_scaled = (y_samples - y_mean) / y_std
     with torch.no_grad():
-        u = dist.cdf(y_samples_scaled)                      # (N, M)
-    return _probit(u)                                        # (N, M)
+        u = dist.cdf(y_samples_scaled)  # (N, M)
+    return _probit(u)  # (N, M)
 
 
 def _shrunk_correlation(z_fit: torch.Tensor) -> tuple[torch.Tensor, float]:
@@ -104,21 +105,26 @@ def run(dcfg: DebugConfig, M: int = 2048, m_fit: int = None, rank: int = 32) -> 
 
         ceiling_per_ep, _ = fit_rank_ceiling(R_z.unsqueeze(0), min(rank, N - 1), jitter=jitter, device=dcfg.device)
 
-        per_episode.append({
-            "n_test": N,
-            "floor_copula_nll_on_Rz": float(floor_nll.item()),
-            "copula_nll_of_Rpost_on_pit_z": float(r_post_on_pit_nll.item()),
-            "rank_ceiling_on_Rz": float(ceiling_per_ep.item()),
-            "Rz_shrinkage_coefficient": shrinkage,
-            "Rz_vs_Rpost_pearson": pearson,
-            "Rz_vs_Rpost_mae": float(np.abs(off_z - off_post).mean()),
-        })
+        per_episode.append(
+            {
+                "n_test": N,
+                "floor_copula_nll_on_Rz": float(floor_nll.item()),
+                "copula_nll_of_Rpost_on_pit_z": float(r_post_on_pit_nll.item()),
+                "rank_ceiling_on_Rz": float(ceiling_per_ep.item()),
+                "Rz_shrinkage_coefficient": shrinkage,
+                "Rz_vs_Rpost_pearson": pearson,
+                "Rz_vs_Rpost_mae": float(np.abs(off_z - off_post).mean()),
+            }
+        )
 
     def _mean(key):
         return float(np.mean([e[key] for e in per_episode]))
 
     return {
-        "M": M, "m_fit": m_fit, "rank": rank, "n_episodes_scored": len(per_episode),
+        "M": M,
+        "m_fit": m_fit,
+        "rank": rank,
+        "n_episodes_scored": len(per_episode),
         "summary": {
             "floor_copula_nll_on_Rz_mean": _mean("floor_copula_nll_on_Rz"),
             "copula_nll_of_Rpost_on_pit_z_mean": _mean("copula_nll_of_Rpost_on_pit_z"),
@@ -139,8 +145,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     result = run(dcfg, M=args.m_samples, rank=args.rank)
     if "error" in result:

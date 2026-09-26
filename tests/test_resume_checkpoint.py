@@ -1,13 +1,13 @@
 """Tests for checkpoint loading and resuming the LR schedule.
 
-  1. load_checkpoint restores model weights.
-  2. It leaves optimizer state alone unless an optimizer is passed.
-  3. It has no scheduler parameter.
-  4. It returns the saved step (0 without one).
-  5. A missing path raises FileNotFoundError.
-  6. It loads through torch.compile's _orig_mod.
-  7. cosine_lr_lambda holds at the floor past the end.
-  8. LambdaLR with last_epoch=start_step-1 matches an uninterrupted run.
+1. load_checkpoint restores model weights.
+2. It leaves optimizer state alone unless an optimizer is passed.
+3. It has no scheduler parameter.
+4. It returns the saved step (0 without one).
+5. A missing path raises FileNotFoundError.
+6. It loads through torch.compile's _orig_mod.
+7. cosine_lr_lambda holds at the floor past the end.
+8. LambdaLR with last_epoch=start_step-1 matches an uninterrupted run.
 """
 
 from __future__ import annotations
@@ -152,9 +152,7 @@ def test_resume_continues_cosine_schedule_instead_of_restarting():
     resumed_opt = make_optimizer()
     for group in resumed_opt.param_groups:
         group["initial_lr"] = base_lr
-    resumed_sched = torch.optim.lr_scheduler.LambdaLR(
-        resumed_opt, lr_lambda=lr_lambda, last_epoch=resume_step - 1
-    )
+    resumed_sched = torch.optim.lr_scheduler.LambdaLR(resumed_opt, lr_lambda=lr_lambda, last_epoch=resume_step - 1)
 
     assert resumed_sched.get_last_lr() == pytest.approx(uninterrupted_sched.get_last_lr())
     # Mid-decay, not the warmup-start LR.

@@ -72,13 +72,18 @@ def morans_i(field: np.ndarray) -> float:
     cross_v = x[:-1, :] * x[1:, :]
     n_edges = cross_h.size + cross_v.size
     numerator = cross_h.sum() + cross_v.sum()
-    denominator = (x ** 2).sum()
+    denominator = (x**2).sum()
     return float(field.size * numerator / (n_edges * denominator))
 
 
 def sample_copula_residual_fields(
-    tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
-    coords_test: np.ndarray, R_context: np.ndarray, device: str, z_shared_batch: np.ndarray,
+    tabicl_marginal,
+    context_coords: np.ndarray,
+    context_values: np.ndarray,
+    coords_test: np.ndarray,
+    R_context: np.ndarray,
+    device: str,
+    z_shared_batch: np.ndarray,
 ) -> np.ndarray:
     """K joint draws (K, D) from the copula model: y_k = F^{-1}(Phi(L z_shared_batch[k])), L = chol(R_context).
 
@@ -124,12 +129,22 @@ def pool_yspace_samples_and_correlate(samples_per_day: list) -> np.ndarray:
 
 
 def predict_copula_residual_field(
-    tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
-    coords_test: np.ndarray, R_context: np.ndarray, device: str, z_shared: np.ndarray,
+    tabicl_marginal,
+    context_coords: np.ndarray,
+    context_values: np.ndarray,
+    coords_test: np.ndarray,
+    R_context: np.ndarray,
+    device: str,
+    z_shared: np.ndarray,
 ) -> np.ndarray:
     """One draw (D,) from the copula model (sample_copula_residual_fields with K=1)."""
     return sample_copula_residual_fields(
-        tabicl_marginal, context_coords, context_values, coords_test, R_context, device,
+        tabicl_marginal,
+        context_coords,
+        context_values,
+        coords_test,
+        R_context,
+        device,
         np.asarray(z_shared)[None, :],
     )[0]
 
@@ -140,20 +155,26 @@ def load_marginal_tabicl(cfg, device: str):
 
     source = resolve_pit_ckpt(cfg)
     if source is None:
-        print("Warning: cfg.tabicl.pretrained=False and no pit_ckpt set — "
-              "no usable marginal for PIT; context z_train will fall back "
-              "to naive standardization.")
+        print(
+            "Warning: cfg.tabicl.pretrained=False and no pit_ckpt set — "
+            "no usable marginal for PIT; context z_train will fall back "
+            "to naive standardization."
+        )
         return None
 
     try:
         return load_tabicl(source, device)
     except Exception as exc:  # noqa: BLE001
-        print(f"Warning: failed to load marginal '{source}' ({exc}); "
-              "context z_train will fall back to naive standardization.")
+        print(
+            f"Warning: failed to load marginal '{source}' ({exc}); "
+            "context z_train will fall back to naive standardization."
+        )
         return None
 
 
-def _forward_correlation(model, device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray) -> np.ndarray:
+def _forward_correlation(
+    model, device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray
+) -> np.ndarray:
     """Model forward (x_train, z_train, x_test) -> dense Sigma."""
     import torch
 
@@ -183,7 +204,11 @@ def extract_model_dummy_context_correlation(model, device, coords_test: np.ndarr
 
 
 def compute_context_z_train(
-    x_train_norm: np.ndarray, context_values: np.ndarray, tabicl_marginal, device: str, k_folds: int = 10,
+    x_train_norm: np.ndarray,
+    context_values: np.ndarray,
+    tabicl_marginal,
+    device: str,
+    k_folds: int = 10,
 ) -> np.ndarray:
     """K-fold PIT z_train of a real context sample under tabicl_marginal (standardized values when it is None)."""
     if tabicl_marginal is None:
@@ -200,15 +225,25 @@ def compute_context_z_train(
     context_values_scaled_t, _, _, _ = normalize_targets(context_values_t)
     Y_train_t = context_values_scaled_t.unsqueeze(-1)  # (P, 1)
     pit_out = run_pit(
-        tabicl_marginal, X_train_t, Y_train_t, X_train_t[:1], Y_train_t[:1], k_folds=k_folds,
+        tabicl_marginal,
+        X_train_t,
+        Y_train_t,
+        X_train_t[:1],
+        Y_train_t[:1],
+        k_folds=k_folds,
         Y_train_raw=context_values_t.unsqueeze(-1),
     )
     return pit_out["z_train"].squeeze(-1).cpu().numpy()  # (P,)
 
 
 def extract_model_context_correlation(
-    model, device, tabicl_marginal, context_coords: np.ndarray, context_values: np.ndarray,
-    coords_test: np.ndarray, k_folds: int = 10,
+    model,
+    device,
+    tabicl_marginal,
+    context_coords: np.ndarray,
+    context_values: np.ndarray,
+    coords_test: np.ndarray,
+    k_folds: int = 10,
 ) -> np.ndarray:
     """Model correlation at coords_test given a real context sample (z_train from compute_context_z_train)."""
     from inference.copula_inference import normalize_features
@@ -225,13 +260,17 @@ def _exact_gp_loo_z_train(K_ff: np.ndarray, y: np.ndarray) -> np.ndarray:
     L = safe_cholesky(K_ff)
     alpha = cho_solve((L, True), y)
     L_inv = solve_triangular(L, np.eye(L.shape[0]), lower=True)
-    K_inv_diag = np.clip(np.sum(L_inv ** 2, axis=0), 1e-12, None)
+    K_inv_diag = np.clip(np.sum(L_inv**2, axis=0), 1e-12, None)
     return alpha / np.sqrt(K_inv_diag)
 
 
 def extract_model_true_z_train_correlation(
-    model, device, context_coords: np.ndarray, K_ff_context: np.ndarray,
-    context_values: np.ndarray, coords_test: np.ndarray,
+    model,
+    device,
+    context_coords: np.ndarray,
+    K_ff_context: np.ndarray,
+    context_values: np.ndarray,
+    coords_test: np.ndarray,
 ) -> np.ndarray:
     """Model correlation conditioned on the exact GP LOO z_train (synthetic mode only)."""
     from inference.copula_inference import normalize_features
@@ -242,7 +281,10 @@ def extract_model_true_z_train_correlation(
 
 
 def sample_simple_kernel_covariance(
-    cfg, coordinates: np.ndarray, kernel_name: "str | None" = None, seed: "int | None" = None,
+    cfg,
+    coordinates: np.ndarray,
+    kernel_name: "str | None" = None,
+    seed: "int | None" = None,
 ) -> "tuple[np.ndarray, str]":
     """Covariance of one elementary data_gen kernel (random or given) at standardized coordinates, with hyperparameters from the training priors.
 
@@ -268,7 +310,8 @@ def sample_simple_kernel_covariance(
     if kernel_name is None:
         # Exclude kernels without a lengthscale, and cosine for k > 1.
         candidates = [
-            name for name in _COMPOSABLE_KERNELS
+            name
+            for name in _COMPOSABLE_KERNELS
             if name not in ("dot_product", "polynomial") and not (k > 1 and name in _SCALAR_ONLY_KERNELS)
         ]
         kernel_name = _random.choice(candidates)
@@ -284,7 +327,14 @@ def sample_simple_kernel_covariance(
 
 
 def build_synthetic_grid_task(
-    cfg, kernel_name: str, grid_size: int, n_context: int, n_bins: int, seed: int, *, min_context: int = 1,
+    cfg,
+    kernel_name: str,
+    grid_size: int,
+    n_context: int,
+    n_bins: int,
+    seed: int,
+    *,
+    min_context: int = 1,
 ) -> dict:
     """Synthetic task: grid_size x grid_size grid on [-1000, 1000]^2, one sampled covariance, distance/bin/pair-count arrays and a context sample.
 
@@ -382,7 +432,7 @@ def exponential_law(r: np.ndarray, L: float) -> np.ndarray:
 def gaussian_law(r: np.ndarray, L: float) -> np.ndarray:
     """rho(r) = exp(-r^2 / (2 L^2)) — Matern nu -> infinity."""
     r = np.asarray(r, dtype=np.float64)
-    return np.exp(-(r ** 2) / (2.0 * L ** 2))
+    return np.exp(-(r**2) / (2.0 * L**2))
 
 
 def matern_law(r: np.ndarray, L: float, nu: float) -> np.ndarray:
@@ -391,7 +441,7 @@ def matern_law(r: np.ndarray, L: float, nu: float) -> np.ndarray:
     out = np.ones_like(r)
     nz = r > 0
     x = r[nz] / L
-    out[nz] = (2.0 ** (1.0 - nu) / gamma_fn(nu)) * (x ** nu) * bessel_k(nu, x)
+    out[nz] = (2.0 ** (1.0 - nu) / gamma_fn(nu)) * (x**nu) * bessel_k(nu, x)
     return out
 
 
@@ -405,7 +455,7 @@ def rational_quadratic_law(r: np.ndarray, L: float, alpha: float) -> np.ndarray:
     """rho(r) = (1 + r^2 / (2 alpha L^2))^(-alpha) — a scale mixture of
     Gaussian kernels with Gamma-distributed lengthscales."""
     r = np.asarray(r, dtype=np.float64)
-    return (1.0 + (r ** 2) / (2.0 * alpha * L ** 2)) ** (-alpha)
+    return (1.0 + (r**2) / (2.0 * alpha * L**2)) ** (-alpha)
 
 
 # name -> (callable(r, *params), ordered param names)
@@ -449,7 +499,10 @@ def _correlation_length_guess(dist_centers: np.ndarray, rho: np.ndarray) -> floa
 
 
 def fit_theoretical_law(
-    dist_centers: np.ndarray, rho_emp: np.ndarray, pair_counts: np.ndarray, model: str,
+    dist_centers: np.ndarray,
+    rho_emp: np.ndarray,
+    pair_counts: np.ndarray,
+    model: str,
 ) -> "dict | None":
     """Weighted (sqrt(pair_counts)) least-squares fit of a decay law to the binned empirical curve; None if the fit fails."""
     if model not in THEORY_LAWS:
@@ -479,7 +532,7 @@ def fit_theoretical_law(
     pred = law_fn(d, *popt)
     resid = r - pred
     weighted_ss_res = float(np.sum((resid / sigma) ** 2))
-    r_bar = np.average(r, weights=1.0 / sigma ** 2)
+    r_bar = np.average(r, weights=1.0 / sigma**2)
     weighted_ss_tot = float(np.sum(((r - r_bar) / sigma) ** 2))
     r_squared = 1.0 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot > 0 else float("nan")
 

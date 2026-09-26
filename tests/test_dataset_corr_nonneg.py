@@ -26,11 +26,7 @@ _SEED = 0
 
 
 def _iter_episodes(folder: str):
-    paths = sorted(
-        os.path.join(folder, f)
-        for f in os.listdir(folder)
-        if f.endswith(".pt") and f != "meta.pt"
-    )
+    paths = sorted(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".pt") and f != "meta.pt")
     for p in paths:
         obj = torch.load(p, map_location="cpu", weights_only=False)
         if isinstance(obj, list):
@@ -101,9 +97,7 @@ def test_correlations_not_saturated(off_diag):
 def test_correlations_not_all_near_zero(off_diag):
     """Most entries near-zero (matrix ~= identity) means R_star carries no signal."""
     frac_near_zero = (off_diag.abs() < 0.02).float().mean().item()
-    assert frac_near_zero < 0.85, (
-        f"{frac_near_zero:.1%} of entries are ~0 — R_star looks like a matrix full of 0s"
-    )
+    assert frac_near_zero < 0.85, f"{frac_near_zero:.1%} of entries are ~0 — R_star looks like a matrix full of 0s"
 
 
 def test_correlations_std_nonzero(off_diag):
@@ -121,9 +115,7 @@ def test_unit_diagonal(dataset_dir):
     for i, ep in enumerate(episodes[:20]):
         R = ep["R_star"]
         diag_err = (R.diagonal() - 1.0).abs().max().item()
-        assert diag_err < 1e-4, (
-            f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
-        )
+        assert diag_err < 1e-4, f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
 
 
 def test_r_star_well_conditioned(min_eigenvalues):
@@ -137,6 +129,4 @@ def test_r_star_well_conditioned(min_eigenvalues):
 
 def test_r_star_psd(min_eigenvalues):
     neg = [v for v in min_eigenvalues if v < -1e-5]
-    assert len(neg) == 0, (
-        f"{len(neg)} episodes have negative min eigenvalue (most negative: {min(neg):.2e})"
-    )
+    assert len(neg) == 0, f"{len(neg)} episodes have negative min eigenvalue (most negative: {min(neg):.2e})"

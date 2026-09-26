@@ -1,8 +1,8 @@
 """Tests composing the conf/model presets through Hydra.
 
-  1. copula_prod resolves to the pretrained backbone settings.
-  2. copula_nano resolves to the shrunk from-scratch backbone with a pit_ckpt.
-  3. copula_nano builds and runs a forward on CPU (per parametrization too).
+1. copula_prod resolves to the pretrained backbone settings.
+2. copula_nano resolves to the shrunk from-scratch backbone with a pit_ckpt.
+3. copula_nano builds and runs a forward on CPU (per parametrization too).
 """
 
 from __future__ import annotations
@@ -92,9 +92,7 @@ def test_copula_head_accepts_half_precision_backbone_features():
     assert torch.isfinite(out["W"]).all()
 
 
-@pytest.mark.parametrize(
-    "parametrization", ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
-)
+@pytest.mark.parametrize("parametrization", ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"])
 def test_copula_nano_builds_and_runs_forward_per_parametrization(parametrization):
     """copula_nano builds and runs for every correlation_parametrization."""
     cfg = _compose("copula_nano")

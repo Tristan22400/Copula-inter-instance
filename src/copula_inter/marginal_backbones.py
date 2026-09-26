@@ -73,9 +73,7 @@ MAX_TIER: dict[str, int] = {name: spec.max_tier for name, spec in BACKENDS.items
 def resolve_tier(backbone_name: str, tier: int) -> int:
     """Return tier if backbone_name supports it, else raise ValueError."""
     if backbone_name not in MAX_TIER:
-        raise ValueError(
-            f"Unknown marginal backbone {backbone_name!r}; expected one of {list(BACKBONE_NAMES)}."
-        )
+        raise ValueError(f"Unknown marginal backbone {backbone_name!r}; expected one of {list(BACKBONE_NAMES)}.")
     top = MAX_TIER[backbone_name]
     if tier > top:
         raise ValueError(
@@ -144,8 +142,11 @@ class MarginalBackbone:
 
     # -- gradient-carrying quantile forward -----------------------------------
     def quantile_forward(
-        self, X_context: Sequence[np.ndarray], y_context: Sequence[np.ndarray],
-        X_query: Sequence[np.ndarray], probs: "np.ndarray | None" = None,
+        self,
+        X_context: Sequence[np.ndarray],
+        y_context: Sequence[np.ndarray],
+        X_query: Sequence[np.ndarray],
+        probs: "np.ndarray | None" = None,
     ) -> torch.Tensor:
         """(B, n_query, Q) quantiles in raw y units, with gradients.
 
@@ -165,9 +166,7 @@ class MarginalBackbone:
             if own is not None:
                 return own
             probs = self.native_probs
-        return QuantileToDistribution(alpha_levels=list(probs)).to(
-            next(self.module.parameters()).device
-        )
+        return QuantileToDistribution(alpha_levels=list(probs)).to(next(self.module.parameters()).device)
 
     # -- checkpointing ---------------------------------------------------------
     def save(self, path: str, *, step: int, cfg=None, extra: Optional[dict] = None) -> None:
@@ -216,9 +215,7 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
     from eval.spatial.tabldm_batched import _episode_member_batch, _group_episode_batches
 
     B = len(X_context)
-    per_episode = [
-        _episode_member_batch(bb.handle, X_context[b], y_context[b], X_query[b]) for b in range(B)
-    ]
+    per_episode = [_episode_member_batch(bb.handle, X_context[b], y_context[b], X_query[b]) for b in range(B)]
     device = next(bb.module.parameters()).device
     banks = [None] * B
     for indices in _group_episode_batches(per_episode):
@@ -227,11 +224,19 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
         ys = torch.from_numpy(np.concatenate([per_episode[b][1] for b in indices], axis=0)).float().to(device)
 
         # Same forward as the regressor, with autograd enabled.
-        kwargs = {"output_type": "raw_quantiles"} if probs is None else {
-            "output_type": "quantiles", "alphas": list(probs),
-        }
+        kwargs = (
+            {"output_type": "raw_quantiles"}
+            if probs is None
+            else {
+                "output_type": "quantiles",
+                "alphas": list(probs),
+            }
+        )
         out = bb.module.predict_stats(
-            xs, ys, inference_config=bb.handle.inference_config_, **kwargs,
+            xs,
+            ys,
+            inference_config=bb.handle.inference_config_,
+            **kwargs,
         )
         out = out.reshape(len(indices), members, -1, out.shape[-1])
 
@@ -271,15 +276,14 @@ def _exaone_grad_forward(
             )
 
     use_ckpt = (
-        bb.exaone_activation_checkpointing and torch.is_grad_enabled()
+        bb.exaone_activation_checkpointing
+        and torch.is_grad_enabled()
         and any(p.requires_grad for p in bb.module.parameters())
     )
     total_members = support.shape[0]
     if total_members <= chunk_size:
         if use_ckpt:
-            return checkpoint(
-                _model_call, support, label, query, use_reentrant=False
-            )
+            return checkpoint(_model_call, support, label, query, use_reentrant=False)
         return _model_call(support, label, query)
 
     chunks = []
@@ -289,11 +293,7 @@ def _exaone_grad_forward(
         sub_l = label[start:stop]
         sub_q = query[start:stop]
         if use_ckpt:
-            chunks.append(
-                checkpoint(
-                    _model_call, sub_s, sub_l, sub_q, use_reentrant=False
-                )
-            )
+            chunks.append(checkpoint(_model_call, sub_s, sub_l, sub_q, use_reentrant=False))
         else:
             chunks.append(_model_call(sub_s, sub_l, sub_q))
     return torch.cat(chunks, dim=0)
@@ -303,9 +303,7 @@ def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
     from eval.spatial.exaone_batched import _episode_member_batch
 
     B = len(X_context)
-    per_episode = [
-        _episode_member_batch(bb.handle, X_context[b], y_context[b], X_query[b]) for b in range(B)
-    ]
+    per_episode = [_episode_member_batch(bb.handle, X_context[b], y_context[b], X_query[b]) for b in range(B)]
     n_passes = len(per_episode[0][0])
     device = next(bb.module.parameters()).device
 
@@ -331,8 +329,11 @@ def _exaone_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
     # Interpolate EXAONE's native grid onto probs differentiably.
     native_n = bank.shape[-1]
     native = torch.linspace(
-        1.0 / (native_n + 1), native_n / (native_n + 1), native_n,
-        device=bank.device, dtype=bank.dtype,
+        1.0 / (native_n + 1),
+        native_n / (native_n + 1),
+        native_n,
+        device=bank.device,
+        dtype=bank.dtype,
     )
     return _interp_last_dim(bank, native, torch.as_tensor(probs, device=bank.device, dtype=bank.dtype))
 
@@ -393,10 +394,7 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
     if ckpt:
         payload = torch.load(ckpt, map_location=device, weights_only=False)
         if payload.get("backbone") not in (None, name):
-            raise ValueError(
-                f"checkpoint {ckpt} was written for backbone {payload.get('backbone')!r}, "
-                f"not {name!r}."
-            )
+            raise ValueError(f"checkpoint {ckpt} was written for backbone {payload.get('backbone')!r}, not {name!r}.")
         module.load_state_dict(payload["state_dict"], strict=True)
     return MarginalBackbone(name=name, module=module, handle=regressor, config={})
 
@@ -433,9 +431,15 @@ def assert_patterns_match(module: nn.Module, patterns: Sequence[str]) -> dict[st
 
 
 def kfold_quantiles_grad(
-    backbone: "MarginalBackbone", x_train: torch.Tensor, y_train_scaled: torch.Tensor,
-    x_test: torch.Tensor, y_test_scaled: torch.Tensor, *, k_folds: int,
-    probs: "np.ndarray | None" = None, fold_subset: Optional[Sequence[int]] = None,
+    backbone: "MarginalBackbone",
+    x_train: torch.Tensor,
+    y_train_scaled: torch.Tensor,
+    x_test: torch.Tensor,
+    y_test_scaled: torch.Tensor,
+    *,
+    k_folds: int,
+    probs: "np.ndarray | None" = None,
+    fold_subset: Optional[Sequence[int]] = None,
 ) -> dict:
     """run_pit_batched_grad for non-TabICL backbones: returns q_test, q_train and train_query_idx.
 
@@ -453,7 +457,10 @@ def kfold_quantiles_grad(
     xte = x_test.detach().cpu().numpy()
 
     q_test = backbone.quantile_forward(
-        [xtr[b] for b in range(B)], [ytr[b] for b in range(B)], [xte[b] for b in range(B)], probs,
+        [xtr[b] for b in range(B)],
+        [ytr[b] for b in range(B)],
+        [xte[b] for b in range(B)],
+        probs,
     )
 
     wanted = range(K) if fold_subset is None else sorted({int(k) for k in fold_subset})
@@ -493,18 +500,14 @@ def kfold_quantiles_grad(
             if ctx.size == 0:
                 continue
             q_fold = backbone.quantile_forward(
-                [xtr[b][ctx] for b in range(B)], [ytr[b][ctx] for b in range(B)],
-                [xtr[b][qry] for b in range(B)], probs,
+                [xtr[b][ctx] for b in range(B)],
+                [ytr[b][ctx] for b in range(B)],
+                [xtr[b][qry] for b in range(B)],
+                probs,
             )
             q_train_parts.append(q_fold)
             idx_parts.append(torch.as_tensor(qry, dtype=torch.long, device=q_test.device))
 
-    q_train = (
-        torch.cat(q_train_parts, dim=1) if q_train_parts
-        else q_test.new_zeros((B, 0, q_test.shape[-1]))
-    )
-    train_query_idx = (
-        torch.cat(idx_parts) if idx_parts
-        else torch.zeros(0, dtype=torch.long, device=q_test.device)
-    )
+    q_train = torch.cat(q_train_parts, dim=1) if q_train_parts else q_test.new_zeros((B, 0, q_test.shape[-1]))
+    train_query_idx = torch.cat(idx_parts) if idx_parts else torch.zeros(0, dtype=torch.long, device=q_test.device)
     return {"q_test": q_test, "q_train": q_train, "train_query_idx": train_query_idx}

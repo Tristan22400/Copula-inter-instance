@@ -8,6 +8,7 @@ Usage:
     python debug/run_debug.py s6 --ckpt <name>
     python debug/stages/s6_guards.py --n-episodes 50
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,6 +26,7 @@ from debug.config import DebugConfig, add_common_args, build_config
 def _cholesky_instrumentation():
     """Context manager counting jitter retries and non-finite slices in loss._safe_cholesky (monkey-patched, restored on exit)."""
     from copula_inter import loss as loss_mod
+
     counters = {"cholesky_calls": 0, "safe_cholesky_calls": 0, "escalated_calls": 0, "nonfinite_slices": 0}
     orig_cholesky = torch.linalg.cholesky
     orig_safe_cholesky = loss_mod._safe_cholesky
@@ -65,15 +67,18 @@ def run(dcfg: DebugConfig) -> dict:
 
     with torch.no_grad():
         out = model(batch)
-        W = out["W"].float()                          # (B, N_max, r)
+        W = out["W"].float()  # (B, N_max, r)
         s = out.get("s")
         Sigma = low_rank_correlation(
-            W, s.float() if s is not None else None, batch["test_mask"],
-            jitter=jitter, parametrization=parametrization,
+            W,
+            s.float() if s is not None else None,
+            batch["test_mask"],
+            jitter=jitter,
+            parametrization=parametrization,
         )
 
     mask = batch["test_mask"]
-    W_norm = W.norm(dim=-1)[mask].cpu().numpy()          # ||W_i|| per valid test point
+    W_norm = W.norm(dim=-1)[mask].cpu().numpy()  # ||W_i|| per valid test point
     escape_ratio = None
     if parametrization == "covnorm" and s is not None:
         D = F.softplus(s.float())
@@ -95,11 +100,20 @@ def run(dcfg: DebugConfig) -> dict:
         "sigma_jitter": jitter,
         "W_norm": {"mean": float(W_norm.mean()), "std": float(W_norm.std()), "max": float(W_norm.max())},
         "escape_ratio": (
-            {"mean": float(escape_ratio.mean()), "std": float(escape_ratio.std()),
-             "max": float(escape_ratio.max()), "frac_gt_1": float((escape_ratio > 1).mean())}
-            if escape_ratio is not None else None
+            {
+                "mean": float(escape_ratio.mean()),
+                "std": float(escape_ratio.std()),
+                "max": float(escape_ratio.max()),
+                "frac_gt_1": float((escape_ratio > 1).mean()),
+            }
+            if escape_ratio is not None
+            else None
         ),
-        "sigma_offdiag": {"mean": float(offdiag.mean()), "abs_mean": float(np.abs(offdiag).mean()), "std": float(offdiag.std())},
+        "sigma_offdiag": {
+            "mean": float(offdiag.mean()),
+            "abs_mean": float(np.abs(offdiag).mean()),
+            "std": float(offdiag.std()),
+        },
         "cholesky_calls_total": counters["cholesky_calls"],
         "safe_cholesky_calls_total": counters["safe_cholesky_calls"],
         "safe_cholesky_calls_escalated": counters["escalated_calls"],
@@ -113,8 +127,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     result = run(dcfg)
 
@@ -123,11 +142,17 @@ def main() -> None:
     print(f"  ||W_i||: mean={w['mean']:.4f} std={w['std']:.4f} max={w['max']:.4f}")
     if result["escape_ratio"] is not None:
         e = result["escape_ratio"]
-        print(f"  escape ratio ||W||^2/softplus(s): mean={e['mean']:.4f} std={e['std']:.4f} max={e['max']:.4f} frac>1={e['frac_gt_1']:.4f}")
-        print("    (near 0 = still near init-independence; >1 = the model has actively pushed toward strong correlations)")
+        print(
+            f"  escape ratio ||W||^2/softplus(s): mean={e['mean']:.4f} std={e['std']:.4f} max={e['max']:.4f} frac>1={e['frac_gt_1']:.4f}"
+        )
+        print(
+            "    (near 0 = still near init-independence; >1 = the model has actively pushed toward strong correlations)"
+        )
     sd = result["sigma_offdiag"]
     print(f"  Sigma offdiag: mean={sd['mean']:+.4f} abs_mean={sd['abs_mean']:.4f} std={sd['std']:.4f}")
-    print(f"\n  Cholesky calls (y_space_nll pass): {result['cholesky_calls_total']} over {result['safe_cholesky_calls_total']} _safe_cholesky invocation(s)")
+    print(
+        f"\n  Cholesky calls (y_space_nll pass): {result['cholesky_calls_total']} over {result['safe_cholesky_calls_total']} _safe_cholesky invocation(s)"
+    )
     print(f"  Escalated (needed jitter > 1e-6): {result['safe_cholesky_calls_escalated']}")
     print(f"  Non-finite input slices (identity fallback fired): {result['nonfinite_input_slices']}")
 

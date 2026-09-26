@@ -74,5 +74,10 @@ def tabicl_loo_pit(
 
     return kfold_loo_pit(
         lambda Xc, yc, Xq, _fold: tabicl_quantiles(regressor, Xc, yc, Xq, probs),
-        X_train, y_train, probs, k_folds=k_folds, eps=eps, seed=seed,
+        X_train,
+        y_train,
+        probs,
+        k_folds=k_folds,
+        eps=eps,
+        seed=seed,
     )

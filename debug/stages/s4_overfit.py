@@ -91,7 +91,9 @@ def parse_args() -> argparse.Namespace:
         "tanhnorm, sparse_covnorm — see src/copula_inter/correlation_factory.py.",
     )
     p.add_argument(
-        "--target", choices=["prior", "posterior"], default="prior",
+        "--target",
+        choices=["prior", "posterior"],
+        default="prior",
         help="Correlation to overfit to: R* (prior, unconditioned kernel "
         "correlation -- original behaviour) or R_post (exact GP posterior "
         "conditioned on the context, pit.py::gp_analytical_posterior). "
@@ -99,7 +101,9 @@ def parse_args() -> argparse.Namespace:
         "metadata attached), not --episode.",
     )
     p.add_argument(
-        "--z-source", choices=["oracle", "tabicl"], default="oracle",
+        "--z-source",
+        choices=["oracle", "tabicl"],
+        default="oracle",
         help="How the K realizations' z_test are drawn. 'oracle': exact "
         "z ~ N(0, R) synthetic draws (original behaviour). 'tabicl': draw "
         "y_test ~ N(mu_post, Sigma_post) and PIT each through a frozen "
@@ -161,7 +165,7 @@ def build_synthetic_dataset_from_R(episode: dict, R: torch.Tensor, K: int) -> li
     n_test = R.shape[0]
     L = _safe_cholesky(R)
     eps = torch.randn(n_test, K, device=R.device, dtype=L.dtype)  # (n_test, K)
-    z_samples = (L @ eps).T.cpu()         # (K, n_test) -- realizations are stored/cloned as CPU episode dicts
+    z_samples = (L @ eps).T.cpu()  # (K, n_test) -- realizations are stored/cloned as CPU episode dicts
 
     realizations = []
     for k in range(K):
@@ -192,9 +196,7 @@ def main() -> None:
 
     # Build config from yaml files without Hydra.
     base_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "config.yaml"))
-    model_cfg = OmegaConf.load(
-        os.path.join(_ROOT, "conf", "model", f"{args.model}.yaml")
-    )
+    model_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "model", f"{args.model}.yaml"))
     data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
     # The model presets are `# @package _global_`: merge at the top level.
@@ -257,9 +259,7 @@ def main() -> None:
         if args.z_source == "oracle":
             realizations = build_synthetic_dataset_from_R(episode, R_target, args.k_realizations)
         else:
-            tabicl_model = common.load_frozen_tabicl(
-                common.DebugConfig(cfg=cfg, device=device)
-            )
+            tabicl_model = common.load_frozen_tabicl(common.DebugConfig(cfg=cfg, device=device))
             realizations = build_tabicl_dataset(episode, post, args.k_realizations, tabicl_model, device)
     R_target = R_target.to(device)
 
@@ -285,28 +285,30 @@ def main() -> None:
         b = {k: v.to(device) for k, v in b.items()}
         with torch.no_grad():
             R_batch = R_target.unsqueeze(0).expand(b["z_test"].shape[0], -1, -1)
-            oracle_nll_vals.append(
-                oracle_copula_nll(R_batch, b["z_test"].float(), b["test_mask"]).item()
-            )
+            oracle_nll_vals.append(oracle_copula_nll(R_batch, b["z_test"].float(), b["test_mask"]).item())
     oracle_nll = sum(oracle_nll_vals) / len(oracle_nll_vals)
 
     # Rank-r ceiling on the same target.
     rank = int(cfg.model.get("rank", 32))
     ceiling_per_ep, _ = fit_rank_ceiling(
-        R_target.unsqueeze(0).float(), min(rank, n_test - 1), jitter=jitter, device=device,
+        R_target.unsqueeze(0).float(),
+        min(rank, n_test - 1),
+        jitter=jitter,
+        device=device,
     )
     rank_ceiling_nll = float(ceiling_per_ep.item())
 
     R_star = R_target  # kept for the unchanged plotting/printing code below
 
     print(f"\nFull-rank oracle copula NLL ({args.target}) = {oracle_nll:.6f}")
-    print(f"Rank-{rank} ceiling on the same target       = {rank_ceiling_nll:.6f}  (S1's exact fit, see debug/stages/s1_rank_ceiling.py)")
-    if args.z_source == "tabicl":
-        print("(z-source=tabicl: run debug/stages/s3_pit_floor.py on the same episode for the PIT-distorted attainable floor)")
-    header = (
-        f"{'step':>6}  {'cop_nll':>10}  {'oracle':>10}  {'gap':>10}"
-        f"  {'||R-R*||_F':>12}  {'||R-R*||_F/N²':>15}"
+    print(
+        f"Rank-{rank} ceiling on the same target       = {rank_ceiling_nll:.6f}  (S1's exact fit, see debug/stages/s1_rank_ceiling.py)"
     )
+    if args.z_source == "tabicl":
+        print(
+            "(z-source=tabicl: run debug/stages/s3_pit_floor.py on the same episode for the PIT-distorted attainable floor)"
+        )
+    header = f"{'step':>6}  {'cop_nll':>10}  {'oracle':>10}  {'gap':>10}  {'||R-R*||_F':>12}  {'||R-R*||_F/N²':>15}"
     print(header)
     print("-" * len(header))
 
@@ -334,9 +336,7 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], 1.0
-            )
+            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             optimizer.step()
 
             if step % args.log_every == 0:
@@ -348,7 +348,7 @@ def main() -> None:
                     Sigma_eval = build_sigma(out_eval, cfg, jitter=jitter, test_mask=eval_batch["test_mask"])
                     R_hat = Sigma_eval[0, :n_test, :n_test]
                     frob = (R_hat - R_star).norm().item()
-                    frob_per_n2 = frob / (n_test ** 2)
+                    frob_per_n2 = frob / (n_test**2)
                 print(
                     f"{step:>6}  {parts['copula'].item():>10.4f}  {oracle_nll:>10.4f}"
                     f"  {parts['copula'].item() - oracle_nll:>10.4f}"
@@ -375,7 +375,9 @@ def main() -> None:
     final_gap_vs_ceiling = parts["copula"].item() - rank_ceiling_nll
     print(f"\nFinal ||R̂ - R||_F              = {final_frob:.4f}")
     print(f"Final copula gap (vs full-rank) = {final_gap:.4f}")
-    print(f"Final copula gap (vs rank-{rank})  = {final_gap_vs_ceiling:.4f}  (0 here means rank isn't limiting convergence)")
+    print(
+        f"Final copula gap (vs rank-{rank})  = {final_gap_vs_ceiling:.4f}  (0 here means rank isn't limiting convergence)"
+    )
 
     plot_correlation_comparison(R_star, R_hat_final, final_frob, final_gap, args.plot)
 

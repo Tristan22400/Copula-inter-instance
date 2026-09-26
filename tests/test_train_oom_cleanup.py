@@ -49,6 +49,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
         return {"total": total, "copula": total, "marginal": total}
 
     from copula_inter import training_core
+
     monkeypatch.setattr(training_core, "low_rank_correlation_factor", fake_correlation)
     monkeypatch.setattr(training_core, "y_space_nll", fake_nll)
 
@@ -138,7 +139,8 @@ def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
     """
     captured = {}
     monkeypatch.setattr(
-        torch.cuda, "set_per_process_memory_fraction",
+        torch.cuda,
+        "set_per_process_memory_fraction",
         lambda frac, dev: captured.update(fraction=frac, device=dev),
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
@@ -153,7 +155,8 @@ def test_reserve_headroom_clamps_fraction_floor(monkeypatch):
     """A huge worker count shouldn't starve this process itself below 50%."""
     captured = {}
     monkeypatch.setattr(
-        torch.cuda, "set_per_process_memory_fraction",
+        torch.cuda,
+        "set_per_process_memory_fraction",
         lambda frac, dev: captured.update(fraction=frac, device=dev),
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))

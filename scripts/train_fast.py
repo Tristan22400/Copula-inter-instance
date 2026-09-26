@@ -54,8 +54,15 @@ DEBUG_VAL_EVERY = 20
 DEBUG_VAL_N_BATCHES = 2
 
 
-def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_device: str,
-                            tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float):
+def _build_debug_val_batch(
+    cfg: DictConfig,
+    t: DictConfig,
+    device: str,
+    gen_device: str,
+    tabicl_model,
+    tabicl_k_folds: int,
+    tabicl_split_calib_frac: float,
+):
     """The first DEBUG_VAL_N_BATCHES batches of the live validation set (same seeds), PIT'd with tabicl_model.
 
     Returns (n_episodes, val_seed, batch_size, batches, oracle_copula_nll), the
@@ -71,8 +78,11 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
     for i in range(DEBUG_VAL_N_BATCHES):
         val_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": val_seed + i * 104_729}))
         episodes = generate_gp_batch(
-            val_cfg, batch_size, device=gen_device,
-            tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+            val_cfg,
+            batch_size,
+            device=gen_device,
+            tabicl_model=tabicl_model,
+            tabicl_k_folds=tabicl_k_folds,
             tabicl_split_calib_frac=tabicl_split_calib_frac,
             return_kernel_metadata=True,
         )
@@ -88,20 +98,30 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
         batch = {k: v.to(device, non_blocking=True) for k, v in collate_fn(episodes).items()}
         batches.append(batch)
     oracle_copula_nll = (
-        sum(oracle_copula_per_point) / len(oracle_copula_per_point)
-        if oracle_copula_per_point else float("nan")
+        sum(oracle_copula_per_point) / len(oracle_copula_per_point) if oracle_copula_per_point else float("nan")
     )
     return n_episodes, val_seed, batch_size, batches, oracle_copula_nll
 
 
-def _build_episode_batch(cfg: DictConfig, n: int, seed: int, device: str,
-                          tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float,
-                          gen_device: str, return_kernel_metadata: bool = False,
-                          tabicl_mix_weights=None):
+def _build_episode_batch(
+    cfg: DictConfig,
+    n: int,
+    seed: int,
+    device: str,
+    tabicl_model,
+    tabicl_k_folds: int,
+    tabicl_split_calib_frac: float,
+    gen_device: str,
+    return_kernel_metadata: bool = False,
+    tabicl_mix_weights=None,
+):
     call_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": seed}))
     episodes = generate_gp_batch(
-        call_cfg, n, device=gen_device,
-        tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+        call_cfg,
+        n,
+        device=gen_device,
+        tabicl_model=tabicl_model,
+        tabicl_k_folds=tabicl_k_folds,
         tabicl_split_calib_frac=tabicl_split_calib_frac,
         tabicl_mix_weights=tabicl_mix_weights,
         return_kernel_metadata=return_kernel_metadata,
@@ -115,14 +135,13 @@ def main(cfg: DictConfig) -> None:
     t_script0 = time.perf_counter()
     torch.manual_seed(cfg.seed)
     t = cfg.training
-    device = (
-        "cuda" if t.device == "auto" and torch.cuda.is_available()
-        else ("cpu" if t.device == "auto" else t.device)
-    )
+    device = "cuda" if t.device == "auto" and torch.cuda.is_available() else ("cpu" if t.device == "auto" else t.device)
 
     # Cap training.steps unless it was overridden.
     if int(t.steps) >= 100_000:
-        print(f"[train_fast] training.steps={int(t.steps)} looks like the production default -- capping to 60 for this debug run (pass training.steps=N to override).")
+        print(
+            f"[train_fast] training.steps={int(t.steps)} looks like the production default -- capping to 60 for this debug run (pass training.steps=N to override)."
+        )
         t.steps = 60
 
     z_train_source = z_train_source_of(cfg)
@@ -130,8 +149,7 @@ def main(cfg: DictConfig) -> None:
     gen_device = "cpu"
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
     tabicl_split_calib_frac = (
-        float(cfg.data.get("z_train_split_calib_frac", 1.0))
-        if z_train_source == "tabicl_split" else 0.0
+        float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
     )
 
     # Fixed-fraction TabICL z_train mixing only (floor_frac == max_frac).
@@ -192,7 +210,13 @@ def main(cfg: DictConfig) -> None:
 
     t_val0 = time.perf_counter()
     n_val_debug, val_seed, val_batch_size, val_batches, oracle_copula_nll = _build_debug_val_batch(
-        cfg, t, device, val_gen_device, val_tabicl_model, tabicl_k_folds, tabicl_split_calib_frac,
+        cfg,
+        t,
+        device,
+        val_gen_device,
+        val_tabicl_model,
+        tabicl_k_folds,
+        tabicl_split_calib_frac,
     )
     print(
         f"[train_fast] Built val set: first {n_val_debug} episodes "
@@ -202,7 +226,9 @@ def main(cfg: DictConfig) -> None:
         "training.batch_size/training.live_val_seed/data.*/the resolved TabICL "
         "checkpoint match the run you're comparing against."
     )
-    print(f"[train_fast] Oracle (exact GP posterior) copula NLL on this val set: {oracle_copula_nll:.4f} -- the copula_gap below is the model's copula NLL minus this.")
+    print(
+        f"[train_fast] Oracle (exact GP posterior) copula NLL on this val set: {oracle_copula_nll:.4f} -- the copula_gap below is the model's copula NLL minus this."
+    )
 
     t_model0 = time.perf_counter()
     model = build_copula_transformer(cfg).to(device)
@@ -215,15 +241,23 @@ def main(cfg: DictConfig) -> None:
     optimizer = Muon(
         [
             {
-                "params": muon_params, "use_muon": True, "lr": t.muon_lr,
-                "weight_decay": t.muon_weight_decay, "momentum": t.muon_momentum,
-                "matched_adamw_rms": t.muon_matched_adamw_rms, "ns_steps": t.muon_ns_steps,
-                "nesterov": t.muon_nesterov, "adamw_betas": tuple(t.muon_adamw_betas),
+                "params": muon_params,
+                "use_muon": True,
+                "lr": t.muon_lr,
+                "weight_decay": t.muon_weight_decay,
+                "momentum": t.muon_momentum,
+                "matched_adamw_rms": t.muon_matched_adamw_rms,
+                "ns_steps": t.muon_ns_steps,
+                "nesterov": t.muon_nesterov,
+                "adamw_betas": tuple(t.muon_adamw_betas),
                 "adamw_eps": t.muon_adamw_eps,
             },
             {
-                "params": adamw_params, "use_muon": False, "lr": t.muon_lr,
-                "weight_decay": 0.0, "adamw_betas": tuple(t.muon_adamw_betas),
+                "params": adamw_params,
+                "use_muon": False,
+                "lr": t.muon_lr,
+                "weight_decay": 0.0,
+                "adamw_betas": tuple(t.muon_adamw_betas),
                 "adamw_eps": t.muon_adamw_eps,
             },
         ]
@@ -239,7 +273,9 @@ def main(cfg: DictConfig) -> None:
     if resume_ckpt:
         ckpt_step = load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
         if bool(t.get("resume_reset_schedule", False)):
-            print(f"[train_fast] Resumed weights+optimizer from {resume_ckpt} (step {ckpt_step}) -- resetting to step 0")
+            print(
+                f"[train_fast] Resumed weights+optimizer from {resume_ckpt} (step {ckpt_step}) -- resetting to step 0"
+            )
         else:
             start_step = ckpt_step
             print(f"[train_fast] Resumed weights+optimizer from {resume_ckpt} -- continuing from step {start_step}")
@@ -258,26 +294,45 @@ def main(cfg: DictConfig) -> None:
     aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
     triu_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
-    print(f"[train_fast] Ready to train after {time.perf_counter() - t_script0:.1f}s (steps={int(t.steps)}, batch_size={int(t.batch_size)})")
+    print(
+        f"[train_fast] Ready to train after {time.perf_counter() - t_script0:.1f}s (steps={int(t.steps)}, batch_size={int(t.batch_size)})"
+    )
     print("[train_fast] Training loop started (Ctrl-C to stop)\n")
 
     model.train()
     for step in range(start_step + 1, int(t.steps) + 1):
         step_t0 = time.perf_counter()
         _, batch = _build_episode_batch(
-            cfg, int(t.batch_size), seed=int(cfg.seed) + step * 104_729, device=device,
-            tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
-            tabicl_split_calib_frac=tabicl_split_calib_frac, gen_device=gen_device,
+            cfg,
+            int(t.batch_size),
+            seed=int(cfg.seed) + step * 104_729,
+            device=device,
+            tabicl_model=tabicl_model,
+            tabicl_k_folds=tabicl_k_folds,
+            tabicl_split_calib_frac=tabicl_split_calib_frac,
+            gen_device=gen_device,
             tabicl_mix_weights=tabicl_mix_weights,
         )
         data_ms = (time.perf_counter() - step_t0) * 1000.0
 
         optimizer.zero_grad(set_to_none=True)
         out, Sigma, parts, loss, aux_mae, grad_norm = _run_train_step(
-            model=model, optimizer=optimizer, scheduler=scheduler, trainable=trainable,
-            batch=batch, device=device, use_amp=use_amp, amp_dtype=amp_dtype, scaler=scaler,
-            clip_grad_norm=float(t.clip_grad_norm), nll_weight=nll_weight, aux_mae_weight=aux_mae_weight,
-            jitter=jitter, triu_cache=triu_cache, phase_start=lambda: None, phase_end=lambda name, s: None,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            trainable=trainable,
+            batch=batch,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+            clip_grad_norm=float(t.clip_grad_norm),
+            nll_weight=nll_weight,
+            aux_mae_weight=aux_mae_weight,
+            jitter=jitter,
+            triu_cache=triu_cache,
+            phase_start=lambda: None,
+            phase_end=lambda name, s: None,
             parametrization=parametrization,
         )
         step_ms = (time.perf_counter() - step_t0) * 1000.0
@@ -299,8 +354,15 @@ def main(cfg: DictConfig) -> None:
             with torch.no_grad():
                 for vb in val_batches:
                     _, _, val_parts, _, _ = _forward_and_loss(
-                        model=model, batch=vb, device=device, use_amp=use_amp, amp_dtype=amp_dtype,
-                        nll_weight=nll_weight, aux_mae_weight=0.0, jitter=jitter, triu_cache=triu_cache,
+                        model=model,
+                        batch=vb,
+                        device=device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        nll_weight=nll_weight,
+                        aux_mae_weight=0.0,
+                        jitter=jitter,
+                        triu_cache=triu_cache,
                         parametrization=parametrization,
                     )
                     totals.append(val_parts["total"].item())

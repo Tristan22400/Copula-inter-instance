@@ -35,8 +35,13 @@ from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles  # noqa: E
 _G = 9.80665  # m/s^2, for geopotential (m^2/s^2) -> elevation (m)
 _TEMP_VAR_CANDIDATES = ("t2m", "2m_temperature", "temperature", "temp")
 _ELEV_VAR_CANDIDATES = (
-    "z", "geopotential", "geopotential_at_surface", "surface_geopotential",
-    "orography", "elevation", "altitude",
+    "z",
+    "geopotential",
+    "geopotential_at_surface",
+    "surface_geopotential",
+    "orography",
+    "elevation",
+    "altitude",
 )
 
 # Public ARCO-ERA5 archive (no credentials needed).
@@ -165,16 +170,19 @@ def sample_icl_task_from_era5(
         n = int(mask.sum())
         return np.column_stack(
             [
-                lat_grid[mask], lon_grid[mask], elev_field[mask],
-                np.full(n, cos_day), np.full(n, sin_day), np.full(n, cos_hour), np.full(n, sin_hour),
+                lat_grid[mask],
+                lon_grid[mask],
+                elev_field[mask],
+                np.full(n, cos_day),
+                np.full(n, sin_day),
+                np.full(n, cos_hour),
+                np.full(n, sin_hour),
             ]
         )
 
     lat_lo, lat_hi = target_lat_bounds
     lon_lo, lon_hi = target_lon_bounds
-    target_mask = (
-        (lat_grid >= lat_lo) & (lat_grid <= lat_hi) & (lon_grid >= lon_lo) & (lon_grid <= lon_hi)
-    )
+    target_mask = (lat_grid >= lat_lo) & (lat_grid <= lat_hi) & (lon_grid >= lon_lo) & (lon_grid <= lon_hi)
     if not target_mask.any():
         raise ValueError("target_lat_bounds/target_lon_bounds select zero grid points.")
 
@@ -319,37 +327,56 @@ def build_calibration_figure(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--nc-path", type=str, default=None,
+        "--nc-path",
+        type=str,
+        default=None,
         help="Path to a real ERA5 temperature NetCDF file. If omitted, a small real "
         f"sample is auto-downloaded and cached to {_DEFAULT_CACHE_NC}.",
     )
     parser.add_argument(
-        "--target-lat-bounds", type=float, nargs=2, default=list(_DEFAULT_TARGET_LAT_BOUNDS),
+        "--target-lat-bounds",
+        type=float,
+        nargs=2,
+        default=list(_DEFAULT_TARGET_LAT_BOUNDS),
         metavar=("LAT_MIN", "LAT_MAX"),
     )
     parser.add_argument(
-        "--target-lon-bounds", type=float, nargs=2, default=list(_DEFAULT_TARGET_LON_BOUNDS),
+        "--target-lon-bounds",
+        type=float,
+        nargs=2,
+        default=list(_DEFAULT_TARGET_LON_BOUNDS),
         metavar=("LON_MIN", "LON_MAX"),
     )
     parser.add_argument(
-        "--tabicl-ckpt", type=str, default=None,
+        "--tabicl-ckpt",
+        type=str,
+        default=None,
         help="TabICLRegressor marginal checkpoint (required for the non-default estimator).",
     )
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     parser.add_argument("--n-ctx", type=int, default=1000, help="Global context points sampled per timestamp.")
-    parser.add_argument("--n-timestamps", type=int, default=None, help="Number of timestamps to evaluate (default: all).")
+    parser.add_argument(
+        "--n-timestamps", type=int, default=None, help="Number of timestamps to evaluate (default: all)."
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--output", type=str, default=os.path.join(_DEFAULT_FIGURES_DIR, "era5_multivariate_calibration.pdf"),
+        "--output",
+        type=str,
+        default=os.path.join(_DEFAULT_FIGURES_DIR, "era5_multivariate_calibration.pdf"),
     )
     args = parser.parse_args()
 
     nc_path = args.nc_path if args.nc_path is not None else _fetch_default_era5_subset()
 
     y_true, all_quantiles = run_era5_eval(
-        nc_path, tuple(args.target_lat_bounds), tuple(args.target_lon_bounds),
-        tabicl_ckpt=args.tabicl_ckpt, device=args.device,
-        n_ctx=args.n_ctx, n_timestamps=args.n_timestamps, seed=args.seed,
+        nc_path,
+        tuple(args.target_lat_bounds),
+        tuple(args.target_lon_bounds),
+        tabicl_ckpt=args.tabicl_ckpt,
+        device=args.device,
+        n_ctx=args.n_ctx,
+        n_timestamps=args.n_timestamps,
+        seed=args.seed,
     )
     print(f"Evaluated {y_true.shape[0]} timestamps x {y_true.shape[1]} target grid cells.")
     build_calibration_figure(y_true, all_quantiles, ALPHA_GRID, args.output)

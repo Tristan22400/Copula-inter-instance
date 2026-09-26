@@ -22,10 +22,12 @@ def test_disabled_is_noop():
 
 def test_zero_prob_is_noop():
     z_train = make_z_train()
-    cfg = OmegaConf.create({
-        "z_train_corruption_enabled": True,
-        "z_train_corruption_prob": 0.0,
-    })
+    cfg = OmegaConf.create(
+        {
+            "z_train_corruption_enabled": True,
+            "z_train_corruption_prob": 0.0,
+        }
+    )
     out = corrupt_z_train(z_train, cfg)
     assert torch.equal(out, z_train)
 
@@ -37,15 +39,17 @@ def test_achieves_target_correlation():
     # One point per episode: measure the across-episode correlation.
     z_train = make_z_train(B=B, P=P, seed=1)
 
-    cfg = OmegaConf.create({
-        "z_train_corruption_enabled": True,
-        "z_train_corruption_prob": 1.0,
-        # rho fixed near a known value.
-        "z_train_corruption_rho_beta_a": 5000.0,
-        "z_train_corruption_rho_beta_b": 5000.0 * (1.0 - 0.5) / 0.5,  # mean rho ~= 0.5
-    })
+    cfg = OmegaConf.create(
+        {
+            "z_train_corruption_enabled": True,
+            "z_train_corruption_prob": 1.0,
+            # rho fixed near a known value.
+            "z_train_corruption_rho_beta_a": 5000.0,
+            "z_train_corruption_rho_beta_b": 5000.0 * (1.0 - 0.5) / 0.5,  # mean rho ~= 0.5
+        }
+    )
     out = corrupt_z_train(z_train, cfg)
 
     achieved = torch.corrcoef(torch.stack([z_train.squeeze(-1), out.squeeze(-1)]))[0, 1].item()
-    expected = 0.5 ** 0.5  # sqrt(rho), rho ~= 0.5
+    expected = 0.5**0.5  # sqrt(rho), rho ~= 0.5
     assert abs(achieved - expected) < 0.03, f"achieved corr={achieved:.3f}, expected~={expected:.3f}"

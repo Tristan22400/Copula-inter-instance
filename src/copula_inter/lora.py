@@ -35,12 +35,14 @@ def _get_mha_class():
 
 def _get_mha_forward():
     from tabicl._model.attention import multi_head_attention_forward  # type: ignore[import]
+
     return multi_head_attention_forward
 
 
 def _get_kv_types():
     from tabicl._model.kv_cache import KVCacheEntry  # type: ignore[import]
     from tabicl._model.rope import RotaryEmbedding  # type: ignore[import]
+
     return KVCacheEntry, RotaryEmbedding
 
 
@@ -103,12 +105,11 @@ class LoRAMultiheadAttention(nn.Module):
                 setattr(self, f"lora_A_{proj}", A)
                 setattr(self, f"lora_B_{proj}", B)
 
-
     def _effective_in_proj_weight(self) -> Tensor:
-        W = self.in_proj_weight          # (3D, D) buffer
+        W = self.in_proj_weight  # (3D, D) buffer
         D = self.embed_dim
         s = self.scaling
-        delta = W.new_zeros(3 * D, D)   # always zero for absent projections
+        delta = W.new_zeros(3 * D, D)  # always zero for absent projections
         if "q" in self.target:
             delta[:D] = s * (self.lora_B_q @ self.lora_A_q)
         if "k" in self.target:
@@ -118,11 +119,10 @@ class LoRAMultiheadAttention(nn.Module):
         return W + delta
 
     def _effective_out_proj_weight(self) -> Tensor:
-        W = self.out_proj_weight         # (D, D) buffer
+        W = self.out_proj_weight  # (D, D) buffer
         if "o" in self.target:
             return W + self.scaling * (self.lora_B_o @ self.lora_A_o)
         return W
-
 
     def forward(
         self,
@@ -195,17 +195,13 @@ def _replace_mha_in_module(
         full_name = f"{prefix}.{child_name}" if prefix else child_name
         if isinstance(child, MultiheadAttention):
             # Only replace if the full name contains one of the requested stage keywords
-            stage_match = any(
-                _STAGE_KEYWORDS[s] in full_name for s in stages if s in _STAGE_KEYWORDS
-            )
+            stage_match = any(_STAGE_KEYWORDS[s] in full_name for s in stages if s in _STAGE_KEYWORDS)
             if stage_match:
                 lora_mha = LoRAMultiheadAttention(child, rank=rank, alpha=alpha, target=target)
                 setattr(parent, child_name, lora_mha)
                 replaced += 1
         else:
-            replaced += _replace_mha_in_module(
-                child, full_name, rank, alpha, target, stages, MultiheadAttention
-            )
+            replaced += _replace_mha_in_module(child, full_name, rank, alpha, target, stages, MultiheadAttention)
     return replaced
 
 
@@ -277,9 +273,7 @@ def apply_lora(
     n_replaced = 0
     if adapters_requested:
         MultiheadAttention = _get_mha_class()
-        n_replaced = _replace_mha_in_module(
-            backbone, "", int(rank), alpha, target, stages, MultiheadAttention
-        )
+        n_replaced = _replace_mha_in_module(backbone, "", int(rank), alpha, target, stages, MultiheadAttention)
         if n_replaced == 0:
             raise RuntimeError(
                 f"apply_lora found 0 MultiheadAttention modules in stages={stages}. "
@@ -340,10 +334,7 @@ def merged_base_state_dict(backbone: nn.Module) -> dict:
     Loads strictly into a stock TabICL; the live module keeps its adapters.
     Returns detached CPU tensors.
     """
-    lora_paths = [
-        name for name, m in backbone.named_modules()
-        if isinstance(m, LoRAMultiheadAttention)
-    ]
+    lora_paths = [name for name, m in backbone.named_modules() if isinstance(m, LoRAMultiheadAttention)]
 
     sd: dict = {}
     for key, val in backbone.state_dict().items():
@@ -378,13 +369,9 @@ class LoRAParametrization(nn.Module):
     def __init__(self, weight: Tensor, rank: int, alpha: float):
         super().__init__()
         out_features, in_features = weight.shape[-2], weight.shape[-1]
-        self.A = nn.Parameter(
-            torch.zeros(rank, in_features, dtype=torch.float32, device=weight.device)
-        )
+        self.A = nn.Parameter(torch.zeros(rank, in_features, dtype=torch.float32, device=weight.device))
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
-        self.B = nn.Parameter(
-            torch.zeros(out_features, rank, dtype=torch.float32, device=weight.device)
-        )
+        self.B = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float32, device=weight.device))
         self.scaling = float(alpha) / float(rank)
 
     def forward(self, weight: Tensor) -> Tensor:

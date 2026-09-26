@@ -42,7 +42,7 @@ def test_tier0_patterns_match_real_parameters(backbone):
     )
     n_total = sum(p.numel() for p in backbone.module.parameters())
     # Tier 0 is a real but small fraction of the model.
-    assert 0.0005 < n_tier0 / n_total < 0.25, f"tier-0 covers {n_tier0/n_total:.1%} of {backbone.name}"
+    assert 0.0005 < n_tier0 / n_total < 0.25, f"tier-0 covers {n_tier0 / n_total:.1%} of {backbone.name}"
 
 
 def test_quantile_forward_is_differentiable_into_the_trunk(backbone):
@@ -61,8 +61,11 @@ def test_quantile_forward_is_differentiable_into_the_trunk(backbone):
     assert torch.isfinite(q).all()
 
     q.pow(2).mean().backward()
-    with_grad = [n for n, p in backbone.module.named_parameters()
-                 if p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0]
+    with_grad = [
+        n
+        for n, p in backbone.module.named_parameters()
+        if p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+    ]
     assert len(with_grad) > 10, f"only {len(with_grad)} parameters received gradient"
     # Something in the trunk gets a gradient.
     assert any(("tf_icl" in n) or ("transformer.layers" in n) for n in with_grad), (
@@ -76,7 +79,7 @@ def test_native_grid_is_the_default_and_matches_the_model_head(backbone):
     Xc, yc, Xq = _episode(rng)
 
     assert backbone.native_quantile_count == 999
-    q = backbone.quantile_forward([Xc], [yc], [Xq])          # probs=None
+    q = backbone.quantile_forward([Xc], [yc], [Xq])  # probs=None
     assert q.shape == (1, Xq.shape[0], 999)
     assert q.requires_grad and torch.isfinite(q).all()
 
@@ -94,9 +97,7 @@ def test_native_grid_is_the_default_and_matches_the_model_head(backbone):
 def test_native_probs_follow_the_repo_grid_convention(backbone):
     """native_probs == linspace(1/(n+1), n/(n+1), n)."""
     n = backbone.native_quantile_count
-    np.testing.assert_allclose(
-        backbone.native_probs, np.linspace(1.0 / (n + 1), n / (n + 1), n), rtol=0, atol=1e-12
-    )
+    np.testing.assert_allclose(backbone.native_probs, np.linspace(1.0 / (n + 1), n / (n + 1), n), rtol=0, atol=1e-12)
 
 
 def test_quantile_forward_is_monotone_in_probs(backbone):
@@ -144,9 +145,12 @@ def test_checkpoint_rejects_a_different_architecture(backbone, tmp_path):
 @pytest.mark.parametrize(
     "name,tier,ok",
     [
-        ("tabicl", 3, True), ("tabldm", 3, True),
-        ("exaone", 0, True), ("tabpfn", 0, True),
-        ("exaone", 1, False), ("tabpfn", 1, False),
+        ("tabicl", 3, True),
+        ("tabldm", 3, True),
+        ("exaone", 0, True),
+        ("tabpfn", 0, True),
+        ("exaone", 1, False),
+        ("tabpfn", 1, False),
     ],
 )
 def test_resolve_tier_gates_the_ladder(name, tier, ok):

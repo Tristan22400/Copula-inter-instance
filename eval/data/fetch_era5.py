@@ -18,9 +18,7 @@ import os
 import numpy as np
 from scipy.io.netcdf import netcdf_file
 
-_CACHE_DIR = os.environ.get(
-    "ERA5_CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
-)
+_CACHE_DIR = os.environ.get("ERA5_CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache"))
 _ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
 
 __all__ = ["fetch", "cache_path_for"]
@@ -95,6 +93,7 @@ def fetch(
     from scipy.interpolate import RegularGridInterpolator
 
     from eval.data.fetch_era5_static import STATIC_VARS, load_static
+
     static_dict = load_static()
     lat_asc = static_dict["latitude"][::-1]
     lon_grid, lat_grid = np.meshgrid(lon % 360.0, lat)
@@ -121,7 +120,9 @@ def fetch(
 
     for vname in STATIC_VARS:
         arr_asc = static_dict[vname][::-1, :]
-        interp = RegularGridInterpolator((lat_asc, static_dict["longitude"]), arr_asc, method="linear", bounds_error=False, fill_value=None)
+        interp = RegularGridInterpolator(
+            (lat_asc, static_dict["longitude"]), arr_asc, method="linear", bounds_error=False, fill_value=None
+        )
         sub_vals = interp(pts).reshape(lat.size, lon.size).astype(np.float64)
         v = f.createVariable(vname, "f8", ("latitude", "longitude"))
         v[:] = sub_vals

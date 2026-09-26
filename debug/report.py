@@ -12,6 +12,7 @@ Usage:
     python debug/report.py --run-id 20260826_120000_abcd123_all
     python debug/report.py --run-id <new_id> --baseline <old_id>
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,7 +22,15 @@ import os
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_ROOT = os.path.join(_HERE, "results")
 
-STAGE_ORDER = ["s0_signal", "s1_rank_ceiling", "s2_uspace", "s3_pit_floor", "s5_kfold", "s6_guards", "s7b_backend_train"]
+STAGE_ORDER = [
+    "s0_signal",
+    "s1_rank_ceiling",
+    "s2_uspace",
+    "s3_pit_floor",
+    "s5_kfold",
+    "s6_guards",
+    "s7b_backend_train",
+]
 
 
 def _load(run_id: str, stage: str):
@@ -113,13 +122,19 @@ def _highlight_s7b(r: dict) -> "list[str]":
         if not hist:
             continue
         last = hist[-1]
-        lines.append(f"| {backend} | {last['eval_total']:.4f} | {last['eval_copula']:.4f} | {last['eval_marginal']:.4f} |")
+        lines.append(
+            f"| {backend} | {last['eval_total']:.4f} | {last['eval_copula']:.4f} | {last['eval_marginal']:.4f} |"
+        )
     return lines
 
 
 _HIGHLIGHTERS = {
-    "s0_signal": _highlight_s0, "s1_rank_ceiling": _highlight_s1, "s2_uspace": _highlight_s2,
-    "s3_pit_floor": _highlight_s3, "s5_kfold": _highlight_s5, "s6_guards": _highlight_s6,
+    "s0_signal": _highlight_s0,
+    "s1_rank_ceiling": _highlight_s1,
+    "s2_uspace": _highlight_s2,
+    "s3_pit_floor": _highlight_s3,
+    "s5_kfold": _highlight_s5,
+    "s6_guards": _highlight_s6,
     "s7b_backend_train": _highlight_s7b,
 }
 
@@ -139,8 +154,10 @@ def build_report(run_id: str, baseline_id: "str | None" = None) -> str:
             continue
         found_any = True
         lines.append(f"## {stage}")
-        lines.append(f"*git_sha={payload.get('git_sha')}  n_episodes={payload.get('n_episodes')}  "
-                      f"ckpt={payload.get('ckpt')}  overrides={payload.get('overrides')}*")
+        lines.append(
+            f"*git_sha={payload.get('git_sha')}  n_episodes={payload.get('n_episodes')}  "
+            f"ckpt={payload.get('ckpt')}  overrides={payload.get('overrides')}*"
+        )
         lines.append("")
         highlighter = _HIGHLIGHTERS.get(stage)
         result = payload.get("result", {})

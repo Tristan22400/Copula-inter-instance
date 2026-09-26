@@ -164,8 +164,14 @@ def plot_corr_grid(
 
 
 def _plot_field_grid(
-    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, true_fields: list, col_titles: list,
-    output_path: "str | None", row0_label: str, suptitle: str,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    grid_shape: tuple,
+    true_fields: list,
+    col_titles: list,
+    output_path: "str | None",
+    row0_label: str,
+    suptitle: str,
     predicted_fields: "list[np.ndarray] | None" = None,
     predicted_fields_2: "list[np.ndarray] | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
@@ -175,7 +181,8 @@ def _plot_field_grid(
     pred2_row_label: str = "Copula model\n(2nd variant)\nLatitude",
     indep_row_label: str = "Independent\n(no copula)\nLatitude",
     oracle_row_label: str = "Oracle correlation\n+ marginal\nLatitude",
-    xlabel: str = "Longitude", cbar_label: str = "Residual (deg C)",
+    xlabel: str = "Longitude",
+    cbar_label: str = "Residual (deg C)",
 ):
     """Render rows of fields on grid_shape with one color scale and Moran's I per panel.
 
@@ -205,14 +212,21 @@ def _plot_field_grid(
 
     def _annotate_morans_i(ax, field):
         ax.text(
-            0.97, 0.95, f"$I$={morans_i(field):.2f}", transform=ax.transAxes,
-            ha="right", va="top", fontsize=7,
+            0.97,
+            0.95,
+            f"$I$={morans_i(field):.2f}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=7,
             bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.7, edgecolor="none"),
         )
 
     n_cols = len(true_fields)
     n_rows = 1 + int(has_oracle) + int(has_pred) + int(has_pred2) + int(has_indep)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False
+    )
     mesh = None
     for j, (title, field) in enumerate(zip(col_titles, true_fields)):
         mesh = axes[0][j].pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
@@ -222,12 +236,19 @@ def _plot_field_grid(
 
     def _plot_row(row_idx, grids, ylabel):
         for j, field in enumerate(grids):
-            mesh_local = axes[row_idx][j].pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+            mesh_local = axes[row_idx][j].pcolormesh(
+                lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto"
+            )
             _annotate_morans_i(axes[row_idx][j], field)
             if context_coords is not None:
                 axes[row_idx][j].scatter(
-                    context_coords[:, 0], context_coords[:, 1],
-                    c="black", s=8, marker="o", linewidths=0.4, edgecolors="white",
+                    context_coords[:, 0],
+                    context_coords[:, 1],
+                    c="black",
+                    s=8,
+                    marker="o",
+                    linewidths=0.4,
+                    edgecolors="white",
                     label="Context points" if j == 0 else None,
                 )
         axes[row_idx][0].set_ylabel(ylabel)
@@ -263,7 +284,10 @@ def _plot_field_grid(
 
 
 def plot_residual_grid(
-    data: dict, days: list, predicted_fields: "list[np.ndarray] | None", output_path: "str | None",
+    data: dict,
+    days: list,
+    predicted_fields: "list[np.ndarray] | None",
+    output_path: "str | None",
     context_coords: "np.ndarray | None" = None,
     predicted_fields_2: "list[np.ndarray] | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
@@ -284,7 +308,8 @@ def plot_residual_grid(
         true_fields = [data["t2m"][d] - data["t2m"][d - 1] for d in days]
         col_titles = [f"day {d}: $E_t = Z_{{{d}}} - Z_{{{d - 1}}}$" for d in days]
         suptitle = (
-            "24h Persistence Residual Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
+            "24h Persistence Residual Fields: Ground Truth vs. Copula Model Prediction"
+            if predicted_fields is not None
             else "24h Persistence Residual Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
         )
         cbar_label = "Residual (deg C)"
@@ -292,18 +317,27 @@ def plot_residual_grid(
         true_fields = [data["t2m"][d] for d in days]
         col_titles = [f"day {d}: $Z_{{{d}}}$ (raw)" for d in days]
         suptitle = (
-            "Raw Temperature Fields: Ground Truth vs. Copula Model Prediction" if predicted_fields is not None
+            "Raw Temperature Fields: Ground Truth vs. Copula Model Prediction"
+            if predicted_fields is not None
             else "Raw Temperature Fields (ground-truth input to $R_{emp}$ and real-context conditioning)"
         )
         cbar_label = "Temperature (deg C)"
     if oracle_fields is not None and predicted_fields is not None:
         suptitle += "\n(prediction rows are posterior SAMPLES on the same context and latent noise)"
     return _plot_field_grid(
-        lat, lon, grid_shape, true_fields, col_titles, output_path,
-        row0_label="Ground truth\nLatitude", suptitle=suptitle,
-        predicted_fields=predicted_fields, predicted_fields_2=predicted_fields_2,
+        lat,
+        lon,
+        grid_shape,
+        true_fields,
+        col_titles,
+        output_path,
+        row0_label="Ground truth\nLatitude",
+        suptitle=suptitle,
+        predicted_fields=predicted_fields,
+        predicted_fields_2=predicted_fields_2,
         independent_fields=independent_fields,
-        oracle_fields=oracle_fields, oracle_row_label=oracle_row_label,
+        oracle_fields=oracle_fields,
+        oracle_row_label=oracle_row_label,
         pred2_row_label=pred2_row_label,
         context_coords=context_coords,
         cbar_label=cbar_label,
@@ -311,8 +345,12 @@ def plot_residual_grid(
 
 
 def plot_mean_removed_grid(
-    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, days: list,
-    true_resid_fields: list[np.ndarray], output_path: "str | None",
+    lat: np.ndarray,
+    lon: np.ndarray,
+    grid_shape: tuple,
+    days: list,
+    true_resid_fields: list[np.ndarray],
+    output_path: "str | None",
     predicted_fields: "list[np.ndarray] | None" = None,
     predicted_fields_2: "list[np.ndarray] | None" = None,
     independent_fields: "list[np.ndarray] | None" = None,
@@ -327,15 +365,22 @@ def plot_mean_removed_grid(
     """
     col_titles = [f"day {d}" for d in days]
     return _plot_field_grid(
-        lat, lon, grid_shape, true_resid_fields, col_titles, output_path,
+        lat,
+        lon,
+        grid_shape,
+        true_resid_fields,
+        col_titles,
+        output_path,
         row0_label="Ground truth\nminus marginal mean\nLatitude",
         suptitle=(
             "Mean-Removed Residual Fields: Ground Truth vs. Copula Model Prediction\n"
             "(each row's own predictive mean subtracted at every location)"
         ),
-        predicted_fields=predicted_fields, predicted_fields_2=predicted_fields_2,
+        predicted_fields=predicted_fields,
+        predicted_fields_2=predicted_fields_2,
         independent_fields=independent_fields,
-        oracle_fields=oracle_fields, oracle_row_label=oracle_row_label,
+        oracle_fields=oracle_fields,
+        oracle_row_label=oracle_row_label,
         pred_row_label="Copula model\n(predicted) minus\nmarginal mean\nLatitude",
         pred2_row_label=pred2_row_label,
         indep_row_label="Independent\n(no copula) minus\nmarginal mean\nLatitude",
@@ -345,10 +390,15 @@ def plot_mean_removed_grid(
 
 
 def plot_synthetic_residual_grid(
-    grid_y: np.ndarray, grid_x: np.ndarray, grid_shape: tuple,
-    true_fields: list, predicted_fields_true_z: list, predicted_fields_tabicl_z: list,
+    grid_y: np.ndarray,
+    grid_x: np.ndarray,
+    grid_shape: tuple,
+    true_fields: list,
+    predicted_fields_true_z: list,
+    predicted_fields_tabicl_z: list,
     independent_fields: list,
-    output_path: str, context_coords: "np.ndarray | None" = None,
+    output_path: str,
+    context_coords: "np.ndarray | None" = None,
     oracle_fields: "list[np.ndarray] | None" = None,
 ) -> None:
     """Synthetic analogue of plot_residual_grid: one column per GP draw.
@@ -358,23 +408,38 @@ def plot_synthetic_residual_grid(
     """
     col_titles = [f"draw {i + 1}" for i in range(len(true_fields))]
     _plot_field_grid(
-        grid_y, grid_x, grid_shape, true_fields, col_titles, output_path,
-        row0_label="Ground truth\n(synthetic kernel)\ny", suptitle="Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
-        predicted_fields=predicted_fields_true_z, predicted_fields_2=predicted_fields_tabicl_z,
-        independent_fields=independent_fields, context_coords=context_coords,
+        grid_y,
+        grid_x,
+        grid_shape,
+        true_fields,
+        col_titles,
+        output_path,
+        row0_label="Ground truth\n(synthetic kernel)\ny",
+        suptitle="Synthetic GP Draws: Ground Truth vs. Copula Model Prediction",
+        predicted_fields=predicted_fields_true_z,
+        predicted_fields_2=predicted_fields_tabicl_z,
+        independent_fields=independent_fields,
+        context_coords=context_coords,
         oracle_fields=oracle_fields,
         pred_row_label="Copula model\n(true z_train)\ny",
         pred2_row_label="Copula model\n(TabICLv2 z_train)\ny",
         indep_row_label="Independent\n(no copula)\ny",
         oracle_row_label="Oracle correlation\n+ TabICLv2 marginal\ny",
-        xlabel="x", cbar_label="Field value",
+        xlabel="x",
+        cbar_label="Field value",
     )
 
 
 def plot_z_predictor_samples(
-    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, day: int,
-    independent_fields: list, predicted_fields: list, gp_fields: list,
-    output_path: "str | None" = None, context_coords: "np.ndarray | None" = None,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    grid_shape: tuple,
+    day: int,
+    independent_fields: list,
+    predicted_fields: list,
+    gp_fields: list,
+    output_path: "str | None" = None,
+    context_coords: "np.ndarray | None" = None,
 ):
     """Samples of the latent z for one day: rows are independent, copula-model and GP correlation, columns share white noise.
 
@@ -384,20 +449,33 @@ def plot_z_predictor_samples(
     suptitle = f"Copula Latent z-Samples (day {day}): Independent vs. Copula Model vs. GP Baseline"
     independent_grids = [f.reshape(grid_shape) for f in independent_fields]
     return _plot_field_grid(
-        lat, lon, grid_shape, independent_grids, col_titles, output_path,
-        row0_label="Independent\n(no copula)\nLatitude", suptitle=suptitle,
-        predicted_fields=predicted_fields, oracle_fields=gp_fields,
+        lat,
+        lon,
+        grid_shape,
+        independent_grids,
+        col_titles,
+        output_path,
+        row0_label="Independent\n(no copula)\nLatitude",
+        suptitle=suptitle,
+        predicted_fields=predicted_fields,
+        oracle_fields=gp_fields,
         pred_row_label="Copula model\nLatitude",
         oracle_row_label="GP baseline\n(fitted correlation)\nLatitude",
-        context_coords=context_coords, xlabel="Longitude",
+        context_coords=context_coords,
+        xlabel="Longitude",
         cbar_label="z (copula latent, std normal)",
     )
 
 
 def plot_marginal_variance_grid(
-    lat: np.ndarray, lon: np.ndarray, grid_shape: tuple, days: list, var_fields: list,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    grid_shape: tuple,
+    days: list,
+    var_fields: list,
     gp_var_fields: "list | None" = None,
-    output_path: "str | None" = None, context_coords: "np.ndarray | None" = None,
+    output_path: "str | None" = None,
+    context_coords: "np.ndarray | None" = None,
     gp_row_label: str = "Fitted GP\nposterior",
 ):
     """Per-location predictive variance (sequential colormap from 0) per day: the TabICL marginal and, optionally, the fitted GP; context overlaid."""
@@ -412,7 +490,9 @@ def plot_marginal_variance_grid(
     vmax = float(np.max(grids + gp_grids)) if (grids or gp_grids) else 1.0
     n_cols = len(grids)
     n_rows = 1 + int(has_gp)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False
+    )
     mesh = None
 
     def _plot_row(row_idx, row_grids, ylabel, show_col_titles):
@@ -423,8 +503,13 @@ def plot_marginal_variance_grid(
                 axes[row_idx][j].set_title(f"day {days[j]}", fontsize=9)
             if context_coords is not None:
                 axes[row_idx][j].scatter(
-                    context_coords[:, 0], context_coords[:, 1],
-                    c="red", s=8, marker="o", linewidths=0.4, edgecolors="white",
+                    context_coords[:, 0],
+                    context_coords[:, 1],
+                    c="red",
+                    s=8,
+                    marker="o",
+                    linewidths=0.4,
+                    edgecolors="white",
                     label="Context points" if j == 0 else None,
                 )
         axes[row_idx][0].set_ylabel(ylabel)

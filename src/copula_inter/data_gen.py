@@ -118,9 +118,7 @@ class KernelPriorSpec:
 
 
 # Kernels whose lengthscale can be ARD (cosine's period_length is always scalar).
-_ARD_ELIGIBLE_KERNELS = frozenset(
-    {"rbf", "matern12", "matern32", "matern52", "periodic", "rational_quadratic"}
-)
+_ARD_ELIGIBLE_KERNELS = frozenset({"rbf", "matern12", "matern32", "matern52", "periodic", "rational_quadratic"})
 
 
 def _kernel_prior_spec(cfg, kernel_name: str) -> KernelPriorSpec:
@@ -208,11 +206,7 @@ def _build_scaled_kernel(
     base = _BASE_GPYTORCH_KERNEL_CLS[name](**kernel_kwargs).to(device)
 
     # One isotropic-collapse draw per episode, shared by lengthscale and period.
-    iso_mask = (
-        torch.rand(B, device=device) < spec.isotropic_ratio
-        if spec.ard and spec.isotropic_ratio > 0.0
-        else None
-    )
+    iso_mask = torch.rand(B, device=device) < spec.isotropic_ratio if spec.ard and spec.isotropic_ratio > 0.0 else None
 
     l_attr = getattr(base, spec.lengthscale_attr)
     l_sample = spec.lengthscale_prior(k).sample(l_attr.shape).to(device)
@@ -261,18 +255,18 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
         # batch_shape comes from w's leading dim (B,).
         super().__init__(batch_shape=torch.Size([w.shape[0]]), **kwargs)
         self.base_kernel = base_kernel
-        self.register_buffer("w", w)   # (B, k)
-        self.register_buffer("b", b)   # (B,)
-        self.register_buffer("a", a)   # (B,) sharpness, > 0
+        self.register_buffer("w", w)  # (B, k)
+        self.register_buffer("b", b)  # (B,)
+        self.register_buffer("a", a)  # (B,) sharpness, > 0
         self.active_cols = list(active_dims) if active_dims is not None else None
 
     def _signs(self, x: Tensor) -> Tensor:
         """s(x) = tanh(a * (w . x[..., active_cols] + b)), shape (..., n) for x of shape (..., n, d)."""
         cols = self.active_cols
         x_active = x[..., cols] if cols is not None else x
-        w = self.w.unsqueeze(-2)   # (B, 1, k)
-        b = self.b.unsqueeze(-1)   # (B, 1)
-        a = self.a.unsqueeze(-1)   # (B, 1)
+        w = self.w.unsqueeze(-2)  # (B, 1, k)
+        b = self.b.unsqueeze(-1)  # (B, 1)
+        a = self.a.unsqueeze(-1)  # (B, 1)
         z = (x_active * w).sum(-1) + b
         return torch.tanh(a * z)
 
@@ -308,9 +302,7 @@ class _DenseComposedKernel(gpytorch.kernels.Kernel):
         return a + b if self.op == "+" else a * b
 
 
-def _sample_sign_modulation(
-    cfg, k: int, B: int, device
-) -> tuple[Tensor, Tensor, Tensor]:
+def _sample_sign_modulation(cfg, k: int, B: int, device) -> tuple[Tensor, Tensor, Tensor]:
     """Sample one hyperplane per episode: w ~ N(0, I_k)/sqrt(k), b ~ N(0, 1), a ~ LogNormal(sharpness loc, scale)."""
     w = torch.randn(B, k, device=device) / math.sqrt(max(k, 1))
     b = torch.randn(B, device=device)
@@ -355,7 +347,12 @@ def _maybe_wrap_sign_modulated(
 
 
 def _build_kernel_component(
-    cfg, name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None,
+    cfg,
+    name: str,
+    k: int,
+    B: int,
+    device,
+    active_dims: Optional[List[int]] = None,
     d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
     """Build one elementary kernel for B episodes and its sampled hyperparameter dict.
@@ -409,22 +406,23 @@ def _build_kernel_component(
             "alpha2": a_sample.reshape(B),
             "power": torch.full((B,), float(power), device=device),
         }
-        scaled, sign_params = _maybe_wrap_sign_modulated(
-            cfg, scaled, sign_prob, k, B, device, active_dims=active_dims
-        )
+        scaled, sign_params = _maybe_wrap_sign_modulated(cfg, scaled, sign_prob, k, B, device, active_dims=active_dims)
         params.update(sign_params)
         return scaled, params
     spec = _kernel_prior_spec(cfg, name)
     scaled, params = _build_scaled_kernel(name, spec, k, B, device, active_dims=active_dims)
-    scaled, sign_params = _maybe_wrap_sign_modulated(
-        cfg, scaled, sign_prob, k, B, device, active_dims=active_dims
-    )
+    scaled, sign_params = _maybe_wrap_sign_modulated(cfg, scaled, sign_prob, k, B, device, active_dims=active_dims)
     params.update(sign_params)
     return scaled, params
 
 
 def _sample_episode_kernel(
-    cfg, kernel_name: str, k: int, B: int, device, active_dims: Optional[List[int]] = None,
+    cfg,
+    kernel_name: str,
+    k: int,
+    B: int,
+    device,
+    active_dims: Optional[List[int]] = None,
     d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, Dict[str, Tensor]]:
     """Sample B episodes' kernel for kernel_name (base or "A+B"/"A*B").
@@ -489,8 +487,17 @@ def _wrap_concrete_sign_modulated(
 
 
 def _build_concrete_kernel(
-    name: str, l, alpha2, *, period=None, rq_alpha=None, power=None, active_dims: Optional[List[int]] = None,
-    sign_w=None, sign_b=None, sign_a=None,
+    name: str,
+    l,
+    alpha2,
+    *,
+    period=None,
+    rq_alpha=None,
+    power=None,
+    active_dims: Optional[List[int]] = None,
+    sign_w=None,
+    sign_b=None,
+    sign_a=None,
 ) -> gpytorch.kernels.Kernel:
     """Build a non-batched gpytorch Kernel with given hyperparameter values (used by build_kernel_fn).
 
@@ -570,18 +577,42 @@ def build_kernel_fn(
     composite = _parse_composite(kernel_name)
     if composite is None:
         kernel = _build_concrete_kernel(
-            kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims,
-            sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
+            kernel_name,
+            l,
+            alpha2,
+            period=period,
+            rq_alpha=rq_alpha,
+            power=power,
+            active_dims=active_dims,
+            sign_w=sign_w,
+            sign_b=sign_b,
+            sign_a=sign_a,
         )
     else:
         name_a, op, name_b = composite
         kernel_a = _build_concrete_kernel(
-            name_a, l, alpha2, period=period, rq_alpha=rq_alpha, power=power, active_dims=active_dims,
-            sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
+            name_a,
+            l,
+            alpha2,
+            period=period,
+            rq_alpha=rq_alpha,
+            power=power,
+            active_dims=active_dims,
+            sign_w=sign_w,
+            sign_b=sign_b,
+            sign_a=sign_a,
         )
         kernel_b = _build_concrete_kernel(
-            name_b, l_b, alpha2_b, period=period_b, rq_alpha=rq_alpha_b, power=power_b, active_dims=active_dims,
-            sign_w=sign_w_b, sign_b=sign_b_b, sign_a=sign_a_b,
+            name_b,
+            l_b,
+            alpha2_b,
+            period=period_b,
+            rq_alpha=rq_alpha_b,
+            power=power_b,
+            active_dims=active_dims,
+            sign_w=sign_w_b,
+            sign_b=sign_b_b,
+            sign_a=sign_a_b,
         )
         kernel = _DenseComposedKernel(kernel_a, op, kernel_b)
 
@@ -655,8 +686,15 @@ KERNEL_REGISTRY: Dict[str, Callable[..., Tensor]] = {
 
 # Composite kernels: sum / product of every pair of base kernels.
 _COMPOSABLE_KERNELS: List[str] = [
-    "rbf", "matern12", "matern32", "matern52", "cosine", "periodic",
-    "rational_quadratic", "dot_product", "polynomial",
+    "rbf",
+    "matern12",
+    "matern32",
+    "matern52",
+    "cosine",
+    "periodic",
+    "rational_quadratic",
+    "dot_product",
+    "polynomial",
 ]
 
 # Kernels that are PSD only for scalar inputs; composites containing one use k=1.
@@ -697,8 +735,17 @@ def _composite_kernel(
 ) -> Tensor:
     """Evaluate a registered "A+B" / "A*B" kernel through build_kernel_fn."""
     fn = build_kernel_fn(
-        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
-        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
+        kernel_name,
+        l,
+        alpha2,
+        period=period,
+        rq_alpha=rq_alpha,
+        power=power,
+        l_b=l_b,
+        alpha2_b=alpha2_b,
+        period_b=period_b,
+        rq_alpha_b=rq_alpha_b,
+        power_b=power_b,
     )
     return fn(X1, X2)
 
@@ -788,9 +835,7 @@ def _resolve_kernel_name(cfg, kernel_weights: Optional[Tensor] = None) -> str:
     return "rbf"
 
 
-def _sample_kernel_chain_structure(
-    cfg, kernel_weights: Optional[Tensor] = None
-) -> tuple[List[str], List[str], str]:
+def _sample_kernel_chain_structure(cfg, kernel_weights: Optional[Tensor] = None) -> tuple[List[str], List[str], str]:
     """Sample a kernel chain for systematic composition.
 
     m ~ round(LogNormal(composite_num_kernels_lognormal_loc, _scale)), clipped to
@@ -821,7 +866,13 @@ def _sample_kernel_chain_structure(
 
 
 def _build_kernel_chain(
-    cfg, names: List[str], ops: List[str], k: int, B: int, device, active_dims: Optional[List[int]] = None,
+    cfg,
+    names: List[str],
+    ops: List[str],
+    k: int,
+    B: int,
+    device,
+    active_dims: Optional[List[int]] = None,
     d_total: Optional[int] = None,
 ) -> tuple[gpytorch.kernels.Kernel, List[Dict[str, Tensor]], Dict[str, Tensor]]:
     """Build a systematic-composition chain for B episodes.
@@ -834,8 +885,7 @@ def _build_kernel_chain(
         (kernel, component_params list in names order, outer sign params dict).
     """
     built = [
-        _build_kernel_component(cfg, name, k, B, device, active_dims=active_dims, d_total=d_total)
-        for name in names
+        _build_kernel_component(cfg, name, k, B, device, active_dims=active_dims, d_total=d_total) for name in names
     ]
     kernel = built[0][0]
     for op, (comp_kernel, _) in zip(ops, built[1:]):
@@ -1016,7 +1066,7 @@ def gp_posterior(
     P, N = x_train.shape[0], x_test.shape[0]
 
     K_ff = kernel_fn(x_train, x_train) + noise * torch.eye(P, device=x_train.device)
-    K_sf = kernel_fn(x_test, x_train)   # (N, P)
+    K_sf = kernel_fn(x_test, x_train)  # (N, P)
     K_ss = kernel_fn(x_test, x_test)
     if not latent:
         K_ss = K_ss + noise * torch.eye(N, device=x_test.device)
@@ -1153,9 +1203,9 @@ def tabiclv2_warp_features(x: Tensor, seed: Optional[int] = None) -> Tensor:
             if c == 0:  # Identity — Standard Normal baseline
                 continue
             elif c == 1:  # Signed-square — mild heavy tails
-                warped_x[b, :, col] = torch.sign(col_data) * (col_data ** 2)
+                warped_x[b, :, col] = torch.sign(col_data) * (col_data**2)
             elif c == 2:  # Cube — Student-T-like heavy tails
-                warped_x[b, :, col] = col_data ** 3
+                warped_x[b, :, col] = col_data**3
             elif c == 3:  # Log-normal / exponential — right-skewed power law
                 # Clamp before exp() to avoid float overflow.
                 warped_x[b, :, col] = torch.exp(col_data.clamp(min=-5.0, max=4.0))
@@ -1428,7 +1478,11 @@ def _sample_structural_ops(category_weights: Dict[str, float], num_ops_min: int,
 
 
 def _sample_structural_category_mask(
-    M: int, category_weights: Dict[str, float], num_ops_min: int, num_ops_max: int, device,
+    M: int,
+    category_weights: Dict[str, float],
+    num_ops_min: int,
+    num_ops_max: int,
+    device,
 ) -> Tuple[Tensor, List[str]]:
     """Batched category selection for M draws (Gumbel top-k).
 
@@ -1692,9 +1746,7 @@ def apply_structural_feature_warp(x: Tensor, cfg, device) -> Tensor:
     use_index_axis = axis_gate.reshape(-1)[gated_idx]
 
     M = gated_idx.numel()
-    chosen_mask, eligible = _sample_structural_category_mask(
-        M, category_weights, num_ops_min, num_ops_max, dev
-    )
+    chosen_mask, eligible = _sample_structural_category_mask(M, category_weights, num_ops_min, num_ops_max, dev)
 
     # Loop over categories, each applied to the gated columns that chose it.
     for category in _STRUCTURAL_CATEGORIES:
@@ -1793,7 +1845,11 @@ def _evaluate_kernel_dense(kernel_obj: gpytorch.kernels.Kernel, x_norm: Tensor) 
 
 @torch.no_grad()
 def _generate_gp_batch_raw(
-    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
+    cfg,
+    B: int,
+    device: str = "cpu",
+    *,
+    return_kernel_metadata: bool = False,
     d_override: Optional[int] = None,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
@@ -1845,9 +1901,7 @@ def _generate_gp_batch_raw(
     # Shared settings for this batch. systematic_composition samples a chain instead of cfg.data.kernel(s).
     systematic = bool(getattr(cfg.data, "systematic_composition", False))
     if systematic:
-        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(
-            cfg, kernel_weights=kernel_weights
-        )
+        chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg, kernel_weights=kernel_weights)
     else:
         kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
     P = random.randint(cfg.data.P_min, cfg.data.P_max)
@@ -1880,15 +1934,21 @@ def _generate_gp_batch_raw(
         params = {
             key: torch.zeros(B, device=device)
             for key in (
-                "l", "alpha2", "period", "rq_alpha", "power",
-                "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b",
+                "l",
+                "alpha2",
+                "period",
+                "rq_alpha",
+                "power",
+                "l_b",
+                "alpha2_b",
+                "period_b",
+                "rq_alpha_b",
+                "power_b",
             )
         }
         params.update(outer_sign_params)
     else:
-        kernel_obj, params = _sample_episode_kernel(
-            cfg, kernel_name, k, B, device, active_dims=kernel_cols, d_total=d
-        )
+        kernel_obj, params = _sample_episode_kernel(cfg, kernel_name, k, B, device, active_dims=kernel_cols, d_total=d)
     likelihood = _build_likelihood(cfg, kernel_name, B, device)
     nugget = likelihood.noise.reshape(B)  # "nugget" name kept for the saved-metadata schema
 
@@ -1908,9 +1968,7 @@ def _generate_gp_batch_raw(
     # The kernel and mean are evaluated on x_kernel, a hidden transform of x_norm
     # (identity unless kernel_hidden_enabled); the model sees x_norm.
     if return_kernel_metadata:
-        x_kernel, kernel_hidden_applied = apply_kernel_hidden_warp(
-            x_norm, cfg, device, return_gate=True
-        )
+        x_kernel, kernel_hidden_applied = apply_kernel_hidden_warp(x_norm, cfg, device, return_gate=True)
     else:
         x_kernel = apply_kernel_hidden_warp(x_norm, cfg, device)
 
@@ -1934,27 +1992,27 @@ def _generate_gp_batch_raw(
     # K_all = L_all L_all^T from a PSD-repaired Cholesky, so the sample y_all and the
     # reported covariances come from the same PSD matrix.
     L_all, failed_all = _psd_safe_batch(K_all_raw)
-    K_all = L_all @ L_all.mT                          # (B, T, T), PSD by construction
+    K_all = L_all @ L_all.mT  # (B, T, T), PSD by construction
     y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero-mean GP sample
     # Add the mean function (evaluated on x_kernel).
     y_all = y_all + mean_module(x_kernel)
 
-    x_norm_train   = x_norm[:, :P]                     # (B, P, d) -- model-visible, saved/returned below
-    x_norm_test    = x_norm[:, P:P + N]                # (B, N, d)
-    x_norm_calib   = x_norm[:, P + N:]                 # (B, P_C, d) -- tabicl_split PIT context only
-    x_kernel_train = x_kernel[:, :P]                   # (B, P, d) -- oracle-only, never saved/returned
-    x_kernel_test  = x_kernel[:, P:P + N]              # (B, N, d)
-    y_train        = y_all[:,  :P]                     # (B, P)
-    y_test         = y_all[:,  P:P + N]                # (B, N)
-    y_calib        = y_all[:,  P + N:]                 # (B, P_C)
+    x_norm_train = x_norm[:, :P]  # (B, P, d) -- model-visible, saved/returned below
+    x_norm_test = x_norm[:, P : P + N]  # (B, N, d)
+    x_norm_calib = x_norm[:, P + N :]  # (B, P_C, d) -- tabicl_split PIT context only
+    x_kernel_train = x_kernel[:, :P]  # (B, P, d) -- oracle-only, never saved/returned
+    x_kernel_test = x_kernel[:, P : P + N]  # (B, N, d)
+    y_train = y_all[:, :P]  # (B, P)
+    y_test = y_all[:, P : P + N]  # (B, N)
+    y_calib = y_all[:, P + N :]  # (B, P_C)
 
     # --- Sub-matrices of K_all (nugget already on diagonal) ---
-    K_ff = K_all[:, :P, :P]         # (B, P, P) -- P_C never enters K_ff/LOO/oracle
-    K_ss = K_all[:, P:P + N, P:P + N]  # (B, N, N)
+    K_ff = K_all[:, :P, :P]  # (B, P, P) -- P_C never enters K_ff/LOO/oracle
+    K_ss = K_all[:, P : P + N, P : P + N]  # (B, N, N)
 
     # LOO PIT needs L_ff and alpha = K_ff^{-1} (y_train - mean_train).
     L_ff, failed_ff = _batched_cholesky(K_ff)
-    mean_train = mean_module(x_kernel_train)                                      # (B, P)
+    mean_train = mean_module(x_kernel_train)  # (B, P)
     alpha = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L_ff).squeeze(-1)  # (B, P)
 
     # Episodes whose Cholesky failed are dropped at the end.
@@ -1964,49 +2022,45 @@ def _generate_gp_batch_raw(
     if oracle_mode == "prior":
         # Prior oracle: R_star is the prior correlation of the test block of K_all.
         # The copula target is the posterior correlation R_post (see z_test below).
-        mu_star    = mean_module(x_kernel_test)
+        mu_star = mean_module(x_kernel_test)
         Sigma_star = K_ss
     else:
         raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; only 'prior' is supported.")
     Sigma_star = 0.5 * (Sigma_star + Sigma_star.permute(0, 2, 1))
 
     # sigma_to_correlation (batched)
-    var_diag   = Sigma_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10)              # (B, N)
+    var_diag = Sigma_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10)  # (B, N)
     sigma_star = var_diag.sqrt()
-    inv_s      = var_diag.rsqrt()
-    R_star     = Sigma_star * inv_s.unsqueeze(1) * inv_s.unsqueeze(2)             # (B, N, N)
-    d_diag     = R_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
-    R_star     = R_star / (d_diag.unsqueeze(1) * d_diag.unsqueeze(2))
+    inv_s = var_diag.rsqrt()
+    R_star = Sigma_star * inv_s.unsqueeze(1) * inv_s.unsqueeze(2)  # (B, N, N)
+    d_diag = R_star.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
+    R_star = R_star / (d_diag.unsqueeze(1) * d_diag.unsqueeze(2))
 
     # Prior correlation among the test points (same as R_star; kept for the schema).
-    prior_var  = K_ss.diagonal(dim1=1, dim2=2).clamp(min=1e-10)                   # (B, N)
-    prior_inv  = prior_var.rsqrt()
-    R_prior    = K_ss * prior_inv.unsqueeze(1) * prior_inv.unsqueeze(2)           # (B, N, N)
-    pd_diag    = R_prior.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
-    R_prior    = R_prior / (pd_diag.unsqueeze(1) * pd_diag.unsqueeze(2))
+    prior_var = K_ss.diagonal(dim1=1, dim2=2).clamp(min=1e-10)  # (B, N)
+    prior_inv = prior_var.rsqrt()
+    R_prior = K_ss * prior_inv.unsqueeze(1) * prior_inv.unsqueeze(2)  # (B, N, N)
+    pd_diag = R_prior.diagonal(dim1=1, dim2=2).clamp(min=1e-10).sqrt()
+    R_prior = R_prior / (pd_diag.unsqueeze(1) * pd_diag.unsqueeze(2))
 
     # LOO PIT for z_train; diag(K_ff^{-1}) is the column-wise squared norm of L_ff^{-1}.
-    eye_P      = torch.eye(P, device=device)
-    L_inv      = torch.linalg.solve_triangular(
-        L_ff, eye_P.unsqueeze(0).expand(B, -1, -1), upper=False
-    )                                                                               # (B, P, P)
-    K_inv_diag = (L_inv ** 2).sum(dim=1).clamp(min=1e-12)                         # (B, P)
-    z_train    = alpha * K_inv_diag.rsqrt()                                       # (B, P)
+    eye_P = torch.eye(P, device=device)
+    L_inv = torch.linalg.solve_triangular(L_ff, eye_P.unsqueeze(0).expand(B, -1, -1), upper=False)  # (B, P, P)
+    K_inv_diag = (L_inv**2).sum(dim=1).clamp(min=1e-12)  # (B, P)
+    z_train = alpha * K_inv_diag.rsqrt()  # (B, P)
 
     # Posterior PIT for z_test: standardize by the GP posterior marginals
     # N(mu_post_i, Sigma_post_ii), matching what a TabICL marginal conditioned on
     # the context gives. mu_star/sigma_star stay prior quantities. Only diag of the
     # Schur complement is used (each entry >= nugget).
-    K_sf     = K_all[:, P:P + N, :P]                                               # (B, N, P)
-    V_sf     = torch.linalg.solve_triangular(L_ff, K_sf.mT, upper=False)           # (B, P, N)
-    mu_post  = mu_star + torch.bmm(K_sf, alpha.unsqueeze(-1)).squeeze(-1)          # (B, N)
-    var_post = K_ss.diagonal(dim1=1, dim2=2) - (V_sf ** 2).sum(dim=1)              # (B, N)
+    K_sf = K_all[:, P : P + N, :P]  # (B, N, P)
+    V_sf = torch.linalg.solve_triangular(L_ff, K_sf.mT, upper=False)  # (B, P, N)
+    mu_post = mu_star + torch.bmm(K_sf, alpha.unsqueeze(-1)).squeeze(-1)  # (B, N)
+    var_post = K_ss.diagonal(dim1=1, dim2=2) - (V_sf**2).sum(dim=1)  # (B, N)
     var_post = var_post.clamp(min=likelihood.noise.reshape(B, 1).clamp(min=1e-10))
-    sig_c        = var_post.sqrt()
-    z_test       = (y_test - mu_post) / sig_c                                      # (B, N)
-    log_pdf_test = (
-        -0.5 * math.log(2.0 * math.pi) - sig_c.log() - 0.5 * z_test ** 2
-    )                                                                               # (B, N)
+    sig_c = var_post.sqrt()
+    z_test = (y_test - mu_post) / sig_c  # (B, N)
+    log_pdf_test = -0.5 * math.log(2.0 * math.pi) - sig_c.log() - 0.5 * z_test**2  # (B, N)
 
     # Discard episodes whose z_train is non-finite or has degenerate spread.
     non_finite = ~torch.isfinite(z_train).all(dim=1)
@@ -2023,7 +2077,7 @@ def _generate_gp_batch_raw(
     # Discard episodes whose every active kernel dimension collapsed to a constant
     # (R_star would then be constant).
     active_cols = kernel_cols if kernel_cols is not None else list(range(d))
-    active_stds = x_norm[:, :, active_cols].std(dim=1)             # (B, len(active_cols))
+    active_stds = x_norm[:, :, active_cols].std(dim=1)  # (B, len(active_cols))
     degenerate_active_col = (active_stds.max(dim=1).values) < 1e-4
     if degenerate_active_col.any():
         warnings.warn(
@@ -2034,7 +2088,7 @@ def _generate_gp_batch_raw(
     discard = discard | degenerate_active_col
 
     # Reconstruct full posterior covariance (for Y-space oracle)
-    Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)       # (B, N, N)
+    Sigma_full = R_star * sigma_star.unsqueeze(1) * sigma_star.unsqueeze(2)  # (B, N, N)
 
     # z_train override from a marginal model (z_train_source tabicl / tabicl_split /
     # backends), after the degenerate-episode checks. Targets are z-scored per
@@ -2063,8 +2117,14 @@ def _generate_gp_batch_raw(
         base_seed = int(getattr(cfg, "seed", None) or 0)
         _run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
         out = _run_batched(
-            marginal_regressor, x_train_np, y_train_s, x_test_np, y_test_s,
-            k_folds=tabicl_k_folds, probs_n=marginal_probs_n, seed=base_seed,
+            marginal_regressor,
+            x_train_np,
+            y_train_s,
+            x_test_np,
+            y_test_s,
+            k_folds=tabicl_k_folds,
+            probs_n=marginal_probs_n,
+            seed=base_seed,
         )
         z_train = torch.from_numpy(out["z_train"]).to(device=device)
         z_test = torch.from_numpy(out["z_test"]).to(device=device)
@@ -2078,9 +2138,7 @@ def _generate_gp_batch_raw(
 
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        probs = np.linspace(
-            1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
-        )
+        probs = np.linspace(1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n)
         base_seed = int(getattr(cfg, "seed", None) or 0)
         z_train_np = np.empty((B, P), dtype=np.float32)
         z_test_np = np.empty((B, N), dtype=np.float32)
@@ -2093,12 +2151,15 @@ def _generate_gp_batch_raw(
             yq = ((y_test[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
             seed_b = (base_seed + b) % (2**31)
             z_train_np[b] = _backend_loo_pit(
-                marginal_backend, marginal_regressor, xc, yc, probs,
-                k_folds=tabicl_k_folds, seed=seed_b,
+                marginal_backend,
+                marginal_regressor,
+                xc,
+                yc,
+                probs,
+                k_folds=tabicl_k_folds,
+                seed=seed_b,
             )
-            q_test = _backend_quantiles(
-                marginal_backend, marginal_regressor, xc, yc, xq, probs, seed=seed_b
-            )
+            q_test = _backend_quantiles(marginal_backend, marginal_regressor, xc, yc, xq, probs, seed=seed_b)
             z_test_b, log_pdf_b = compute_pit(q_test, probs, yq)
             z_test_np[b] = z_test_b
             # Jacobian back to raw-y nats.
@@ -2111,33 +2172,39 @@ def _generate_gp_batch_raw(
         from copula_inter.pit import run_pit_calib_split_batched  # local: pit.py imports from this module
 
         y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)   # (B, P, 1)
-        y_calib_scaled = ((y_calib - y_mean) / y_std).unsqueeze(-1)   # (B, P_C, 1)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
+        y_calib_scaled = ((y_calib - y_mean) / y_std).unsqueeze(-1)  # (B, P_C, 1)
         split_pit = run_pit_calib_split_batched(
-            tabicl_model, x_norm_train, y_train_scaled,
-            x_norm_calib, y_calib_scaled,
+            tabicl_model,
+            x_norm_train,
+            y_train_scaled,
+            x_norm_calib,
+            y_calib_scaled,
             Y_query_raw=y_train.unsqueeze(-1),
             Y_calib_raw=y_calib.unsqueeze(-1),
         )
-        z_train = split_pit["z_train"].squeeze(-1)                    # (B, P)
+        z_train = split_pit["z_train"].squeeze(-1)  # (B, P)
     elif apply_tabicl:
         # "tabicl": K-fold PIT on the training points and a full-context PIT on the
         # real test points; z_train, z_test and log_pdf_test all come from TabICL.
         from copula_inter.pit import run_pit_batched  # local: pit.py imports from this module
 
         y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std  = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)   # (B, P, 1)
-        y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)     # (B, N, 1)
+        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+        y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
+        y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)  # (B, N, 1)
         tabicl_pit = run_pit_batched(
-            tabicl_model, x_norm_train, y_train_scaled,
-            x_norm_test, y_test_scaled,
+            tabicl_model,
+            x_norm_train,
+            y_train_scaled,
+            x_norm_test,
+            y_test_scaled,
             k_folds=tabicl_k_folds,
             Y_train_raw=y_train.unsqueeze(-1),
         )
-        z_train = tabicl_pit["z_train"].squeeze(-1)                   # (B, P)
-        z_test = tabicl_pit["z_test"].squeeze(-1)                     # (B, N)
+        z_train = tabicl_pit["z_train"].squeeze(-1)  # (B, P)
+        z_test = tabicl_pit["z_test"].squeeze(-1)  # (B, N)
         # Jacobian back to raw-y nats: log p_raw = log p_scaled - log(std).
         log_pdf_test = tabicl_pit["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast
 
@@ -2148,17 +2215,17 @@ def _generate_gp_batch_raw(
     # --- Pack into list of dicts (single D→H transfer) ---
     tensors = {
         "x_norm_train": x_norm_train.cpu(),
-        "x_norm_test":  x_norm_test.cpu(),
-        "y_train":      y_train.cpu(),
-        "y_test":       y_test.cpu(),
-        "z_train":      z_train.cpu(),
-        "z_test":       z_test.cpu(),
+        "x_norm_test": x_norm_test.cpu(),
+        "y_train": y_train.cpu(),
+        "y_test": y_test.cpu(),
+        "z_train": z_train.cpu(),
+        "z_test": z_test.cpu(),
         "log_pdf_test": log_pdf_test.cpu(),
-        "R_star":       R_star.cpu(),
-        "R_prior":      R_prior.cpu(),
-        "Sigma_star":   Sigma_full.cpu(),
-        "mu_star":      mu_star.cpu(),
-        "sigma_star":   sigma_star.cpu(),
+        "R_star": R_star.cpu(),
+        "R_prior": R_prior.cpu(),
+        "Sigma_star": Sigma_full.cpu(),
+        "mu_star": mu_star.cpu(),
+        "sigma_star": sigma_star.cpu(),
     }
 
     # Discard any episode with a non-finite saved field.
@@ -2181,9 +2248,20 @@ def _generate_gp_batch_raw(
         # Per-episode hyperparameters and factors plus the call-shared kernel name and
         # active_dims. Chains carry per-component sign fields in kernel_component_params.
         flat_keys = [
-            "l", "alpha2", "period", "rq_alpha", "power",
-            "l_b", "alpha2_b", "period_b", "rq_alpha_b", "power_b",
-            "sign_applied_outer", "sign_w_outer", "sign_b_outer", "sign_a_outer",
+            "l",
+            "alpha2",
+            "period",
+            "rq_alpha",
+            "power",
+            "l_b",
+            "alpha2_b",
+            "period_b",
+            "rq_alpha_b",
+            "power_b",
+            "sign_applied_outer",
+            "sign_w_outer",
+            "sign_b_outer",
+            "sign_a_outer",
         ]
         if not systematic:
             flat_keys += ["sign_applied", "sign_w", "sign_b", "sign_a"]
@@ -2197,9 +2275,17 @@ def _generate_gp_batch_raw(
         tensors["x_kernel_train"] = x_kernel_train.cpu()
         tensors["x_kernel_test"] = x_kernel_test.cpu()
         for key in (
-            "mean_weight", "mean_bias", "mean_nonzero", "mean_family", "mean_linear",
-            "mean_exp_direction", "mean_exp_rate", "mean_exp_scale",
-            "mean_anomaly_direction", "mean_anomaly_threshold", "mean_anomaly_magnitude",
+            "mean_weight",
+            "mean_bias",
+            "mean_nonzero",
+            "mean_family",
+            "mean_linear",
+            "mean_exp_direction",
+            "mean_exp_rate",
+            "mean_exp_scale",
+            "mean_anomaly_direction",
+            "mean_anomaly_threshold",
+            "mean_anomaly_magnitude",
         ):
             tensors[key] = mean_params[key].cpu()
         tensors["_L_ff"] = L_ff
@@ -2211,14 +2297,19 @@ def _generate_gp_batch_raw(
 
     # Drop discarded episodes from the per-episode tensors (the extra fields are call-shared).
     return assemble_episodes(
-        tensors, extra, discard,
-        (chain_names, chain_ops, component_params)
-        if return_kernel_metadata and systematic else None,
+        tensors,
+        extra,
+        discard,
+        (chain_names, chain_ops, component_params) if return_kernel_metadata and systematic else None,
     )
 
 
 def generate_gp_batch(
-    cfg, B: int, device: str = "cpu", *, return_kernel_metadata: bool = False,
+    cfg,
+    B: int,
+    device: str = "cpu",
+    *,
+    return_kernel_metadata: bool = False,
     tabicl_model: Optional[torch.nn.Module] = None,
     tabicl_k_folds: int = 10,
     tabicl_split_calib_frac: float = 0.0,
@@ -2237,13 +2328,20 @@ def generate_gp_batch(
     """
     base_seed = getattr(cfg, "seed", None)
     episodes = _generate_gp_batch_raw(
-        cfg, B, device, return_kernel_metadata=return_kernel_metadata,
+        cfg,
+        B,
+        device,
+        return_kernel_metadata=return_kernel_metadata,
         d_override=d_override,
-        tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+        tabicl_model=tabicl_model,
+        tabicl_k_folds=tabicl_k_folds,
         tabicl_split_calib_frac=tabicl_split_calib_frac,
-        kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
-        marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
-        marginal_probs_n=marginal_probs_n, raw_y_override=raw_y_override,
+        kernel_weights=kernel_weights,
+        tabicl_mix_weights=tabicl_mix_weights,
+        marginal_backend=marginal_backend,
+        marginal_regressor=marginal_regressor,
+        marginal_probs_n=marginal_probs_n,
+        raw_y_override=raw_y_override,
     )
     # Pin every top-up round to the first round's d (or d_override).
     if episodes:
@@ -2259,13 +2357,20 @@ def generate_gp_batch(
             # Offset the seed per round so retries draw new kernels.
             cfg.seed = base_seed + round_idx * 104_729
         new_episodes = _generate_gp_batch_raw(
-            cfg, shortfall, device, return_kernel_metadata=return_kernel_metadata,
+            cfg,
+            shortfall,
+            device,
+            return_kernel_metadata=return_kernel_metadata,
             d_override=d_fixed,
-            tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+            tabicl_model=tabicl_model,
+            tabicl_k_folds=tabicl_k_folds,
             tabicl_split_calib_frac=tabicl_split_calib_frac,
-            kernel_weights=kernel_weights, tabicl_mix_weights=tabicl_mix_weights,
-            marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
-            marginal_probs_n=marginal_probs_n, raw_y_override=raw_y_override,
+            kernel_weights=kernel_weights,
+            tabicl_mix_weights=tabicl_mix_weights,
+            marginal_backend=marginal_backend,
+            marginal_regressor=marginal_regressor,
+            marginal_probs_n=marginal_probs_n,
+            raw_y_override=raw_y_override,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])

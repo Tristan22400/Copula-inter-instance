@@ -6,6 +6,7 @@ single-GPU only, weights reshaped to 2-D for Newton-Schulz, Newton-Schulz
 batched across parameters of the same shape, fused momentum updates
 (torch._foreach_*), and a torch.compile'd Newton-Schulz kernel.
 """
+
 import math
 from collections import defaultdict
 
@@ -47,26 +48,34 @@ class Muon(torch.optim.Optimizer):
     May work poorly with small batches or for fine-tuning pretrained models.
     """
 
-    def __init__(self,
-                 param_groups,
-                 lr=2e-2,
-                 weight_decay=0.1,
-                 matched_adamw_rms=0.2,
-                 momentum=0.95,
-                 nesterov=True,
-                 ns_steps=5,
-                 adamw_betas=(0.95, 0.95),
-                 adamw_eps=1e-8):
-        defaults = dict(lr=lr, weight_decay=weight_decay,
-                        matched_adamw_rms=matched_adamw_rms,
-                        momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
-                        adamw_betas=adamw_betas, adamw_eps=adamw_eps)
+    def __init__(
+        self,
+        param_groups,
+        lr=2e-2,
+        weight_decay=0.1,
+        matched_adamw_rms=0.2,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        adamw_betas=(0.95, 0.95),
+        adamw_eps=1e-8,
+    ):
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            matched_adamw_rms=matched_adamw_rms,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            adamw_betas=adamw_betas,
+            adamw_eps=adamw_eps,
+        )
         super().__init__(param_groups, defaults)
 
     def step(self):
         # ---- Muon groups ----
         for group in self.param_groups:
-            if not group.get('use_muon', False):
+            if not group.get("use_muon", False):
                 continue
             lr = group["lr"]
             ns_steps = group["ns_steps"]
@@ -125,27 +134,27 @@ class Muon(torch.optim.Optimizer):
 
         # ---- AdamW groups ----
         for group in self.param_groups:
-            if group.get('use_muon', False):
+            if group.get("use_muon", False):
                 continue
-            if 'step' in group:
-                group['step'] += 1
+            if "step" in group:
+                group["step"] += 1
             else:
-                group['step'] = 1
-            step = group['step']
+                group["step"] = 1
+            step = group["step"]
             params = group["params"]
-            lr = group['lr']
-            weight_decay = group['weight_decay']
-            beta1, beta2 = group['adamw_betas']
-            eps = group['adamw_eps']
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            beta1, beta2 = group["adamw_betas"]
+            eps = group["adamw_eps"]
             for p in params:
                 g = p.grad
                 assert g is not None
                 state = self.state[p]
                 if len(state) == 0:
-                    state['adamw_exp_avg'] = torch.zeros_like(g)
-                    state['adamw_exp_avg_sq'] = torch.zeros_like(g)
-                buf1 = state['adamw_exp_avg']
-                buf2 = state['adamw_exp_avg_sq']
+                    state["adamw_exp_avg"] = torch.zeros_like(g)
+                    state["adamw_exp_avg_sq"] = torch.zeros_like(g)
+                buf1 = state["adamw_exp_avg"]
+                buf2 = state["adamw_exp_avg_sq"]
                 buf1.lerp_(g, 1 - beta1)
                 buf2.lerp_(g.square(), 1 - beta2)
                 g = buf1 / (eps + buf2.sqrt())

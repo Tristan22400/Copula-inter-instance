@@ -49,8 +49,13 @@ from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import load_copula_model, normalize_features
 
 __all__ = [
-    "get_model", "run_real_config", "run_synthetic_config", "build_era5_probe",
-    "weighted_corr", "weighted_rmse_bias", "weighted_r2",
+    "get_model",
+    "run_real_config",
+    "run_synthetic_config",
+    "build_era5_probe",
+    "weighted_corr",
+    "weighted_rmse_bias",
+    "weighted_r2",
 ]
 
 _MODEL_CACHE: dict = {}
@@ -102,7 +107,7 @@ def weighted_rmse_bias(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> tuple:
         return float("nan"), float("nan")
     a, b, w = a[mask], b[mask], w[mask]
     diff = a - b
-    rmse = float(np.sqrt(np.average(diff ** 2, weights=w)))
+    rmse = float(np.sqrt(np.average(diff**2, weights=w)))
     bias = float(np.average(diff, weights=w))
     return rmse, bias
 
@@ -118,7 +123,7 @@ def weighted_r2(pred: np.ndarray, target: np.ndarray, n: np.ndarray) -> float:
     pred, target, n = pred[mask], target[mask], n[mask]
     sigma = 1.0 / np.sqrt(n)
     resid = pred - target
-    t_bar = float(np.average(target, weights=1.0 / sigma ** 2))
+    t_bar = float(np.average(target, weights=1.0 / sigma**2))
     weighted_ss_res = float(np.sum((resid / sigma) ** 2))
     weighted_ss_tot = float(np.sum(((target - t_bar) / sigma) ** 2))
     return 1.0 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot > 0 else float("nan")
@@ -160,13 +165,22 @@ def _fit_gp_baseline_nll(
     for kname in kernel_names:
         try:
             fit = fit_and_eval_gpytorch(
-                X_train, y_train_std, X_test, kname, n_steps=n_steps, lr=lr,
-                oracle_mode="posterior", n_restarts=n_restarts,
+                X_train,
+                y_train_std,
+                X_test,
+                kname,
+                n_steps=n_steps,
+                lr=lr,
+                oracle_mode="posterior",
+                n_restarts=n_restarts,
             )
             mean_real = fit["mean"] * sigma_y + mu_y
-            Sigma_real = fit["Sigma"] * (sigma_y ** 2)
+            Sigma_real = fit["Sigma"] * (sigma_y**2)
             parts = gp_oracle_y_nll(
-                Sigma_real.unsqueeze(0), mean_real.unsqueeze(0), y_test_t.unsqueeze(0), mask,
+                Sigma_real.unsqueeze(0),
+                mean_real.unsqueeze(0),
+                y_test_t.unsqueeze(0),
+                mask,
             )
             out[kname] = {k: float(v) for k, v in parts.items()}
         except Exception as exc:  # noqa: BLE001
@@ -178,11 +192,19 @@ def _fit_gp_baseline_nll(
 
 
 def run_real_config(
-    ckpt: str, config_name: str, region_name: str, grid_size: int,
-    n_days: int = N_DAYS, device: "str | None" = None, seed: int = SEED,
-    n_context: int = N_CONTEXT, n_bins: int = N_BINS,
-    compute_gp_baseline: bool = True, gp_baseline_kernels: "list | None" = None,
-    gp_n_steps_mle: int = GP_N_STEPS_MLE, gp_lr_mle: float = GP_LR_MLE,
+    ckpt: str,
+    config_name: str,
+    region_name: str,
+    grid_size: int,
+    n_days: int = N_DAYS,
+    device: "str | None" = None,
+    seed: int = SEED,
+    n_context: int = N_CONTEXT,
+    n_bins: int = N_BINS,
+    compute_gp_baseline: bool = True,
+    gp_baseline_kernels: "list | None" = None,
+    gp_n_steps_mle: int = GP_N_STEPS_MLE,
+    gp_lr_mle: float = GP_LR_MLE,
     gp_n_restarts_mle: int = GP_N_RESTARTS_MLE,
 ) -> dict:
     """Real-ERA5 config: fetch the region's days and score the checkpoint's context-conditioned correlogram against the empirical one."""
@@ -232,14 +254,26 @@ def run_real_config(
         day_values = data["t2m"][d].ravel()
         context_values = day_values[context_idx]
         R_context = extract_model_context_correlation(
-            model, resolved_device, marginal, context_coords, context_values, coords, k_folds=PIT_K_FOLDS,
+            model,
+            resolved_device,
+            marginal,
+            context_coords,
+            context_values,
+            coords,
+            k_folds=PIT_K_FOLDS,
         )
 
         # Y-space correlation curve from pooled model samples.
         z_batch = rng.standard_normal((N_YSPACE_MC_SAMPLES, D))
         model_yspace_samples.append(
             sample_copula_residual_fields(
-                marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch,
+                marginal,
+                context_coords,
+                context_values,
+                coords,
+                R_context,
+                resolved_device,
+                z_batch,
             )
         )
 
@@ -257,9 +291,15 @@ def run_real_config(
 
         if compute_gp_baseline:
             gp_day = _fit_gp_baseline_nll(
-                cache_key=(config_name, d, seed, n_context_eff), x_train_norm=x_train_norm,
-                context_values=context_values, x_test_norm=x_nll_test_norm, y_test=day_values[nll_test_idx],
-                kernel_names=gp_kernels, n_steps=gp_n_steps_mle, lr=gp_lr_mle, n_restarts=gp_n_restarts_mle,
+                cache_key=(config_name, d, seed, n_context_eff),
+                x_train_norm=x_train_norm,
+                context_values=context_values,
+                x_test_norm=x_nll_test_norm,
+                y_test=day_values[nll_test_idx],
+                kernel_names=gp_kernels,
+                n_steps=gp_n_steps_mle,
+                lr=gp_lr_mle,
+                n_restarts=gp_n_restarts_mle,
                 device=resolved_device,
             )
             for kname, parts in gp_day.items():
@@ -270,18 +310,23 @@ def run_real_config(
     nll_total = float(np.nanmean(nll_total_per_day)) if nll_total_per_day else float("nan")
     nll_marginal = float(np.nanmean(nll_marginal_per_day)) if nll_marginal_per_day else float("nan")
     nll_copula = float(np.nanmean(nll_copula_per_day)) if nll_copula_per_day else float("nan")
-    gp_baseline_nll = {
-        kname: {comp: float(np.nanmean(vals)) if vals else float("nan") for comp, vals in parts.items()}
-        for kname, parts in gp_nll_per_day.items()
-    } if compute_gp_baseline else {}
+    gp_baseline_nll = (
+        {
+            kname: {comp: float(np.nanmean(vals)) if vals else float("nan") for comp, vals in parts.items()}
+            for kname, parts in gp_nll_per_day.items()
+        }
+        if compute_gp_baseline
+        else {}
+    )
 
     rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
     rho_dummy = bin_correlation_by_distance(R_dummy, dist, bin_edges)
 
     shape_corr = weighted_corr(rho_model_yspace, rho_emp, pair_counts)
     rmse, bias = weighted_rmse_bias(rho_model_yspace, rho_emp, pair_counts)
-    fro_ratio = float(np.sqrt(np.nanmean((rho_model_yspace - rho_emp) ** 2)) /
-                       max(np.sqrt(np.nanmean(rho_emp ** 2)), 1e-8))
+    fro_ratio = float(
+        np.sqrt(np.nanmean((rho_model_yspace - rho_emp) ** 2)) / max(np.sqrt(np.nanmean(rho_emp**2)), 1e-8)
+    )
 
     gt_fit = fit_theoretical_law(dist_centers, rho_emp, pair_counts.astype(int), "matern")
     model_r2 = weighted_r2(rho_model_yspace, rho_emp, pair_counts)
@@ -312,15 +357,23 @@ def run_real_config(
         "rho_model_yspace": rho_model_yspace.tolist(),
         "rho_dummy": rho_dummy.tolist(),
     }
-    print(f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
-          f"rmse={rmse:.3f} bias={bias:+.3f} model_r2={model_r2:.3f} nll_total={nll_total:.3f}")
+    print(
+        f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
+        f"rmse={rmse:.3f} bias={bias:+.3f} model_r2={model_r2:.3f} nll_total={nll_total:.3f}"
+    )
     return result
 
 
 def run_synthetic_config(
-    ckpt: str, config_name: str, kernel_name: str, grid_size: int,
-    n_context: int = N_CONTEXT, n_draws: int = 20, seed: int = SEED,
-    device: "str | None" = None, n_bins: int = N_BINS,
+    ckpt: str,
+    config_name: str,
+    kernel_name: str,
+    grid_size: int,
+    n_context: int = N_CONTEXT,
+    n_draws: int = 20,
+    seed: int = SEED,
+    device: "str | None" = None,
+    n_bins: int = N_BINS,
 ) -> dict:
     """Synthetic config: sample a known covariance from one data_gen kernel and score how well the checkpoint recovers it."""
     model, cfg, resolved_device, marginal = get_model(ckpt, device)
@@ -337,7 +390,13 @@ def run_synthetic_config(
         z_true = L @ rng.standard_normal(D)
         context_values = z_true[context_idx]
         R_pred = extract_model_context_correlation(
-            model, resolved_device, marginal, context_coords, context_values, coords, k_folds=PIT_K_FOLDS,
+            model,
+            resolved_device,
+            marginal,
+            context_coords,
+            context_values,
+            coords,
+            k_folds=PIT_K_FOLDS,
         )
         R_pred_draws.append(R_pred)
     R_pred_mean = np.mean(R_pred_draws, axis=0)
@@ -351,23 +410,40 @@ def run_synthetic_config(
     gt_fit = fit_theoretical_law(dist_centers, rho_true, pair_counts.astype(int), "matern")
 
     result = {
-        "ckpt": ckpt, "config": config_name, "true_kernel": kernel_name,
-        "grid_size": grid_size, "D": int(D), "n_context": int(n_context_eff), "n_draws": n_draws,
-        "shape_corr": shape_corr, "rmse": rmse, "bias": bias, "model_r2": model_r2,
+        "ckpt": ckpt,
+        "config": config_name,
+        "true_kernel": kernel_name,
+        "grid_size": grid_size,
+        "D": int(D),
+        "n_context": int(n_context_eff),
+        "n_draws": n_draws,
+        "shape_corr": shape_corr,
+        "rmse": rmse,
+        "bias": bias,
+        "model_r2": model_r2,
         "gt_matern_r2": gt_fit["r_squared"] if gt_fit else None,
         "dist_centers": dist_centers.tolist(),
         "pair_counts": pair_counts.tolist(),
         "rho_true": rho_true.tolist(),
         "rho_pred": rho_pred.tolist(),
     }
-    print(f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
-          f"model_r2={model_r2:.3f} bias={bias:+.3f}")
+    print(
+        f"[{config_name} | {os.path.basename(ckpt)}] shape_corr={shape_corr:.3f} "
+        f"model_r2={model_r2:.3f} bias={bias:+.3f}"
+    )
     return result
 
 
 def build_era5_probe(
-    region_name: str, grid_size: int, n_days_fetch: int, n_days_probe: int,
-    n_context: int, n_bins: int, tabicl_marginal, device: str, seed: int = SEED,
+    region_name: str,
+    grid_size: int,
+    n_days_fetch: int,
+    n_days_probe: int,
+    n_context: int,
+    n_bins: int,
+    tabicl_marginal,
+    device: str,
+    seed: int = SEED,
 ) -> dict:
     """Frozen real-ERA5 probe for region_name, computed once for the training loop.
 
@@ -432,7 +508,11 @@ def build_era5_probe(
         day_values = data["t2m"][d].ravel()
         context_values = day_values[context_idx]
         z_train = compute_context_z_train(
-            x_train_norm, context_values, tabicl_marginal, device, k_folds=PIT_K_FOLDS,
+            x_train_norm,
+            context_values,
+            tabicl_marginal,
+            device,
+            k_folds=PIT_K_FOLDS,
         )
         z_train_per_day.append(z_train)
         context_values_per_day.append(context_values)
@@ -440,14 +520,14 @@ def build_era5_probe(
 
     return {
         "region": region_name,
-        "x_train_norm": x_train_norm,                       # (P, 2)
-        "x_test_norm": x_test_norm,                          # (D, 2)
+        "x_train_norm": x_train_norm,  # (P, 2)
+        "x_test_norm": x_test_norm,  # (D, 2)
         "z_train_per_day": np.stack(z_train_per_day, axis=0),  # (n_days_probe, P)
-        "x_nll_test_norm": x_nll_test_norm,                    # (n_nll_test, 2)
-        "nll_test_idx": nll_test_idx,                          # (n_nll_test,) indices into x_test_norm/coords
-        "context_values_per_day": np.stack(context_values_per_day, axis=0),    # (n_days_probe, P) raw t2m
+        "x_nll_test_norm": x_nll_test_norm,  # (n_nll_test, 2)
+        "nll_test_idx": nll_test_idx,  # (n_nll_test,) indices into x_test_norm/coords
+        "context_values_per_day": np.stack(context_values_per_day, axis=0),  # (n_days_probe, P) raw t2m
         "nll_test_values_per_day": np.stack(nll_test_values_per_day, axis=0),  # (n_days_probe, n_nll_test) raw t2m
-        "dist": dist,                                        # (D, D)
+        "dist": dist,  # (D, D)
         "bin_edges": bin_edges,
         "dist_centers": dist_centers,
         "pair_counts": pair_counts,

@@ -30,12 +30,17 @@ from eval.runners.eval_checkpoint import _eval_icl_episode  # noqa: E402
 
 _TINY_DATA_CFG = {
     "d_features": 1,
-    "P_min": 5, "P_max": 8,
-    "N_min": 4, "N_max": 6,
+    "P_min": 5,
+    "P_max": 8,
+    "N_min": 4,
+    "N_max": 6,
     "n_tasks": 4,
-    "l_min": 0.5, "l_max": 1.5,
-    "alpha2_min": 0.5, "alpha2_max": 1.5,
-    "noise_min": 0.05, "noise_max": 0.2,
+    "l_min": 0.5,
+    "l_max": 1.5,
+    "alpha2_min": 0.5,
+    "alpha2_max": 1.5,
+    "noise_min": 0.05,
+    "noise_max": 0.2,
 }
 
 
@@ -148,11 +153,22 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
     )
 
     expected_keys = {
-        "independence", "gp_prior_rbf",
-        "gp_mle_rbf", "gp_mle_ard_rbf", "gp_mle_matern32", "gp_mle_ard_matern32",
-        "gp_mle_periodic", "gp_mle_ard_periodic", "gp_mle_rq", "gp_mle_ard_rq",
-        "gp_mle_dot_product", "gp_mle_polynomial",
-        "dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product",
+        "independence",
+        "gp_prior_rbf",
+        "gp_mle_rbf",
+        "gp_mle_ard_rbf",
+        "gp_mle_matern32",
+        "gp_mle_ard_matern32",
+        "gp_mle_periodic",
+        "gp_mle_ard_periodic",
+        "gp_mle_rq",
+        "gp_mle_ard_rq",
+        "gp_mle_dot_product",
+        "gp_mle_polynomial",
+        "dkl_rbf",
+        "dkl_matern32",
+        "dkl_rq",
+        "dkl_dot_product",
         "per_ep_transformer",
     }
     # y_space_nlls excludes the unfitted references.
@@ -172,8 +188,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         parts = y_space_nlls[method]
         assert set(parts.keys()) == {"total", "marginal", "copula"}
         for part_name, val in parts.items():
-            assert torch.isfinite(torch.tensor(val)), \
-                f"{method}'s {part_name} Y-space NLL is non-finite"
+            assert torch.isfinite(torch.tensor(val)), f"{method}'s {part_name} Y-space NLL is non-finite"
         # total = marginal + copula exactly.
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
@@ -183,7 +198,9 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode):
     fake_model = _FakeICLModel(n_test=n_test, rank=2)
 
     nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts = _eval_icl_episode(
-        ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"),
+        ep=tiny_episode,
+        icl_model=fake_model,
+        device=torch.device("cpu"),
     )
 
     assert set(nlls.keys()) == {"icl", "oracle"}
@@ -215,11 +232,13 @@ def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode):
         "z_train": torch.randn(n_train),
         "z_test": z_test,
         # Standard-normal log-density as a stand-in marginal.
-        "log_pdf_test": -0.5 * (z_test ** 2 + math.log(2 * math.pi)),
+        "log_pdf_test": -0.5 * (z_test**2 + math.log(2 * math.pi)),
     }
 
     _, _, _, _, icl_y_parts = _eval_icl_episode(
-        ep=tiny_episode, icl_model=fake_model, device=torch.device("cpu"),
+        ep=tiny_episode,
+        icl_model=fake_model,
+        device=torch.device("cpu"),
         marginal_pit=tabicl_pit,
     )
 
@@ -227,7 +246,8 @@ def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode):
     for val in icl_y_parts.values():
         assert torch.isfinite(torch.tensor(val))
     assert icl_y_parts["total"] == pytest.approx(
-        icl_y_parts["marginal"] + icl_y_parts["copula"], abs=1e-3,
+        icl_y_parts["marginal"] + icl_y_parts["copula"],
+        abs=1e-3,
     )
 
 
@@ -243,13 +263,21 @@ def _near_duplicate_rbf_task(alpha2: float) -> dict:
     x_train = torch.tensor([[-1.0], [0.0], [1.0]])
     x_test = torch.tensor([[0.50000], [0.50001], [-0.7]])  # first two are near-duplicates
     return {
-        "kernel": "rbf", "l": torch.tensor([0.3]), "alpha2": torch.tensor([alpha2]),
+        "kernel": "rbf",
+        "l": torch.tensor([0.3]),
+        "alpha2": torch.tensor([alpha2]),
         "nugget": torch.tensor([1e-4]),
-        "period": zero, "rq_alpha": zero, "power": zero,
-        "l_b": zero, "alpha2_b": zero, "period_b": zero,
-        "rq_alpha_b": zero, "power_b": zero,
+        "period": zero,
+        "rq_alpha": zero,
+        "power": zero,
+        "l_b": zero,
+        "alpha2_b": zero,
+        "period_b": zero,
+        "rq_alpha_b": zero,
+        "power_b": zero,
         "kernel_feature_indices": torch.tensor([0]),
-        "x_norm_train": x_train, "x_norm_test": x_test,
+        "x_norm_train": x_train,
+        "x_norm_test": x_test,
         "y_train": torch.tensor([0.5, -0.3, 0.8]),
         "y_test": torch.tensor([1.0, -1.0, 0.5]),  # near-duplicates disagree by 2.0
         "mu_star": torch.zeros(3),
@@ -281,9 +309,7 @@ def test_gp_analytical_posterior_eig_floor_nugget_bound():
 
     Sigma_post = post["Sigma_post"].double()
     repaired_min_eig = torch.linalg.eigvalsh(Sigma_post).min().item()
-    assert repaired_min_eig >= 1e-4 - 1e-9, (
-        "post-repair eigenvalues must respect the nugget lower bound"
-    )
+    assert repaired_min_eig >= 1e-4 - 1e-9, "post-repair eigenvalues must respect the nugget lower bound"
 
 
 def test_baseline_cache_round_trip(tiny_episode, tmp_path):
@@ -292,18 +318,37 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path):
 
     fingerprint = baseline_fingerprint(
         OmegaConf.create({"data": dict(_TINY_DATA_CFG)}),
-        live_generate=True, dataset_dir=None, seed=0, icl_rank=2, oracle_mode="prior",
-        n_steps_mle=3, lr_mle=0.1, n_restarts_mle=1,
-        n_steps_dkl=3, lr_dkl=0.1, n_steps_per_ep=3, patience_per_ep=2,
+        live_generate=True,
+        dataset_dir=None,
+        seed=0,
+        icl_rank=2,
+        oracle_mode="prior",
+        n_steps_mle=3,
+        lr_mle=0.1,
+        n_restarts_mle=1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
     )
 
     nlls, R_dict, y_space_nlls = eval_baselines_episode(
-        ep=tiny_episode, icl_rank=2, n_steps_mle=3, lr_mle=0.1, n_steps_dkl=3, lr_dkl=0.1,
-        n_steps_per_ep=3, patience_per_ep=2, device=torch.device("cpu"), oracle_mode="prior", n_restarts_mle=1,
+        ep=tiny_episode,
+        icl_rank=2,
+        n_steps_mle=3,
+        lr_mle=0.1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
+        device=torch.device("cpu"),
+        oracle_mode="prior",
+        n_restarts_mle=1,
     )
     key = episode_cache_key(live_generate=True, dataset_dir=None, seed=0, ep_i=0)
     save_baseline_cache(
-        cache_path, fingerprint,
+        cache_path,
+        fingerprint,
         {key: {"nlls": nlls, "R_dict": R_dict, "y_nlls": y_space_nlls}},
     )
 
@@ -317,11 +362,21 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path):
     # A different fingerprint (e.g. changed n_steps_mle) must miss entirely.
     other_fingerprint = baseline_fingerprint(
         OmegaConf.create({"data": dict(_TINY_DATA_CFG)}),
-        live_generate=True, dataset_dir=None, seed=0, icl_rank=2, oracle_mode="prior",
-        n_steps_mle=99, lr_mle=0.1, n_restarts_mle=1,
-        n_steps_dkl=3, lr_dkl=0.1, n_steps_per_ep=3, patience_per_ep=2,
+        live_generate=True,
+        dataset_dir=None,
+        seed=0,
+        icl_rank=2,
+        oracle_mode="prior",
+        n_steps_mle=99,
+        lr_mle=0.1,
+        n_restarts_mle=1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
     )
     assert load_baseline_cache(cache_path, other_fingerprint) == {}
+
 
 def test_failed_baseline_fit_still_yields_nan_parts_dict(tiny_episode, monkeypatch):
     """A baseline whose fit raises records a {total, marginal, copula} NaN dict, not a bare float."""
@@ -338,9 +393,17 @@ def test_failed_baseline_fit_still_yields_nan_parts_dict(tiny_episode, monkeypat
     monkeypatch.setattr(classical, "fit_and_eval_gpytorch", fail_dkl_only)
 
     _, _, y_space_nlls = eval_baselines_episode(
-        ep=tiny_episode, icl_rank=2, n_steps_mle=3, lr_mle=0.1, n_steps_dkl=3,
-        lr_dkl=0.1, n_steps_per_ep=3, patience_per_ep=2,
-        device=torch.device("cpu"), oracle_mode="prior", n_restarts_mle=1,
+        ep=tiny_episode,
+        icl_rank=2,
+        n_steps_mle=3,
+        lr_mle=0.1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
+        device=torch.device("cpu"),
+        oracle_mode="prior",
+        n_restarts_mle=1,
     )
 
     dkl_labels = [k for k in y_space_nlls if k.startswith("dkl_")]

@@ -69,9 +69,16 @@ def _is_transient_cusolver_error(exc: BaseException) -> bool:
 
 
 def _generate_shard_with_oom_retry(
-    cfg, n_this: int, device: str, *, tabicl_model, tabicl_k_folds: int,
+    cfg,
+    n_this: int,
+    device: str,
+    *,
+    tabicl_model,
+    tabicl_k_folds: int,
     tabicl_split_calib_frac: float = 0.0,
-    marginal_backend=None, marginal_regressor=None, marginal_probs_n: int = 99,
+    marginal_backend=None,
+    marginal_regressor=None,
+    marginal_probs_n: int = 99,
 ) -> list:
     """Generate n_this episodes for one shard, halving the chunk size on CUDA OOM.
 
@@ -92,8 +99,12 @@ def _generate_shard_with_oom_retry(
             cfg.seed = base_seed + chunk_idx * 900_001
         try:
             new_episodes = generate_gp_batch(
-                cfg, this_chunk, device, d_override=d_fixed,
-                tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+                cfg,
+                this_chunk,
+                device,
+                d_override=d_fixed,
+                tabicl_model=tabicl_model,
+                tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
@@ -151,9 +162,14 @@ def _save_shard_atomic(episodes: list, out_path: str) -> None:
     atomic_torch_save(episodes, out_path)
     stat = os.stat(out_path)
     atomic_json_save(
-        {"count": len(episodes), "sha256": file_digest(out_path),
-         "size": stat.st_size, "ctime_ns": stat.st_ctime_ns,
-         "mtime_ns": stat.st_mtime_ns, "inode": stat.st_ino},
+        {
+            "count": len(episodes),
+            "sha256": file_digest(out_path),
+            "size": stat.st_size,
+            "ctime_ns": stat.st_ctime_ns,
+            "mtime_ns": stat.st_mtime_ns,
+            "inode": stat.st_ino,
+        },
         shard_count_path(out_path),
     )
 
@@ -172,8 +188,10 @@ def _refresh_meta(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int, di
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             _write_meta(
-                pit_dir, _scan_meta_total(pit_dir, n_tasks, n_shards, shard_size),
-                shard_size, digest,
+                pit_dir,
+                _scan_meta_total(pit_dir, n_tasks, n_shards, shard_size),
+                shard_size,
+                digest,
             )
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -191,18 +209,18 @@ def _reject_disk_unsupported_z_train_source(z_train_source: str) -> None:
 
 @hydra.main(config_path=config_dir(__file__), config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
-    device  = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     pit_dir = cfg.data.pit_dir
     os.makedirs(pit_dir, exist_ok=True)
 
-    n_tasks    = cfg.data.n_tasks
-    B          = int(cfg.data.get("shard_size", 256))
-    n_shards   = (n_tasks + B - 1) // B
-    base_seed  = getattr(cfg, "seed", None)
+    n_tasks = cfg.data.n_tasks
+    B = int(cfg.data.get("shard_size", 256))
+    n_shards = (n_tasks + B - 1) // B
+    base_seed = getattr(cfg, "seed", None)
 
     # Parallel generation: worker worker_id handles shards with shard_idx % num_workers == worker_id.
-    worker_id    = int(getattr(cfg, "worker_id", 0))
-    num_workers  = int(getattr(cfg, "num_workers", 1))
+    worker_id = int(getattr(cfg, "worker_id", 0))
+    num_workers = int(getattr(cfg, "num_workers", 1))
     if not (0 <= worker_id < num_workers):
         raise ValueError(f"worker_id={worker_id} must be in [0, num_workers={num_workers})")
 
@@ -251,11 +269,13 @@ def main(cfg: DictConfig) -> None:
     worker_shard_idxs = range(worker_id, n_shards, num_workers)
     n_tasks_this_worker = sum(min(B, n_tasks - i * B) for i in worker_shard_idxs)
 
-    print(f"Generating {n_tasks} episodes → {pit_dir}"
-          + (f"  |  worker {worker_id}/{num_workers} owns {n_tasks_this_worker} of them"
-             if num_workers > 1 else ""))
-    print(f"Batch/shard size: {B}  |  Total shards: {n_shards}  |  Device: {device}  |  "
-          f"z_train_source: {z_train_source}")
+    print(
+        f"Generating {n_tasks} episodes → {pit_dir}"
+        + (f"  |  worker {worker_id}/{num_workers} owns {n_tasks_this_worker} of them" if num_workers > 1 else "")
+    )
+    print(
+        f"Batch/shard size: {B}  |  Total shards: {n_shards}  |  Device: {device}  |  z_train_source: {z_train_source}"
+    )
 
     # Initialize meta.pt from the shards already on disk.
     _refresh_meta(pit_dir, n_tasks, n_shards, B, manifest["digest"])
@@ -280,8 +300,11 @@ def main(cfg: DictConfig) -> None:
             if base_seed is not None:
                 cfg.seed = base_seed + shard_idx
             episodes = _generate_shard_with_oom_retry(
-                cfg, n_this, device,
-                tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+                cfg,
+                n_this,
+                device,
+                tabicl_model=tabicl_model,
+                tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
@@ -305,8 +328,9 @@ def main(cfg: DictConfig) -> None:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    print(f"Done. Worker {worker_id}/{num_workers} wrote {len(worker_shard_idxs)} of "
-          f"{n_shards} total shards to {pit_dir}")
+    print(
+        f"Done. Worker {worker_id}/{num_workers} wrote {len(worker_shard_idxs)} of {n_shards} total shards to {pit_dir}"
+    )
 
 
 if __name__ == "__main__":

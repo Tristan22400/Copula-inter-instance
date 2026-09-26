@@ -82,12 +82,8 @@ def test_update_weights_ignores_excluded_family_gap():
         "oracle_diag/kernel_fit/periodic/gap_nll": 100.0,
         "oracle_diag/kernel_fit/rbf/gap_nll": 0.4,
     }
-    out_excluded = train._update_adaptive_kernel_weights(
-        prev, metrics, lr=1.0, floor=0.05, exclude={"periodic"}
-    )
-    out_included = train._update_adaptive_kernel_weights(
-        prev, metrics, lr=1.0, floor=0.05, exclude=None
-    )
+    out_excluded = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05, exclude={"periodic"})
+    out_included = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05, exclude=None)
     i_periodic = _COMPOSABLE_KERNELS.index("periodic")
     # Excluded: periodic stays far below what its gap would give.
     assert out_excluded[i_periodic] < out_included[i_periodic]
@@ -98,14 +94,12 @@ def test_signal_tabicl_uses_tabicl_gap_not_oracle_gap():
     """signal="tabicl" uses gap_nll_tabicl."""
     prev = _uniform_weights()
     metrics = {
-        "oracle_diag/kernel_fit/rbf/gap_nll": 0.01,       # tiny under the oracle marginal
-        "kernel_fit/rbf/gap_nll_tabicl": 0.45,            # large under TabICL's real PIT
+        "oracle_diag/kernel_fit/rbf/gap_nll": 0.01,  # tiny under the oracle marginal
+        "kernel_fit/rbf/gap_nll_tabicl": 0.45,  # large under TabICL's real PIT
         "oracle_diag/kernel_fit/matern32/gap_nll": 0.01,
         "kernel_fit/matern32/gap_nll_tabicl": 0.01,
     }
-    out = train._update_adaptive_kernel_weights(
-        prev, metrics, lr=1.0, floor=0.05, signal="tabicl"
-    )
+    out = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05, signal="tabicl")
     i_rbf = _COMPOSABLE_KERNELS.index("rbf")
     i_mat = _COMPOSABLE_KERNELS.index("matern32")
     assert out[i_rbf] > out[i_mat]
@@ -136,9 +130,7 @@ def test_signal_default_is_oracle():
         "kernel_fit/rbf/gap_nll_tabicl": 999.0,  # must be ignored by default
     }
     out_default = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05)
-    out_explicit_oracle = train._update_adaptive_kernel_weights(
-        prev, metrics, lr=1.0, floor=0.05, signal="oracle"
-    )
+    out_explicit_oracle = train._update_adaptive_kernel_weights(prev, metrics, lr=1.0, floor=0.05, signal="oracle")
     assert torch.equal(out_default, out_explicit_oracle)
 
 

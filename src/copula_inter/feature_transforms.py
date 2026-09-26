@@ -31,9 +31,7 @@ def _apply_mlp_activation(x: Tensor, name: str) -> Tensor:
     raise ValueError(f"Unknown MLP-mixing activation '{name}'")
 
 
-def apply_mlp_feature_mixing(
-    x: Tensor, cfg, device, *, return_gate: bool = False
-) -> Tensor | tuple[Tensor, Tensor]:
+def apply_mlp_feature_mixing(x: Tensor, cfg, device, *, return_gate: bool = False) -> Tensor | tuple[Tensor, Tensor]:
     """Mix the input feature columns of gated episodes through a small random MLP.
 
     The number of layers and their activations are shared by the call; weights
@@ -139,10 +137,7 @@ def apply_kernel_hidden_warp(
     W_up = torch.randn(B, r, d, device=device) * (w_std / math.sqrt(r))
     b_up = torch.randn(B, 1, d, device=device) * w_std
     x_hidden = torch.einsum("btr,brd->btd", h, W_up) + b_up
-    x_hidden = (
-        (x_hidden - x_hidden.mean(1, keepdim=True))
-        / x_hidden.std(1, keepdim=True).clamp(min=1e-8)
-    )
+    x_hidden = (x_hidden - x_hidden.mean(1, keepdim=True)) / x_hidden.std(1, keepdim=True).clamp(min=1e-8)
 
     gate_1d = torch.rand(B, device=device) < hidden_prob  # (B,)
     gate = gate_1d[:, None, None]  # (B,1,1), see apply_mlp_feature_mixing

@@ -49,7 +49,11 @@ def _args() -> argparse.Namespace:
 def _metrics(model, episode, weights, device: str) -> dict:
     with torch.no_grad():
         result = phase_a_batch_loss(
-            model, [episode], weights, k_folds=2, folds_per_step=None,
+            model,
+            [episode],
+            weights,
+            k_folds=2,
+            folds_per_step=None,
             device=device,
         )
     return {
@@ -66,10 +70,17 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     overrides = [
-        "data.P_min=12", "data.P_max=12", "data.N_min=8", "data.N_max=8",
-        "data.d_features=2", "data.systematic_composition=false", "data.kernel=rbf",
-        "data.structural_warp_enabled=false", "data.mlp_mixing_enabled=false",
-        "data.mean_fn_enabled=false", "marginal.era5.mix_frac=0",
+        "data.P_min=12",
+        "data.P_max=12",
+        "data.N_min=8",
+        "data.N_max=8",
+        "data.d_features=2",
+        "data.systematic_composition=false",
+        "data.kernel=rbf",
+        "data.structural_warp_enabled=false",
+        "data.mlp_mixing_enabled=false",
+        "data.mean_fn_enabled=false",
+        "marginal.era5.mix_frac=0",
     ]
     with initialize_config_dir(config_dir=os.path.join(_ROOT, "conf"), version_base=None):
         cfg = compose(config_name="finetune_marginal", overrides=overrides)
@@ -79,23 +90,23 @@ def main() -> None:
     episode = _generate_phase_a_gp_batch(gp_cfg, 1, args.device)[0]
     # The episode is fixed supervision. This is defensive for hand-built
     # episodes too, whose temporary gpytorch kernel can otherwise retain a graph.
-    episode = {
-        key: value.detach() if torch.is_tensor(value) else value
-        for key, value in episode.items()
-    }
+    episode = {key: value.detach() if torch.is_tensor(value) else value for key, value in episode.items()}
 
-    model, _ = load_tabicl(
-        str(cfg.marginal.ckpt), args.device, trainable=True, return_config=True
-    )
+    model, _ = load_tabicl(str(cfg.marginal.ckpt), args.device, trainable=True, return_config=True)
     report = apply_tier(
-        model, args.tier, lora_rank=int(cfg.marginal.lora_rank),
+        model,
+        args.tier,
+        lora_rank=int(cfg.marginal.lora_rank),
         lora_alpha=float(cfg.marginal.lora_alpha),
         lora_target=str(cfg.marginal.lora_target),
     )
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     weights = MarginalLossWeights(
-        distill=1.0, nll=0.0, crps=0.0, pinball=0.0,
+        distill=1.0,
+        nll=0.0,
+        crps=0.0,
+        pinball=0.0,
         tail_power=float(cfg.marginal.loss.tail_power),
     )
 
@@ -104,7 +115,11 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
         result = phase_a_batch_loss(
-            model, [episode], weights, k_folds=2, folds_per_step=None,
+            model,
+            [episode],
+            weights,
+            k_folds=2,
+            folds_per_step=None,
             device=args.device,
         )
         result["loss"].backward()

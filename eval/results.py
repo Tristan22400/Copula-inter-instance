@@ -28,7 +28,8 @@ def score_summary(episodes: Sequence[Mapping[str, float]], key: str) -> tuple[fl
 
 
 def competition_ranks(
-    episodes: Sequence[Mapping[str, float]], keys: Sequence[str],
+    episodes: Sequence[Mapping[str, float]],
+    keys: Sequence[str],
 ) -> dict[str, list[int]]:
     """Equal scores share a rank; the next rank skips the tied positions."""
     ranks: dict[str, list[int]] = {key: [] for key in keys}
@@ -52,9 +53,7 @@ def require_coverage(valid: int, attempted: int, minimum_fraction: float) -> Non
     if not 0 <= minimum_fraction <= 1:
         raise ValueError("minimum coverage must lie in [0, 1]")
     if attempted == 0 or valid / attempted < minimum_fraction:
-        raise RuntimeError(
-            f"evaluation coverage {valid}/{attempted} is below {minimum_fraction:.0%}"
-        )
+        raise RuntimeError(f"evaluation coverage {valid}/{attempted} is below {minimum_fraction:.0%}")
 
 
 def jsonable(obj):
@@ -99,8 +98,7 @@ def render_saved_totals(report: Mapping) -> str:
     methods = sorted({name for episode in episodes for name in episode.get("total_nlls", {})})
     lines = ["| Method | Mean total NLL | Std | Valid/All |", "|---|---:|---:|---:|"]
     for method in methods:
-        values = [episode.get("total_nlls", {}).get(method, {}).get("total", float("nan"))
-                  for episode in episodes]
+        values = [episode.get("total_nlls", {}).get(method, {}).get("total", float("nan")) for episode in episodes]
         mean, std, count = numeric_summary(values)
         lines.append(f"| {method} | {mean:.4f} | {std:.4f} | {count}/{len(episodes)} |")
     return "\n".join(lines)

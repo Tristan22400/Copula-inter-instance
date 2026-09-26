@@ -36,7 +36,11 @@ AR_CONDITIONINGS = ("teacher_forcing", "sample")
 
 
 def _orderings(
-    B: int, N: int, order: str, seed: int, episode_indices: Optional[list[int]],
+    B: int,
+    N: int,
+    order: str,
+    seed: int,
+    episode_indices: Optional[list[int]],
 ) -> torch.Tensor:
     """(B, N) visit orders, seeded per episode from zlib.crc32 of (seed, global index); "natural" is 0..N-1."""
     if order not in AR_ORDERS:
@@ -89,20 +93,18 @@ def autoregressive_log_pdf(
         each step (visit order, raw units).
     """
     if conditioning not in AR_CONDITIONINGS:
-        raise ValueError(
-            f"conditioning must be one of {AR_CONDITIONINGS}, got {conditioning!r}"
-        )
+        raise ValueError(f"conditioning must be one of {AR_CONDITIONINGS}, got {conditioning!r}")
     B, P, d_x = x_train.shape
     N = x_test.shape[1]
     device, dtype = x_train.device, x_train.dtype
 
     # Scale y by the context's mean/std, fixed for the whole chain (as normalize_targets).
-    mean = y_train.mean(dim=-1, keepdim=True)                  # (B, 1)
-    std = y_train.std(dim=-1, keepdim=True).clamp(min=1e-8)    # (B, 1)
+    mean = y_train.mean(dim=-1, keepdim=True)  # (B, 1)
+    std = y_train.std(dim=-1, keepdim=True).clamp(min=1e-8)  # (B, 1)
     y_train_s = (y_train - mean) / std
     y_test_s = (y_test - mean) / std
 
-    visit = _orderings(B, N, order, seed, episode_indices).to(device)   # (B, N)
+    visit = _orderings(B, N, order, seed, episode_indices).to(device)  # (B, N)
 
     # Context buffer: the P context rows, then room for every revealed point.
     ctx_x = torch.empty(B, P + N, d_x, device=device, dtype=dtype)
@@ -115,26 +117,26 @@ def autoregressive_log_pdf(
     bidx = torch.arange(B, device=device)
 
     for i in range(N):
-        rem = visit[:, i:]                                               # (B, N-i)
+        rem = visit[:, i:]  # (B, N-i)
         x_rem = x_test.gather(1, rem.unsqueeze(-1).expand(-1, -1, d_x))  # (B, N-i, d_x)
 
         lo = 0 if max_context is None else max(0, (P + i) - int(max_context))
         if lo > 0:
             # Keep the episode's own context, drop the oldest revealed points.
-            ctx_keep_x = torch.cat([ctx_x[:, :P], ctx_x[:, P + lo:P + i]], dim=1)
-            ctx_keep_y = torch.cat([ctx_y[:, :P], ctx_y[:, P + lo:P + i]], dim=1)
+            ctx_keep_x = torch.cat([ctx_x[:, :P], ctx_x[:, P + lo : P + i]], dim=1)
+            ctx_keep_y = torch.cat([ctx_y[:, :P], ctx_y[:, P + lo : P + i]], dim=1)
         else:
-            ctx_keep_x, ctx_keep_y = ctx_x[:, :P + i], ctx_y[:, :P + i]
+            ctx_keep_x, ctx_keep_y = ctx_x[:, : P + i], ctx_y[:, : P + i]
 
-        X = torch.cat([ctx_keep_x, x_rem], dim=1)                        # (B, n_ctx+N-i, d_x)
-        logits = tabicl_forward(tabicl, X, ctx_keep_y)                   # (B, N-i, Q)
+        X = torch.cat([ctx_keep_x, x_rem], dim=1)  # (B, n_ctx+N-i, d_x)
+        logits = tabicl_forward(tabicl, X, ctx_keep_y)  # (B, N-i, Q)
         # TabICL may return its output on CPU; move it back.
         logits = logits.to(device)
         # Only the point revealed at this step is scored.
-        dist = tabicl.quantile_dist(logits[:, 0, :])                     # batch_shape (B,)
+        dist = tabicl.quantile_dist(logits[:, 0, :])  # batch_shape (B,)
 
-        tgt = visit[:, i]                                                # (B,)
-        y_true = y_test_s[bidx, tgt]                                     # (B,)
+        tgt = visit[:, i]  # (B,)
+        y_true = y_test_s[bidx, tgt]  # (B,)
         log_pdf_s[bidx, tgt] = dist.log_prob(y_true).to(log_pdf_s.dtype)
 
         if conditioning == "teacher_forcing":
@@ -162,7 +164,8 @@ def autoregressive_log_pdf(
 
 
 def ar_parts_from_log_pdf(
-    ar_log_pdf: torch.Tensor, marginal_log_pdf: torch.Tensor,
+    ar_log_pdf: torch.Tensor,
+    marginal_log_pdf: torch.Tensor,
 ) -> dict[str, float]:
     """{total, marginal, copula} per point for one episode: marginal from the one-shot log_pdf_test, total from the chain, copula = total - marginal."""
     total = -float(ar_log_pdf.mean())

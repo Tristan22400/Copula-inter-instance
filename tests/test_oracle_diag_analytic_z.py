@@ -43,9 +43,7 @@ def _reprior_standardize(episodes):
         sig = ep["sigma_star"].double().clamp_min(1e-8)
         z = (ep["y_test"].double() - ep["mu_star"].double()) / sig
         ep["z_test"] = z.float()
-        ep["log_pdf_test"] = (
-            -0.5 * math.log(2.0 * math.pi) - sig.log() - 0.5 * z ** 2
-        ).float()
+        ep["log_pdf_test"] = (-0.5 * math.log(2.0 * math.pi) - sig.log() - 0.5 * z**2).float()
         # Replace z_train too, as the TabICL branch does.
         ep["z_train"] = (ep["z_train"].double() * 0.5).float()
     return episodes
@@ -68,7 +66,7 @@ def test_build_analytic_val_z_recovers_the_exact_gp_pit(small_cfg, small_model_c
     """_build_analytic_val_z recomputes gp_analytical_pit, ignoring the batch's PIT."""
     cfg = _cfg(small_cfg, small_model_cfg)
     eps = _episodes(cfg, b=4)
-    truth = [gp_analytical_pit(ep) for ep in eps]     # BEFORE the overwrite
+    truth = [gp_analytical_pit(ep) for ep in eps]  # BEFORE the overwrite
     _reprior_standardize(eps)
     batches = [collate_fn(eps)]
 
@@ -80,25 +78,18 @@ def test_build_analytic_val_z_recovers_the_exact_gp_pit(small_cfg, small_model_c
             assert torch.allclose(got, want[key].float(), atol=1e-5), (key, b)
 
     # The cache differs from what the batch carries.
-    assert not torch.allclose(
-        cache[0]["z_test"], batches[0]["z_test"].float(), atol=1e-3
-    )
+    assert not torch.allclose(cache[0]["z_test"], batches[0]["z_test"].float(), atol=1e-3)
 
 
 def test_oracle_diag_marginal_follows_the_analytic_pit(small_cfg, small_model_cfg):
     """oracle_diag total - copula equals -mean(analytic log_pdf_test), not the batch's marginal."""
     cfg = _cfg(small_cfg, small_model_cfg)
     eps = _episodes(cfg, b=4, seed=1)
-    analytic_marginal = float(
-        np.mean([-float(gp_analytical_pit(ep)["log_pdf_test"].double().mean()) for ep in eps])
-    )
+    analytic_marginal = float(np.mean([-float(gp_analytical_pit(ep)["log_pdf_test"].double().mean()) for ep in eps]))
     _reprior_standardize(eps)
-    batch_marginal = float(
-        np.mean([-float(ep["log_pdf_test"].double().mean()) for ep in eps])
-    )
+    batch_marginal = float(np.mean([-float(ep["log_pdf_test"].double().mean()) for ep in eps]))
     assert abs(analytic_marginal - batch_marginal) > 1e-2, (
-        "the stand-in did not actually change the marginal; the rest of this "
-        "test would then be vacuous"
+        "the stand-in did not actually change the marginal; the rest of this test would then be vacuous"
     )
 
     batches = [collate_fn(eps)]
@@ -124,9 +115,7 @@ def test_copula_gap_equals_gap_nll_and_marginal_gap_vanishes(small_cfg, small_mo
     assert m["oracle_diag/copula_gap"] == pytest.approx(m["oracle_diag/gap_nll"], abs=1e-4)
     # copula_headroom is positive.
     assert m["oracle_diag/copula_headroom"] > 0.0
-    assert m["oracle_diag/copula_headroom"] == pytest.approx(
-        -m["y_nll_oracle_posterior_copula"], abs=1e-9
-    )
+    assert m["oracle_diag/copula_headroom"] == pytest.approx(-m["y_nll_oracle_posterior_copula"], abs=1e-9)
 
 
 def test_without_the_cache_the_marginal_gap_is_nonzero(small_cfg, small_model_cfg):
@@ -167,4 +156,3 @@ def test_kernel_hidden_warp_oracle_diag_marginal_gap_vanishes(small_cfg, small_m
     assert m["oracle_diag/marginal_gap"] == pytest.approx(0.0, abs=1e-3)
     assert m["oracle_diag/copula_gap"] == pytest.approx(m["oracle_diag/gap_nll"], abs=1e-4)
     assert m["oracle_diag/copula_headroom"] > 0.0
-

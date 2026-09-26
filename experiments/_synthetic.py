@@ -38,8 +38,6 @@ def pick_train_indices(n_test: int, n_train: int, rng: np.random.Generator) -> n
     base = np.linspace(0, n_test - 1, n_train).round().astype(int)
     base = np.unique(base)
     if len(base) < n_train:
-        extra = rng.choice(
-            [i for i in range(n_test) if i not in base], size=n_train - len(base), replace=False
-        )
+        extra = rng.choice([i for i in range(n_test) if i not in base], size=n_train - len(base), replace=False)
         base = np.sort(np.concatenate([base, extra]))
     return base

@@ -9,21 +9,21 @@ from torch import Tensor
 
 class RawEpisode(TypedDict):
     x_norm_train: Tensor  # (P, D), same normalization as x_norm_test
-    x_norm_test: Tensor   # (N, D)
-    y_train: Tensor       # (P,)
-    y_test: Tensor        # (N,)
+    x_norm_test: Tensor  # (N, D)
+    y_train: Tensor  # (P,)
+    y_test: Tensor  # (N,)
     n_train: Tensor
     n_test: Tensor
-    R_star: Tensor        # (N, N), prior oracle when available
-    mu_star: Tensor       # (N,)
-    sigma_star: Tensor    # (N,)
+    R_star: Tensor  # (N, N), prior oracle when available
+    mu_star: Tensor  # (N,)
+    sigma_star: Tensor  # (N,)
     x_kernel_train: NotRequired[Tensor]  # pre-normalization kernel space (P, Dk)
-    x_kernel_test: NotRequired[Tensor]   # same kernel space (N, Dk)
+    x_kernel_test: NotRequired[Tensor]  # same kernel space (N, Dk)
 
 
 class PITResult(TypedDict):
-    z_train: Tensor      # (P,)
-    z_test: Tensor       # (N,)
+    z_train: Tensor  # (P,)
+    z_test: Tensor  # (N,)
     log_pdf_test: Tensor  # (N,), density on original y scale
 
 
@@ -56,13 +56,20 @@ def validate_episode(ep: RawEpisode | dict) -> None:
     if p < 1 or n < 1 or d < 1:
         raise ValueError(f"episode dimensions must be positive: P={p}, N={n}, D={d}")
     shapes = {
-        "x_norm_train": (p, d), "x_norm_test": (n, d),
-        "y_train": (p,), "y_test": (n,),
-        "z_train": (p,), "z_test": (n,), "log_pdf_test": (n,),
-        "R_star": (n, n), "mu_star": (n,), "sigma_star": (n,),
+        "x_norm_train": (p, d),
+        "x_norm_test": (n, d),
+        "y_train": (p,),
+        "y_test": (n,),
+        "z_train": (p,),
+        "z_test": (n,),
+        "log_pdf_test": (n,),
+        "R_star": (n, n),
+        "mu_star": (n,),
+        "sigma_star": (n,),
     }
     optional = {
-        "R_prior": (n, n), "Sigma_star": (n, n),
+        "R_prior": (n, n),
+        "Sigma_star": (n, n),
     }
     for key, shape in shapes.items():
         if key not in ep or tuple(ep[key].shape) != shape:
@@ -79,7 +86,9 @@ def validate_episode(ep: RawEpisode | dict) -> None:
 
 
 def assemble_episodes(
-    tensors: dict[str, Tensor], extra: dict, discard: Tensor,
+    tensors: dict[str, Tensor],
+    extra: dict,
+    discard: Tensor,
     chain_metadata: tuple[list[str], list[str], list[dict[str, Tensor]]] | None = None,
 ) -> list[dict]:
     """Apply the validity mask and attach per-episode and shared metadata."""
@@ -91,15 +100,11 @@ def assemble_episodes(
     episodes = [{key: val[b] for key, val in fields.items()} | extra for b in range(count)]
     if chain_metadata is not None:
         names, ops, components = chain_metadata
-        filtered = [
-            {key: val[keep.to(val.device)] for key, val in component.items()}
-            for component in components
-        ]
+        filtered = [{key: val[keep.to(val.device)] for key, val in component.items()} for component in components]
         for b, episode in enumerate(episodes):
             episode["kernel_components"] = names
             episode["kernel_ops"] = ops
             episode["kernel_component_params"] = [
-                {key: val[b].cpu() for key, val in component.items()}
-                for component in filtered
+                {key: val[b].cpu() for key, val in component.items()} for component in filtered
             ]
     return episodes

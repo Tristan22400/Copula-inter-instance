@@ -24,10 +24,10 @@ failures = []
 
 
 def run_command(command: list, description: str, env: dict | None = None):
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"🚀 RUNNING: {description}")
     print(f"💻 Command: {' '.join(command)}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     run_env = {**os.environ, **env} if env else None
     try:
@@ -40,15 +40,26 @@ def run_command(command: list, description: str, env: dict | None = None):
         failures.append((description, e.returncode))
         return False
 
+
 def main():
     parser = argparse.ArgumentParser(description="Automated Kernel Validation Pipeline")
     parser.add_argument("--kernel", type=str, default="rbf", help="Kernel to validate (e.g., rbf)")
-    parser.add_argument("--skip-dataset-validation", action="store_true",
-                         help="Skip generating a dataset and checking its R_star correlation structure")
-    parser.add_argument("--n-episodes", type=int, default=500,
-                         help="Episodes to generate for the dataset correlation check (default: 500)")
-    parser.add_argument("--keep-dataset", action="store_true",
-                         help="Keep the generated validation dataset instead of deleting it afterwards")
+    parser.add_argument(
+        "--skip-dataset-validation",
+        action="store_true",
+        help="Skip generating a dataset and checking its R_star correlation structure",
+    )
+    parser.add_argument(
+        "--n-episodes",
+        type=int,
+        default=500,
+        help="Episodes to generate for the dataset correlation check (default: 500)",
+    )
+    parser.add_argument(
+        "--keep-dataset",
+        action="store_true",
+        help="Keep the generated validation dataset instead of deleting it afterwards",
+    )
     args, extra_overrides = parser.parse_known_args()
     if extra_overrides:
         print(f"📎 Extra Hydra overrides for Step 2a (dataset generation): {extra_overrides}")
@@ -61,10 +72,7 @@ def main():
     # (tests/test_data.py), so the node id carries the kernel name in brackets
     # rather than in the function name.
     test_name = f"tests/test_data.py::test_kernel_goldilocks_and_psd[{kernel}]"
-    run_command(
-        ["pytest", test_name, "-v"],
-        description="Step 1: Math Stability (PSD) & Goldilocks Correlation Bounds"
-    )
+    run_command(["pytest", test_name, "-v"], description="Step 1: Math Stability (PSD) & Goldilocks Correlation Bounds")
 
     # Step 2: Generate a small dataset and verify the R_star correlation
     # structure across real episodes (dataset-level checks that a single
@@ -75,18 +83,19 @@ def main():
         try:
             run_command(
                 [
-                    "python", "-m", "copula_inter.generate_pit_dataset",
+                    "python",
+                    "-m",
+                    "copula_inter.generate_pit_dataset",
                     f"data.kernel={kernel}",
                     f"data.n_tasks={args.n_episodes}",
                     f"data.dataset_dir={dataset_dir}",
                     *extra_overrides,
                 ],
-                description=f"Step 2a: Generate {args.n_episodes} episodes for dataset validation"
+                description=f"Step 2a: Generate {args.n_episodes} episodes for dataset validation",
             )
 
             dataset_test_file = (
-                "tests/test_dataset_corr_uniform.py" if _is_oscillatory(kernel)
-                else "tests/test_dataset_corr_nonneg.py"
+                "tests/test_dataset_corr_uniform.py" if _is_oscillatory(kernel) else "tests/test_dataset_corr_nonneg.py"
             )
             run_command(
                 ["pytest", dataset_test_file, "-v"],
@@ -104,7 +113,7 @@ def main():
     # Step 3: Structural Diversity Visualization
     run_command(
         ["python", "scripts/visualize_kernel.py", "--kernel", kernel],
-        description="Step 3: Structural Diversity Visualization (Headless)"
+        description="Step 3: Structural Diversity Visualization (Headless)",
     )
 
     if failures:
@@ -114,6 +123,7 @@ def main():
         sys.exit(1)
     else:
         print(f"\n🎉 ALL PIPELINE STEPS COMPLETED SUCCESSFULLY FOR '{kernel}'!")
+
 
 if __name__ == "__main__":
     main()

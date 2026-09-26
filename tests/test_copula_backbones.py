@@ -137,9 +137,7 @@ def test_tabldm_lora_installs_adapters():
         }
     )
     model = build_copula_transformer(cfg)
-    lora_owners = {
-        n.split(".lora_")[0] for n, _ in model.feature_extractor.named_parameters() if ".lora_" in n
-    }
+    lora_owners = {n.split(".lora_")[0] for n, _ in model.feature_extractor.named_parameters() if ".lora_" in n}
     assert lora_owners, "no LoRA parameters registered on the tabldm backbone"
     assert all(o.startswith("icl_predictor") for o in lora_owners), (
         f"stages=['icl'] leaked adapters outside icl_predictor: {sorted(lora_owners)[:5]}"

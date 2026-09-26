@@ -1,6 +1,6 @@
 """Null-distribution checks for the calibration metrics in eval/spatial/calibration.py: Kendall PIT ~ Uniform(0, 1), Mahalanobis d^2 ~ chi^2_D, spatial coverage ~ c^D, and exceedance reliability on y = x.
 
-    pytest tests/test_calibration_math.py -v
+pytest tests/test_calibration_math.py -v
 """
 
 from __future__ import annotations
@@ -76,7 +76,9 @@ def test_mahalanobis_null():
     assert np.all(d2 >= 0.0)
 
     stat, p_value = kstest(d2, "chi2", args=(D,))
-    assert p_value > 0.05, f"Mahalanobis distances failed KS-test against chi2(df={D}): stat={stat:.4f}, p={p_value:.4f}"
+    assert p_value > 0.05, (
+        f"Mahalanobis distances failed KS-test against chi2(df={D}): stat={stat:.4f}, p={p_value:.4f}"
+    )
 
 
 def test_mahalanobis_shape_mismatch_raises():
@@ -117,8 +119,7 @@ def test_spatial_coverage_null():
     # Binomial standard error at n=20000 trials, p=expected.
     se = np.sqrt(expected * (1 - expected) / n)
     assert abs(coverage - expected) < 6 * se, (
-        f"Empirical coverage {coverage:.4f} too far from 0.90^{D}={expected:.4f} "
-        f"(6*SE={6 * se:.4f})"
+        f"Empirical coverage {coverage:.4f} too far from 0.90^{D}={expected:.4f} (6*SE={6 * se:.4f})"
     )
 
 

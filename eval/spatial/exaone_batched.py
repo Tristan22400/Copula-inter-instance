@@ -30,9 +30,7 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
         if regressor.manifest.regression.member_weighting != "uniform":
             regressor.manifest = dataclasses.replace(
                 regressor.manifest,
-                regression=dataclasses.replace(
-                    regressor.manifest.regression, member_weighting="uniform"
-                ),
+                regression=dataclasses.replace(regressor.manifest.regression, member_weighting="uniform"),
             )
 
     regressor.fit(x_support, y_support)
@@ -52,7 +50,9 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
 
     passes = []
     for n_svd, seed in state["passes"]:
-        plan = EnsemblePlan(members=regressor.manifest.runtime.ensemble_count, seed=seed, task="regression", n_svd=n_svd)
+        plan = EnsemblePlan(
+            members=regressor.manifest.runtime.ensemble_count, seed=seed, task="regression", n_svd=n_svd
+        )
         batch_xs, batch_y, batch_xq, _fitted_plan = build_ensemble_inputs(support_x, support_y, query_x, plan)
         passes.append((batch_xs, batch_y, batch_xq))
     return passes, float(state["center"]), float(state["scale"])
@@ -61,9 +61,7 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
 def _quantile_bank_batched(regressor, X_context: list, y_context: list, X_query: list) -> np.ndarray:
     """(B, query_rows, quantile_count) quantile bank in raw y units, mean-pooled over members, from one forward."""
     B = len(X_context)
-    per_episode = [
-        _episode_member_batch(regressor, X_context[b], y_context[b], X_query[b]) for b in range(B)
-    ]
+    per_episode = [_episode_member_batch(regressor, X_context[b], y_context[b], X_query[b]) for b in range(B)]
     n_passes = len(per_episode[0][0])
     query_rows = X_query[0].shape[0]
 
@@ -84,7 +82,7 @@ def _quantile_bank_batched(regressor, X_context: list, y_context: list, X_query:
         pass_outputs.append(raw.float().reshape(B, members_per_episode, query_rows, -1))
 
     # Sort each member's quantiles to remove crossings.
-    pooled = torch.cat(pass_outputs, dim=1)              # (B, total_members, query_rows, Q)
+    pooled = torch.cat(pass_outputs, dim=1)  # (B, total_members, query_rows, Q)
     pooled = torch.sort(pooled, dim=-1).values.mean(dim=1)  # (B, query_rows, Q)
 
     center = torch.tensor([per_episode[b][1] for b in range(B)], device=pooled.device).view(B, 1, 1)
@@ -92,13 +90,12 @@ def _quantile_bank_batched(regressor, X_context: list, y_context: list, X_query:
     return (pooled * scale + center).cpu().numpy()
 
 
-def _quantile_bank_on_probs(regressor, X_context: list, y_context: list, X_query: list,
-                            probs: np.ndarray) -> np.ndarray:
+def _quantile_bank_on_probs(
+    regressor, X_context: list, y_context: list, X_query: list, probs: np.ndarray
+) -> np.ndarray:
     """_quantile_bank_batched interpolated from EXAONE's native 999-level grid onto probs."""
     quantile_count = regressor.manifest.regression.quantile_count
-    native_probs = np.linspace(
-        1.0 / (quantile_count + 1), quantile_count / (quantile_count + 1), quantile_count
-    )
+    native_probs = np.linspace(1.0 / (quantile_count + 1), quantile_count / (quantile_count + 1), quantile_count)
     bank = _quantile_bank_batched(regressor, X_context, y_context, X_query)  # (B, F, quantile_count)
     out = np.empty(bank.shape[:2] + (len(probs),), dtype=np.float64)
     for b in range(bank.shape[0]):
@@ -108,16 +105,27 @@ def _quantile_bank_on_probs(regressor, X_context: list, y_context: list, X_query
 
 
 def exaone_run_pit_batched(
-    regressor, X_train: np.ndarray, Y_train: np.ndarray, X_test: np.ndarray, Y_test: np.ndarray,
-    k_folds: int = 10, probs_n: int = 99, eps: float = 1e-6, seed: int = 0,
+    regressor,
+    X_train: np.ndarray,
+    Y_train: np.ndarray,
+    X_test: np.ndarray,
+    Y_test: np.ndarray,
+    k_folds: int = 10,
+    probs_n: int = 99,
+    eps: float = 1e-6,
+    seed: int = 0,
 ) -> dict:
     """run_pit_batched for EXAONE, via the shared K-fold driver (_batched_pit.run_kfold_pit_batched)."""
     from eval.spatial._batched_pit import run_kfold_pit_batched
 
     return run_kfold_pit_batched(
-        lambda X_ctx, y_ctx, X_qry, probs: _quantile_bank_on_probs(
-            regressor, X_ctx, y_ctx, X_qry, probs
-        ),
-        X_train, Y_train, X_test, Y_test,
-        k_folds=k_folds, probs_n=probs_n, eps=eps, seed=seed,
+        lambda X_ctx, y_ctx, X_qry, probs: _quantile_bank_on_probs(regressor, X_ctx, y_ctx, X_qry, probs),
+        X_train,
+        Y_train,
+        X_test,
+        Y_test,
+        k_folds=k_folds,
+        probs_n=probs_n,
+        eps=eps,
+        seed=seed,
     )

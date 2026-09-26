@@ -93,26 +93,26 @@ from copula_inter.training_core import (
 # prefixes. Pre-Volta entries are CUDA-core peaks.
 _GPU_PEAK_TFLOPS: dict[str, float] = {
     "H100 PCIE": 756e12,
-    "H100": 989e12,               # SXM/HBM3/bare "H100" — no PCIe suffix in the name
+    "H100": 989e12,  # SXM/HBM3/bare "H100" — no PCIe suffix in the name
     "RTX PRO 6000 BLACKWELL": 1021e12,  # vercors18 — estimate, not verified against a datasheet
     "A100": 312e12,
     "V100": 125e12,
     "RTX 4090": 165e12,
     "RTX 3090": 142e12,
     "RTX A6000": 130e12,
-    "RTX A5000": 111e12,          # vercors9/10
-    "RTX 6000 ADA": 728e12,       # vercors14/15 — this training node's GPU
-    "RTX 5000 ADA": 522.2e12,     # not yet confirmed on a specific Grid5000 node -- derived
-                                   # Datasheet 1044.4 / 2, same convention as RTX 6000 ADA.
-    "L40S": 362e12,               # kinovis, vercors17 — must precede "L4"
-    "L4": 121e12,                 # vercors16
+    "RTX A5000": 111e12,  # vercors9/10
+    "RTX 6000 ADA": 728e12,  # vercors14/15 — this training node's GPU
+    "RTX 5000 ADA": 522.2e12,  # not yet confirmed on a specific Grid5000 node -- derived
+    # Datasheet 1044.4 / 2, same convention as RTX 6000 ADA.
+    "L40S": 362e12,  # kinovis, vercors17 — must precede "L4"
+    "L4": 121e12,  # vercors16
     "QUADRO RTX 8000": 130.5e12,  # vercors5/8/11
-    "TITAN RTX": 130.5e12,        # vercors4/7/12 — same TU102 die as Quadro RTX 8000
-    "P100": 21.2e12,              # drac — Pascal, no Tensor Cores: CUDA-core FP16 peak
-    "TITAN XP": 12.15e12,         # vercors3 — Pascal, no Tensor Cores: CUDA-core FP32 peak
-    "TITAN X (PASCAL)": 10.97e12, # vercors2 — Pascal, no Tensor Cores: CUDA-core FP32 peak
-    "C2050": 1.03e12,             # adonis (Fermi) — no Tensor Cores: CUDA-core FP32 peak
-    "C1060": 0.933e12,            # adonis (Tesla 10-series) — no Tensor Cores: CUDA-core FP32 peak
+    "TITAN RTX": 130.5e12,  # vercors4/7/12 — same TU102 die as Quadro RTX 8000
+    "P100": 21.2e12,  # drac — Pascal, no Tensor Cores: CUDA-core FP16 peak
+    "TITAN XP": 12.15e12,  # vercors3 — Pascal, no Tensor Cores: CUDA-core FP32 peak
+    "TITAN X (PASCAL)": 10.97e12,  # vercors2 — Pascal, no Tensor Cores: CUDA-core FP32 peak
+    "C2050": 1.03e12,  # adonis (Fermi) — no Tensor Cores: CUDA-core FP32 peak
+    "C1060": 0.933e12,  # adonis (Tesla 10-series) — no Tensor Cores: CUDA-core FP32 peak
 }
 _GPU_PEAK_FLOPS_DEFAULT = 100e12
 
@@ -201,9 +201,7 @@ def _live_data_segment(data_cfg: DictConfig) -> str:
         kernel_str = str(data_cfg.get("kernel", "rbf"))
 
     dfeat_str = (
-        "logN"
-        if data_cfg.get("d_features_lognormal_loc", None) is not None
-        else str(data_cfg.get("d_features", 10))
+        "logN" if data_cfg.get("d_features_lognormal_loc", None) is not None else str(data_cfg.get("d_features", 10))
     )
 
     tags = []
@@ -240,7 +238,7 @@ def _build_model_and_optimizer(cfg, device, resume_ckpt, t):
     wandb.config.update({"n_trainable_params": n_train_params})
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    muon_params  = [p for p in trainable if p.ndim >= 2]
+    muon_params = [p for p in trainable if p.ndim >= 2]
     adamw_params = [p for p in trainable if p.ndim < 2]
     optimizer = Muon(
         [
@@ -279,10 +277,14 @@ def _build_model_and_optimizer(cfg, device, resume_ckpt, t):
     if resume_ckpt:
         ckpt_step = load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
         if bool(t.get("resume_reset_schedule", False)):
-            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} (step {ckpt_step}) — resetting to step 0 with a fresh warmup/cosine schedule (resume_reset_schedule=true)")
+            print(
+                f"Resumed weights + optimizer/scaler state from {resume_ckpt} (step {ckpt_step}) — resetting to step 0 with a fresh warmup/cosine schedule (resume_reset_schedule=true)"
+            )
         else:
             start_step = ckpt_step
-            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — continuing cosine schedule from step {start_step}")
+            print(
+                f"Resumed weights + optimizer/scaler state from {resume_ckpt} — continuing cosine schedule from step {start_step}"
+            )
 
     if start_step > 0:
         # LambdaLR needs initial_lr to resume at a non-zero step; use this run's base LR.
@@ -302,9 +304,7 @@ def _build_validation_probes(cfg, device, t, tabicl_mix_weights, val_episodes_me
     synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
     # Fallback posterior probe when the val loader has no kernel metadata (disk or ERA5).
     posterior_probe = (
-        _build_posterior_probe_batches(cfg, device)
-        if (baselines_on and val_episodes_meta is None)
-        else None
+        _build_posterior_probe_batches(cfg, device) if (baselines_on and val_episodes_meta is None) else None
     )
 
     # Frozen TabICL marginal (quantile head intact) for PIT-ing validation episodes; see pit.resolve_pit_ckpt.
@@ -350,9 +350,7 @@ def _build_validation_probes(cfg, device, t, tabicl_mix_weights, val_episodes_me
                 "[train] Building TabICL PIT cache for kernel_fit/<family> "
                 "probes (feeds training.adaptive_kernel_signal='tabicl')..."
             )
-            tabicl_kernel_fit_z = _build_tabicl_kernel_fit_z(
-                synth_kernel_batches, tabicl_marginal, pit_k_folds, device
-            )
+            tabicl_kernel_fit_z = _build_tabicl_kernel_fit_z(synth_kernel_batches, tabicl_marginal, pit_k_folds, device)
         if tabicl_mix_weights is not None:
             floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
             max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
@@ -376,8 +374,7 @@ def _build_validation_probes(cfg, device, t, tabicl_mix_weights, val_episodes_me
                 for family, gap in sorted(z_gap.items(), key=lambda kv: -kv[1]):
                     idx = _COMPOSABLE_KERNELS.index(family)
                     print(
-                        f"[train]   {family}: z_train_tabicl_gap={gap:.3f} "
-                        f"-> mix_frac={float(new_mix_frac[idx]):.3f}"
+                        f"[train]   {family}: z_train_tabicl_gap={gap:.3f} -> mix_frac={float(new_mix_frac[idx]):.3f}"
                     )
                 wandb.log(
                     {f"data/z_train_tabicl_gap/{f}": g for f, g in z_gap.items()}
@@ -425,7 +422,16 @@ def _build_validation_probes(cfg, device, t, tabicl_mix_weights, val_episodes_me
             era5_val_batches = _build_era5_val_batches(cfg, None, device)
             if era5_viz_on:
                 era5_viz_batch = _build_era5_viz_batch(cfg, None, device)
-    return analytic_val_z, era5_val_batches, era5_viz_batch, pit_ckpt, posterior_probe, synth_kernel_batches, tabicl_kernel_fit_z, tabicl_val_z
+    return (
+        analytic_val_z,
+        era5_val_batches,
+        era5_viz_batch,
+        pit_ckpt,
+        posterior_probe,
+        synth_kernel_batches,
+        tabicl_kernel_fit_z,
+        tabicl_val_z,
+    )
 
 
 def _init_wandb_run(cfg, dataset_name, t):
@@ -477,14 +483,7 @@ def _init_wandb_run(cfg, dataset_name, t):
     )
     resume_ckpt = t.get("resume_ckpt", None)
     resume_str = "_resumed" if resume_ckpt else ""
-    run_name = (
-        f"{dataset_name}"
-        f"{model_hparams}"
-        f"{training_hparams}"
-        f"_unfreeze={unfreeze}"
-        f"{lora_str}"
-        f"{resume_str}"
-    )
+    run_name = f"{dataset_name}{model_hparams}{training_hparams}_unfreeze={unfreeze}{lora_str}{resume_str}"
     wandb.init(
         project=cfg.wandb.project,
         entity=cfg.wandb.entity if cfg.wandb.entity else None,
@@ -525,7 +524,7 @@ def _build_data_loaders(cfg, device, live_generation, live_source, t):
         if tabicl_mix_weights is None:
             train_iter = iter(train_loader)
     else:
-        meta_path   = os.path.join(t.dataset_dir, "meta.pt")
+        meta_path = os.path.join(t.dataset_dir, "meta.pt")
         shard_files = sorted(glob(os.path.join(t.dataset_dir, "shard_*.pt")))
 
         train_sampler = None
@@ -533,20 +532,14 @@ def _build_data_loaders(cfg, device, live_generation, live_source, t):
         val_batch_sampler = None
         variable_d = False
         loader_num_workers_override = t.get("loader_num_workers", None)
-        loader_num_workers = (
-            int(loader_num_workers_override) if loader_num_workers_override is not None else 4
-        )
+        loader_num_workers = int(loader_num_workers_override) if loader_num_workers_override is not None else 4
         # Batches queued per worker (conf/config.yaml sets 8).
         prefetch_factor_override = t.get("prefetch_factor", None)
-        prefetch_factor = (
-            int(prefetch_factor_override) if prefetch_factor_override is not None else 8
-        )
+        prefetch_factor = int(prefetch_factor_override) if prefetch_factor_override is not None else 8
         if shard_files and os.path.exists(meta_path):
             shard_block_shards = int(t.get("shard_block_shards", 16))
             # Cache a full shard block (+4 for workers straddling blocks).
-            full_dataset = CopulaDataset(
-                episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4
-            )
+            full_dataset = CopulaDataset(episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4)
             n = len(full_dataset)
             n_val = min(int(t.get("val_episodes", 500)), n)
             # Stride validation indices across the dataset so val spans many shards.
@@ -554,16 +547,13 @@ def _build_data_loaders(cfg, device, live_generation, live_source, t):
             val_set = set(val_indices)
             train_indices = [i for i in range(n) if i not in val_set]
             train_dataset = Subset(full_dataset, train_indices)
-            val_dataset   = Subset(full_dataset, val_indices)
+            val_dataset = Subset(full_dataset, val_indices)
 
             # Detect datasets whose d_features varies per shard.
             shard_size = full_dataset.shard_size
             n_shards = (n + shard_size - 1) // shard_size
             probe_ids = torch.randperm(n_shards)[:8].tolist()
-            d_seen = {
-                int(full_dataset[min(sid * shard_size, n - 1)]["x_norm_train"].shape[-1])
-                for sid in probe_ids
-            }
+            d_seen = {int(full_dataset[min(sid * shard_size, n - 1)]["x_norm_train"].shape[-1]) for sid in probe_ids}
             variable_d = len(d_seen) > 1
 
             if variable_d:
@@ -573,11 +563,7 @@ def _build_data_loaders(cfg, device, live_generation, live_source, t):
                 # Clear the cache so the smaller cap applies (the LRU never shrinks on its own).
                 full_dataset._shard_cache.clear()
                 # Loader workers for variable-d data (training.loader_num_workers; shards are mmap-loaded).
-                loader_num_workers = (
-                    int(loader_num_workers_override)
-                    if loader_num_workers_override is not None
-                    else 4
-                )
+                loader_num_workers = int(loader_num_workers_override) if loader_num_workers_override is not None else 4
                 print(
                     "[train] per-shard-varying d_features detected "
                     f"({sorted(d_seen)}...) → batching within single shards "
@@ -605,12 +591,10 @@ def _build_data_loaders(cfg, device, live_generation, live_source, t):
         else:
             all_files = sorted(glob(os.path.join(t.dataset_dir, "task_*.pt")))
             if not all_files:
-                raise RuntimeError(
-                    f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first."
-                )
+                raise RuntimeError(f"No episode files in {t.dataset_dir}. Run generate_pit_dataset.py first.")
             n_val = min(int(t.get("val_episodes", 500)), len(all_files))
             train_dataset = CopulaDataset(file_list=all_files[n_val:])
-            val_dataset   = CopulaDataset(file_list=all_files[:n_val])
+            val_dataset = CopulaDataset(file_list=all_files[:n_val])
 
         print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)} episodes")
 
@@ -658,7 +642,8 @@ def _build_data_loaders(cfg, device, live_generation, live_source, t):
 def main(cfg: DictConfig) -> None:
     torch.manual_seed(cfg.seed)
     device = (
-        "cuda" if cfg.training.device == "auto" and torch.cuda.is_available()
+        "cuda"
+        if cfg.training.device == "auto" and torch.cuda.is_available()
         else ("cpu" if cfg.training.device == "auto" else cfg.training.device)
     )
     gpu_peak_flops = get_gpu_peak_flops() if device == "cuda" else None
@@ -693,11 +678,31 @@ def main(cfg: DictConfig) -> None:
         dataset_name = f"{parent_name}/{shard_name}" if parent_name else shard_name
     resume_ckpt = _init_wandb_run(cfg=cfg, dataset_name=dataset_name, t=t)
 
-    (adaptive_kernel_weights, tabicl_mix_weights, train_iter, train_loader, val_episodes_meta, val_loader) = _build_data_loaders(cfg=cfg, device=device, live_generation=live_generation, live_source=live_source, t=t)
+    (adaptive_kernel_weights, tabicl_mix_weights, train_iter, train_loader, val_episodes_meta, val_loader) = (
+        _build_data_loaders(cfg=cfg, device=device, live_generation=live_generation, live_source=live_source, t=t)
+    )
 
-    (analytic_val_z, era5_val_batches, era5_viz_batch, pit_ckpt, posterior_probe, synth_kernel_batches, tabicl_kernel_fit_z, tabicl_val_z) = _build_validation_probes(cfg=cfg, device=device, t=t, tabicl_mix_weights=tabicl_mix_weights, val_episodes_meta=val_episodes_meta, val_loader=val_loader)
+    (
+        analytic_val_z,
+        era5_val_batches,
+        era5_viz_batch,
+        pit_ckpt,
+        posterior_probe,
+        synth_kernel_batches,
+        tabicl_kernel_fit_z,
+        tabicl_val_z,
+    ) = _build_validation_probes(
+        cfg=cfg,
+        device=device,
+        t=t,
+        tabicl_mix_weights=tabicl_mix_weights,
+        val_episodes_meta=val_episodes_meta,
+        val_loader=val_loader,
+    )
 
-    (amp_dtype, model, optimizer, scaler, scheduler, start_step, trainable, use_amp) = _build_model_and_optimizer(cfg=cfg, device=device, resume_ckpt=resume_ckpt, t=t)
+    (amp_dtype, model, optimizer, scaler, scheduler, start_step, trainable, use_amp) = _build_model_and_optimizer(
+        cfg=cfg, device=device, resume_ckpt=resume_ckpt, t=t
+    )
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
@@ -857,9 +862,7 @@ def main(cfg: DictConfig) -> None:
                 Sigma = Sigma.dense()
                 sig_stats = _sigma_stats(Sigma, batch["test_mask"])
                 # Count batches where _safe_cholesky replaced a non-finite slice.
-                sigma_nonfinite = int(
-                    (~torch.isfinite(Sigma).flatten(1).all(-1)).sum().item()
-                )
+                sigma_nonfinite = int((~torch.isfinite(Sigma).flatten(1).all(-1)).sum().item())
 
             # Profiling readout (one sync): window averages plus this step's own phase times.
             last_step_ms = dict(_prof_last_ms)  # CPU fallback; overwritten below on CUDA
@@ -892,10 +895,7 @@ def main(cfg: DictConfig) -> None:
             else:
                 actual_flops_per_sec = 0.0
                 tokens_per_sec = 0.0
-            mfu_pct = (
-                100.0 * actual_flops_per_sec / gpu_peak_flops
-                if (gpu_peak_flops and iter_time_sec > 0) else 0.0
-            )
+            mfu_pct = 100.0 * actual_flops_per_sec / gpu_peak_flops if (gpu_peak_flops and iter_time_sec > 0) else 0.0
 
             # GPU memory as a share of device capacity.
             if device == "cuda":
@@ -910,29 +910,29 @@ def main(cfg: DictConfig) -> None:
 
             wandb.log(
                 {
-                    "train/y_nll_total":          loss_val,
-                    "train/y_nll_copula":         cop_val,
-                    "train/y_nll_marginal":       mar_val,
-                    "train/aux_mae":              aux_mae_val,
-                    "train/lr":                   lr_now,
-                    "train/grad_norm":            grad_norm_val,
-                    "train/amp_scale":            amp_scale,
-                    "train/loss_ema":             loss_ema,
-                    "train/W_norm_mean":          w_norm_mean,
-                    "train/sigma_offdiag_mean":   sig_stats["offdiag_mean"],
+                    "train/y_nll_total": loss_val,
+                    "train/y_nll_copula": cop_val,
+                    "train/y_nll_marginal": mar_val,
+                    "train/aux_mae": aux_mae_val,
+                    "train/lr": lr_now,
+                    "train/grad_norm": grad_norm_val,
+                    "train/amp_scale": amp_scale,
+                    "train/loss_ema": loss_ema,
+                    "train/W_norm_mean": w_norm_mean,
+                    "train/sigma_offdiag_mean": sig_stats["offdiag_mean"],
                     "train/sigma_nonfinite_count": sigma_nonfinite,
-                    "perf/step_ms":                wall_step_ms,
-                    "perf/steps_per_sec":          steps_per_sec,
-                    "perf/data_ms":                step_ms["data"],
-                    "perf/forward_ms":             step_ms["forward"],
-                    "perf/loss_ms":                step_ms["loss"],
-                    "perf/backward_step_ms":       step_ms["backward_step"],
-                    "perf/mem_allocated_pct":      mem_alloc_pct,
-                    "perf/mem_reserved_pct":        mem_reserved_pct,
-                    "perf/mem_peak_pct":           mem_peak_pct,
-                    "perf/mfu_pct":                mfu_pct,
-                    "perf/tokens_per_sec":         tokens_per_sec,
-                    "perf/iter_time_sec":          iter_time_sec,
+                    "perf/step_ms": wall_step_ms,
+                    "perf/steps_per_sec": steps_per_sec,
+                    "perf/data_ms": step_ms["data"],
+                    "perf/forward_ms": step_ms["forward"],
+                    "perf/loss_ms": step_ms["loss"],
+                    "perf/backward_step_ms": step_ms["backward_step"],
+                    "perf/mem_allocated_pct": mem_alloc_pct,
+                    "perf/mem_reserved_pct": mem_reserved_pct,
+                    "perf/mem_peak_pct": mem_peak_pct,
+                    "perf/mfu_pct": mfu_pct,
+                    "perf/tokens_per_sec": tokens_per_sec,
+                    "perf/iter_time_sec": iter_time_sec,
                 },
                 step=step,
             )
@@ -958,7 +958,12 @@ def main(cfg: DictConfig) -> None:
             plot_val_every = int(t.get("plot_val_every", 5000))
             do_plot = plot_val_every > 0 and step % plot_val_every == 0
             metrics, plot_figs = validate(
-                model, val_loader, cfg, device, step=step, do_plot=do_plot,
+                model,
+                val_loader,
+                cfg,
+                device,
+                step=step,
+                do_plot=do_plot,
                 synth_kernel_batches=synth_kernel_batches,
                 tabicl_val_z=tabicl_val_z,
                 analytic_val_z=analytic_val_z,
@@ -969,18 +974,19 @@ def main(cfg: DictConfig) -> None:
                 val_episodes_meta=val_episodes_meta,
             )
             # oracle_diag/* keys are logged as-is; others get the val/ prefix.
-            log_dict = {
-                (k if k.startswith("oracle_diag/") else f"val/{k}"): v
-                for k, v in metrics.items()
-            }
+            log_dict = {(k if k.startswith("oracle_diag/") else f"val/{k}"): v for k, v in metrics.items()}
             if adaptive_kernel_weights is not None:
                 lr = float(t.get("adaptive_kernel_lr", 1.0))
                 floor = float(t.get("adaptive_kernel_floor", 0.05))
                 signal = str(t.get("adaptive_kernel_signal", "tabicl"))
                 excluded_kernels = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
                 new_kernel_weights = _update_adaptive_kernel_weights(
-                    adaptive_kernel_weights, metrics, lr, floor,
-                    exclude=excluded_kernels, signal=signal,
+                    adaptive_kernel_weights,
+                    metrics,
+                    lr,
+                    floor,
+                    exclude=excluded_kernels,
+                    signal=signal,
                 )
                 # In-place update of the shared-memory tensor the workers read.
                 adaptive_kernel_weights.copy_(new_kernel_weights)
@@ -1010,8 +1016,7 @@ def main(cfg: DictConfig) -> None:
             cop_gap = metrics.get("oracle_diag/copula_gap", float("nan"))
             headroom = metrics.get("oracle_diag/copula_headroom", float("nan"))
             cop_gap_str = (
-                f"{cop_gap:.4f}/{headroom:.4f}"
-                if math.isfinite(cop_gap) and math.isfinite(headroom) else "n/a"
+                f"{cop_gap:.4f}/{headroom:.4f}" if math.isfinite(cop_gap) and math.isfinite(headroom) else "n/a"
             )
             ckl = metrics.get("oracle_diag/corr_kl", float("nan"))
             ckl_str = f"{ckl:.4f}" if math.isfinite(ckl) else "n/a"
@@ -1030,13 +1035,8 @@ def main(cfg: DictConfig) -> None:
 
         if step % t.save_every == 0 and step > 0:
             save_checkpoint(model, optimizer, scheduler, cfg, step, scaler=scaler)
-            if (
-                tabicl_mix_weights is not None and pit_ckpt
-                and bool(cfg.data.get("z_train_tabicl_mix_adaptive", False))
-            ):
-                z_gap, new_mix_frac = _refresh_tabicl_mix_weights(
-                    cfg, pit_ckpt, tabicl_mix_weights, device
-                )
+            if tabicl_mix_weights is not None and pit_ckpt and bool(cfg.data.get("z_train_tabicl_mix_adaptive", False)):
+                z_gap, new_mix_frac = _refresh_tabicl_mix_weights(cfg, pit_ckpt, tabicl_mix_weights, device)
                 print(f"[train][step {step}] Re-measured z_train_tabicl_mix_* (adaptive):")
                 save_log = {}
                 for i, family in enumerate(_COMPOSABLE_KERNELS):

@@ -87,9 +87,7 @@ def _compute_r_true(oracle_mode: str, X_train_t, y_train_t, X_test_t, kernel_fn)
 
 
 @torch.no_grad()
-def run_one_function(
-    seed: int, tabicl_model, copula_model, pfn4bo_model, oracle_mode: str, args
-) -> tuple[dict, tuple]:
+def run_one_function(seed: int, tabicl_model, copula_model, pfn4bo_model, oracle_mode: str, args) -> tuple[dict, tuple]:
     rng_np = np.random.default_rng(seed)
     rng_torch = torch.Generator().manual_seed(seed)
 
@@ -114,8 +112,10 @@ def run_one_function(
     )
     pit_out = run_pit(
         tabicl_model,
-        X_train_norm_t.to(tabicl_device), y_train_scaled.unsqueeze(-1),
-        X_test_norm_t.to(tabicl_device), y_test_scaled.unsqueeze(-1),
+        X_train_norm_t.to(tabicl_device),
+        y_train_scaled.unsqueeze(-1),
+        X_test_norm_t.to(tabicl_device),
+        y_test_scaled.unsqueeze(-1),
         k_folds=min(10, len(X_train)),
         Y_train_raw=y_train_t.to(tabicl_device).unsqueeze(-1),
     )
@@ -179,16 +179,20 @@ def run_one_function(
 
 def _print_summary(results: list[dict]) -> None:
     keys = [
-        "corr_frob_norm", "nlpd_ours_total", "nlpd_ours_copula", "nlpd_ours_marginal",
-        "nlpd_pfn4bo_total", "nlpd_pfn4bo_marginal",
+        "corr_frob_norm",
+        "nlpd_ours_total",
+        "nlpd_ours_copula",
+        "nlpd_ours_marginal",
+        "nlpd_pfn4bo_total",
+        "nlpd_pfn4bo_marginal",
     ]
-    print(f"\n{'-'*70}")
+    print(f"\n{'-' * 70}")
     print(f"Summary over {len(results)} synthetic functions (mean +/- std)")
-    print(f"{'-'*70}")
+    print(f"{'-' * 70}")
     for k in keys:
         vals = np.array([r[k] for r in results], dtype=float)
         print(f"  {k:<22} {np.nanmean(vals):>10.4f} +/- {np.nanstd(vals):>8.4f}  (n_valid={np.isfinite(vals).sum()})")
-    print(f"{'-'*70}\n")
+    print(f"{'-' * 70}\n")
 
 
 def _plot_locality_aggregate(all_dists, all_r_test, all_r_true, out_path: str, n_bins: int = 15) -> None:
@@ -241,8 +245,10 @@ def main() -> None:
     args.kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
     assert all(k in KERNELS for k in args.kernels), f"Unknown kernel(s) in {args.kernels}, must be subset of {KERNELS}"
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
+    device = (
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
 
@@ -291,7 +297,9 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     _plot_locality_aggregate(
-        np.concatenate(all_dists), np.concatenate(all_r_test), np.concatenate(all_r_true),
+        np.concatenate(all_dists),
+        np.concatenate(all_r_test),
+        np.concatenate(all_r_true),
         os.path.join(args.out_dir, "experiment_b_locality_aggregate.png"),
     )
 

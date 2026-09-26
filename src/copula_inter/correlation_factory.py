@@ -156,9 +156,7 @@ def tanhnorm_correlation(W: Tensor, eps: float = _EPS) -> LowRankCorrelationFact
     return LowRankCorrelationFactor(U=U, D=D)
 
 
-def sparse_covnorm_correlation(
-    W: Tensor, v: Tensor, lam_raw: Tensor, eps: float = _EPS
-) -> LowRankCorrelationFactor:
+def sparse_covnorm_correlation(W: Tensor, v: Tensor, lam_raw: Tensor, eps: float = _EPS) -> LowRankCorrelationFactor:
     """SparseCovNorm: CovNorm with a soft-thresholded (sparsified) W.
 
     W: (B, d, r) unconstrained.

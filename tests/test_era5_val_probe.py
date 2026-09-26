@@ -90,8 +90,15 @@ def test_weighted_corr_nan_with_too_few_valid_points():
 
 def test_build_era5_probe_shapes_and_finite(tabicl_fake):
     probe = build_era5_probe(
-        _TINY_REGION, _TINY_GRID, _TINY_DAYS_FETCH, _TINY_DAYS_PROBE,
-        _TINY_CONTEXT, _TINY_BINS, tabicl_fake, "cpu", seed=123,
+        _TINY_REGION,
+        _TINY_GRID,
+        _TINY_DAYS_FETCH,
+        _TINY_DAYS_PROBE,
+        _TINY_CONTEXT,
+        _TINY_BINS,
+        tabicl_fake,
+        "cpu",
+        seed=123,
     )
     D = _TINY_GRID * _TINY_GRID
     n_context = min(_TINY_CONTEXT, D - 1)
@@ -114,12 +121,26 @@ def test_build_era5_probe_shapes_and_finite(tabicl_fake):
 def test_build_era5_probe_deterministic(tabicl_fake):
     """build_era5_probe gives the same probe for the same seed."""
     p1 = build_era5_probe(
-        _TINY_REGION, _TINY_GRID, _TINY_DAYS_FETCH, _TINY_DAYS_PROBE,
-        _TINY_CONTEXT, _TINY_BINS, tabicl_fake, "cpu", seed=99,
+        _TINY_REGION,
+        _TINY_GRID,
+        _TINY_DAYS_FETCH,
+        _TINY_DAYS_PROBE,
+        _TINY_CONTEXT,
+        _TINY_BINS,
+        tabicl_fake,
+        "cpu",
+        seed=99,
     )
     p2 = build_era5_probe(
-        _TINY_REGION, _TINY_GRID, _TINY_DAYS_FETCH, _TINY_DAYS_PROBE,
-        _TINY_CONTEXT, _TINY_BINS, tabicl_fake, "cpu", seed=99,
+        _TINY_REGION,
+        _TINY_GRID,
+        _TINY_DAYS_FETCH,
+        _TINY_DAYS_PROBE,
+        _TINY_CONTEXT,
+        _TINY_BINS,
+        tabicl_fake,
+        "cpu",
+        seed=99,
     )
     np.testing.assert_array_equal(p1["z_train_per_day"], p2["z_train_per_day"])
     np.testing.assert_array_equal(p1["rho_emp"], p2["rho_emp"])
@@ -128,8 +149,15 @@ def test_build_era5_probe_deterministic(tabicl_fake):
 
 def test_build_era5_probe_none_marginal_uses_naive_standardization():
     probe = build_era5_probe(
-        _TINY_REGION, _TINY_GRID, _TINY_DAYS_FETCH, _TINY_DAYS_PROBE,
-        _TINY_CONTEXT, _TINY_BINS, None, "cpu", seed=7,
+        _TINY_REGION,
+        _TINY_GRID,
+        _TINY_DAYS_FETCH,
+        _TINY_DAYS_PROBE,
+        _TINY_CONTEXT,
+        _TINY_BINS,
+        None,
+        "cpu",
+        seed=7,
     )
     z = probe["z_train_per_day"][0]
     assert np.isfinite(z).all()
@@ -138,21 +166,23 @@ def test_build_era5_probe_none_marginal_uses_naive_standardization():
 
 
 def _tiny_era5_cfg(seed: int = 555) -> "OmegaConf":
-    return OmegaConf.create({
-        "baselines": {
-            "era5_regions": [_TINY_REGION],
-            "era5_grid_size": _TINY_GRID,
-            "era5_n_days_fetch": _TINY_DAYS_FETCH,
-            "era5_n_days_probe": _TINY_DAYS_PROBE,
-            "era5_n_context": _TINY_CONTEXT,
-            "era5_n_bins": _TINY_BINS,
-            "era5_seed": seed,
-            # GP baseline off here for speed (tested separately below).
-            "era5_gp_baseline": False,
-        },
-        # tabicl.pit_k_folds, as in copula_prod.yaml.
-        "tabicl": {"pit_k_folds": 5},
-    })
+    return OmegaConf.create(
+        {
+            "baselines": {
+                "era5_regions": [_TINY_REGION],
+                "era5_grid_size": _TINY_GRID,
+                "era5_n_days_fetch": _TINY_DAYS_FETCH,
+                "era5_n_days_probe": _TINY_DAYS_PROBE,
+                "era5_n_context": _TINY_CONTEXT,
+                "era5_n_bins": _TINY_BINS,
+                "era5_seed": seed,
+                # GP baseline off here for speed (tested separately below).
+                "era5_gp_baseline": False,
+            },
+            # tabicl.pit_k_folds, as in copula_prod.yaml.
+            "tabicl": {"pit_k_folds": 5},
+        }
+    )
 
 
 def test_build_era5_val_batches_shapes(tabicl_fake):
@@ -214,29 +244,33 @@ def test_build_era5_val_batches_gp_baseline(tabicl_fake):
 
 def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake):
     """era5_gp_baseline defaults to True when the key is absent."""
-    cfg = OmegaConf.create({
-        "baselines": {
-            "era5_regions": [_TINY_REGION],
-            "era5_grid_size": _TINY_GRID,
-            "era5_n_days_fetch": _TINY_DAYS_FETCH,
-            "era5_n_days_probe": _TINY_DAYS_PROBE,
-            "era5_n_context": _TINY_CONTEXT,
-            "era5_n_bins": _TINY_BINS,
-            "era5_gp_baseline_kernels": ["rbf"],
-            "era5_gp_n_steps_mle": 20,
-            "era5_gp_n_restarts_mle": 1,
-        },
-        "tabicl": {"pit_k_folds": 5},
-    })
+    cfg = OmegaConf.create(
+        {
+            "baselines": {
+                "era5_regions": [_TINY_REGION],
+                "era5_grid_size": _TINY_GRID,
+                "era5_n_days_fetch": _TINY_DAYS_FETCH,
+                "era5_n_days_probe": _TINY_DAYS_PROBE,
+                "era5_n_context": _TINY_CONTEXT,
+                "era5_n_bins": _TINY_BINS,
+                "era5_gp_baseline_kernels": ["rbf"],
+                "era5_gp_n_steps_mle": 20,
+                "era5_gp_n_restarts_mle": 1,
+            },
+            "tabicl": {"pit_k_folds": 5},
+        }
+    )
     batches = _build_era5_val_batches(cfg, tabicl_fake, "cpu")
     assert "gp_baseline_nll" in batches[_TINY_REGION]
 
 
 def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake):
-    cfg = OmegaConf.create({
-        "baselines": {"era5_regions": ["not_a_real_region"]},
-        "tabicl": {"pit_k_folds": 5},
-    })
+    cfg = OmegaConf.create(
+        {
+            "baselines": {"era5_regions": ["not_a_real_region"]},
+            "tabicl": {"pit_k_folds": 5},
+        }
+    )
     assert _build_era5_val_batches(cfg, tabicl_fake, "cpu") == {}
 
 
@@ -285,6 +319,4 @@ def test_era5_fit_scoring_with_tiny_model(small_model_cfg, tabicl_fake):
     assert math.isfinite(parts["total"].item())
     assert math.isfinite(parts["marginal"].item())
     assert math.isfinite(parts["copula"].item())
-    assert parts["total"].item() == pytest.approx(
-        parts["marginal"].item() + parts["copula"].item(), abs=1e-3
-    )
+    assert parts["total"].item() == pytest.approx(parts["marginal"].item() + parts["copula"].item(), abs=1e-3)

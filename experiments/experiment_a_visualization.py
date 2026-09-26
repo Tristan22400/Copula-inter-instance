@@ -39,13 +39,14 @@ TEST_FUNCTIONS = [
     ("matern32", 0.3, "Matern-3/2 (l=0.3)"),
 ]
 
+
 def _locality_check(R_test: np.ndarray, X_test: np.ndarray, label: str) -> None:
     n = R_test.shape[0]
     i = n // 2
     r_adjacent = R_test[i, i + 1]
     dx = abs(X_test[i + 1, 0] - X_test[i, 0])
     flag = "" if r_adjacent > 0.7 else "  <-- FLAG: low adjacent correlation, local smoothness not learned?"
-    print(f"  [{label}] R_test[{i},{i+1}] (dx={dx:.4f}) = {r_adjacent:.4f}{flag}")
+    print(f"  [{label}] R_test[{i},{i + 1}] (dx={dx:.4f}) = {r_adjacent:.4f}{flag}")
 
 
 @torch.no_grad()
@@ -83,9 +84,7 @@ def run_one_function(
     X_train_norm, X_test_norm = normalize_features(X_train, X_test)
 
     # --- Reference exact GP posterior (known kernel) ---
-    mu_star, Sigma_star = gp_posterior(
-        X_train_t, y_train_t, X_test_t, kernel_fn, noise=OBS_NOISE_STD**2, latent=False
-    )
+    mu_star, Sigma_star = gp_posterior(X_train_t, y_train_t, X_test_t, kernel_fn, noise=OBS_NOISE_STD**2, latent=False)
     mu_star_np = mu_star.numpy()
     sigma_star_np = Sigma_star.diagonal().clamp(min=1e-12).sqrt().numpy()
     L_star = _safe_cholesky(Sigma_star)
@@ -117,9 +116,7 @@ def run_one_function(
 
     # --- PFN4BO's own marginals + R=I ---
     try:
-        quantile_grid_pfn, probs_pfn = get_marginal_quantiles_pfn4bo(
-            pfn4bo_model, X_train_norm, y_train, X_test_norm
-        )
+        quantile_grid_pfn, probs_pfn = get_marginal_quantiles_pfn4bo(pfn4bo_model, X_train_norm, y_train, X_test_norm)
         samples_pfn_own, n_clipped_pfn_own = sample_trajectories(
             quantile_grid_pfn, probs_pfn, R_I, args.n_samples, rng=np.random.default_rng(seed + 3)
         )
@@ -174,8 +171,10 @@ def main() -> None:
     parser.add_argument("--n-test", type=int, default=60)
     args = parser.parse_args()
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
+    device = (
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
 
@@ -195,8 +194,13 @@ def main() -> None:
     for i, (kernel_name, lengthscale, label) in enumerate(TEST_FUNCTIONS):
         print(f"\n=== {label} ===")
         run_one_function(
-            kernel_name, lengthscale, label,
-            tabicl_model, copula_model, pfn4bo_model, args,
+            kernel_name,
+            lengthscale,
+            label,
+            tabicl_model,
+            copula_model,
+            pfn4bo_model,
+            args,
             seed=args.seed + i,
         )
 

@@ -100,14 +100,12 @@ def validate(
         # Oracle-posterior total/copula NLL for this batch (when val_episodes_meta is available).
         eps_b = val_episodes_meta.get(batch_idx) if val_episodes_meta is not None else None
         if val_episodes_meta is not None:
-            parts_o = y_space_nll(
-                Sigma, z_test_an, log_pdf_an, batch["test_mask"]
-            )
+            parts_o = y_space_nll(Sigma, z_test_an, log_pdf_an, batch["test_mask"])
             all_oracle_total.append(parts_o["total"].item())
             all_oracle_copula.append(parts_o["copula"].item())
 
         # ---- Per-task diagnostics (vectorized — no Python loop over batch) ----
-        n_test_cur = batch["test_mask"].sum(-1).float()   # (B,)
+        n_test_cur = batch["test_mask"].sum(-1).float()  # (B,)
         valid_cur = n_test_cur >= 2
 
         if valid_cur.any():
@@ -126,7 +124,7 @@ def validate(
             z_f = z_test_an
             tmp_cur = torch.linalg.solve_triangular(L_cur, z_f.unsqueeze(-1), upper=False)
             S_inv_z_cur = torch.linalg.solve_triangular(L_cur.mT, tmp_cur, upper=True).squeeze(-1)
-            cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f ** 2).sum(-1)) / n_safe_cur
+            cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f**2).sum(-1)) / n_safe_cur
             cop_per_task.extend(cop_cur[valid_cur].cpu().tolist())
 
             # W row norms and s means over valid test rows (no s for tanhnorm).
@@ -163,7 +161,7 @@ def validate(
                     sub_batch = {
                         "x_train": batch["x_train"][b : b + 1, :n_tr],
                         "z_train": z_tabicl_b,
-                        "x_test":  batch["x_test"][b : b + 1, :n],
+                        "x_test": batch["x_test"][b : b + 1, :n],
                     }
                     out_tabicl = model(sub_batch)
                     Sigma_tabicl = build_sigma(out_tabicl, cfg, jitter=jitter)
@@ -172,9 +170,7 @@ def validate(
                     z_test_tabicl_b = z_cache_b["z_test"][b, :n].to(device).unsqueeze(0)
                     log_pdf_tabicl_b = z_cache_b["log_pdf_test"][b, :n].to(device).unsqueeze(0)
                     mask_tabicl_b = torch.ones(1, n, dtype=torch.bool, device=device)
-                    parts_tabicl_b = y_space_nll(
-                        Sigma_tabicl, z_test_tabicl_b, log_pdf_tabicl_b, mask_tabicl_b
-                    )
+                    parts_tabicl_b = y_space_nll(Sigma_tabicl, z_test_tabicl_b, log_pdf_tabicl_b, mask_tabicl_b)
                     all_tabicl_marginal_total.append(parts_tabicl_b["total"].item())
                     all_tabicl_marginal_marginal.append(parts_tabicl_b["marginal"].item())
                     all_tabicl_marginal_copula.append(parts_tabicl_b["copula"].item())
@@ -193,9 +189,7 @@ def validate(
                     off_p_post.append(Sigma[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
                     off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
                     # Correlation KL, a noise-free convergence signal (pit.gaussian_corr_kl).
-                    ckl = gaussian_corr_kl(
-                        Sigma[b, :n, :n].cpu(), post["R_post"].cpu()
-                    )
+                    ckl = gaussian_corr_kl(Sigma[b, :n, :n].cpu(), post["R_post"].cpu())
                     if math.isfinite(ckl):
                         corr_kl_vals.append(ckl)
                     else:
@@ -213,15 +207,17 @@ def validate(
     if all_sigma_off:
         off_arr = np.array(all_sigma_off, dtype=np.float32)
         metrics["sigma_offdiag_mean_analytic_z"] = float(off_arr.mean())
-        metrics["sigma_offdiag_std_analytic_z"]  = float(off_arr.std())
+        metrics["sigma_offdiag_std_analytic_z"] = float(off_arr.std())
         metrics["sigma_offdiag_abs_mean_analytic_z"] = float(np.abs(off_arr).mean())
     else:
-        metrics["sigma_offdiag_mean_analytic_z"] = metrics["sigma_offdiag_std_analytic_z"] = metrics["sigma_offdiag_abs_mean_analytic_z"] = 0.0
+        metrics["sigma_offdiag_mean_analytic_z"] = metrics["sigma_offdiag_std_analytic_z"] = metrics[
+            "sigma_offdiag_abs_mean_analytic_z"
+        ] = 0.0
     metrics["sigma_diag_mean_analytic_z"] = float(np.mean(all_sigma_diag)) if all_sigma_diag else 1.0
 
     # Model output statistics (same analytic-z_train caveat as above)
     metrics["W_norm_mean_analytic_z"] = float(np.mean(all_W_norms)) if all_W_norms else 0.0
-    metrics["s_mean_analytic_z"]      = float(np.mean(all_s_vals))  if all_s_vals  else 0.0
+    metrics["s_mean_analytic_z"] = float(np.mean(all_s_vals)) if all_s_vals else 0.0
 
     # Bayes-optimal ceiling (gp_analytical_posterior). If the main loop could not
     # fill the accumulators, use the separately drawn posterior_probe.
@@ -229,9 +225,7 @@ def validate(
         pb = posterior_probe["batch"]
         out_p = model(pb)
         Sigma_p = build_sigma(out_p, cfg, jitter=jitter, test_mask=pb["test_mask"])
-        parts_p = y_space_nll(
-            Sigma_p, pb["z_test"].float(), pb["log_pdf_test"].float(), pb["test_mask"]
-        )
+        parts_p = y_space_nll(Sigma_p, pb["z_test"].float(), pb["log_pdf_test"].float(), pb["test_mask"])
         all_oracle_total.append(parts_p["total"].item())
         all_oracle_copula.append(parts_p["copula"].item())
         for b, ep in enumerate(posterior_probe["episodes"]):
@@ -299,14 +293,12 @@ def validate(
         sbatch = probe_s["batch"]
         out_s = model(sbatch)
         Sigma_s = build_sigma(out_s, cfg, jitter=jitter, test_mask=sbatch["test_mask"])
-        parts_s = y_space_nll(
-            Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
-        )
+        parts_s = y_space_nll(Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"])
         cop_s = parts_s["copula"].item()
         mar_s = parts_s["marginal"].item()
         tot_s = parts_s["total"].item()
         metrics[f"oracle_diag/kernel_fit/{family}/copula_nll"] = cop_s
-        metrics[f"oracle_diag/kernel_fit/{family}/total_nll"]  = tot_s
+        metrics[f"oracle_diag/kernel_fit/{family}/total_nll"] = tot_s
         metrics[f"kernel_fit/{family}/marginal_nll"] = mar_s
 
         # Per-family Bayes-optimal ceiling.

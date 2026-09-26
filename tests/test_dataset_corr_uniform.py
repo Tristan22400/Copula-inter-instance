@@ -21,24 +21,20 @@ def dataset_dir():
     return os.environ.get("DATASET_DIR", _DEFAULT_DIR)
 
 
-_N_EPISODES = 500   # episodes to sample
+_N_EPISODES = 500  # episodes to sample
 _SEED = 0
 
 
 def _iter_episodes(folder: str, shuffle_seed: int | None = None):
     """Yield episode dicts from a folder (shards in shuffled order, or individual files)."""
-    paths = sorted(
-        os.path.join(folder, f)
-        for f in os.listdir(folder)
-        if f.endswith(".pt") and f != "meta.pt"
-    )
+    paths = sorted(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".pt") and f != "meta.pt")
     if shuffle_seed is not None:
         random.Random(shuffle_seed).shuffle(paths)
     for p in paths:
         obj = torch.load(p, map_location="cpu", weights_only=False)
-        if isinstance(obj, list):           # shard: list of episode dicts
+        if isinstance(obj, list):  # shard: list of episode dicts
             yield from obj
-        elif isinstance(obj, dict):         # individual task_*.pt
+        elif isinstance(obj, dict):  # individual task_*.pt
             yield obj
 
 
@@ -53,7 +49,7 @@ def _load_episodes(folder: str, n: int, seed: int):
     values = []
     min_eigs = []
     for ep in episodes:
-        R = ep["R_star"]          # (N, N)
+        R = ep["R_star"]  # (N, N)
         N = R.shape[0]
         mask = ~torch.eye(N, dtype=torch.bool)
         values.append(R[mask].flatten())
@@ -87,9 +83,7 @@ def test_correlations_have_both_signs(off_diag):
     assert off_diag.min().item() < -0.02, (
         f"Min correlation {off_diag.min().item():.3f} — no negative correlations found"
     )
-    assert off_diag.max().item() > 0.02, (
-        f"Max correlation {off_diag.max().item():.3f} — no positive correlations found"
-    )
+    assert off_diag.max().item() > 0.02, f"Max correlation {off_diag.max().item():.3f} — no positive correlations found"
 
 
 def test_correlations_mean_near_zero(off_diag):
@@ -108,9 +102,7 @@ def test_correlations_negative_fraction(off_diag):
 def test_correlations_std_nonzero(off_diag):
     """The off-diagonal std is at least 0.1."""
     std = off_diag.std().item()
-    assert std > 0.1, (
-        f"Std {std:.4f} too low — posterior R_star correlations appear degenerate."
-    )
+    assert std > 0.1, f"Std {std:.4f} too low — posterior R_star correlations appear degenerate."
 
 
 def test_unit_diagonal(dataset_dir):
@@ -127,9 +119,7 @@ def test_unit_diagonal(dataset_dir):
     for i, ep in enumerate(episodes):
         R = ep["R_star"]
         diag_err = (R.diagonal() - 1.0).abs().max().item()
-        assert diag_err < 1e-4, (
-            f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
-        )
+        assert diag_err < 1e-4, f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
 
 
 def test_r_star_well_conditioned(min_eigenvalues):
@@ -145,6 +135,4 @@ def test_r_star_well_conditioned(min_eigenvalues):
 def test_r_star_psd(min_eigenvalues):
     """R_star must be positive semi-definite (no negative eigenvalues)."""
     neg = [v for v in min_eigenvalues if v < -1e-5]
-    assert len(neg) == 0, (
-        f"{len(neg)} episodes have negative min eigenvalue (most negative: {min(neg):.2e})"
-    )
+    assert len(neg) == 0, f"{len(neg)} episodes have negative min eigenvalue (most negative: {min(neg):.2e})"

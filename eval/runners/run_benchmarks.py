@@ -144,15 +144,19 @@ def main() -> None:
     parser.add_argument("--out_dir", default=os.path.join(_REPO_ROOT, "eval", "results"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--max_failed_fraction", type=float, default=0.0,
+        "--max_failed_fraction",
+        type=float,
+        default=0.0,
         help="Maximum failed-episode fraction before exiting nonzero (1.0 allows exploratory partial runs).",
     )
     args = parser.parse_args()
     if not 0 <= args.max_failed_fraction <= 1:
         parser.error("--max_failed_fraction must lie in [0, 1]")
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
+    device = (
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
 
@@ -183,18 +187,27 @@ def main() -> None:
             rng = np.random.default_rng(episode_seed)
             try:
                 records, R_by_method, pair_series = run_episode(
-                    benchmark_name, episode_seed, tabicl_reg, copula_model, args.n_samples, rng,
+                    benchmark_name,
+                    episode_seed,
+                    tabicl_reg,
+                    copula_model,
+                    args.n_samples,
+                    rng,
                     cfg,
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"  [episode {ep}] FAILED:", flush=True)
                 traceback.print_exc()
                 failed_episodes += 1
-                all_records.append({
-                    "benchmark": benchmark_name, "seed": episode_seed,
-                    "method": "__episode__", "status": "failed",
-                    "error": repr(exc),
-                })
+                all_records.append(
+                    {
+                        "benchmark": benchmark_name,
+                        "seed": episode_seed,
+                        "method": "__episode__",
+                        "status": "failed",
+                        "error": repr(exc),
+                    }
+                )
                 save_results_json(all_records, results_path)
                 continue
 

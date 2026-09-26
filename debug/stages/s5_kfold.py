@@ -9,6 +9,7 @@ Usage:
     python debug/run_debug.py s5 --ckpt <name>
     python debug/stages/s5_kfold.py --ckpt kernel-sweep-all-tabicl-retrain-15k --n-episodes 50
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,9 +38,11 @@ def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
     y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)
 
     out = run_pit_batched(tabicl_model, x_train, y_train_scaled, x_test, y_test_scaled, k_folds=k_folds)
-    z_train = out["z_train"].squeeze(-1)                              # (B, P)
-    z_test = out["z_test"].squeeze(-1)                                # (B, N)
-    log_pdf_test = out["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast, matches data_gen.py's own convention
+    z_train = out["z_train"].squeeze(-1)  # (B, P)
+    z_test = out["z_test"].squeeze(-1)  # (B, N)
+    log_pdf_test = (
+        out["log_pdf_test"].squeeze(-1) - y_std.log()
+    )  # (B, N) - (B, 1) broadcast, matches data_gen.py's own convention
     return z_train, z_test, log_pdf_test
 
 
@@ -120,8 +123,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     result = run(dcfg, k_sweep=[int(x) for x in args.k_sweep.split(",")])
     if "error" in result:

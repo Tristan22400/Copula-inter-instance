@@ -116,8 +116,7 @@ def test_oracle_le_independence_on_average():
     mean_indep = sum(pred_losses) / len(pred_losses)
     # Oracle beats independence in expectation, not in every case.
     assert mean_oracle < mean_indep + 1.0, (
-        f"Oracle ({mean_oracle:.4f}) should be better than or comparable to "
-        f"independence ({mean_indep:.4f}) on average"
+        f"Oracle ({mean_oracle:.4f}) should be better than or comparable to independence ({mean_indep:.4f}) on average"
     )
 
 
@@ -156,9 +155,7 @@ def test_copula_nll_smaller_for_better_w():
 
     mean_true = sum(nll_true_list) / len(nll_true_list)
     mean_rand = sum(nll_rand_list) / len(nll_rand_list)
-    assert mean_true < mean_rand, (
-        f"True W NLL ({mean_true:.4f}) should be lower than random W NLL ({mean_rand:.4f})"
-    )
+    assert mean_true < mean_rand, f"True W NLL ({mean_true:.4f}) should be lower than random W NLL ({mean_rand:.4f})"
 
 
 def test_woodbury_matches_direct_cholesky():
@@ -181,10 +178,5 @@ def test_woodbury_matches_direct_cholesky():
     nll_direct = oracle_copula_nll(R_eps, z, mask)
 
     # Relative tolerance: both formulas should agree to ~0.1%
-    rel_err = abs(nll_woodbury.item() - nll_direct.item()) / (
-        abs(nll_direct.item()) + 1e-8
-    )
-    assert rel_err < 1e-3, (
-        f"Woodbury ({nll_woodbury:.6f}) != direct ({nll_direct:.6f}), "
-        f"rel_err={rel_err:.2e}"
-    )
+    rel_err = abs(nll_woodbury.item() - nll_direct.item()) / (abs(nll_direct.item()) + 1e-8)
+    assert rel_err < 1e-3, f"Woodbury ({nll_woodbury:.6f}) != direct ({nll_direct:.6f}), rel_err={rel_err:.2e}"

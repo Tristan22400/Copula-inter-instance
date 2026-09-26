@@ -1,14 +1,14 @@
 """Losses and metrics for Gaussian copula models.
 
-    copula_nll: inter-instance copula NLL for R = eps I + W W^T, via the Matrix
-        Determinant Lemma and Woodbury, O(N r^2):
-            log|R| = N log(eps) + log|M|,  M = I + W^T W / eps
-            R^{-1} z = (z - W M^{-1} W^T z / eps) / eps
-            L = 0.5 (log|R| + z^T R^{-1} z - z^T z) / N
-    y_space_nll: Sklar total = copula NLL + marginal NLL, dense or low-rank.
-    woodbury_nll: NLL of N(mu, diag(D) + V V^T), O(d r^2).
-    indep_normal_nll, marginal_nll, oracle_copula_nll, gp_oracle_y_nll,
-    energy_score, kl_gaussian, plot_prediction_comparison.
+copula_nll: inter-instance copula NLL for R = eps I + W W^T, via the Matrix
+    Determinant Lemma and Woodbury, O(N r^2):
+        log|R| = N log(eps) + log|M|,  M = I + W^T W / eps
+        R^{-1} z = (z - W M^{-1} W^T z / eps) / eps
+        L = 0.5 (log|R| + z^T R^{-1} z - z^T z) / N
+y_space_nll: Sklar total = copula NLL + marginal NLL, dense or low-rank.
+woodbury_nll: NLL of N(mu, diag(D) + V V^T), O(d r^2).
+indep_normal_nll, marginal_nll, oracle_copula_nll, gp_oracle_y_nll,
+energy_score, kl_gaussian, plot_prediction_comparison.
 """
 
 from __future__ import annotations
@@ -98,9 +98,7 @@ def woodbury_nll(
 
     # Capacitance M = I_r + V^T D^{-1} V, symmetrized.
     M_raw = torch.matmul(V.transpose(-2, -1), D_inv_V)  # (B, N, r, r)
-    M = torch.eye(r, dtype=V.dtype, device=V.device) + 0.5 * (
-        M_raw + M_raw.transpose(-2, -1)
-    )
+    M = torch.eye(r, dtype=V.dtype, device=V.device) + 0.5 * (M_raw + M_raw.transpose(-2, -1))
     # Cholesky of M for stable solve and log-det
     L_M = _safe_cholesky(M)  # (B, N, r, r)
 
@@ -110,9 +108,7 @@ def woodbury_nll(
     # M^{-1} (V^T D^{-1} r) via two triangular solves (cholesky_solve lacks sm_75 kernels in PyTorch 2.11+cu130).
     rhs = VT_Dinv_r.unsqueeze(-1)  # (B, N, r, 1)
     tmp = torch.linalg.solve_triangular(L_M, rhs, upper=False)
-    Minv_VT_Dinv_r = torch.linalg.solve_triangular(
-        L_M.transpose(-2, -1), tmp, upper=True
-    ).squeeze(-1)  # (B, N, r)
+    Minv_VT_Dinv_r = torch.linalg.solve_triangular(L_M.transpose(-2, -1), tmp, upper=True).squeeze(-1)  # (B, N, r)
 
     # Quadratic form  r^T D^{-1} r - (V^T D^{-1} r)^T M^{-1} (V^T D^{-1} r)
     quad = (
@@ -245,9 +241,7 @@ def plot_prediction_comparison(
         )
         axes[row, 1].set_title(rf"Predicted $\hat{{\Sigma}}$ (inst {inst_idx})")
 
-        sns.heatmap(
-            np.abs(Sigma_true - Sigma_pred), ax=axes[row, 2], cmap="Reds", square=True
-        )
+        sns.heatmap(np.abs(Sigma_true - Sigma_pred), ax=axes[row, 2], cmap="Reds", square=True)
         axes[row, 2].set_title(rf"$|\Sigma^* - \hat{{\Sigma}}|$ (inst {inst_idx})")
 
         # ---- Mean ----
@@ -507,7 +501,7 @@ def oracle_copula_nll(
     rhs = z_test.unsqueeze(-1)
     tmp = torch.linalg.solve_triangular(L, rhs, upper=False)
     R_inv_z = torch.linalg.solve_triangular(L.mT, tmp, upper=True).squeeze(-1)
-    losses = 0.5 * (log_det + (z_test * R_inv_z).sum(-1) - (z_test ** 2).sum(-1)) / n_test.clamp(min=1)
+    losses = 0.5 * (log_det + (z_test * R_inv_z).sum(-1) - (z_test**2).sum(-1)) / n_test.clamp(min=1)
 
     valid = n_test > 0
     if not valid.any():
@@ -557,7 +551,7 @@ def y_space_nll(
     S_inv_z = torch.linalg.solve_triangular(L.mT, tmp, upper=True).squeeze(-1)  # (B, N_max)
 
     n_safe = n_test.clamp(min=1)
-    copula = 0.5 * (log_det + (z_test * S_inv_z).sum(-1) - (z_test ** 2).sum(-1)) / n_safe
+    copula = 0.5 * (log_det + (z_test * S_inv_z).sum(-1) - (z_test**2).sum(-1)) / n_safe
     marginal = -log_pdf_test.sum(-1) / n_safe
 
     valid = n_test > 0
@@ -593,24 +587,24 @@ def _y_space_nll_lowrank(
     mask = test_mask.bool()
     n_test = mask.sum(-1).to(out_dtype)  # (B,)
 
-    U = factor.U.double() * mask.unsqueeze(-1)            # (B, N, r)
+    U = factor.U.double() * mask.unsqueeze(-1)  # (B, N, r)
     D = torch.where(mask, factor.D.double(), torch.ones_like(factor.D, dtype=torch.float64))
     z = z_test.double() * mask
 
     d_isqrt = D.rsqrt()
-    U_t = U * d_isqrt.unsqueeze(-1)                       # Ũ = D^{-1/2} U
-    z_t = z * d_isqrt                                     # z̃ = D^{-1/2} z
+    U_t = U * d_isqrt.unsqueeze(-1)  # Ũ = D^{-1/2} U
+    z_t = z * d_isqrt  # z̃ = D^{-1/2} z
 
     r = U.shape[-1]
     eye_r = torch.eye(r, dtype=torch.float64, device=U.device)
-    M = eye_r + U_t.transpose(-1, -2) @ U_t               # (B, r, r)
+    M = eye_r + U_t.transpose(-1, -2) @ U_t  # (B, r, r)
     L_M = _safe_cholesky(M)
 
     log_det = D.log().sum(-1) + 2.0 * L_M.diagonal(dim1=-2, dim2=-1).clamp_min(1e-300).log().sum(-1)
-    w = torch.linalg.solve_triangular(
-        L_M, (U_t.transpose(-1, -2) @ z_t.unsqueeze(-1)), upper=False
-    ).squeeze(-1)                                         # L^{-1} Ũ^T z̃, (B, r)
-    quad = (z_t * z_t).sum(-1) - (w * w).sum(-1)          # z^T Σ^{-1} z
+    w = torch.linalg.solve_triangular(L_M, (U_t.transpose(-1, -2) @ z_t.unsqueeze(-1)), upper=False).squeeze(
+        -1
+    )  # L^{-1} Ũ^T z̃, (B, r)
+    quad = (z_t * z_t).sum(-1) - (w * w).sum(-1)  # z^T Σ^{-1} z
 
     n_safe = n_test.clamp(min=1)
     copula = (0.5 * (log_det + quad - (z * z).sum(-1))).to(out_dtype) / n_safe
@@ -675,15 +669,15 @@ def gp_oracle_y_nll(
 
     n_safe = n_test.clamp(min=1)
     total_nll = 0.5 * (log_det + quad + n_test * log_2pi) / n_safe
-    mar_nll   = 0.5 * (log_det_diag + quad_diag + n_test * log_2pi) / n_safe
-    cop_nll   = total_nll - mar_nll
+    mar_nll = 0.5 * (log_det_diag + quad_diag + n_test * log_2pi) / n_safe
+    cop_nll = total_nll - mar_nll
 
     valid = n_test > 0
     if not valid.any():
         zero = Sigma_star.sum() * 0.0
         return {"total": zero, "copula": zero, "marginal": zero}
     return {
-        "total":    total_nll[valid].mean(),
-        "copula":   cop_nll[valid].mean(),
+        "total": total_nll[valid].mean(),
+        "copula": cop_nll[valid].mean(),
         "marginal": mar_nll[valid].mean(),
     }

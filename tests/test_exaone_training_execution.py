@@ -1,4 +1,5 @@
 """Execution optimizations must preserve LoRA gradients across optimizer steps."""
+
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -30,9 +31,13 @@ def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_si
     torch.manual_seed(42)
     reference = RepeatedWeightModel()
     actual = deepcopy(reference)
-    bb = MarginalBackbone("exaone", actual, SimpleNamespace(model=actual),
-                          exaone_chunk_size=chunk_size,
-                          exaone_activation_checkpointing=checkpointing)
+    bb = MarginalBackbone(
+        "exaone",
+        actual,
+        SimpleNamespace(model=actual),
+        exaone_chunk_size=chunk_size,
+        exaone_activation_checkpointing=checkpointing,
+    )
     opts = [torch.optim.SGD(m.parameters(), lr=0.01) for m in (reference, actual)]
     for _ in range(2):
         support, label, query = torch.randn(5, 7, 3), torch.randn(5, 7), torch.randn(5, 4, 3)
@@ -51,8 +56,9 @@ def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_si
             opt.step()
             opt.zero_grad(set_to_none=True)
         with torch.no_grad():
-            torch.testing.assert_close(_exaone_grad_forward(bb, support, label, query),
-                                       reference(support, label, query))
+            torch.testing.assert_close(
+                _exaone_grad_forward(bb, support, label, query), reference(support, label, query)
+            )
 
 
 def test_invalid_chunk_size():

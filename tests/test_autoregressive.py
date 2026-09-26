@@ -1,12 +1,12 @@
 """Tests for eval/baselines/autoregressive.py and its place in eval_checkpoint's tables.
 
-  1. Step 0 reproduces the one-shot PIT's log_pdf_test.
-  2. Teacher forcing appends the true values in visit order.
-  3. conditioning="sample" appends draws, reproducibly for a seed.
-  4. Orderings are permutations seeded by global index; "natural" is identity.
-  5. max_context caps the context rows and keeps the P context points.
-  6. ar_parts_from_log_pdf: total = marginal + copula.
-  7. "autoregressive" is in _TOTAL_NLL_ORDER but not _METHOD_ORDER.
+1. Step 0 reproduces the one-shot PIT's log_pdf_test.
+2. Teacher forcing appends the true values in visit order.
+3. conditioning="sample" appends draws, reproducibly for a seed.
+4. Orderings are permutations seeded by global index; "natural" is identity.
+5. max_context caps the context rows and keeps the P context points.
+6. ar_parts_from_log_pdf: total = marginal + copula.
+7. "autoregressive" is in _TOTAL_NLL_ORDER but not _METHOD_ORDER.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class RecordingFakeTabICL(RowIndependentFakeTabICL):
 
     def __init__(self, q: int = 3):
         super().__init__(q)
-        self.calls: list[tuple[int, int]] = []   # (n_context, n_query)
+        self.calls: list[tuple[int, int]] = []  # (n_context, n_query)
 
     def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         self.calls.append((y.shape[1], X.shape[1] - y.shape[1]))
@@ -41,7 +41,7 @@ def _episodes(B=2, P=6, N=5, d_x=3, seed=0):
     g = torch.Generator().manual_seed(seed)
     return (
         torch.randn(B, P, d_x, generator=g),
-        torch.randn(B, P, generator=g) * 3.0 + 280.0,   # absolute-scale, like ERA5 Kelvin
+        torch.randn(B, P, generator=g) * 3.0 + 280.0,  # absolute-scale, like ERA5 Kelvin
         torch.randn(B, N, d_x, generator=g),
         torch.randn(B, N, generator=g) * 3.0 + 280.0,
     )
@@ -54,18 +54,20 @@ def test_ar_step0_matches_the_one_shot_marginal():
 
     one_shot = _pit_group(x_tr, y_tr, x_te, y_te, tabicl, k_folds=3)
     ar = autoregressive_log_pdf(
-        tabicl, x_tr, y_tr, x_te, y_te, order="natural",
-        conditioning="teacher_forcing", seed=0,
+        tabicl,
+        x_tr,
+        y_tr,
+        x_te,
+        y_te,
+        order="natural",
+        conditioning="teacher_forcing",
+        seed=0,
     )
 
     # Natural order visits test index 0 first.
-    assert torch.allclose(
-        ar["log_pdf"][:, 0], one_shot["log_pdf_test"][:, 0], atol=1e-5
-    )
+    assert torch.allclose(ar["log_pdf"][:, 0], one_shot["log_pdf_test"][:, 0], atol=1e-5)
     # Later points differ from the one-shot values.
-    assert not torch.allclose(
-        ar["log_pdf"][:, 1:], one_shot["log_pdf_test"][:, 1:], atol=1e-5
-    )
+    assert not torch.allclose(ar["log_pdf"][:, 1:], one_shot["log_pdf_test"][:, 1:], atol=1e-5)
 
 
 def test_teacher_forcing_appends_the_truth_in_visit_order():
@@ -73,8 +75,14 @@ def test_teacher_forcing_appends_the_truth_in_visit_order():
     x_tr, y_tr, x_te, y_te = _episodes(seed=1)
 
     ar = autoregressive_log_pdf(
-        tabicl, x_tr, y_tr, x_te, y_te, order="random",
-        conditioning="teacher_forcing", seed=7,
+        tabicl,
+        x_tr,
+        y_tr,
+        x_te,
+        y_te,
+        order="random",
+        conditioning="teacher_forcing",
+        seed=7,
     )
     expected = y_te.gather(1, ar["order"])
     assert torch.allclose(ar["appended"], expected, atol=1e-4)
@@ -136,7 +144,13 @@ def test_max_context_caps_the_table_and_keeps_the_episodes_own_context():
     cap = P + 2
     capped = RecordingFakeTabICL()
     autoregressive_log_pdf(
-        capped, x_tr, y_tr, x_te, y_te, order="natural", max_context=cap,
+        capped,
+        x_tr,
+        y_tr,
+        x_te,
+        y_te,
+        order="natural",
+        max_context=cap,
     )
     assert [c[0] for c in capped.calls] == [min(P + i, cap) for i in range(N)]
     assert max(c[0] for c in capped.calls) == cap
@@ -173,11 +187,9 @@ def test_autoregressive_is_a_total_table_row_only():
 def test_ar_note_warns_on_sampled_conditioning():
     from eval.runners.eval_tables import _NAN_PARTS, _ar_note
 
-    rows = [{"autoregressive": {"total": 0.5, "marginal": 1.0, "copula": -0.5}},
-            {"autoregressive": _NAN_PARTS.copy()}]
+    rows = [{"autoregressive": {"total": 0.5, "marginal": 1.0, "copula": -0.5}}, {"autoregressive": _NAN_PARTS.copy()}]
     forced = _ar_note(rows, "random", "teacher_forcing", None)
     assert "1/2 episodes" in forced and "WARNING" not in forced
     sampled = _ar_note(rows, "random", "sample", 64)
     assert "WARNING" in sampled and "max_context=64" in sampled
-    assert _ar_note([{"autoregressive": _NAN_PARTS.copy()}], "random",
-                    "teacher_forcing", None) is None
+    assert _ar_note([{"autoregressive": _NAN_PARTS.copy()}], "random", "teacher_forcing", None) is None

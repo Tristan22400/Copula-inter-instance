@@ -169,8 +169,7 @@ class LiveGPDataset(IterableDataset):
             ckpt = resolve_pit_ckpt(cfg)
             if ckpt is None:
                 reason = (
-                    "data.z_train_tabicl_mix_enabled=true" if mix_enabled
-                    else f"data.z_train_source={z_train_source}"
+                    "data.z_train_tabicl_mix_enabled=true" if mix_enabled else f"data.z_train_source={z_train_source}"
                 )
                 raise ValueError(
                     f"training.live_generation with {reason} requires a resolvable "
@@ -178,7 +177,8 @@ class LiveGPDataset(IterableDataset):
                     "or tabicl.pit_ckpt."
                 )
             reason = (
-                f"data.z_train_tabicl_mix_enabled=true (z_train_source={z_train_source})" if mix_enabled
+                f"data.z_train_tabicl_mix_enabled=true (z_train_source={z_train_source})"
+                if mix_enabled
                 else f"data.z_train_source={z_train_source}"
             )
             print(
@@ -203,11 +203,16 @@ class LiveGPDataset(IterableDataset):
             cfg.seed = worker_seed(self._base_seed, worker_id, call_idx)
             call_idx += 1
             episodes = generate_gp_batch(
-                cfg, self.group_size, device=gen_device, kernel_weights=self.kernel_weights,
-                tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+                cfg,
+                self.group_size,
+                device=gen_device,
+                kernel_weights=self.kernel_weights,
+                tabicl_model=tabicl_model,
+                tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 tabicl_mix_weights=self.tabicl_mix_weights,
-                marginal_backend=self.marginal_backend, marginal_regressor=marginal_regressor,
+                marginal_backend=self.marginal_backend,
+                marginal_regressor=marginal_regressor,
                 marginal_probs_n=self.marginal_probs_n,
                 raw_y_override=raw_y_override,
             )
@@ -263,10 +268,7 @@ def build_live_train_loader(
     group_size = batch_size * group_multiplier
 
     if batched_marginal_worker_enabled and device != "cuda":
-        reason = (
-            "data.z_train_tabicl_mix_enabled=true" if mix_enabled
-            else f"data.z_train_source={z_train_source}"
-        )
+        reason = "data.z_train_tabicl_mix_enabled=true" if mix_enabled else f"data.z_train_source={z_train_source}"
         raise ValueError(
             f"training.live_generation with {reason} requires device='cuda' "
             f"(got {device!r}) -- CPU-only inference for this backend was "
@@ -310,10 +312,14 @@ def build_live_train_loader(
         tabicl_mix_weights = torch.full((n,), floor_frac, dtype=torch.float32).share_memory_()
     marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     live_ds = LiveGPDataset(
-        cfg, group_size=group_size, kernel_weights=kernel_weights, tabicl_device=tabicl_device,
+        cfg,
+        group_size=group_size,
+        kernel_weights=kernel_weights,
+        tabicl_device=tabicl_device,
         tabicl_mix_weights=tabicl_mix_weights,
         marginal_backend=z_train_source if generic_marginal_enabled else None,
-        marginal_device=marginal_device, marginal_probs_n=marginal_probs_n,
+        marginal_device=marginal_device,
+        marginal_probs_n=marginal_probs_n,
     )
     # CUDA-resident worker models require spawn.
     loader = DataLoader(
@@ -331,7 +337,9 @@ def build_live_train_loader(
 
 
 def build_fixed_live_val_batches(
-    cfg: DictConfig, t: DictConfig, device: str = "cpu",
+    cfg: DictConfig,
+    t: DictConfig,
+    device: str = "cpu",
 ) -> Tuple[List[dict], List[List[dict]]]:
     """Fixed validation set for live-generation training.
 
@@ -397,12 +405,16 @@ def build_fixed_live_val_batches(
             val_cfg = copy.deepcopy(cfg)
             val_cfg.seed = val_seed + i * 104_729  # distinct, fixed, reproducible per batch
             episodes = generate_gp_batch(
-                val_cfg, batch_size, device=gen_device,
-                tabicl_model=tabicl_model, tabicl_k_folds=tabicl_k_folds,
+                val_cfg,
+                batch_size,
+                device=gen_device,
+                tabicl_model=tabicl_model,
+                tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 return_kernel_metadata=True,
                 marginal_backend=z_train_source if generic_marginal_enabled else None,
-                marginal_regressor=marginal_regressor, marginal_probs_n=marginal_probs_n,
+                marginal_regressor=marginal_regressor,
+                marginal_probs_n=marginal_probs_n,
                 raw_y_override=raw_y_override,
             )
             if gen_device == "cuda":
@@ -416,6 +428,7 @@ def build_fixed_live_val_batches(
         del tabicl_model, marginal_regressor
         if device == "cuda":
             import gc
+
             gc.collect()
             torch.cuda.empty_cache()
     return batches, episodes_by_batch

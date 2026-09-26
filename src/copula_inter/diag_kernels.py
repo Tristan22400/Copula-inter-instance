@@ -8,6 +8,7 @@ saturation near +-1. tests/test_diag_kernels.py reuses these checks.
     python -m copula_inter.diag_kernels --n-stage3 200
     python -m copula_inter.diag_kernels --skip-stage3
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,6 +24,7 @@ from copula_inter.data_gen import ALL_KERNELS, generate_gp_task  # noqa: E402
 
 # Minimal config (mirrors gp_tasks.yaml defaults).
 
+
 @dataclass
 class DataCfg:
     d_features: int = 10
@@ -36,7 +38,7 @@ class DataCfg:
     l_max: float = 10.0
     alpha2_min: float = 0.5
     alpha2_max: float = 2.0
-    dot_product_alpha2_min: float = 0.0   # must be >= 0 for PSD (see gp_tasks.yaml)
+    dot_product_alpha2_min: float = 0.0  # must be >= 0 for PSD (see gp_tasks.yaml)
     dot_product_alpha2_max: float = 1.0
     nugget_min: float = 0.1
     nugget_max: float = 1.0
@@ -55,7 +57,7 @@ class Cfg:
 
 
 def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
-    R = task["R_star"]        # (N, N)
+    R = task["R_star"]  # (N, N)
     N = R.shape[0]
     issues: List[str] = []
 
@@ -93,8 +95,8 @@ def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
     mask = ~torch.eye(N, dtype=torch.bool)
     off_diag = R[mask]
     od_mean = off_diag.mean().item()
-    od_std  = off_diag.std().item()
-    od_abs  = off_diag.abs().mean().item()
+    od_std = off_diag.std().item()
+    od_abs = off_diag.abs().mean().item()
 
     # "Meaningful" = not all near 0 (no structure) or all same value (trivial)
     if od_std < 1e-4:
@@ -123,7 +125,7 @@ def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
 
 # Stage 3: pooled off-diagonal R_star distribution per kernel (neither ~0 nor ~+-1 everywhere).
 
-COLLAPSE_THRESHOLD   = 0.01  # E[|R*_offdiag|] below this -> screening effect
+COLLAPSE_THRESHOLD = 0.01  # E[|R*_offdiag|] below this -> screening effect
 DEGENERATE_THRESHOLD = 0.95  # E[|R*_offdiag|] above this -> trivial task
 HEALTHY_LOW, HEALTHY_HIGH = 0.1, 0.8  # target band for a "Goldilocks" mean|r|
 
@@ -163,9 +165,7 @@ def batch_off_diagonal_stats(kernel_name: str, cfg: "Cfg", n_tasks: int) -> dict
     else:
         verdict = "BORDERLINE (outside the [0.1, 0.8] Goldilocks band)"
 
-    quantiles = torch.quantile(
-        abs_off_diag.float(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95])
-    ).tolist()
+    quantiles = torch.quantile(abs_off_diag.float(), torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95])).tolist()
 
     return {
         "kernel": kernel_name,
@@ -174,8 +174,11 @@ def batch_off_diagonal_stats(kernel_name: str, cfg: "Cfg", n_tasks: int) -> dict
         "mean": off_diag.mean().item(),
         "mean_abs": mean_abs,
         "std": off_diag.std().item(),
-        "p5": quantiles[0], "p25": quantiles[1], "p50": quantiles[2],
-        "p75": quantiles[3], "p95": quantiles[4],
+        "p5": quantiles[0],
+        "p25": quantiles[1],
+        "p50": quantiles[2],
+        "p75": quantiles[3],
+        "p95": quantiles[4],
         "frac_collapsed": (abs_off_diag < COLLAPSE_THRESHOLD).float().mean().item(),
         "frac_degenerate": (abs_off_diag > DEGENERATE_THRESHOLD).float().mean().item(),
         "verdict": verdict,
@@ -193,13 +196,15 @@ def run_stage3(cfg: "Cfg", n_tasks: int) -> bool:
     fig_axes = []
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+
         ncols = 3
         nrows = math.ceil(len(ALL_KERNELS) / ncols)
         fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
         fig_axes = list(axes.flat)
-        for ax in fig_axes[len(ALL_KERNELS):]:
+        for ax in fig_axes[len(ALL_KERNELS) :]:
             ax.set_visible(False)
     except ImportError:
         fig = None
@@ -210,39 +215,37 @@ def run_stage3(cfg: "Cfg", n_tasks: int) -> bool:
             all_healthy = False
 
         print(f"\n  {kernel_name.upper()}  ({stats['n_pairs']:,} pooled off-diagonal entries)")
-        print(
-            f"    E[|R*_offdiag|]={stats['mean_abs']:.4f}  "
-            f"mean={stats['mean']:+.4f}  std={stats['std']:.4f}"
-        )
+        print(f"    E[|R*_offdiag|]={stats['mean_abs']:.4f}  mean={stats['mean']:+.4f}  std={stats['std']:.4f}")
         print(
             f"    percentiles(|r|): p5={stats['p5']:.3f} p25={stats['p25']:.3f} "
             f"p50={stats['p50']:.3f} p75={stats['p75']:.3f} p95={stats['p95']:.3f}"
         )
         print(
-            f"    frac(|r|<{COLLAPSE_THRESHOLD})={stats['frac_collapsed']*100:.2f}%   "
-            f"frac(|r|>{DEGENERATE_THRESHOLD})={stats['frac_degenerate']*100:.2f}%"
+            f"    frac(|r|<{COLLAPSE_THRESHOLD})={stats['frac_collapsed'] * 100:.2f}%   "
+            f"frac(|r|>{DEGENERATE_THRESHOLD})={stats['frac_degenerate'] * 100:.2f}%"
         )
         print(f"    verdict: {stats['verdict']}")
         if stats["verdict"] == "COLLAPSED (screening effect — model will just learn identity)":
-            print("    fix: increase l_min (or l_log_uniform range) so training context "
-                  "explains less of the test set, or decrease nugget_max.")
+            print(
+                "    fix: increase l_min (or l_log_uniform range) so training context "
+                "explains less of the test set, or decrease nugget_max."
+            )
         elif stats["verdict"] == "DEGENERATE (trivially near-identical instances)":
-            print("    fix: decrease l_max so instances decorrelate faster, "
-                  "or increase nugget_min.")
+            print("    fix: decrease l_max so instances decorrelate faster, or increase nugget_min.")
         print(_ascii_histogram(stats["off_diag"]))
 
         if fig is not None:
             ax = fig_axes[i]
             ax.hist(stats["off_diag"].numpy(), bins=40, range=(-1, 1), color="steelblue")
             ax.axvline(0, color="black", linewidth=0.8)
-            ax.set_title(f"{kernel_name}\nE[|r|]={stats['mean_abs']:.3f} ({stats['verdict'].split()[0]})",
-                         fontsize=9)
+            ax.set_title(f"{kernel_name}\nE[|r|]={stats['mean_abs']:.3f} ({stats['verdict'].split()[0]})", fontsize=9)
 
     if fig is not None:
         fig.suptitle(f"Off-diagonal R_star distribution ({n_tasks} tasks/kernel)")
         fig.tight_layout()
         out_path = "plots/off_diag_distribution.png"
         import os
+
         os.makedirs("plots", exist_ok=True)
         fig.savefig(out_path, dpi=120)
         print(f"\n  Saved histogram grid to: {out_path}")
@@ -257,10 +260,13 @@ SEED = 42
 
 def main() -> bool:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--n-stage3", type=int, default=1000,
-                         help="Tasks per kernel for the Stage 3 batch distribution check (default: 1000)")
-    parser.add_argument("--skip-stage3", action="store_true",
-                         help="Skip the Stage 3 batch distribution check")
+    parser.add_argument(
+        "--n-stage3",
+        type=int,
+        default=1000,
+        help="Tasks per kernel for the Stage 3 batch distribution check (default: 1000)",
+    )
+    parser.add_argument("--skip-stage3", action="store_true", help="Skip the Stage 3 batch distribution check")
     args = parser.parse_args()
 
     random.seed(SEED)
@@ -290,7 +296,7 @@ def main() -> bool:
 
             if result["ok"]:
                 print(
-                    f"  [{status}] task {i+1}  "
+                    f"  [{status}] task {i + 1}  "
                     f"P={result['P']:2d} N={result['N']:2d}  "
                     f"l={result['l']:.2f} a2={result['alpha2']:.2f} nug={result['nugget']:.2f}  "
                     f"r:[{result['r_min']:+.3f},{result['r_max']:+.3f}]  "
@@ -299,7 +305,7 @@ def main() -> bool:
                     f"min_eig={result['min_eig']:.4f}"
                 )
             else:
-                print(f"  [{status}] task {i+1}  ISSUES: {result['issues']}")
+                print(f"  [{status}] task {i + 1}  ISSUES: {result['issues']}")
                 # also print any numeric stats if they were computed
                 for key in ("r_min", "r_max", "od_mean", "od_std", "od_abs_mean", "min_eig"):
                     if key in result:

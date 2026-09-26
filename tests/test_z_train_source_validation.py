@@ -20,9 +20,7 @@ from copula_inter.live_dataset import (
 from copula_inter.train import _reserve_gpu_headroom_for_live_tabicl
 
 
-@pytest.mark.parametrize(
-    "value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train"]
-)
+@pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train"])
 def test_validate_z_train_source_accepts_known_values(value):
     _validate_z_train_source(value)  # must not raise
 
@@ -45,7 +43,13 @@ def test_validate_z_train_source_rejects_unknown_values(value):
 def test_valid_z_train_sources_matches_documented_set():
     # _VALID_Z_TRAIN_SOURCES matches the documented values.
     assert set(_VALID_Z_TRAIN_SOURCES) == {
-        "analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train",
+        "analytic",
+        "tabicl",
+        "tabicl_split",
+        "exaone",
+        "tabpfn",
+        "tabldm",
+        "y_train",
     }
 
 

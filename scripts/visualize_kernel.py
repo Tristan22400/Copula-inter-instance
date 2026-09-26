@@ -7,6 +7,7 @@ backend.
 Usage:
     python scripts/visualize_kernel.py --kernel rbf
 """
+
 import argparse
 import os
 import sys
@@ -19,11 +20,11 @@ import numpy as np
 import scipy.cluster.hierarchy as sch
 from omegaconf import OmegaConf
 
-_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 from copula_inter.data_gen import KERNEL_REGISTRY, generate_gp_batch  # noqa: E402
 
 N_SAMPLES = 8  # print at least 8 generated posterior draws along the way
-N_PLOT = 4     # number of those draws to actually plot (raw + sorted each)
+N_PLOT = 4  # number of those draws to actually plot (raw + sorted each)
 
 
 def _load_cfg(kernel_name: str):
@@ -40,8 +41,7 @@ def _load_cfg(kernel_name: str):
 def visualize(kernel_name: str):
     print(f"[*] Generating posterior R* visualization for {kernel_name}...")
     if kernel_name not in KERNEL_REGISTRY:
-        print(f"[!] Kernel {kernel_name} not found in KERNEL_REGISTRY. "
-              f"Available: {sorted(KERNEL_REGISTRY)}")
+        print(f"[!] Kernel {kernel_name} not found in KERNEL_REGISTRY. Available: {sorted(KERNEL_REGISTRY)}")
         sys.exit(1)
 
     cfg = _load_cfg(kernel_name)
@@ -70,16 +70,16 @@ def visualize(kernel_name: str):
         distance_matrix = np.clip(0.5 * (distance_matrix + distance_matrix.T), 0, 1)
         np.fill_diagonal(distance_matrix, 0.0)
 
-        linkage = sch.linkage(sch.distance.squareform(distance_matrix), method='average')
+        linkage = sch.linkage(sch.distance.squareform(distance_matrix), method="average")
         dendro = sch.dendrogram(linkage, no_plot=True)
-        idx = dendro['leaves']
+        idx = dendro["leaves"]
         R_sorted = R[idx, :][:, idx]
 
-        im1 = axes[0][col].imshow(R, cmap='viridis', interpolation='nearest', vmin=-1, vmax=1)
+        im1 = axes[0][col].imshow(R, cmap="viridis", interpolation="nearest", vmin=-1, vmax=1)
         axes[0][col].set_title(f"Posterior R* ({kernel_name}) — draw {col + 1}")
         plt.colorbar(im1, ax=axes[0][col])
 
-        im2 = axes[1][col].imshow(R_sorted, cmap='viridis', interpolation='nearest', vmin=-1, vmax=1)
+        im2 = axes[1][col].imshow(R_sorted, cmap="viridis", interpolation="nearest", vmin=-1, vmax=1)
         axes[1][col].set_title(f"Sorted R* — draw {col + 1}")
         plt.colorbar(im2, ax=axes[1][col])
 

@@ -40,13 +40,9 @@ def test_tabldm_batched_matches_per_episode(regressor, constant_column):
     B, P, N, p_x, K, probs_n = 2, 12, 4, 3, 3, 21
     X_train = rng.normal(size=(B, P, p_x)).astype(np.float32)
     true_w = rng.normal(size=(B, p_x)).astype(np.float32)
-    Y_train = (
-        np.einsum("bpi,bi->bp", X_train, true_w) + 0.2 * rng.normal(size=(B, P))
-    ).astype(np.float32)
+    Y_train = (np.einsum("bpi,bi->bp", X_train, true_w) + 0.2 * rng.normal(size=(B, P))).astype(np.float32)
     X_test = rng.normal(size=(B, N, p_x)).astype(np.float32)
-    Y_test = (
-        np.einsum("bni,bi->bn", X_test, true_w) + 0.2 * rng.normal(size=(B, N))
-    ).astype(np.float32)
+    Y_test = (np.einsum("bni,bi->bn", X_test, true_w) + 0.2 * rng.normal(size=(B, N))).astype(np.float32)
     if constant_column:
         # Equal raw widths become different widths after per-episode fitting.
         X_train[1, :, -1] = 1.0
@@ -58,9 +54,7 @@ def test_tabldm_batched_matches_per_episode(regressor, constant_column):
     z_test_ref = np.empty((B, N), dtype=np.float32)
     log_pdf_ref = np.empty((B, N), dtype=np.float32)
     for b in range(B):
-        z_train_ref[b] = loo_pit(
-            "tabldm", regressor, X_train[b], Y_train[b], probs, k_folds=K, seed=base_seed + b
-        )
+        z_train_ref[b] = loo_pit("tabldm", regressor, X_train[b], Y_train[b], probs, k_folds=K, seed=base_seed + b)
         q_test = quantiles("tabldm", regressor, X_train[b], Y_train[b], X_test[b], probs, seed=base_seed + b)
         z_b, lp_b = compute_pit(q_test, probs, Y_test[b])
         z_test_ref[b] = z_b

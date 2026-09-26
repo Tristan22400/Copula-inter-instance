@@ -19,9 +19,7 @@ import os
 
 import numpy as np
 
-_CACHE_DIR = os.environ.get(
-    "ERA5_CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
-)
+_CACHE_DIR = os.environ.get("ERA5_CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache"))
 _STATIC_PATH = os.path.join(_CACHE_DIR, "era5_static.nc")
 _ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
 STATIC_VARS = (

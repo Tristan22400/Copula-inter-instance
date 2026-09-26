@@ -51,9 +51,7 @@ N_NLL_TEST = constants.N_NLL_TEST
 def _z_train_gap(z_true: np.ndarray, z_hat: np.ndarray) -> dict:
     mask = np.isfinite(z_true) & np.isfinite(z_hat)
     zt, zh = z_true[mask], z_hat[mask]
-    corr = (
-        float(np.corrcoef(zt, zh)[0, 1]) if len(zt) > 2 and zt.std() > 0 and zh.std() > 0 else float("nan")
-    )
+    corr = float(np.corrcoef(zt, zh)[0, 1]) if len(zt) > 2 and zt.std() > 0 and zh.std() > 0 else float("nan")
     return {
         "z_corr": corr,
         "z_rmse": float(np.sqrt(np.mean((zt - zh) ** 2))) if len(zt) else float("nan"),
@@ -64,8 +62,15 @@ def _z_train_gap(z_true: np.ndarray, z_hat: np.ndarray) -> dict:
 
 
 def run_task(
-    model, cfg, device, backends: list, regressors: dict,
-    kernel_name: str, grid_size: int, n_context: int, seed: int,
+    model,
+    cfg,
+    device,
+    backends: list,
+    regressors: dict,
+    kernel_name: str,
+    grid_size: int,
+    n_context: int,
+    seed: int,
     n_nll_test: int = N_NLL_TEST,
 ) -> dict:
     task = build_synthetic_grid_task(cfg, kernel_name, grid_size, n_context, constants.N_BINS, seed, min_context=4)
@@ -94,13 +99,16 @@ def run_task(
 
     # Reference NLL with the true marginal N(0, true_cov_ii).
     from scipy.stats import norm as _norm
+
     exact_std = np.sqrt(np.clip(np.diag(true_cov)[nll_test_idx], 1e-12, None))
     qgrid_exact = exact_std[:, None] * _norm.ppf(PROBS)[None, :]
     R_nll_true = R_pred_true[np.ix_(nll_test_idx, nll_test_idx)]
     nll_true = compute_joint_nll(qgrid_exact, PROBS, R_nll_true, y_nll_test)
 
     out = {
-        "kernel": kernel_name, "grid_size": grid_size, "seed": seed,
+        "kernel": kernel_name,
+        "grid_size": grid_size,
+        "seed": seed,
         "ground_truth_spatial_model_r2": weighted_r2(rho_pred_true, rho_true, pair_counts),
         "ground_truth_nll_total": nll_true["total"],
         "ground_truth_nll_marginal": nll_true["marginal"],
@@ -108,8 +116,13 @@ def run_task(
     }
     for name in backends:
         z_hat = loo_pit(
-            name, regressors[name], x_train_norm, context_values, PROBS,
-            k_folds=constants.PIT_K_FOLDS, seed=seed,
+            name,
+            regressors[name],
+            x_train_norm,
+            context_values,
+            PROBS,
+            k_folds=constants.PIT_K_FOLDS,
+            seed=seed,
         )
         gap = _z_train_gap(z_train_true, z_hat)
 
@@ -137,10 +150,15 @@ def run_task(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ckpt", type=str, default="kernel-sweep-classic-prod")
-    parser.add_argument("--backends", type=str, default="tabicl,exaone",
-                         help=f"Comma-separated subset of {BACKEND_NAMES}. 'tabpfn' needs TABPFN_TOKEN.")
-    parser.add_argument("--profile", type=str, default="low_context_7config",
-                         choices=list(constants.SYNTHETIC_SWEEP_PROFILES))
+    parser.add_argument(
+        "--backends",
+        type=str,
+        default="tabicl,exaone",
+        help=f"Comma-separated subset of {BACKEND_NAMES}. 'tabpfn' needs TABPFN_TOKEN.",
+    )
+    parser.add_argument(
+        "--profile", type=str, default="low_context_7config", choices=list(constants.SYNTHETIC_SWEEP_PROFILES)
+    )
     parser.add_argument("--n-draws", type=int, default=5)
     parser.add_argument("--n-context", type=int, default=constants.N_CONTEXT)
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
@@ -168,15 +186,26 @@ def main() -> None:
         for draw in range(args.n_draws):
             seed = args.seed * 10_000 + hash((config_name, draw)) % 10_000
             r = run_task(
-                model, cfg, resolved_device, backends, regressors,
-                kernel_name, grid_size, args.n_context, seed,
+                model,
+                cfg,
+                resolved_device,
+                backends,
+                regressors,
+                kernel_name,
+                grid_size,
+                args.n_context,
+                seed,
             )
             r["config"] = config_name
             results.append(r)
-            print(f"[{config_name} draw {draw}] gt_r2={r['ground_truth_spatial_model_r2']:.3f} "
-                  f"gt_nll={r['ground_truth_nll_total']:.3f} "
-                  + " ".join(f"{b}: z_corr={r[b]['z_corr']:.3f} r2={r[b]['spatial_model_r2']:.3f} "
-                             f"nll={r[b]['nll_total']:.3f}" for b in backends))
+            print(
+                f"[{config_name} draw {draw}] gt_r2={r['ground_truth_spatial_model_r2']:.3f} "
+                f"gt_nll={r['ground_truth_nll_total']:.3f} "
+                + " ".join(
+                    f"{b}: z_corr={r[b]['z_corr']:.3f} r2={r[b]['spatial_model_r2']:.3f} nll={r[b]['nll_total']:.3f}"
+                    for b in backends
+                )
+            )
             os.makedirs(os.path.dirname(args.out), exist_ok=True)
             with open(args.out, "w") as f:
                 json.dump(results, f, indent=2)
@@ -192,8 +221,10 @@ def _print_summary(results: list, backends: list) -> None:
     gt_nll = np.nanmean([r["ground_truth_nll_total"] for r in results])
     print(f"Ground-truth-z_train spatial model_r2 (upper bound): {gt_r2:.3f}")
     print(f"Ground-truth-marginal total NLL (upper bound, nats/point): {gt_nll:.3f}")
-    header = (f"{'backend':10s} {'z_corr':>8s} {'z_rmse':>8s} {'z_hat_std':>10s} {'spatial_r2':>11s} "
-              f"{'shape_corr':>11s} {'nll_total':>10s} {'nll_marg':>10s} {'nll_cop':>10s}")
+    header = (
+        f"{'backend':10s} {'z_corr':>8s} {'z_rmse':>8s} {'z_hat_std':>10s} {'spatial_r2':>11s} "
+        f"{'shape_corr':>11s} {'nll_total':>10s} {'nll_marg':>10s} {'nll_cop':>10s}"
+    )
     print(header)
     for b in backends:
         z_corr = np.nanmean([r[b]["z_corr"] for r in results])
@@ -204,8 +235,10 @@ def _print_summary(results: list, backends: list) -> None:
         n_tot = np.nanmean([r[b]["nll_total"] for r in results])
         n_marg = np.nanmean([r[b]["nll_marginal"] for r in results])
         n_cop = np.nanmean([r[b]["nll_copula"] for r in results])
-        print(f"{b:10s} {z_corr:8.3f} {z_rmse:8.3f} {z_std:10.3f} {s_r2:11.3f} {s_corr:11.3f} "
-              f"{n_tot:10.3f} {n_marg:10.3f} {n_cop:10.3f}")
+        print(
+            f"{b:10s} {z_corr:8.3f} {z_rmse:8.3f} {z_std:10.3f} {s_r2:11.3f} {s_corr:11.3f} "
+            f"{n_tot:10.3f} {n_marg:10.3f} {n_cop:10.3f}"
+        )
 
 
 def _plot_summary(results: list, backends: list, out_path: str) -> None:

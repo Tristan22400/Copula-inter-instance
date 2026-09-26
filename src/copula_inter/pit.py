@@ -84,9 +84,7 @@ def resolve_pit_ckpt(cfg) -> str | None:
     return pit_ckpt
 
 
-def load_tabicl(
-    ckpt_name: str, device: str, trainable: bool = False, return_config: bool = False
-) -> nn.Module:
+def load_tabicl(ckpt_name: str, device: str, trainable: bool = False, return_config: bool = False) -> nn.Module:
     """Load a TabICL regressor.
 
     Args:
@@ -128,7 +126,8 @@ def _probit(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 def normalize_targets(
-    y_train: torch.Tensor, y_test: Optional[torch.Tensor] = None,
+    y_train: torch.Tensor,
+    y_test: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """Z-score targets with y_train's mean and std (y_test uses y_train's moments).
 
@@ -150,10 +149,7 @@ def normalize_targets(
 def _scale_fold_targets(y_context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Standardize one fold using only its context labels (unit scale for a single context row)."""
     mean = y_context.mean(dim=-1, keepdim=True)
-    std = (
-        y_context.std(dim=-1, keepdim=True).clamp(min=1e-8)
-        if y_context.shape[-1] > 1 else torch.ones_like(mean)
-    )
+    std = y_context.std(dim=-1, keepdim=True).clamp(min=1e-8) if y_context.shape[-1] > 1 else torch.ones_like(mean)
     return (y_context - mean) / std, mean, std
 
 
@@ -193,18 +189,18 @@ def run_pit(
     fold_targets = Y_train if Y_train_raw is None else Y_train_raw
 
     # A) Test instances: one forward over the full train context, d targets on the batch axis.
-    X_concat = torch.cat([X_train, X_test], dim=0)                       # (P+N, p_x)
+    X_concat = torch.cat([X_train, X_test], dim=0)  # (P+N, p_x)
     X_test_batch = X_concat.unsqueeze(0).expand(d, -1, -1).contiguous()  # (d, P+N, p_x)
-    y_train_batch = Y_train.permute(1, 0).contiguous()                   # (d, P)
+    y_train_batch = Y_train.permute(1, 0).contiguous()  # (d, P)
 
-    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)         # (d, N, Q)
+    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)  # (d, N, Q)
     # TabICL may return its output on CPU under memory pressure; move it back to `device`.
     logits = logits.to(device)
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(d * N, Q))
 
     y_test_flat = Y_test.permute(1, 0).reshape(d * N)
-    u_test = dist.cdf(y_test_flat).reshape(d, N).permute(1, 0)           # (N, d)
+    u_test = dist.cdf(y_test_flat).reshape(d, N).permute(1, 0)  # (N, d)
     log_pdf_test = dist.log_prob(y_test_flat).reshape(d, N).permute(1, 0)  # (N, d)
 
     # B) Training instances: K disjoint folds.
@@ -224,21 +220,19 @@ def run_pit(
         ctx_idx = indices[ctx_mask]
         F = qry_idx.numel()
 
-        X_fold = torch.cat([X_train[ctx_idx], X_train[qry_idx]], dim=0)    # (P-F+F, p_x)
+        X_fold = torch.cat([X_train[ctx_idx], X_train[qry_idx]], dim=0)  # (P-F+F, p_x)
         X_fold_batch = X_fold.unsqueeze(0).expand(d, -1, -1).contiguous()
-        y_context = fold_targets[ctx_idx].permute(1, 0)                  # (d, P-F)
+        y_context = fold_targets[ctx_idx].permute(1, 0)  # (d, P-F)
         y_ctx_batch, fold_mean, fold_std = _scale_fold_targets(y_context)
         y_ctx_batch = y_ctx_batch.contiguous()
 
-        logits_fold = tabicl_forward(tabicl, X_fold_batch, y_ctx_batch)    # (d, F, Q)
+        logits_fold = tabicl_forward(tabicl, X_fold_batch, y_ctx_batch)  # (d, F, Q)
         logits_fold = logits_fold.to(device)  # see run_pit's offload-mode comment above
         dist_fold = tabicl.quantile_dist(logits_fold.reshape(d * F, Q))
 
         y_query = fold_targets[qry_idx].permute(1, 0)
         y_qry_flat = ((y_query - fold_mean) / fold_std).reshape(d * F)
-        u_train[qry_idx, :] = (
-            dist_fold.cdf(y_qry_flat).reshape(d, F).permute(1, 0)
-        )
+        u_train[qry_idx, :] = dist_fold.cdf(y_qry_flat).reshape(d, F).permute(1, 0)
 
     z_train = _probit(u_train, eps)
     z_test = _probit(u_test, eps)
@@ -308,27 +302,25 @@ def _run_pit_batched_impl(
         full_std = Y_train_raw.std(dim=1).clamp(min=1e-8).unsqueeze(-1).unsqueeze(-1)
 
     # A) Test instances: one forward, batch axis = B*d.
-    X_concat = torch.cat([X_train, X_test], dim=1)                              # (B, P+N, p_x)
-    X_test_batch = (
-        X_concat.unsqueeze(1).expand(B, d, P + N, p_x).reshape(B * d, P + N, p_x).contiguous()
-    )
-    y_train_batch = Y_train.permute(0, 2, 1).reshape(B * d, P).contiguous()     # (B*d, P)
+    X_concat = torch.cat([X_train, X_test], dim=1)  # (B, P+N, p_x)
+    X_test_batch = X_concat.unsqueeze(1).expand(B, d, P + N, p_x).reshape(B * d, P + N, p_x).contiguous()
+    y_train_batch = Y_train.permute(0, 2, 1).reshape(B * d, P).contiguous()  # (B*d, P)
 
-    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)                # (B*d, N, Q)
+    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)  # (B*d, N, Q)
     # TabICL may return its output on CPU under memory pressure.
     logits = logits.to(device)
     Q = logits.shape[-1]
     if compute_pit:
         dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
         y_test_flat = Y_test.permute(0, 2, 1).reshape(B * d * N)
-        u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)       # (B, N, d)
+        u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)  # (B, N, d)
         log_pdf_test = dist.log_prob(y_test_flat).reshape(B, d, N).permute(0, 2, 1)
     else:
         u_test = log_pdf_test = None
 
     q_test = None
     if return_quantiles:
-        q_test = logits.reshape(B, d, N, Q).permute(0, 2, 1, 3)                 # (B, N, d, Q)
+        q_test = logits.reshape(B, d, N, Q).permute(0, 2, 1, 3)  # (B, N, d, Q)
 
     # B) Training instances: K disjoint folds, batch axis = B*d.
     fold_size = math.ceil(P / K)
@@ -370,8 +362,7 @@ def _run_pit_batched_impl(
         for qry_idx, ctx_idx, F in group:
             X_fold = torch.cat([X_train[:, ctx_idx], X_train[:, qry_idx]], dim=1)
             x_group.append(
-                X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x)
-                .reshape(B * d, X_fold.shape[1], p_x).contiguous()
+                X_fold.unsqueeze(1).expand(B, d, X_fold.shape[1], p_x).reshape(B * d, X_fold.shape[1], p_x).contiguous()
             )
             y_context = fold_targets[:, ctx_idx].permute(0, 2, 1)  # (B, d, P-F)
             y_scaled, fold_mean, fold_std = _scale_fold_targets(y_context)
@@ -382,7 +373,7 @@ def _run_pit_batched_impl(
         logits_group = logits_group.to(device)
 
         for group_idx, (qry_idx, _ctx_idx, F) in enumerate(group):
-            logits_fold = logits_group[group_idx * B * d:(group_idx + 1) * B * d]
+            logits_fold = logits_group[group_idx * B * d : (group_idx + 1) * B * d]
             fold_mean, fold_std = fold_scales[group_idx]
 
             if compute_pit:
@@ -396,9 +387,7 @@ def _run_pit_batched_impl(
                 q_fold = q_fold * fold_std.unsqueeze(-1) + fold_mean.unsqueeze(-1)
                 if Y_train_raw is not None:
                     q_fold = (q_fold - full_mean) / full_std
-                q_train_parts.append(
-                    (qry_idx, q_fold.permute(0, 2, 1, 3))
-                )
+                q_train_parts.append((qry_idx, q_fold.permute(0, 2, 1, 3)))
 
     no_fold_outputs = not (q_train_parts if return_quantiles else u_train_parts)
     if no_fold_outputs:
@@ -415,23 +404,25 @@ def _run_pit_batched_impl(
             out.update(
                 {
                     "q_test": q_test,
-                    **({
-                        "u_test": u_test,
-                        "clamp_frac_test": (
-                            (u_test <= eps) | (u_test >= 1.0 - eps)
-                        ).float().mean().detach(),
-                    } if compute_pit else {}),
+                    **(
+                        {
+                            "u_test": u_test,
+                            "clamp_frac_test": ((u_test <= eps) | (u_test >= 1.0 - eps)).float().mean().detach(),
+                        }
+                        if compute_pit
+                        else {}
+                    ),
                 }
             )
             levels = _alpha_levels_of(tabicl, device)
             if levels is not None:
-                out["alpha_levels"] = levels                                   # (Q,)
+                out["alpha_levels"] = levels  # (Q,)
         return out
 
     parts_for_order = q_train_parts if return_quantiles else u_train_parts
-    order = torch.cat([qi for qi, _ in parts_for_order], dim=0)                # (P',)
+    order = torch.cat([qi for qi, _ in parts_for_order], dim=0)  # (P',)
     if compute_pit:
-        u_train = torch.cat([uf for _, uf in u_train_parts], dim=1)            # (B, P', d)
+        u_train = torch.cat([uf for _, uf in u_train_parts], dim=1)  # (B, P', d)
     if fold_subset is None:
         # Full pass: restore the caller's row order.
         inv = torch.argsort(order)
@@ -442,11 +433,13 @@ def _run_pit_batched_impl(
 
     out = {}
     if compute_pit:
-        out.update({
-            "z_train": _probit(u_train, eps),
-            "z_test": _probit(u_test, eps),
-            "log_pdf_test": log_pdf_test,
-        })
+        out.update(
+            {
+                "z_train": _probit(u_train, eps),
+                "z_test": _probit(u_test, eps),
+                "log_pdf_test": log_pdf_test,
+            }
+        )
     if fold_subset is not None:
         out["train_query_idx"] = order
     if return_quantiles:
@@ -455,24 +448,24 @@ def _run_pit_batched_impl(
             q_train = q_train[:, inv, :, :]
         out.update(
             {
-                "q_train": q_train,                                            # (B, P', d, Q)
-                "q_test": q_test,                                              # (B, N, d, Q)
-                **({
-                    "u_train": u_train,
-                    "u_test": u_test,
-                    # Silent-failure counters: _probit hard-caps |z| at 4.7534.
-                    "clamp_frac_train": (
-                        (u_train <= eps) | (u_train >= 1.0 - eps)
-                    ).float().mean().detach(),
-                    "clamp_frac_test": (
-                        (u_test <= eps) | (u_test >= 1.0 - eps)
-                    ).float().mean().detach(),
-                } if compute_pit else {}),
+                "q_train": q_train,  # (B, P', d, Q)
+                "q_test": q_test,  # (B, N, d, Q)
+                **(
+                    {
+                        "u_train": u_train,
+                        "u_test": u_test,
+                        # Silent-failure counters: _probit hard-caps |z| at 4.7534.
+                        "clamp_frac_train": ((u_train <= eps) | (u_train >= 1.0 - eps)).float().mean().detach(),
+                        "clamp_frac_test": ((u_test <= eps) | (u_test >= 1.0 - eps)).float().mean().detach(),
+                    }
+                    if compute_pit
+                    else {}
+                ),
             }
         )
         levels = _alpha_levels_of(tabicl, device)
         if levels is not None:
-            out["alpha_levels"] = levels                                       # (Q,)
+            out["alpha_levels"] = levels  # (Q,)
     return out
 
 
@@ -506,7 +499,13 @@ def run_pit_batched(
         dict with z_train (B, P, d), z_test (B, N, d), log_pdf_test (B, N, d).
     """
     return _run_pit_batched_impl(
-        tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
+        tabicl,
+        X_train,
+        Y_train,
+        X_test,
+        Y_test,
+        k_folds,
+        eps,
         return_quantiles=return_quantiles,
         Y_train_raw=Y_train_raw,
     )
@@ -529,9 +528,17 @@ def run_pit_batched_grad(
     """run_pit_batched with gradients enabled and the model in train mode; returns quantiles by default."""
     with _train_mode(tabicl):
         return _run_pit_batched_impl(
-            tabicl, X_train, Y_train, X_test, Y_test, k_folds, eps,
-            return_quantiles=return_quantiles, fold_subset=fold_subset,
-            compute_pit=compute_pit, fuse_folds=fuse_folds,
+            tabicl,
+            X_train,
+            Y_train,
+            X_test,
+            Y_test,
+            k_folds,
+            eps,
+            return_quantiles=return_quantiles,
+            fold_subset=fold_subset,
+            compute_pit=compute_pit,
+            fuse_folds=fuse_folds,
             Y_train_raw=Y_train_raw,
         )
 
@@ -566,18 +573,16 @@ def run_pit_calib_split_batched(
     P_C = X_calib.shape[1]
     d = Y_query.shape[2]
 
-    X_concat = torch.cat([X_calib, X_query], dim=1)                          # (B, P_C+P_Q, p_x)
-    X_batch = (
-        X_concat.unsqueeze(1).expand(B, d, P_C + P_Q, p_x).reshape(B * d, P_C + P_Q, p_x).contiguous()
-    )
+    X_concat = torch.cat([X_calib, X_query], dim=1)  # (B, P_C+P_Q, p_x)
+    X_batch = X_concat.unsqueeze(1).expand(B, d, P_C + P_Q, p_x).reshape(B * d, P_C + P_Q, p_x).contiguous()
     if (Y_query_raw is None) != (Y_calib_raw is None):
         raise ValueError("Y_query_raw and Y_calib_raw must be supplied together")
     calib_source = Y_calib if Y_calib_raw is None else Y_calib_raw
     query_source = Y_query if Y_query_raw is None else Y_query_raw
     y_calib_scaled, calib_mean, calib_std = _scale_fold_targets(calib_source.permute(0, 2, 1))
-    y_calib_batch = y_calib_scaled.reshape(B * d, P_C).contiguous()          # (B*d, P_C)
+    y_calib_batch = y_calib_scaled.reshape(B * d, P_C).contiguous()  # (B*d, P_C)
 
-    logits = tabicl_forward(tabicl, X_batch, y_calib_batch)                  # (B*d, P_Q, Q)
+    logits = tabicl_forward(tabicl, X_batch, y_calib_batch)  # (B*d, P_Q, Q)
     # TabICL may return its output on CPU under memory pressure.
     logits = logits.to(device)
     Q = logits.shape[-1]
@@ -585,7 +590,7 @@ def run_pit_calib_split_batched(
 
     y_query = query_source.permute(0, 2, 1)
     y_query_flat = ((y_query - calib_mean) / calib_std).reshape(B * d * P_Q)
-    u_query = dist.cdf(y_query_flat).reshape(B, d, P_Q).permute(0, 2, 1)     # (B, P_Q, d)
+    u_query = dist.cdf(y_query_flat).reshape(B, d, P_Q).permute(0, 2, 1)  # (B, P_Q, d)
     z_train = _probit(u_query, eps)
 
     return {"z_train": z_train}
@@ -631,17 +636,23 @@ def _kernel_fn_from_chain_task(task: dict):
         l = l_t.item() if l_t.numel() == 1 else l_t
         alpha2 = params["alpha2"].item()
         period = _optional_param(params["period"]) if "period" in params else None
-        rq_alpha = (
-            params["rq_alpha"].item() if "rq_alpha" in params and params["rq_alpha"].item() != 0.0 else None
-        )
-        power = (
-            params["power"].item() if "power" in params and params["power"].item() != 0.0 else None
-        )
+        rq_alpha = params["rq_alpha"].item() if "rq_alpha" in params and params["rq_alpha"].item() != 0.0 else None
+        power = params["power"].item() if "power" in params and params["power"].item() != 0.0 else None
         sign_w, sign_b, sign_a = _sign_triple(params, "sign_applied", "sign_w", "sign_b", "sign_a")
-        component_fns.append(build_kernel_fn(
-            name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
-            active_dims=cols, sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
-        ))
+        component_fns.append(
+            build_kernel_fn(
+                name,
+                l,
+                alpha2,
+                period=period,
+                rq_alpha=rq_alpha,
+                power=power,
+                active_dims=cols,
+                sign_w=sign_w,
+                sign_b=sign_b,
+                sign_a=sign_a,
+            )
+        )
 
     def kernel_fn(X1, X2):
         K = component_fns[0](X1, X2)
@@ -661,20 +672,20 @@ def _kernel_fn_from_task(task: dict):
     kernel_name = task["kernel"]
     # Scalar, or a (k,) lengthscale vector for ARD episodes.
     l_tensor = task["l"]
-    l      = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
+    l = l_tensor.item() if l_tensor.numel() == 1 else l_tensor
     alpha2 = task["alpha2"].item()
     nugget = task["nugget"].item()
     # 0.0 means not applicable; period is a vector under periodic+ARD.
-    period   = _optional_param(task["period"])
+    period = _optional_param(task["period"])
     rq_alpha = task["rq_alpha"].item() if task["rq_alpha"].item() != 0.0 else None
     # Polynomial degree (0.0 = not applicable).
-    power    = task["power"].item() if task["power"].item() != 0.0 else None
+    power = task["power"].item() if task["power"].item() != 0.0 else None
     # Second component of a composite ("A+B"/"A*B") kernel; may be ARD vectors.
-    l_b        = _optional_param(task["l_b"])
-    alpha2_b   = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
-    period_b   = _optional_param(task["period_b"])
+    l_b = _optional_param(task["l_b"])
+    alpha2_b = task["alpha2_b"].item() if task["alpha2_b"].item() != 0.0 else None
+    period_b = _optional_param(task["period_b"])
     rq_alpha_b = task["rq_alpha_b"].item() if task["rq_alpha_b"].item() != 0.0 else None
-    power_b    = task["power_b"].item() if task["power_b"].item() != 0.0 else None
+    power_b = task["power_b"].item() if task["power_b"].item() != 0.0 else None
 
     sign_w, sign_b, sign_a = _sign_triple(task, "sign_applied", "sign_w", "sign_b", "sign_a")
     sign_w_b, sign_b_b, sign_a_b = _sign_triple(task, "sign_applied_b", "sign_w_b", "sign_b_b", "sign_a_b")
@@ -685,12 +696,27 @@ def _kernel_fn_from_task(task: dict):
     # active_dims lets kernel_fn select its columns from the full-width inputs.
     cols = task["kernel_feature_indices"].tolist()
     kernel_fn = build_kernel_fn(
-        kernel_name, l, alpha2, period=period, rq_alpha=rq_alpha, power=power,
-        l_b=l_b, alpha2_b=alpha2_b, period_b=period_b, rq_alpha_b=rq_alpha_b, power_b=power_b,
+        kernel_name,
+        l,
+        alpha2,
+        period=period,
+        rq_alpha=rq_alpha,
+        power=power,
+        l_b=l_b,
+        alpha2_b=alpha2_b,
+        period_b=period_b,
+        rq_alpha_b=rq_alpha_b,
+        power_b=power_b,
         active_dims=cols,
-        sign_w=sign_w, sign_b=sign_b, sign_a=sign_a,
-        sign_w_b=sign_w_b, sign_b_b=sign_b_b, sign_a_b=sign_a_b,
-        sign_w_outer=sign_w_outer, sign_b_outer=sign_b_outer, sign_a_outer=sign_a_outer,
+        sign_w=sign_w,
+        sign_b=sign_b,
+        sign_a=sign_a,
+        sign_w_b=sign_w_b,
+        sign_b_b=sign_b_b,
+        sign_a_b=sign_a_b,
+        sign_w_outer=sign_w_outer,
+        sign_b_outer=sign_b_outer,
+        sign_a_outer=sign_a_outer,
     )
     return kernel_fn, nugget
 
@@ -716,46 +742,38 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
-    x_k_train = task.get("x_kernel_train", task["x_norm_train"])   # (P, d_features)
-    x_k_test   = task.get("x_kernel_test", task["x_norm_test"])    # (N, d_features)
-    y_train    = task["y_train"]                  # (P,)
-    y_test     = task["y_test"]                   # (N,)
-    mu_star    = task["mu_star"]                  # (N,) PRIOR mean at the test points
+    x_k_train = task.get("x_kernel_train", task["x_norm_train"])  # (P, d_features)
+    x_k_test = task.get("x_kernel_test", task["x_norm_test"])  # (N, d_features)
+    y_train = task["y_train"]  # (P,)
+    y_test = task["y_test"]  # (N,)
+    mu_star = task["mu_star"]  # (N,) PRIOR mean at the test points
 
     # L_ff / alpha, shared by the test posterior and the train LOO; reuse cached factors when present.
     P = y_train.shape[0]
     if "_L_ff" in task and "_alpha" in task:
-        L     = task["_L_ff"]
+        L = task["_L_ff"]
         alpha = task["_alpha"]
     else:
-        K_ff       = kernel_fn(x_k_train, x_k_train) + nugget * torch.eye(P, device=y_train.device)
-        L          = _safe_cholesky(K_ff)
+        K_ff = kernel_fn(x_k_train, x_k_train) + nugget * torch.eye(P, device=y_train.device)
+        L = _safe_cholesky(K_ff)
         mean_train = _mean_train_from_task(task, x_k_train)
-        alpha      = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L).squeeze(-1)  # (P,)
+        alpha = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L).squeeze(-1)  # (P,)
 
     # Test: exact GP posterior marginals (K_sf noise-free, nugget on K_ss's diagonal).
-    x_ref     = x_k_test.to(L.device)
-    K_sf      = kernel_fn(x_ref, x_k_train.to(L.device))                       # (N, P)
-    K_ss_diag = (
-        kernel_fn(x_ref, x_ref).diagonal() + nugget
-    )                                                                          # (N,)
-    V_sf      = torch.linalg.solve_triangular(L, K_sf.T.to(L.dtype), upper=False)  # (P, N)
-    mu_post   = mu_star.to(L.device) + K_sf @ alpha                            # (N,)
-    var_post  = (K_ss_diag - (V_sf ** 2).sum(dim=0)).clamp(min=max(nugget, 1e-12))
-    sig_clamped  = var_post.sqrt()
-    z_test       = (y_test.to(L.device) - mu_post) / sig_clamped
-    log_pdf_test = (
-        -0.5 * math.log(2.0 * math.pi)
-        - sig_clamped.log()
-        - 0.5 * z_test**2
-    )
+    x_ref = x_k_test.to(L.device)
+    K_sf = kernel_fn(x_ref, x_k_train.to(L.device))  # (N, P)
+    K_ss_diag = kernel_fn(x_ref, x_ref).diagonal() + nugget  # (N,)
+    V_sf = torch.linalg.solve_triangular(L, K_sf.T.to(L.dtype), upper=False)  # (P, N)
+    mu_post = mu_star.to(L.device) + K_sf @ alpha  # (N,)
+    var_post = (K_ss_diag - (V_sf**2).sum(dim=0)).clamp(min=max(nugget, 1e-12))
+    sig_clamped = var_post.sqrt()
+    z_test = (y_test.to(L.device) - mu_post) / sig_clamped
+    log_pdf_test = -0.5 * math.log(2.0 * math.pi) - sig_clamped.log() - 0.5 * z_test**2
 
     # Train: exact GP LOO; diag(K_ff^{-1}) is the column-wise squared norm of L^{-1}.
-    L_inv      = torch.linalg.solve_triangular(
-        L, torch.eye(P, device=L.device, dtype=L.dtype), upper=False
-    )                                                                      # (P, P)
-    K_inv_diag = (L_inv**2).sum(dim=0).clamp(min=1e-12)                   # (P,)
-    z_train    = alpha * K_inv_diag.rsqrt()                               # alpha_i/√[K⁻¹]_ii
+    L_inv = torch.linalg.solve_triangular(L, torch.eye(P, device=L.device, dtype=L.dtype), upper=False)  # (P, P)
+    K_inv_diag = (L_inv**2).sum(dim=0).clamp(min=1e-12)  # (P,)
+    z_train = alpha * K_inv_diag.rsqrt()  # alpha_i/√[K⁻¹]_ii
 
     return {"z_train": z_train, "z_test": z_test, "log_pdf_test": log_pdf_test}
 
@@ -781,7 +799,7 @@ def mvn_nll_parts(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> d
     y64, mean64 = y.double(), mean.double()
     std = Sigma.double().diagonal().clamp(min=1e-12).sqrt()
     z = (y64 - mean64) / std
-    marginal = (0.5 * math.log(2.0 * math.pi) + std.log() + 0.5 * z ** 2).sum().item()
+    marginal = (0.5 * math.log(2.0 * math.pi) + std.log() + 0.5 * z**2).sum().item()
     return {"total": total, "marginal": marginal, "copula": total - marginal}
 
 
@@ -803,29 +821,27 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     kernel_fn, nugget = _kernel_fn_from_task(task)
     # Run on the device of the cached _L_ff/_alpha (x_train's device when absent).
     x_train_raw = task.get("x_kernel_train", task["x_norm_train"])
-    x_test_raw  = task.get("x_kernel_test", task["x_norm_test"])
+    x_test_raw = task.get("x_kernel_test", task["x_norm_test"])
     ref_device = task["_L_ff"].device if "_L_ff" in task else x_train_raw.device
-    x_train = x_train_raw.to(ref_device)   # (P, d), float32
-    x_test  = x_test_raw.to(ref_device)    # (N, d), float32
-    y_train = task["y_train"].to(ref_device)         # (P,)
+    x_train = x_train_raw.to(ref_device)  # (P, d), float32
+    x_test = x_test_raw.to(ref_device)  # (N, d), float32
+    y_train = task["y_train"].to(ref_device)  # (P,)
     P, N = x_train.shape[0], x_test.shape[0]
 
     if "_L_ff" in task and "_alpha" in task:
-        L_ff  = task["_L_ff"].double()
+        L_ff = task["_L_ff"].double()
         alpha = task["_alpha"].double()
     else:
-        K_ff       = kernel_fn(x_train, x_train) + nugget * torch.eye(P, device=x_train.device)
-        L_ff       = _safe_cholesky(K_ff).double()
+        K_ff = kernel_fn(x_train, x_train) + nugget * torch.eye(P, device=x_train.device)
+        L_ff = _safe_cholesky(K_ff).double()
         mean_train = _mean_train_from_task(task, x_train)
-        alpha      = torch.cholesky_solve(
-            (y_train - mean_train).double().unsqueeze(-1), L_ff
-        ).squeeze(-1)
+        alpha = torch.cholesky_solve((y_train - mean_train).double().unsqueeze(-1), L_ff).squeeze(-1)
 
     # K_sf has no noise term; K_ss has the nugget on its diagonal.
-    K_sf = kernel_fn(x_test, x_train).double()                                              # (N, P)
+    K_sf = kernel_fn(x_test, x_train).double()  # (N, P)
     K_ss = (kernel_fn(x_test, x_test) + nugget * torch.eye(N, device=x_test.device)).double()  # (N, N)
 
-    V = torch.linalg.solve_triangular(L_ff, K_sf.T, upper=False)   # (P, N)
+    V = torch.linalg.solve_triangular(L_ff, K_sf.T, upper=False)  # (P, N)
     Sigma_post = K_ss - V.T @ V
     Sigma_post = 0.5 * (Sigma_post + Sigma_post.T)
 
@@ -851,21 +867,21 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
 
     K_ss_sym = 0.5 * (K_ss + K_ss.T)
     prior_parts = mvn_nll_parts(y_test, mean_test, K_ss_sym)
-    post_parts  = mvn_nll_parts(y_test, mu_post, Sigma_post)
+    post_parts = mvn_nll_parts(y_test, mu_post, Sigma_post)
 
     return {
-        "mu_post":    mu_post.float(),
+        "mu_post": mu_post.float(),
         "Sigma_post": Sigma_post.float(),
-        "R_post":     R_post,
-        "min_eig":    min_eig,
-        "repaired":   repaired,
-        "nll_prior":  prior_parts["total"],
-        "nll_post":   post_parts["total"],
+        "R_post": R_post,
+        "min_eig": min_eig,
+        "repaired": repaired,
+        "nll_prior": prior_parts["total"],
+        "nll_post": post_parts["total"],
         # Marginal/copula split of both totals.
         "nll_prior_marginal": prior_parts["marginal"],
-        "nll_prior_copula":   prior_parts["copula"],
-        "nll_post_marginal":  post_parts["marginal"],
-        "nll_post_copula":    post_parts["copula"],
+        "nll_prior_copula": prior_parts["copula"],
+        "nll_post_marginal": post_parts["marginal"],
+        "nll_post_copula": post_parts["copula"],
     }
 
 

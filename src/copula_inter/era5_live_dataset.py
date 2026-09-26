@@ -85,9 +85,16 @@ def _resolve_marginal(cfg) -> Tuple[Optional[str], int]:
 
 
 def _backend_pit_batched(
-    x_train: torch.Tensor, y_train_scaled: torch.Tensor, x_test: torch.Tensor,
-    y_test_scaled: torch.Tensor, *, backend: str, regressor, k_folds: int,
-    probs_n: int, seed: int,
+    x_train: torch.Tensor,
+    y_train_scaled: torch.Tensor,
+    x_test: torch.Tensor,
+    y_test_scaled: torch.Tensor,
+    *,
+    backend: str,
+    regressor,
+    k_folds: int,
+    probs_n: int,
+    seed: int,
 ) -> dict:
     """Batched PIT of a group of ERA5 episodes through a non-TabICL backend; returns tensors on x_train's device."""
     from copula_inter.data_gen import _BATCHED_MARGINAL_BACKENDS
@@ -95,18 +102,30 @@ def _backend_pit_batched(
     run_batched = _BATCHED_MARGINAL_BACKENDS[backend]()
     out = run_batched(
         regressor,
-        x_train.detach().cpu().numpy(), y_train_scaled.detach().cpu().numpy(),
-        x_test.detach().cpu().numpy(), y_test_scaled.detach().cpu().numpy(),
-        k_folds=k_folds, probs_n=probs_n, seed=seed,
+        x_train.detach().cpu().numpy(),
+        y_train_scaled.detach().cpu().numpy(),
+        x_test.detach().cpu().numpy(),
+        y_test_scaled.detach().cpu().numpy(),
+        k_folds=k_folds,
+        probs_n=probs_n,
+        seed=seed,
     )
     dev = x_train.device
     return {k: torch.as_tensor(v, dtype=torch.float32, device=dev) for k, v in out.items()}
 
 
 def _pit_episode(
-    x_train: torch.Tensor, y_train: torch.Tensor, x_test: torch.Tensor, y_test: torch.Tensor,
-    tabicl_model, k_folds: int, *, marginal_backend: Optional[str] = None,
-    marginal_regressor=None, marginal_probs_n: int = 99, seed: int = 0,
+    x_train: torch.Tensor,
+    y_train: torch.Tensor,
+    x_test: torch.Tensor,
+    y_test: torch.Tensor,
+    tabicl_model,
+    k_folds: int,
+    *,
+    marginal_backend: Optional[str] = None,
+    marginal_regressor=None,
+    marginal_probs_n: int = 99,
+    seed: int = 0,
 ) -> Optional[dict]:
     """PIT of one ERA5 episode (z_train, z_test, log_pdf_test in raw nats), or None with too little context."""
     if x_train.shape[0] < 2 or x_test.shape[0] < 1:
@@ -115,10 +134,15 @@ def _pit_episode(
     if marginal_backend is not None:
         # One episode through the batched path with a leading singleton axis.
         out = _backend_pit_batched(
-            x_train.unsqueeze(0), y_train_scaled.unsqueeze(0),
-            x_test.unsqueeze(0), y_test_scaled.unsqueeze(0),
-            backend=marginal_backend, regressor=marginal_regressor,
-            k_folds=k_folds, probs_n=marginal_probs_n, seed=seed,
+            x_train.unsqueeze(0),
+            y_train_scaled.unsqueeze(0),
+            x_test.unsqueeze(0),
+            y_test_scaled.unsqueeze(0),
+            backend=marginal_backend,
+            regressor=marginal_regressor,
+            k_folds=k_folds,
+            probs_n=marginal_probs_n,
+            seed=seed,
         )
         return {
             "z_train": out["z_train"][0],
@@ -128,7 +152,12 @@ def _pit_episode(
     Y_train = y_train_scaled.unsqueeze(-1)
     Y_test = y_test_scaled.unsqueeze(-1)
     pit_out = run_pit(
-        tabicl_model, x_train, Y_train, x_test, Y_test, k_folds=k_folds,
+        tabicl_model,
+        x_train,
+        Y_train,
+        x_test,
+        Y_test,
+        k_folds=k_folds,
         Y_train_raw=y_train.unsqueeze(-1),
     )
     return {
@@ -140,9 +169,17 @@ def _pit_episode(
 
 
 def _pit_group(
-    x_train: torch.Tensor, y_train: torch.Tensor, x_test: torch.Tensor, y_test: torch.Tensor,
-    tabicl_model, k_folds: int, *, marginal_backend: Optional[str] = None,
-    marginal_regressor=None, marginal_probs_n: int = 99, seed: int = 0,
+    x_train: torch.Tensor,
+    y_train: torch.Tensor,
+    x_test: torch.Tensor,
+    y_test: torch.Tensor,
+    tabicl_model,
+    k_folds: int,
+    *,
+    marginal_backend: Optional[str] = None,
+    marginal_regressor=None,
+    marginal_probs_n: int = 99,
+    seed: int = 0,
 ) -> Optional[dict]:
     """Batched PIT of B episodes that share P and N, each normalized by its own training targets.
 
@@ -162,9 +199,15 @@ def _pit_group(
     y_test_scaled = (y_test - mean) / std
     if marginal_backend is not None:
         out = _backend_pit_batched(
-            x_train, y_train_scaled, x_test, y_test_scaled,
-            backend=marginal_backend, regressor=marginal_regressor,
-            k_folds=k_folds, probs_n=marginal_probs_n, seed=seed,
+            x_train,
+            y_train_scaled,
+            x_test,
+            y_test_scaled,
+            backend=marginal_backend,
+            regressor=marginal_regressor,
+            k_folds=k_folds,
+            probs_n=marginal_probs_n,
+            seed=seed,
         )
         return {
             "z_train": out["z_train"],
@@ -174,7 +217,12 @@ def _pit_group(
     Y_train = y_train_scaled.unsqueeze(-1)
     Y_test = y_test_scaled.unsqueeze(-1)
     pit_out = run_pit_batched(
-        tabicl_model, x_train, Y_train, x_test, Y_test, k_folds=k_folds,
+        tabicl_model,
+        x_train,
+        Y_train,
+        x_test,
+        Y_test,
+        k_folds=k_folds,
         Y_train_raw=y_train.unsqueeze(-1),
     )
     return {
@@ -239,8 +287,10 @@ class LiveERA5Dataset(IterableDataset):
         else:
             from eval.spatial.marginal_backends import make_regressor
 
-            print(f"[era5_live_dataset] worker {worker_id}: building {self.marginal_backend} marginal "
-                  f"on {self.tabicl_device}")
+            print(
+                f"[era5_live_dataset] worker {worker_id}: building {self.marginal_backend} marginal "
+                f"on {self.tabicl_device}"
+            )
             marginal_regressor = make_regressor(self.marginal_backend, device=self.tabicl_device)
 
         call_idx = 0
@@ -279,7 +329,12 @@ class LiveERA5Dataset(IterableDataset):
                 np.stack([e["y_test"] for e in raw_eps]), dtype=torch.float32, device=self.tabicl_device
             )
             pit = _pit_group(
-                x_train, y_train, x_test, y_test, tabicl_model, self.k_folds,
+                x_train,
+                y_train,
+                x_test,
+                y_test,
+                tabicl_model,
+                self.k_folds,
                 marginal_backend=self.marginal_backend,
                 marginal_regressor=marginal_regressor,
                 marginal_probs_n=self.marginal_probs_n,
@@ -418,7 +473,9 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
             while len(episodes) < batch_size and attempts < batch_size * 20:
                 attempts += 1
                 ep = corpus.sample_episode(
-                    rng, ecfg["grid_size_range"], ecfg["box_deg_range"],
+                    rng,
+                    ecfg["grid_size_range"],
+                    ecfg["box_deg_range"],
                     ecfg["n_context_frac_range"],
                 )
                 if ep is None:
@@ -428,7 +485,12 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
                 y_train = torch.as_tensor(ep["y_train"], dtype=torch.float32, device=device)
                 y_test = torch.as_tensor(ep["y_test"], dtype=torch.float32, device=device)
                 pit = _pit_episode(
-                    x_train, y_train, x_test, y_test, tabicl_model, k_folds,
+                    x_train,
+                    y_train,
+                    x_test,
+                    y_test,
+                    tabicl_model,
+                    k_folds,
                     marginal_backend=marginal_backend,
                     marginal_regressor=marginal_regressor,
                     marginal_probs_n=marginal_probs_n,
@@ -436,12 +498,17 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
                 )
                 if pit is None:
                     continue
-                episodes.append({
-                    "x_norm_train": x_train.cpu(), "x_norm_test": x_test.cpu(),
-                    "y_train": y_train.cpu(), "y_test": y_test.cpu(),
-                    "z_train": pit["z_train"].cpu(), "z_test": pit["z_test"].cpu(),
-                    "log_pdf_test": pit["log_pdf_test"].cpu(),
-                })
+                episodes.append(
+                    {
+                        "x_norm_train": x_train.cpu(),
+                        "x_norm_test": x_test.cpu(),
+                        "y_train": y_train.cpu(),
+                        "y_test": y_test.cpu(),
+                        "z_train": pit["z_train"].cpu(),
+                        "z_test": pit["z_test"].cpu(),
+                        "log_pdf_test": pit["log_pdf_test"].cpu(),
+                    }
+                )
             if episodes:
                 batches.append(era5_collate_fn(episodes))
     del tabicl_model

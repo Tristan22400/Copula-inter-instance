@@ -51,9 +51,7 @@ def _load_finetuned_weights(name: str, regressor, ckpt: str, device: "str | None
     payload = torch.load(ckpt, map_location=device or "cpu", weights_only=False)
     written_for = payload.get("backbone")
     if written_for not in (None, name):
-        raise ValueError(
-            f"marginal checkpoint {ckpt} was written for backbone {written_for!r}, not {name!r}."
-        )
+        raise ValueError(f"marginal checkpoint {ckpt} was written for backbone {written_for!r}, not {name!r}.")
     _trainable_module(name, regressor).load_state_dict(payload["state_dict"], strict=True)
 
 
@@ -81,16 +79,12 @@ def _make_pretrained_regressor(name: str, device: "str | None" = None):
             and torch.cuda.get_device_capability(device)[0] >= 8
         )
         # ensemble_count=1 (members are pooled into one bank anyway).
-        reg = EXAONETabularRegressor.from_pretrained(
-            device="cuda" if use_cuda else "cpu", ensemble_count=1
-        )
+        reg = EXAONETabularRegressor.from_pretrained(device="cuda" if use_cuda else "cpu", ensemble_count=1)
         # Uniform member weighting (contexts are far below the NNLS threshold).
         if getattr(getattr(reg, "manifest", None), "regression", None) is not None:
             reg.manifest = dataclasses.replace(
                 reg.manifest,
-                regression=dataclasses.replace(
-                    reg.manifest.regression, member_weighting="uniform"
-                ),
+                regression=dataclasses.replace(reg.manifest.regression, member_weighting="uniform"),
             )
         return reg
     if name == "tabldm":
@@ -124,8 +118,14 @@ def _require_tabpfn_token() -> None:
 
 # quantiles(): (X_context, y_context, X_query, probs) -> (n_query, Q) in raw y units.
 def quantiles(
-    name: str, regressor, X_context: np.ndarray, y_context: np.ndarray,
-    X_query: np.ndarray, probs: np.ndarray, *, seed: int = 0,
+    name: str,
+    regressor,
+    X_context: np.ndarray,
+    y_context: np.ndarray,
+    X_query: np.ndarray,
+    probs: np.ndarray,
+    *,
+    seed: int = 0,
 ) -> np.ndarray:
     if name == "tabicl":
         from eval.tabicl_utils import tabicl_quantiles
@@ -150,12 +150,17 @@ def _exaone_capture_quantile_bank(regressor):
     valid with NNLS member weighting.
     """
     import torch
+
     original = regressor.__dict__.get("_collapse_members")
     had_override = "_collapse_members" in regressor.__dict__
 
     def _passthrough(self, output, query_count):
         expected = (self.manifest.runtime.ensemble_count, query_count, self.manifest.output_width)
-        if not isinstance(output, torch.Tensor) or tuple(output.shape) != expected or not bool(torch.isfinite(output).all()):
+        if (
+            not isinstance(output, torch.Tensor)
+            or tuple(output.shape) != expected
+            or not bool(torch.isfinite(output).all())
+        ):
             raise RuntimeError("model returned invalid regression quantiles")
         return torch.sort(output.float(), dim=-1).values
 
@@ -170,17 +175,20 @@ def _exaone_capture_quantile_bank(regressor):
 
 
 def _exaone_quantiles(
-    regressor, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray,
-    probs: np.ndarray, *, seed: int,
+    regressor,
+    X_context: np.ndarray,
+    y_context: np.ndarray,
+    X_query: np.ndarray,
+    probs: np.ndarray,
+    *,
+    seed: int,
 ) -> np.ndarray:
     """EXAONE's native 999-level quantile grid, linearly interpolated onto probs (seed unused)."""
     if getattr(getattr(regressor, "manifest", None), "regression", None) is not None:
         if regressor.manifest.regression.member_weighting != "uniform":
             regressor.manifest = dataclasses.replace(
                 regressor.manifest,
-                regression=dataclasses.replace(
-                    regressor.manifest.regression, member_weighting="uniform"
-                ),
+                regression=dataclasses.replace(regressor.manifest.regression, member_weighting="uniform"),
             )
     regressor.fit(X_context, y_context)
     if regressor._fitted_state.get("member_weights") is not None:
@@ -200,8 +208,13 @@ def _exaone_quantiles(
 
 
 def _tabldm_quantiles(
-    regressor, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray,
-    probs: np.ndarray, *, seed: int,
+    regressor,
+    X_context: np.ndarray,
+    y_context: np.ndarray,
+    X_query: np.ndarray,
+    probs: np.ndarray,
+    *,
+    seed: int,
 ) -> np.ndarray:
     """TabLDM quantiles at probs via predict(output_type="quantiles") (seed unused)."""
     regressor.fit(X_context, y_context)
@@ -211,12 +224,23 @@ def _tabldm_quantiles(
 
 # Generic K-fold PIT through quantiles().
 def loo_pit(
-    name: str, regressor, X_train: np.ndarray, y_train: np.ndarray, probs: np.ndarray,
-    k_folds: int = 10, eps: float = 1e-6, seed: int = 0,
+    name: str,
+    regressor,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    probs: np.ndarray,
+    k_folds: int = 10,
+    eps: float = 1e-6,
+    seed: int = 0,
 ) -> np.ndarray:
     from eval.metrics.joint_nll import kfold_loo_pit
 
     return kfold_loo_pit(
         lambda Xc, yc, Xq, k: quantiles(name, regressor, Xc, yc, Xq, probs, seed=seed * 1000 + k),
-        X_train, y_train, probs, k_folds=k_folds, eps=eps, seed=seed,
+        X_train,
+        y_train,
+        probs,
+        k_folds=k_folds,
+        eps=eps,
+        seed=seed,
     )

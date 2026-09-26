@@ -144,7 +144,13 @@ def loo_pit(
     y_t = y_train_scaled.unsqueeze(-1)  # (P, 1)
 
     out = run_pit(
-        tabicl, X_t, y_t, X_t[:1], y_t[:1], k_folds=k_folds, eps=eps,
+        tabicl,
+        X_t,
+        y_t,
+        X_t[:1],
+        y_t[:1],
+        k_folds=k_folds,
+        eps=eps,
         Y_train_raw=y_train_raw_t.unsqueeze(-1),
     )
     return out["z_train"].squeeze(-1).cpu().numpy()
@@ -163,8 +169,7 @@ def _resolve_copula_checkpoint(ckpt_path: str) -> str:
             candidates.append((int(match.group(1)), name.endswith("_final.pt"), path))
     if not candidates:
         raise FileNotFoundError(
-            f"No checkpoint files named step_<number>.pt or step_<number>_final.pt "
-            f"found in directory '{ckpt_path}'."
+            f"No checkpoint files named step_<number>.pt or step_<number>_final.pt found in directory '{ckpt_path}'."
         )
 
     _, _, resolved = max(candidates)
@@ -193,9 +198,7 @@ def load_copula_model(
     cfg = ckpt.get("cfg")
     if cfg is None:
         if config_path is None:
-            raise ValueError(
-                f"Checkpoint '{ckpt_path}' has no saved 'cfg' and no config_path was given."
-            )
+            raise ValueError(f"Checkpoint '{ckpt_path}' has no saved 'cfg' and no config_path was given.")
         cfg = OmegaConf.load(config_path)
     elif isinstance(cfg, dict):
         cfg = OmegaConf.create(cfg)

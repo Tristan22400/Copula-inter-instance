@@ -37,23 +37,23 @@ def _sigma_stats(Sigma: torch.Tensor, mask: torch.Tensor) -> dict:
     B, N, _ = Sigma.shape
     ri, ci = torch.triu_indices(N, N, offset=1, device=Sigma.device)
     mask_2d = mask.unsqueeze(-1) & mask.unsqueeze(-2)  # (B, N, N)
-    valid_off = mask_2d[:, ri, ci]                     # (B, n_pairs)
-    off_vals = Sigma[:, ri, ci][valid_off]             # flat valid off-diagonal entries
-    diag_vals = Sigma.diagonal(dim1=-2, dim2=-1)[mask] # flat valid diagonal entries
+    valid_off = mask_2d[:, ri, ci]  # (B, n_pairs)
+    off_vals = Sigma[:, ri, ci][valid_off]  # flat valid off-diagonal entries
+    diag_vals = Sigma.diagonal(dim1=-2, dim2=-1)[mask]  # flat valid diagonal entries
     if off_vals.numel() == 0:
         return {"offdiag_mean": 0.0, "offdiag_std": 0.0, "diag_mean": 1.0}
     return {
         "offdiag_mean": off_vals.mean().item(),
-        "offdiag_std":  off_vals.std().item(),
-        "diag_mean":    diag_vals.mean().item(),
+        "offdiag_std": off_vals.std().item(),
+        "diag_mean": diag_vals.mean().item(),
     }
 
 
 def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
     """MSE, MAE, Pearson r and signed bias of predicted vs oracle off-diagonal correlations (1-D arrays)."""
     diff = off_pred - off_ora
-    mse  = float(np.mean(diff ** 2))
-    mae  = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(diff**2))
+    mae = float(np.mean(np.abs(diff)))
     bias = float(np.mean(diff))
     std_p, std_o = off_pred.std(), off_ora.std()
     pearson = float(np.corrcoef(off_pred, off_ora)[0, 1]) if (std_p > 1e-12 and std_o > 1e-12) else 0.0
@@ -93,17 +93,19 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
         family_seed = _name_seed(base_seed, family)
         synth_cfg = OmegaConf.merge(
             cfg,
-            OmegaConf.create({
-                "seed": family_seed,
-                "data": {
-                    "kernel": family,
-                    "systematic_composition": False,
-                    "P_min": probe_P_min,
-                    "P_max": probe_P_max,
-                    "N_min": probe_N_min,
-                    "N_max": probe_N_max,
-                },
-            }),
+            OmegaConf.create(
+                {
+                    "seed": family_seed,
+                    "data": {
+                        "kernel": family,
+                        "systematic_composition": False,
+                        "P_min": probe_P_min,
+                        "P_max": probe_P_max,
+                        "N_min": probe_N_min,
+                        "N_max": probe_N_max,
+                    },
+                }
+            ),
         )
         episodes = generate_gp_batch(synth_cfg, n_episodes, device=device, return_kernel_metadata=True)
         batch = collate_fn(episodes)
@@ -132,7 +134,10 @@ def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
 
 @torch.no_grad()
 def _tabicl_pit_batch(
-    batch: dict, tabicl_marginal: nn.Module, k_folds: int, device: str,
+    batch: dict,
+    tabicl_marginal: nn.Module,
+    k_folds: int,
+    device: str,
 ) -> dict[str, torch.Tensor]:
     """TabICL K-fold PIT (pit.run_pit) of each episode in a collated batch.
 
@@ -165,7 +170,12 @@ def _tabicl_pit_batch(
         Y_b = y_b_scaled.unsqueeze(-1)
         Y_te = y_te_scaled.unsqueeze(-1)
         pit_out = run_pit(
-            tabicl_marginal, X_b, Y_b, X_te, Y_te, k_folds=k_folds,
+            tabicl_marginal,
+            X_b,
+            Y_b,
+            X_te,
+            Y_te,
+            k_folds=k_folds,
             Y_train_raw=y_train[b, :n].unsqueeze(-1),
         )
         z_tabicl[b, :n] = pit_out["z_train"].squeeze(-1)
@@ -180,7 +190,10 @@ def _tabicl_pit_batch(
 
 @torch.no_grad()
 def _build_tabicl_val_z(
-    val_loader, tabicl_marginal: nn.Module, k_folds: int, device: str,
+    val_loader,
+    tabicl_marginal: nn.Module,
+    k_folds: int,
+    device: str,
 ) -> dict[int, dict[str, torch.Tensor]]:
     """TabICL PIT of every val_loader episode, computed once before training.
 
@@ -198,7 +211,9 @@ def _build_tabicl_val_z(
 
 @torch.no_grad()
 def _build_analytic_val_z(
-    val_loader, val_episodes_meta: dict[int, list[dict]], device: str,
+    val_loader,
+    val_episodes_meta: dict[int, list[dict]],
+    device: str,
 ) -> dict[int, dict[str, torch.Tensor]]:
     """Exact GP PIT (pit.gp_analytical_pit) of every val episode, computed once.
 
@@ -239,7 +254,10 @@ def _build_analytic_val_z(
 
 @torch.no_grad()
 def _build_tabicl_kernel_fit_z(
-    synth_kernel_batches: dict, tabicl_marginal: nn.Module, k_folds: int, device: str,
+    synth_kernel_batches: dict,
+    tabicl_marginal: nn.Module,
+    k_folds: int,
+    device: str,
 ) -> dict[str, dict[str, torch.Tensor]]:
     """TabICL PIT of each kernel_fit/<family> probe set, computed once.
 

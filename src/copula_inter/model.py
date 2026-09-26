@@ -69,8 +69,8 @@ def low_rank_correlation(
     eye = torch.eye(N, device=W.device, dtype=W.dtype).expand(B, N, N)
 
     if parametrization == "covnorm":
-        D = F.softplus(s)                                   # (B, N) > 0
-        S = torch.matmul(W, W.transpose(-1, -2))            # (B, N, N)
+        D = F.softplus(s)  # (B, N) > 0
+        S = torch.matmul(W, W.transpose(-1, -2))  # (B, N, N)
         S = S + torch.diag_embed(D)
         diag = S.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
         inv_sqrt = diag.rsqrt()
@@ -188,20 +188,20 @@ class CopulaTabICL(nn.Module):
         parametrization is "tanhnorm", plus lam: (1,) for "sparse_covnorm", plus
         moe_aux_loss when the backbone emits one.
         """
-        x_train = batch["x_train"]            # (B, P_max, d_x)
-        x_test = batch["x_test"]              # (B, N_max, d_x)
-        z_train = batch["z_train"]            # (B, P_max) — Z-space context labels
+        x_train = batch["x_train"]  # (B, P_max, d_x)
+        x_test = batch["x_test"]  # (B, N_max, d_x)
+        z_train = batch["z_train"]  # (B, P_max) — Z-space context labels
 
-        X = torch.cat([x_train, x_test], dim=1)            # (B, T, d_x)
-        features = self.feature_extractor(X, z_train)      # (B, N_max, feature_dim)
+        X = torch.cat([x_train, x_test], dim=1)  # (B, T, d_x)
+        features = self.feature_extractor(X, z_train)  # (B, N_max, feature_dim)
         # Cast backbone features to the head's dtype (TabICL may return float16).
         features = features.to(dtype=self.copula_head.weight.dtype)
-        head_out = self.copula_head(features)              # (B, N_max, head_out_dim)
-        W = head_out[..., : self.rank]                      # (B, N_max, r)
+        head_out = self.copula_head(features)  # (B, N_max, head_out_dim)
+        W = head_out[..., : self.rank]  # (B, N_max, r)
 
         out = {"W": W}
         if self.correlation_parametrization not in _NO_SCALAR_COLUMN:
-            out["s"] = head_out[..., self.rank]              # (B, N_max)
+            out["s"] = head_out[..., self.rank]  # (B, N_max)
         if self.correlation_parametrization == "sparse_covnorm":
             out["lam"] = self.sparse_lambda_raw
 
@@ -222,8 +222,7 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
     backbone_name = str(cfg.model.get("backbone", "tabicl"))
     if backbone_name not in copula_backbones.BACKBONE_NAMES:
         raise ValueError(
-            f"Unknown cfg.model.backbone={backbone_name!r}; expected one of "
-            f"{list(copula_backbones.BACKBONE_NAMES)}."
+            f"Unknown cfg.model.backbone={backbone_name!r}; expected one of {list(copula_backbones.BACKBONE_NAMES)}."
         )
     base = copula_backbones.load_raw_backbone(backbone_name, cfg)
 
@@ -237,6 +236,7 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
     lora_cfg = cfg.get("lora", {})
     if bool(lora_cfg.get("enabled", False)):
         from copula_inter.lora import apply_lora  # type: ignore[import]
+
         n = apply_lora(
             backbone=model.feature_extractor,
             rank=int(lora_cfg.get("rank", 8)),
@@ -244,9 +244,11 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
             target=str(lora_cfg.get("target", "qkvo")),
             stages=list(lora_cfg.get("stages", ["icl", "row", "col"])),
         )
-        print(f"LoRA applied: {n} MultiheadAttention modules replaced "
-              f"(rank={lora_cfg.get('rank', 8)}, alpha={lora_cfg.get('alpha', 16.0)}, "
-              f"target={lora_cfg.get('target', 'qkvo')}, stages={list(lora_cfg.get('stages', ['icl', 'row', 'col']))})")
+        print(
+            f"LoRA applied: {n} MultiheadAttention modules replaced "
+            f"(rank={lora_cfg.get('rank', 8)}, alpha={lora_cfg.get('alpha', 16.0)}, "
+            f"target={lora_cfg.get('target', 'qkvo')}, stages={list(lora_cfg.get('stages', ['icl', 'row', 'col']))})"
+        )
         # copula_head is always trainable; backbone LoRA params set by apply_lora
         return model
 

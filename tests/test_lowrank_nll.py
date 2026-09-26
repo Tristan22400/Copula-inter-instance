@@ -1,6 +1,5 @@
 """Low-rank (Matrix Determinant Lemma + Woodbury) y_space_nll vs the dense path: same Sigma, values and gradients."""
 
-
 import pytest
 import torch
 
@@ -44,9 +43,7 @@ def test_factor_dense_matches_low_rank_correlation(param):
     dense = low_rank_correlation(W, s, jitter=1e-4, parametrization=param, lam=lam)
     factor = low_rank_correlation_factor(W, s, jitter=1e-4, parametrization=param, lam=lam)
     torch.testing.assert_close(factor.dense(), dense, rtol=1e-10, atol=1e-10)
-    torch.testing.assert_close(
-        factor.dense().diagonal(dim1=-2, dim2=-1), torch.ones_like(s), rtol=0, atol=1e-12
-    )
+    torch.testing.assert_close(factor.dense().diagonal(dim1=-2, dim2=-1), torch.ones_like(s), rtol=0, atol=1e-12)
 
 
 @pytest.mark.parametrize("param", PARAMS)

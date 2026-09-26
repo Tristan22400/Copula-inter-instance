@@ -12,9 +12,7 @@ BACKENDS = ["tabldm", "exaone"]
 
 
 def _load(name):
-    pytest.importorskip(
-        {"tabldm": "tabldm", "exaone": "exaonetabular"}[name], reason=f"{name} not installed"
-    )
+    pytest.importorskip({"tabldm": "tabldm", "exaone": "exaonetabular"}[name], reason=f"{name} not installed")
     from copula_inter.marginal_backbones import load_backbone
 
     return load_backbone(name, device="cpu")
@@ -84,14 +82,15 @@ def test_only_adapters_train_and_gradients_reach_them(name):
     q.pow(2).mean().backward()
 
     def _live(suffix):
-        return [n for n, p in bb.module.named_parameters()
-                if n.endswith(suffix) and p.grad is not None and p.grad.abs().sum() > 0]
+        return [
+            n
+            for n, p in bb.module.named_parameters()
+            if n.endswith(suffix) and p.grad is not None and p.grad.abs().sum() > 0
+        ]
 
     # At init B == 0, so only the B factors get gradients.
     n_b = sum(1 for n, _ in bb.module.named_parameters() if n.endswith(".B"))
-    assert len(_live(".B")) > 0.9 * n_b, (
-        f"{name}: only {len(_live('.B'))}/{n_b} B factors received gradient"
-    )
+    assert len(_live(".B")) > 0.9 * n_b, f"{name}: only {len(_live('.B'))}/{n_b} B factors received gradient"
     assert not _live(".A"), "A should have zero gradient while B is still zero"
 
     # After one step A gets gradients too.
@@ -100,9 +99,7 @@ def test_only_adapters_train_and_gradients_reach_them(name):
     bb.module.zero_grad(set_to_none=True)
     q2 = bb.quantile_forward([X[:12]], [y[:12]], [X[12:]], probs)
     q2.pow(2).mean().backward()
-    assert len(_live(".A")) > 0.5 * n_b, (
-        f"{name}: A factors still dead after a step ({len(_live('.A'))}/{n_b})"
-    )
+    assert len(_live(".A")) > 0.5 * n_b, f"{name}: A factors still dead after a step ({len(_live('.A'))}/{n_b})"
 
 
 @pytest.mark.parametrize("name", BACKENDS)
@@ -133,6 +130,5 @@ def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name, tmp_path
 
     fresh = load_backbone(name, device="cpu")
     base = fresh.module.state_dict()
-    moved = [k for k in stock_keys
-             if base[k].dim() == 2 and not torch.allclose(base[k].float(), sd[k].float())]
+    moved = [k for k in stock_keys if base[k].dim() == 2 and not torch.allclose(base[k].float(), sd[k].float())]
     assert moved, "no adapted weight changed; the delta was not merged in"

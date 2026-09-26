@@ -168,12 +168,8 @@ def test_feature_normalisation_over_all_instances(small_cfg):
         x_all = torch.cat([task["x_norm_train"], task["x_norm_test"]], dim=0)
         for f in range(x_all.shape[1]):
             col = x_all[:, f]
-            assert abs(col.mean().item()) < 0.2, (
-                f"Feature {f} mean {col.mean():.3f} not near zero"
-            )
-            assert abs(col.std().item() - 1.0) < 0.2, (
-                f"Feature {f} std {col.std():.3f} not near 1"
-            )
+            assert abs(col.mean().item()) < 0.2, f"Feature {f} mean {col.mean():.3f} not near zero"
+            assert abs(col.std().item() - 1.0) < 0.2, f"Feature {f} std {col.std():.3f} not near 1"
 
 
 def test_r_star_is_valid_correlation_matrix(small_cfg):
@@ -185,15 +181,11 @@ def test_r_star_is_valid_correlation_matrix(small_cfg):
         N = task["n_test"].item()
 
         # Unit diagonal
-        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4), (
-            f"R_star diagonal not 1: {R.diagonal()}"
-        )
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4), f"R_star diagonal not 1: {R.diagonal()}"
 
         # PSD
         eigvals = torch.linalg.eigvalsh(R)
-        assert (eigvals >= -1e-4).all(), (
-            f"R_star has negative eigenvalue: {eigvals.min():.6f}"
-        )
+        assert (eigvals >= -1e-4).all(), f"R_star has negative eigenvalue: {eigvals.min():.6f}"
 
         # Symmetry
         assert torch.allclose(R, R.T, atol=1e-5)
@@ -218,8 +210,8 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.d_features = 6
-    cfg.data.inactive_frac_min = 1 / 3     # (6-4)/6 -> k up to 4
-    cfg.data.inactive_frac_max = 5 / 6     # (6-1)/6 -> k down to 1
+    cfg.data.inactive_frac_min = 1 / 3  # (6-4)/6 -> k up to 4
+    cfg.data.inactive_frac_max = 5 / 6  # (6-1)/6 -> k down to 1
 
     torch.manual_seed(abs(hash(kernel_name)) % (2**31))
     off_diag_abs = []
@@ -228,26 +220,18 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name):
         R = task["R_star"]
         N = R.shape[0]
 
-        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4), (
-            f"{kernel_name}: diagonal not 1: {R.diagonal()}"
-        )
+        assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4), f"{kernel_name}: diagonal not 1: {R.diagonal()}"
         assert torch.allclose(R, R.T, atol=1e-5), f"{kernel_name}: not symmetric"
         eigvals = torch.linalg.eigvalsh(R)
-        assert (eigvals >= -1e-4).all(), (
-            f"{kernel_name}: not PSD (min eig={eigvals.min():.6f})"
-        )
+        assert (eigvals >= -1e-4).all(), f"{kernel_name}: not PSD (min eig={eigvals.min():.6f})"
         assert R.abs().max() <= 1.0 + 1e-5, f"{kernel_name}: value outside [-1, 1]"
 
         mask = ~torch.eye(N, dtype=torch.bool)
         off_diag_abs.append(R[mask].abs())
 
     mean_abs_r = torch.cat(off_diag_abs).mean().item()
-    assert mean_abs_r > _COLLAPSE_THRESHOLD, (
-        f"{kernel_name}: screening effect, mean|r*_offdiag|={mean_abs_r:.4f}"
-    )
-    assert mean_abs_r < _DEGENERATE_THRESHOLD, (
-        f"{kernel_name}: degenerate/trivial, mean|r*_offdiag|={mean_abs_r:.4f}"
-    )
+    assert mean_abs_r > _COLLAPSE_THRESHOLD, f"{kernel_name}: screening effect, mean|r*_offdiag|={mean_abs_r:.4f}"
+    assert mean_abs_r < _DEGENERATE_THRESHOLD, f"{kernel_name}: degenerate/trivial, mean|r*_offdiag|={mean_abs_r:.4f}"
 
 
 @pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
@@ -340,9 +324,7 @@ def test_systematic_composition_goldilocks_and_psd(small_cfg):
         )
         assert torch.allclose(R, R.T, atol=1e-5), f"{task['kernel']}: not symmetric"
         eigvals = torch.linalg.eigvalsh(R)
-        assert (eigvals >= -1e-4).all(), (
-            f"{task['kernel']}: not PSD (min eig={eigvals.min():.6f})"
-        )
+        assert (eigvals >= -1e-4).all(), f"{task['kernel']}: not PSD (min eig={eigvals.min():.6f})"
         assert R.abs().max() <= 1.0 + 1e-5, f"{task['kernel']}: value outside [-1, 1]"
 
         mask = ~torch.eye(N, dtype=torch.bool)
@@ -365,7 +347,7 @@ def test_ard_samples_per_dimension_lengthscale(small_cfg, kernel_name):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.d_features = 6
-    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_min = 0.5  # (6-3)/6 -> fixed k=3
     cfg.data.inactive_frac_max = 0.5
     cfg.data.ard = True
 
@@ -389,7 +371,7 @@ def test_ard_default_false_keeps_isotropic_lengthscale(small_cfg):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.d_features = 6
-    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_min = 0.5  # (6-3)/6 -> fixed k=3
     cfg.data.inactive_frac_max = 0.5
 
     torch.manual_seed(0)
@@ -401,7 +383,7 @@ def test_ard_not_applied_to_cosine_or_dot_product(small_cfg):
     """cfg.data.ard has no effect on cosine and dot_product."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
-    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_min = 0.5  # (6-3)/6 -> fixed k=3
     cfg.data.inactive_frac_max = 0.5
     cfg.data.ard = True
 
@@ -422,7 +404,7 @@ def test_isotropic_ratio_one_collapses_every_episode(small_cfg, kernel_name):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.d_features = 6
-    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_min = 0.5  # (6-3)/6 -> fixed k=3
     cfg.data.inactive_frac_max = 0.5
     cfg.data.ard = True
     cfg.data.isotropic_ratio = 1.0
@@ -452,9 +434,7 @@ def test_isotropic_ratio_zero_is_default_ard_behaviour(small_cfg):
 
     torch.manual_seed(0)
     episodes = generate_gp_batch(cfg, B=20, device="cpu", return_kernel_metadata=True)
-    n_collapsed = sum(
-        torch.allclose(task["l"], task["l"][0].expand_as(task["l"]), atol=1e-6) for task in episodes
-    )
+    n_collapsed = sum(torch.allclose(task["l"], task["l"][0].expand_as(task["l"]), atol=1e-6) for task in episodes)
     assert n_collapsed == 0, "isotropic_ratio default (0.0) should never force-collapse an ARD lengthscale"
 
 
@@ -485,9 +465,7 @@ def test_isotropic_ratio_partial_mixes_isotropic_and_ard_episodes(small_cfg):
 
     torch.manual_seed(1)
     episodes = generate_gp_batch(cfg, B=400, device="cpu", return_kernel_metadata=True)
-    n_collapsed = sum(
-        torch.allclose(task["l"], task["l"][0].expand_as(task["l"]), atol=1e-6) for task in episodes
-    )
+    n_collapsed = sum(torch.allclose(task["l"], task["l"][0].expand_as(task["l"]), atol=1e-6) for task in episodes)
     assert 150 < n_collapsed < 250, f"expected ~200/400 isotropic episodes, got {n_collapsed}"
 
 
@@ -525,6 +503,7 @@ def test_polynomial_power_varies_across_batches(small_cfg):
 def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
     """generate_gp_batch's top-up rounds reuse the first round's d_features."""
     from copula_inter import data_gen as dg
+
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
@@ -554,6 +533,7 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
     """_generate_shard_with_oom_retry's retry chunks reuse the first chunk's d_features."""
     from copula_inter import data_gen as dg
     from copula_inter import generate_pit_dataset as gpd
+
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
@@ -572,7 +552,11 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
     monkeypatch.setattr(gpd, "generate_gp_batch", oom_first_chunk)
 
     episodes = gpd._generate_shard_with_oom_retry(
-        cfg, n_this=20, device="cpu", tabicl_model=None, tabicl_k_folds=10,
+        cfg,
+        n_this=20,
+        device="cpu",
+        tabicl_model=None,
+        tabicl_k_folds=10,
     )
     assert state["n_calls"] > 1, "test setup didn't actually trigger a retry chunk"
     assert len(episodes) == 20
@@ -583,6 +567,7 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
 def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeypatch):
     """A LinAlgError from kernel evaluation discards the batch (and generate_gp_batch tops up) instead of raising."""
     from copula_inter import data_gen as dg
+
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.seed = 11
@@ -593,9 +578,7 @@ def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeyp
     def poisoned_evaluate_kernel_dense(kernel_obj, x_norm):
         state["n_calls"] += 1
         if state["n_calls"] == 1:
-            raise torch.linalg.LinAlgError(
-                "linalg.eigh: synthetic non-convergence for test"
-            )
+            raise torch.linalg.LinAlgError("linalg.eigh: synthetic non-convergence for test")
         return real_evaluate_kernel_dense(kernel_obj, x_norm)
 
     monkeypatch.setattr(dg, "_evaluate_kernel_dense", poisoned_evaluate_kernel_dense)
@@ -608,17 +591,12 @@ def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeyp
 def test_is_transient_cusolver_error_covers_tabicl_contention_errors():
     """_is_transient_cusolver_error flags TabICL's two contention errors and not an unrelated RuntimeError."""
     from copula_inter import generate_pit_dataset as gpd
+
     assert gpd._is_transient_cusolver_error(
-        RuntimeError(
-            "CPU memory allocation failed (CUDA error: invalid argument) "
-            "and disk offload is not available."
-        )
+        RuntimeError("CPU memory allocation failed (CUDA error: invalid argument) and disk offload is not available.")
     )
     assert gpd._is_transient_cusolver_error(
-        RuntimeError(
-            "Expected all tensors to be on the same device, but found at "
-            "least two devices, cuda:0 and cpu!"
-        )
+        RuntimeError("Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!")
     )
     assert not gpd._is_transient_cusolver_error(RuntimeError("index out of range"))
     assert not gpd._is_transient_cusolver_error(torch.cuda.OutOfMemoryError("oom"))
@@ -627,6 +605,7 @@ def test_is_transient_cusolver_error_covers_tabicl_contention_errors():
 def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
     """An episode with non-finite z_train is discarded, not returned."""
     from copula_inter import data_gen as dg
+
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.seed = 7
@@ -658,6 +637,7 @@ def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch):
 def test_degenerate_active_kernel_column_is_discarded_not_leaked(small_cfg, kernel_name, monkeypatch):
     """A k=1 (periodic/cosine) episode whose active column is constant is discarded."""
     from copula_inter import data_gen as dg
+
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.systematic_composition = False
@@ -692,6 +672,7 @@ def test_degenerate_active_kernel_column_is_discarded_not_leaked(small_cfg, kern
 def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeypatch):
     """An episode whose every active column (3 of 4) is constant is discarded."""
     from copula_inter import data_gen as dg
+
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -729,6 +710,7 @@ def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeyp
 def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch):
     """An episode with only one of several active columns constant is kept."""
     from copula_inter import data_gen as dg
+
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -759,9 +741,7 @@ def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch
     assert not degen_warns, f"partial collapse should not be discarded, got: {degen_warns}"
     assert len(episodes) == 8
     stds = [float(torch.cat([ep["x_norm_train"], ep["x_norm_test"]], dim=0)[:, 0].std()) for ep in episodes]
-    assert min(stds) < 1e-4, (
-        "the partially-collapsed episode should have been kept, not discarded/regenerated away"
-    )
+    assert min(stds) < 1e-4, "the partially-collapsed episode should have been kept, not discarded/regenerated away"
 
 
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
@@ -772,7 +752,7 @@ def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name):
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
     cfg.data.d_features = 6
-    cfg.data.inactive_frac_min = 0.5    # (6-3)/6 -> fixed k=3
+    cfg.data.inactive_frac_min = 0.5  # (6-3)/6 -> fixed k=3
     cfg.data.inactive_frac_max = 0.5
 
     torch.manual_seed(abs(hash("poly_recon_" + kernel_name)) % (2**31))
@@ -899,9 +879,7 @@ def test_mlp_mixing_goldilocks_and_psd(small_cfg, kernel_name):
         assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4)
         assert torch.allclose(R, R.T, atol=1e-5)
         eigvals = torch.linalg.eigvalsh(R)
-        assert (eigvals >= -1e-4).all(), (
-            f"{kernel_name}: not PSD with MLP mixing (min eig={eigvals.min():.6f})"
-        )
+        assert (eigvals >= -1e-4).all(), f"{kernel_name}: not PSD with MLP mixing (min eig={eigvals.min():.6f})"
         assert R.abs().max() <= 1.0 + 1e-5
 
         mask = ~torch.eye(N, dtype=torch.bool)
@@ -1026,9 +1004,7 @@ def test_kernel_hidden_warp_goldilocks_and_psd(small_cfg, kernel_name):
         assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4)
         assert torch.allclose(R, R.T, atol=1e-5)
         eigvals = torch.linalg.eigvalsh(R)
-        assert (eigvals >= -1e-4).all(), (
-            f"{kernel_name}: not PSD with kernel-hidden warp (min eig={eigvals.min():.6f})"
-        )
+        assert (eigvals >= -1e-4).all(), f"{kernel_name}: not PSD with kernel-hidden warp (min eig={eigvals.min():.6f})"
         assert R.abs().max() <= 1.0 + 1e-5
 
         mask = ~torch.eye(N, dtype=torch.bool)
@@ -1071,10 +1047,7 @@ def test_kernel_hidden_warp_breaks_isometry(small_cfg):
             torch.manual_seed(1000 + call)
             random.seed(1000 + call)
             x_norm = torch.randn(B, T, cfg_local.data.d_features)
-            x_norm = (
-                (x_norm - x_norm.mean(1, keepdim=True))
-                / x_norm.std(1, keepdim=True).clamp(min=1e-8)
-            )
+            x_norm = (x_norm - x_norm.mean(1, keepdim=True)) / x_norm.std(1, keepdim=True).clamp(min=1e-8)
             x_kernel = apply_kernel_hidden_warp(x_norm, cfg_local, "cpu")
             for b in range(B):
                 all_model.append(_pairwise_dists(x_norm[b]))
@@ -1083,8 +1056,8 @@ def test_kernel_hidden_warp_breaks_isometry(small_cfg):
         dk = torch.cat(all_kernel)
         return torch.corrcoef(torch.stack([dm, dk]))[0, 1].item()
 
-    corr_mild = measure(frac=0.9)      # near-minimal rank loss (r = d-1)
-    corr_default = measure(frac=0.5)   # this repo's default
+    corr_mild = measure(frac=0.9)  # near-minimal rank loss (r = d-1)
+    corr_default = measure(frac=0.5)  # this repo's default
     corr_aggressive = measure(frac=0.2)
 
     assert corr_aggressive < corr_default < corr_mild + 1e-6, (
@@ -1096,8 +1069,7 @@ def test_kernel_hidden_warp_breaks_isometry(small_cfg):
         f"at this repo's small d_features, got corr={corr_mild:.4f}"
     )
     assert corr_aggressive < 0.35, (
-        f"aggressive bottleneck should leave little recoverable distance "
-        f"structure, got corr={corr_aggressive:.4f}"
+        f"aggressive bottleneck should leave little recoverable distance structure, got corr={corr_aggressive:.4f}"
     )
 
 
@@ -1192,9 +1164,7 @@ def test_structural_warp_goldilocks_and_psd(small_cfg, kernel_name):
         assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4)
         assert torch.allclose(R, R.T, atol=1e-5)
         eigvals = torch.linalg.eigvalsh(R)
-        assert (eigvals >= -1e-4).all(), (
-            f"{kernel_name}: not PSD with structural warping (min eig={eigvals.min():.6f})"
-        )
+        assert (eigvals >= -1e-4).all(), f"{kernel_name}: not PSD with structural warping (min eig={eigvals.min():.6f})"
         assert R.abs().max() <= 1.0 + 1e-5
 
         mask = ~torch.eye(N, dtype=torch.bool)
@@ -1265,9 +1235,7 @@ def test_structural_warp_batched_category_selection_matches_per_column_marginals
     for c in _STRUCTURAL_CATEGORIES:
         old_rate = old_counts[c] / n_draws
         new_rate = new_counts[c] / n_draws
-        assert abs(old_rate - new_rate) < 0.02, (
-            f"{c}: per-column rate={old_rate:.3f} vs batched rate={new_rate:.3f}"
-        )
+        assert abs(old_rate - new_rate) < 0.02, f"{c}: per-column rate={old_rate:.3f} vs batched rate={new_rate:.3f}"
 
     old_mean_k = sum(old_k) / len(old_k)
     new_mean_k = sum(new_k) / len(new_k)
@@ -1278,9 +1246,15 @@ def test_structural_warp_batched_category_selection_matches_per_column_marginals
 
 def test_structural_warp_batch_is_deterministic_given_seed():
     """apply_structural_feature_warp is deterministic given the torch seed."""
-    cfg = OmegaConf.create({"data": {
-        "structural_warp_enabled": True, "structural_warp_prob": 0.5, "d_features": 6,
-    }})
+    cfg = OmegaConf.create(
+        {
+            "data": {
+                "structural_warp_enabled": True,
+                "structural_warp_prob": 0.5,
+                "d_features": 6,
+            }
+        }
+    )
 
     torch.manual_seed(7)
     x1 = torch.randn(16, 32, 6)
@@ -1339,9 +1313,7 @@ def test_structural_warp_censor_never_collapses_whole_column():
             n_trials += 1
             if float(out.std()) < 1e-9:
                 n_collapsed += 1
-    assert n_collapsed == 0, (
-        f"{n_collapsed}/{n_trials} censor calls collapsed the whole column to a constant"
-    )
+    assert n_collapsed == 0, f"{n_collapsed}/{n_trials} censor calls collapsed the whole column to a constant"
 
 
 def test_structural_warp_differential_flat_derivative_does_not_collapse_column(monkeypatch):
@@ -1663,9 +1635,7 @@ def test_mean_fn_z_train_stays_calibrated(small_cfg, family_probs):
     episodes = generate_gp_batch(cfg, B=300, device="cpu")
     z_train = torch.cat([ep["z_train"] for ep in episodes])
 
-    assert z_train.mean().abs().item() < 0.15, (
-        f"family {family_probs}: z_train mean={z_train.mean():.4f} (expected ~0)"
-    )
+    assert z_train.mean().abs().item() < 0.15, f"family {family_probs}: z_train mean={z_train.mean():.4f} (expected ~0)"
     assert abs(z_train.std().item() - 1.0) < 0.15, (
         f"family {family_probs}: z_train std={z_train.std():.4f} (expected ~1 -- "
         f"a large deviation indicates the mean bank's contribution is leaking "
@@ -1727,6 +1697,7 @@ def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg):
 def test_gp_posterior_helper():
     """gp_posterior should return correct shapes and PSD Sigma_star."""
     from copula_inter.data_gen import build_kernel_fn
+
     P, N, d = 20, 8, 1
     x_train = torch.randn(P, d)
     y_train = torch.randn(P)
@@ -1856,9 +1827,7 @@ def test_add_derived_fields_reconstructs_sigma_and_prior():
     """_add_derived_fields rebuilds R_prior and Sigma_star from R_star and sigma_star."""
     sample = _make_sample(P=6, N=4)
     expected_R_prior = sample["R_star"].clone()
-    expected_Sigma_star = (
-        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
-    )
+    expected_Sigma_star = sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
     del sample["Sigma_star"]
 
     out = _add_derived_fields(sample)
@@ -1890,9 +1859,7 @@ def test_copula_dataset_individual_reconstructs_missing_fields(tmp_path):
 
     assert "R_prior" in item and "Sigma_star" in item
     assert torch.allclose(item["R_prior"], sample["R_star"])
-    expected_Sigma_star = (
-        sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
-    )
+    expected_Sigma_star = sample["R_star"] * sample["sigma_star"].unsqueeze(0) * sample["sigma_star"].unsqueeze(1)
     assert torch.allclose(item["Sigma_star"], expected_Sigma_star)
 
     # collate_fn must still work end-to-end on the reconstructed episode.

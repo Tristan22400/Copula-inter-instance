@@ -117,9 +117,7 @@ def load_split(
     X_test = np.concatenate([X_explore, X_exploit], axis=0)
     X_test_norm_t = torch.as_tensor((X_test - ctx_mean) / ctx_std_safe, dtype=torch.float32)
 
-    mu_star, Sigma_latent = gp_posterior(
-        X_ctx_norm_t, y_ctx, X_test_norm_t, kernel_fn, noise=noise_var, latent=True
-    )
+    mu_star, Sigma_latent = gp_posterior(X_ctx_norm_t, y_ctx, X_test_norm_t, kernel_fn, noise=noise_var, latent=True)
     L_test = _safe_cholesky(Sigma_latent)
     eps_test = torch.randn(n_test, generator=rng_torch)
     y_test_t = mu_star + (L_test @ eps_test.unsqueeze(-1)).squeeze(-1)

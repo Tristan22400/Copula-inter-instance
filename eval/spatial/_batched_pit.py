@@ -19,8 +19,15 @@ __all__ = ["run_kfold_pit_batched"]
 
 
 def run_kfold_pit_batched(
-    bank_fn, X_train: np.ndarray, Y_train: np.ndarray, X_test: np.ndarray, Y_test: np.ndarray,
-    k_folds: int = 10, probs_n: int = 99, eps: float = 1e-6, seed: int = 0,
+    bank_fn,
+    X_train: np.ndarray,
+    Y_train: np.ndarray,
+    X_test: np.ndarray,
+    Y_test: np.ndarray,
+    k_folds: int = 10,
+    probs_n: int = 99,
+    eps: float = 1e-6,
+    seed: int = 0,
 ) -> dict:
     """K-fold PIT for z_train and a full-context pass for z_test/log_pdf_test, batched across episodes.
 
@@ -63,8 +70,10 @@ def run_kfold_pit_batched(
             z_train[b, qry_idx[b]] = z_held
 
     bank_test = bank_fn(
-        [X_train[b] for b in range(B)], [Y_train[b] for b in range(B)],
-        [X_test[b] for b in range(B)], probs,
+        [X_train[b] for b in range(B)],
+        [Y_train[b] for b in range(B)],
+        [X_test[b] for b in range(B)],
+        probs,
     )  # (B, N, Q)
     z_test = np.empty((B, N), dtype=np.float32)
     log_pdf_test = np.empty((B, N), dtype=np.float32)

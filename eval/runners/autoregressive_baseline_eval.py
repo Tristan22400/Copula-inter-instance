@@ -41,13 +41,25 @@ from eval.viz.sample_comparison_plots import plot_sample_comparison  # noqa: E40
 from inference.copula_inference import load_copula_model  # noqa: E402
 
 _DEFAULT_CKPT = os.path.join(
-    _REPO_ROOT, "checkpoints", "copula_nano", "copula-finetune-marginal-float32",
+    _REPO_ROOT,
+    "checkpoints",
+    "copula_nano",
+    "copula-finetune-marginal-float32",
     "step_0630000.pt",
 )
 
 
 def _one_sample_pair(
-    tabicl_marginal, icl_model, R_icl, X_train, y_train, X_test, y_train_scaled, mean, std, device,
+    tabicl_marginal,
+    icl_model,
+    R_icl,
+    X_train,
+    y_train,
+    X_test,
+    y_train_scaled,
+    mean,
+    std,
+    device,
 ):
     """One joint sample per method in raw y units: the copula model (one marginal pass plus chol(Sigma) noise) and the chain (ancestral sampling)."""
     N = X_test.shape[0]
@@ -55,10 +67,12 @@ def _one_sample_pair(
     L = torch.from_numpy(safe_cholesky(Sigma_np)).to(device=device, dtype=X_test.dtype)
     z_shared = torch.randn(N, device=device, dtype=X_test.dtype)
     z_copula = L @ z_shared
-    u_copula = torch.clamp(0.5 * (1.0 + torch.erf(z_copula / (2.0 ** 0.5))), 1e-6, 1.0 - 1e-6)
+    u_copula = torch.clamp(0.5 * (1.0 + torch.erf(z_copula / (2.0**0.5))), 1e-6, 1.0 - 1e-6)
 
     logits = tabicl_forward(
-        tabicl_marginal, torch.cat([X_train, X_test]).unsqueeze(0), y_train_scaled.unsqueeze(0),
+        tabicl_marginal,
+        torch.cat([X_train, X_test]).unsqueeze(0),
+        y_train_scaled.unsqueeze(0),
     ).to(device)
     marginal_dist = tabicl_marginal.quantile_dist(logits[0])
     # Trailing size-1 axis: one quantile level per distribution.
@@ -66,8 +80,13 @@ def _one_sample_pair(
     y_copula_sample = (mean + std * y_copula_scaled).detach().cpu().numpy()
 
     ar = autoregressive_log_pdf(
-        tabicl_marginal, X_train[None], y_train[None], X_test[None], torch.zeros_like(X_test[None, :, 0]),
-        order="natural", conditioning="sample",
+        tabicl_marginal,
+        X_train[None],
+        y_train[None],
+        X_test[None],
+        torch.zeros_like(X_test[None, :, 0]),
+        order="natural",
+        conditioning="sample",
     )
     ar_sample = ar["appended"][0].detach().cpu().numpy()
     return y_copula_sample, ar_sample
@@ -76,23 +95,36 @@ def _one_sample_pair(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare the Copula Model against an autoregressive marginal-chain "
-                     "baseline that uses only the same frozen marginal, no copula head."
+        "baseline that uses only the same frozen marginal, no copula head."
     )
-    parser.add_argument("--config", default="conf/config.yaml",
-                         help="Hydra config defining the eval-episode-generating distribution "
-                              "(cfg.data), same convention as eval_checkpoint.py's --config.")
+    parser.add_argument(
+        "--config",
+        default="conf/config.yaml",
+        help="Hydra config defining the eval-episode-generating distribution "
+        "(cfg.data), same convention as eval_checkpoint.py's --config.",
+    )
     parser.add_argument("--ckpt", default=_DEFAULT_CKPT, help="Copula Model checkpoint.")
-    parser.add_argument("--tabicl_marginal_ckpt", default="era5-33y",
-                         help="Marginal checkpoint shared by BOTH methods -- a "
-                              "MARGINAL_FAMILIES name (eval/configs/checkpoints.py) or a raw "
-                              "path. Default 'era5-33y': TabICL v2 fine-tuned on ERA5.")
-    parser.add_argument("--n_episodes", type=int, default=20,
-                         help="Fewer than eval_checkpoint.py's default (30) -- the "
-                              "autoregressive chain does N forward passes per episode "
-                              "instead of 1, so wall-clock is much higher.")
-    parser.add_argument("--n_plot_episodes", type=int, default=3,
-                         help="How many of the evaluated episodes additionally get a "
-                              "sample-comparison PNG (see --out_dir).")
+    parser.add_argument(
+        "--tabicl_marginal_ckpt",
+        default="era5-33y",
+        help="Marginal checkpoint shared by BOTH methods -- a "
+        "MARGINAL_FAMILIES name (eval/configs/checkpoints.py) or a raw "
+        "path. Default 'era5-33y': TabICL v2 fine-tuned on ERA5.",
+    )
+    parser.add_argument(
+        "--n_episodes",
+        type=int,
+        default=20,
+        help="Fewer than eval_checkpoint.py's default (30) -- the "
+        "autoregressive chain does N forward passes per episode "
+        "instead of 1, so wall-clock is much higher.",
+    )
+    parser.add_argument(
+        "--n_plot_episodes",
+        type=int,
+        default=3,
+        help="How many of the evaluated episodes additionally get a sample-comparison PNG (see --out_dir).",
+    )
     parser.add_argument("--tabicl_pit_k_folds", type=int, default=DEFAULT_K_FOLDS)
     parser.add_argument("--tabicl_amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--out_dir", default=os.path.join(_REPO_ROOT, "eval", "results"))
@@ -102,7 +134,8 @@ def main() -> None:
 
     _set_seed(args.seed)
     device = torch.device(
-        "cuda" if (args.device == "auto" and torch.cuda.is_available())
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
         else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
@@ -111,8 +144,9 @@ def main() -> None:
 
     print(f"\nLoading Copula Model checkpoint: {args.ckpt}")
     icl_model, icl_cfg = load_copula_model(args.ckpt, config_path=args.config, device=str(device))
-    print(f"Copula Model parameters: {sum(p.numel() for p in icl_model.parameters()):,}  "
-          f"rank={int(icl_cfg.model.rank)}")
+    print(
+        f"Copula Model parameters: {sum(p.numel() for p in icl_model.parameters()):,}  rank={int(icl_cfg.model.rank)}"
+    )
 
     marginal_ckpt_path = resolve_marginal_checkpoint(args.tabicl_marginal_ckpt)
     print(f"\nLoading shared TabICL marginal: {marginal_ckpt_path}")
@@ -142,19 +176,34 @@ def main() -> None:
         y_train_scaled, y_test_scaled, mean, std = normalize_targets(y_train, y_test)
 
         log_pdf = autoregressive_log_pdf(
-            tabicl_marginal, X_train[None], y_train[None], X_test[None], y_test[None], order="natural",
+            tabicl_marginal,
+            X_train[None],
+            y_train[None],
+            X_test[None],
+            y_test[None],
+            order="natural",
         )["log_pdf"]
         ar_total = float(-log_pdf.sum().item()) / N
 
         copula_totals.append(copula_total)
         ar_totals.append(ar_total)
-        print(f"  episode {i}: Copula Model total={copula_total:.4f} nats/pt   "
-              f"AR-chain total={ar_total:.4f} nats/pt   (N={N})")
+        print(
+            f"  episode {i}: Copula Model total={copula_total:.4f} nats/pt   "
+            f"AR-chain total={ar_total:.4f} nats/pt   (N={N})"
+        )
 
         if i < args.n_plot_episodes:
             y_copula_sample, ar_sample = _one_sample_pair(
-                tabicl_marginal, icl_model, R_dict["icl"],
-                X_train, y_train, X_test, y_train_scaled, mean, std, device,
+                tabicl_marginal,
+                icl_model,
+                R_dict["icl"],
+                X_train,
+                y_train,
+                X_test,
+                y_train_scaled,
+                mean,
+                std,
+                device,
             )
             out_path = os.path.join(args.out_dir, f"sample_comparison_ep{i}.png")
             plot_sample_comparison(
@@ -171,8 +220,10 @@ def main() -> None:
 
     elapsed = time.time() - t0
     print(f"\n{'─' * 70}")
-    print(f"Total NLL (Y-space, marginal+copula, shared marginal) — lower is better  "
-          f"[N={len(copula_totals)} episodes, {elapsed:.1f}s]")
+    print(
+        f"Total NLL (Y-space, marginal+copula, shared marginal) — lower is better  "
+        f"[N={len(copula_totals)} episodes, {elapsed:.1f}s]"
+    )
     print(f"{'─' * 70}")
     print(f"{'Method':<45}{'Mean nats/pt':>14}{'Std':>10}")
     print(f"{'Copula Model':<45}{np.nanmean(copula_totals):>14.4f}{np.nanstd(copula_totals):>10.4f}")

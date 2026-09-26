@@ -26,7 +26,9 @@ __all__ = [
 
 
 def compute_quantile_ece(
-    y_true: np.ndarray, y_pred_quantiles: np.ndarray, quantiles: "list | np.ndarray",
+    y_true: np.ndarray,
+    y_pred_quantiles: np.ndarray,
+    quantiles: "list | np.ndarray",
 ) -> "tuple[float, np.ndarray]":
     """
     Compute the quantile-regression Expected Calibration Error (ECE) — per-
@@ -55,9 +57,7 @@ def compute_quantile_ece(
     if y_pred_quantiles.ndim != 2:
         raise ValueError("y_pred_quantiles must be 2D (n_samples, n_quantiles).")
     if y_pred_quantiles.shape[0] != y_true.shape[0]:
-        raise ValueError(
-            f"y_true has {y_true.shape[0]} samples but y_pred_quantiles has {y_pred_quantiles.shape[0]}."
-        )
+        raise ValueError(f"y_true has {y_true.shape[0]} samples but y_pred_quantiles has {y_pred_quantiles.shape[0]}.")
     if y_pred_quantiles.shape[1] != quantiles.shape[0]:
         raise ValueError(
             f"y_pred_quantiles has {y_pred_quantiles.shape[1]} quantile columns "
@@ -70,7 +70,10 @@ def compute_quantile_ece(
 
 
 def generate_era5_reliability_diagram(
-    y_true: np.ndarray, y_pred_quantiles: np.ndarray, quantiles: "list | np.ndarray", output_path: str,
+    y_true: np.ndarray,
+    y_pred_quantiles: np.ndarray,
+    quantiles: "list | np.ndarray",
+    output_path: str,
 ) -> float:
     """
     Build and save a reliability diagram for TabICL's ERA5 quantile
@@ -98,7 +101,12 @@ def generate_era5_reliability_diagram(
     ax.set_ylabel("Empirical coverage")
     ax.set_title("Reliability Diagram: TabICL on ERA5 Dataset")
     ax.text(
-        0.05, 0.95, f"ECE = {ece:.4f}", transform=ax.transAxes, fontsize=11, verticalalignment="top",
+        0.05,
+        0.95,
+        f"ECE = {ece:.4f}",
+        transform=ax.transAxes,
+        fontsize=11,
+        verticalalignment="top",
         bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.85),
     )
     ax.legend(loc="lower right")
@@ -149,7 +157,9 @@ def plot_era5_quantile_reliability(
     for d in range(n_days):
         context_values = field_all[d].ravel()[context_idx]
         regressor.fit(context_coords, context_values)
-        preds = regressor.predict(target_coords, output_type="quantiles", alphas=list(quantiles))  # (n_target, n_quantiles)
+        preds = regressor.predict(
+            target_coords, output_type="quantiles", alphas=list(quantiles)
+        )  # (n_target, n_quantiles)
         y_true_chunks.append(field_all[d].ravel()[target_idx])
         y_pred_chunks.append(preds)
 
@@ -202,8 +212,14 @@ def plot_kendall_pit(z_values: np.ndarray, ax, n_bins: int = 20):
     """Histogram of Kendall PIT values against the theoretical Uniform(0, 1) density."""
     z_values = np.asarray(z_values, dtype=np.float64)
     ax.hist(
-        z_values, bins=n_bins, range=(0.0, 1.0), density=True,
-        color="tab:blue", alpha=0.75, edgecolor="white", label="Empirical",
+        z_values,
+        bins=n_bins,
+        range=(0.0, 1.0),
+        density=True,
+        color="tab:blue",
+        alpha=0.75,
+        edgecolor="white",
+        label="Empirical",
     )
     ax.axhline(1.0, color="k", linestyle="--", linewidth=1, label="Uniform(0, 1)")
     ax.set_xlim(0.0, 1.0)
@@ -214,9 +230,7 @@ def plot_kendall_pit(z_values: np.ndarray, ax, n_bins: int = 20):
     return ax
 
 
-def calc_mahalanobis_distances(
-    y_true: np.ndarray, means: np.ndarray, variances: np.ndarray
-) -> np.ndarray:
+def calc_mahalanobis_distances(y_true: np.ndarray, means: np.ndarray, variances: np.ndarray) -> np.ndarray:
     """
     Mahalanobis distance under a diagonal covariance (Gaussian marginals,
     independence copula): d_i^2 = sum_d (y_{i,d} - mu_{i,d})^2 / sigma^2_{i,d}.

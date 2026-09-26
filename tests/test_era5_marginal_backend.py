@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 @pytest.mark.parametrize(
     "source,expected",
     [
-        ("analytic", None),      # no generating GP on real data -> stay on TabICL
+        ("analytic", None),  # no generating GP on real data -> stay on TabICL
         ("tabicl", None),
         ("tabicl_split", None),
         ("exaone", "exaone"),
@@ -57,8 +57,10 @@ def test_pit_group_and_episode_agree_under_backend(backend):
     y_train, y_test = torch.randn(B, P) * 2 + 1, torch.randn(B, N) * 2 + 1
 
     kw = dict(
-        marginal_backend=backend, marginal_regressor=regressor,
-        marginal_probs_n=9, seed=7,
+        marginal_backend=backend,
+        marginal_regressor=regressor,
+        marginal_probs_n=9,
+        seed=7,
     )
     grouped = _pit_group(x_train, y_train, x_test, y_test, None, 2, **kw)
     assert grouped["z_train"].shape == (B, P)

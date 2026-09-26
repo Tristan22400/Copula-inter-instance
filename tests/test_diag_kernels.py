@@ -37,9 +37,7 @@ def test_kernel_produces_valid_r_star(cfg, kernel_name):
         if not result["ok"]:
             failures.append((i, result["issues"]))
 
-    assert not failures, (
-        f"{kernel_name}: {len(failures)}/{N_TASKS_PER_KERNEL} tasks failed — {failures}"
-    )
+    assert not failures, f"{kernel_name}: {len(failures)}/{N_TASKS_PER_KERNEL} tasks failed — {failures}"
 
 
 # Stage-3 check over fewer tasks: fail only on COLLAPSED or DEGENERATE.
@@ -55,8 +53,7 @@ def test_kernel_off_diagonal_not_degenerate(cfg, kernel_name):
 
     stats = batch_off_diagonal_stats(kernel_name, cfg, N_TASKS_STAGE3)
     assert not stats["verdict"].startswith("COLLAPSED"), (
-        f"{kernel_name}: screening effect — E[|R*_offdiag|]={stats['mean_abs']:.4f} "
-        f"({stats['n_pairs']} pooled pairs)"
+        f"{kernel_name}: screening effect — E[|R*_offdiag|]={stats['mean_abs']:.4f} ({stats['n_pairs']} pooled pairs)"
     )
     assert not stats["verdict"].startswith("DEGENERATE"), (
         f"{kernel_name}: trivially near-identical instances — "

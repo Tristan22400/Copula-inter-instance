@@ -141,14 +141,8 @@ def compute_kernel_bank(
     pair_mask = _offdiag_pair_mask(mask)
     need_iso = any(not a for a in ard_flags)
     need_ard = any(a for a in ard_flags)
-    ls_iso = (
-        _median_isotropic(torch.cdist(x, x), pair_mask, lengthscale_scale)
-        if need_iso else None
-    )
-    ls_ard = (
-        _median_ard((x.unsqueeze(2) - x.unsqueeze(1)).abs(), pair_mask, lengthscale_scale)
-        if need_ard else None
-    )
+    ls_iso = _median_isotropic(torch.cdist(x, x), pair_mask, lengthscale_scale) if need_iso else None
+    ls_ard = _median_ard((x.unsqueeze(2) - x.unsqueeze(1)).abs(), pair_mask, lengthscale_scale) if need_ard else None
 
     bank: "OrderedDict[str, Tensor]" = OrderedDict()
     for family in families:

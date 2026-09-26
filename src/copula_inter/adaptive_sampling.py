@@ -26,8 +26,12 @@ from copula_inter.pit import (
 
 
 def _update_adaptive_kernel_weights(
-    prev_weights: torch.Tensor, metrics: dict, lr: float, floor: float,
-    exclude: Optional[set] = None, signal: str = "oracle",
+    prev_weights: torch.Tensor,
+    metrics: dict,
+    lr: float,
+    floor: float,
+    exclude: Optional[set] = None,
+    signal: str = "oracle",
 ) -> torch.Tensor:
     """Exponentiated-gradient update of per-family kernel sampling weights (_COMPOSABLE_KERNELS order).
 
@@ -68,7 +72,10 @@ def _update_adaptive_kernel_weights(
 
 @torch.no_grad()
 def _compute_tabicl_z_train_gap(
-    cfg: DictConfig, tabicl_marginal: nn.Module, k_folds: int, device: str = "cpu",
+    cfg: DictConfig,
+    tabicl_marginal: nn.Module,
+    k_folds: int,
+    device: str = "cpu",
 ) -> dict[str, float]:
     """Per kernel family, mean |z_tabicl - z_analytic| of z_train on the same episodes.
 
@@ -95,35 +102,41 @@ def _compute_tabicl_z_train_gap(
             family_seed = _name_seed(base_seed, family)
             probe_cfg = OmegaConf.merge(
                 cfg,
-                OmegaConf.create({
-                    "seed": family_seed,
-                    "data": {
-                        "kernel": family,
-                        "systematic_composition": False,
-                        "P_min": probe_P_min, "P_max": probe_P_max,
-                        "N_min": probe_N_min, "N_max": probe_N_max,
-                    },
-                }),
+                OmegaConf.create(
+                    {
+                        "seed": family_seed,
+                        "data": {
+                            "kernel": family,
+                            "systematic_composition": False,
+                            "P_min": probe_P_min,
+                            "P_max": probe_P_max,
+                            "N_min": probe_N_min,
+                            "N_max": probe_N_max,
+                        },
+                    }
+                ),
             )
             analytic_eps = _generate_gp_batch_raw(probe_cfg, n_episodes, device=device)
             probe_cfg.seed = family_seed  # _generate_gp_batch_raw mutates nothing, but stay explicit
             tabicl_eps = _generate_gp_batch_raw(
-                probe_cfg, n_episodes, device=device,
-                tabicl_model=tabicl_marginal, tabicl_k_folds=k_folds,
+                probe_cfg,
+                n_episodes,
+                device=device,
+                tabicl_model=tabicl_marginal,
+                tabicl_k_folds=k_folds,
             )
             n = min(len(analytic_eps), len(tabicl_eps))
             if n == 0:
                 continue
-            diffs = [
-                (tabicl_eps[i]["z_train"] - analytic_eps[i]["z_train"]).abs().mean().item()
-                for i in range(n)
-            ]
+            diffs = [(tabicl_eps[i]["z_train"] - analytic_eps[i]["z_train"]).abs().mean().item() for i in range(n)]
             gaps[family] = float(sum(diffs) / len(diffs))
     return gaps
 
 
 def _tabicl_gap_to_mix_frac(
-    gaps: dict[str, float], floor_frac: float, max_frac: float,
+    gaps: dict[str, float],
+    floor_frac: float,
+    max_frac: float,
 ) -> torch.Tensor:
     """Map per-family gaps to mixing fractions in [floor_frac, max_frac] (_COMPOSABLE_KERNELS order).
 
@@ -148,7 +161,10 @@ def _tabicl_gap_to_mix_frac(
 
 
 def _refresh_tabicl_mix_weights(
-    cfg: DictConfig, pit_ckpt: str, tabicl_mix_weights: torch.Tensor, device: str,
+    cfg: DictConfig,
+    pit_ckpt: str,
+    tabicl_mix_weights: torch.Tensor,
+    device: str,
 ) -> tuple[dict[str, float], torch.Tensor]:
     """Reload the TabICL marginal, re-measure the gaps and copy new mix fractions into tabicl_mix_weights in place.
 
@@ -157,9 +173,7 @@ def _refresh_tabicl_mix_weights(
     floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
     max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
     if math.isclose(floor_frac, max_frac, abs_tol=1e-12):
-        new_mix_frac = torch.full(
-            (len(_COMPOSABLE_KERNELS),), floor_frac, dtype=torch.float32
-        )
+        new_mix_frac = torch.full((len(_COMPOSABLE_KERNELS),), floor_frac, dtype=torch.float32)
         tabicl_mix_weights.copy_(new_mix_frac)
         return {}, new_mix_frac
     tabicl_marginal = load_tabicl(pit_ckpt, device)

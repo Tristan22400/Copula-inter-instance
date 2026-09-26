@@ -61,7 +61,7 @@ class GlobalERA5Corpus:
                     "worldwide finetuning corpus."
                 )
             if max_months is not None and max_months > 0:
-                paths = paths[-int(max_months):]
+                paths = paths[-int(max_months) :]
             self._paths = paths
 
             if lazy is None:

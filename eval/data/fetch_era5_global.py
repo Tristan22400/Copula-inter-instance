@@ -90,7 +90,9 @@ def fetch_month(year: int, month: int, cache_dir: str = _CACHE_DIR, force: bool 
     return target_path
 
 
-def fetch_range(start_year: int, start_month: int, n_months: int, cache_dir: str = _CACHE_DIR, force: bool = False) -> list[str]:
+def fetch_range(
+    start_year: int, start_month: int, n_months: int, cache_dir: str = _CACHE_DIR, force: bool = False
+) -> list[str]:
     """Fetch n_months consecutive months from (start_year, start_month), skipping cached ones unless force."""
     paths = []
     year, month = start_year, start_month

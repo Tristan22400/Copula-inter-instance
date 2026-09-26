@@ -1,4 +1,5 @@
 """Fast CPU checks for the debug/ pipeline."""
+
 from __future__ import annotations
 
 import os
@@ -22,7 +23,9 @@ def test_rank_ceiling_recovers_exact_low_rank_target():
     R_true = low_rank_correlation(W_true, s_true, jitter=1e-4, parametrization="covnorm")
 
     per_ep, _ = fit_rank_ceiling(R_true, r, steps=800, lr=0.05, jitter=1e-4, device="cpu")
-    assert per_ep.item() < 0.02, f"expected near-zero ceiling loss for an exactly-representable target, got {per_ep.item()}"
+    assert per_ep.item() < 0.02, (
+        f"expected near-zero ceiling loss for an exactly-representable target, got {per_ep.item()}"
+    )
 
 
 def test_rank_ceiling_monotone_in_rank():
@@ -79,7 +82,9 @@ def test_build_config_applies_dotted_overrides():
 
     dcfg = build_config(
         overrides=["data.P_min=17", "data.P_max=17", "model.rank=64"],
-        n_episodes=3, device="cpu", seed=1,
+        n_episodes=3,
+        device="cpu",
+        seed=1,
     )
     assert int(dcfg.cfg.data.P_min) == 17
     assert int(dcfg.cfg.data.P_max) == 17

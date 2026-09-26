@@ -38,8 +38,13 @@ def test_batched_shape(toy_task):
     K = 7
     z_batch = toy_task["rng"].standard_normal((K, toy_task["D"]))
     out = sample_copula_residual_fields(
-        None, toy_task["context_coords"], toy_task["context_values"], toy_task["coords_test"],
-        toy_task["R"], "cpu", z_batch,
+        None,
+        toy_task["context_coords"],
+        toy_task["context_values"],
+        toy_task["coords_test"],
+        toy_task["R"],
+        "cpu",
+        z_batch,
     )
     assert out.shape == (K, toy_task["D"])
     assert np.all(np.isfinite(out))
@@ -50,13 +55,23 @@ def test_batched_matches_single_sample_rowwise(toy_task):
     K = 5
     z_batch = toy_task["rng"].standard_normal((K, toy_task["D"]))
     batch = sample_copula_residual_fields(
-        None, toy_task["context_coords"], toy_task["context_values"], toy_task["coords_test"],
-        toy_task["R"], "cpu", z_batch,
+        None,
+        toy_task["context_coords"],
+        toy_task["context_values"],
+        toy_task["coords_test"],
+        toy_task["R"],
+        "cpu",
+        z_batch,
     )
     for k in range(K):
         single = predict_copula_residual_field(
-            None, toy_task["context_coords"], toy_task["context_values"], toy_task["coords_test"],
-            toy_task["R"], "cpu", z_batch[k],
+            None,
+            toy_task["context_coords"],
+            toy_task["context_values"],
+            toy_task["coords_test"],
+            toy_task["R"],
+            "cpu",
+            z_batch[k],
         )
         assert np.allclose(batch[k], single)
 
@@ -67,8 +82,13 @@ def test_naive_fallback_is_affine_in_z(toy_task):
     K = 4000  # enough draws for a stable empirical correlation at D=8
     z_batch = rng.standard_normal((K, toy_task["D"]))
     samples = sample_copula_residual_fields(
-        None, toy_task["context_coords"], toy_task["context_values"], toy_task["coords_test"],
-        toy_task["R"], "cpu", z_batch,
+        None,
+        toy_task["context_coords"],
+        toy_task["context_values"],
+        toy_task["coords_test"],
+        toy_task["R"],
+        "cpu",
+        z_batch,
     )
     R_empirical = np.corrcoef(samples.T)
     assert np.allclose(R_empirical, toy_task["R"], atol=0.05)
@@ -77,12 +97,22 @@ def test_naive_fallback_is_affine_in_z(toy_task):
 def test_single_sample_wrapper_matches_batch_of_one(toy_task):
     z = toy_task["rng"].standard_normal(toy_task["D"])
     single = predict_copula_residual_field(
-        None, toy_task["context_coords"], toy_task["context_values"], toy_task["coords_test"],
-        toy_task["R"], "cpu", z,
+        None,
+        toy_task["context_coords"],
+        toy_task["context_values"],
+        toy_task["coords_test"],
+        toy_task["R"],
+        "cpu",
+        z,
     )
     batch = sample_copula_residual_fields(
-        None, toy_task["context_coords"], toy_task["context_values"], toy_task["coords_test"],
-        toy_task["R"], "cpu", z[None, :],
+        None,
+        toy_task["context_coords"],
+        toy_task["context_values"],
+        toy_task["coords_test"],
+        toy_task["R"],
+        "cpu",
+        z[None, :],
     )
     assert single.shape == (toy_task["D"],)
     assert np.allclose(single, batch[0])

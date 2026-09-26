@@ -69,8 +69,16 @@ def _safe_ckpt_tag(token: str) -> str:
     return token
 
 
-def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_context: int,
-                    device: "str | None", seed: int, out_dir: str) -> None:
+def _diagnose_real(
+    ckpt_token: str,
+    region: str,
+    grid_size: int,
+    n_days: int,
+    n_context: int,
+    device: "str | None",
+    seed: int,
+    out_dir: str,
+) -> None:
     ckpt = resolve_checkpoint(ckpt_token)
     model, cfg, resolved_device, marginal = get_model(ckpt, device)
     lat_bounds, lon_bounds = regions.REGIONS[region]
@@ -98,24 +106,38 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
     for d in days:
         context_values = data["t2m"][d].ravel()[context_idx]
         R_context = extract_model_context_correlation(
-            model, resolved_device, marginal, context_coords, context_values, coords, k_folds=constants.PIT_K_FOLDS,
+            model,
+            resolved_device,
+            marginal,
+            context_coords,
+            context_values,
+            coords,
+            k_folds=constants.PIT_K_FOLDS,
         )
         z_shared = rng.standard_normal(D)
         predicted_fields.append(
-            predict_copula_residual_field(marginal, context_coords, context_values, coords, R_context, resolved_device, z_shared)
+            predict_copula_residual_field(
+                marginal, context_coords, context_values, coords, R_context, resolved_device, z_shared
+            )
         )
         independent_fields.append(
-            predict_copula_residual_field(marginal, context_coords, context_values, coords, R_indep, resolved_device, z_shared)
+            predict_copula_residual_field(
+                marginal, context_coords, context_values, coords, R_indep, resolved_device, z_shared
+            )
         )
 
         # Y-space correlation from pooled samples, with the context-conditioned and
         # the unconditional correlation under the same context and marginal.
         z_batch = rng.standard_normal((constants.N_YSPACE_MC_SAMPLES, D))
         model_yspace_samples.append(
-            sample_copula_residual_fields(marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch)
+            sample_copula_residual_fields(
+                marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch
+            )
         )
         dummy_yspace_samples.append(
-            sample_copula_residual_fields(marginal, context_coords, context_values, coords, R_dummy, resolved_device, z_batch)
+            sample_copula_residual_fields(
+                marginal, context_coords, context_values, coords, R_dummy, resolved_device, z_batch
+            )
         )
     R_model_yspace = pool_yspace_samples_and_correlate(model_yspace_samples)
     R_dummy_yspace = pool_yspace_samples_and_correlate(dummy_yspace_samples)
@@ -128,20 +150,35 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
         "model_context": (dist[iu], R_model_yspace[iu]),
         "dummy_context": (dist[iu], R_dummy_yspace[iu]),
     }
-    plot_correlation_vs_distance(series, os.path.join(out_dir, f"diagnose_distance_{tag}.png"), scatter_series="ground_truth")
+    plot_correlation_vs_distance(
+        series, os.path.join(out_dir, f"diagnose_distance_{tag}.png"), scatter_series="ground_truth"
+    )
     plot_correlation_heatmaps(
         {"ground_truth": R_emp, "model_context": R_model_yspace, "dummy_context": R_dummy_yspace},
         os.path.join(out_dir, f"diagnose_heatmaps_{tag}.png"),
     )
     plot_residual_grid(
-        data, days, predicted_fields, os.path.join(out_dir, f"diagnose_residual_grid_{tag}.png"),
-        context_coords=context_coords, independent_fields=independent_fields, target="raw",
+        data,
+        days,
+        predicted_fields,
+        os.path.join(out_dir, f"diagnose_residual_grid_{tag}.png"),
+        context_coords=context_coords,
+        independent_fields=independent_fields,
+        target="raw",
     )
     print(f"[diagnose real] {ckpt_token}: done ({tag})")
 
 
-def _diagnose_synthetic(ckpt_token: str, kernel: "str | None", grid_size: int, n_context: int, n_draws: int,
-                         device: "str | None", seed: int, out_dir: str) -> None:
+def _diagnose_synthetic(
+    ckpt_token: str,
+    kernel: "str | None",
+    grid_size: int,
+    n_context: int,
+    n_draws: int,
+    device: "str | None",
+    seed: int,
+    out_dir: str,
+) -> None:
     from copula_inter.data_gen import sigma_to_correlation
 
     ckpt = resolve_checkpoint(ckpt_token)
@@ -171,25 +208,44 @@ def _diagnose_synthetic(ckpt_token: str, kernel: "str | None", grid_size: int, n
         z_true = L @ rng.standard_normal(D)
         context_values = z_true[context_idx]
         R_pred_tabicl_z = extract_model_context_correlation(
-            model, resolved_device, marginal, context_coords, context_values, coords, k_folds=constants.PIT_K_FOLDS,
+            model,
+            resolved_device,
+            marginal,
+            context_coords,
+            context_values,
+            coords,
+            k_folds=constants.PIT_K_FOLDS,
         )
         R_pred_true_z = extract_model_true_z_train_correlation(
-            model, resolved_device, context_coords, K_ff_context, context_values, coords,
+            model,
+            resolved_device,
+            context_coords,
+            K_ff_context,
+            context_values,
+            coords,
         )
         R_pred_draws.append(R_pred_tabicl_z)
         true_fields.append(z_true)
         z_shared = rng.standard_normal(D)
         predicted_fields_true_z.append(
-            predict_copula_residual_field(marginal, context_coords, context_values, coords, R_pred_true_z, resolved_device, z_shared)
+            predict_copula_residual_field(
+                marginal, context_coords, context_values, coords, R_pred_true_z, resolved_device, z_shared
+            )
         )
         predicted_fields_tabicl_z.append(
-            predict_copula_residual_field(marginal, context_coords, context_values, coords, R_pred_tabicl_z, resolved_device, z_shared)
+            predict_copula_residual_field(
+                marginal, context_coords, context_values, coords, R_pred_tabicl_z, resolved_device, z_shared
+            )
         )
         oracle_marginal_fields.append(
-            predict_copula_residual_field(marginal, context_coords, context_values, coords, R_true, resolved_device, z_shared)
+            predict_copula_residual_field(
+                marginal, context_coords, context_values, coords, R_true, resolved_device, z_shared
+            )
         )
         independent_fields.append(
-            predict_copula_residual_field(marginal, context_coords, context_values, coords, R_indep, resolved_device, z_shared)
+            predict_copula_residual_field(
+                marginal, context_coords, context_values, coords, R_indep, resolved_device, z_shared
+            )
         )
     R_pred_mean = np.mean(R_pred_draws, axis=0)
 
@@ -197,22 +253,43 @@ def _diagnose_synthetic(ckpt_token: str, kernel: "str | None", grid_size: int, n
     dist = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(-1))
     iu = np.triu_indices_from(R_true, k=1)
     series = {"ground_truth": (dist[iu], R_true[iu]), "model_context": (dist[iu], R_pred_mean[iu])}
-    plot_correlation_vs_distance(series, os.path.join(out_dir, f"diagnose_distance_{tag}.png"), scatter_series="ground_truth")
+    plot_correlation_vs_distance(
+        series, os.path.join(out_dir, f"diagnose_distance_{tag}.png"), scatter_series="ground_truth"
+    )
     plot_correlation_heatmaps(
-        {"ground_truth": R_true, "model_context": R_pred_mean}, os.path.join(out_dir, f"diagnose_heatmaps_{tag}.png"),
+        {"ground_truth": R_true, "model_context": R_pred_mean},
+        os.path.join(out_dir, f"diagnose_heatmaps_{tag}.png"),
     )
     grid_shape = (grid_size, grid_size)
     true_grids = [f.reshape(grid_shape) for f in true_fields]
     plot_synthetic_residual_grid(
-        axis, axis, grid_shape, true_grids, predicted_fields_true_z, predicted_fields_tabicl_z, independent_fields,
+        axis,
+        axis,
+        grid_shape,
+        true_grids,
+        predicted_fields_true_z,
+        predicted_fields_tabicl_z,
+        independent_fields,
         os.path.join(out_dir, f"diagnose_residual_grid_{tag}.png"),
-        context_coords=context_coords, oracle_fields=oracle_marginal_fields,
+        context_coords=context_coords,
+        oracle_fields=oracle_marginal_fields,
     )
     print(f"[diagnose synthetic] {ckpt_token}: kernel={kernel_name}, done ({tag})")
 
 
-def _diagnose(mode: str, ckpt_tokens: list, region: str, grid_size: int, kernel: "str | None",
-              n_days: int, n_context: int, n_draws: int, device: "str | None", seed: int, out_dir: str) -> None:
+def _diagnose(
+    mode: str,
+    ckpt_tokens: list,
+    region: str,
+    grid_size: int,
+    kernel: "str | None",
+    n_days: int,
+    n_context: int,
+    n_draws: int,
+    device: "str | None",
+    seed: int,
+    out_dir: str,
+) -> None:
     os.makedirs(out_dir, exist_ok=True)
     for token in ckpt_tokens:
         if mode == "real":
@@ -224,18 +301,41 @@ def _diagnose(mode: str, ckpt_tokens: list, region: str, grid_size: int, kernel:
 def cmd_diagnose(args) -> None:
     tokens = [t.strip() for t in args.ckpt.split(",") if t.strip()]
     _diagnose(
-        args.mode, tokens, args.region, args.grid_size, args.kernel,
-        args.n_days, args.n_context, args.n_draws, args.device, args.seed, args.out_dir,
+        args.mode,
+        tokens,
+        args.region,
+        args.grid_size,
+        args.kernel,
+        args.n_days,
+        args.n_context,
+        args.n_draws,
+        args.device,
+        args.seed,
+        args.out_dir,
     )
 
 
-def _sweep(mode: str, profile: str, checkpoints_arg: "str | None", n_context: int, n_days: int,
-           n_draws: int, device: "str | None", seed: int, out_path: "str | None" = None,
-           compute_gp_baseline: bool = True, gp_kernels: "list | None" = None,
-           gp_n_steps_mle: int = constants.GP_N_STEPS_MLE, gp_lr_mle: float = constants.GP_LR_MLE,
-           gp_n_restarts_mle: int = constants.GP_N_RESTARTS_MLE) -> str:
-    tokens = all_family_names() if (checkpoints_arg in (None, "all")) else \
-        [t.strip() for t in checkpoints_arg.split(",") if t.strip()]
+def _sweep(
+    mode: str,
+    profile: str,
+    checkpoints_arg: "str | None",
+    n_context: int,
+    n_days: int,
+    n_draws: int,
+    device: "str | None",
+    seed: int,
+    out_path: "str | None" = None,
+    compute_gp_baseline: bool = True,
+    gp_kernels: "list | None" = None,
+    gp_n_steps_mle: int = constants.GP_N_STEPS_MLE,
+    gp_lr_mle: float = constants.GP_LR_MLE,
+    gp_n_restarts_mle: int = constants.GP_N_RESTARTS_MLE,
+) -> str:
+    tokens = (
+        all_family_names()
+        if (checkpoints_arg in (None, "all"))
+        else [t.strip() for t in checkpoints_arg.split(",") if t.strip()]
+    )
 
     profile_configs = regions.SWEEP_PROFILES[profile] if mode == "real" else constants.SYNTHETIC_SWEEP_PROFILES[profile]
 
@@ -248,13 +348,30 @@ def _sweep(mode: str, profile: str, checkpoints_arg: "str | None", n_context: in
         for config_name, axis_name, grid_size in profile_configs:
             if mode == "real":
                 r = run_real_config(
-                    ckpt, config_name, axis_name, grid_size, n_days=n_days, device=device, seed=seed, n_context=n_context,
-                    compute_gp_baseline=compute_gp_baseline, gp_baseline_kernels=gp_kernels,
-                    gp_n_steps_mle=gp_n_steps_mle, gp_lr_mle=gp_lr_mle, gp_n_restarts_mle=gp_n_restarts_mle,
+                    ckpt,
+                    config_name,
+                    axis_name,
+                    grid_size,
+                    n_days=n_days,
+                    device=device,
+                    seed=seed,
+                    n_context=n_context,
+                    compute_gp_baseline=compute_gp_baseline,
+                    gp_baseline_kernels=gp_kernels,
+                    gp_n_steps_mle=gp_n_steps_mle,
+                    gp_lr_mle=gp_lr_mle,
+                    gp_n_restarts_mle=gp_n_restarts_mle,
                 )
             else:
                 r = run_synthetic_config(
-                    ckpt, config_name, axis_name, grid_size, n_context=n_context, n_draws=n_draws, seed=seed, device=device,
+                    ckpt,
+                    config_name,
+                    axis_name,
+                    grid_size,
+                    n_context=n_context,
+                    n_draws=n_draws,
+                    seed=seed,
+                    device=device,
                 )
             r["family"] = token
             results.append(r)
@@ -265,13 +382,34 @@ def _sweep(mode: str, profile: str, checkpoints_arg: "str | None", n_context: in
 
 
 def cmd_sweep(args) -> None:
-    _sweep(args.mode, args.profile, args.checkpoints, args.n_context, args.n_days, args.n_draws, args.device, args.seed, args.out,
-           compute_gp_baseline=not args.no_gp_baseline, gp_kernels=args.gp_kernels,
-           gp_n_steps_mle=args.gp_n_steps_mle, gp_lr_mle=args.gp_lr_mle, gp_n_restarts_mle=args.gp_n_restarts_mle)
+    _sweep(
+        args.mode,
+        args.profile,
+        args.checkpoints,
+        args.n_context,
+        args.n_days,
+        args.n_draws,
+        args.device,
+        args.seed,
+        args.out,
+        compute_gp_baseline=not args.no_gp_baseline,
+        gp_kernels=args.gp_kernels,
+        gp_n_steps_mle=args.gp_n_steps_mle,
+        gp_lr_mle=args.gp_lr_mle,
+        gp_n_restarts_mle=args.gp_n_restarts_mle,
+    )
 
 
-def _baseline(mode: str, profile: str, laws: list, n_days: int, ckpt_token: "str | None",
-              device: "str | None", seed: int, out_path: "str | None" = None) -> str:
+def _baseline(
+    mode: str,
+    profile: str,
+    laws: list,
+    n_days: int,
+    ckpt_token: "str | None",
+    device: "str | None",
+    seed: int,
+    out_path: "str | None" = None,
+) -> str:
     out_path = out_path or os.path.join(_RESULTS_DIR, f"baseline_{mode}.json")
     out = {}
 
@@ -371,8 +509,15 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
     for j, law in enumerate(baseline_laws):
         i = len(families) + j
         vals = [baselines.get(c, {}).get(law, np.nan) for c in configs]
-        ax.bar(x + (i - n_series / 2 + 0.5) * width, vals, width=width, label=f"baseline: {law}",
-               hatch="//", edgecolor="black", linewidth=0.5)
+        ax.bar(
+            x + (i - n_series / 2 + 0.5) * width,
+            vals,
+            width=width,
+            label=f"baseline: {law}",
+            hatch="//",
+            edgecolor="black",
+            linewidth=0.5,
+        )
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_xticks(x)
     ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
@@ -402,8 +547,15 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
         for j, kname in enumerate(gp_kernels):
             i = len(families) + j
             vals = [gp_lut_by_config.get(c, {}).get(kname, {}).get("total", np.nan) for c in configs]
-            ax.bar(x + (i - n_series_nll / 2 + 0.5) * width_nll, vals, width=width_nll,
-                   label=f"GP-MLE: {kname}", hatch="//", edgecolor="black", linewidth=0.5)
+            ax.bar(
+                x + (i - n_series_nll / 2 + 0.5) * width_nll,
+                vals,
+                width=width_nll,
+                label=f"GP-MLE: {kname}",
+                hatch="//",
+                edgecolor="black",
+                linewidth=0.5,
+            )
         ax.axhline(0, color="black", linewidth=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
@@ -428,10 +580,20 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
         for r in recs:
             d = np.array(r["dist_centers"])
             if not gt_plotted:
-                ax.plot(d, np.array(r[gt_key], dtype=float), color="black", linewidth=3.0, label="Ground truth", zorder=10)
+                ax.plot(
+                    d, np.array(r[gt_key], dtype=float), color="black", linewidth=3.0, label="Ground truth", zorder=10
+                )
                 gt_plotted = True
             label, color = _family_style(r["family"])
-            ax.plot(d, np.array(r[pred_key], dtype=float), color=color, linewidth=2.0, marker="o", markersize=3.5, label=label)
+            ax.plot(
+                d,
+                np.array(r[pred_key], dtype=float),
+                color=color,
+                linewidth=2.0,
+                marker="o",
+                markersize=3.5,
+                label=label,
+            )
         ax.axhline(0, color="gray", linewidth=0.6, linestyle=":")
         ax.set_xlabel("Distance")
         ax.set_ylabel(r"Correlation $\rho$")
@@ -444,8 +606,13 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
         print(f"Saved {curve_path}")
 
 
-def _report(out_dir: "str | None", real_results: "str | None", synthetic_results: "str | None",
-            baseline_real: "str | None", baseline_synthetic: "str | None") -> None:
+def _report(
+    out_dir: "str | None",
+    real_results: "str | None",
+    synthetic_results: "str | None",
+    baseline_real: "str | None",
+    baseline_synthetic: "str | None",
+) -> None:
     out_dir = out_dir or _FIGURES_DIR
     os.makedirs(out_dir, exist_ok=True)
 
@@ -458,15 +625,19 @@ def _report(out_dir: "str | None", real_results: "str | None", synthetic_results
         with open(real_path) as f:
             _report_mode(json.load(f), "real", out_dir, baseline_real_path)
     else:
-        print(f"No real sweep results at {real_path}; skipping real-mode report figures "
-              f"(run `sweep --mode real` first, or `all`).")
+        print(
+            f"No real sweep results at {real_path}; skipping real-mode report figures "
+            f"(run `sweep --mode real` first, or `all`)."
+        )
 
     if os.path.exists(synth_path):
         with open(synth_path) as f:
             _report_mode(json.load(f), "synthetic", out_dir, baseline_synth_path)
     else:
-        print(f"No synthetic sweep results at {synth_path}; skipping synthetic-mode report figures "
-              f"(run `sweep --mode synthetic` first, or `all`).")
+        print(
+            f"No synthetic sweep results at {synth_path}; skipping synthetic-mode report figures "
+            f"(run `sweep --mode synthetic` first, or `all`)."
+        )
 
 
 def cmd_report(args) -> None:
@@ -476,22 +647,45 @@ def cmd_report(args) -> None:
 def cmd_all(args) -> None:
     checkpoints = args.checkpoints or "all"
     baseline_synthetic_ckpt = (
-        [t.strip() for t in checkpoints.split(",") if t.strip()][-1]
-        if checkpoints != "all" else all_family_names()[-1]
+        [t.strip() for t in checkpoints.split(",") if t.strip()][-1] if checkpoints != "all" else all_family_names()[-1]
     )
     print("=== [all] 1/5: sweep --mode real ===")
-    _sweep("real", "low_context_7config", checkpoints, constants.N_CONTEXT, constants.N_DAYS,
-           constants.N_SYNTHETIC_DRAWS, args.device, constants.SEED,
-           compute_gp_baseline=not args.no_gp_baseline)
+    _sweep(
+        "real",
+        "low_context_7config",
+        checkpoints,
+        constants.N_CONTEXT,
+        constants.N_DAYS,
+        constants.N_SYNTHETIC_DRAWS,
+        args.device,
+        constants.SEED,
+        compute_gp_baseline=not args.no_gp_baseline,
+    )
     print("=== [all] 2/5: sweep --mode synthetic ===")
-    _sweep("synthetic", "low_context_7config", checkpoints, constants.N_CONTEXT, constants.N_DAYS,
-           constants.N_SYNTHETIC_DRAWS, args.device, constants.SEED)
+    _sweep(
+        "synthetic",
+        "low_context_7config",
+        checkpoints,
+        constants.N_CONTEXT,
+        constants.N_DAYS,
+        constants.N_SYNTHETIC_DRAWS,
+        args.device,
+        constants.SEED,
+    )
     print("=== [all] 3/5: baseline --mode real ===")
-    _baseline("real", "low_context_7config", constants.CURVE_FIT_LAWS, constants.N_DAYS, None,
-              args.device, constants.SEED)
+    _baseline(
+        "real", "low_context_7config", constants.CURVE_FIT_LAWS, constants.N_DAYS, None, args.device, constants.SEED
+    )
     print("=== [all] 4/5: baseline --mode synthetic ===")
-    _baseline("synthetic", "low_context_7config", constants.CURVE_FIT_LAWS, constants.N_DAYS,
-              baseline_synthetic_ckpt, args.device, constants.SEED)
+    _baseline(
+        "synthetic",
+        "low_context_7config",
+        constants.CURVE_FIT_LAWS,
+        constants.N_DAYS,
+        baseline_synthetic_ckpt,
+        args.device,
+        constants.SEED,
+    )
     print("=== [all] 5/5: report ===")
     _report(None, None, None, None, None)
     print(f"=== [all] done. Figures in {_FIGURES_DIR} ===")
@@ -502,15 +696,27 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_diag = sub.add_parser("diagnose", help="Single/multi-checkpoint deep-dive plots for one config.")
-    p_diag.add_argument("--ckpt", type=str, required=True,
-                         help="Comma-separated list of checkpoint family names (see eval/configs/checkpoints.py), "
-                              "'family:step', or raw .pt paths — looped over in-process, sharing the model cache.")
+    p_diag.add_argument(
+        "--ckpt",
+        type=str,
+        required=True,
+        help="Comma-separated list of checkpoint family names (see eval/configs/checkpoints.py), "
+        "'family:step', or raw .pt paths — looped over in-process, sharing the model cache.",
+    )
     p_diag.add_argument("--mode", choices=["real", "synthetic"], default="real")
-    p_diag.add_argument("--region", choices=list(regions.REGIONS), default="western_europe",
-                         help="[--mode real] Named region (eval/configs/regions.py).")
+    p_diag.add_argument(
+        "--region",
+        choices=list(regions.REGIONS),
+        default="western_europe",
+        help="[--mode real] Named region (eval/configs/regions.py).",
+    )
     p_diag.add_argument("--grid-size", type=int, default=24)
-    p_diag.add_argument("--kernel", choices=constants.SYNTHETIC_SWEEP_KERNELS, default=None,
-                         help="[--mode synthetic] Ground-truth kernel; random if omitted.")
+    p_diag.add_argument(
+        "--kernel",
+        choices=constants.SYNTHETIC_SWEEP_KERNELS,
+        default=None,
+        help="[--mode synthetic] Ground-truth kernel; random if omitted.",
+    )
     p_diag.add_argument("--n-days", type=int, default=constants.N_DAYS, help="[--mode real]")
     p_diag.add_argument("--n-context", type=int, default=constants.N_CONTEXT)
     p_diag.add_argument("--n-draws", type=int, default=constants.N_SYNTHETIC_DRAWS, help="[--mode synthetic]")
@@ -521,37 +727,57 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sweep = sub.add_parser("sweep", help="Batch scalar+curve metrics over a named config profile.")
     p_sweep.add_argument("--mode", choices=["real", "synthetic"], default="real")
-    p_sweep.add_argument("--profile", type=str, default="low_context_7config",
-                          help="Named config list — see eval/configs/regions.py:SWEEP_PROFILES "
-                               "(--mode real) / eval/configs/constants.py:SYNTHETIC_SWEEP_PROFILES (--mode synthetic).")
-    p_sweep.add_argument("--checkpoints", type=str, default="all",
-                          help="'all' (default, auto-discovers every eval/configs/checkpoints.py family), or a "
-                               "comma-separated list of family names / 'family:step' / raw .pt paths.")
+    p_sweep.add_argument(
+        "--profile",
+        type=str,
+        default="low_context_7config",
+        help="Named config list — see eval/configs/regions.py:SWEEP_PROFILES "
+        "(--mode real) / eval/configs/constants.py:SYNTHETIC_SWEEP_PROFILES (--mode synthetic).",
+    )
+    p_sweep.add_argument(
+        "--checkpoints",
+        type=str,
+        default="all",
+        help="'all' (default, auto-discovers every eval/configs/checkpoints.py family), or a "
+        "comma-separated list of family names / 'family:step' / raw .pt paths.",
+    )
     p_sweep.add_argument("--n-context", type=int, default=constants.N_CONTEXT)
     p_sweep.add_argument("--n-days", type=int, default=constants.N_DAYS, help="[--mode real]")
     p_sweep.add_argument("--n-draws", type=int, default=constants.N_SYNTHETIC_DRAWS, help="[--mode synthetic]")
     p_sweep.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     p_sweep.add_argument("--seed", type=int, default=constants.SEED)
     p_sweep.add_argument("--out", type=str, default=None, help="Default: eval/results/sweep_<mode>_<profile>.json")
-    p_sweep.add_argument("--gp-kernels", type=str, nargs="+", default=constants.GP_BASELINE_KERNELS,
-                          choices=constants.GP_BASELINE_KERNELS,
-                          help="[--mode real] Classical-GP-MLE kernels to fit as a real-ERA5 nll_total "
-                               "baseline (eval/spatial/sweep_core.py::_fit_gp_baseline_nll).")
+    p_sweep.add_argument(
+        "--gp-kernels",
+        type=str,
+        nargs="+",
+        default=constants.GP_BASELINE_KERNELS,
+        choices=constants.GP_BASELINE_KERNELS,
+        help="[--mode real] Classical-GP-MLE kernels to fit as a real-ERA5 nll_total "
+        "baseline (eval/spatial/sweep_core.py::_fit_gp_baseline_nll).",
+    )
     p_sweep.add_argument("--gp-n-steps-mle", type=int, default=constants.GP_N_STEPS_MLE)
     p_sweep.add_argument("--gp-lr-mle", type=float, default=constants.GP_LR_MLE)
     p_sweep.add_argument("--gp-n-restarts-mle", type=int, default=constants.GP_N_RESTARTS_MLE)
-    p_sweep.add_argument("--no-gp-baseline", action="store_true",
-                          help="[--mode real] Skip the classical-GP-MLE baseline nll_total fit.")
+    p_sweep.add_argument(
+        "--no-gp-baseline", action="store_true", help="[--mode real] Skip the classical-GP-MLE baseline nll_total fit."
+    )
     p_sweep.set_defaults(func=cmd_sweep)
 
     p_base = sub.add_parser("baseline", help="Direct (non-learned) theoretical-law curve fits against ground truth.")
     p_base.add_argument("--mode", choices=["real", "synthetic"], default="real")
     p_base.add_argument("--profile", type=str, default="low_context_7config")
-    p_base.add_argument("--laws", type=str, nargs="+", default=constants.CURVE_FIT_LAWS, choices=list(constants.CURVE_FIT_LAWS))
+    p_base.add_argument(
+        "--laws", type=str, nargs="+", default=constants.CURVE_FIT_LAWS, choices=list(constants.CURVE_FIT_LAWS)
+    )
     p_base.add_argument("--n-days", type=int, default=constants.N_DAYS, help="[--mode real]")
-    p_base.add_argument("--ckpt", type=str, default=None,
-                         help="[--mode synthetic] Checkpoint to source data_gen.py kernel-prior cfg from "
-                              "(no model forward pass) — default: the last registered family.")
+    p_base.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="[--mode synthetic] Checkpoint to source data_gen.py kernel-prior cfg from "
+        "(no model forward pass) — default: the last registered family.",
+    )
     p_base.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
     p_base.add_argument("--seed", type=int, default=constants.SEED)
     p_base.add_argument("--out", type=str, default=None, help="Default: eval/results/baseline_<mode>.json")
@@ -567,12 +793,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_all = sub.add_parser("all", help="sweep -> baseline -> report, real+synthetic, zero required flags.")
     p_all.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
-    p_all.add_argument("--checkpoints", type=str, default=None,
-                        help="'all' (default, every registered family) or a comma-separated list of "
-                             "family names / 'family:step' / raw .pt paths, same as `sweep --checkpoints`.")
-    p_all.add_argument("--no-gp-baseline", action="store_true",
-                        help="Skip the real-ERA5 classical-GP-MLE baseline nll_total fit (same as "
-                             "`sweep --no-gp-baseline`).")
+    p_all.add_argument(
+        "--checkpoints",
+        type=str,
+        default=None,
+        help="'all' (default, every registered family) or a comma-separated list of "
+        "family names / 'family:step' / raw .pt paths, same as `sweep --checkpoints`.",
+    )
+    p_all.add_argument(
+        "--no-gp-baseline",
+        action="store_true",
+        help="Skip the real-ERA5 classical-GP-MLE baseline nll_total fit (same as `sweep --no-gp-baseline`).",
+    )
     p_all.set_defaults(func=cmd_all)
 
     return parser

@@ -41,9 +41,7 @@ def test_z_test_is_centred_conditional_on_the_context(small_cfg):
     """E[z_test | context] = 0 per episode."""
     eps = _episodes(small_cfg, b=32)
     per_ep = np.array([float(ep["z_test"].double().mean()) for ep in eps])
-    assert abs(per_ep.mean()) < 0.15, (
-        f"mean per-episode E[z_test | context] = {per_ep.mean():+.4f}; expected ~0."
-    )
+    assert abs(per_ep.mean()) < 0.15, f"mean per-episode E[z_test | context] = {per_ep.mean():+.4f}; expected ~0."
 
 
 def test_analytic_pit_matches_gp_analytical_posterior_marginals(small_cfg):
@@ -53,14 +51,12 @@ def test_analytic_pit_matches_gp_analytical_posterior_marginals(small_cfg):
         rec = gp_analytical_pit(ep)
         z = rec["z_test"].double()
         # log_pdf = -0.5*log(2pi) - log(sigma) - 0.5*z^2  =>  recover sigma
-        sigma = torch.exp(
-            -0.5 * float(np.log(2.0 * np.pi)) - 0.5 * z**2 - rec["log_pdf_test"].double()
-        )
+        sigma = torch.exp(-0.5 * float(np.log(2.0 * np.pi)) - 0.5 * z**2 - rec["log_pdf_test"].double())
         mu = ep["y_test"].double() - z * sigma
         assert torch.allclose(mu, post["mu_post"].double(), atol=1e-3), "mu != mu_post"
-        assert torch.allclose(
-            sigma, post["Sigma_post"].double().diagonal().sqrt(), atol=1e-3
-        ), "sigma != sqrt(diag(Sigma_post))"
+        assert torch.allclose(sigma, post["Sigma_post"].double().diagonal().sqrt(), atol=1e-3), (
+            "sigma != sqrt(diag(Sigma_post))"
+        )
 
 
 def test_batched_generator_matches_single_episode_pit(small_cfg):
@@ -75,9 +71,7 @@ def test_analytic_pit_is_not_the_prior_standardisation(small_cfg):
     """z_test is not (y_test - mu_star) / sigma_star."""
     max_dev = 0.0
     for ep in _episodes(small_cfg, b=16):
-        prior_z = (ep["y_test"].double() - ep["mu_star"].double()) / ep[
-            "sigma_star"
-        ].double().clamp(min=1e-8)
+        prior_z = (ep["y_test"].double() - ep["mu_star"].double()) / ep["sigma_star"].double().clamp(min=1e-8)
         max_dev = max(max_dev, float((prior_z - ep["z_test"].double()).abs().max()))
     assert max_dev > 1e-3, (
         "z_test equals the PRIOR standardisation (y - mu_star)/sigma_star; "
@@ -101,9 +95,7 @@ def _second_moment_of_emitted_z(ep, post):
     with (mu_used, sigma_used) recovered from the emitted z_test/log_pdf_test.
     """
     z = ep["z_test"].double()
-    sigma_u = torch.exp(
-        -0.5 * float(np.log(2.0 * np.pi)) - 0.5 * z**2 - ep["log_pdf_test"].double()
-    )
+    sigma_u = torch.exp(-0.5 * float(np.log(2.0 * np.pi)) - 0.5 * z**2 - ep["log_pdf_test"].double())
     mu_u = ep["y_test"].double() - z * sigma_u
     Dinv = torch.diag(1.0 / sigma_u)
     delta = Dinv @ (post["mu_post"].double() - mu_u)

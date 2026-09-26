@@ -50,9 +50,12 @@ def main() -> None:
             config_name="finetune_marginal",
             overrides=[
                 f"training.batch_size={args.batch_size}",
-                f"data.P_min={args.p}", f"data.P_max={args.p}",
-                f"data.N_min={args.n}", f"data.N_max={args.n}",
-                "wandb.mode=disabled", "marginal.era5.mix_frac=0",
+                f"data.P_min={args.p}",
+                f"data.P_max={args.p}",
+                f"data.N_min={args.n}",
+                f"data.N_max={args.n}",
+                "wandb.mode=disabled",
+                "marginal.era5.mix_frac=0",
             ],
         )
 
@@ -62,20 +65,34 @@ def main() -> None:
     params = [p for p in tabicl.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=float(cfg.training.lr))
     _sync()
-    print(f"gpu={torch.cuda.get_device_name()} model_load_s={time.perf_counter() - t0:.3f} "
-          f"trainable={report['n_trainable_params']}", flush=True)
+    print(
+        f"gpu={torch.cuda.get_device_name()} model_load_s={time.perf_counter() - t0:.3f} "
+        f"trainable={report['n_trainable_params']}",
+        flush=True,
+    )
 
     weights = MarginalLossWeights(
-        distill=float(cfg.marginal.loss.distill), nll=float(cfg.marginal.loss.nll),
-        crps=float(cfg.marginal.loss.crps), tail_power=float(cfg.marginal.loss.tail_power),
+        distill=float(cfg.marginal.loss.distill),
+        nll=float(cfg.marginal.loss.nll),
+        crps=float(cfg.marginal.loss.crps),
+        tail_power=float(cfg.marginal.loss.tail_power),
     )
     gp_cfg = _gp_cfg(cfg)
     gen = torch.Generator().manual_seed(55)
     amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.amp)
-    totals = {name: 0.0 for name in (
-        "generation", "collate", "tabicl_forward", "analytic_targets",
-        "objective", "backward", "optimizer", "step",
-    )}
+    totals = {
+        name: 0.0
+        for name in (
+            "generation",
+            "collate",
+            "tabicl_forward",
+            "analytic_targets",
+            "objective",
+            "backward",
+            "optimizer",
+            "step",
+        )
+    }
     measured = 0
     torch.cuda.reset_peak_memory_stats()
 
@@ -90,15 +107,18 @@ def main() -> None:
         generation = time.perf_counter() - t
 
         parts: dict[str, float] | None = {} if measure else None
-        amp_ctx = (
-            torch.autocast(device_type="cuda", dtype=amp_dtype)
-            if amp_dtype is not None else nullcontext()
-        )
+        amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if amp_dtype is not None else nullcontext()
         with amp_ctx:
             res = phase_a_batch_loss(
-                tabicl, episodes, weights, k_folds=int(cfg.marginal.k_folds),
-                folds_per_step=args.folds_per_step, generator=gen, device=device,
-                eps=float(cfg.marginal.pit_eps), timings=parts,
+                tabicl,
+                episodes,
+                weights,
+                k_folds=int(cfg.marginal.k_folds),
+                folds_per_step=args.folds_per_step,
+                generator=gen,
+                device=device,
+                eps=float(cfg.marginal.pit_eps),
+                timings=parts,
             )
         if not torch.isfinite(res["loss"]):
             raise RuntimeError(f"non-finite loss under amp={args.amp}")
@@ -122,13 +142,13 @@ def main() -> None:
             totals["optimizer"] += optimizer
             totals["step"] += elapsed
             detail = " ".join(f"{key}={value:.3f}" for key, value in (parts or {}).items())
-            print(f"step={measured} generation={generation:.3f} {detail} "
-                  f"backward={backward:.3f} optimizer={optimizer:.3f} total={elapsed:.3f}",
-                  flush=True)
+            print(
+                f"step={measured} generation={generation:.3f} {detail} "
+                f"backward={backward:.3f} optimizer={optimizer:.3f} total={elapsed:.3f}",
+                flush=True,
+            )
 
-    print("mean_seconds " + " ".join(
-        f"{key}={value / measured:.4f}" for key, value in totals.items()
-    ), flush=True)
+    print("mean_seconds " + " ".join(f"{key}={value / measured:.4f}" for key, value in totals.items()), flush=True)
     print(f"peak_cuda_gib={torch.cuda.max_memory_allocated() / 2**30:.3f}", flush=True)
 
 

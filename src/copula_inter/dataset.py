@@ -40,7 +40,7 @@ def _add_derived_fields(ep: dict) -> dict:
 class CopulaDataset(Dataset):
     """Dataset of saved PIT episodes (individual files or shards)."""
 
-    _SHARD_CACHE_SIZE = 4   # default shards kept in memory per worker process
+    _SHARD_CACHE_SIZE = 4  # default shards kept in memory per worker process
 
     def __init__(
         self,
@@ -60,7 +60,7 @@ class CopulaDataset(Dataset):
         if episode_dir is None:
             raise ValueError("Provide either episode_dir or file_list.")
 
-        meta_path   = os.path.join(episode_dir, "meta.pt")
+        meta_path = os.path.join(episode_dir, "meta.pt")
         shard_files = sorted(glob(os.path.join(episode_dir, "shard_*.pt")))
 
         if shard_files and os.path.exists(meta_path):
@@ -69,29 +69,26 @@ class CopulaDataset(Dataset):
             indiv_files = sorted(glob(os.path.join(episode_dir, "task_*.pt")))
             if not indiv_files:
                 raise RuntimeError(
-                    f"No episode files found in {episode_dir}. "
-                    "Expected shard_*.pt+meta.pt or task_*.pt files."
+                    f"No episode files found in {episode_dir}. Expected shard_*.pt+meta.pt or task_*.pt files."
                 )
             self._init_individual(indiv_files)
 
-
     def _init_individual(self, files: List[str]) -> None:
-        self._mode  = "individual"
+        self._mode = "individual"
         existing = [f for f in files if os.path.isfile(f)]
         if len(existing) < len(files):
             import warnings
-            warnings.warn(
-                f"CopulaDataset: {len(files) - len(existing)} listed file(s) missing on disk."
-            )
+
+            warnings.warn(f"CopulaDataset: {len(files) - len(existing)} listed file(s) missing on disk.")
         if not existing:
             raise RuntimeError("No .pt files available.")
         self._files = existing
 
     def _init_sharded(self, shard_files: List[str], meta_path: str) -> None:
-        self._mode         = "sharded"
-        meta               = torch.load(meta_path, map_location="cpu", weights_only=True)
-        self._n_total      = int(meta["n_total"])
-        self._shard_size   = int(meta["shard_size"])
+        self._mode = "sharded"
+        meta = torch.load(meta_path, map_location="cpu", weights_only=True)
+        self._n_total = int(meta["n_total"])
+        self._shard_size = int(meta["shard_size"])
         if self._n_total < 0 or self._shard_size <= 0:
             raise ValueError(f"invalid shard metadata in {meta_path}")
         needed = (self._n_total + self._shard_size - 1) // self._shard_size
@@ -119,7 +116,6 @@ class CopulaDataset(Dataset):
                 raise ValueError(f"shard counts disagree with {meta_path}")
         self._shard_cache: OrderedDict[str, list] = OrderedDict()
 
-
     @property
     def shard_size(self) -> int:
         """Episodes per shard (only meaningful in sharded mode)."""
@@ -137,7 +133,6 @@ class CopulaDataset(Dataset):
             return self._get_individual(idx)
         return self._get_sharded(idx)
 
-
     def _get_individual(self, idx: int) -> dict:
         try:
             ep = torch.load(self._files[idx], map_location="cpu", weights_only=True, mmap=True)
@@ -147,30 +142,31 @@ class CopulaDataset(Dataset):
                 raise
             ep = torch.load(
                 self._files[random.choice(candidates)],
-                map_location="cpu", weights_only=True, mmap=True,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
             )
         return _add_derived_fields(ep)
-
 
     _MAX_INVALID_RETRIES = 8
 
     def _load_shard_entry(self, idx: int) -> dict:
         if idx < 0 or idx >= self._n_total:
             raise IndexError(idx)
-        shard_idx  = idx // self._shard_size
-        local_idx  = idx  - shard_idx * self._shard_size
+        shard_idx = idx // self._shard_size
+        local_idx = idx - shard_idx * self._shard_size
         shard_path = self._shard_files[shard_idx]
 
         if shard_path not in self._shard_cache:
             if len(self._shard_cache) >= self._SHARD_CACHE_SIZE:
-                self._shard_cache.popitem(last=False)   # evict LRU
+                self._shard_cache.popitem(last=False)  # evict LRU
             shard = torch.load(shard_path, map_location="cpu", weights_only=False, mmap=True)
             self._shard_cache[shard_path] = shard
         else:
             # Move to end to mark as most-recently used
             self._shard_cache.move_to_end(shard_path)
 
-        shard     = self._shard_cache[shard_path]
+        shard = self._shard_cache[shard_path]
         if local_idx >= len(shard):
             raise ValueError(f"shard {shard_path} has fewer episodes than its metadata declares")
         # Derive R_prior/Sigma_star on a shallow copy so the cached shard stays mmap-only.
@@ -178,9 +174,9 @@ class CopulaDataset(Dataset):
 
     def _get_sharded(self, idx: int) -> dict:
         # Skip non-finite episodes, to the next episode in the same shard.
-        shard_size  = self._shard_size
+        shard_size = self._shard_size
         shard_start = (idx // shard_size) * shard_size
-        shard_len   = min(shard_size, self._n_total - shard_start)
+        shard_len = min(shard_size, self._n_total - shard_start)
         probe = idx
         for _ in range(self._MAX_INVALID_RETRIES):
             ep = self._load_shard_entry(probe)
@@ -188,6 +184,7 @@ class CopulaDataset(Dataset):
                 return ep
             next_probe = shard_start + (probe - shard_start + 1) % shard_len
             import warnings
+
             warnings.warn(
                 f"CopulaDataset: episode at idx {probe} has non-finite "
                 f"z_train/y_train (stale degenerate episode); skipping to "
@@ -215,7 +212,7 @@ def collate_fn(samples: List[dict]) -> dict:
         raise ValueError("collate_fn requires at least one episode")
     for sample in samples:
         validate_episode(sample)
-    B   = len(samples)
+    B = len(samples)
     d_x = samples[0]["x_norm_train"].shape[-1]
 
     # Episodes with different d_features cannot be stacked (use ShardHomogeneousBatchSampler).
@@ -230,62 +227,62 @@ def collate_fn(samples: List[dict]) -> dict:
 
     P_list = [int(s["n_train"]) for s in samples]
     N_list = [int(s["n_test"]) for s in samples]
-    P_max  = max(P_list)
-    N_max  = max(N_list)
+    P_max = max(P_list)
+    N_max = max(N_list)
 
-    x_train      = torch.zeros(B, P_max, d_x)
-    x_test       = torch.zeros(B, N_max, d_x)
-    y_train      = torch.zeros(B, P_max)
-    y_test       = torch.zeros(B, N_max)
-    z_train      = torch.zeros(B, P_max)
-    z_test       = torch.zeros(B, N_max)
+    x_train = torch.zeros(B, P_max, d_x)
+    x_test = torch.zeros(B, N_max, d_x)
+    y_train = torch.zeros(B, P_max)
+    y_test = torch.zeros(B, N_max)
+    z_train = torch.zeros(B, P_max)
+    z_test = torch.zeros(B, N_max)
     log_pdf_test = torch.zeros(B, N_max)
-    train_mask   = torch.zeros(B, P_max, dtype=torch.bool)
-    test_mask    = torch.zeros(B, N_max, dtype=torch.bool)
-    R_star       = torch.zeros(B, N_max, N_max)
-    Sigma_star   = torch.zeros(B, N_max, N_max)
-    mu_star      = torch.zeros(B, N_max)
-    sigma_star   = torch.zeros(B, N_max)
+    train_mask = torch.zeros(B, P_max, dtype=torch.bool)
+    test_mask = torch.zeros(B, N_max, dtype=torch.bool)
+    R_star = torch.zeros(B, N_max, N_max)
+    Sigma_star = torch.zeros(B, N_max, N_max)
+    mu_star = torch.zeros(B, N_max)
+    sigma_star = torch.zeros(B, N_max)
     # R_prior is optional.
-    has_prior    = "R_prior" in samples[0]
-    R_prior      = torch.zeros(B, N_max, N_max) if has_prior else None
+    has_prior = "R_prior" in samples[0]
+    R_prior = torch.zeros(B, N_max, N_max) if has_prior else None
 
     for b, s in enumerate(samples):
         P = P_list[b]
         N = N_list[b]
 
-        x_train[b, :P]      = s["x_norm_train"]
-        x_test[b,  :N]      = s["x_norm_test"]
-        y_train[b, :P]      = s["y_train"]
-        y_test[b,  :N]      = s["y_test"]
-        z_train[b, :P]      = s["z_train"]
-        z_test[b,  :N]      = s["z_test"]
+        x_train[b, :P] = s["x_norm_train"]
+        x_test[b, :N] = s["x_norm_test"]
+        y_train[b, :P] = s["y_train"]
+        y_test[b, :N] = s["y_test"]
+        z_train[b, :P] = s["z_train"]
+        z_test[b, :N] = s["z_test"]
         log_pdf_test[b, :N] = s["log_pdf_test"]
-        train_mask[b, :P]   = True
-        test_mask[b,  :N]   = True
-        R_star[b,    :N, :N] = s["R_star"]
+        train_mask[b, :P] = True
+        test_mask[b, :N] = True
+        R_star[b, :N, :N] = s["R_star"]
         Sigma_star[b, :N, :N] = s["Sigma_star"]
-        mu_star[b,   :N]    = s["mu_star"]
-        sigma_star[b, :N]   = s["sigma_star"]
+        mu_star[b, :N] = s["mu_star"]
+        sigma_star[b, :N] = s["sigma_star"]
         if has_prior:
             R_prior[b, :N, :N] = s["R_prior"]
 
     out = {
-        "x_train":      x_train,
-        "x_test":       x_test,
-        "y_train":      y_train,
-        "y_test":       y_test,
-        "z_train":      z_train,
-        "z_test":       z_test,
+        "x_train": x_train,
+        "x_test": x_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "z_train": z_train,
+        "z_test": z_test,
         "log_pdf_test": log_pdf_test,
-        "train_mask":   train_mask,
-        "test_mask":    test_mask,
-        "R_star":       R_star,
-        "Sigma_star":   Sigma_star,
-        "mu_star":      mu_star,
-        "sigma_star":   sigma_star,
-        "n_train":      torch.tensor(P_list, dtype=torch.long),
-        "n_test":       torch.tensor(N_list, dtype=torch.long),
+        "train_mask": train_mask,
+        "test_mask": test_mask,
+        "R_star": R_star,
+        "Sigma_star": Sigma_star,
+        "mu_star": mu_star,
+        "sigma_star": sigma_star,
+        "n_train": torch.tensor(P_list, dtype=torch.long),
+        "n_test": torch.tensor(N_list, dtype=torch.long),
     }
     if has_prior:
         out["R_prior"] = R_prior

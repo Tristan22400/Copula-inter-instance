@@ -38,12 +38,19 @@ from eval.spatial.marginal_backends import BACKEND_NAMES, _exaone_capture_quanti
 
 def _episode(p: int = 3, n: int = 2, d: int = 4) -> dict:
     return {
-        "x_norm_train": torch.randn(p, d), "x_norm_test": torch.randn(n, d),
-        "y_train": torch.randn(p), "y_test": torch.randn(n),
-        "z_train": torch.randn(p), "z_test": torch.randn(n),
-        "log_pdf_test": torch.randn(n), "R_star": torch.eye(n),
-        "Sigma_star": torch.eye(n), "mu_star": torch.zeros(n), "sigma_star": torch.ones(n),
-        "n_train": torch.tensor(p), "n_test": torch.tensor(n),
+        "x_norm_train": torch.randn(p, d),
+        "x_norm_test": torch.randn(n, d),
+        "y_train": torch.randn(p),
+        "y_test": torch.randn(n),
+        "z_train": torch.randn(p),
+        "z_test": torch.randn(n),
+        "log_pdf_test": torch.randn(n),
+        "R_star": torch.eye(n),
+        "Sigma_star": torch.eye(n),
+        "mu_star": torch.zeros(n),
+        "sigma_star": torch.ones(n),
+        "n_train": torch.tensor(p),
+        "n_test": torch.tensor(n),
     }
 
 
@@ -67,10 +74,20 @@ def test_episode_contract_and_padding() -> None:
 def test_manifest_rejects_changed_settings_and_checkpoint_bytes(tmp_path) -> None:
     checkpoint = tmp_path / "marginal.pt"
     checkpoint.write_bytes(b"weights A")
-    cfg = OmegaConf.create({"seed": 7, "data": {
-        "n_tasks": 2, "shard_size": 2, "z_train_source": "tabicl",
-        "dataset_dir": str(tmp_path), "pit_dir": str(tmp_path / "pit"), "resume": False,
-    }, "tabicl": {"ckpt": str(checkpoint)}})
+    cfg = OmegaConf.create(
+        {
+            "seed": 7,
+            "data": {
+                "n_tasks": 2,
+                "shard_size": 2,
+                "z_train_source": "tabicl",
+                "dataset_dir": str(tmp_path),
+                "pit_dir": str(tmp_path / "pit"),
+                "resume": False,
+            },
+            "tabicl": {"ckpt": str(checkpoint)},
+        }
+    )
     directory = tmp_path / "pit"
     spec = generation_spec(cfg, str(checkpoint))
     first = ensure_manifest(directory, spec)
@@ -104,7 +121,9 @@ def test_assembly_keeps_metadata_aligned_after_discard() -> None:
     tensors = {"z_test": torch.tensor([[1.0], [2.0], [3.0]])}
     components = [{"lengthscale": torch.tensor([10.0, 20.0, 30.0])}]
     result = assemble_episodes(
-        tensors, {"kernel": "rbf+matern32"}, torch.tensor([False, True, False]),
+        tensors,
+        {"kernel": "rbf+matern32"},
+        torch.tensor([False, True, False]),
         (["rbf", "matern32"], ["+"], components),
     )
     assert [float(ep["z_test"][0]) for ep in result] == [1.0, 3.0]
@@ -153,13 +172,23 @@ def test_scored_fingerprint_tracks_checkpoint_and_resolved_marginal(tmp_path) ->
     marginal = tmp_path / "marginal.pt"
     checkpoint.write_bytes(b"model A")
     marginal.write_bytes(b"marginal A")
-    args = Namespace(**{
-        "ckpt": str(checkpoint), "tabicl_ckpt": None, "z_train_source": "tabicl",
-        "tabicl_amp": False, "marginal_probs_n": 99, "n_folds": 2,
-        "min_fold_size": 2, "seed": 1, "zeromean_gp": False,
-        "n_steps_zeromean_gp": 1, "lr_zeromean_gp": 0.01,
-        "n_restarts_zeromean_gp": 1, "autoregressive": False,
-    })
+    args = Namespace(
+        **{
+            "ckpt": str(checkpoint),
+            "tabicl_ckpt": None,
+            "z_train_source": "tabicl",
+            "tabicl_amp": False,
+            "marginal_probs_n": 99,
+            "n_folds": 2,
+            "min_fold_size": 2,
+            "seed": 1,
+            "zeromean_gp": False,
+            "n_steps_zeromean_gp": 1,
+            "lr_zeromean_gp": 0.01,
+            "n_restarts_zeromean_gp": 1,
+            "autoregressive": False,
+        }
+    )
     first = _results_fingerprint({}, args, 5, resolved_marginal=str(marginal))
     copied = tmp_path / "same-model.pt"
     copied.write_bytes(checkpoint.read_bytes())
@@ -174,17 +203,20 @@ def test_scored_fingerprint_tracks_checkpoint_and_resolved_marginal(tmp_path) ->
 
 
 def test_result_ties_and_coverage_are_explicit() -> None:
-    ranks = competition_ranks([{"a": 1.0, "b": 1.0, "c": 3.0, "d": float("nan")}],
-                              ["a", "b", "c", "d"])
+    ranks = competition_ranks([{"a": 1.0, "b": 1.0, "c": 3.0, "d": float("nan")}], ["a", "b", "c", "d"])
     assert ranks == {"a": [1], "b": [1], "c": [3], "d": []}
     interleaved = competition_ranks([{"a": 2.0, "b": float("nan"), "c": 1.0}], ["a", "b", "c"])
     assert interleaved == {"a": [2], "b": [], "c": [1]}
     with pytest.raises(RuntimeError, match="coverage 1/2"):
         require_coverage(1, 2, 0.75)
-    table = render_saved_totals({"episodes": [
-        {"total_nlls": {"icl": {"total": 1.0}}},
-        {"total_nlls": {"icl": {"total": float("nan")}}},
-    ]})
+    table = render_saved_totals(
+        {
+            "episodes": [
+                {"total_nlls": {"icl": {"total": 1.0}}},
+                {"total_nlls": {"icl": {"total": float("nan")}}},
+            ]
+        }
+    )
     assert "1/2" in table
 
 
@@ -227,9 +259,13 @@ def test_backend_registry_capabilities() -> None:
 
 def test_training_core_import_does_not_load_reporting_or_era5() -> None:
     subprocess.run(
-        [sys.executable, "-c", "import sys, copula_inter.training_core; "
-         "assert not any(name == 'wandb' or name.startswith(('matplotlib', 'eval.data.era5')) "
-         "for name in sys.modules)"],
+        [
+            sys.executable,
+            "-c",
+            "import sys, copula_inter.training_core; "
+            "assert not any(name == 'wandb' or name.startswith(('matplotlib', 'eval.data.era5')) "
+            "for name in sys.modules)",
+        ],
         check=True,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
     )

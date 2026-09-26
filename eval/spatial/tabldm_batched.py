@@ -64,13 +64,15 @@ def _group_episode_batches(per_episode):
 
 
 def _quantile_bank_batched(
-    regressor, X_context: list, y_context: list, X_query: list, probs: np.ndarray,
+    regressor,
+    X_context: list,
+    y_context: list,
+    X_query: list,
+    probs: np.ndarray,
 ) -> np.ndarray:
     """(B, n_query, len(probs)) quantiles in raw y units, one fused forward per shape group."""
     B = len(X_context)
-    per_episode = [
-        _episode_member_batch(regressor, X_context[b], y_context[b], X_query[b]) for b in range(B)
-    ]
+    per_episode = [_episode_member_batch(regressor, X_context[b], y_context[b], X_query[b]) for b in range(B)]
     banks = [None] * B
     for indices in _group_episode_batches(per_episode):
         members = per_episode[indices[0]][0].shape[0]
@@ -86,16 +88,27 @@ def _quantile_bank_batched(
 
 
 def tabldm_run_pit_batched(
-    regressor, X_train: np.ndarray, Y_train: np.ndarray, X_test: np.ndarray, Y_test: np.ndarray,
-    k_folds: int = 10, probs_n: int = 99, eps: float = 1e-6, seed: int = 0,
+    regressor,
+    X_train: np.ndarray,
+    Y_train: np.ndarray,
+    X_test: np.ndarray,
+    Y_test: np.ndarray,
+    k_folds: int = 10,
+    probs_n: int = 99,
+    eps: float = 1e-6,
+    seed: int = 0,
 ) -> dict:
     """run_pit_batched for TabLDM, via the shared K-fold driver."""
     from eval.spatial._batched_pit import run_kfold_pit_batched
 
     return run_kfold_pit_batched(
-        lambda X_ctx, y_ctx, X_qry, probs: _quantile_bank_batched(
-            regressor, X_ctx, y_ctx, X_qry, probs
-        ),
-        X_train, Y_train, X_test, Y_test,
-        k_folds=k_folds, probs_n=probs_n, eps=eps, seed=seed,
+        lambda X_ctx, y_ctx, X_qry, probs: _quantile_bank_batched(regressor, X_ctx, y_ctx, X_qry, probs),
+        X_train,
+        Y_train,
+        X_test,
+        Y_test,
+        k_folds=k_folds,
+        probs_n=probs_n,
+        eps=eps,
+        seed=seed,
     )

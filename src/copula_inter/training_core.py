@@ -1,4 +1,5 @@
 """The training schedule and single-step execution used by all entrypoints."""
+
 from __future__ import annotations
 
 import math
@@ -17,9 +18,7 @@ def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> 
         return step / max(1, warmup)
     # Clamp progress to [0, 1] (a resumed run can start past training.steps).
     progress = min(1.0, (step - warmup) / max(1, total - warmup))
-    return lr_min_frac + (1.0 - lr_min_frac) * 0.5 * (
-        1.0 + math.cos(math.pi * progress)
-    )
+    return lr_min_frac + (1.0 - lr_min_frac) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def _forward_and_loss(
@@ -74,9 +73,7 @@ def _forward_and_loss(
         n_test = Sigma_dense.shape[1]
         mask_2d = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
         if n_test not in triu_cache:
-            triu_cache[n_test] = torch.triu_indices(
-                n_test, n_test, offset=1, device=Sigma_dense.device
-            )
+            triu_cache[n_test] = torch.triu_indices(n_test, n_test, offset=1, device=Sigma_dense.device)
         ri, ci = triu_cache[n_test]
         valid_off = mask_2d[:, ri, ci]
         if valid_off.any():
@@ -181,4 +178,3 @@ def _run_train_step(
     scheduler.step()
     phase_end("backward_step", ev_bwd0)
     return out, Sigma, parts, loss, aux_mae, grad_norm
-

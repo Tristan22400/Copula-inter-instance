@@ -52,8 +52,7 @@ def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch):
         return [episode(4)]
 
     monkeypatch.setattr(entrypoint, "generate_gp_batch", fake_generate)
-    cfg = OmegaConf.create({"seed": 9, "data": {"P_min": 2, "P_max": 8,
-                                                  "N_min": 3, "N_max": 3}})
+    cfg = OmegaConf.create({"seed": 9, "data": {"P_min": 2, "P_max": 8, "N_min": 3, "N_max": 3}})
     got = _generate_phase_a_gp_batch(cfg, 3, "cpu")
     assert [ep["x_norm_train"].shape[0] for ep in got] == [4, 4, 4]
     assert calls[1][1:] == (4, 4, 2)
@@ -81,8 +80,9 @@ def _tiny_tabicl(num_quantiles: int = 33) -> nn.Module:
     )
 
 
-def _rbf_task(P: int = 12, N: int = 5, d: int = 2, ls: float = 0.7,
-              alpha2: float = 1.3, nugget: float = 0.05, seed: int = 0) -> dict:
+def _rbf_task(
+    P: int = 12, N: int = 5, d: int = 2, ls: float = 0.7, alpha2: float = 1.3, nugget: float = 0.05, seed: int = 0
+) -> dict:
     """Episode dict with a known RBF kernel and a genuine GP draw, carrying the keys _kernel_fn_from_task and _mean_train_from_task read."""
     g = torch.Generator().manual_seed(seed)
     x = torch.rand(P + N, d, generator=g) * 2 - 1
@@ -98,9 +98,14 @@ def _rbf_task(P: int = 12, N: int = 5, d: int = 2, ls: float = 0.7,
         "l": torch.tensor(ls),
         "alpha2": torch.tensor(alpha2),
         "nugget": torch.tensor(nugget),
-        "period": zero, "rq_alpha": zero, "power": zero,
-        "l_b": zero, "alpha2_b": zero, "period_b": zero,
-        "rq_alpha_b": zero, "power_b": zero,
+        "period": zero,
+        "rq_alpha": zero,
+        "power": zero,
+        "l_b": zero,
+        "alpha2_b": zero,
+        "period_b": zero,
+        "rq_alpha_b": zero,
+        "power_b": zero,
         "kernel_feature_indices": torch.arange(d),
         "mean_nonzero": torch.tensor(False),
         "x_norm_train": x[:P],
@@ -153,8 +158,7 @@ def test_tier3_adds_lora_to_every_backbone_stage():
     m = _tiny_tabicl()
     report = apply_tier(m, 3, lora_rank=2, lora_alpha=4.0)
     lora_names = {
-        name for name, p in m.named_parameters()
-        if p.requires_grad and ("lora_A_" in name or "lora_B_" in name)
+        name for name, p in m.named_parameters() if p.requires_grad and ("lora_A_" in name or "lora_B_" in name)
     }
     assert report["lora_modules_replaced"] > 0
     assert any(name.startswith("col_embedder.") for name in lora_names)
@@ -173,7 +177,7 @@ def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward():
     torch.manual_seed(0)
     m = _tiny_tabicl()
     ref = _tiny_tabicl()
-    ref.load_state_dict(m.state_dict())          # identical starting point
+    ref.load_state_dict(m.state_dict())  # identical starting point
 
     apply_tier(m, 1, lora_rank=4, lora_alpha=8.0)
     # Perturb the adapters so the merge is a real merge, not a no-op on zeros.
@@ -183,18 +187,30 @@ def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward():
                 p.normal_(0.0, 0.05)
 
     sd = merged_base_state_dict(m)
-    fresh = TabICL(**{
-        "max_classes": 0, "num_quantiles": 33, "embed_dim": 16,
-        "col_num_blocks": 1, "col_nhead": 2, "col_num_inds": 8,
-        "col_target_aware": True, "row_num_blocks": 1, "row_nhead": 2,
-        "row_num_cls": 2, "icl_num_blocks": 2, "icl_nhead": 2,
-        "ff_factor": 1, "dropout": 0.0,
-    })
-    fresh.load_state_dict(sd)                    # strict — the actual assertion
+    fresh = TabICL(
+        **{
+            "max_classes": 0,
+            "num_quantiles": 33,
+            "embed_dim": 16,
+            "col_num_blocks": 1,
+            "col_nhead": 2,
+            "col_num_inds": 8,
+            "col_target_aware": True,
+            "row_num_blocks": 1,
+            "row_nhead": 2,
+            "row_num_cls": 2,
+            "icl_num_blocks": 2,
+            "icl_nhead": 2,
+            "ff_factor": 1,
+            "dropout": 0.0,
+        }
+    )
+    fresh.load_state_dict(sd)  # strict — the actual assertion
 
     x = torch.randn(2, 14, 3)
     y = torch.randn(2, 10)
-    m.train(); fresh.train()
+    m.train()
+    fresh.train()
     with torch.no_grad():
         a = m(x, y)
         b = fresh(x, y)
@@ -233,18 +249,15 @@ def test_analytic_target_is_observable_y_not_latent_f():
     task = _rbf_task(P=10, N=4, seed=2)
     kfn = build_kernel_fn("rbf", 0.7, 1.3, active_dims=[0, 1])
     nug = float(task["nugget"])
-    _, sigma = analytic_marginal_targets(task, task["x_norm_train"], task["y_train"],
-                                         task["x_norm_test"])
+    _, sigma = analytic_marginal_targets(task, task["x_norm_train"], task["y_train"], task["x_norm_test"])
 
-    _, S_obs = gp_posterior(task["x_norm_train"], task["y_train"], task["x_norm_test"],
-                            kfn, nug, latent=False)
-    _, S_lat = gp_posterior(task["x_norm_train"], task["y_train"], task["x_norm_test"],
-                            kfn, nug, latent=True)
+    _, S_obs = gp_posterior(task["x_norm_train"], task["y_train"], task["x_norm_test"], kfn, nug, latent=False)
+    _, S_lat = gp_posterior(task["x_norm_train"], task["y_train"], task["x_norm_test"], kfn, nug, latent=True)
 
     assert torch.allclose(sigma, S_obs.diagonal().clamp(min=0).sqrt(), atol=1e-4)
     assert not torch.allclose(sigma, S_lat.diagonal().clamp(min=0).sqrt(), atol=1e-3)
     # And the difference is exactly the nugget, on the variance scale.
-    assert torch.allclose(sigma ** 2 - S_lat.diagonal(), torch.full_like(sigma, nug), atol=1e-4)
+    assert torch.allclose(sigma**2 - S_lat.diagonal(), torch.full_like(sigma, nug), atol=1e-4)
 
 
 def test_analytic_target_contracts_with_more_context():
@@ -289,7 +302,7 @@ def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K):
     for i in range(P):
         k = i // fold_size
         ctx = torch.tensor([j for j in range(P) if not (k * fold_size <= j < min((k + 1) * fold_size, P))])
-        mu_i, sig_i = analytic_marginal_targets(task, x[ctx], y[ctx], x[i:i + 1])
+        mu_i, sig_i = analytic_marginal_targets(task, x[ctx], y[ctx], x[i : i + 1])
         assert torch.allclose(mu[i], mu_i[0], atol=1e-4), i
         assert torch.allclose(sigma[i], sig_i[0], atol=1e-4), i
 
@@ -321,8 +334,7 @@ def test_fold_subset_rows_match_a_full_pit_pass():
 
     from copula_inter.pit import _run_pit_batched_impl
 
-    sub = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, K, 1e-6,
-                                return_quantiles=True, fold_subset=[1, 3])
+    sub = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, K, 1e-6, return_quantiles=True, fold_subset=[1, 3])
     rows = sub["train_query_idx"]
     assert rows.numel() > 0
     assert torch.allclose(sub["z_train"], full["z_train"][:, rows, :], atol=0)
@@ -338,8 +350,7 @@ def test_fold_subset_empty_returns_test_only():
     Xtr, Ytr = torch.randn(1, 8, 2), torch.randn(1, 8, 1)
     Xte, Yte = torch.randn(1, 3, 2), torch.randn(1, 3, 1)
     full = run_pit_batched(tab, Xtr, Ytr, Xte, Yte, k_folds=4)
-    only = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, 4, 1e-6,
-                                 return_quantiles=True, fold_subset=[])
+    only = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, 4, 1e-6, return_quantiles=True, fold_subset=[])
     assert "z_train" not in only
     assert torch.allclose(only["z_test"], full["z_test"], atol=0)
     assert only["q_test"].shape[:3] == (1, 3, 1)
@@ -354,12 +365,27 @@ def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output():
     Xtr, Ytr = torch.randn(2, 9, 2), torch.randn(2, 9, 1)
     Xte, Yte = torch.randn(2, 4, 2), torch.randn(2, 4, 1)
     full = _run_pit_batched_impl(
-        tab, Xtr, Ytr, Xte, Yte, 3, 1e-6,
-        return_quantiles=True, fold_subset=[0, 2],
+        tab,
+        Xtr,
+        Ytr,
+        Xte,
+        Yte,
+        3,
+        1e-6,
+        return_quantiles=True,
+        fold_subset=[0, 2],
     )
     fast = _run_pit_batched_impl(
-        tab, Xtr, Ytr, Xte, Yte, 3, 1e-6,
-        return_quantiles=True, fold_subset=[0, 2], compute_pit=False,
+        tab,
+        Xtr,
+        Ytr,
+        Xte,
+        Yte,
+        3,
+        1e-6,
+        return_quantiles=True,
+        fold_subset=[0, 2],
+        compute_pit=False,
     )
     assert torch.equal(fast["train_query_idx"], full["train_query_idx"])
     assert torch.equal(fast["q_train"], full["q_train"])
@@ -377,9 +403,7 @@ def test_fused_fold_forward_matches_separate_forwards():
     Xte, Yte = torch.randn(2, 4, 2), torch.randn(2, 4, 1)
     kwargs = dict(return_quantiles=True, fold_subset=[0, 2, 4], compute_pit=False)
     separate = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, 5, 1e-6, **kwargs)
-    fused = _run_pit_batched_impl(
-        tab, Xtr, Ytr, Xte, Yte, 5, 1e-6, fuse_folds=True, **kwargs
-    )
+    fused = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, 5, 1e-6, fuse_folds=True, **kwargs)
     assert torch.equal(fused["train_query_idx"], separate["train_query_idx"])
     assert torch.equal(fused["q_train"], separate["q_train"])
     assert torch.equal(fused["q_test"], separate["q_test"])
@@ -411,7 +435,7 @@ def test_distillation_respects_target_mask():
     mu = torch.randn(M)
     sigma = torch.rand(M) + 0.5
     q = mu.unsqueeze(-1) + sigma.unsqueeze(-1) * _probit(alpha).unsqueeze(0)
-    q[:3] += 1.0                                # first three deliberately wrong
+    q[:3] += 1.0  # first three deliberately wrong
 
     w = MarginalLossWeights(distill=1.0, nll=0.0, crps=0.0)
     mask = torch.tensor([False] * 3 + [True] * 3)
@@ -421,8 +445,7 @@ def test_distillation_respects_target_mask():
     assert float(unmasked["distill"]) > 1e-4
 
     # An all-False mask degrades to "no distillation", not to a crash or a NaN.
-    none = marginal_objective(q, mu.clone(), qd, w, mu=mu, sigma=sigma,
-                              target_mask=torch.zeros(M, dtype=torch.bool))
+    none = marginal_objective(q, mu.clone(), qd, w, mu=mu, sigma=sigma, target_mask=torch.zeros(M, dtype=torch.bool))
     assert float(none["distill"]) == 0.0
 
 
@@ -495,9 +518,12 @@ def test_distillation_does_not_inverse_variance_weight_sharp_rows():
     target = mu[:, None] + sigma[:, None] * _probit(alpha)[None]
     q = (target + 0.01).requires_grad_()
     out = marginal_objective(
-        q, mu, qd,
+        q,
+        mu,
+        qd,
         MarginalLossWeights(distill=1.0, nll=0.0, crps=0.0, pinball=0.0),
-        mu=mu, sigma=sigma,
+        mu=mu,
+        sigma=sigma,
     )
     grad = torch.autograd.grad(out["loss"], q)[0]
     assert torch.allclose(grad[0], grad[1], rtol=1e-5, atol=1e-8)
@@ -511,22 +537,19 @@ def test_full_phase_a_path_overfits_one_fixed_synthetic_episode():
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=3e-3, weight_decay=0.0)
     weights = MarginalLossWeights(
-        distill=1.0, nll=0.0, crps=0.0, pinball=0.0,
+        distill=1.0,
+        nll=0.0,
+        crps=0.0,
+        pinball=0.0,
     )
 
-    initial = phase_a_batch_loss(
-        model, [episode], weights, k_folds=2, device="cpu"
-    )["loss"].detach().item()
+    initial = phase_a_batch_loss(model, [episode], weights, k_folds=2, device="cpu")["loss"].detach().item()
     for _ in range(60):
         optimizer.zero_grad(set_to_none=True)
-        result = phase_a_batch_loss(
-            model, [episode], weights, k_folds=2, device="cpu"
-        )
+        result = phase_a_batch_loss(model, [episode], weights, k_folds=2, device="cpu")
         result["loss"].backward()
         optimizer.step()
-    final = phase_a_batch_loss(
-        model, [episode], weights, k_folds=2, device="cpu"
-    )["loss"].detach().item()
+    final = phase_a_batch_loss(model, [episode], weights, k_folds=2, device="cpu")["loss"].detach().item()
 
     assert final < initial * 0.2, (initial, final)
 
@@ -545,9 +568,7 @@ def test_oracle_marginal_nll_matches_closed_form_gaussian():
     y = torch.tensor([0.3, -1.2])
     mu = torch.tensor([0.0, -1.0])
     sd = torch.tensor([1.0, 2.0])
-    expect = float(
-        torch.mean(0.5 * (torch.log(2 * math.pi * sd ** 2) + ((y - mu) / sd) ** 2))
-    )
+    expect = float(torch.mean(0.5 * (torch.log(2 * math.pi * sd**2) + ((y - mu) / sd) ** 2)))
     assert abs(oracle_marginal_nll(y, mu, sd) - expect) < 1e-6
 
 

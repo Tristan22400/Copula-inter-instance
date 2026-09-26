@@ -104,8 +104,10 @@ def _load_tabldm(cfg: DictConfig) -> nn.Module:
             if hasattr(sub, "recompute"):
                 sub.recompute = True
                 n_flipped += 1
-        print(f"[copula_backbones] tabldm: forced recompute=True on {n_flipped} "
-              "submodules (gradient checkpointing escalated for OOM headroom).")
+        print(
+            f"[copula_backbones] tabldm: forced recompute=True on {n_flipped} "
+            "submodules (gradient checkpointing escalated for OOM headroom)."
+        )
 
     return module
 

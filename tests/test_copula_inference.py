@@ -99,12 +99,8 @@ def test_sample_trajectories_recovers_known_correlation():
     idx = np.arange(n_test)
     R = rho ** np.abs(idx[:, None] - idx[None, :])
 
-    samples_small, _ = sample_trajectories(
-        quantile_grid, probs, R, n_samples=300, rng=np.random.default_rng(10)
-    )
-    samples_large, _ = sample_trajectories(
-        quantile_grid, probs, R, n_samples=30000, rng=np.random.default_rng(11)
-    )
+    samples_small, _ = sample_trajectories(quantile_grid, probs, R, n_samples=300, rng=np.random.default_rng(10))
+    samples_large, _ = sample_trajectories(quantile_grid, probs, R, n_samples=30000, rng=np.random.default_rng(11))
 
     err_small = np.linalg.norm(np.corrcoef(samples_small, rowvar=False) - R)
     err_large = np.linalg.norm(np.corrcoef(samples_large, rowvar=False) - R)
@@ -118,9 +114,7 @@ def test_sample_trajectories_identity_gives_near_zero_cross_correlation():
     quantile_grid = _standard_normal_grid(n_test, probs)
     R = np.eye(n_test)
 
-    samples, _ = sample_trajectories(
-        quantile_grid, probs, R, n_samples=20000, rng=np.random.default_rng(20)
-    )
+    samples, _ = sample_trajectories(quantile_grid, probs, R, n_samples=20000, rng=np.random.default_rng(20))
     corr = np.corrcoef(samples, rowvar=False)
     off_diag = corr[~np.eye(n_test, dtype=bool)]
 
@@ -141,9 +135,7 @@ def test_sample_trajectories_clip_diagnostic_flags_narrow_grid():
     # Wide grid: essentially the whole standard-normal mass is covered.
     probs_wide = np.linspace(1e-6, 1 - 1e-6, 999)
     grid_wide = np.tile(norm.ppf(probs_wide), (n_test, 1))
-    _, n_clipped_wide = sample_trajectories(
-        grid_wide, probs_wide, R, n_samples=2000, rng=np.random.default_rng(31)
-    )
+    _, n_clipped_wide = sample_trajectories(grid_wide, probs_wide, R, n_samples=2000, rng=np.random.default_rng(31))
 
     assert n_clipped_narrow > 0
     assert n_clipped_wide < n_clipped_narrow

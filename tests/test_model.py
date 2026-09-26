@@ -63,12 +63,8 @@ def test_output_shape(model_and_cfg):
     with torch.no_grad():
         out = model(batch)
     rank = cfg.model.rank
-    assert out["W"].shape == (B, N, rank), (
-        f"Expected W {(B, N, rank)}, got {out['W'].shape}"
-    )
-    assert out["s"].shape == (B, N), (
-        f"Expected s {(B, N)}, got {out['s'].shape}"
-    )
+    assert out["W"].shape == (B, N, rank), f"Expected W {(B, N, rank)}, got {out['W'].shape}"
+    assert out["s"].shape == (B, N), f"Expected s {(B, N)}, got {out['s'].shape}"
 
 
 def test_correlation_unit_diagonal(model_and_cfg):
@@ -79,9 +75,7 @@ def test_correlation_unit_diagonal(model_and_cfg):
         out = model(batch)
         Sigma = low_rank_correlation(out["W"], out["s"], batch["test_mask"])
     diag = Sigma.diagonal(dim1=-2, dim2=-1)
-    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-6), (
-        f"Diagonal not 1: {diag}"
-    )
+    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-6), f"Diagonal not 1: {diag}"
 
 
 def test_correlation_is_psd(model_and_cfg):
@@ -93,9 +87,7 @@ def test_correlation_is_psd(model_and_cfg):
         Sigma = low_rank_correlation(out["W"], out["s"], batch["test_mask"])
     for b in range(Sigma.shape[0]):
         eigvals = torch.linalg.eigvalsh(Sigma[b])
-        assert (eigvals >= -1e-4).all(), (
-            f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
-        )
+        assert (eigvals >= -1e-4).all(), f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
 
 
 def test_permutation_equivariance_test_instances(model_and_cfg):
@@ -152,7 +144,7 @@ def test_test_instances_are_independent(model_and_cfg):
         out2 = model(batch_perturbed)
 
     w_diff = (out1["W"] - out2["W"]).abs().sum(dim=-1)  # (B, N)
-    s_diff = (out1["s"] - out2["s"]).abs()               # (B, N)
+    s_diff = (out1["s"] - out2["s"]).abs()  # (B, N)
 
     # The perturbed instance (index 0) is expected to change.
     assert (w_diff[:, 0] > 1e-6).all() or (s_diff[:, 0] > 1e-6).all(), (
@@ -197,10 +189,14 @@ def test_forward_with_padding(model_and_cfg):
     test_mask[1, :3] = True
 
     batch = {
-        "x_train": x_train, "z_train": z_train,
-        "x_test": x_test, "z_test": z_test,
-        "train_mask": train_mask, "test_mask": test_mask,
-        "n_train": torch.tensor([8, 6]), "n_test": torch.tensor([4, 3]),
+        "x_train": x_train,
+        "z_train": z_train,
+        "x_test": x_test,
+        "z_test": z_test,
+        "train_mask": train_mask,
+        "test_mask": test_mask,
+        "n_train": torch.tensor([8, 6]),
+        "n_test": torch.tensor([4, 3]),
     }
 
     with torch.no_grad():

@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import numpy as np
 
-N_CONTEXT = 30              # in-context sample size for --profile sweeps (see regions.SWEEP_PROFILES)
-N_BINS = 15                 # distance bins for correlation-vs-distance binning
+N_CONTEXT = 30  # in-context sample size for --profile sweeps (see regions.SWEEP_PROFILES)
+N_BINS = 15  # distance bins for correlation-vs-distance binning
 SEED = 42
-N_DAYS = 60                 # daily ERA5 snapshots fetched per (region, grid_size)
+N_DAYS = 60  # daily ERA5 snapshots fetched per (region, grid_size)
 MAX_DIST_PERCENTILE = 90.0  # cap the binned distance range at this percentile (excludes the
-                             # corner-only, high-variance tail of a bounded lat/lon rectangle)
-PIT_K_FOLDS = 10            # K-fold leave-one-out PIT folds for real-context z_train estimation
-N_SYNTHETIC_DRAWS = 20      # independent GP draws averaged per synthetic-mode config
+# corner-only, high-variance tail of a bounded lat/lon rectangle)
+PIT_K_FOLDS = 10  # K-fold leave-one-out PIT folds for real-context z_train estimation
+N_SYNTHETIC_DRAWS = 20  # independent GP draws averaged per synthetic-mode config
 EARTH_RADIUS_KM = 6371.0
 
 # Joint y-space samples per probe day for the real-ERA5 model correlation curve (pooled across days).
 N_YSPACE_MC_SAMPLES = 20
 
 # Held-out points for the real-ERA5 joint-NLL diagnostic.
-N_NLL_TEST = 30             # held-out (never-in-context) points scored per task/day
+N_NLL_TEST = 30  # held-out (never-in-context) points scored per task/day
 NLL_PROBS = np.linspace(0.02, 0.98, 49)  # quantile-grid probability levels for compute_joint_nll
 
 # GP-MLE baseline settings for the real-ERA5 held-out NLL (eval_checkpoint's defaults).

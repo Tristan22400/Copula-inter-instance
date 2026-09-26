@@ -26,8 +26,8 @@ def generation_spec(cfg, marginal_checkpoint: str | None) -> dict:
         "data": data,
         "tabicl": (
             OmegaConf.to_container(cfg.tabicl, resolve=True)
-            if z_train_source_of(cfg) in ("tabicl", "tabicl_split")
-            and "tabicl" in cfg else None
+            if z_train_source_of(cfg) in ("tabicl", "tabicl_split") and "tabicl" in cfg
+            else None
         ),
         "marginal": artifact_identity(marginal_checkpoint),
     }
@@ -67,7 +67,9 @@ def shard_count_path(shard_path: str | os.PathLike[str]) -> Path:
 
 
 def verified_shard_digest(
-    shard_path: str | os.PathLike[str], *, require_match: bool = False,
+    shard_path: str | os.PathLike[str],
+    *,
+    require_match: bool = False,
 ) -> tuple[int, str]:
     """Trust write-time digest only while size and ctime match its sidecar."""
     path = Path(shard_path)
@@ -78,10 +80,13 @@ def verified_shard_digest(
     count = saved["count"]
     stat = path.stat()
     digest = saved.get("sha256")
-    if (not digest or saved.get("size") != stat.st_size
-            or saved.get("ctime_ns") != stat.st_ctime_ns
-            or saved.get("mtime_ns") != stat.st_mtime_ns
-            or saved.get("inode") != stat.st_ino):
+    if (
+        not digest
+        or saved.get("size") != stat.st_size
+        or saved.get("ctime_ns") != stat.st_ctime_ns
+        or saved.get("mtime_ns") != stat.st_mtime_ns
+        or saved.get("inode") != stat.st_ino
+    ):
         actual = file_digest(path)
         if require_match and digest and actual != digest:
             raise ValueError(f"shard content differs from its sidecar: {path}")

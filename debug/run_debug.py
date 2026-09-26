@@ -14,6 +14,7 @@ Usage:
     python debug/run_debug.py s8 --kernel matern52
     python debug/run_debug.py report --run-id <run_id>
 """
+
 from __future__ import annotations
 
 import argparse

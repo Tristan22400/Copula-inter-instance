@@ -7,6 +7,7 @@ Usage:
     python debug/run_debug.py s7b --backends tabicl,tabpfn --steps 200
     python debug/stages/s7b_backend_train.py --backends tabicl,tabpfn --steps 200 --batch-size 8
 """
+
 from __future__ import annotations
 
 import argparse
@@ -43,8 +44,16 @@ def _generic_pit_episode(backend: str, regressor, ep: dict, k_folds: int, probs_
     return torch.from_numpy(z_train).float(), torch.from_numpy(z_test).float(), torch.from_numpy(log_pdf).float()
 
 
-def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offset: int, tabicl_model=None,
-                              regressor=None, k_folds: int = 5, probs_n: int = DEFAULT_PROBS_N):
+def _build_batch_for_backend(
+    dcfg: DebugConfig,
+    backend: str,
+    n: int,
+    seed_offset: int,
+    tabicl_model=None,
+    regressor=None,
+    k_folds: int = 5,
+    probs_n: int = DEFAULT_PROBS_N,
+):
     from copula_inter.dataset import collate_fn
 
     episodes = common.generate_episodes(dcfg, n, tabicl_model=None, seed_offset=seed_offset)
@@ -60,8 +69,17 @@ def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offse
     return {k: v.to(dcfg.device) for k, v in collate_fn(episodes).items()}
 
 
-def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: int, lr: float,
-                        eval_every: int, n_eval: int, k_folds: int, probs_n: int):
+def _train_one_backend(
+    dcfg: DebugConfig,
+    backend: str,
+    steps: int,
+    batch_size: int,
+    lr: float,
+    eval_every: int,
+    n_eval: int,
+    k_folds: int,
+    probs_n: int,
+):
     from copula_inter.loss import y_space_nll
     from copula_inter.model import build_copula_transformer, build_sigma
 
@@ -80,16 +98,28 @@ def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: 
 
     # Fixed evaluation episodes shared by every backend and checkpoint.
     eval_batch = _build_batch_for_backend(
-        dcfg, backend, n_eval, seed_offset=9_999_999, tabicl_model=tabicl_model,
-        regressor=regressor, k_folds=k_folds, probs_n=probs_n,
+        dcfg,
+        backend,
+        n_eval,
+        seed_offset=9_999_999,
+        tabicl_model=tabicl_model,
+        regressor=regressor,
+        k_folds=k_folds,
+        probs_n=probs_n,
     )
 
     history = []
     t0 = time.time()
     for step in range(1, steps + 1):
         batch = _build_batch_for_backend(
-            dcfg, backend, batch_size, seed_offset=step * 104_729, tabicl_model=tabicl_model,
-            regressor=regressor, k_folds=k_folds, probs_n=probs_n,
+            dcfg,
+            backend,
+            batch_size,
+            seed_offset=step * 104_729,
+            tabicl_model=tabicl_model,
+            regressor=regressor,
+            k_folds=k_folds,
+            probs_n=probs_n,
         )
         out = model(batch)
         Sigma = build_sigma(out, dcfg.cfg, jitter=jitter, test_mask=batch["test_mask"])
@@ -107,30 +137,54 @@ def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: 
                 out_e = model(eval_batch)
                 Sigma_e = build_sigma(out_e, dcfg.cfg, jitter=jitter, test_mask=eval_batch["test_mask"])
                 eval_parts = y_space_nll(
-                    Sigma_e, eval_batch["z_test"].float(), eval_batch["log_pdf_test"].float(), eval_batch["test_mask"],
+                    Sigma_e,
+                    eval_batch["z_test"].float(),
+                    eval_batch["log_pdf_test"].float(),
+                    eval_batch["test_mask"],
                 )
             model.train()
-            history.append({
-                "step": step, "train_loss": float(loss.item()),
-                "eval_total": float(eval_parts["total"].item()),
-                "eval_copula": float(eval_parts["copula"].item()),
-                "eval_marginal": float(eval_parts["marginal"].item()),
-                "elapsed_s": time.time() - t0,
-            })
-            print(f"  [{backend:>7}] step {step:>5}/{steps}  train_loss={loss.item():.4f}  "
-                  f"eval_total={eval_parts['total'].item():.4f}  eval_copula={eval_parts['copula'].item():.4f}")
+            history.append(
+                {
+                    "step": step,
+                    "train_loss": float(loss.item()),
+                    "eval_total": float(eval_parts["total"].item()),
+                    "eval_copula": float(eval_parts["copula"].item()),
+                    "eval_marginal": float(eval_parts["marginal"].item()),
+                    "elapsed_s": time.time() - t0,
+                }
+            )
+            print(
+                f"  [{backend:>7}] step {step:>5}/{steps}  train_loss={loss.item():.4f}  "
+                f"eval_total={eval_parts['total'].item():.4f}  eval_copula={eval_parts['copula'].item():.4f}"
+            )
 
     return history
 
 
-def run(dcfg: DebugConfig, backends: list[str], steps: int, batch_size: int, lr: float,
-        eval_every: int, n_eval: int, k_folds: int, probs_n: int) -> dict:
+def run(
+    dcfg: DebugConfig,
+    backends: list[str],
+    steps: int,
+    batch_size: int,
+    lr: float,
+    eval_every: int,
+    n_eval: int,
+    k_folds: int,
+    probs_n: int,
+) -> dict:
     result = {}
     for backend in backends:
         print(f"\n=== training backend={backend} ===")
         result[backend] = _train_one_backend(
-            dcfg, backend, steps=steps, batch_size=batch_size, lr=lr,
-            eval_every=eval_every, n_eval=n_eval, k_folds=k_folds, probs_n=probs_n,
+            dcfg,
+            backend,
+            steps=steps,
+            batch_size=batch_size,
+            lr=lr,
+            eval_every=eval_every,
+            n_eval=n_eval,
+            k_folds=k_folds,
+            probs_n=probs_n,
         )
     return {"backends": backends, "steps": steps, "batch_size": batch_size, "history": result}
 
@@ -145,24 +199,43 @@ def main() -> None:
     p.add_argument("--eval-every", type=int, default=20)
     p.add_argument("--n-eval", type=int, default=8, help="Fixed eval-set episode count")
     p.add_argument("--k-folds", type=int, default=5)
-    p.add_argument("--probs-n", type=int, default=DEFAULT_PROBS_N, help="Quantile grid size for tabpfn (default 99; TabICL always uses its own 999)")
+    p.add_argument(
+        "--probs-n",
+        type=int,
+        default=DEFAULT_PROBS_N,
+        help="Quantile grid size for tabpfn (default 99; TabICL always uses its own 999)",
+    )
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     backends = args.backends.split(",")
     result = run(
-        dcfg, backends, steps=args.steps, batch_size=args.batch_size, lr=args.lr,
-        eval_every=args.eval_every, n_eval=args.n_eval, k_folds=args.k_folds, probs_n=args.probs_n,
+        dcfg,
+        backends,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        eval_every=args.eval_every,
+        n_eval=args.n_eval,
+        k_folds=args.k_folds,
+        probs_n=args.probs_n,
     )
 
     print("\n=== final eval_copula by backend ===")
     for backend in backends:
         last = result["history"][backend][-1]
-        print(f"  {backend:>7}: eval_total={last['eval_total']:.4f} eval_copula={last['eval_copula']:.4f} "
-              f"eval_marginal={last['eval_marginal']:.4f}  ({last['elapsed_s']:.0f}s)")
+        print(
+            f"  {backend:>7}: eval_total={last['eval_total']:.4f} eval_copula={last['eval_copula']:.4f} "
+            f"eval_marginal={last['eval_marginal']:.4f}  ({last['elapsed_s']:.0f}s)"
+        )
 
     path = common.save_stage_result(dcfg, "s7b_backend_train", result)
     print(f"\nSaved -> {path}")

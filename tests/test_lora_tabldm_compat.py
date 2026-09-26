@@ -59,14 +59,16 @@ def test_apply_lora_installs_adapters_on_a_tabldm_backbone():
     backbone = reg.model_
 
     n_replaced = apply_lora(
-        backbone=backbone, rank=4, alpha=8.0, target="qkvo",
-        stages=["icl"], also_trainable=(),
+        backbone=backbone,
+        rank=4,
+        alpha=8.0,
+        target="qkvo",
+        stages=["icl"],
+        also_trainable=(),
     )
     assert n_replaced > 0
 
-    lora_owners = {
-        n.split(".lora_")[0] for n, _ in backbone.named_parameters() if ".lora_" in n
-    }
+    lora_owners = {n.split(".lora_")[0] for n, _ in backbone.named_parameters() if ".lora_" in n}
     assert lora_owners, "no LoRA parameters registered"
     assert all(o.startswith("icl_predictor") for o in lora_owners), (
         f"stages=['icl'] leaked adapters outside icl_predictor: {sorted(lora_owners)[:5]}"

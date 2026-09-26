@@ -44,10 +44,10 @@ def _eval_zero_mean_gp_baselines(
     use marginal_pit's z_test/log_pdf_test like the ICL row. Not cached (depends
     on the marginal).
     """
-    X_train = ep["x_norm_train"].to(device)   # (P, d_x)
-    X_test = ep["x_norm_test"].to(device)     # (N, d_x)
-    z_test = ep["z_test"].to(device)          # (N,) ground truth, shared across every baseline
-    z_train_marg = marginal_pit["z_train"].to(device)   # (P,) real marginal's PIT residual
+    X_train = ep["x_norm_train"].to(device)  # (P, d_x)
+    X_test = ep["x_norm_test"].to(device)  # (N, d_x)
+    z_test = ep["z_test"].to(device)  # (N,) ground truth, shared across every baseline
+    z_train_marg = marginal_pit["z_train"].to(device)  # (P,) real marginal's PIT residual
     N = X_test.shape[0]
     test_mask = torch.ones(1, N, dtype=torch.bool, device=device)
     R_I = torch.eye(N, dtype=X_train.dtype, device=device)
@@ -59,9 +59,15 @@ def _eval_zero_mean_gp_baselines(
         label = f"gp_zeromean_{kname}"
         try:
             fit = fit_zero_mean_gp_on_marginal(
-                X_train, z_train_marg, X_test, kname,
-                n_steps=n_steps, lr=lr, n_restarts=n_restarts,
-                oracle_mode=oracle_mode, prior_cfg=prior_cfg,
+                X_train,
+                z_train_marg,
+                X_test,
+                kname,
+                n_steps=n_steps,
+                lr=lr,
+                n_restarts=n_restarts,
+                oracle_mode=oracle_mode,
+                prior_cfg=prior_cfg,
             )
             nlls[label] = corr_nll_single(fit["R"], z_test)
             R_dict[label] = fit["R"]
@@ -89,13 +95,17 @@ def _make_folds(n: int, k: int, seed: int) -> list[Tensor]:
     start = 0
     for i in range(k):
         size = base + (1 if i < extra else 0)
-        folds.append(perm[start:start + size])
+        folds.append(perm[start : start + size])
         start += size
     return folds
 
 
 def _select_best_baseline_cv(
-    baseline_R: dict[str, Tensor], z_test: Tensor, n_folds: int, min_fold_size: int, seed: int,
+    baseline_R: dict[str, Tensor],
+    z_test: Tensor,
+    n_folds: int,
+    min_fold_size: int,
+    seed: int,
 ) -> tuple[float, str | None, list[dict]]:
     """Best fitted baseline by nested leave-one-fold-out CV over the test points.
 
@@ -128,10 +138,15 @@ def _select_best_baseline_cv(
         selected = min(val_nll, key=val_nll.get)
         test_nll = _sub_nll(selected, test_idx)
         weighted_sum += test_idx.numel() * test_nll
-        fold_details.append({
-            "fold": i, "size": test_idx.numel(), "selected": selected,
-            "val_nll": val_nll[selected], "test_nll": test_nll,
-        })
+        fold_details.append(
+            {
+                "fold": i,
+                "size": test_idx.numel(),
+                "selected": selected,
+                "val_nll": val_nll[selected],
+                "test_nll": test_nll,
+            }
+        )
 
     pooled_nll = weighted_sum / n
     mode_key = Counter(fd["selected"] for fd in fold_details).most_common(1)[0][0]
@@ -185,20 +200,21 @@ def _fit_baselines_task(payload: tuple) -> tuple:
     # One thread per worker.
     _torch.set_num_threads(1)
     try:
-        nlls, R_dict, y_nlls = eval_baselines_episode(
-            ep=ep, device=_torch.device("cpu"), fit_seed=fit_seed, **kwargs
-        )
+        nlls, R_dict, y_nlls = eval_baselines_episode(ep=ep, device=_torch.device("cpu"), fit_seed=fit_seed, **kwargs)
     except Exception as exc:  # pragma: no cover - defensive
         import traceback
 
         return cache_key, None, f"{exc}\n{traceback.format_exc()}"
-    return cache_key, {
-        "nlls": nlls,
-        # Copy so the array owns its storage.
-        "R_dict": {k: v.detach().cpu().contiguous().numpy().copy()
-                   for k, v in R_dict.items()},
-        "y_nlls": y_nlls,
-    }, None
+    return (
+        cache_key,
+        {
+            "nlls": nlls,
+            # Copy so the array owns its storage.
+            "R_dict": {k: v.detach().cpu().contiguous().numpy().copy() for k, v in R_dict.items()},
+            "y_nlls": y_nlls,
+        },
+        None,
+    )
 
 
 def _count_physical_cores(cpus: set[int]) -> int:
@@ -206,9 +222,7 @@ def _count_physical_cores(cpus: set[int]) -> int:
     cores = set()
     for c in cpus:
         try:
-            with open(
-                f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
-            ) as fh:
+            with open(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list") as fh:
                 cores.add(fh.read().strip())
         except OSError:
             return 0
@@ -217,7 +231,7 @@ def _count_physical_cores(cpus: set[int]) -> int:
 
 def _baseline_fit_seed(seed: int, cache_key: str) -> int:
     """Per-episode fitting seed: zlib.crc32 of the cache key."""
-    return (zlib.crc32(cache_key.encode()) ^ (seed * 2_654_435_761)) % (2 ** 31 - 1)
+    return (zlib.crc32(cache_key.encode()) ^ (seed * 2_654_435_761)) % (2**31 - 1)
 
 
 def _valid_cached_entry(cache_entries: dict, cache_key: str, ep_i: int) -> dict | None:
@@ -274,9 +288,7 @@ def _prefit_baselines_parallel(
                 print(f"  [prefit] {cache_key} FAILED:\n{err}", flush=True)
             else:
                 # Convert NumPy results back to tensors for the cache.
-                result["R_dict"] = {
-                    k: torch.from_numpy(v) for k, v in result["R_dict"].items()
-                }
+                result["R_dict"] = {k: torch.from_numpy(v) for k, v in result["R_dict"].items()}
                 fitted[cache_key] = result
                 if use_cache:
                     # Write this episode's shard now.
@@ -287,14 +299,13 @@ def _prefit_baselines_parallel(
             eta = rate * (total - done)
             print(
                 f"  [prefit {done}/{total}] {cache_key}  "
-                f"({elapsed/60:.1f} min elapsed, {rate:.1f} s/ep wall, "
-                f"ETA {eta/60:.1f} min)",
+                f"({elapsed / 60:.1f} min elapsed, {rate:.1f} s/ep wall, "
+                f"ETA {eta / 60:.1f} min)",
                 flush=True,
             )
 
     print(
         f"  [prefit] fitted {done - failures}/{total} episode(s) on "
-        f"{n_workers} worker(s) in {(time.time() - t0)/60:.1f} min"
-        + (f" — {failures} FAILED" if failures else ""),
+        f"{n_workers} worker(s) in {(time.time() - t0) / 60:.1f} min" + (f" — {failures} FAILED" if failures else ""),
         flush=True,
     )

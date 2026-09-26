@@ -1,10 +1,10 @@
 """Tests for _build_tabicl_val_z and resolve_pit_ckpt.
 
-  1. One (B, P_max) tensor per batch, zero beyond each episode's P.
-  2. Repeated calls give identical output.
-  3. Episodes with fewer than 2 training points stay zero.
-  4. resolve_pit_ckpt across the tabicl.pretrained / ckpt / pit_ckpt
-     combinations the presets use.
+1. One (B, P_max) tensor per batch, zero beyond each episode's P.
+2. Repeated calls give identical output.
+3. Episodes with fewer than 2 training points stay zero.
+4. resolve_pit_ckpt across the tabicl.pretrained / ckpt / pit_ckpt
+   combinations the presets use.
 """
 
 from __future__ import annotations
@@ -37,8 +37,13 @@ class FakeTabICL(nn.Module):
 
 
 def make_val_batch(
-    B: int, P_max: int, d_x: int = 2, n_train: "list[int] | None" = None,
-    N_max: int = 4, n_test: "list[int] | None" = None, seed: int = 0,
+    B: int,
+    P_max: int,
+    d_x: int = 2,
+    n_train: "list[int] | None" = None,
+    N_max: int = 4,
+    n_test: "list[int] | None" = None,
+    seed: int = 0,
 ):
     g = torch.Generator().manual_seed(seed)
     x_train = torch.randn(B, P_max, d_x, generator=g)
@@ -54,8 +59,12 @@ def make_val_batch(
     for b, n in enumerate(n_test):
         test_mask[b, :n] = True
     return {
-        "x_train": x_train, "y_train": y_train, "train_mask": train_mask,
-        "x_test": x_test, "y_test": y_test, "test_mask": test_mask,
+        "x_train": x_train,
+        "y_train": y_train,
+        "train_mask": train_mask,
+        "x_test": x_test,
+        "y_test": y_test,
+        "test_mask": test_mask,
     }
 
 

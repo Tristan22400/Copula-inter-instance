@@ -33,9 +33,9 @@ RESULTS_ROOT = os.path.join(_HERE, "results")
 
 @dataclasses.dataclass
 class DebugConfig:
-    cfg: "OmegaConf"                       # merged Hydra-style config (cfg.data/model/tabicl/training)
+    cfg: "OmegaConf"  # merged Hydra-style config (cfg.data/model/tabicl/training)
     n_episodes: int = 200
-    ckpt: Optional[str] = None             # checkpoint name/dir under ./checkpoints, or None (fresh model)
+    ckpt: Optional[str] = None  # checkpoint name/dir under ./checkpoints, or None (fresh model)
     out_dir: str = RESULTS_ROOT
     run_id: str = "adhoc"
     device: str = "cuda"
@@ -52,8 +52,11 @@ class DebugConfig:
 def _git_sha(repo_root: str) -> str:
     try:
         out = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=repo_root,
-            capture_output=True, text=True, timeout=5,
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         return out.stdout.strip() or "nogit"
     except Exception:
@@ -99,8 +102,13 @@ def build_config(
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{_git_sha(_REPO_ROOT)}_{_config_hash(overrides)}"
 
     return DebugConfig(
-        cfg=cfg, n_episodes=n_episodes, ckpt=ckpt, run_id=run_id,
-        device=resolved_device, seed=seed, overrides=overrides,
+        cfg=cfg,
+        n_episodes=n_episodes,
+        ckpt=ckpt,
+        run_id=run_id,
+        device=resolved_device,
+        seed=seed,
+        overrides=overrides,
     )
 
 
@@ -124,7 +132,11 @@ def _coerce(val: str):
 
 
 def add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--ckpt", default=None, help="Checkpoint name under ./checkpoints/, or a full path. Omit for a fresh (untrained) model where a stage doesn't need one.")
+    p.add_argument(
+        "--ckpt",
+        default=None,
+        help="Checkpoint name under ./checkpoints/, or a full path. Omit for a fresh (untrained) model where a stage doesn't need one.",
+    )
     p.add_argument("--model", default="copula_prod", help="conf/model/<name>.yaml preset (default: copula_prod)")
     p.add_argument("--n-episodes", type=int, default=200)
     p.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
@@ -132,6 +144,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--run-id", default=None, help="Results subdir name (default: timestamp_gitsha_confhash)")
     p.add_argument("--out-dir", default=RESULTS_ROOT)
     p.add_argument(
-        "override", nargs="*",
+        "override",
+        nargs="*",
         help="Hydra-style config overrides, e.g. data.P_max=64 model.rank=64",
     )

@@ -72,15 +72,21 @@ def assert_shared_z_test(z_test: Tensor, ep: dict) -> None:
         "ranking (see assert_shared_z_test's docstring)."
     )
 
+
 # Keys eval_baselines_episode returns; cached entries missing any are refitted.
 EXPECTED_BASELINE_KEYS = frozenset(
     {"independence", "gp_prior_rbf", "per_ep_transformer"}
     | {
-        "gp_mle_rbf", "gp_mle_ard_rbf",
-        "gp_mle_matern32", "gp_mle_ard_matern32",
-        "gp_mle_periodic", "gp_mle_ard_periodic",
-        "gp_mle_rq", "gp_mle_ard_rq",
-        "gp_mle_dot_product", "gp_mle_polynomial",
+        "gp_mle_rbf",
+        "gp_mle_ard_rbf",
+        "gp_mle_matern32",
+        "gp_mle_ard_matern32",
+        "gp_mle_periodic",
+        "gp_mle_ard_periodic",
+        "gp_mle_rq",
+        "gp_mle_ard_rq",
+        "gp_mle_dot_product",
+        "gp_mle_polynomial",
     }
     | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
 )
@@ -103,9 +109,7 @@ def _resolve_val_select(mode: str, ard: bool) -> bool:
         return False
     if mode == "ard":
         return ard
-    raise ValueError(
-        f"gp_val_select={mode!r} is not one of {GP_VAL_SELECT_MODES}"
-    )
+    raise ValueError(f"gp_val_select={mode!r} is not one of {GP_VAL_SELECT_MODES}")
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
@@ -219,9 +223,13 @@ def _randomize_init(
     if "offset_prior" in kernel_priors:
         base.offset = kernel_priors["offset_prior"].sample(base.offset.shape).to(device)
     if "variance_prior" in kernel_priors:
-        model.covar_module.variance = kernel_priors["variance_prior"].sample(model.covar_module.variance.shape).to(device)
+        model.covar_module.variance = (
+            kernel_priors["variance_prior"].sample(model.covar_module.variance.shape).to(device)
+        )
     if "outputscale_prior" in kernel_priors:
-        model.covar_module.outputscale = kernel_priors["outputscale_prior"].sample(model.covar_module.outputscale.shape).to(device)
+        model.covar_module.outputscale = (
+            kernel_priors["outputscale_prior"].sample(model.covar_module.outputscale.shape).to(device)
+        )
 
 
 class _ExactGPModel(gpytorch.models.ExactGP):
@@ -250,7 +258,9 @@ class _ExactGPModel(gpytorch.models.ExactGP):
             base = gpytorch.kernels.RBFKernel(lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw)
         elif kernel_name in _MATERN_NU:
             base = gpytorch.kernels.MaternKernel(
-                nu=_MATERN_NU[kernel_name], lengthscale_prior=kp.get("lengthscale_prior"), **ard_kw,
+                nu=_MATERN_NU[kernel_name],
+                lengthscale_prior=kp.get("lengthscale_prior"),
+                **ard_kw,
             )
         elif kernel_name == "periodic":
             base = gpytorch.kernels.PeriodicKernel(
@@ -259,7 +269,9 @@ class _ExactGPModel(gpytorch.models.ExactGP):
                 **ard_kw,
             )
         elif kernel_name == "rational_quadratic":
-            base = gpytorch.kernels.RQKernel(lengthscale_prior=kp.get("lengthscale_prior"), alpha_prior=kp.get("alpha_prior"), **ard_kw)
+            base = gpytorch.kernels.RQKernel(
+                lengthscale_prior=kp.get("lengthscale_prior"), alpha_prior=kp.get("alpha_prior"), **ard_kw
+            )
         elif kernel_name == "dot_product":
             base = gpytorch.kernels.LinearKernel(variance_prior=kp.get("variance_prior"))
         elif kernel_name == "polynomial":
@@ -269,7 +281,8 @@ class _ExactGPModel(gpytorch.models.ExactGP):
 
         # LinearKernel has its own variance, so no ScaleKernel; PolynomialKernel gets one.
         self.covar_module = (
-            base if kernel_name == "dot_product"
+            base
+            if kernel_name == "dot_product"
             else gpytorch.kernels.ScaleKernel(base, outputscale_prior=kp.get("outputscale_prior"))
         )
 
@@ -350,69 +363,75 @@ def fit_and_eval_gpytorch(
 
     for poly_power in poly_powers:
         for _ in range(max(1, n_restarts)):
-          try:
-            # Noise constraint exp(-8)..exp(2), built fresh each restart (its bounds are mutable tensors).
-            noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
-            likelihood = gpytorch.likelihoods.GaussianLikelihood(
-                noise_constraint=noise_constraint, noise_prior=noise_prior,
-            )
-            # Random initial noise inside the constraint.
-            likelihood.noise = noise_prior.sample(likelihood.noise.shape).to(X_train.device).clamp(
-                min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99
-            )
+            try:
+                # Noise constraint exp(-8)..exp(2), built fresh each restart (its bounds are mutable tensors).
+                noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
+                likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                    noise_constraint=noise_constraint,
+                    noise_prior=noise_prior,
+                )
+                # Random initial noise inside the constraint.
+                likelihood.noise = (
+                    noise_prior.sample(likelihood.noise.shape)
+                    .to(X_train.device)
+                    .clamp(min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99)
+                )
 
-            # Fresh feature extractor each restart.
-            feature_extractor = (
-                feature_extractor_factory() if feature_extractor_factory is not None else None
-            )
-            model = _ExactGPModel(
-                X_fit, y_fit, likelihood, kernel_name,
-                ard_num_dims=ard_num_dims, feature_extractor=feature_extractor,
-                kernel_priors=kernel_priors, poly_power=poly_power,
-            ).to(X_train.device)
-            _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
+                # Fresh feature extractor each restart.
+                feature_extractor = feature_extractor_factory() if feature_extractor_factory is not None else None
+                model = _ExactGPModel(
+                    X_fit,
+                    y_fit,
+                    likelihood,
+                    kernel_name,
+                    ard_num_dims=ard_num_dims,
+                    feature_extractor=feature_extractor,
+                    kernel_priors=kernel_priors,
+                    poly_power=poly_power,
+                ).to(X_train.device)
+                _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
 
-            model.train()
-            likelihood.train()
-            opt = Adam(model.parameters(), lr=lr)
-            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+                model.train()
+                likelihood.train()
+                opt = Adam(model.parameters(), lr=lr)
+                mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
-            best_step_val: float = float("inf")
-            best_step_state: tuple[dict, dict] | None = None
-            loss = None
-            for step in range(n_steps):
-                opt.zero_grad()
-                loss = -mll(model(X_fit), y_fit)
-                loss.backward()
-                opt.step()
+                best_step_val: float = float("inf")
+                best_step_state: tuple[dict, dict] | None = None
+                loss = None
+                for step in range(n_steps):
+                    opt.zero_grad()
+                    loss = -mll(model(X_fit), y_fit)
+                    loss.backward()
+                    opt.step()
 
-                if use_val and step in val_check_steps:
-                    model.eval()
-                    likelihood.eval()
-                    with torch.no_grad():
-                        val_nll = -likelihood(model(X_val)).log_prob(y_val).item() / X_val.shape[0]
-                    model.train()
-                    likelihood.train()
-                    if val_nll < best_step_val:
-                        best_step_val = val_nll
-                        best_step_state = (
-                            copy.deepcopy(model.state_dict()),
-                            copy.deepcopy(likelihood.state_dict()),
-                        )
+                    if use_val and step in val_check_steps:
+                        model.eval()
+                        likelihood.eval()
+                        with torch.no_grad():
+                            val_nll = -likelihood(model(X_val)).log_prob(y_val).item() / X_val.shape[0]
+                        model.train()
+                        likelihood.train()
+                        if val_nll < best_step_val:
+                            best_step_val = val_nll
+                            best_step_state = (
+                                copy.deepcopy(model.state_dict()),
+                                copy.deepcopy(likelihood.state_dict()),
+                            )
 
-            if use_val:
-                model.load_state_dict(best_step_state[0])
-                likelihood.load_state_dict(best_step_state[1])
-                final_loss = best_step_val
-            else:
-                final_loss = loss.item()
+                if use_val:
+                    model.load_state_dict(best_step_state[0])
+                    likelihood.load_state_dict(best_step_state[1])
+                    final_loss = best_step_val
+                else:
+                    final_loss = loss.item()
 
-            if best_loss is None or final_loss < best_loss:
-                best_loss, best_model, best_likelihood = final_loss, model, likelihood
-          except Exception as exc:
-            # Skip a (degree, restart) whose kernel matrix is not PSD; raise only if all fail.
-            print(f"  [gp_mle_polynomial power={poly_power}] restart failed: {exc}")
-            continue
+                if best_loss is None or final_loss < best_loss:
+                    best_loss, best_model, best_likelihood = final_loss, model, likelihood
+            except Exception as exc:
+                # Skip a (degree, restart) whose kernel matrix is not PSD; raise only if all fail.
+                print(f"  [gp_mle_polynomial power={poly_power}] restart failed: {exc}")
+                continue
 
     if best_model is None:
         raise RuntimeError(
@@ -468,10 +487,18 @@ def fit_zero_mean_gp_on_marginal(
 ) -> dict[str, Tensor]:
     """Zero-mean GP-MLE on (X_train, z_train), z_train being a real marginal's PIT; returns {"R", "mean", "Sigma"} in z space."""
     return fit_and_eval_gpytorch(
-        X_train, z_train, X_test, kernel_name,
-        n_steps=n_steps, lr=lr, ard=False, jitter=jitter,
-        oracle_mode=oracle_mode, prior_cfg=zero_mean_gp_prior_cfg(prior_cfg),
-        n_restarts=n_restarts, val_select=False,
+        X_train,
+        z_train,
+        X_test,
+        kernel_name,
+        n_steps=n_steps,
+        lr=lr,
+        ard=False,
+        jitter=jitter,
+        oracle_mode=oracle_mode,
+        prior_cfg=zero_mean_gp_prior_cfg(prior_cfg),
+        n_restarts=n_restarts,
+        val_select=False,
     )
 
 
@@ -512,9 +539,7 @@ class _SelfAttn(nn.Module):
         self.norm2 = nn.LayerNorm(m)
         self.attn = nn.MultiheadAttention(m, n_heads, dropout=dropout, batch_first=True)
         d_ff = max(round(8 / 3 * m / 32) * 32, 32)
-        self.ff = nn.Sequential(
-            nn.Linear(m, d_ff), nn.SiLU(), nn.Dropout(dropout), nn.Linear(d_ff, m)
-        )
+        self.ff = nn.Sequential(nn.Linear(m, d_ff), nn.SiLU(), nn.Dropout(dropout), nn.Linear(d_ff, m))
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -534,8 +559,7 @@ class _CrossAttn(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, q: Tensor, kv: Tensor) -> Tensor:
-        h, _ = self.attn(self.norm_q(q), self.norm_kv(kv), self.norm_kv(kv),
-                         need_weights=False)
+        h, _ = self.attn(self.norm_q(q), self.norm_kv(kv), self.norm_kv(kv), need_weights=False)
         return q + self.drop(h)
 
 
@@ -570,19 +594,19 @@ class PerEpisodeTransformer(nn.Module):
         nn.init.zeros_(self.head.bias)
 
     def forward(self, X_ctx: Tensor, z_ctx: Tensor, X_qry: Tensor) -> tuple[Tensor, Tensor]:
-        ex = self.x_enc(X_ctx)                                            # (n_sup, m)
+        ex = self.x_enc(X_ctx)  # (n_sup, m)
         row = self.row_enc(torch.cat([ex, z_ctx.unsqueeze(-1)], dim=-1))  # (n_sup, m)
-        row = row.unsqueeze(0)                                           # (1, n_sup, m)
+        row = row.unsqueeze(0)  # (1, n_sup, m)
         for block in self.self_attn:
             row = block(row)
 
-        eq = self.x_enc(X_qry).unsqueeze(0)                              # (1, n_qry, m)
+        eq = self.x_enc(X_qry).unsqueeze(0)  # (1, n_qry, m)
         q_emb = self.W_q(eq)
-        h = self.cross_attn(q_emb, row).squeeze(0)                       # (n_qry, m)
+        h = self.cross_attn(q_emb, row).squeeze(0)  # (n_qry, m)
 
-        out = self.head(h)                                                # (n_qry, r+1)
-        W = out[:, : self.r]                                              # (n_qry, r)
-        s = out[:, self.r]                                                # (n_qry,)
+        out = self.head(h)  # (n_qry, r+1)
+        W = out[:, : self.r]  # (n_qry, r)
+        s = out[:, self.r]  # (n_qry,)
         return W, s
 
 
@@ -701,13 +725,13 @@ def eval_baselines_episode(
     if fit_seed is not None:
         torch.manual_seed(fit_seed)
 
-    X_train = ep["x_norm_train"].to(device)      # (P, d_x)
-    y_train = ep["y_train"].to(device)            # (P,)  raw target, used to fit the GP-MLE/DKL baselines
-    z_train_self = _standardize_y(y_train)        # (P,) z-scored y_train, used to train per_ep_transformer
-    X_test = ep["x_norm_test"].to(device)         # (N, d_x)
-    z_test = ep["z_test"].to(device)              # (N,)
+    X_train = ep["x_norm_train"].to(device)  # (P, d_x)
+    y_train = ep["y_train"].to(device)  # (P,)  raw target, used to fit the GP-MLE/DKL baselines
+    z_train_self = _standardize_y(y_train)  # (P,) z-scored y_train, used to train per_ep_transformer
+    X_test = ep["x_norm_test"].to(device)  # (N, d_x)
+    z_test = ep["z_test"].to(device)  # (N,)
     assert_shared_z_test(z_test, ep)
-    y_test = ep["y_test"].to(device)              # (N,)  raw target, for total Y-space NLL
+    y_test = ep["y_test"].to(device)  # (N,)  raw target, for total Y-space NLL
 
     N = X_test.shape[0]
     nlls: dict[str, float] = {}
@@ -717,7 +741,10 @@ def eval_baselines_episode(
 
     def _nll_parts(mean: Tensor, Sigma: Tensor) -> dict[str, float]:
         parts = gp_oracle_y_nll(
-            Sigma.unsqueeze(0), mean.unsqueeze(0), y_test.unsqueeze(0), test_mask,
+            Sigma.unsqueeze(0),
+            mean.unsqueeze(0),
+            y_test.unsqueeze(0),
+            test_mask,
         )
         return {k: v.item() for k, v in parts.items()}
 
@@ -734,28 +761,35 @@ def eval_baselines_episode(
     # --- GP MLE baselines (plain + ARD for lengthscale kernels) ---
     _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic", "dot_product", "polynomial"]
     _LABEL_MAP = {
-        ("rbf", False):                "gp_mle_rbf",
-        ("rbf", True):                 "gp_mle_ard_rbf",
-        ("matern32", False):           "gp_mle_matern32",
-        ("matern32", True):            "gp_mle_ard_matern32",
-        ("periodic", False):           "gp_mle_periodic",
-        ("periodic", True):            "gp_mle_ard_periodic",
+        ("rbf", False): "gp_mle_rbf",
+        ("rbf", True): "gp_mle_ard_rbf",
+        ("matern32", False): "gp_mle_matern32",
+        ("matern32", True): "gp_mle_ard_matern32",
+        ("periodic", False): "gp_mle_periodic",
+        ("periodic", True): "gp_mle_ard_periodic",
         ("rational_quadratic", False): "gp_mle_rq",
-        ("rational_quadratic", True):  "gp_mle_ard_rq",
-        ("dot_product", False):        "gp_mle_dot_product",
-        ("polynomial", False):         "gp_mle_polynomial",
+        ("rational_quadratic", True): "gp_mle_ard_rq",
+        ("dot_product", False): "gp_mle_dot_product",
+        ("polynomial", False): "gp_mle_polynomial",
     }
     for kname in _GP_KERNELS:
-        for ard in ([False, True] if _ARD_ELIGIBLE[kname] else [False]):
+        for ard in [False, True] if _ARD_ELIGIBLE[kname] else [False]:
             label = _LABEL_MAP[(kname, ard)]
             try:
                 # Held-out selection per _resolve_val_select.
-                fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
-                                             n_steps=n_steps_mle, lr=lr_mle, ard=ard,
-                                             oracle_mode=oracle_mode, prior_cfg=prior_cfg,
-                                             n_restarts=n_restarts_mle,
-                                             val_select=_resolve_val_select(
-                                                 gp_val_select, ard))
+                fit = fit_and_eval_gpytorch(
+                    X_train,
+                    y_train,
+                    X_test,
+                    kname,
+                    n_steps=n_steps_mle,
+                    lr=lr_mle,
+                    ard=ard,
+                    oracle_mode=oracle_mode,
+                    prior_cfg=prior_cfg,
+                    n_restarts=n_restarts_mle,
+                    val_select=_resolve_val_select(gp_val_select, ard),
+                )
                 nlls[label] = corr_nll_single(fit["R"], z_test)
                 R_dict[label] = fit["R"]
                 y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
@@ -768,22 +802,31 @@ def eval_baselines_episode(
     # DKL kernels (periodic excluded).
     _DKL_KERNELS = ["rbf", "matern32", "rational_quadratic", "dot_product"]
     _DKL_LABEL_MAP = {
-        "rbf":                "dkl_rbf",
-        "matern32":           "dkl_matern32",
+        "rbf": "dkl_rbf",
+        "matern32": "dkl_matern32",
         "rational_quadratic": "dkl_rq",
-        "dot_product":        "dkl_dot_product",
+        "dot_product": "dkl_dot_product",
     }
+
     def _make_dkl_mlp(d_x: int = X_train.shape[1], dev: torch.device = device) -> nn.Module:
         return DKLFeatureExtractor(d_x, hidden=32, out_dim=16, dropout=0.0).to(dev)
 
     for kname in _DKL_KERNELS:
         label = _DKL_LABEL_MAP[kname]
         try:
-            fit = fit_and_eval_gpytorch(X_train, y_train, X_test, kname,
-                                        n_steps=n_steps_dkl, lr=lr_dkl,
-                                        ard=False, feature_extractor_factory=_make_dkl_mlp,
-                                        oracle_mode=oracle_mode, prior_cfg=prior_cfg,
-                                        n_restarts=n_restarts_dkl)
+            fit = fit_and_eval_gpytorch(
+                X_train,
+                y_train,
+                X_test,
+                kname,
+                n_steps=n_steps_dkl,
+                lr=lr_dkl,
+                ard=False,
+                feature_extractor_factory=_make_dkl_mlp,
+                oracle_mode=oracle_mode,
+                prior_cfg=prior_cfg,
+                n_restarts=n_restarts_dkl,
+            )
             nlls[label] = corr_nll_single(fit["R"], z_test)
             R_dict[label] = fit["R"]
             y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
@@ -798,8 +841,11 @@ def eval_baselines_episode(
     # its Y-space NLL uses the empirical Gaussian marginal.
     try:
         per_ep_model = train_per_episode(
-            X_train, z_train_self, r=icl_rank,
-            n_steps=n_steps_per_ep, patience=patience_per_ep,
+            X_train,
+            z_train_self,
+            r=icl_rank,
+            n_steps=n_steps_per_ep,
+            patience=patience_per_ep,
             device=device,
         )
         with torch.no_grad():
@@ -810,7 +856,8 @@ def eval_baselines_episode(
         mean_tr = y_train.mean()
         std_tr = y_train.std(unbiased=True).clamp(min=1e-6)
         y_space_nlls["per_ep_transformer"] = _nll_parts(
-            mean_tr.expand(N), (std_tr ** 2) * Sigma_te,
+            mean_tr.expand(N),
+            (std_tr**2) * Sigma_te,
         )
     except Exception as exc:
         print(f"  [per_ep_transformer] failed: {exc}")
@@ -854,8 +901,7 @@ def baseline_fingerprint(
         "live_generate": live_generate,
         "dataset_dir": os.path.abspath(dataset_dir) if (dataset_dir and not live_generate) else None,
         "dataset_identity": (
-            dataset_identity(dataset_dir)
-            if dataset_dir and not live_generate and os.path.isdir(dataset_dir) else None
+            dataset_identity(dataset_dir) if dataset_dir and not live_generate and os.path.isdir(dataset_dir) else None
         ),
         "seed": seed,
         "oracle_mode": oracle_mode,
@@ -872,8 +918,12 @@ def baseline_fingerprint(
 
 
 def episode_cache_key(
-    live_generate: bool, dataset_dir: str | None, seed: int, ep_i: int,
-    *, source: str | None = None,
+    live_generate: bool,
+    dataset_dir: str | None,
+    seed: int,
+    ep_i: int,
+    *,
+    source: str | None = None,
 ) -> str:
     """Cache key of one episode.
 
@@ -947,8 +997,10 @@ def load_baseline_cache(path: str, fingerprint: dict) -> dict[str, dict]:
             print(f"  [baseline_cache] loaded {n_shard} episode(s) from {d}")
 
     if n_stale:
-        print(f"  [baseline_cache] ignored {n_stale} entr(ies) built under different "
-              "generation/fitting settings — those episodes will be refitted")
+        print(
+            f"  [baseline_cache] ignored {n_stale} entr(ies) built under different "
+            "generation/fitting settings — those episodes will be refitted"
+        )
     return entries
 
 

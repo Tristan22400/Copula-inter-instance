@@ -193,17 +193,15 @@ def analytic_marginal_targets(
         K_ff = (kernel_fn(x_ctx, x_ctx) + nugget * torch.eye(P_c, device=device)).double()
         L_ff = _safe_cholesky(K_ff, max_attempts=12)
         mean_ctx = _mean_train_from_task(task, x_ctx).double()
-        alpha = torch.cholesky_solve(
-            (y_ctx.double() - mean_ctx).unsqueeze(-1), L_ff
-        ).squeeze(-1)
+        alpha = torch.cholesky_solve((y_ctx.double() - mean_ctx).unsqueeze(-1), L_ff).squeeze(-1)
 
-    K_sf = kernel_fn(x_qry, x_ctx).double()                       # (M, P_c)
+    K_sf = kernel_fn(x_qry, x_ctx).double()  # (M, P_c)
     mean_qry = _mean_train_from_task(task, x_qry).double()
-    mu = mean_qry + K_sf @ alpha                                  # (M,)
+    mu = mean_qry + K_sf @ alpha  # (M,)
 
     V = torch.linalg.solve_triangular(L_ff, K_sf.T, upper=False)  # (P_c, M)
     k_diag = kernel_fn(x_qry, x_qry).diagonal().double() + nugget
-    var = (k_diag - (V ** 2).sum(0)).clamp(min=nugget)
+    var = (k_diag - (V**2).sum(0)).clamp(min=nugget)
     return mu.float(), var.sqrt().float()
 
 
@@ -229,7 +227,7 @@ def episode_fold_targets(
     mu_out = torch.empty(query_idx.numel(), device=device)
     sig_out = torch.empty(query_idx.numel(), device=device)
 
-    fold_of = (query_idx // fold_size)
+    fold_of = query_idx // fold_size
     cached = "_L_ff" in task and "_alpha" in task
     if cached:
         L_full = task["_L_ff"].to(device=device, dtype=torch.float64)
@@ -237,7 +235,7 @@ def episode_fold_targets(
     else:
         kernel_fn, nugget = _kernel_fn_from_task(task)
     for k in fold_of.unique().tolist():
-        sel = (fold_of == k).nonzero(as_tuple=True)[0]           # positions in query_idx
+        sel = (fold_of == k).nonzero(as_tuple=True)[0]  # positions in query_idx
         qry_rows = query_idx[sel]
         start, end = k * fold_size, min((k + 1) * fold_size, P)
         if cached:
@@ -249,9 +247,7 @@ def episode_fold_targets(
             precision_cols = torch.cholesky_solve(eye_q, L_full)
             precision_qq = precision_cols[fold_rows]
             L_qq = _safe_cholesky(precision_qq, max_attempts=12)
-            correction = torch.cholesky_solve(
-                alpha_full[fold_rows].unsqueeze(-1), L_qq
-            ).squeeze(-1)
+            correction = torch.cholesky_solve(alpha_full[fold_rows].unsqueeze(-1), L_qq).squeeze(-1)
             covariance_qq = torch.cholesky_inverse(L_qq)
             positions = qry_rows - start
             mu_k = (y_train[fold_rows].double() - correction)[positions]
@@ -261,8 +257,12 @@ def episode_fold_targets(
             ctx_mask[start:end] = False
             ctx_rows = ctx_mask.nonzero(as_tuple=True)[0]
             mu_k, sig_k = analytic_marginal_targets(
-                task, x_train[ctx_rows], y_train[ctx_rows], x_train[qry_rows],
-                kernel_fn=kernel_fn, nugget=nugget,
+                task,
+                x_train[ctx_rows],
+                y_train[ctx_rows],
+                x_train[qry_rows],
+                kernel_fn=kernel_fn,
+                nugget=nugget,
             )
         mu_out[sel] = mu_k.to(mu_out.dtype)
         sig_out[sel] = sig_k.to(sig_out.dtype)
@@ -291,9 +291,7 @@ class MarginalLossWeights:
         self.tail_power = float(tail_power)
 
 
-def quantile_level_weights(
-    alpha_levels: torch.Tensor, tail_power: float = 0.5
-) -> torch.Tensor:
+def quantile_level_weights(alpha_levels: torch.Tensor, tail_power: float = 0.5) -> torch.Tensor:
     """Weights w_k proportional to (alpha_k (1 - alpha_k))^tail_power, normalized to mean 1 (tail_power=0 is uniform)."""
     a = alpha_levels.clamp(1e-9, 1 - 1e-9)
     w = (a * (1.0 - a)) ** float(tail_power)
@@ -339,8 +337,8 @@ def marginal_objective(
         alpha_levels = quantile_dist.alpha_levels.to(q.device, dtype=q.dtype)
 
     dist = quantile_dist(q)
-    nll = -dist.log_prob(y)                     # (M,)
-    crps = dist.crps(y)                         # (M,)
+    nll = -dist.log_prob(y)  # (M,)
+    crps = dist.crps(y)  # (M,)
     error = y.unsqueeze(-1) - q
     pinball = torch.maximum(alpha_levels * error, (alpha_levels - 1.0) * error)
 
@@ -366,11 +364,13 @@ def marginal_objective(
             q_d, mu_d, sig_d = q[target_mask], mu[target_mask], sigma[target_mask]
         else:
             q_d, mu_d, sig_d = q, mu, sigma
-        z_target = _standard_normal_icdf(alpha_levels)                      # (Q,)
-        w = quantile_level_weights(alpha_levels, weights.tail_power)        # (Q,)
+        z_target = _standard_normal_icdf(alpha_levels)  # (Q,)
+        w = quantile_level_weights(alpha_levels, weights.tail_power)  # (Q,)
         q_target = mu_d.unsqueeze(-1) + sig_d.unsqueeze(-1) * z_target
         per_level = torch.nn.functional.huber_loss(
-            q_d, q_target, reduction="none",
+            q_d,
+            q_target,
+            reduction="none",
             delta=weights.huber_delta,
         )
         out["distill"] = (per_level * w).mean()
@@ -386,11 +386,7 @@ class AnchorPenalty:
     """L2 penalty pulling the trainable parameters toward their initial (pretrained) values."""
 
     def __init__(self, module: nn.Module) -> None:
-        self.ref = {
-            name: p.detach().clone()
-            for name, p in module.named_parameters()
-            if p.requires_grad
-        }
+        self.ref = {name: p.detach().clone() for name, p in module.named_parameters() if p.requires_grad}
 
     def __call__(self, module: nn.Module) -> torch.Tensor:
         total = None
@@ -469,9 +465,7 @@ def marginal_metrics(
 
 
 @torch.no_grad()
-def oracle_marginal_nll(
-    y: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor
-) -> float:
+def oracle_marginal_nll(y: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> float:
     """Mean -log N(y; mu, sigma^2): the analytic floor for the model's marginal NLL."""
     var = sigma.clamp(min=1e-12) ** 2
     nll = 0.5 * (torch.log(2 * math.pi * var) + (y - mu) ** 2 / var)
@@ -480,10 +474,10 @@ def oracle_marginal_nll(
 
 def stack_episodes(episodes: Sequence[dict], device: str | torch.device) -> dict:
     """Stack same-shape generate_gp_batch episodes into (B, ...) tensors plus each episode's normalize_targets scale."""
-    x_train = torch.stack([e["x_norm_train"] for e in episodes]).to(device)   # (B,P,d)
-    y_train = torch.stack([e["y_train"] for e in episodes]).to(device)        # (B,P)
-    x_test = torch.stack([e["x_norm_test"] for e in episodes]).to(device)     # (B,N,d)
-    y_test = torch.stack([e["y_test"] for e in episodes]).to(device)          # (B,N)
+    x_train = torch.stack([e["x_norm_train"] for e in episodes]).to(device)  # (B,P,d)
+    y_train = torch.stack([e["y_train"] for e in episodes]).to(device)  # (B,P)
+    x_test = torch.stack([e["x_norm_test"] for e in episodes]).to(device)  # (B,N,d)
+    y_test = torch.stack([e["y_test"] for e in episodes]).to(device)  # (B,N)
 
     y_tr_s, y_te_s, means, stds = [], [], [], []
     for b in range(len(episodes)):
@@ -525,6 +519,7 @@ def phase_a_batch_loss(
     contribute sample-score terms. tabicl is a TabICL module or a
     MarginalBackbone (marginal_backbones.kfold_quantiles_grad, same fold geometry).
     """
+
     def _mark(name: str, started: float) -> float:
         if timings is not None:
             if torch.cuda.is_available() and str(device).startswith("cuda"):
@@ -557,7 +552,8 @@ def phase_a_batch_loss(
     if is_backbone:
         # None: score the model's native decoder grid (999 levels).
         probs = (
-            None if marginal_probs_n is None
+            None
+            if marginal_probs_n is None
             else np.linspace(
                 1.0 / (marginal_probs_n + 1),
                 marginal_probs_n / (marginal_probs_n + 1),
@@ -565,9 +561,14 @@ def phase_a_batch_loss(
             )
         )
         out = kfold_quantiles_grad(
-            tabicl, batch["x_train"], batch["y_train_scaled"],
-            batch["x_test"], batch["y_test_scaled"],
-            k_folds=K, probs=probs, fold_subset=fold_subset,
+            tabicl,
+            batch["x_train"],
+            batch["y_train_scaled"],
+            batch["x_test"],
+            batch["y_test_scaled"],
+            k_folds=K,
+            probs=probs,
+            fold_subset=fold_subset,
         )
         quantile_dist = tabicl.quantile_dist_module(probs)
         q_test, q_train = out["q_test"], out["q_train"]
@@ -588,8 +589,8 @@ def phase_a_batch_loss(
             Y_train_raw=batch["y_train_raw"].unsqueeze(-1),
         )
         quantile_dist = module.quantile_dist
-        q_test = out["q_test"].squeeze(2)                             # (B, N, Q)
-        q_train = out["q_train"].squeeze(2)                           # (B, P', Q)
+        q_test = out["q_test"].squeeze(2)  # (B, N, Q)
+        q_train = out["q_train"].squeeze(2)  # (B, P', Q)
     t_part = _mark("tabicl_forward", t_part)
     if fold_subset is None:
         train_idx = torch.arange(P, device=q_train.device)
@@ -609,8 +610,12 @@ def phase_a_batch_loss(
                 kernel_fn, nugget = _kernel_fn_from_task(ep)
                 mu_te, sig_te = analytic_marginal_targets(
                     ep,
-                    batch["x_train"][b], batch["y_train_raw"][b], batch["x_test"][b],
-                    kernel_fn=kernel_fn, nugget=nugget, use_cached_full_context=True,
+                    batch["x_train"][b],
+                    batch["y_train_raw"][b],
+                    batch["x_test"][b],
+                    kernel_fn=kernel_fn,
+                    nugget=nugget,
+                    use_cached_full_context=True,
                 )
                 mu_tr, sig_tr = episode_fold_targets(ep, train_idx, K, device=device)
             except (NotImplementedError, KeyError):
@@ -622,10 +627,8 @@ def phase_a_batch_loss(
             mask_all[b] = True
     t_part = _mark("analytic_targets", t_part)
 
-    q_all = torch.cat([q_test, q_train], dim=1)                       # (B, N+P', Q)
-    y_all = torch.cat(
-        [batch["y_test_scaled"], batch["y_train_scaled"][:, train_idx]], dim=1
-    )                                                                 # (B, N+P')
+    q_all = torch.cat([q_test, q_train], dim=1)  # (B, N+P', Q)
+    y_all = torch.cat([batch["y_test_scaled"], batch["y_train_scaled"][:, train_idx]], dim=1)  # (B, N+P')
 
     Q = q_all.shape[-1]
     q_flat = q_all.reshape(-1, Q)
@@ -635,19 +638,20 @@ def phase_a_batch_loss(
     mask_flat = mask_all.reshape(-1)
 
     res = marginal_objective(
-        q_flat, y_flat, quantile_dist, weights,
-        mu=mu_flat, sigma=sig_flat, target_mask=mask_flat,
+        q_flat,
+        y_flat,
+        quantile_dist,
+        weights,
+        mu=mu_flat,
+        sigma=sig_flat,
+        target_mask=mask_flat,
     )
     # Report the pre-sort quantile crossing rate (a decoder collapse shows up here).
-    res["raw_crossing_frac"] = float(
-        (q_flat[:, 1:] < q_flat[:, :-1]).float().mean().detach()
-    )
+    res["raw_crossing_frac"] = float((q_flat[:, 1:] < q_flat[:, :-1]).float().mean().detach())
     _mark("objective", t_part)
     res["n_episodes_with_target"] = n_ok
     res["oracle_nll"] = (
-        oracle_marginal_nll(y_flat[mask_flat], mu_flat[mask_flat], sig_flat[mask_flat])
-        if n_ok
-        else float("nan")
+        oracle_marginal_nll(y_flat[mask_flat], mu_flat[mask_flat], sig_flat[mask_flat]) if n_ok else float("nan")
     )
     # Gap of the model's marginal NLL to the analytic floor on these rows.
     res["nll_gap_to_oracle"] = float(res["nll"].detach()) - res["oracle_nll"]
@@ -681,8 +685,15 @@ def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
         # zlib.crc32 seed, same as probe_batches._name_seed, so both phases use the same points.
         seed = base_seed + (zlib.crc32(region.encode()) % 10_000)
         probe = build_era5_probe(
-            region, grid_size, n_days_fetch, n_days_probe, n_context,
-            n_bins=12, tabicl_marginal=None, device=str(device), seed=seed,
+            region,
+            grid_size,
+            n_days_fetch,
+            n_days_probe,
+            n_context,
+            n_bins=12,
+            tabicl_marginal=None,
+            device=str(device),
+            seed=seed,
         )
         n_days = probe["context_values_per_day"].shape[0]
         x_tr = torch.as_tensor(probe["x_train_norm"], dtype=torch.float32, device=device)
@@ -690,10 +701,8 @@ def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
         batches[region] = {
             "x_train": x_tr.unsqueeze(0).expand(n_days, -1, -1).contiguous(),
             "x_test": x_te.unsqueeze(0).expand(n_days, -1, -1).contiguous(),
-            "y_train": torch.as_tensor(
-                probe["context_values_per_day"], dtype=torch.float32, device=device),
-            "y_test": torch.as_tensor(
-                probe["nll_test_values_per_day"], dtype=torch.float32, device=device),
+            "y_train": torch.as_tensor(probe["context_values_per_day"], dtype=torch.float32, device=device),
+            "y_test": torch.as_tensor(probe["nll_test_values_per_day"], dtype=torch.float32, device=device),
         }
     return batches
 
@@ -715,10 +724,9 @@ def validate_era5_marginal(
     is_backbone = isinstance(tabicl, MarginalBackbone) and tabicl.name != "tabicl"
     if is_backbone:
         probs = (
-            None if marginal_probs_n is None
-            else np.linspace(
-                1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n
-            )
+            None
+            if marginal_probs_n is None
+            else np.linspace(1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n)
         )
         quantile_dist = tabicl.quantile_dist_module(probs)
 
@@ -726,7 +734,10 @@ def validate_era5_marginal(
         y_tr_s, y_te_s, mean, std = [], [], [], []
         for d in range(b["y_train"].shape[0]):
             a, c, m, sd = normalize_targets(b["y_train"][d], b["y_test"][d])
-            y_tr_s.append(a); y_te_s.append(c); mean.append(m); std.append(sd)
+            y_tr_s.append(a)
+            y_te_s.append(c)
+            mean.append(m)
+            std.append(sd)
         y_tr_s = torch.stack(y_tr_s)
         y_te_s = torch.stack(y_te_s)
         std_t = torch.stack(std)
@@ -745,13 +756,19 @@ def validate_era5_marginal(
         else:
             module = tabicl.module if isinstance(tabicl, MarginalBackbone) else tabicl
             out = run_pit_batched_grad(
-                module, b["x_train"], y_tr_s.unsqueeze(-1),
-                b["x_test"], y_te_s.unsqueeze(-1),
-                k_folds=2, eps=eps, return_quantiles=True, fold_subset=[],
+                module,
+                b["x_train"],
+                y_tr_s.unsqueeze(-1),
+                b["x_test"],
+                y_te_s.unsqueeze(-1),
+                k_folds=2,
+                eps=eps,
+                return_quantiles=True,
+                fold_subset=[],
                 compute_pit=False,
                 Y_train_raw=b["y_train"].unsqueeze(-1),
             )
-            q = out["q_test"].squeeze(2)                                  # (days, N, Q)
+            q = out["q_test"].squeeze(2)  # (days, N, Q)
             quantile_dist = module.quantile_dist
 
         # Per-day std for the raw-nats conversion.
@@ -759,8 +776,12 @@ def validate_era5_marginal(
         log_std = std_t.log().unsqueeze(1).expand(-1, n_q).reshape(-1)
         y_std = std_t.unsqueeze(1).expand(-1, n_q).reshape(-1)
         m = marginal_metrics(
-            q.reshape(-1, q.shape[-1]), y_te_s.reshape(-1), quantile_dist,
-            log_std=log_std, y_std=y_std, eps=eps,
+            q.reshape(-1, q.shape[-1]),
+            y_te_s.reshape(-1),
+            quantile_dist,
+            log_std=log_std,
+            y_std=y_std,
+            eps=eps,
         )
         per_region[region] = m
 
@@ -770,9 +791,7 @@ def validate_era5_marginal(
             metrics[f"val_marginal/{region}/{k}"] = m[k]
     if per_region:
         for k in ("nll", "crps", "ece", "ks", "clamp_frac"):
-            metrics[f"val_marginal/mean_{k}"] = float(
-                np.mean([m[k] for m in per_region.values()])
-            )
+            metrics[f"val_marginal/mean_{k}"] = float(np.mean([m[k] for m in per_region.values()]))
     return metrics
 
 
@@ -792,8 +811,13 @@ def validate_synthetic_marginal(
     nlls, crpss, distills, oracles, crossings = [], [], [], [], []
     for episodes in episode_batches:
         res = phase_a_batch_loss(
-            tabicl, episodes, metric_w, k_folds=k_folds,
-            folds_per_step=None, device=device, eps=eps,
+            tabicl,
+            episodes,
+            metric_w,
+            k_folds=k_folds,
+            folds_per_step=None,
+            device=device,
+            eps=eps,
             marginal_probs_n=marginal_probs_n,
         )
         nlls.append(float(res["nll"]))
@@ -804,13 +828,9 @@ def validate_synthetic_marginal(
     out = {
         "val_marginal/gp/nll": float(np.mean(nlls)) if nlls else float("nan"),
         "val_marginal/gp/crps": float(np.mean(crpss)) if crpss else float("nan"),
-        "val_marginal/gp/distill": (
-            float(np.mean(distills)) if distills else float("nan")
-        ),
+        "val_marginal/gp/distill": (float(np.mean(distills)) if distills else float("nan")),
         "val_marginal/gp/nll_oracle": float(np.nanmean(oracles)) if oracles else float("nan"),
-        "val_marginal/gp/raw_crossing_frac": (
-            float(np.mean(crossings)) if crossings else float("nan")
-        ),
+        "val_marginal/gp/raw_crossing_frac": (float(np.mean(crossings)) if crossings else float("nan")),
     }
     out["val_marginal/gp/nll_gap_to_oracle"] = out["val_marginal/gp/nll"] - out["val_marginal/gp/nll_oracle"]
     return out
@@ -860,8 +880,9 @@ def _seed_everything(seed: int) -> None:
 class ERA5EpisodeSampler:
     """Batches of real-ERA5 episodes with one shared P and N (sample_episode_fixed_shape); region, day and box vary."""
 
-    def __init__(self, corpus, *, grid_size: int, n_context: int,
-                 box_deg_range: tuple[float, float], seed: int) -> None:
+    def __init__(
+        self, corpus, *, grid_size: int, n_context: int, box_deg_range: tuple[float, float], seed: int
+    ) -> None:
         self.corpus = corpus
         self.grid_size = int(grid_size)
         self.n_context = int(n_context)
@@ -873,9 +894,7 @@ class ERA5EpisodeSampler:
         tries = 0
         while len(out) < B and tries < max_tries * B:
             tries += 1
-            ep = self.corpus.sample_episode_fixed_shape(
-                self.rng, self.grid_size, self.box_deg_range, self.n_context
-            )
+            ep = self.corpus.sample_episode_fixed_shape(self.rng, self.grid_size, self.box_deg_range, self.n_context)
             if ep is None:
                 continue
             out.append(
@@ -898,25 +917,16 @@ class ERA5EpisodeSampler:
 
 def _gp_cfg(cfg: DictConfig) -> DictConfig:
     """A config with the data group and a seed, as generate_gp_batch expects."""
-    return OmegaConf.create(
-        {"data": OmegaConf.to_container(cfg.data, resolve=True), "seed": int(cfg.seed)}
-    )
+    return OmegaConf.create({"data": OmegaConf.to_container(cfg.data, resolve=True), "seed": int(cfg.seed)})
 
 
-def _generate_phase_a_gp_batch(
-    gp_cfg: DictConfig, batch_size: int, device: str, *, max_rounds: int = 20
-) -> list[dict]:
+def _generate_phase_a_gp_batch(gp_cfg: DictConfig, batch_size: int, device: str, *, max_rounds: int = 20) -> list[dict]:
     """generate_gp_batch with P, N and d pinned after the first call, so every episode has the same shape."""
-    episodes = generate_gp_batch(
-        gp_cfg, batch_size, device, return_kernel_metadata=True
-    )
+    episodes = generate_gp_batch(gp_cfg, batch_size, device, return_kernel_metadata=True)
     P = int(episodes[0]["x_norm_train"].shape[0])
     N = int(episodes[0]["x_norm_test"].shape[0])
     d = int(episodes[0]["x_norm_train"].shape[1])
-    out = [
-        ep for ep in episodes
-        if ep["x_norm_train"].shape == (P, d) and ep["x_norm_test"].shape == (N, d)
-    ]
+    out = [ep for ep in episodes if ep["x_norm_train"].shape == (P, d) and ep["x_norm_test"].shape == (N, d)]
     if len(out) == batch_size:
         return out
 
@@ -926,10 +936,15 @@ def _generate_phase_a_gp_batch(
     base_seed = int(gp_cfg.seed)
     for round_idx in range(1, max_rounds + 1):
         fixed.seed = base_seed + round_idx * 1_000_003
-        out.extend(generate_gp_batch(
-            fixed, batch_size - len(out), device,
-            return_kernel_metadata=True, d_override=d,
-        ))
+        out.extend(
+            generate_gp_batch(
+                fixed,
+                batch_size - len(out),
+                device,
+                return_kernel_metadata=True,
+                d_override=d,
+            )
+        )
         if len(out) >= batch_size:
             return out[:batch_size]
     raise RuntimeError(
@@ -946,7 +961,9 @@ def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
         gp_cfg.seed = int(cfg.validation.gp_seed) + i
         batches.append(
             _generate_phase_a_gp_batch(
-                gp_cfg, int(cfg.validation.gp_batch_size), device,
+                gp_cfg,
+                int(cfg.validation.gp_batch_size),
+                device,
             )
         )
     return batches
@@ -965,21 +982,15 @@ def main(cfg: DictConfig) -> None:
     marginal_probs_n = None if _probs_n_cfg is None else int(_probs_n_cfg)
     if backbone_name == "tabicl":
         # Unchanged path: load_tabicl owns TabICL's own checkpoint schema.
-        tabicl, tabicl_config = load_tabicl(
-            str(cfg.marginal.ckpt), device, trainable=True, return_config=True
-        )
+        tabicl, tabicl_config = load_tabicl(str(cfg.marginal.ckpt), device, trainable=True, return_config=True)
         trainable_module = tabicl
     else:
-        backbone_obj = load_backbone(
-            backbone_name, ckpt=cfg.marginal.get("resume_ckpt", None), device=device
-        )
+        backbone_obj = load_backbone(backbone_name, ckpt=cfg.marginal.get("resume_ckpt", None), device=device)
         if backbone_name == "exaone":
             backbone_obj.exaone_chunk_size = int(cfg.marginal.exaone.chunk_size)
             if backbone_obj.exaone_chunk_size < 1:
                 raise ValueError("marginal.exaone.chunk_size must be positive")
-            backbone_obj.exaone_activation_checkpointing = bool(
-                cfg.marginal.exaone.activation_checkpointing
-            )
+            backbone_obj.exaone_activation_checkpointing = bool(cfg.marginal.exaone.activation_checkpointing)
         tabicl, tabicl_config = backbone_obj, {}
         trainable_module = backbone_obj.module
         for p_ in trainable_module.parameters():
@@ -1018,7 +1029,8 @@ def main(cfg: DictConfig) -> None:
         crps=float(era5_loss_cfg.crps),
         pinball=float(era5_loss_cfg.pinball),
         anchor=weights.anchor,
-        huber_delta=weights.huber_delta, tail_power=weights.tail_power,
+        huber_delta=weights.huber_delta,
+        tail_power=weights.tail_power,
     )
     anchor = AnchorPenalty(trainable_module) if weights.anchor > 0 else None
 
@@ -1028,7 +1040,8 @@ def main(cfg: DictConfig) -> None:
         raise RuntimeError("Tier routing left no trainable parameters.")
     adam_eps = 1e-4 if any(p.dtype == torch.float16 for p in params) else 1e-8
     opt = torch.optim.AdamW(
-        params, lr=float(cfg.training.lr),
+        params,
+        lr=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay),
         eps=adam_eps,
     )
@@ -1036,7 +1049,9 @@ def main(cfg: DictConfig) -> None:
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt,
         lambda s: cosine_lr_lambda(
-            s, int(cfg.training.warmup_steps), total_steps,
+            s,
+            int(cfg.training.warmup_steps),
+            total_steps,
             float(cfg.training.lr_min_frac),
         ),
     )
@@ -1097,8 +1112,7 @@ def main(cfg: DictConfig) -> None:
             mode=str(cfg.wandb.mode),
         )
         wandb.watch(trainable_module, log="gradients", log_freq=max(1, int(cfg.training.log_every)))
-        wandb.log({f"model/{k}": v for k, v in report.items()
-                   if isinstance(v, (int, float))}, step=0)
+        wandb.log({f"model/{k}": v for k, v in report.items() if isinstance(v, (int, float))}, step=0)
 
     def _log(payload: dict, step: int) -> None:
         if run is not None:
@@ -1107,14 +1121,16 @@ def main(cfg: DictConfig) -> None:
     def _validate(step: int) -> dict[str, float]:
         t0 = time.time()
         t_era5 = time.time()
-        metrics = validate_era5_marginal(
-            tabicl, era5_val, eps=eps, marginal_probs_n=marginal_probs_n
-        )
+        metrics = validate_era5_marginal(tabicl, era5_val, eps=eps, marginal_probs_n=marginal_probs_n)
         metrics["val_marginal/era5_seconds"] = time.time() - t_era5
         t_gp = time.time()
         metrics.update(
             validate_synthetic_marginal(
-                tabicl, gp_val, k_folds=k_folds, eps=eps, device=device,
+                tabicl,
+                gp_val,
+                k_folds=k_folds,
+                eps=eps,
+                device=device,
                 marginal_probs_n=marginal_probs_n,
             )
         )
@@ -1141,23 +1157,25 @@ def main(cfg: DictConfig) -> None:
             return None
         name = f"step_{step:07d}{tag}.pt"
         path = os.path.join(str(cfg.training.ckpt_dir), name)
-        tier_extra = {"tier_report": {k: v for k, v in report.items()
-                                      if isinstance(v, (int, float, str))}}
+        tier_extra = {"tier_report": {k: v for k, v in report.items() if isinstance(v, (int, float, str))}}
         if isinstance(tabicl, MarginalBackbone):
             # Non-TabICL backbones write their own checkpoint format.
             tabicl.save(path, step=step, cfg=cfg, extra=tier_extra)
         else:
             save_marginal_checkpoint(
-                path, tabicl, tabicl_config, step=step, cfg=cfg, extra=tier_extra,
+                path,
+                tabicl,
+                tabicl_config,
+                step=step,
+                cfg=cfg,
+                extra=tier_extra,
             )
         print(f"[ckpt] {path}")
         return path
 
     # ---- train -----------------------------------------------------------
     initial_metrics = _validate(0)
-    selection_metric = str(cfg.training.get(
-        "selection_metric", "val_marginal/mean_nll"
-    ))
+    selection_metric = str(cfg.training.get("selection_metric", "val_marginal/mean_nll"))
     if selection_metric not in initial_metrics:
         raise KeyError(
             f"training.selection_metric={selection_metric!r} was not emitted by "
@@ -1165,19 +1183,13 @@ def main(cfg: DictConfig) -> None:
         )
     best_value = float(initial_metrics[selection_metric])
     if not math.isfinite(best_value):
-        raise RuntimeError(
-            f"Initial selection metric {selection_metric} is non-finite: {best_value}"
-        )
+        raise RuntimeError(f"Initial selection metric {selection_metric} is non-finite: {best_value}")
     best_step = 0
     selection_min_delta = float(cfg.training.get("selection_min_delta", 0.0))
 
     def _snapshot_trainable() -> dict[str, torch.Tensor]:
         # Keep only the trainable tensors for best-checkpoint selection.
-        return {
-            name: p.detach().cpu().clone()
-            for name, p in trainable_module.named_parameters()
-            if p.requires_grad
-        }
+        return {name: p.detach().cpu().clone() for name, p in trainable_module.named_parameters() if p.requires_grad}
 
     def _restore_trainable(state: dict[str, torch.Tensor]) -> None:
         named = dict(trainable_module.named_parameters())
@@ -1194,10 +1206,7 @@ def main(cfg: DictConfig) -> None:
             best_step = step
             best_value = value
             best_state = _snapshot_trainable()
-            print(
-                f"[selection] new best {selection_metric}={best_value:.6f} "
-                f"at step {best_step}"
-            )
+            print(f"[selection] new best {selection_metric}={best_value:.6f} at step {best_step}")
 
     rng = np.random.default_rng(int(cfg.seed) + 991)
     gen = torch.Generator().manual_seed(int(cfg.seed) + 13)
@@ -1215,9 +1224,7 @@ def main(cfg: DictConfig) -> None:
         use_era5 = era5_sampler is not None and rng.random() < mix_frac
         if use_era5:
             episodes = era5_sampler.batch(B)
-            episodes = [
-                {k: v.to(device) for k, v in ep.items()} for ep in episodes
-            ]
+            episodes = [{k: v.to(device) for k, v in ep.items()} for ep in episodes]
             w = era5_weights
         else:
             gp_cfg.seed = int(cfg.seed) * 1_000_003 + step
@@ -1229,10 +1236,16 @@ def main(cfg: DictConfig) -> None:
 
         part_timings: dict[str, float] | None = {} if profiling else None
         res = phase_a_batch_loss(
-            tabicl, episodes, w,
-            k_folds=k_folds, folds_per_step=folds_per_step,
-            generator=gen, device=device, eps=eps,
-            timings=part_timings, marginal_probs_n=marginal_probs_n,
+            tabicl,
+            episodes,
+            w,
+            k_folds=k_folds,
+            folds_per_step=folds_per_step,
+            generator=gen,
+            device=device,
+            eps=eps,
+            timings=part_timings,
+            marginal_probs_n=marginal_probs_n,
         )
         loss = res["loss"]
         anchor_val = 0.0
@@ -1244,9 +1257,7 @@ def main(cfg: DictConfig) -> None:
         backward_started = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(
-            params, float(cfg.training.clip_grad_norm)
-        )
+        gnorm = torch.nn.utils.clip_grad_norm_(params, float(cfg.training.clip_grad_norm))
         if profiling and device.startswith("cuda"):
             torch.cuda.synchronize(device)
         backward_seconds = time.perf_counter() - backward_started
@@ -1267,14 +1278,10 @@ def main(cfg: DictConfig) -> None:
             }
             for key, value in measured.items():
                 profile_totals[key] = profile_totals.get(key, 0.0) + value
-            print("[profile step %d] %s" % (
-                step, " ".join(f"{key}={value:.4f}s" for key, value in measured.items())
-            ))
+            print("[profile step %d] %s" % (step, " ".join(f"{key}={value:.4f}s" for key, value in measured.items())))
             if step == profile_steps:
                 means = {key: value / profile_steps for key, value in profile_totals.items()}
-                print("[profile mean] " + " ".join(
-                    f"{key}={value:.4f}s" for key, value in means.items()
-                ))
+                print("[profile mean] " + " ".join(f"{key}={value:.4f}s" for key, value in means.items()))
                 _log({f"profile/{key}_seconds": value for key, value in means.items()}, step)
 
         if step % int(cfg.training.log_every) == 0:
@@ -1305,8 +1312,7 @@ def main(cfg: DictConfig) -> None:
                 f"pinball={res['pinball'].detach().item():.4f} "
                 f"cross={res['raw_crossing_frac']:.3%} "
                 f"gap={res.get('nll_gap_to_oracle', float('nan')):.4f} "
-                f"lr={sched.get_last_lr()[0]:.2e} {dt:.2f}s/step"
-                + ("  [era5]" if use_era5 else "")
+                f"lr={sched.get_last_lr()[0]:.2e} {dt:.2f}s/step" + ("  [era5]" if use_era5 else "")
             )
 
         hooks_started = time.time()
@@ -1322,10 +1328,7 @@ def main(cfg: DictConfig) -> None:
 
     if bool(cfg.training.get("restore_best", True)):
         _restore_trainable(best_state)
-        print(
-            f"[selection] restored step {best_step} with "
-            f"{selection_metric}={best_value:.6f} before final export"
-        )
+        print(f"[selection] restored step {best_step} with {selection_metric}={best_value:.6f} before final export")
         export_step = best_step
     else:
         export_step = total_steps

@@ -46,9 +46,7 @@ from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
 _LOG_F_CEILING = math.log(1e6)
 
 
-def _episode_metrics(
-    tabicl, episodes, k_folds: int, eps: float, device: str
-) -> list[dict]:
+def _episode_metrics(tabicl, episodes, k_folds: int, eps: float, device: str) -> list[dict]:
     """Score one shared-(P, N) batch of GP episodes through pit.run_pit_batched; one record per episode."""
     B = len(episodes)
     x_tr = torch.stack([e["x_norm_train"] for e in episodes]).to(device)
@@ -67,15 +65,21 @@ def _episode_metrics(
     std_t = torch.stack(stds)
 
     out = run_pit_batched(
-        tabicl, x_tr, y_tr_s.unsqueeze(-1), x_te, y_te_s.unsqueeze(-1),
-        k_folds=k_folds, eps=eps, return_quantiles=True,
+        tabicl,
+        x_tr,
+        y_tr_s.unsqueeze(-1),
+        x_te,
+        y_te_s.unsqueeze(-1),
+        k_folds=k_folds,
+        eps=eps,
+        return_quantiles=True,
         Y_train_raw=y_tr.unsqueeze(-1),
     )
-    q_test = out["q_test"].squeeze(2)                          # (B, N, Q)
-    u_test = out["u_test"].squeeze(2)                          # (B, N)
-    z_test = out["z_test"].squeeze(2)                          # (B, N)
-    z_train = out["z_train"].squeeze(2)                        # (B, P)
-    logp_scaled = out["log_pdf_test"].squeeze(2)               # (B, N)
+    q_test = out["q_test"].squeeze(2)  # (B, N, Q)
+    u_test = out["u_test"].squeeze(2)  # (B, N)
+    z_test = out["z_test"].squeeze(2)  # (B, N)
+    z_train = out["z_train"].squeeze(2)  # (B, P)
+    logp_scaled = out["log_pdf_test"].squeeze(2)  # (B, N)
     alpha = out["alpha_levels"].detach().cpu().numpy()
 
     records = []
@@ -90,26 +94,16 @@ def _episode_metrics(
             "N": int(x_te.shape[1]),
             "nll": nll_raw,
             "ks": ks_uniform(u_test[b].cpu().numpy()),
-            "ece": float(
-                compute_quantile_ece(
-                    y_te_s[b].cpu().numpy(), q_test[b].cpu().numpy(), alpha
-                )[0]
-            ),
-            "probit_clamp": float(
-                ((u_test[b] <= eps) | (u_test[b] >= 1 - eps)).float().mean()
-            ),
-            "slope_clamp": float(
-                (logp_scaled[b].abs() >= _LOG_F_CEILING - 1e-3).float().mean()
-            ),
+            "ece": float(compute_quantile_ece(y_te_s[b].cpu().numpy(), q_test[b].cpu().numpy(), alpha)[0]),
+            "probit_clamp": float(((u_test[b] <= eps) | (u_test[b] >= 1 - eps)).float().mean()),
+            "slope_clamp": float((logp_scaled[b].abs() >= _LOG_F_CEILING - 1e-3).float().mean()),
             "rank_hist": rank_histogram(u_test[b].cpu().numpy(), 20).tolist(),
         }
 
         # Analytic references (skipped for kernels that cannot be rebuilt).
         try:
             kfn, nugget = _kernel_fn_from_task(ep)
-            mu, sigma = analytic_marginal_targets(
-                ep, x_tr[b], y_tr[b], x_te[b], kernel_fn=kfn, nugget=nugget
-            )
+            mu, sigma = analytic_marginal_targets(ep, x_tr[b], y_tr[b], x_te[b], kernel_fn=kfn, nugget=nugget)
             rec["nll_oracle"] = oracle_marginal_nll(y_te[b], mu, sigma)
             rec["gap"] = rec["nll"] - rec["nll_oracle"]
         except (NotImplementedError, KeyError):
@@ -118,12 +112,8 @@ def _episode_metrics(
 
         try:
             ana = gp_analytical_pit(ep)
-            rec["z_gap_train"] = float(
-                (z_train[b].cpu() - ana["z_train"].reshape(-1).cpu()).abs().mean()
-            )
-            rec["z_gap_test"] = float(
-                (z_test[b].cpu() - ana["z_test"].reshape(-1).cpu()).abs().mean()
-            )
+            rec["z_gap_train"] = float((z_train[b].cpu() - ana["z_train"].reshape(-1).cpu()).abs().mean())
+            rec["z_gap_test"] = float((z_test[b].cpu() - ana["z_test"].reshape(-1).cpu()).abs().mean())
         except (NotImplementedError, KeyError):
             rec["z_gap_train"] = float("nan")
             rec["z_gap_test"] = float("nan")
@@ -137,8 +127,15 @@ def _agg(records: list[dict], keys: list[str]) -> dict:
 
 
 _METRIC_KEYS = [
-    "nll", "nll_oracle", "gap", "ks", "ece",
-    "z_gap_train", "z_gap_test", "probit_clamp", "slope_clamp",
+    "nll",
+    "nll_oracle",
+    "gap",
+    "ks",
+    "ece",
+    "z_gap_train",
+    "z_gap_test",
+    "probit_clamp",
+    "slope_clamp",
 ]
 
 
@@ -164,25 +161,28 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument(
-        "--ckpt", default="tabicl-regressor-v2-20260212.ckpt",
+        "--ckpt",
+        default="tabicl-regressor-v2-20260212.ckpt",
         help="HF filename in jingang/TabICL, a local .pt/.ckpt path, or a name "
-             "registered in eval/configs/checkpoints.py::MARGINAL_FAMILIES.",
+        "registered in eval/configs/checkpoints.py::MARGINAL_FAMILIES.",
     )
-    ap.add_argument("--n-episodes", type=int, default=128,
-                    help="Episodes per context size P.")
-    ap.add_argument("--batch-size", type=int, default=8,
-                    help="Episodes per generate_gp_batch / PIT call (they share P and N).")
-    ap.add_argument("--p-values", type=int, nargs="+", default=[8, 16, 32, 64, 128, 256],
-                    help="Context sizes to sweep. The defect is expected to vary "
-                         "along this axis, and so is the fix.")
+    ap.add_argument("--n-episodes", type=int, default=128, help="Episodes per context size P.")
+    ap.add_argument(
+        "--batch-size", type=int, default=8, help="Episodes per generate_gp_batch / PIT call (they share P and N)."
+    )
+    ap.add_argument(
+        "--p-values",
+        type=int,
+        nargs="+",
+        default=[8, 16, 32, 64, 128, 256],
+        help="Context sizes to sweep. The defect is expected to vary along this axis, and so is the fix.",
+    )
     ap.add_argument("--n-test", type=int, default=128, help="Query rows per episode.")
-    ap.add_argument("--k-folds", type=int, default=DEFAULT_K_FOLDS,
-                    help="Must match deployment (tabicl.pit_k_folds).")
+    ap.add_argument("--k-folds", type=int, default=DEFAULT_K_FOLDS, help="Must match deployment (tabicl.pit_k_folds).")
     ap.add_argument("--eps", type=float, default=1.0e-6, help="Probit clamp epsilon.")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=20260902)
-    ap.add_argument("--out-json", default=None,
-                    help="Write the full per-group record (incl. rank histograms) here.")
+    ap.add_argument("--out-json", default=None, help="Write the full per-group record (incl. rank histograms) here.")
     args = ap.parse_args()
 
     device = args.device
@@ -203,9 +203,7 @@ def main() -> None:
 
     all_records: list[dict] = []
     for P in args.p_values:
-        gp_cfg = OmegaConf.create(
-            {"data": OmegaConf.to_container(full.data, resolve=True), "seed": args.seed}
-        )
+        gp_cfg = OmegaConf.create({"data": OmegaConf.to_container(full.data, resolve=True), "seed": args.seed})
         gp_cfg.data.P_min = int(P)
         gp_cfg.data.P_max = int(P)
         gp_cfg.data.N_min = int(args.n_test)
@@ -263,7 +261,8 @@ def main() -> None:
                     "rank_hist": hist.tolist(),
                     "records": all_records,
                 },
-                f, indent=2,
+                f,
+                indent=2,
             )
         print(f"[out] {args.out_json}")
 

@@ -10,6 +10,7 @@ Usage:
     python debug/run_debug.py s1
     python debug/stages/s1_rank_ceiling.py --n-episodes 64 --ranks 8,16,32,64
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,8 +25,13 @@ RANK_SWEEP_DEFAULT = [4, 8, 16, 32, 64, 128]
 
 
 def fit_rank_ceiling(
-    R_post: torch.Tensor, r: int, *, steps: int = 300, lr: float = 0.05,
-    jitter: float = 1e-4, device: str = "cpu",
+    R_post: torch.Tensor,
+    r: int,
+    *,
+    steps: int = 300,
+    lr: float = 0.05,
+    jitter: float = 1e-4,
+    device: str = "cpu",
 ):
     """Fit a rank-r covnorm model to R_post (B, N, N) by the closed-form expected copula NLL.
 
@@ -87,16 +93,23 @@ def run(dcfg: DebugConfig, ranks=None, steps: int = 300, lr: float = 0.05) -> di
             per_ep, _ = fit_rank_ceiling(R_batch, r_eff, steps=steps, lr=lr, jitter=jitter, device=dcfg.device)
             losses_all.append(per_ep.numpy())
         losses = np.concatenate(losses_all)
-        per_rank.append({
-            "rank": r,
-            "ceiling_copula_nll_per_point": {
-                "mean": float(losses.mean()), "std": float(losses.std()),
-                "min": float(losses.min()), "max": float(losses.max()),
-            },
-        })
+        per_rank.append(
+            {
+                "rank": r,
+                "ceiling_copula_nll_per_point": {
+                    "mean": float(losses.mean()),
+                    "std": float(losses.std()),
+                    "min": float(losses.min()),
+                    "max": float(losses.max()),
+                },
+            }
+        )
 
     return {
-        "ranks": ranks, "n_episodes_scored": len(pairs), "steps": steps, "lr": lr,
+        "ranks": ranks,
+        "n_episodes_scored": len(pairs),
+        "steps": steps,
+        "lr": lr,
         "per_rank": per_rank,
     }
 
@@ -110,8 +123,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     ranks = [int(x) for x in args.ranks.split(",")]
     result = run(dcfg, ranks=ranks, steps=args.steps, lr=args.lr)

@@ -79,7 +79,9 @@ def generate_episodes(
         cfg = OmegaConf.merge(cfg, OmegaConf.create({"data": {"P_min": P_override, "P_max": P_override}}))
     cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": dcfg.seed + seed_offset}))
     return generate_gp_batch(
-        cfg, n, device=dcfg.device,
+        cfg,
+        n,
+        device=dcfg.device,
         tabicl_model=tabicl_model,
         tabicl_k_folds=int(cfg.data.get("z_train_tabicl_k_folds", 10)),
         return_kernel_metadata=return_kernel_metadata,
@@ -107,8 +109,9 @@ def posterior_oracle(episode: dict):
         return None
 
 
-def collect_posteriors(dcfg: DebugConfig, n: int, *, P_override: Optional[int] = None,
-                        seed_offset: int = 0, batch_size: int = 32):
+def collect_posteriors(
+    dcfg: DebugConfig, n: int, *, P_override: Optional[int] = None, seed_offset: int = 0, batch_size: int = 32
+):
     """Generate n analytic episodes in chunks of batch_size and pair each with its posterior (unsupported ones skipped)."""
     pairs = []
     remaining = n
@@ -116,7 +119,10 @@ def collect_posteriors(dcfg: DebugConfig, n: int, *, P_override: Optional[int] =
     while remaining > 0:
         b = min(batch_size, remaining)
         episodes = generate_episodes(
-            dcfg, b, tabicl_model=None, P_override=P_override,
+            dcfg,
+            b,
+            tabicl_model=None,
+            P_override=P_override,
             seed_offset=seed_offset + chunk_idx * 104_729,
         )
         for ep in episodes:

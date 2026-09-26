@@ -9,6 +9,7 @@ Usage:
     python debug/era5_viz_preview.py <ckpt> --n-days 4 --gp-kernel rational_quadratic
     python debug/era5_viz_preview.py <ckpt> --no-gp
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,11 +31,11 @@ from eval.spatial.sweep_core import get_model  # noqa: E402
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("ckpt", help="path to a copula checkpoint (.pt)")
-    p.add_argument("--out", default=os.path.join(_REPO_ROOT, "results", "era5_viz_gp_row",
-                                                 "era5_predictions_gp_row.png"))
+    p.add_argument(
+        "--out", default=os.path.join(_REPO_ROOT, "results", "era5_viz_gp_row", "era5_predictions_gp_row.png")
+    )
     p.add_argument("--n-days", type=int, default=3)
     p.add_argument("--region", default=None, help="override baselines.era5_viz_region")
     p.add_argument("--grid-size", type=int, default=None)
@@ -44,6 +45,7 @@ def main() -> None:
     args = p.parse_args()
 
     from copula_inter import train as T
+
     model, cfg, device, marginal = get_model(args.ckpt, args.device)
     OmegaConf.set_struct(cfg, False)
     cfg.baselines.era5_viz_n_days = args.n_days
@@ -57,8 +59,10 @@ def main() -> None:
     vb = T._build_era5_viz_batch(cfg, marginal, device)
     if vb is None:
         raise SystemExit("era5 viz probe unavailable (check baselines.era5_regions)")
-    print(f"region={vb['region']} D={vb['D']} n_context={vb['n_context']} "
-          f"({100.0 * vb['n_context'] / vb['D']:.1f}% of grid) days={vb['days']}")
+    print(
+        f"region={vb['region']} D={vb['D']} n_context={vb['n_context']} "
+        f"({100.0 * vb['n_context'] / vb['D']:.1f}% of grid) days={vb['days']}"
+    )
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     with torch.no_grad():
@@ -86,17 +90,19 @@ def main() -> None:
     print(f"{'day':>6} {'truth':>9} {'GP post':>9} {'model':>9} {'indep':>9}")
     with torch.no_grad():
         for i, d in enumerate(vb["days"]):
-            z_tr = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32,
-                                   device=device).unsqueeze(0)
+            z_tr = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
             out_v = model({"x_train": x_tr, "z_train": z_tr, "x_test": x_te})
             Sigma = T.build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
             z = rng.standard_normal(vb["D"])
             di, ym, ys = vb["dists_per_day"][i], vb["y_mean_per_day"][i], vb["y_std_per_day"][i]
-            m_gp = (morans_i(T._era5_viz_gp_field(gp_post[i], z).reshape(shape))
-                    if gp_post[i] is not None else float("nan"))
-            print(f"{d:>6} {morans_i(vb['true_fields'][i]):>9.3f} {m_gp:>9.3f} "
-                  f"{morans_i(T._era5_viz_field(Sigma, di, ym, ys, z, device).reshape(shape)):>9.3f} "
-                  f"{morans_i(T._era5_viz_field(R_indep, di, ym, ys, z, device).reshape(shape)):>9.3f}")
+            m_gp = (
+                morans_i(T._era5_viz_gp_field(gp_post[i], z).reshape(shape)) if gp_post[i] is not None else float("nan")
+            )
+            print(
+                f"{d:>6} {morans_i(vb['true_fields'][i]):>9.3f} {m_gp:>9.3f} "
+                f"{morans_i(T._era5_viz_field(Sigma, di, ym, ys, z, device).reshape(shape)):>9.3f} "
+                f"{morans_i(T._era5_viz_field(R_indep, di, ym, ys, z, device).reshape(shape)):>9.3f}"
+            )
 
     print(f"\nwrote {args.out}")
 

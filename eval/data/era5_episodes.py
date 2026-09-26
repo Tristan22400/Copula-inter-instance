@@ -135,59 +135,65 @@ def build_era5_eval_episodes(
     # Pass lazy explicitly (max_months is applied before the corpus' own heuristic).
     corpus = GlobalERA5Corpus(corpus_dir, max_months=max_months, lazy=lazy)
     if verbose:
-        print(f"  [era5] corpus: {corpus.n_days_total} daily snapshots, "
-              f"native grid {len(corpus.lat)}x{len(corpus.lon)}")
+        print(
+            f"  [era5] corpus: {corpus.n_days_total} daily snapshots, native grid {len(corpus.lat)}x{len(corpus.lon)}"
+        )
 
     # ---- Geographic/target draws (CPU, cheap) ----
     raw: list[dict] = []
     for local_i in range(n_episodes):
         ep_i = offset + local_i
         drawn = _draw_episode(
-            corpus, _episode_rng(seed, ep_i),
-            vary_geometry=vary_geometry, grid_size=grid_size, n_context=n_context,
-            box_deg_range=box_deg_range, grid_size_range=grid_size_range,
+            corpus,
+            _episode_rng(seed, ep_i),
+            vary_geometry=vary_geometry,
+            grid_size=grid_size,
+            n_context=n_context,
+            box_deg_range=box_deg_range,
+            grid_size_range=grid_size_range,
             n_context_frac_range=n_context_frac_range,
         )
-        raw.append({
-            "ep_i": ep_i,
-            "x_norm_train": torch.from_numpy(drawn["x_norm_train"]),
-            "x_norm_test": torch.from_numpy(drawn["x_norm_test"]),
-            "y_train": torch.from_numpy(drawn["y_train"]),
-            "y_test": torch.from_numpy(drawn["y_test"]),
-            # Both samplers always return these keys.
-            "grid_size": int(drawn["grid_size"]),
-            "lat_bounds": drawn["lat_bounds"],
-            "lon_bounds": drawn["lon_bounds"],
-        })
+        raw.append(
+            {
+                "ep_i": ep_i,
+                "x_norm_train": torch.from_numpy(drawn["x_norm_train"]),
+                "x_norm_test": torch.from_numpy(drawn["x_norm_test"]),
+                "y_train": torch.from_numpy(drawn["y_train"]),
+                "y_test": torch.from_numpy(drawn["y_test"]),
+                # Both samplers always return these keys.
+                "grid_size": int(drawn["grid_size"]),
+                "lat_bounds": drawn["lat_bounds"],
+                "lon_bounds": drawn["lon_bounds"],
+            }
+        )
 
     # PIT: batched for fixed shapes, per episode for varying geometry.
     dev = torch.device(device)
     group = 1 if vary_geometry else max(1, int(pit_group_size))
     episodes: list[dict] = []
     for chunk_i, start in enumerate(range(0, len(raw), group)):
-        chunk = raw[start:start + group]
+        chunk = raw[start : start + group]
         # _pit_group also handles B=1.
         out = _pit_group(
             torch.stack([r["x_norm_train"] for r in chunk]).to(dev),
             torch.stack([r["y_train"] for r in chunk]).to(dev),
             torch.stack([r["x_norm_test"] for r in chunk]).to(dev),
             torch.stack([r["y_test"] for r in chunk]).to(dev),
-            tabicl_model, k_folds,
-            marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
-            marginal_probs_n=marginal_probs_n, seed=chunk[0]["ep_i"],
+            tabicl_model,
+            k_folds,
+            marginal_backend=marginal_backend,
+            marginal_regressor=marginal_regressor,
+            marginal_probs_n=marginal_probs_n,
+            seed=chunk[0]["ep_i"],
         )
         pits = [
-            None if out is None else {k: out[k][b] for k in
-                                      ("z_train", "z_test", "log_pdf_test")}
+            None if out is None else {k: out[k][b] for k in ("z_train", "z_test", "log_pdf_test")}
             for b in range(len(chunk))
         ]
 
         # Autoregressive chain on the same group and marginal, raw y.
         ar_log_pdf: list[Optional[torch.Tensor]] = [None] * len(chunk)
-        n_ar = (
-            len(chunk) if ar_n_episodes is None
-            else max(0, min(len(chunk), int(ar_n_episodes) - start))
-        )
+        n_ar = len(chunk) if ar_n_episodes is None else max(0, min(len(chunk), int(ar_n_episodes) - start))
         if autoregressive and out is not None and n_ar > 0:
             sub = chunk[:n_ar]
             ar_out = autoregressive_log_pdf(
@@ -196,8 +202,10 @@ def build_era5_eval_episodes(
                 torch.stack([r["y_train"] for r in sub]).to(dev),
                 torch.stack([r["x_norm_test"] for r in sub]).to(dev),
                 torch.stack([r["y_test"] for r in sub]).to(dev),
-                order=ar_order, conditioning=ar_conditioning,
-                max_context=ar_max_context, seed=seed,
+                order=ar_order,
+                conditioning=ar_conditioning,
+                max_context=ar_max_context,
+                seed=seed,
                 episode_indices=[r["ep_i"] for r in sub],
             )
             for b in range(len(sub)):
@@ -210,9 +218,7 @@ def build_era5_eval_episodes(
             P = int(r["x_norm_train"].shape[0])
             N = int(r["x_norm_test"].shape[0])
             # Same normalize_targets call as the PIT, so y_log_std is its exact Jacobian.
-            y_tr_scaled, y_te_scaled, _, y_std = normalize_targets(
-                r["y_train"], r["y_test"]
-            )
+            y_tr_scaled, y_te_scaled, _, y_std = normalize_targets(r["y_train"], r["y_test"])
             if standardize_y:
                 y_tr, y_te = y_tr_scaled, y_te_scaled
                 y_log_std = float(y_std.log())
@@ -254,15 +260,19 @@ def build_era5_eval_episodes(
 
     if verbose and autoregressive:
         n_with = sum(1 for e in episodes if "ar_log_pdf" in e)
-        print(f"  [era5] autoregressive chain: {n_with}/{len(episodes)} episodes, "
-              f"order={ar_order}, conditioning={ar_conditioning}, "
-              f"max_context={ar_max_context}")
+        print(
+            f"  [era5] autoregressive chain: {n_with}/{len(episodes)} episodes, "
+            f"order={ar_order}, conditioning={ar_conditioning}, "
+            f"max_context={ar_max_context}"
+        )
     if verbose and episodes:
         Ps = [e["era5_meta"]["P"] for e in episodes]
         Ns = [e["era5_meta"]["N"] for e in episodes]
-        print(f"  [era5] built {len(episodes)} episodes — "
-              f"P {min(Ps)}..{max(Ps)}, N {min(Ns)}..{max(Ns)}, d_x="
-              f"{episodes[0]['x_norm_train'].shape[-1]}")
+        print(
+            f"  [era5] built {len(episodes)} episodes — "
+            f"P {min(Ps)}..{max(Ps)}, N {min(Ns)}..{max(Ns)}, d_x="
+            f"{episodes[0]['x_norm_train'].shape[-1]}"
+        )
     return episodes
 
 
@@ -291,9 +301,7 @@ def era5_episode_fingerprint(
         "box_deg_range": [float(b) for b in box_deg_range],
         "vary_geometry": bool(vary_geometry),
         "grid_size_range": [int(g) for g in grid_size_range] if vary_geometry else None,
-        "n_context_frac_range": (
-            [float(f) for f in n_context_frac_range] if vary_geometry else None
-        ),
+        "n_context_frac_range": ([float(f) for f in n_context_frac_range] if vary_geometry else None),
         "pit_k_folds": int(k_folds),
         "pit_marginal": marginal,
         "max_months": max_months,

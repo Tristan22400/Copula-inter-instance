@@ -9,6 +9,7 @@ Usage:
     python debug/run_debug.py s2
     python debug/stages/s2_uspace.py --n-episodes 100
 """
+
 from __future__ import annotations
 
 import argparse
@@ -20,8 +21,8 @@ import torch
 from debug import common
 from debug.config import DebugConfig, add_common_args, build_config
 
-U_HARD_CLAMP = 1e-6      # pit.py::_probit's clamp -- exactly |z| = 4.7534 beyond this
-U_SPLINE_KNOT = 1e-3     # TabICL's outermost quantile knot (num_quantiles=999 -> alpha in [.001,.999])
+U_HARD_CLAMP = 1e-6  # pit.py::_probit's clamp -- exactly |z| = 4.7534 beyond this
+U_SPLINE_KNOT = 1e-3  # TabICL's outermost quantile knot (num_quantiles=999 -> alpha in [.001,.999])
 Z_STD_DEGEN_LO, Z_STD_DEGEN_HI = 0.1, 3.0  # data_gen.py's own post-hoc degeneracy filter bounds
 
 
@@ -46,12 +47,16 @@ def _pit_ece(u: np.ndarray, n_levels: int = 19) -> tuple[float, np.ndarray, np.n
 
 def _clamp_stats(u_per_episode: "list[np.ndarray]") -> dict:
     pooled = np.concatenate(u_per_episode) if u_per_episode else np.array([])
-    per_ep_frac_spline = np.array([
-        float(((e <= U_SPLINE_KNOT) | (e >= 1 - U_SPLINE_KNOT)).mean()) for e in u_per_episode
-    ])
+    per_ep_frac_spline = np.array(
+        [float(((e <= U_SPLINE_KNOT) | (e >= 1 - U_SPLINE_KNOT)).mean()) for e in u_per_episode]
+    )
     return {
-        "pooled_frac_hard_clamp": float(((pooled <= U_HARD_CLAMP) | (pooled >= 1 - U_HARD_CLAMP)).mean()) if pooled.size else None,
-        "pooled_frac_spline_saturated": float(((pooled <= U_SPLINE_KNOT) | (pooled >= 1 - U_SPLINE_KNOT)).mean()) if pooled.size else None,
+        "pooled_frac_hard_clamp": float(((pooled <= U_HARD_CLAMP) | (pooled >= 1 - U_HARD_CLAMP)).mean())
+        if pooled.size
+        else None,
+        "pooled_frac_spline_saturated": float(((pooled <= U_SPLINE_KNOT) | (pooled >= 1 - U_SPLINE_KNOT)).mean())
+        if pooled.size
+        else None,
         "per_episode_frac_spline_saturated": {
             "mean": float(per_ep_frac_spline.mean()) if per_ep_frac_spline.size else None,
             "max": float(per_ep_frac_spline.max()) if per_ep_frac_spline.size else None,
@@ -75,8 +80,10 @@ def _audit_source(u_train_per_ep, u_test_per_ep) -> dict:
         ece, alpha_grid, coverage = _pit_ece(pooled)
         hist, edges = np.histogram(pooled, bins=20, range=(0, 1))
         out[name] = {
-            "mean": float(pooled.mean()), "std": float(pooled.std()),
-            "ks_statistic_pooled": float(ks_pooled.statistic), "ks_pvalue_pooled": float(ks_pooled.pvalue),
+            "mean": float(pooled.mean()),
+            "std": float(pooled.std()),
+            "ks_statistic_pooled": float(ks_pooled.statistic),
+            "ks_pvalue_pooled": float(ks_pooled.pvalue),
             "ks_statistic_per_episode_mean": float(np.mean(ks_per_ep)) if ks_per_ep else None,
             "ks_statistic_per_episode_max": float(np.max(ks_per_ep)) if ks_per_ep else None,
             "pit_ece": float(ece),
@@ -123,7 +130,8 @@ def _print_summary(result: dict) -> None:
         for name in ("z_train", "z_test"):
             d = r[name]
             if "error" in d:
-                print(f"  {name}: {d['error']}"); continue
+                print(f"  {name}: {d['error']}")
+                continue
             cc = d["clamping_census"]
             print(
                 f"  {name:8s} mean={d['mean']:.4f} std={d['std']:.4f} "
@@ -132,7 +140,9 @@ def _print_summary(result: dict) -> None:
                 f"spline_sat={cc['pooled_frac_spline_saturated']:.5f} "
                 f"episodes>1%sat={cc['n_episodes_gt_1pct_saturated']}/{cc['n_episodes_total']}"
             )
-        print(f"  z_train degeneracy rate (post-PIT, std outside [0.1,3.0]): {r['z_train_degeneracy_rate_post_pit']:.4f}")
+        print(
+            f"  z_train degeneracy rate (post-PIT, std outside [0.1,3.0]): {r['z_train_degeneracy_rate_post_pit']:.4f}"
+        )
 
 
 def main() -> None:
@@ -141,8 +151,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     result = run(dcfg)
     _print_summary(result)

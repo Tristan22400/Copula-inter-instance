@@ -69,8 +69,15 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
             continue  # not a registered eval/configs/regions.py entry
         region_seed = _name_seed(base_seed, region_name)
         probe = build_era5_probe(
-            region_name, grid_size, n_days_fetch, n_days_probe, n_context, n_bins,
-            tabicl_marginal, device, seed=region_seed,
+            region_name,
+            grid_size,
+            n_days_fetch,
+            n_days_probe,
+            n_context,
+            n_bins,
+            tabicl_marginal,
+            device,
+            seed=region_seed,
         )
         n_days_p = probe["z_train_per_day"].shape[0]
         x_train = torch.as_tensor(probe["x_train_norm"], dtype=torch.float32, device=device)
@@ -116,7 +123,9 @@ def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> di
                     x_test_norm=probe["x_nll_test_norm"],
                     y_test=probe["nll_test_values_per_day"][d],
                     kernel_names=gp_baseline_kernels,
-                    n_steps=gp_n_steps_mle, lr=gp_lr_mle, n_restarts=gp_n_restarts_mle,
+                    n_steps=gp_n_steps_mle,
+                    lr=gp_lr_mle,
+                    n_restarts=gp_n_restarts_mle,
                     device=device,
                 )
                 for kname, parts in gp_day.items():
@@ -194,15 +203,31 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
         z_train_per_day.append(z_train_d)
         gp_post_per_day.append(
             _era5_viz_gp_posterior(
-                x_train_norm, context_values, x_test_norm, gp_row_kernel,
-                gp_row_n_steps, gp_row_lr, gp_row_n_restarts, device,
-            ) if gp_row_enabled else None
+                x_train_norm,
+                context_values,
+                x_test_norm,
+                gp_row_kernel,
+                gp_row_n_steps,
+                gp_row_lr,
+                gp_row_n_restarts,
+                device,
+            )
+            if gp_row_enabled
+            else None
         )
         gp_post_z_per_day.append(
             _era5_viz_gp_posterior_on_z(
-                x_train_norm, z_train_d, x_test_norm, gp_row_kernel,
-                gp_row_n_steps, gp_row_lr, gp_row_n_restarts, device,
-            ) if gp_row_enabled else None
+                x_train_norm,
+                z_train_d,
+                x_test_norm,
+                gp_row_kernel,
+                gp_row_n_steps,
+                gp_row_lr,
+                gp_row_n_restarts,
+                device,
+            )
+            if gp_row_enabled
+            else None
         )
         context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
         context_values_scaled_t, _, y_mean_t, y_std_t = normalize_targets(context_values_t)
@@ -214,9 +239,7 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
             marginal_mean_per_day.append(None)
             continue
         with torch.no_grad():
-            logits = tabicl_forward(
-                tabicl_marginal, x_batch, context_values_scaled_t.unsqueeze(0)
-            )  # (1, D, Q)
+            logits = tabicl_forward(tabicl_marginal, x_batch, context_values_scaled_t.unsqueeze(0))  # (1, D, Q)
             dist_d = tabicl_marginal.quantile_dist(logits.reshape(D, -1))
             dists_per_day.append(dist_d)
             # Variance in Kelvin^2: Var[y_scaled | x] * y_std^2.
@@ -225,22 +248,40 @@ def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dic
             marginal_mean_per_day.append((y_mean_t.double() + y_std_t.double() * dist_d.mean().double()).cpu().numpy())
 
     return {
-        "region": region_name, "lat": lat, "lon": lon, "grid_shape": data["t2m"][days[0]].shape,
-        "days": days, "true_fields": true_fields, "coords": coords,
-        "context_coords": context_coords, "D": D, "n_context": n_context,
-        "x_train_norm": x_train_norm, "x_test_norm": x_test_norm,
+        "region": region_name,
+        "lat": lat,
+        "lon": lon,
+        "grid_shape": data["t2m"][days[0]].shape,
+        "days": days,
+        "true_fields": true_fields,
+        "coords": coords,
+        "context_coords": context_coords,
+        "D": D,
+        "n_context": n_context,
+        "x_train_norm": x_train_norm,
+        "x_test_norm": x_test_norm,
         "z_train_per_day": z_train_per_day,
-        "dists_per_day": dists_per_day, "y_mean_per_day": y_mean_per_day, "y_std_per_day": y_std_per_day,
-        "marginal_var_per_day": marginal_var_per_day, "marginal_mean_per_day": marginal_mean_per_day,
-        "gp_post_per_day": gp_post_per_day, "gp_post_z_per_day": gp_post_z_per_day,
+        "dists_per_day": dists_per_day,
+        "y_mean_per_day": y_mean_per_day,
+        "y_std_per_day": y_std_per_day,
+        "marginal_var_per_day": marginal_var_per_day,
+        "marginal_mean_per_day": marginal_mean_per_day,
+        "gp_post_per_day": gp_post_per_day,
+        "gp_post_z_per_day": gp_post_z_per_day,
         "gp_row_kernel": gp_row_kernel,
         "seed": seed,
     }
 
 
 def _era5_viz_gp_posterior(
-    x_train_norm: np.ndarray, context_values: np.ndarray, x_test_norm: np.ndarray,
-    kernel_name: str, n_steps: int, lr: float, n_restarts: int, device: str,
+    x_train_norm: np.ndarray,
+    context_values: np.ndarray,
+    x_test_norm: np.ndarray,
+    kernel_name: str,
+    n_steps: int,
+    lr: float,
+    n_restarts: int,
+    device: str,
 ) -> "dict | None":
     """GP posterior (mean, Cholesky factor) at the viz grid, fitted by MLE+MAP on the sparse context.
 
@@ -256,11 +297,17 @@ def _era5_viz_gp_posterior(
         X_te = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
         y_tr = torch.as_tensor((context_values - mu_y) / sigma_y, dtype=torch.float32, device=device)
         fit = fit_and_eval_gpytorch(
-            X_tr, y_tr, X_te, kernel_name, n_steps=n_steps, lr=lr,
-            oracle_mode="posterior", n_restarts=n_restarts,
+            X_tr,
+            y_tr,
+            X_te,
+            kernel_name,
+            n_steps=n_steps,
+            lr=lr,
+            oracle_mode="posterior",
+            n_restarts=n_restarts,
         )
         mean = (fit["mean"].double() * sigma_y + mu_y).cpu().numpy()
-        Sigma = (fit["Sigma"].double() * (sigma_y ** 2)).cpu().numpy()
+        Sigma = (fit["Sigma"].double() * (sigma_y**2)).cpu().numpy()
         return {"mean": mean, "L": safe_cholesky(Sigma), "kernel": kernel_name}
     except Exception as exc:  # noqa: BLE001
         print(f"  [era5_viz_gp:{kernel_name}] fit failed, dropping GP row: {exc}")
@@ -268,8 +315,14 @@ def _era5_viz_gp_posterior(
 
 
 def _era5_viz_gp_posterior_on_z(
-    x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray,
-    kernel_name: str, n_steps: int, lr: float, n_restarts: int, device: str,
+    x_train_norm: np.ndarray,
+    z_train: np.ndarray,
+    x_test_norm: np.ndarray,
+    kernel_name: str,
+    n_steps: int,
+    lr: float,
+    n_restarts: int,
+    device: str,
 ) -> "dict | None":
     """GP correlation matrix at the viz grid, fitted on the PIT latent z_train instead of Kelvin.
 
@@ -282,8 +335,14 @@ def _era5_viz_gp_posterior_on_z(
         X_te = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
         z_tr = torch.as_tensor(z_train, dtype=torch.float32, device=device)
         fit = fit_and_eval_gpytorch(
-            X_tr, z_tr, X_te, kernel_name, n_steps=n_steps, lr=lr,
-            oracle_mode="posterior", n_restarts=n_restarts,
+            X_tr,
+            z_tr,
+            X_te,
+            kernel_name,
+            n_steps=n_steps,
+            lr=lr,
+            oracle_mode="posterior",
+            n_restarts=n_restarts,
         )
         R = fit["R"].double().cpu().numpy()
         return {"L": safe_cholesky(R), "kernel": kernel_name}
@@ -304,7 +363,9 @@ def _era5_viz_gp_correlation(gp: dict) -> np.ndarray:
     return Sigma / np.outer(std, std)
 
 
-def _era5_viz_field(Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.Tensor, z_shared: np.ndarray, device: str) -> np.ndarray:
+def _era5_viz_field(
+    Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.Tensor, z_shared: np.ndarray, device: str
+) -> np.ndarray:
     """One draw (D,) from the copula model: y = F^{-1}(Phi(chol(Sigma) z_shared)).
 
     Uses the day's frozen marginal dist, or a Gaussian(mean, std) marginal when
@@ -324,7 +385,11 @@ def _era5_viz_field(Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.
 
 
 def _era5_viz_fig(
-    model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str,
+    model: nn.Module,
+    cfg: DictConfig,
+    vb: dict,
+    jitter: float,
+    device: str,
 ) -> "tuple[plt.Figure | None, plt.Figure | None]":
     """Build val/era5_predictions and val/era5_residuals from the frozen viz probe.
 
@@ -367,7 +432,12 @@ def _era5_viz_fig(
         # The z-space GP fit can fail independently of the raw-y fit.
         if gp_post_z[i] is not None:
             gp_tabicl_field = _era5_viz_field(
-                _era5_viz_gp_correlation(gp_post_z[i]), dist_i, y_mean_i, y_std_i, z_shared, device,
+                _era5_viz_gp_correlation(gp_post_z[i]),
+                dist_i,
+                y_mean_i,
+                y_std_i,
+                z_shared,
+                device,
             )
             gp_tabicl_fields.append(gp_tabicl_field)
             if mean_i is not None:
@@ -377,9 +447,14 @@ def _era5_viz_fig(
     gp_tabicl_row = gp_tabicl_fields if len(gp_tabicl_fields) == len(vb["days"]) else None
     data_like = {"latitude": vb["lat"], "longitude": vb["lon"], "t2m": dict(zip(vb["days"], vb["true_fields"]))}
     fig_raw = plot_residual_grid(
-        data_like, vb["days"], predicted_fields, output_path=None,
-        context_coords=vb["context_coords"], independent_fields=independent_fields,
-        oracle_fields=oracle_fields, predicted_fields_2=gp_tabicl_row,
+        data_like,
+        vb["days"],
+        predicted_fields,
+        output_path=None,
+        context_coords=vb["context_coords"],
+        independent_fields=independent_fields,
+        oracle_fields=oracle_fields,
+        predicted_fields_2=gp_tabicl_row,
         oracle_row_label=f"Fitted GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample\nLatitude",
         pred2_row_label="Fitted GP correlation\n+ TabICLv2 marginal\nsample\nLatitude",
         target="raw",
@@ -389,9 +464,16 @@ def _era5_viz_fig(
         oracle_resid = gp_resid if len(gp_resid) == len(vb["days"]) else None
         gp_tabicl_resid_row = gp_tabicl_resid if len(gp_tabicl_resid) == len(vb["days"]) else None
         fig_resid = plot_mean_removed_grid(
-            vb["lat"], vb["lon"], vb["grid_shape"], vb["days"], true_resid, output_path=None,
-            predicted_fields=predicted_resid, predicted_fields_2=gp_tabicl_resid_row,
-            independent_fields=independent_resid, oracle_fields=oracle_resid,
+            vb["lat"],
+            vb["lon"],
+            vb["grid_shape"],
+            vb["days"],
+            true_resid,
+            output_path=None,
+            predicted_fields=predicted_resid,
+            predicted_fields_2=gp_tabicl_resid_row,
+            independent_fields=independent_resid,
+            oracle_fields=oracle_resid,
             context_coords=vb["context_coords"],
             oracle_row_label=f"Fitted GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample minus\nGP mean\nLatitude",
         )
@@ -399,7 +481,12 @@ def _era5_viz_fig(
 
 
 def _era5_z_samples_fig(
-    model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str, n_samples: int = 3,
+    model: nn.Module,
+    cfg: DictConfig,
+    vb: dict,
+    jitter: float,
+    device: str,
+    n_samples: int = 3,
 ) -> "plt.Figure | None":
     """Build val/era5_predictions_z: n_samples draws of the latent z on the first viz day.
 
@@ -431,9 +518,15 @@ def _era5_z_samples_fig(
         gp_fields.append(L_gp @ z_shared)
 
     return plot_z_predictor_samples(
-        vb["lat"], vb["lon"], vb["grid_shape"], day0,
-        independent_fields, predicted_fields, gp_fields,
-        output_path=None, context_coords=vb["context_coords"],
+        vb["lat"],
+        vb["lon"],
+        vb["grid_shape"],
+        day0,
+        independent_fields,
+        predicted_fields,
+        gp_fields,
+        output_path=None,
+        context_coords=vb["context_coords"],
     )
 
 
@@ -451,8 +544,13 @@ def _era5_marginal_variance_fig(vb: dict) -> "plt.Figure | None":
     if len(gp_var_fields) != len(vb["days"]):
         gp_var_fields = None
     return plot_marginal_variance_grid(
-        vb["lat"], vb["lon"], vb["grid_shape"], vb["days"], var_fields,
+        vb["lat"],
+        vb["lon"],
+        vb["grid_shape"],
+        vb["days"],
+        var_fields,
         gp_var_fields=gp_var_fields,
-        output_path=None, context_coords=vb["context_coords"],
+        output_path=None,
+        context_coords=vb["context_coords"],
         gp_row_label=f"Fitted GP\nposterior\n({vb.get('gp_row_kernel', 'gp')})",
     )

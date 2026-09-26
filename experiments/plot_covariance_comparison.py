@@ -52,13 +52,13 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
     # Normalize targets before TabICL.
     tabicl_device = next(tabicl_model.parameters()).device
     with torch.no_grad():
-        y_train_scaled, y_test_scaled, _, _ = normalize_targets(
-            y_train_t.to(tabicl_device), y_test_t.to(tabicl_device)
-        )
+        y_train_scaled, y_test_scaled, _, _ = normalize_targets(y_train_t.to(tabicl_device), y_test_t.to(tabicl_device))
         pit_out = run_pit(
             tabicl_model,
-            X_train_norm_t.to(tabicl_device), y_train_scaled.unsqueeze(-1),
-            X_test_norm_t.to(tabicl_device), y_test_scaled.unsqueeze(-1),
+            X_train_norm_t.to(tabicl_device),
+            y_train_scaled.unsqueeze(-1),
+            X_test_norm_t.to(tabicl_device),
+            y_test_scaled.unsqueeze(-1),
             k_folds=min(10, len(X_train)),
             Y_train_raw=y_train_t.to(tabicl_device).unsqueeze(-1),
         )
@@ -113,8 +113,10 @@ def main() -> None:
     args.kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
+    device = (
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
 

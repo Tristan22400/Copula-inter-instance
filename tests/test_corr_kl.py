@@ -64,7 +64,7 @@ def test_singular_model_returns_inf_not_an_exception():
     """A singular R_model returns inf."""
     n = 6
     R_post = _random_correlation(n, seed=11)
-    singular = torch.ones(n, n, dtype=torch.float64)   # rank 1, unit diagonal
+    singular = torch.ones(n, n, dtype=torch.float64)  # rank 1, unit diagonal
     assert gaussian_corr_kl(singular, R_post) == float("inf")
 
 
