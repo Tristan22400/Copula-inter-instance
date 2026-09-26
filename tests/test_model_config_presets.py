@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import hydra
 import pytest
@@ -17,10 +18,13 @@ from conftest import make_batch
 from copula_inter.model import build_copula_transformer, build_sigma, low_rank_correlation
 from copula_inter.pit import resolve_pit_ckpt as _resolve_pit_ckpt
 
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
 _CONF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "conf")
 
 
-def _compose(model_name: str):
+def _compose(model_name: str) -> DictConfig:
     with hydra.initialize_config_dir(config_dir=_CONF_DIR, version_base=None):
         return hydra.compose(config_name="config", overrides=[f"model={model_name}"])
 
@@ -93,7 +97,7 @@ def test_copula_head_accepts_half_precision_backbone_features() -> None:
 
 
 @pytest.mark.parametrize("parametrization", ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"])
-def test_copula_nano_builds_and_runs_forward_per_parametrization(parametrization) -> None:
+def test_copula_nano_builds_and_runs_forward_per_parametrization(parametrization: str) -> None:
     """copula_nano builds and runs for every correlation_parametrization."""
     cfg = _compose("copula_nano")
     cfg.model.correlation_parametrization = parametrization

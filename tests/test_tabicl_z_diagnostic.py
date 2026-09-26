@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -30,7 +32,7 @@ class FakeTabICL(nn.Module):
         g = torch.Generator().manual_seed(int(X.sum().item() * 1000) % 2**31)
         return torch.randn(d, n, self.q, generator=g)
 
-    def quantile_dist(self, logits_flat: torch.Tensor):
+    def quantile_dist(self, logits_flat: torch.Tensor) -> torch.distributions.Normal:
         loc = logits_flat[:, 0]
         scale = torch.nn.functional.softplus(logits_flat[:, 1]) + 1e-3
         return torch.distributions.Normal(loc, scale)
@@ -44,7 +46,7 @@ def make_val_batch(
     N_max: int = 4,
     n_test: "list[int] | None" = None,
     seed: int = 0,
-):
+) -> dict[str, torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     x_train = torch.randn(B, P_max, d_x, generator=g)
     y_train = torch.randn(B, P_max, generator=g)
@@ -101,15 +103,15 @@ def test_deterministic_across_calls() -> None:
 class _FakeTabiclGroup:
     """Stand-in for cfg.tabicl with only .get."""
 
-    def __init__(self, **kw) -> None:
+    def __init__(self, **kw: Any) -> None:
         self._d = kw
 
-    def get(self, key, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         return self._d.get(key, default)
 
 
 class _FakeCfg:
-    def __init__(self, **tabicl_kw) -> None:
+    def __init__(self, **tabicl_kw: Any) -> None:
         self.tabicl = _FakeTabiclGroup(**tabicl_kw)
 
 

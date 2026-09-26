@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -47,7 +48,7 @@ _TINY_DATA_CFG = {
 
 
 @pytest.fixture(scope="module")
-def tiny_episode():
+def tiny_episode() -> dict[str, torch.Tensor]:
     cfg = OmegaConf.create({"seed": 0, "data": dict(_TINY_DATA_CFG)})
     torch.manual_seed(0)
     return generate_gp_batch(cfg, B=1, device="cpu", return_kernel_metadata=True)[0]
@@ -72,7 +73,7 @@ def _assert_valid_correlation(R: torch.Tensor, n: int, atol: float = 1e-3) -> No
     assert torch.allclose(R.diagonal(), torch.ones(n), atol=1e-2)
 
 
-def _contains_tensor(value) -> bool:
+def _contains_tensor(value: Any) -> bool:
     if isinstance(value, torch.Tensor):
         return True
     if isinstance(value, dict):
@@ -84,7 +85,7 @@ def _contains_tensor(value) -> bool:
 
 def test_pool_episode_payload_encodes_nested_metadata_tensors() -> None:
     """Pool payloads contain no tensors, including inside kernel_component_params."""
-    episode = {
+    episode: dict[str, Any] = {
         "x_norm_train": torch.tensor([[1.0]]),
         "kernel_component_params": [
             {"l": torch.tensor([0.5]), "nested": (torch.tensor([2.0]),)},
@@ -106,11 +107,11 @@ def test_pool_episode_payload_encodes_nested_metadata_tensors() -> None:
     )
 
 
-def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode, tmp_path: Path) -> None:
+def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode: dict[str, torch.Tensor], tmp_path: Path) -> None:
     """The spawned pool transports episodes with nested tensor metadata."""
-    episode = dict(tiny_episode)
+    episode: dict[str, Any] = dict(tiny_episode)
     episode["kernel_component_params"] = [{"l": torch.tensor([0.5])}]
-    fitted = {}
+    fitted: dict[str, Any] = {}
     _prefit_baselines_parallel(
         pending=[("nested-metadata", 7, episode)],
         fit_kwargs={
@@ -136,7 +137,7 @@ def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode, tmp_path: 
     assert all(isinstance(R, torch.Tensor) for R in fitted["nested-metadata"]["R_dict"].values())
 
 
-def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode) -> None:
+def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode: dict[str, torch.Tensor]) -> None:
     """Every baseline fits (or falls back) on a tiny episode with finite NLLs and valid correlation matrices."""
     n_test = tiny_episode["x_norm_test"].shape[0]
 
@@ -195,7 +196,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
-def test_eval_icl_episode_scores_against_oracle(tiny_episode) -> None:
+def test_eval_icl_episode_scores_against_oracle(tiny_episode: dict[str, torch.Tensor]) -> None:
     n_test = tiny_episode["x_norm_test"].shape[0]
     fake_model = _FakeICLModel(n_test=n_test, rank=2)
 
@@ -209,6 +210,7 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode) -> None:
     assert torch.isfinite(torch.tensor(nlls["icl"]))
     assert torch.isfinite(torch.tensor(nlls["oracle"]))
     _assert_valid_correlation(R_dict["icl"], n_test)
+    assert R_oracle is not None
     assert torch.equal(R_oracle, tiny_episode["R_star"])
     # Without a marginal PIT there is no ICL Y-space NLL.
     assert set(icl_y_parts.keys()) == {"total", "marginal", "copula"}
@@ -223,7 +225,7 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode) -> None:
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
-def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode) -> None:
+def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode: dict[str, torch.Tensor]) -> None:
     """With a marginal PIT, icl_y_parts is finite and total = marginal + copula."""
     n_train = tiny_episode["x_norm_train"].shape[0]
     n_test = tiny_episode["x_norm_test"].shape[0]
@@ -253,7 +255,7 @@ def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode) -> N
     )
 
 
-def test_gp_oracle_posterior_total_nll_bayes_optimal(tiny_episode) -> None:
+def test_gp_oracle_posterior_total_nll_bayes_optimal(tiny_episode: dict[str, torch.Tensor]) -> None:
     """The per-point oracle rows keep posterior <= prior."""
     post = gp_analytical_posterior(tiny_episode)
     assert post["nll_post"] <= post["nll_prior"] + 1e-6
@@ -314,7 +316,7 @@ def test_gp_analytical_posterior_eig_floor_nugget_bound() -> None:
     assert repaired_min_eig >= 1e-4 - 1e-9, "post-repair eigenvalues must respect the nugget lower bound"
 
 
-def test_baseline_cache_round_trip(tiny_episode, tmp_path: Path) -> None:
+def test_baseline_cache_round_trip(tiny_episode: dict[str, torch.Tensor], tmp_path: Path) -> None:
     """save_baseline_cache / load_baseline_cache round-trip on a matching fingerprint and miss otherwise."""
     cache_path = str(tmp_path / "baseline_cache.pt")
 
@@ -380,13 +382,15 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path: Path) -> None:
     assert load_baseline_cache(cache_path, other_fingerprint) == {}
 
 
-def test_failed_baseline_fit_still_yields_nan_parts_dict(tiny_episode, monkeypatch: MonkeyPatch) -> None:
+def test_failed_baseline_fit_still_yields_nan_parts_dict(
+    tiny_episode: dict[str, torch.Tensor], monkeypatch: MonkeyPatch
+) -> None:
     """A baseline whose fit raises records a {total, marginal, copula} NaN dict, not a bare float."""
     import eval.baselines.classical as classical
 
     real_fit = classical.fit_and_eval_gpytorch
 
-    def fail_dkl_only(*args, **kwargs):
+    def fail_dkl_only(*args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
         # Only DKL fits fail; GP-MLE still runs.
         if kwargs.get("feature_extractor_factory") is not None:
             raise RuntimeError("synthetic DKL failure")

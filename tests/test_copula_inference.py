@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -160,7 +161,7 @@ def test_get_test_correlation_is_symmetric_and_unit_diagonal() -> None:
     n_test, rank = 6, 2
     W = torch.randn(1, n_test, rank) * 0.3
     s = torch.randn(1, n_test)
-    model = _FakeCopulaModel(W, s)
+    model: Any = _FakeCopulaModel(W, s)
 
     X_train = np.random.randn(4, 1)
     Z_train = np.random.randn(4)
@@ -180,7 +181,7 @@ def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing(
     n_test, rank = 5, 3
     W = torch.randn(1, n_test, rank) * 0.5
     s = torch.randn(1, n_test)
-    model = _FakeCopulaModel(W, s)
+    model: Any = _FakeCopulaModel(W, s)
 
     X_train = np.random.randn(3, 1)
     Z_train = np.random.randn(3)

@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 from copula_inter.data_gen import corrupt_z_train
 
 
-def make_z_train(B: int = 200, P: int = 40, seed: int = 0):
+def make_z_train(B: int = 200, P: int = 40, seed: int = 0) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
     return torch.randn(B, P, generator=g)
 

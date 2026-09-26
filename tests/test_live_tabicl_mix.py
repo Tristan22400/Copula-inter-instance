@@ -12,11 +12,18 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from omegaconf import OmegaConf
 
 from copula_inter.data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw, _tabicl_mix_prob_for_kernel
 from tests.test_pit_batched import RowIndependentFakeTabICL
+
+if TYPE_CHECKING:
+    import types
+
+    from omegaconf import DictConfig
 
 
 def _mix_weights(**by_family: float) -> torch.Tensor:
@@ -46,7 +53,7 @@ def test_tabicl_mix_prob_for_kernel_composite_uses_max() -> None:
     assert abs(_tabicl_mix_prob_for_kernel("matern32*rbf*periodic", w) - 0.8) < 1e-6
 
 
-def test_zero_mix_weights_is_noop_vs_pure_analytic(small_cfg) -> None:
+def test_zero_mix_weights_is_noop_vs_pure_analytic(small_cfg: DictConfig) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -69,7 +76,7 @@ def test_zero_mix_weights_is_noop_vs_pure_analytic(small_cfg) -> None:
         assert torch.allclose(ep_a["z_train"], ep_z["z_train"], atol=1e-6)
 
 
-def test_one_mix_weights_matches_legacy_full_override(small_cfg) -> None:
+def test_one_mix_weights_matches_legacy_full_override(small_cfg: DictConfig) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -92,7 +99,7 @@ def test_one_mix_weights_matches_legacy_full_override(small_cfg) -> None:
         assert torch.allclose(ep_l["z_train"], ep_m["z_train"], atol=1e-6)
 
 
-def test_mix_hit_rate_matches_configured_fraction(small_cfg) -> None:
+def test_mix_hit_rate_matches_configured_fraction(small_cfg: DictConfig) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -120,7 +127,7 @@ def test_mix_hit_rate_matches_configured_fraction(small_cfg) -> None:
     assert abs(empirical_frac - target_frac) < 0.08, empirical_frac
 
 
-def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg) -> None:
+def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg: DictConfig) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -187,13 +194,13 @@ def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg) -> N
     assert any_diff_legacy
 
 
-def _import_train():
+def _import_train() -> types.ModuleType:
     from copula_inter import adaptive_sampling as train
 
     return train
 
 
-def test_compute_tabicl_z_train_gap_runs_on_declared_device(small_cfg) -> None:
+def test_compute_tabicl_z_train_gap_runs_on_declared_device(small_cfg: DictConfig) -> None:
     """_compute_tabicl_z_train_gap runs both paired calls on the given device (CPU here) with finite gaps."""
     train = _import_train()
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))

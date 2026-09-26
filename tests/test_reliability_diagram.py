@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import numpy as np
 import pytest
@@ -57,17 +58,18 @@ class _FakeTabICLRegressor:
 
     def __init__(self) -> None:
         self.fit_calls = 0
-        self.predict_alphas = []
-        self._X = None
-        self._y = None
+        self.predict_alphas: list[list[float]] = []
+        self._X: np.ndarray | None = None
+        self._y: np.ndarray | None = None
 
-    def fit(self, X, y):
+    def fit(self, X: np.ndarray, y: np.ndarray) -> _FakeTabICLRegressor:
         self.fit_calls += 1
         self._X, self._y = np.asarray(X), np.asarray(y)
         return self
 
-    def predict(self, X_test, output_type: str = "quantiles", alphas=None):
+    def predict(self, X_test: np.ndarray, output_type: str = "quantiles", alphas: Any = None) -> np.ndarray:
         assert output_type == "quantiles"
+        assert self._X is not None and self._y is not None
         self.predict_alphas.append(list(alphas))
         X_test = np.asarray(X_test)
         dists = np.linalg.norm(X_test[:, None, :] - self._X[None, :, :], axis=-1)
@@ -87,7 +89,7 @@ def test_reliability_diagram_excludes_context_and_batches_alphas(monkeypatch: Mo
 
     captured = {}
 
-    def fake_generate(y_true, y_pred_quantiles, quantiles, out_path) -> float:
+    def fake_generate(y_true: np.ndarray, y_pred_quantiles: np.ndarray, quantiles: Any, out_path: str | None) -> float:
         captured["y_true"] = y_true
         captured["y_pred_quantiles"] = y_pred_quantiles
         return 0.0

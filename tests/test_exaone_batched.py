@@ -6,6 +6,8 @@ observed float noise and far below the error of a real bug.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -19,13 +21,13 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def regressor():
+def regressor() -> Any:
     from eval.spatial.marginal_backends import make_regressor
 
     return make_regressor("exaone", device="cuda")
 
 
-def test_exaone_batched_matches_per_episode(regressor) -> None:
+def test_exaone_batched_matches_per_episode(regressor: Any) -> None:
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.exaone_batched import exaone_run_pit_batched
     from eval.spatial.marginal_backends import loo_pit, quantiles

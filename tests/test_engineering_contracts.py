@@ -9,6 +9,7 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -156,7 +157,7 @@ def test_atomic_save_keeps_old_file_on_failure(tmp_path: Path, monkeypatch: Monk
     atomic_torch_save({"step": 1}, path)
     real_save = torch.save
 
-    def fail_after_partial_write(value, destination):
+    def fail_after_partial_write(value: Any, destination: Any) -> None:
         with open(destination, "wb") as output:
             output.write(b"partial")
         raise OSError("disk full")
@@ -277,7 +278,7 @@ def test_exaone_adapter_overrides_only_one_instance() -> None:
     class FakeRegressor:
         manifest = SimpleNamespace(runtime=SimpleNamespace(ensemble_count=1), output_width=3)
 
-        def _collapse_members(self, output, query_count):
+        def _collapse_members(self, output: Any, query_count: int) -> Any:
             return output.sum(dim=-1)
 
     first, second = FakeRegressor(), FakeRegressor()

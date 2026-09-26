@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
+if TYPE_CHECKING:
+    from copula_inter.marginal_backbones import MarginalBackbone
+
 RANK = 8
 BACKENDS = ["tabldm", "exaone"]
 
 
-def _load(name):
+def _load(name: str) -> MarginalBackbone:
     pytest.importorskip({"tabldm": "tabldm", "exaone": "exaonetabular"}[name], reason=f"{name} not installed")
     from copula_inter.marginal_backbones import load_backbone
 
@@ -47,7 +51,7 @@ def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern() -> None:
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name) -> None:
+def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name: str) -> None:
     from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
@@ -66,7 +70,7 @@ def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name) -> None:
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_only_adapters_train_and_gradients_reach_them(name) -> None:
+def test_only_adapters_train_and_gradients_reach_them(name: str) -> None:
     from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
@@ -83,7 +87,7 @@ def test_only_adapters_train_and_gradients_reach_them(name) -> None:
     assert torch.isfinite(q).all()
     q.pow(2).mean().backward()
 
-    def _live(suffix):
+    def _live(suffix: str) -> list[str]:
         return [
             n
             for n, p in bb.module.named_parameters()
@@ -105,7 +109,7 @@ def test_only_adapters_train_and_gradients_reach_them(name) -> None:
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name, tmp_path: Path) -> None:
+def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name: str, tmp_path: Path) -> None:
     """The checkpoint uses the original parameter names with deltas merged."""
     from copula_inter.lora import apply_lora_all_layers
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -21,7 +23,7 @@ def _random_correlation(rng: np.random.Generator, d: int) -> np.ndarray:
 
 
 @pytest.fixture
-def toy_task():
+def toy_task() -> dict[str, Any]:
     rng = np.random.default_rng(0)
     D = 8
     return {
@@ -34,7 +36,7 @@ def toy_task():
     }
 
 
-def test_batched_shape(toy_task) -> None:
+def test_batched_shape(toy_task: dict[str, Any]) -> None:
     K = 7
     z_batch = toy_task["rng"].standard_normal((K, toy_task["D"]))
     out = sample_copula_residual_fields(
@@ -50,7 +52,7 @@ def test_batched_shape(toy_task) -> None:
     assert np.all(np.isfinite(out))
 
 
-def test_batched_matches_single_sample_rowwise(toy_task) -> None:
+def test_batched_matches_single_sample_rowwise(toy_task: dict[str, Any]) -> None:
     """Each row of a K-sample batch equals predict_copula_residual_field for that z."""
     K = 5
     z_batch = toy_task["rng"].standard_normal((K, toy_task["D"]))
@@ -76,7 +78,7 @@ def test_batched_matches_single_sample_rowwise(toy_task) -> None:
         assert np.allclose(batch[k], single)
 
 
-def test_naive_fallback_is_affine_in_z(toy_task) -> None:
+def test_naive_fallback_is_affine_in_z(toy_task: dict[str, Any]) -> None:
     """With the Gaussian fallback, the pooled samples' correlation recovers R_context."""
     rng = np.random.default_rng(1)
     K = 4000  # enough draws for a stable empirical correlation at D=8
@@ -94,7 +96,7 @@ def test_naive_fallback_is_affine_in_z(toy_task) -> None:
     assert np.allclose(R_empirical, toy_task["R"], atol=0.05)
 
 
-def test_single_sample_wrapper_matches_batch_of_one(toy_task) -> None:
+def test_single_sample_wrapper_matches_batch_of_one(toy_task: dict[str, Any]) -> None:
     z = toy_task["rng"].standard_normal(toy_task["D"])
     single = predict_copula_residual_field(
         None,

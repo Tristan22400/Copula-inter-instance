@@ -10,7 +10,7 @@ import torch
 from copula_inter.pit import gaussian_corr_kl
 
 
-def _random_correlation(n, seed, rank=None):
+def _random_correlation(n: int, seed: int, rank: int | None = None) -> torch.Tensor:
     """Random PD correlation matrix (low-rank plus diagonal, unit diagonal)."""
     g = torch.Generator().manual_seed(seed)
     r = rank or max(2, n // 2)
@@ -21,14 +21,14 @@ def _random_correlation(n, seed, rank=None):
 
 
 @pytest.mark.parametrize("n", [3, 8, 25])
-def test_zero_iff_identical(n) -> None:
+def test_zero_iff_identical(n: int) -> None:
     """The floor: KL(R || R) == 0 exactly."""
     R = _random_correlation(n, seed=n)
     assert abs(gaussian_corr_kl(R, R)) < 1e-9
 
 
 @pytest.mark.parametrize("n", [3, 8, 25])
-def test_strictly_positive_when_different(n) -> None:
+def test_strictly_positive_when_different(n: int) -> None:
     """Positive in both argument orders when the matrices differ."""
     A = _random_correlation(n, seed=n)
     B = _random_correlation(n, seed=n + 100)
@@ -37,7 +37,7 @@ def test_strictly_positive_when_different(n) -> None:
 
 
 @pytest.mark.parametrize("n", [4, 12])
-def test_matches_torch_kl_divergence(n) -> None:
+def test_matches_torch_kl_divergence(n: int) -> None:
     """Matches torch.distributions: gaussian_corr_kl(R_model, R_post) = KL(N(0, R_post) || N(0, R_model))."""
     R_model = _random_correlation(n, seed=n + 7)
     R_post = _random_correlation(n, seed=n + 21)

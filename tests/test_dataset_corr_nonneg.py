@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import random
+from typing import Any, Iterator
 
 import pytest
 import torch
@@ -17,7 +18,7 @@ _DEFAULT_DIR = "./data/rbf-posterior-tuned/pit"
 
 
 @pytest.fixture(scope="module")
-def dataset_dir():
+def dataset_dir() -> str:
     return os.environ.get("DATASET_DIR", _DEFAULT_DIR)
 
 
@@ -25,7 +26,7 @@ _N_EPISODES = 500
 _SEED = 0
 
 
-def _iter_episodes(folder: str):
+def _iter_episodes(folder: str) -> Iterator[dict]:
     paths = sorted(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".pt") and f != "meta.pt")
     for p in paths:
         obj = torch.load(p, map_location="cpu", weights_only=False)
@@ -35,7 +36,7 @@ def _iter_episodes(folder: str):
             yield obj
 
 
-def _load_episodes(folder: str, n: int, seed: int):
+def _load_episodes(folder: str, n: int, seed: int) -> tuple[torch.Tensor, list[Any]]:
     all_eps = list(_iter_episodes(folder))
     rng = random.Random(seed)
     rng.shuffle(all_eps)
@@ -54,7 +55,7 @@ def _load_episodes(folder: str, n: int, seed: int):
 
 
 @pytest.fixture(scope="module")
-def episode_data(dataset_dir):
+def episode_data(dataset_dir: str) -> tuple[torch.Tensor, list[Any]]:
     if not os.path.isdir(dataset_dir):
         pytest.skip(f"Dataset folder not found: {dataset_dir}")
     pts = [f for f in os.listdir(dataset_dir) if f.endswith(".pt")]
@@ -64,16 +65,16 @@ def episode_data(dataset_dir):
 
 
 @pytest.fixture(scope="module")
-def off_diag(episode_data):
+def off_diag(episode_data: tuple[torch.Tensor, list[Any]]) -> torch.Tensor:
     return episode_data[0]
 
 
 @pytest.fixture(scope="module")
-def min_eigenvalues(episode_data):
+def min_eigenvalues(episode_data: tuple[torch.Tensor, list[Any]]) -> list[Any]:
     return episode_data[1]
 
 
-def test_correlations_have_negative_tail(off_diag) -> None:
+def test_correlations_have_negative_tail(off_diag: torch.Tensor) -> None:
     """Some off-diagonal entries are negative."""
     neg_frac = (off_diag < -0.01).float().mean().item()
     assert neg_frac > 0.01, (
@@ -82,31 +83,31 @@ def test_correlations_have_negative_tail(off_diag) -> None:
     )
 
 
-def test_correlations_span_meaningful_range(off_diag) -> None:
+def test_correlations_span_meaningful_range(off_diag: torch.Tensor) -> None:
     """Off-diagonal values must reach well above 0 — not collapsed to a near-identity matrix."""
     q95 = off_diag.quantile(0.95).item()
     assert q95 > 0.15, f"95th percentile {q95:.3f} too low — correlations look collapsed near 0"
 
 
-def test_correlations_not_saturated(off_diag) -> None:
+def test_correlations_not_saturated(off_diag: torch.Tensor) -> None:
     """Off-diagonal values do not pile up near 1."""
     frac_sat = (off_diag > 0.9).float().mean().item()
     assert frac_sat < 0.05, f"{frac_sat:.1%} of entries > 0.9 — matrices look saturated near 1"
 
 
-def test_correlations_not_all_near_zero(off_diag) -> None:
+def test_correlations_not_all_near_zero(off_diag: torch.Tensor) -> None:
     """Most entries near-zero (matrix ~= identity) means R_star carries no signal."""
     frac_near_zero = (off_diag.abs() < 0.02).float().mean().item()
     assert frac_near_zero < 0.85, f"{frac_near_zero:.1%} of entries are ~0 — R_star looks like a matrix full of 0s"
 
 
-def test_correlations_std_nonzero(off_diag) -> None:
+def test_correlations_std_nonzero(off_diag: torch.Tensor) -> None:
     """Standard deviation must be non-trivial — degenerate kernel collapses correlations to zero."""
     std = off_diag.std().item()
     assert std > 0.03, f"Std {std:.4f} too low — R_star correlations appear degenerate."
 
 
-def test_unit_diagonal(dataset_dir) -> None:
+def test_unit_diagonal(dataset_dir: str) -> None:
     if not os.path.isdir(dataset_dir):
         pytest.skip(f"Dataset folder not found: {dataset_dir}")
     episodes = list(_iter_episodes(dataset_dir))
@@ -118,7 +119,7 @@ def test_unit_diagonal(dataset_dir) -> None:
         assert diag_err < 1e-4, f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
 
 
-def test_r_star_well_conditioned(min_eigenvalues) -> None:
+def test_r_star_well_conditioned(min_eigenvalues: list[Any]) -> None:
     """Every R_star has minimum eigenvalue >= 1e-3."""
     bad = [v for v in min_eigenvalues if v < 0.001]
     assert len(bad) == 0, (
@@ -127,6 +128,6 @@ def test_r_star_well_conditioned(min_eigenvalues) -> None:
     )
 
 
-def test_r_star_psd(min_eigenvalues) -> None:
+def test_r_star_psd(min_eigenvalues: list[Any]) -> None:
     neg = [v for v in min_eigenvalues if v < -1e-5]
     assert len(neg) == 0, f"{len(neg)} episodes have negative min eigenvalue (most negative: {min(neg):.2e})"

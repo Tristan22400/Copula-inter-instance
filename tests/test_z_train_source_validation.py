@@ -8,6 +8,8 @@ rejected by the on-disk generator.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 from omegaconf import OmegaConf
 
@@ -19,9 +21,12 @@ from copula_inter.live_dataset import (
 )
 from copula_inter.train import _reserve_gpu_headroom_for_live_tabicl
 
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
 
 @pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train"])
-def test_validate_z_train_source_accepts_known_values(value) -> None:
+def test_validate_z_train_source_accepts_known_values(value: str) -> None:
     _validate_z_train_source(value)  # must not raise
 
 
@@ -35,7 +40,7 @@ def test_validate_z_train_source_accepts_known_values(value) -> None:
         "tabicl_splitt",
     ],
 )
-def test_validate_z_train_source_rejects_unknown_values(value) -> None:
+def test_validate_z_train_source_rejects_unknown_values(value: str) -> None:
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
         _validate_z_train_source(value)
 
@@ -56,7 +61,7 @@ def test_valid_z_train_sources_matches_documented_set() -> None:
 # Each call site raises on an unknown value before other checks (CPU, no TabICL config).
 
 
-def _cfg_with_bad_z_train_source():
+def _cfg_with_bad_z_train_source() -> DictConfig:
     return OmegaConf.create({"data": {"z_train_source": "tabicl-split"}})
 
 
@@ -84,7 +89,7 @@ def test_reserve_gpu_headroom_raises_on_typo() -> None:
 # "y_train": z_train is the z-scored target; z_test/log_pdf_test stay analytic.
 
 
-def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg) -> None:
+def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg: DictConfig) -> None:
     import torch
     from omegaconf import OmegaConf as OC
 
@@ -102,7 +107,7 @@ def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg) -> None:
         assert torch.allclose(ep["z_train"], expected, atol=1e-5)
 
 
-def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg) -> None:
+def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg: DictConfig) -> None:
     import torch
     from omegaconf import OmegaConf as OC
 

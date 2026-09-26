@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -15,8 +16,13 @@ import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
+from copula_inter.config_path import merge_configs
 from copula_inter.era5_probes import _build_era5_val_batches  # noqa: E402
 from copula_inter.loss import y_space_nll  # noqa: E402
 from copula_inter.model import build_copula_transformer, build_sigma  # noqa: E402
@@ -50,14 +56,14 @@ class FakeTabICL(nn.Module):
         g = torch.Generator().manual_seed(int(X.sum().item() * 1000) % 2**31)
         return torch.randn(d, n, self.q, generator=g)
 
-    def quantile_dist(self, logits_flat: torch.Tensor):
+    def quantile_dist(self, logits_flat: torch.Tensor) -> torch.distributions.Normal:
         loc = logits_flat[:, 0]
         scale = torch.nn.functional.softplus(logits_flat[:, 1]) + 1e-3
         return torch.distributions.Normal(loc, scale)
 
 
 @pytest.fixture(scope="module")
-def tabicl_fake():
+def tabicl_fake() -> FakeTabICL:
     return FakeTabICL()
 
 
@@ -88,7 +94,7 @@ def test_weighted_corr_nan_with_too_few_valid_points() -> None:
     assert np.isnan(weighted_corr(a, b, w))
 
 
-def test_build_era5_probe_shapes_and_finite(tabicl_fake) -> None:
+def test_build_era5_probe_shapes_and_finite(tabicl_fake: FakeTabICL) -> None:
     probe = build_era5_probe(
         _TINY_REGION,
         _TINY_GRID,
@@ -118,7 +124,7 @@ def test_build_era5_probe_shapes_and_finite(tabicl_fake) -> None:
     assert np.isfinite(probe["rho_emp"][0])
 
 
-def test_build_era5_probe_deterministic(tabicl_fake) -> None:
+def test_build_era5_probe_deterministic(tabicl_fake: FakeTabICL) -> None:
     """build_era5_probe gives the same probe for the same seed."""
     p1 = build_era5_probe(
         _TINY_REGION,
@@ -165,7 +171,7 @@ def test_build_era5_probe_none_marginal_uses_naive_standardization() -> None:
     assert z.std() == pytest.approx(1.0, abs=1e-6)
 
 
-def _tiny_era5_cfg(seed: int = 555) -> "OmegaConf":
+def _tiny_era5_cfg(seed: int = 555) -> DictConfig:
     return OmegaConf.create(
         {
             "baselines": {
@@ -185,7 +191,7 @@ def _tiny_era5_cfg(seed: int = 555) -> "OmegaConf":
     )
 
 
-def test_build_era5_val_batches_shapes(tabicl_fake) -> None:
+def test_build_era5_val_batches_shapes(tabicl_fake: FakeTabICL) -> None:
     batches = _build_era5_val_batches(_tiny_era5_cfg(), tabicl_fake, "cpu")
     assert set(batches.keys()) == {_TINY_REGION}
 
@@ -222,7 +228,7 @@ def test_build_era5_val_batches_none_marginal_skips_nll() -> None:
     assert "nll_test_idx" not in probe
 
 
-def test_build_era5_val_batches_gp_baseline(tabicl_fake) -> None:
+def test_build_era5_val_batches_gp_baseline(tabicl_fake: FakeTabICL) -> None:
     """era5_gp_baseline=True adds a GP-MLE baseline NLL per kernel to each probe (tiny settings)."""
     cfg = _tiny_era5_cfg()
     cfg.baselines.era5_gp_baseline = True
@@ -242,7 +248,7 @@ def test_build_era5_val_batches_gp_baseline(tabicl_fake) -> None:
     assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
-def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake) -> None:
+def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake: FakeTabICL) -> None:
     """era5_gp_baseline defaults to True when the key is absent."""
     cfg = OmegaConf.create(
         {
@@ -264,7 +270,7 @@ def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake)
     assert "gp_baseline_nll" in batches[_TINY_REGION]
 
 
-def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake) -> None:
+def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake: FakeTabICL) -> None:
     cfg = OmegaConf.create(
         {
             "baselines": {"era5_regions": ["not_a_real_region"]},
@@ -274,12 +280,12 @@ def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake) -> None:
     assert _build_era5_val_batches(cfg, tabicl_fake, "cpu") == {}
 
 
-def test_era5_fit_scoring_with_tiny_model(small_model_cfg, tabicl_fake) -> None:
+def test_era5_fit_scoring_with_tiny_model(small_model_cfg: DictConfig, tabicl_fake: FakeTabICL) -> None:
     torch.manual_seed(0)
     model = build_copula_transformer(small_model_cfg)
     # No model.eval(), as in validate().
 
-    cfg = OmegaConf.merge(
+    cfg = merge_configs(
         small_model_cfg,
         OmegaConf.create({"model": {"sigma_jitter": 1e-4}}),
     )

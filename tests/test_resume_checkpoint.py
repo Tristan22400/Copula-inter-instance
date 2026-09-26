@@ -24,7 +24,9 @@ from copula_inter.checkpointing import load_checkpoint, save_checkpoint
 from copula_inter.training_core import cosine_lr_lambda
 
 
-def make_model_optimizer_scheduler(seed: int):
+def make_model_optimizer_scheduler(
+    seed: int,
+) -> tuple[torch.nn.Linear, torch.optim.SGD, torch.optim.lr_scheduler.LambdaLR]:
     torch.manual_seed(seed)
     model = nn.Linear(4, 4)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
@@ -32,7 +34,9 @@ def make_model_optimizer_scheduler(seed: int):
     return model, optimizer, scheduler
 
 
-def train_a_step(model, optimizer, scheduler) -> None:
+def train_a_step(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LRScheduler
+) -> None:
     """Run one optimizer step so optimizer/scheduler state is non-trivial."""
     out = model(torch.randn(2, 4))
     out.sum().backward()
@@ -42,7 +46,7 @@ def train_a_step(model, optimizer, scheduler) -> None:
 
 
 @pytest.fixture
-def saved_ckpt(tmp_path: Path):
+def saved_ckpt(tmp_path: Path) -> tuple[str, torch.nn.Linear]:
     model, optimizer, scheduler = make_model_optimizer_scheduler(seed=0)
     train_a_step(model, optimizer, scheduler)  # gives optimizer momentum buffers, scheduler last_epoch=1
 
@@ -51,7 +55,7 @@ def saved_ckpt(tmp_path: Path):
     return str(tmp_path / "step_0000042.pt"), model
 
 
-def test_load_checkpoint_restores_weights(saved_ckpt) -> None:
+def test_load_checkpoint_restores_weights(saved_ckpt: tuple[str, torch.nn.Linear]) -> None:
     ckpt_path, saved_model = saved_ckpt
     fresh_model, _, _ = make_model_optimizer_scheduler(seed=1)  # different init
     assert not torch.equal(fresh_model.weight, saved_model.weight)
@@ -62,7 +66,9 @@ def test_load_checkpoint_restores_weights(saved_ckpt) -> None:
     assert torch.equal(fresh_model.bias, saved_model.bias)
 
 
-def test_load_checkpoint_does_not_touch_optimizer_or_scheduler_when_not_passed(saved_ckpt) -> None:
+def test_load_checkpoint_does_not_touch_optimizer_or_scheduler_when_not_passed(
+    saved_ckpt: tuple[str, torch.nn.Linear],
+) -> None:
     ckpt_path, _ = saved_ckpt
     fresh_model, fresh_optimizer, fresh_scheduler = make_model_optimizer_scheduler(seed=1)
 
@@ -77,7 +83,7 @@ def test_load_checkpoint_does_not_touch_optimizer_or_scheduler_when_not_passed(s
     assert fresh_scheduler.state_dict() == scheduler_state_before
 
 
-def test_load_checkpoint_returns_step(saved_ckpt) -> None:
+def test_load_checkpoint_returns_step(saved_ckpt: tuple[str, torch.nn.Linear]) -> None:
     ckpt_path, _ = saved_ckpt
     fresh_model, _, _ = make_model_optimizer_scheduler(seed=1)
     assert load_checkpoint(ckpt_path, fresh_model, device="cpu") == 42
@@ -106,13 +112,13 @@ def test_load_checkpoint_missing_file_raises(tmp_path: Path) -> None:
         load_checkpoint(str(tmp_path / "does_not_exist.pt"), fresh_model, device="cpu")
 
 
-def test_load_checkpoint_through_compile_wrapper(saved_ckpt) -> None:
+def test_load_checkpoint_through_compile_wrapper(saved_ckpt: tuple[str, torch.nn.Linear]) -> None:
     """load_checkpoint loads into a torch.compile'd model's _orig_mod."""
     ckpt_path, saved_model = saved_ckpt
     fresh_model, _, _ = make_model_optimizer_scheduler(seed=1)
 
     class FakeCompiledWrapper(nn.Module):
-        def __init__(self, orig_mod) -> None:
+        def __init__(self, orig_mod: torch.nn.Module) -> None:
             super().__init__()
             self._orig_mod = orig_mod
 
@@ -139,7 +145,7 @@ def test_resume_continues_cosine_schedule_instead_of_restarting() -> None:
     lr_min_frac = lr_min / base_lr
     resume_step = 55
 
-    def make_optimizer():
+    def make_optimizer() -> torch.optim.SGD:
         model = nn.Linear(4, 4)
         return torch.optim.SGD(model.parameters(), lr=base_lr)
 

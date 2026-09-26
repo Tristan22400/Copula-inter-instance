@@ -11,7 +11,7 @@ from copula_inter.model import low_rank_correlation, low_rank_correlation_factor
 PARAMS = ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
 
 
-def _exact_copula_nll(Sigma, z, mask):
+def _exact_copula_nll(Sigma: torch.Tensor, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Jitter-free float64 reference (slogdet + solve per episode)."""
     vals = []
     for b in range(Sigma.shape[0]):
@@ -24,7 +24,9 @@ def _exact_copula_nll(Sigma, z, mask):
     return torch.stack(vals).mean()
 
 
-def _inputs(B: int = 3, N: int = 17, r: int = 5, seed: int = 0, dtype=torch.float64):
+def _inputs(
+    B: int = 3, N: int = 17, r: int = 5, seed: int = 0, dtype: torch.dtype = torch.float64
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     W = torch.randn(B, N, r, generator=g, dtype=dtype)
     s = torch.randn(B, N, generator=g, dtype=dtype)
@@ -40,7 +42,7 @@ def _inputs(B: int = 3, N: int = 17, r: int = 5, seed: int = 0, dtype=torch.floa
 
 
 @pytest.mark.parametrize("param", PARAMS)
-def test_factor_dense_matches_low_rank_correlation(param) -> None:
+def test_factor_dense_matches_low_rank_correlation(param: str) -> None:
     W, s, lam, *_ = _inputs()
     dense = low_rank_correlation(W, s, jitter=1e-4, parametrization=param, lam=lam)
     factor = low_rank_correlation_factor(W, s, jitter=1e-4, parametrization=param, lam=lam)
@@ -49,7 +51,7 @@ def test_factor_dense_matches_low_rank_correlation(param) -> None:
 
 
 @pytest.mark.parametrize("param", PARAMS)
-def test_lowrank_nll_matches_dense(param) -> None:
+def test_lowrank_nll_matches_dense(param: str) -> None:
     W, s, lam, z, log_pdf, mask = _inputs()
     dense = low_rank_correlation(W, s, jitter=1e-4, parametrization=param, lam=lam)
     factor = low_rank_correlation_factor(W, s, jitter=1e-4, parametrization=param, lam=lam)

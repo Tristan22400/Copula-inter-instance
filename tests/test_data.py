@@ -6,10 +6,11 @@ import math
 import random
 import warnings
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pytest import MonkeyPatch
 
 from copula_inter.data_gen import (
@@ -90,7 +91,7 @@ def test_tabiclv2_warp_features_left_skew_mirrors_right_skew() -> None:
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_tabiclv2_warp_features_goldilocks_and_psd(small_cfg, kernel_name) -> None:
+def test_tabiclv2_warp_features_goldilocks_and_psd(small_cfg: DictConfig, kernel_name: str) -> None:
     """With the feature warp, R_star stays a valid, PSD, non-trivial correlation matrix for every kernel."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -125,7 +126,7 @@ def test_tabiclv2_warp_features_goldilocks_and_psd(small_cfg, kernel_name) -> No
     )
 
 
-def test_gp_task_output_keys(small_cfg) -> None:
+def test_gp_task_output_keys(small_cfg: DictConfig) -> None:
     task = generate_gp_task(small_cfg)
     required = [
         "x_norm_train",
@@ -142,7 +143,7 @@ def test_gp_task_output_keys(small_cfg) -> None:
         assert key in task, f"Missing key: {key}"
 
 
-def test_gp_task_shapes(small_cfg) -> None:
+def test_gp_task_shapes(small_cfg: DictConfig) -> None:
     torch.manual_seed(0)
     task = generate_gp_task(small_cfg)
     P = task["n_train"].item()
@@ -161,7 +162,7 @@ def test_gp_task_shapes(small_cfg) -> None:
     assert small_cfg.data.N_min <= N <= small_cfg.data.N_max
 
 
-def test_feature_normalisation_over_all_instances(small_cfg) -> None:
+def test_feature_normalisation_over_all_instances(small_cfg: DictConfig) -> None:
     """x_norm_train and x_norm_test together should have ~zero mean, ~unit std."""
     torch.manual_seed(1)
     # Generate multiple tasks and check normalisation
@@ -174,13 +175,13 @@ def test_feature_normalisation_over_all_instances(small_cfg) -> None:
             assert abs(col.std().item() - 1.0) < 0.2, f"Feature {f} std {col.std():.3f} not near 1"
 
 
-def test_r_star_is_valid_correlation_matrix(small_cfg) -> None:
+def test_r_star_is_valid_correlation_matrix(small_cfg: DictConfig) -> None:
     """R_star must have unit diagonal and be positive semi-definite."""
     torch.manual_seed(2)
     for _ in range(20):
         task = generate_gp_task(small_cfg)
         R = task["R_star"]
-        N = task["n_test"].item()
+        N = int(task["n_test"])
 
         # Unit diagonal
         assert torch.allclose(R.diagonal(), torch.ones(N), atol=1e-4), f"R_star diagonal not 1: {R.diagonal()}"
@@ -193,7 +194,7 @@ def test_r_star_is_valid_correlation_matrix(small_cfg) -> None:
         assert torch.allclose(R, R.T, atol=1e-5)
 
 
-def test_r_star_values_in_minus1_1(small_cfg) -> None:
+def test_r_star_values_in_minus1_1(small_cfg: DictConfig) -> None:
     """Correlation matrix entries must be in [-1, 1]."""
     torch.manual_seed(3)
     for _ in range(10):
@@ -207,7 +208,7 @@ _DEGENERATE_THRESHOLD = 0.95
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_kernel_goldilocks_and_psd(small_cfg, kernel_name) -> None:
+def test_kernel_goldilocks_and_psd(small_cfg: DictConfig, kernel_name: str) -> None:
     """Every registered kernel gives a valid, PSD, non-trivial R_star."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -237,7 +238,7 @@ def test_kernel_goldilocks_and_psd(small_cfg, kernel_name) -> None:
 
 
 @pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
-def test_periodic_and_cosine_period_recoverable_in_r_star(small_cfg, kernel_name) -> None:
+def test_periodic_and_cosine_period_recoverable_in_r_star(small_cfg: DictConfig, kernel_name: str) -> None:
     """R_star of a bare periodic/cosine episode equals the analytic kernel from its recorded column, l/period, alpha2 and nugget.
 
         periodic: exp(-2 sin^2(pi (x1 - x2) / period) / l)
@@ -254,7 +255,7 @@ def test_periodic_and_cosine_period_recoverable_in_r_star(small_cfg, kernel_name
         cfg.seed = i
         task = generate_gp_task(cfg)
 
-        col = task["kernel_feature_indices"][0].item()
+        col = int(task["kernel_feature_indices"][0])
         x = task["x_norm_test"][:, col]
         diff = x.unsqueeze(0) - x.unsqueeze(1)  # (N, N)
 
@@ -304,7 +305,7 @@ def test_kernel_needs_scalar_input_handles_n_way_chains() -> None:
     assert _kernel_needs_scalar_input("rbf+periodic") is False
 
 
-def test_systematic_composition_goldilocks_and_psd(small_cfg) -> None:
+def test_systematic_composition_goldilocks_and_psd(small_cfg: DictConfig) -> None:
     """Systematic composition gives a valid R_star on every draw (lower Goldilocks bound only)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.systematic_composition = True
@@ -342,7 +343,7 @@ _ARD_ELIGIBLE_KERNELS = ["rbf", "matern32", "rational_quadratic", "periodic"]
 
 
 @pytest.mark.parametrize("kernel_name", _ARD_ELIGIBLE_KERNELS)
-def test_ard_samples_per_dimension_lengthscale(small_cfg, kernel_name) -> None:
+def test_ard_samples_per_dimension_lengthscale(small_cfg: DictConfig, kernel_name: str) -> None:
     """cfg.data.ard gives a (k,) lengthscale that round-trips through gp_analytical_pit."""
     from copula_inter.pit import gp_analytical_pit
 
@@ -368,7 +369,7 @@ def test_ard_samples_per_dimension_lengthscale(small_cfg, kernel_name) -> None:
     assert torch.allclose(cached["z_test"], reconstructed["z_test"], atol=1e-3)
 
 
-def test_ard_default_false_keeps_isotropic_lengthscale(small_cfg) -> None:
+def test_ard_default_false_keeps_isotropic_lengthscale(small_cfg: DictConfig) -> None:
     """Without cfg.data.ard the lengthscale is a scalar even for k > 1."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -381,7 +382,7 @@ def test_ard_default_false_keeps_isotropic_lengthscale(small_cfg) -> None:
     assert task["l"].shape == (), f"expected isotropic scalar, got shape {tuple(task['l'].shape)}"
 
 
-def test_ard_not_applied_to_cosine_or_dot_product(small_cfg) -> None:
+def test_ard_not_applied_to_cosine_or_dot_product(small_cfg: DictConfig) -> None:
     """cfg.data.ard has no effect on cosine and dot_product."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -401,7 +402,7 @@ def test_ard_not_applied_to_cosine_or_dot_product(small_cfg) -> None:
 
 
 @pytest.mark.parametrize("kernel_name", _ARD_ELIGIBLE_KERNELS)
-def test_isotropic_ratio_one_collapses_every_episode(small_cfg, kernel_name) -> None:
+def test_isotropic_ratio_one_collapses_every_episode(small_cfg: DictConfig, kernel_name: str) -> None:
     """isotropic_ratio=1.0 makes every ARD lengthscale (and period) constant across dims."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -425,7 +426,7 @@ def test_isotropic_ratio_one_collapses_every_episode(small_cfg, kernel_name) -> 
             )
 
 
-def test_isotropic_ratio_zero_is_default_ard_behaviour(small_cfg) -> None:
+def test_isotropic_ratio_zero_is_default_ard_behaviour(small_cfg: DictConfig) -> None:
     """isotropic_ratio=0.0 (default) keeps independent per-dim lengthscales."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -440,7 +441,7 @@ def test_isotropic_ratio_zero_is_default_ard_behaviour(small_cfg) -> None:
     assert n_collapsed == 0, "isotropic_ratio default (0.0) should never force-collapse an ARD lengthscale"
 
 
-def test_isotropic_ratio_no_op_when_ard_false(small_cfg) -> None:
+def test_isotropic_ratio_no_op_when_ard_false(small_cfg: DictConfig) -> None:
     """isotropic_ratio has no effect when ard is off."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -455,7 +456,7 @@ def test_isotropic_ratio_no_op_when_ard_false(small_cfg) -> None:
     assert task["l"].shape == (), f"expected isotropic scalar, got shape {tuple(task['l'].shape)}"
 
 
-def test_isotropic_ratio_partial_mixes_isotropic_and_ard_episodes(small_cfg) -> None:
+def test_isotropic_ratio_partial_mixes_isotropic_and_ard_episodes(small_cfg: DictConfig) -> None:
     """A ratio in (0, 1) mixes isotropic and ARD episodes in roughly that proportion."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -471,7 +472,7 @@ def test_isotropic_ratio_partial_mixes_isotropic_and_ard_episodes(small_cfg) -> 
     assert 150 < n_collapsed < 250, f"expected ~200/400 isotropic episodes, got {n_collapsed}"
 
 
-def test_polynomial_power_shared_across_batch(small_cfg) -> None:
+def test_polynomial_power_shared_across_batch(small_cfg: DictConfig) -> None:
     """All episodes of one call share one polynomial degree in [poly_power_min, poly_power_max]."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "polynomial"
@@ -486,7 +487,7 @@ def test_polynomial_power_shared_across_batch(small_cfg) -> None:
     assert 2 <= power <= 5, f"power {power} outside configured [poly_power_min, poly_power_max]"
 
 
-def test_polynomial_power_varies_across_batches(small_cfg) -> None:
+def test_polynomial_power_varies_across_batches(small_cfg: DictConfig) -> None:
     """Different calls can draw different polynomial degrees."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "polynomial"
@@ -502,7 +503,7 @@ def test_polynomial_power_varies_across_batches(small_cfg) -> None:
     assert len(seen_powers) > 1, f"power never varied across 20 batches: {seen_powers}"
 
 
-def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch: MonkeyPatch) -> None:
+def test_topup_round_reuses_first_round_d_features(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """generate_gp_batch's top-up rounds reuse the first round's d_features."""
     from copula_inter import data_gen as dg
 
@@ -515,7 +516,7 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch: Monke
     real_raw = dg._generate_gp_batch_raw
     state = {"n_calls": 0}
 
-    def truncating_raw(cfg, B, device: str = "cpu", **kwargs):
+    def truncating_raw(cfg: Any, B: int, device: str = "cpu", **kwargs: Any) -> list[dict[str, torch.Tensor]]:
         episodes = real_raw(cfg, B, device, **kwargs)
         state["n_calls"] += 1
         if state["n_calls"] == 1:
@@ -531,12 +532,13 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch: Monke
     assert len(d_set) == 1, f"top-up round used a different d_features than round 0: {d_set}"
 
 
-def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch: MonkeyPatch) -> None:
+def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """_generate_shard_with_oom_retry's retry chunks reuse the first chunk's d_features."""
     from copula_inter import data_gen as dg
     from copula_inter import generate_pit_dataset as gpd
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    assert isinstance(cfg, DictConfig)
     cfg.data.kernel = "rbf"
     cfg.data.d_features_lognormal_loc = 2.302585  # log(10)
     cfg.data.d_features_lognormal_scale = 0.4
@@ -545,7 +547,7 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch: M
     real_generate_gp_batch = dg.generate_gp_batch
     state = {"n_calls": 0}
 
-    def oom_first_chunk(cfg, B, device: str = "cpu", **kwargs):
+    def oom_first_chunk(cfg: Any, B: int, device: str = "cpu", **kwargs: Any) -> list[dict[str, torch.Tensor]]:
         state["n_calls"] += 1
         if state["n_calls"] == 1:
             raise torch.cuda.OutOfMemoryError("synthetic OOM")
@@ -566,7 +568,7 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch: M
     assert len(d_set) == 1, f"retry chunk used a different d_features than the first chunk: {d_set}"
 
 
-def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeypatch: MonkeyPatch) -> None:
+def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """A LinAlgError from kernel evaluation discards the batch (and generate_gp_batch tops up) instead of raising."""
     from copula_inter import data_gen as dg
 
@@ -577,7 +579,7 @@ def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg, monkeyp
     real_evaluate_kernel_dense = dg._evaluate_kernel_dense
     state = {"n_calls": 0}
 
-    def poisoned_evaluate_kernel_dense(kernel_obj, x_norm):
+    def poisoned_evaluate_kernel_dense(kernel_obj: Any, x_norm: torch.Tensor) -> torch.Tensor:
         state["n_calls"] += 1
         if state["n_calls"] == 1:
             raise torch.linalg.LinAlgError("linalg.eigh: synthetic non-convergence for test")
@@ -604,7 +606,7 @@ def test_is_transient_cusolver_error_covers_tabicl_contention_errors() -> None:
     assert not gpd._is_transient_cusolver_error(torch.cuda.OutOfMemoryError("oom"))
 
 
-def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch: MonkeyPatch) -> None:
+def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """An episode with non-finite z_train is discarded, not returned."""
     from copula_inter import data_gen as dg
 
@@ -615,7 +617,7 @@ def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch: Monkey
     real_cholesky_solve = torch.cholesky_solve
     state = {"poisoned": False}
 
-    def poisoning_cholesky_solve(b, L, *args, **kwargs):
+    def poisoning_cholesky_solve(b: torch.Tensor, L: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         # Poison the first cholesky_solve call: one episode's alpha and z_train.
         out = real_cholesky_solve(b, L, *args, **kwargs)
         if not state["poisoned"]:
@@ -637,7 +639,7 @@ def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg, monkeypatch: Monkey
 
 @pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
 def test_degenerate_active_kernel_column_is_discarded_not_leaked(
-    small_cfg, kernel_name, monkeypatch: MonkeyPatch
+    small_cfg: DictConfig, kernel_name: str, monkeypatch: MonkeyPatch
 ) -> None:
     """A k=1 (periodic/cosine) episode whose active column is constant is discarded."""
     from copula_inter import data_gen as dg
@@ -650,7 +652,7 @@ def test_degenerate_active_kernel_column_is_discarded_not_leaked(
     real_tabiclv2 = dg.tabiclv2_warp_features
     state = {"poisoned": False}
 
-    def poisoning_tabiclv2(x, seed=None):
+    def poisoning_tabiclv2(x: torch.Tensor, seed: int | None = None) -> torch.Tensor:
         out = real_tabiclv2(x, seed=seed)
         if not state["poisoned"]:
             state["poisoned"] = True
@@ -673,7 +675,7 @@ def test_degenerate_active_kernel_column_is_discarded_not_leaked(
         )
 
 
-def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeypatch: MonkeyPatch) -> None:
+def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """An episode whose every active column (3 of 4) is constant is discarded."""
     from copula_inter import data_gen as dg
 
@@ -688,7 +690,7 @@ def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeyp
     real_tabiclv2 = dg.tabiclv2_warp_features
     state = {"poisoned": False}
 
-    def poisoning_tabiclv2(x, seed=None):
+    def poisoning_tabiclv2(x: torch.Tensor, seed: int | None = None) -> torch.Tensor:
         out = real_tabiclv2(x, seed=seed)
         if not state["poisoned"]:
             state["poisoned"] = True
@@ -711,7 +713,7 @@ def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg, monkeyp
         )
 
 
-def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch: MonkeyPatch) -> None:
+def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """An episode with only one of several active columns constant is kept."""
     from copula_inter import data_gen as dg
 
@@ -726,7 +728,7 @@ def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch
     real_tabiclv2 = dg.tabiclv2_warp_features
     state = {"poisoned": False}
 
-    def poisoning_tabiclv2(x, seed=None):
+    def poisoning_tabiclv2(x: torch.Tensor, seed: int | None = None) -> torch.Tensor:
         out = real_tabiclv2(x, seed=seed)
         if not state["poisoned"]:
             state["poisoned"] = True
@@ -749,7 +751,7 @@ def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg, monkeypatch
 
 
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
-def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name) -> None:
+def test_polynomial_reconstruction_round_trip(small_cfg: DictConfig, kernel_name: str) -> None:
     """Polynomial offset/alpha2/power round-trip through gp_analytical_pit to the generated z_train/z_test."""
     from copula_inter.pit import gp_analytical_pit
 
@@ -769,7 +771,7 @@ def test_polynomial_reconstruction_round_trip(small_cfg, kernel_name) -> None:
     assert torch.allclose(cached["z_test"], reconstructed["z_test"], atol=1e-3)
 
 
-def test_mlp_mixing_default_off_is_noop(small_cfg) -> None:
+def test_mlp_mixing_default_off_is_noop(small_cfg: DictConfig) -> None:
     """MLP mixing is an exact identity by default."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     x = torch.randn(4, 10, cfg.data.d_features)
@@ -777,7 +779,7 @@ def test_mlp_mixing_default_off_is_noop(small_cfg) -> None:
     assert torch.equal(out, x)
 
 
-def test_mlp_mixing_prob_zero_is_noop(small_cfg) -> None:
+def test_mlp_mixing_prob_zero_is_noop(small_cfg: DictConfig) -> None:
     """mlp_mixing_prob=0 is an exact identity."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.mlp_mixing_enabled = True
@@ -787,7 +789,7 @@ def test_mlp_mixing_prob_zero_is_noop(small_cfg) -> None:
     assert torch.equal(out, x)
 
 
-def test_mlp_mixing_shapes_preserved(small_cfg) -> None:
+def test_mlp_mixing_shapes_preserved(small_cfg: DictConfig) -> None:
     """MLP mixing preserves shape/dtype and generate_gp_batch's schema."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -808,7 +810,7 @@ def test_mlp_mixing_shapes_preserved(small_cfg) -> None:
         assert ep["x_norm_test"].shape[-1] == d
 
 
-def test_mlp_mixing_prob_one_changes_output(small_cfg) -> None:
+def test_mlp_mixing_prob_one_changes_output(small_cfg: DictConfig) -> None:
     """mlp_mixing_prob=1 changes the output."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -821,7 +823,7 @@ def test_mlp_mixing_prob_one_changes_output(small_cfg) -> None:
     assert not torch.equal(out, x)
 
 
-def test_mlp_mixing_partial_gate_leaves_some_episodes_unmixed(small_cfg) -> None:
+def test_mlp_mixing_partial_gate_leaves_some_episodes_unmixed(small_cfg: DictConfig) -> None:
     """0 < mlp_mixing_prob < 1 leaves some episodes unmixed and mixes others."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -838,7 +840,7 @@ def test_mlp_mixing_partial_gate_leaves_some_episodes_unmixed(small_cfg) -> None
     assert n_changed > 0, "expected some episodes mixed at prob=0.5"
 
 
-def test_feature_normalisation_holds_with_mlp_mixing(small_cfg) -> None:
+def test_feature_normalisation_holds_with_mlp_mixing(small_cfg: DictConfig) -> None:
     """Features stay ~zero-mean, unit-std after MLP mixing."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -863,7 +865,7 @@ def test_feature_normalisation_holds_with_mlp_mixing(small_cfg) -> None:
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_mlp_mixing_goldilocks_and_psd(small_cfg, kernel_name) -> None:
+def test_mlp_mixing_goldilocks_and_psd(small_cfg: DictConfig, kernel_name: str) -> None:
     """With MLP mixing on, every kernel still gives a valid, PSD, non-trivial R_star."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -898,7 +900,7 @@ def test_mlp_mixing_goldilocks_and_psd(small_cfg, kernel_name) -> None:
     )
 
 
-def test_kernel_hidden_warp_default_off_is_noop(small_cfg) -> None:
+def test_kernel_hidden_warp_default_off_is_noop(small_cfg: DictConfig) -> None:
     """The kernel-hidden warp is an exact identity by default."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     x = torch.randn(4, 10, cfg.data.d_features)
@@ -906,7 +908,7 @@ def test_kernel_hidden_warp_default_off_is_noop(small_cfg) -> None:
     assert torch.equal(out, x)
 
 
-def test_kernel_hidden_warp_prob_zero_is_noop(small_cfg) -> None:
+def test_kernel_hidden_warp_prob_zero_is_noop(small_cfg: DictConfig) -> None:
     """kernel_hidden_prob=0 is an exact identity."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel_hidden_enabled = True
@@ -916,7 +918,7 @@ def test_kernel_hidden_warp_prob_zero_is_noop(small_cfg) -> None:
     assert torch.equal(out, x)
 
 
-def test_kernel_hidden_warp_shapes_preserved(small_cfg) -> None:
+def test_kernel_hidden_warp_shapes_preserved(small_cfg: DictConfig) -> None:
     """The hidden warp preserves shape/dtype and leaves x_norm_train/x_norm_test unchanged."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -937,7 +939,7 @@ def test_kernel_hidden_warp_shapes_preserved(small_cfg) -> None:
         assert ep["x_norm_test"].shape[-1] == d
 
 
-def test_kernel_hidden_warp_prob_one_changes_output(small_cfg) -> None:
+def test_kernel_hidden_warp_prob_one_changes_output(small_cfg: DictConfig) -> None:
     """kernel_hidden_prob=1 changes the output."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -950,7 +952,7 @@ def test_kernel_hidden_warp_prob_one_changes_output(small_cfg) -> None:
     assert not torch.equal(out, x)
 
 
-def test_kernel_hidden_warp_partial_gate_leaves_some_episodes_unwarped(small_cfg) -> None:
+def test_kernel_hidden_warp_partial_gate_leaves_some_episodes_unwarped(small_cfg: DictConfig) -> None:
     """0 < kernel_hidden_prob < 1 leaves some episodes unwarped and warps others."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -967,7 +969,7 @@ def test_kernel_hidden_warp_partial_gate_leaves_some_episodes_unwarped(small_cfg
     assert n_changed > 0, "expected some episodes warped at prob=0.5"
 
 
-def test_kernel_hidden_warp_disabled_matches_unmodified_pipeline(small_cfg) -> None:
+def test_kernel_hidden_warp_disabled_matches_unmodified_pipeline(small_cfg: DictConfig) -> None:
     """With the warp disabled, R_star, y_train and y_test match a config without the keys exactly."""
     cfg_a = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg_a.data.d_features = 6
@@ -988,7 +990,7 @@ def test_kernel_hidden_warp_disabled_matches_unmodified_pipeline(small_cfg) -> N
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_kernel_hidden_warp_goldilocks_and_psd(small_cfg, kernel_name) -> None:
+def test_kernel_hidden_warp_goldilocks_and_psd(small_cfg: DictConfig, kernel_name: str) -> None:
     """With the hidden warp on, every kernel still gives a valid, PSD, non-trivial R_star."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -1032,7 +1034,7 @@ def _pairwise_dists(x: torch.Tensor) -> torch.Tensor:
     return D[iu[0], iu[1]]
 
 
-def test_kernel_hidden_warp_breaks_isometry(small_cfg) -> None:
+def test_kernel_hidden_warp_breaks_isometry(small_cfg: DictConfig) -> None:
     """A smaller bottleneck preserves less of the model-space distance structure, and the default is well below isometry.
 
     Thresholds are empirical for d ~ 10.
@@ -1077,7 +1079,7 @@ def test_kernel_hidden_warp_breaks_isometry(small_cfg) -> None:
     )
 
 
-def test_structural_warp_default_off_is_noop(small_cfg) -> None:
+def test_structural_warp_default_off_is_noop(small_cfg: DictConfig) -> None:
     """The structural warp is an exact identity by default."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     x = torch.randn(4, 32, cfg.data.d_features)
@@ -1085,7 +1087,7 @@ def test_structural_warp_default_off_is_noop(small_cfg) -> None:
     assert torch.equal(out, x)
 
 
-def test_structural_warp_prob_zero_is_noop(small_cfg) -> None:
+def test_structural_warp_prob_zero_is_noop(small_cfg: DictConfig) -> None:
     """structural_warp_prob=0 is an exact identity."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.structural_warp_enabled = True
@@ -1095,7 +1097,7 @@ def test_structural_warp_prob_zero_is_noop(small_cfg) -> None:
     assert torch.equal(out, x)
 
 
-def test_structural_warp_shapes_preserved(small_cfg) -> None:
+def test_structural_warp_shapes_preserved(small_cfg: DictConfig) -> None:
     """The structural warp preserves shape/dtype and generate_gp_batch's schema."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -1117,7 +1119,7 @@ def test_structural_warp_shapes_preserved(small_cfg) -> None:
         assert ep["x_norm_test"].shape[-1] == d
 
 
-def test_structural_warp_prob_one_changes_output(small_cfg) -> None:
+def test_structural_warp_prob_one_changes_output(small_cfg: DictConfig) -> None:
     """structural_warp_prob=1 changes the output."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -1130,7 +1132,7 @@ def test_structural_warp_prob_one_changes_output(small_cfg) -> None:
     assert not torch.equal(out, x)
 
 
-def test_structural_warp_partial_gate_leaves_some_columns_unwarped(small_cfg) -> None:
+def test_structural_warp_partial_gate_leaves_some_columns_unwarped(small_cfg: DictConfig) -> None:
     """0 < structural_warp_prob < 1 leaves some episodes unwarped and warps others (B=500 keeps a false failure below 1e-3)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -1148,7 +1150,7 @@ def test_structural_warp_partial_gate_leaves_some_columns_unwarped(small_cfg) ->
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_structural_warp_goldilocks_and_psd(small_cfg, kernel_name) -> None:
+def test_structural_warp_goldilocks_and_psd(small_cfg: DictConfig, kernel_name: str) -> None:
     """With structural warping on, every kernel still gives a valid, PSD, non-trivial R_star."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -1205,7 +1207,7 @@ def test_structural_warp_category_weights_zero_excludes_category() -> None:
         assert "quantize" not in ops and "censor" not in ops
 
 
-def test_structural_warp_num_ops_defaults_match_tempopfn(small_cfg) -> None:
+def test_structural_warp_num_ops_defaults_match_tempopfn(small_cfg: DictConfig) -> None:
     """num_ops defaults to 2..6 and category weights to TempoPFN's."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     assert int(getattr(cfg.data, "structural_warp_num_ops_min", 2)) == 2
@@ -1273,7 +1275,7 @@ def test_structural_warp_batch_is_deterministic_given_seed() -> None:
     assert torch.equal(out1, out2)
 
 
-def test_generate_gp_batch_raw_structural_warp_seed_pairing_contract(small_cfg) -> None:
+def test_generate_gp_batch_raw_structural_warp_seed_pairing_contract(small_cfg: DictConfig) -> None:
     """Two _generate_gp_batch_raw calls with the same seed and structural warping are identical in every field."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -1295,7 +1297,7 @@ _ALL_OPS = [(cat, op) for cat, ops in _CATEGORY_OPS.items() for op in ops]
 
 @pytest.mark.parametrize("use_index_axis", [False, True])
 @pytest.mark.parametrize("category,op", _ALL_OPS)
-def test_structural_warp_op_preserves_shape_and_finite_direct(category, op, use_index_axis) -> None:
+def test_structural_warp_op_preserves_shape_and_finite_direct(category: str, op: str, use_index_axis: bool) -> None:
     """Every op, on both pseudo-time axes, preserves shape/dtype and gives finite output."""
     torch.manual_seed(abs(hash(f"op_direct_{category}_{op}_{use_index_axis}")) % (2**31))
     col = torch.randn(64)
@@ -1328,7 +1330,7 @@ def test_structural_warp_differential_flat_derivative_does_not_collapse_column(m
     real_conv1d = torch.nn.functional.conv1d
     calls = {"n": 0}
 
-    def patched_conv1d(inp, weight, *args, **kwargs):
+    def patched_conv1d(inp: torch.Tensor, weight: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         calls["n"] += 1
         out = real_conv1d(inp, weight, *args, **kwargs)
         # Call 1 is the box smoothing (kept); call 2 is the derivative, forced flat.
@@ -1349,7 +1351,7 @@ def test_structural_warp_differential_flat_derivative_does_not_collapse_column(m
 
 
 @pytest.mark.parametrize("kernel_name", ["periodic", "cosine"])
-def test_no_degenerate_active_kernel_column_with_structural_warp(small_cfg, kernel_name) -> None:
+def test_no_degenerate_active_kernel_column_with_structural_warp(small_cfg: DictConfig, kernel_name: str) -> None:
     """With every category forced on, a periodic/cosine episode's single active column never collapses."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -1407,7 +1409,7 @@ def test_structural_warp_time_flip_reverses_value_rank_by_default() -> None:
     assert not torch.equal(out, col.flip(dims=[0]))
 
 
-def test_structural_warp_num_ops_composes_multiple_categories(small_cfg) -> None:
+def test_structural_warp_num_ops_composes_multiple_categories(small_cfg: DictConfig) -> None:
     """num_ops=6 applies one op from every category and differs from a single category."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -1430,7 +1432,7 @@ def test_structural_warp_num_ops_composes_multiple_categories(small_cfg) -> None
     assert not torch.equal(out_all, out_single)
 
 
-def test_structural_warp_index_axis_disabled_by_default(small_cfg) -> None:
+def test_structural_warp_index_axis_disabled_by_default(small_cfg: DictConfig) -> None:
     """The index-axis ratio has no effect unless structural_warp_index_axis_enabled."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -1451,7 +1453,7 @@ def test_structural_warp_index_axis_disabled_by_default(small_cfg) -> None:
     assert torch.equal(out_ratio_set, out_ratio_zero)
 
 
-def test_structural_warp_index_axis_ratio_one_forces_index_axis(small_cfg) -> None:
+def test_structural_warp_index_axis_ratio_one_forces_index_axis(small_cfg: DictConfig) -> None:
     """Ratio 1.0 (enabled) differs from ratio 0.0."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 6
@@ -1474,7 +1476,7 @@ def test_structural_warp_index_axis_ratio_one_forces_index_axis(small_cfg) -> No
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_structural_warp_composed_goldilocks_and_psd(small_cfg, kernel_name) -> None:
+def test_structural_warp_composed_goldilocks_and_psd(small_cfg: DictConfig, kernel_name: str) -> None:
     """With all 6 categories composed on every column, every kernel still gives a valid, PSD, non-trivial R_star."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -1513,7 +1515,7 @@ def test_structural_warp_composed_goldilocks_and_psd(small_cfg, kernel_name) -> 
     )
 
 
-def test_mean_fn_default_off_is_noop(small_cfg) -> None:
+def test_mean_fn_default_off_is_noop(small_cfg: DictConfig) -> None:
     """mean_fn_enabled=False gives an exact ZeroMean without drawing from the RNG."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     d = cfg.data.d_features
@@ -1536,7 +1538,7 @@ def test_mean_fn_default_off_is_noop(small_cfg) -> None:
     assert torch.equal(mean_module(x), torch.zeros(4, 6))
 
 
-def test_mean_fn_prob_zero_is_noop(small_cfg) -> None:
+def test_mean_fn_prob_zero_is_noop(small_cfg: DictConfig) -> None:
     """mean_fn_prob=0 gives an all-zero mean."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.mean_fn_enabled = True
@@ -1550,7 +1552,7 @@ def test_mean_fn_prob_zero_is_noop(small_cfg) -> None:
     assert torch.equal(mean_module(x), torch.zeros(8, 6))
 
 
-def test_mean_fn_all_families_reachable(small_cfg) -> None:
+def test_mean_fn_all_families_reachable(small_cfg: DictConfig) -> None:
     """With mean_fn_prob=1 all three mean families occur."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
@@ -1566,7 +1568,7 @@ def test_mean_fn_all_families_reachable(small_cfg) -> None:
 
 
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-def test_mean_fn_diversifies_mu_star(small_cfg, family_probs) -> None:
+def test_mean_fn_diversifies_mu_star(small_cfg: DictConfig, family_probs: list[float]) -> None:
     """Each mean family gives a non-zero mu_star."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
@@ -1586,7 +1588,7 @@ def test_mean_fn_diversifies_mu_star(small_cfg, family_probs) -> None:
 
 
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs) -> None:
+def test_mean_fn_goldilocks_and_psd(small_cfg: DictConfig, family_probs: list[float]) -> None:
     """R_star stays valid, PSD and non-trivial under every mean family."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
@@ -1622,7 +1624,7 @@ def test_mean_fn_goldilocks_and_psd(small_cfg, family_probs) -> None:
 
 
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-def test_mean_fn_z_train_stays_calibrated(small_cfg, family_probs) -> None:
+def test_mean_fn_z_train_stays_calibrated(small_cfg: DictConfig, family_probs: list[float]) -> None:
     """z_train variance stays calibrated with large means (LOO uses y - mean)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
@@ -1647,7 +1649,7 @@ def test_mean_fn_z_train_stays_calibrated(small_cfg, family_probs) -> None:
     )
 
 
-def test_oracle_mode_posterior_unsupported(small_cfg) -> None:
+def test_oracle_mode_posterior_unsupported(small_cfg: DictConfig) -> None:
     """oracle_mode='posterior' raises."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 3
@@ -1662,7 +1664,7 @@ def test_oracle_mode_posterior_unsupported(small_cfg) -> None:
 
 
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg, family_probs) -> None:
+def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg: DictConfig, family_probs: list[float]) -> None:
     """gp_analytical_pit without cached factors matches the cached z_train for every mean family."""
     from copula_inter.pit import gp_analytical_pit
 
@@ -1684,7 +1686,7 @@ def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg, family_prob
         assert torch.allclose(cached["z_test"], reconstructed["z_test"], atol=1e-3)
 
 
-def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg) -> None:
+def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg: DictConfig) -> None:
     """mean_fn_linear_prob=0 gives a constant linear mean (zero weight)."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4

@@ -131,7 +131,7 @@ def test_spatial_coverage_curve_matches_calc(monkeypatch: MonkeyPatch) -> None:
     n, D = 5000, 3
     y = rng.uniform(0.0, 1.0, size=(n, D))
 
-    def quantile_func(alpha):
+    def quantile_func(alpha: float) -> tuple[np.ndarray, np.ndarray]:
         lo = np.full((n, D), alpha / 2)
         hi = np.full((n, D), 1 - alpha / 2)
         return lo, hi
@@ -160,7 +160,7 @@ def test_exceedance_probs_null() -> None:
 
     y = rng.standard_normal((n, D))
 
-    def cdf_func(tau):
+    def cdf_func(tau: float) -> np.ndarray:
         return np.broadcast_to(norm.cdf(tau), (n, D))
 
     thresholds = np.array([-1.0, 0.0, 1.0, 2.0])

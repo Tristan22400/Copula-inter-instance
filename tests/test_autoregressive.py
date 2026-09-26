@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 import torch
@@ -37,7 +38,9 @@ class RecordingFakeTabICL(RowIndependentFakeTabICL):
         return super().forward(X, y)
 
 
-def _episodes(B: int = 2, P: int = 6, N: int = 5, d_x: int = 3, seed: int = 0):
+def _episodes(
+    B: int = 2, P: int = 6, N: int = 5, d_x: int = 3, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     return (
         torch.randn(B, P, d_x, generator=g),
@@ -53,6 +56,7 @@ def test_ar_step0_matches_the_one_shot_marginal() -> None:
     x_tr, y_tr, x_te, y_te = _episodes()
 
     one_shot = _pit_group(x_tr, y_tr, x_te, y_te, tabicl, k_folds=3)
+    assert one_shot is not None
     ar = autoregressive_log_pdf(
         tabicl,
         x_tr,
@@ -92,7 +96,7 @@ def test_sample_conditioning_departs_from_the_truth_but_is_reproducible() -> Non
     tabicl = RowIndependentFakeTabICL()
     x_tr, y_tr, x_te, y_te = _episodes(seed=2)
 
-    kw = dict(order="natural", conditioning="sample", seed=11)
+    kw: dict[str, Any] = dict(order="natural", conditioning="sample", seed=11)
     a = autoregressive_log_pdf(tabicl, x_tr, y_tr, x_te, y_te, **kw)
     b = autoregressive_log_pdf(tabicl, x_tr, y_tr, x_te, y_te, **kw)
 
@@ -189,7 +193,9 @@ def test_ar_note_warns_on_sampled_conditioning() -> None:
 
     rows = [{"autoregressive": {"total": 0.5, "marginal": 1.0, "copula": -0.5}}, {"autoregressive": _NAN_PARTS.copy()}]
     forced = _ar_note(rows, "random", "teacher_forcing", None)
+    assert forced is not None
     assert "1/2 episodes" in forced and "WARNING" not in forced
     sampled = _ar_note(rows, "random", "sample", 64)
+    assert sampled is not None
     assert "WARNING" in sampled and "max_context=64" in sampled
     assert _ar_note([{"autoregressive": _NAN_PARTS.copy()}], "random", "teacher_forcing", None) is None

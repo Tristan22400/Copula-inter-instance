@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import traceback
 import weakref
+from typing import Any, Callable
 
 import pytest
 import torch
@@ -20,7 +21,7 @@ class _TinyModel(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(1, n_test, 2))
 
-    def forward(self, batch):
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
             "W": self.weight.expand(batch["x_train"].shape[0], -1, -1),
             "s": self.weight[..., :1],
@@ -41,11 +42,11 @@ def test_oom_unwinds_train_step_graph(monkeypatch: MonkeyPatch) -> None:
     }
     graph_ref = {}
 
-    def fake_correlation(W, _s, jitter, **_kwargs):
+    def fake_correlation(W: torch.Tensor, _s: Any, jitter: float, **_kwargs: Any) -> Any:
         graph_ref["tensor"] = weakref.ref(W)
         return W[..., :1] @ W[..., :1].transpose(-1, -2)
 
-    def fake_nll(Sigma, *_args):
+    def fake_nll(Sigma: Any, *_args: Any) -> dict[str, Any]:
         total = Sigma.square().mean()
         return {"total": total, "copula": total, "marginal": total}
 
@@ -54,7 +55,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(training_core, "low_rank_correlation_factor", fake_correlation)
     monkeypatch.setattr(training_core, "y_space_nll", fake_nll)
 
-    def fail_step(*_args, **_kwargs):
+    def fail_step(*_args: Any, **_kwargs: Any) -> None:
         raise torch.cuda.OutOfMemoryError("synthetic OOM")
 
     monkeypatch.setattr(optimizer, "step", fail_step)
@@ -92,7 +93,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch: MonkeyPatch) -> None:
     assert graph_ref["tensor"]() is None
 
 
-def _fake_device_properties(total_gb: float):
+def _fake_device_properties(total_gb: float) -> Callable[[Any], Any]:
     class _Props:
         total_memory = total_gb * 1e9
 
@@ -138,7 +139,7 @@ def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch: MonkeyPa
     returns, _reserve_gpu_headroom_for_live_tabicl reads t.batch_size
     unconditionally.
     """
-    captured = {}
+    captured: dict[str, Any] = {}
     monkeypatch.setattr(
         torch.cuda,
         "set_per_process_memory_fraction",
@@ -154,7 +155,7 @@ def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch: MonkeyPa
 
 def test_reserve_headroom_clamps_fraction_floor(monkeypatch: MonkeyPatch) -> None:
     """A huge worker count shouldn't starve this process itself below 50%."""
-    captured = {}
+    captured: dict[str, Any] = {}
     monkeypatch.setattr(
         torch.cuda,
         "set_per_process_memory_fraction",

@@ -18,7 +18,7 @@ pytest.importorskip("tabldm", reason="Xiaomi-TabLDM not installed")
         ("_model.kv_cache", "KVCacheEntry"),
     ],
 )
-def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path, symbol) -> None:
+def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path: str, symbol: str) -> None:
     """TabLDM's attention classes and functions have the same source as TabICL's."""
     import importlib
 

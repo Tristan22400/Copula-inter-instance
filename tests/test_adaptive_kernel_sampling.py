@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import random
 from collections import Counter
+from typing import TYPE_CHECKING, Any
 
 import torch
 from omegaconf import OmegaConf
 
 from copula_inter import adaptive_sampling as train
 from copula_inter.data_gen import _COMPOSABLE_KERNELS, _sample_kernel_chain_structure, _weights_for_pool
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 
 def _uniform_weights() -> torch.Tensor:
@@ -134,7 +138,7 @@ def test_signal_default_is_oracle() -> None:
     assert torch.equal(out_default, out_explicit_oracle)
 
 
-def _base_cfg(**data_overrides):
+def _base_cfg(**data_overrides: Any) -> DictConfig:
     data = {
         "composite_num_kernels_min": 1,
         "composite_num_kernels_max": 1,  # pin m=1 so names==[single kernel], no chain noise
@@ -160,7 +164,7 @@ def test_sample_kernel_chain_skewed_weights_shift_frequency() -> None:
     weights[_COMPOSABLE_KERNELS.index(target)] = 1.0  # dominant weight
     cfg = _base_cfg()
     random.seed(0)
-    counts = Counter()
+    counts: Counter[str] = Counter()
     for _ in range(500):
         names, _, _ = _sample_kernel_chain_structure(cfg, kernel_weights=weights)
         counts[names[0]] += 1

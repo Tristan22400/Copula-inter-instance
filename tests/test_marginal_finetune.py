@@ -6,11 +6,11 @@ import glob
 import math
 import os
 import re
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 import torch
-import torch.nn as nn
 from pytest import MonkeyPatch
 
 from copula_inter.data_gen import build_kernel_fn, gp_posterior
@@ -32,6 +32,9 @@ from copula_inter.finetune_marginal import (
 from copula_inter.lora import merged_base_state_dict
 from copula_inter.pit import _probit, run_pit_batched, run_pit_batched_grad
 
+if TYPE_CHECKING:
+    from tabicl._model.tabicl import TabICL
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -42,10 +45,10 @@ def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch: MonkeyPatch
 
     calls = []
 
-    def episode(P, N: int = 3, d: int = 2):
+    def episode(P: int, N: int = 3, d: int = 2) -> dict[str, torch.Tensor]:
         return {"x_norm_train": torch.zeros(P, d), "x_norm_test": torch.zeros(N, d)}
 
-    def fake_generate(cfg, B, device, **kwargs):
+    def fake_generate(cfg: Any, B: int, device: Any, **kwargs: Any) -> list[dict[str, torch.Tensor]]:
         calls.append((B, int(cfg.data.P_min), int(cfg.data.P_max), kwargs.get("d_override")))
         if len(calls) == 1:
             return [episode(4), episode(4), episode(7)]
@@ -59,9 +62,9 @@ def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch: MonkeyPatch
     assert calls[1][1:] == (4, 4, 2)
 
 
-def _tiny_tabicl(num_quantiles: int = 33) -> nn.Module:
+def _tiny_tabicl(num_quantiles: int = 33) -> TabICL:
     """Tiny randomly initialized TabICL with the module names the routing and export logic use."""
-    from tabicl._model.tabicl import TabICL  # type: ignore[import]
+    from tabicl._model.tabicl import TabICL
 
     return TabICL(
         max_classes=0,
@@ -173,7 +176,7 @@ def test_unknown_tier_rejected() -> None:
 
 
 def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward() -> None:
-    from tabicl._model.tabicl import TabICL  # type: ignore[import]
+    from tabicl._model.tabicl import TabICL
 
     torch.manual_seed(0)
     m = _tiny_tabicl()
@@ -189,22 +192,20 @@ def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward() ->
 
     sd = merged_base_state_dict(m)
     fresh = TabICL(
-        **{
-            "max_classes": 0,
-            "num_quantiles": 33,
-            "embed_dim": 16,
-            "col_num_blocks": 1,
-            "col_nhead": 2,
-            "col_num_inds": 8,
-            "col_target_aware": True,
-            "row_num_blocks": 1,
-            "row_nhead": 2,
-            "row_num_cls": 2,
-            "icl_num_blocks": 2,
-            "icl_nhead": 2,
-            "ff_factor": 1,
-            "dropout": 0.0,
-        }
+        max_classes=0,
+        num_quantiles=33,
+        embed_dim=16,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        col_target_aware=True,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=2,
+        icl_num_blocks=2,
+        icl_nhead=2,
+        ff_factor=1,
+        dropout=0.0,
     )
     fresh.load_state_dict(sd)  # strict — the actual assertion
 
@@ -291,7 +292,7 @@ def test_cached_full_context_target_matches_direct_recomputation() -> None:
 
 
 @pytest.mark.parametrize("K", [3, 5, 10])
-def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K) -> None:
+def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K: int) -> None:
     """A row's target is conditioned on a context without that row."""
     P = 12
     task = _rbf_task(P=P, N=2, seed=4)
@@ -309,7 +310,7 @@ def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K) -> 
 
 
 @pytest.mark.parametrize("K", [3, 5, 10])
-def test_cached_precision_fold_targets_match_direct_conditioning(K) -> None:
+def test_cached_precision_fold_targets_match_direct_conditioning(K: int) -> None:
     task = _with_cached_full_factors(_rbf_task(P=17, N=2, seed=32 + K))
     idx = torch.tensor([0, 1, 5, 8, 12, 16])
     direct_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}
@@ -402,7 +403,7 @@ def test_fused_fold_forward_matches_separate_forwards() -> None:
     tab = RowIndependentFakeTabICL(q=7)
     Xtr, Ytr = torch.randn(2, 17, 2), torch.randn(2, 17, 1)
     Xte, Yte = torch.randn(2, 4, 2), torch.randn(2, 4, 1)
-    kwargs = dict(return_quantiles=True, fold_subset=[0, 2, 4], compute_pit=False)
+    kwargs: dict[str, Any] = dict(return_quantiles=True, fold_subset=[0, 2, 4], compute_pit=False)
     separate = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, 5, 1e-6, **kwargs)
     fused = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, 5, 1e-6, fuse_folds=True, **kwargs)
     assert torch.equal(fused["train_query_idx"], separate["train_query_idx"])

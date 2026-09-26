@@ -18,7 +18,7 @@ from omegaconf import OmegaConf
         ("tabldm", "tabldm"),
     ],
 )
-def test_resolve_marginal_maps_z_train_source(source, expected) -> None:
+def test_resolve_marginal_maps_z_train_source(source: str, expected: str | None) -> None:
     from copula_inter.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": source}})
@@ -44,7 +44,7 @@ def test_resolve_marginal_rejects_typo() -> None:
 
 
 @pytest.mark.parametrize("backend", ["tabldm"])
-def test_pit_group_and_episode_agree_under_backend(backend) -> None:
+def test_pit_group_and_episode_agree_under_backend(backend: str) -> None:
     """A backend reaches the PIT, and the grouped and single-episode paths agree."""
     pytest.importorskip(backend, reason=f"{backend} not installed")
     from copula_inter.era5_live_dataset import _pit_episode, _pit_group
@@ -63,11 +63,13 @@ def test_pit_group_and_episode_agree_under_backend(backend) -> None:
         seed=7,
     )
     grouped = _pit_group(x_train, y_train, x_test, y_test, None, 2, **kw)
+    assert grouped is not None
     assert grouped["z_train"].shape == (B, P)
     assert grouped["z_test"].shape == (B, N)
     assert grouped["log_pdf_test"].shape == (B, N)
     assert all(torch.isfinite(v).all() for v in grouped.values())
 
     single = _pit_episode(x_train[0], y_train[0], x_test[0], y_test[0], None, 2, **kw)
+    assert single is not None
     torch.testing.assert_close(grouped["z_train"][0], single["z_train"], atol=1e-3, rtol=0)
     torch.testing.assert_close(grouped["log_pdf_test"][0], single["log_pdf_test"], atol=1e-2, rtol=0)

@@ -17,6 +17,7 @@ docstring for the same caveat.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import numpy as np
 import pytest
@@ -30,13 +31,13 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def regressor():
+def regressor() -> Any:
     from eval.spatial.marginal_backends import make_regressor
 
     return make_regressor("tabpfn", device="cpu")
 
 
-def test_tabpfn_batched_matches_per_episode(regressor) -> None:
+def test_tabpfn_batched_matches_per_episode(regressor: Any) -> None:
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.marginal_backends import loo_pit, quantiles
     from eval.spatial.tabpfn_batched import tabpfn_run_pit_batched

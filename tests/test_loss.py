@@ -16,7 +16,9 @@ import torch
 from copula_inter.loss import _safe_cholesky, copula_nll, oracle_copula_nll
 
 
-def make_w_and_z(B: int = 4, N: int = 10, rank: int = 2, seed: int = 0):
+def make_w_and_z(
+    B: int = 4, N: int = 10, rank: int = 2, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     W = torch.randn(B, N, rank + 1)
     W = W / W.norm(dim=-1, keepdim=True)  # unit rows
@@ -25,7 +27,7 @@ def make_w_and_z(B: int = 4, N: int = 10, rank: int = 2, seed: int = 0):
     return W, z, mask
 
 
-def make_identity_w(B: int, N: int, rank: int):
+def make_identity_w(B: int, N: int, rank: int) -> torch.Tensor:
     """W_tilde with eps=1 and W=0 gives R_eps = I + 0 = I (independence)."""
     return torch.zeros(B, N, rank + 1)
 

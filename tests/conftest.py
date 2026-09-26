@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 from omegaconf import OmegaConf
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 # Make src/ importable
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
 
 @pytest.fixture(scope="session")
-def small_model_cfg():
+def small_model_cfg() -> DictConfig:
     """Minimal CopulaTabICL config: scratch (untrained) TabICL backbone.
 
     Sized for fast CPU forward passes in model structural tests, not for
@@ -46,7 +50,7 @@ def small_model_cfg():
 
 
 @pytest.fixture(scope="session")
-def small_cfg():
+def small_cfg() -> DictConfig:
     """Minimal Hydra-like config for fast CPU tests (no GPU required)."""
     return OmegaConf.create(
         {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -20,16 +21,16 @@ class RepeatedWeightModel(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(3, 3))
         parametrize.register_parametrization(self, "weight", LoRAParametrization(self.weight, 2, 4))
-        self.parametrizations.weight.original.requires_grad_(False)
+        cast(Any, self.parametrizations).weight.original.requires_grad_(False)
 
-    def forward(self, support, label, query, **kwargs):
+    def forward(self, support: torch.Tensor, label: torch.Tensor, query: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         hidden = F.linear(query + support.mean(1, keepdim=True), self.weight).tanh()
         return F.linear(hidden, self.weight) + label.mean(1)[:, None, None]
 
 
 @pytest.mark.parametrize("checkpointing", [True, False])
 @pytest.mark.parametrize("chunk_size", [1, 2, 8])
-def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_size) -> None:
+def test_cached_chunked_forward_matches_uncached_updates(checkpointing: bool, chunk_size: int) -> None:
     torch.manual_seed(42)
     reference = RepeatedWeightModel()
     actual = deepcopy(reference)

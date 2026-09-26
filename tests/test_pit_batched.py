@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
@@ -26,6 +28,9 @@ from copula_inter.pit import (
     run_pit_calib_split_batched,
 )
 from inference.copula_inference import loo_pit
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 
 class RowIndependentFakeTabICL(nn.Module):
@@ -46,7 +51,7 @@ class RowIndependentFakeTabICL(nn.Module):
             out[i] = torch.randn(n, self.q, generator=g)
         return out
 
-    def quantile_dist(self, logits_flat: torch.Tensor):
+    def quantile_dist(self, logits_flat: torch.Tensor) -> torch.distributions.Normal:
         loc = logits_flat[:, 0]
         scale = torch.nn.functional.softplus(logits_flat[:, 1]) + 1e-3
         return torch.distributions.Normal(loc, scale)
@@ -64,12 +69,12 @@ class FoldScaleProbe(nn.Module):
         loc = y.pow(3).mean(dim=1, keepdim=True) + self.anchor
         return loc[:, None, :].expand(-1, n_query, -1)
 
-    def quantile_dist(self, logits_flat: torch.Tensor):
+    def quantile_dist(self, logits_flat: torch.Tensor) -> torch.distributions.Normal:
         return torch.distributions.Normal(logits_flat[:, 0], torch.ones_like(logits_flat[:, 0]))
 
 
 def test_fold_target_scaling_uses_only_context_labels() -> None:
-    model = FoldScaleProbe()
+    model: Any = FoldScaleProbe()  # stands in for TabICL
     x = torch.arange(6, dtype=torch.float32)[:, None]
     y = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
     changed = y.clone()
@@ -269,7 +274,7 @@ def test_run_pit_calib_split_batched_finite() -> None:
     assert torch.isfinite(out["z_train"]).all()
 
 
-def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg) -> None:
+def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg: DictConfig) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -309,7 +314,7 @@ def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg) -> None:
             assert torch.allclose(ep_a[key], ep_t[key], atol=1e-6), key
 
 
-def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg) -> None:
+def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg: DictConfig) -> None:
     """z_train_split_calib_frac > 1 works."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -330,7 +335,7 @@ def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg)
         assert ep["z_train"].shape == ep["y_train"].shape
 
 
-def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg) -> None:
+def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg: DictConfig) -> None:
     """tabicl_split_calib_frac=0 with a model uses the K-fold path."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -359,7 +364,7 @@ def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg) -
         assert torch.allclose(ep_a["z_train"], ep_b["z_train"], atol=1e-6)
 
 
-def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg) -> None:
+def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg: DictConfig) -> None:
     """The "tabicl" override replaces z_train, z_test and log_pdf_test with TabICL's PIT and leaves every other field unchanged."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -401,7 +406,7 @@ def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg) -> None:
             assert torch.allclose(ep_a[key], ep_t[key], atol=1e-6), key
 
 
-def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(small_cfg) -> None:
+def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(small_cfg: DictConfig) -> None:
     """The override's z_test/log_pdf_test equal run_pit_batched on the episode with train-only scaling and the Jacobian."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -437,7 +442,7 @@ def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(smal
         assert torch.allclose(ep["log_pdf_test"], expected_log_pdf.squeeze(0), atol=1e-5)
 
 
-def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg) -> None:
+def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg: DictConfig) -> None:
     """Without tabicl_model, z_train/z_test/log_pdf_test are unchanged."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -454,7 +459,7 @@ def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg) -> No
             assert torch.allclose(ep_p[key], ep_a[key], atol=1e-6), key
 
 
-def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg) -> None:
+def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg: DictConfig) -> None:
     """ "tabicl_split" replaces z_train only; z_test/log_pdf_test stay analytic."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -479,7 +484,9 @@ def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg) -> No
             assert torch.allclose(ep_a[key], ep_s[key], atol=1e-6), key
 
 
-def _pit_inputs(B: int = 2, P: int = 9, N: int = 4, seed: int = 0):
+def _pit_inputs(
+    B: int = 2, P: int = 9, N: int = 4, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     return (
         torch.randn(B, P, 3),
@@ -519,7 +526,7 @@ class GradProbeFakeTabICL(nn.Module):
         base = X[:, -n:, :1].mean(-1, keepdim=True)  # (batch, n, 1)
         return base + self.w.view(1, 1, self.q)
 
-    def quantile_dist(self, logits_flat: torch.Tensor):
+    def quantile_dist(self, logits_flat: torch.Tensor) -> torch.distributions.Normal:
         loc = logits_flat[:, 0]
         scale = torch.nn.functional.softplus(logits_flat[:, 1]) + 1e-3
         return torch.distributions.Normal(loc, scale)
