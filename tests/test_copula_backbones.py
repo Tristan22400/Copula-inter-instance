@@ -15,20 +15,20 @@ from copula_inter import copula_backbones
 from copula_inter.model import build_copula_transformer
 
 
-def test_tabicl_strip_decoder(small_model_cfg):
+def test_tabicl_strip_decoder(small_model_cfg) -> None:
     base = copula_backbones.load_raw_backbone("tabicl", small_model_cfg)
     in_features = copula_backbones.strip_decoder(base)
     assert in_features == 16 * 2  # embed_dim * row_num_cls from small_model_cfg
     assert isinstance(base.icl_predictor.decoder, torch.nn.Identity)
 
 
-def test_tabicl_moe_aux_loss_is_none(small_model_cfg):
+def test_tabicl_moe_aux_loss_is_none(small_model_cfg) -> None:
     base = copula_backbones.load_raw_backbone("tabicl", small_model_cfg)
     copula_backbones.strip_decoder(base)
     assert copula_backbones.moe_aux_loss("tabicl", base) is None
 
 
-def test_build_copula_transformer_tabicl_default_backbone(small_model_cfg):
+def test_build_copula_transformer_tabicl_default_backbone(small_model_cfg) -> None:
     """model.backbone defaults to "tabicl"."""
     assert "backbone" not in small_model_cfg.model
     model = build_copula_transformer(small_model_cfg)
@@ -39,7 +39,7 @@ def test_build_copula_transformer_tabicl_default_backbone(small_model_cfg):
     assert "moe_aux_loss" not in out
 
 
-def test_unknown_backbone_raises(small_model_cfg):
+def test_unknown_backbone_raises(small_model_cfg) -> None:
     cfg = OmegaConf.merge(small_model_cfg, {"model": {"backbone": "bogus"}})
     with pytest.raises(ValueError, match="Unknown cfg.model.backbone"):
         build_copula_transformer(cfg)
@@ -62,20 +62,20 @@ def tabldm_model(tabldm_cfg):
     return model
 
 
-def test_tabldm_strip_decoder(tabldm_cfg):
+def test_tabldm_strip_decoder(tabldm_cfg) -> None:
     base = copula_backbones.load_raw_backbone("tabldm", tabldm_cfg)
     in_features = copula_backbones.strip_decoder(base)
     assert in_features == 512  # embed_dim(128) * row_num_cls(4) for the released checkpoint
     assert isinstance(base.icl_predictor.decoder, torch.nn.Identity)
 
 
-def test_tabldm_pretrained_false_raises(tabldm_cfg):
+def test_tabldm_pretrained_false_raises(tabldm_cfg) -> None:
     cfg = OmegaConf.merge(tabldm_cfg, {"tabicl": {"pretrained": False}})
     with pytest.raises(ValueError, match="no from-scratch architecture"):
         copula_backbones.load_raw_backbone("tabldm", cfg)
 
 
-def test_tabldm_recompute_escalation(tabldm_cfg):
+def test_tabldm_recompute_escalation(tabldm_cfg) -> None:
     cfg_on = OmegaConf.merge(tabldm_cfg, {"tabicl": {"recompute": True}})
     base = copula_backbones.load_raw_backbone("tabldm", cfg_on)
     flagged = [m for m in base.modules() if hasattr(m, "recompute")]
@@ -90,7 +90,7 @@ def test_tabldm_recompute_escalation(tabldm_cfg):
     )
 
 
-def test_build_copula_transformer_tabldm(tabldm_model, tabldm_cfg):
+def test_build_copula_transformer_tabldm(tabldm_model, tabldm_cfg) -> None:
     assert tabldm_model.backbone_name == "tabldm"
     assert tabldm_model.feature_dim == 512
     tabldm_model.train()
@@ -102,7 +102,7 @@ def test_build_copula_transformer_tabldm(tabldm_model, tabldm_cfg):
     assert torch.isfinite(out["s"]).all()
 
 
-def test_tabldm_moe_aux_loss_present_and_carries_grad(tabldm_model):
+def test_tabldm_moe_aux_loss_present_and_carries_grad(tabldm_model) -> None:
     tabldm_model.train()
     batch = make_batch(B=2, P=4, N=2)
     out = tabldm_model(batch)
@@ -116,7 +116,7 @@ def test_tabldm_moe_aux_loss_present_and_carries_grad(tabldm_model):
     tabldm_model.zero_grad(set_to_none=True)
 
 
-def test_tabldm_unfreeze_backbone_false_freezes_trunk():
+def test_tabldm_unfreeze_backbone_false_freezes_trunk() -> None:
     cfg = OmegaConf.create(
         {
             "model": {"backbone": "tabldm", "rank": 4, "unfreeze_backbone": False},
@@ -128,7 +128,7 @@ def test_tabldm_unfreeze_backbone_false_freezes_trunk():
     assert all(p.requires_grad for p in model.copula_head.parameters())
 
 
-def test_tabldm_lora_installs_adapters():
+def test_tabldm_lora_installs_adapters() -> None:
     cfg = OmegaConf.create(
         {
             "model": {"backbone": "tabldm", "rank": 4, "unfreeze_backbone": True},
@@ -146,7 +146,7 @@ def test_tabldm_lora_installs_adapters():
     assert all(p.requires_grad for p in model.copula_head.parameters())
 
 
-def test_tabldm_forward_and_loss_backprops(tabldm_model):
+def test_tabldm_forward_and_loss_backprops(tabldm_model) -> None:
     """_forward_and_loss on a tabldm-backed model includes the MoE aux term and backpropagates."""
     from copula_inter.training_core import _forward_and_loss
 

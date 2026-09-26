@@ -15,7 +15,7 @@ from copula_inter.data_gen import generate_gp_batch
 from copula_inter.pit import gp_analytical_pit, gp_analytical_posterior
 
 
-def _episodes(small_cfg, b=24, seed=0):
+def _episodes(small_cfg, b: int = 24, seed: int = 0):
     """RBF episodes with enough test points for per-episode moments."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.P_min = cfg.data.P_max = 16
@@ -25,7 +25,7 @@ def _episodes(small_cfg, b=24, seed=0):
     return generate_gp_batch(cfg, b, "cpu", return_kernel_metadata=True)
 
 
-def test_z_test_has_unit_variance_conditional_on_the_context(small_cfg):
+def test_z_test_has_unit_variance_conditional_on_the_context(small_cfg) -> None:
     """Var(z_test | context) = 1 per episode (prior standardization gives ~0.3)."""
     eps = _episodes(small_cfg, b=32)
     per_ep = np.array([float(ep["z_test"].double().var()) for ep in eps])
@@ -37,14 +37,14 @@ def test_z_test_has_unit_variance_conditional_on_the_context(small_cfg):
     )
 
 
-def test_z_test_is_centred_conditional_on_the_context(small_cfg):
+def test_z_test_is_centred_conditional_on_the_context(small_cfg) -> None:
     """E[z_test | context] = 0 per episode."""
     eps = _episodes(small_cfg, b=32)
     per_ep = np.array([float(ep["z_test"].double().mean()) for ep in eps])
     assert abs(per_ep.mean()) < 0.15, f"mean per-episode E[z_test | context] = {per_ep.mean():+.4f}; expected ~0."
 
 
-def test_analytic_pit_matches_gp_analytical_posterior_marginals(small_cfg):
+def test_analytic_pit_matches_gp_analytical_posterior_marginals(small_cfg) -> None:
     """gp_analytical_pit's implied (mu, sigma) are gp_analytical_posterior's mu_post and sqrt(diag(Sigma_post))."""
     for ep in _episodes(small_cfg, b=12):
         post = gp_analytical_posterior(ep)
@@ -59,7 +59,7 @@ def test_analytic_pit_matches_gp_analytical_posterior_marginals(small_cfg):
         )
 
 
-def test_batched_generator_matches_single_episode_pit(small_cfg):
+def test_batched_generator_matches_single_episode_pit(small_cfg) -> None:
     """data_gen's batched path and gp_analytical_pit give the same z_test/log_pdf_test."""
     for ep in _episodes(small_cfg, b=12):
         rec = gp_analytical_pit(ep)
@@ -67,7 +67,7 @@ def test_batched_generator_matches_single_episode_pit(small_cfg):
         assert torch.allclose(rec["log_pdf_test"], ep["log_pdf_test"], atol=1e-3)
 
 
-def test_analytic_pit_is_not_the_prior_standardisation(small_cfg):
+def test_analytic_pit_is_not_the_prior_standardisation(small_cfg) -> None:
     """z_test is not (y_test - mu_star) / sigma_star."""
     max_dev = 0.0
     for ep in _episodes(small_cfg, b=16):
@@ -102,7 +102,7 @@ def _second_moment_of_emitted_z(ep, post):
     return Dinv @ post["Sigma_post"].double() @ Dinv + torch.outer(delta, delta)
 
 
-def test_copula_optimum_is_the_posterior_correlation(small_cfg):
+def test_copula_optimum_is_the_posterior_correlation(small_cfg) -> None:
     """At the emitted z's second moment, R_post scores better than R_star."""
     wins = total = 0
     for ep in _episodes(small_cfg, b=24):
@@ -121,7 +121,7 @@ def test_copula_optimum_is_the_posterior_correlation(small_cfg):
     )
 
 
-def test_conditional_second_moment_is_a_correlation_matrix(small_cfg):
+def test_conditional_second_moment_is_a_correlation_matrix(small_cfg) -> None:
     """diag(E[z z^T | context]) = 1 for the emitted z."""
     diags = []
     worst = 0.0

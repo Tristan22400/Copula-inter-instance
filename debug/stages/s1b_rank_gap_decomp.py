@@ -105,7 +105,7 @@ def fit_decomposition(
     return out, n_params
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(p)
     p.add_argument("--ranks", default="8,16,32,64,128,255")

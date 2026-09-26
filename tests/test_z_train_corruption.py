@@ -13,14 +13,14 @@ def make_z_train(B: int = 200, P: int = 40, seed: int = 0):
     return torch.randn(B, P, generator=g)
 
 
-def test_disabled_is_noop():
+def test_disabled_is_noop() -> None:
     z_train = make_z_train()
     cfg = OmegaConf.create({})  # z_train_corruption_enabled absent -> defaults False
     out = corrupt_z_train(z_train, cfg)
     assert torch.equal(out, z_train)
 
 
-def test_zero_prob_is_noop():
+def test_zero_prob_is_noop() -> None:
     z_train = make_z_train()
     cfg = OmegaConf.create(
         {
@@ -32,7 +32,7 @@ def test_zero_prob_is_noop():
     assert torch.equal(out, z_train)
 
 
-def test_achieves_target_correlation():
+def test_achieves_target_correlation() -> None:
     """corr(z_train, z_corrupted) ~ sqrt(rho)."""
     torch.manual_seed(0)
     B, P = 4000, 1  # many independent episodes, single "point" per episode

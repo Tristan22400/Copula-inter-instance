@@ -11,7 +11,7 @@ import torch
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
 
-def test_rank_ceiling_recovers_exact_low_rank_target():
+def test_rank_ceiling_recovers_exact_low_rank_target() -> None:
     """Fitting rank r to a rank-r covnorm matrix drives the ceiling loss to ~0."""
     from copula_inter.model import low_rank_correlation
     from debug.stages.s1_rank_ceiling import fit_rank_ceiling
@@ -28,7 +28,7 @@ def test_rank_ceiling_recovers_exact_low_rank_target():
     )
 
 
-def test_rank_ceiling_monotone_in_rank():
+def test_rank_ceiling_monotone_in_rank() -> None:
     """The rank-8 ceiling loss is <= the rank-2 one on the same target."""
     from copula_inter.model import low_rank_correlation
     from debug.stages.s1_rank_ceiling import fit_rank_ceiling
@@ -44,7 +44,7 @@ def test_rank_ceiling_monotone_in_rank():
     assert loss_r16.item() <= loss_r2.item() + 1e-3
 
 
-def test_clamping_census_all_saturated():
+def test_clamping_census_all_saturated() -> None:
     from debug.stages.s2_uspace import U_SPLINE_KNOT, _clamp_stats
 
     n_points = 50
@@ -55,7 +55,7 @@ def test_clamping_census_all_saturated():
     assert stats["n_episodes_total"] == 1
 
 
-def test_clamping_census_none_saturated():
+def test_clamping_census_none_saturated() -> None:
     from debug.stages.s2_uspace import _clamp_stats
 
     n_points = 50
@@ -65,7 +65,7 @@ def test_clamping_census_none_saturated():
     assert stats["n_episodes_gt_1pct_saturated"] == 0
 
 
-def test_u_from_z_roundtrips_probit():
+def test_u_from_z_roundtrips_probit() -> None:
     """u_from_z inverts pit._probit (clamped values come back at the clamp)."""
     from copula_inter.pit import _probit
     from debug.stages.s2_uspace import U_HARD_CLAMP, u_from_z
@@ -77,7 +77,7 @@ def test_u_from_z_roundtrips_probit():
     np.testing.assert_allclose(u_back, expected, atol=1e-4)
 
 
-def test_build_config_applies_dotted_overrides():
+def test_build_config_applies_dotted_overrides() -> None:
     from debug.config import build_config
 
     dcfg = build_config(
@@ -91,14 +91,14 @@ def test_build_config_applies_dotted_overrides():
     assert int(dcfg.cfg.model.rank) == 64
 
 
-def test_build_config_rejects_malformed_override():
+def test_build_config_rejects_malformed_override() -> None:
     from debug.config import build_config
 
     with pytest.raises(ValueError):
         build_config(overrides=["not_a_key_value_pair"], device="cpu")
 
 
-def test_s0_posterior_signal_uses_per_point_normalization():
+def test_s0_posterior_signal_uses_per_point_normalization() -> None:
     """S0 divides the posterior copula NLL by n_test."""
     from debug.config import build_config
     from debug.stages.s0_signal import run_one_P

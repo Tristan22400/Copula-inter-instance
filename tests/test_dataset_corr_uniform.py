@@ -78,7 +78,7 @@ def min_eigenvalues(episode_data):
     return episode_data[1]
 
 
-def test_correlations_have_both_signs(off_diag):
+def test_correlations_have_both_signs(off_diag) -> None:
     """Both positive and negative off-diagonal entries must exist."""
     assert off_diag.min().item() < -0.02, (
         f"Min correlation {off_diag.min().item():.3f} — no negative correlations found"
@@ -86,26 +86,26 @@ def test_correlations_have_both_signs(off_diag):
     assert off_diag.max().item() > 0.02, f"Max correlation {off_diag.max().item():.3f} — no positive correlations found"
 
 
-def test_correlations_mean_near_zero(off_diag):
+def test_correlations_mean_near_zero(off_diag) -> None:
     """|mean off-diagonal R_star| < 0.30."""
     mean = off_diag.mean().item()
     assert abs(mean) < 0.30, f"Mean {mean:.3f} too far from 0 — distribution may be degenerate"
 
 
-def test_correlations_negative_fraction(off_diag):
+def test_correlations_negative_fraction(off_diag) -> None:
     """Between 25 % and 75 % of off-diagonal entries should be negative."""
     neg_frac = (off_diag < 0).float().mean().item()
     assert neg_frac > 0.25, f"Only {neg_frac:.1%} negative — distribution too positive"
     assert neg_frac < 0.75, f"{neg_frac:.1%} negative — distribution too negative"
 
 
-def test_correlations_std_nonzero(off_diag):
+def test_correlations_std_nonzero(off_diag) -> None:
     """The off-diagonal std is at least 0.1."""
     std = off_diag.std().item()
     assert std > 0.1, f"Std {std:.4f} too low — posterior R_star correlations appear degenerate."
 
 
-def test_unit_diagonal(dataset_dir):
+def test_unit_diagonal(dataset_dir) -> None:
     """R_star must have unit diagonal (proper correlation matrix)."""
     if not os.path.isdir(dataset_dir):
         pytest.skip(f"Dataset folder not found: {dataset_dir}")
@@ -122,7 +122,7 @@ def test_unit_diagonal(dataset_dir):
         assert diag_err < 1e-4, f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
 
 
-def test_r_star_well_conditioned(min_eigenvalues):
+def test_r_star_well_conditioned(min_eigenvalues) -> None:
     """Every R_star has minimum eigenvalue >= 1e-4."""
     bad = [v for v in min_eigenvalues if v < 0.0001]
     assert len(bad) == 0, (
@@ -132,7 +132,7 @@ def test_r_star_well_conditioned(min_eigenvalues):
     )
 
 
-def test_r_star_psd(min_eigenvalues):
+def test_r_star_psd(min_eigenvalues) -> None:
     """R_star must be positive semi-definite (no negative eigenvalues)."""
     neg = [v for v in min_eigenvalues if v < -1e-5]
     assert len(neg) == 0, f"{len(neg)} episodes have negative min eigenvalue (most negative: {min(neg):.2e})"

@@ -5,15 +5,18 @@ tabpfn is not tested (licence-gated weights).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+from pytest import FixtureRequest
 
 BACKENDS = ["tabldm", "exaone"]
 
 
 @pytest.fixture(scope="module", params=BACKENDS)
-def backbone(request):
+def backbone(request: FixtureRequest):
     pytest.importorskip(
         {"tabldm": "tabldm", "exaone": "exaonetabular"}[request.param],
         reason=f"{request.param} not installed",
@@ -23,13 +26,13 @@ def backbone(request):
     return load_backbone(request.param, device="cpu")
 
 
-def _episode(rng, n_ctx=12, n_qry=3, p_x=3):
+def _episode(rng, n_ctx: int = 12, n_qry: int = 3, p_x: int = 3):
     X = rng.normal(size=(n_ctx + n_qry, p_x)).astype(np.float32)
     y = (X[:, 0] * 1.4 + 0.3 * rng.normal(size=n_ctx + n_qry)).astype(np.float32)
     return X[:n_ctx], y[:n_ctx], X[n_ctx:]
 
 
-def test_tier0_patterns_match_real_parameters(backbone):
+def test_tier0_patterns_match_real_parameters(backbone) -> None:
     """Every tier-0 pattern matches at least one parameter."""
     from copula_inter.marginal_backbones import assert_patterns_match
 
@@ -45,7 +48,7 @@ def test_tier0_patterns_match_real_parameters(backbone):
     assert 0.0005 < n_tier0 / n_total < 0.25, f"tier-0 covers {n_tier0 / n_total:.1%} of {backbone.name}"
 
 
-def test_quantile_forward_is_differentiable_into_the_trunk(backbone):
+def test_quantile_forward_is_differentiable_into_the_trunk(backbone) -> None:
     """Gradients from the quantiles reach trunk parameters, not only the head."""
     rng = np.random.default_rng(0)
     Xc, yc, Xq = _episode(rng)
@@ -73,7 +76,7 @@ def test_quantile_forward_is_differentiable_into_the_trunk(backbone):
     )
 
 
-def test_native_grid_is_the_default_and_matches_the_model_head(backbone):
+def test_native_grid_is_the_default_and_matches_the_model_head(backbone) -> None:
     """The default grid is the native 999 levels and matches the head."""
     rng = np.random.default_rng(3)
     Xc, yc, Xq = _episode(rng)
@@ -94,13 +97,13 @@ def test_native_grid_is_the_default_and_matches_the_model_head(backbone):
     assert q99.shape == (1, Xq.shape[0], 99)
 
 
-def test_native_probs_follow_the_repo_grid_convention(backbone):
+def test_native_probs_follow_the_repo_grid_convention(backbone) -> None:
     """native_probs == linspace(1/(n+1), n/(n+1), n)."""
     n = backbone.native_quantile_count
     np.testing.assert_allclose(backbone.native_probs, np.linspace(1.0 / (n + 1), n / (n + 1), n), rtol=0, atol=1e-12)
 
 
-def test_quantile_forward_is_monotone_in_probs(backbone):
+def test_quantile_forward_is_monotone_in_probs(backbone) -> None:
     """Quantiles are nondecreasing in alpha."""
     rng = np.random.default_rng(1)
     Xc, yc, Xq = _episode(rng)
@@ -111,7 +114,7 @@ def test_quantile_forward_is_monotone_in_probs(backbone):
     assert (diffs >= -1e-4).all(), f"{backbone.name} quantiles decrease in alpha"
 
 
-def test_checkpoint_round_trips(backbone, tmp_path):
+def test_checkpoint_round_trips(backbone, tmp_path: Path) -> None:
     from copula_inter.marginal_backbones import load_backbone
 
     path = str(tmp_path / f"{backbone.name}_phase_a.pt")
@@ -129,7 +132,7 @@ def test_checkpoint_round_trips(backbone, tmp_path):
         torch.testing.assert_close(a[k], b[k], rtol=0, atol=0)
 
 
-def test_checkpoint_rejects_a_different_architecture(backbone, tmp_path):
+def test_checkpoint_rejects_a_different_architecture(backbone, tmp_path: Path) -> None:
     """Loading a checkpoint into a different architecture raises."""
     from copula_inter.marginal_backbones import load_backbone
 
@@ -153,7 +156,7 @@ def test_checkpoint_rejects_a_different_architecture(backbone, tmp_path):
         ("tabpfn", 1, False),
     ],
 )
-def test_resolve_tier_gates_the_ladder(name, tier, ok):
+def test_resolve_tier_gates_the_ladder(name, tier, ok) -> None:
     """Tier >= 1 raises where attention is not swappable."""
     from copula_inter.marginal_backbones import resolve_tier
 

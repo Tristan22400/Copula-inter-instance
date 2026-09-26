@@ -12,15 +12,35 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Sequence
+from typing import Any, Literal, Optional, Protocol, Sequence, overload
 
 import torch
 import torch.nn as nn
 
 from copula_inter.data_gen import _safe_cholesky, build_kernel_fn, sigma_to_correlation  # noqa: E402
-from tabicl._model.inference_config import InferenceConfig  # noqa: E402
+from tabicl._model.inference_config import InferenceConfig, MgrConfig  # noqa: E402
+from tabicl._model.tabicl import TabICL  # noqa: E402
 
 DEFAULT_K_FOLDS = 10
+
+
+class MarginalDistribution(Protocol):
+    def cdf(self, value: torch.Tensor, /) -> torch.Tensor: ...
+    def log_prob(self, value: torch.Tensor, /) -> torch.Tensor: ...
+
+
+class TabICLLike(Protocol):
+    """What the PIT helpers use from a TabICL model; the tests' fake marginals provide the same."""
+
+    training: bool
+
+    def __call__(self, X: torch.Tensor, y_train: torch.Tensor, /, **kwargs: Any) -> torch.Tensor: ...
+    def quantile_dist(self, quantiles: torch.Tensor, /) -> MarginalDistribution: ...
+    def train(self, mode: bool = True, /) -> Any: ...
+
+
+# Pretrained TabICL regressor in the jingang/TabICL HF repo.
+PRETRAINED_TABICL_CKPT = "tabicl-regressor-v2-20260212.ckpt"
 
 # None keeps TabICL's default (AMP on CUDA); set once by the entrypoint and inherited by workers.
 _TABICL_INFERENCE_CONFIG: Optional[InferenceConfig] = None
@@ -30,13 +50,13 @@ def configure_tabicl_inference_amp(use_amp: bool) -> None:
     """Set the process-global inference precision for every PIT TabICL forward (None = TabICL default)."""
     global _TABICL_INFERENCE_CONFIG
     _TABICL_INFERENCE_CONFIG = InferenceConfig(
-        COL_CONFIG={"use_amp": bool(use_amp)},
-        ROW_CONFIG={"use_amp": bool(use_amp)},
-        ICL_CONFIG={"use_amp": bool(use_amp)},
+        COL_CONFIG=MgrConfig(use_amp=bool(use_amp)),
+        ROW_CONFIG=MgrConfig(use_amp=bool(use_amp)),
+        ICL_CONFIG=MgrConfig(use_amp=bool(use_amp)),
     )
 
 
-def tabicl_forward(tabicl: nn.Module, X: torch.Tensor, y_train: torch.Tensor, **kwargs) -> torch.Tensor:
+def tabicl_forward(tabicl: TabICLLike, X: torch.Tensor, y_train: torch.Tensor, **kwargs) -> torch.Tensor:
     """Forward through TabICL using the configured marginal precision."""
     if _TABICL_INFERENCE_CONFIG is None:
         return tabicl(X, y_train, **kwargs)
@@ -84,7 +104,15 @@ def resolve_pit_ckpt(cfg) -> str | None:
     return pit_ckpt
 
 
-def load_tabicl(ckpt_name: str, device: str, trainable: bool = False, return_config: bool = False) -> nn.Module:
+@overload
+def load_tabicl(ckpt_name: str, device: str, trainable: bool = ..., return_config: Literal[False] = ...) -> TabICL: ...
+@overload
+def load_tabicl(
+    ckpt_name: str, device: str, trainable: bool = ..., *, return_config: Literal[True]
+) -> tuple[TabICL, dict[str, Any]]: ...
+def load_tabicl(
+    ckpt_name: str, device: str, trainable: bool = False, return_config: bool = False
+) -> TabICL | tuple[TabICL, dict[str, Any]]:
     """Load a TabICL regressor.
 
     Args:
@@ -95,8 +123,6 @@ def load_tabicl(ckpt_name: str, device: str, trainable: bool = False, return_con
             frozen and in eval mode.
         return_config: also return the architecture config dict.
     """
-    from tabicl._model.tabicl import TabICL  # type: ignore[import]
-
     if os.path.isfile(ckpt_name):
         ckpt_path = ckpt_name
     else:
@@ -119,12 +145,25 @@ def load_tabicl(ckpt_name: str, device: str, trainable: bool = False, return_con
     return base
 
 
+def _clamp_frac(u: torch.Tensor, eps: float) -> torch.Tensor:
+    """Fraction of u within eps of 0 or 1 (where _probit saturates)."""
+    return ((u <= eps) | (u >= 1.0 - eps)).float().mean().detach()
+
+
 def _probit(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Clamp u to (eps, 1-eps) and apply Phi^{-1}."""
     u = u.clamp(eps, 1.0 - eps)
     return torch.erfinv(2.0 * u - 1.0) * math.sqrt(2.0)
 
 
+@overload
+def normalize_targets(
+    y_train: torch.Tensor, y_test: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+@overload
+def normalize_targets(
+    y_train: torch.Tensor, y_test: None = ...
+) -> tuple[torch.Tensor, None, torch.Tensor, torch.Tensor]: ...
 def normalize_targets(
     y_train: torch.Tensor,
     y_test: Optional[torch.Tensor] = None,
@@ -155,7 +194,7 @@ def _scale_fold_targets(y_context: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 
 @torch.no_grad()
 def run_pit(
-    tabicl: nn.Module,
+    tabicl: TabICLLike,
     X_train: torch.Tensor,
     Y_train: torch.Tensor,
     X_test: torch.Tensor,
@@ -244,7 +283,7 @@ def run_pit(
     }
 
 
-def _alpha_levels_of(tabicl: nn.Module, device) -> "torch.Tensor | None":
+def _alpha_levels_of(tabicl: object, device: torch.device | str) -> "torch.Tensor | None":
     """The quantile levels the model's decoder emits, or None if it exposes none."""
     levels = getattr(getattr(tabicl, "quantile_dist", None), "alpha_levels", None)
     return None if levels is None else levels.to(device)
@@ -253,11 +292,11 @@ def _alpha_levels_of(tabicl: nn.Module, device) -> "torch.Tensor | None":
 class _train_mode:
     """Context manager that keeps module in train mode (TabICL's eval-mode forward uses float16 autocast)."""
 
-    def __init__(self, module: nn.Module) -> None:
+    def __init__(self, module: TabICLLike) -> None:
         self.module = module
         self.was_training = module.training
 
-    def __enter__(self) -> nn.Module:
+    def __enter__(self) -> TabICLLike:
         self.module.train()
         return self.module
 
@@ -266,7 +305,7 @@ class _train_mode:
 
 
 def _run_pit_batched_impl(
-    tabicl: nn.Module,
+    tabicl: TabICLLike,
     X_train: torch.Tensor,
     Y_train: torch.Tensor,
     X_test: torch.Tensor,
@@ -310,13 +349,13 @@ def _run_pit_batched_impl(
     # TabICL may return its output on CPU under memory pressure.
     logits = logits.to(device)
     Q = logits.shape[-1]
+    u_test: torch.Tensor | None = None
+    log_pdf_test: torch.Tensor | None = None
     if compute_pit:
         dist = tabicl.quantile_dist(logits.reshape(B * d * N, Q))
         y_test_flat = Y_test.permute(0, 2, 1).reshape(B * d * N)
         u_test = dist.cdf(y_test_flat).reshape(B, d, N).permute(0, 2, 1)  # (B, N, d)
         log_pdf_test = dist.log_prob(y_test_flat).reshape(B, d, N).permute(0, 2, 1)
-    else:
-        u_test = log_pdf_test = None
 
     q_test = None
     if return_quantiles:
@@ -397,23 +436,17 @@ def _run_pit_batched_impl(
                 f"fold_subset={fold_subset}). Every requested fold was empty."
             )
         # fold_subset=[]: test rows only, one forward with the full P-row context.
-        out = {"train_query_idx": torch.empty(0, dtype=torch.long, device=device)}
+        out: dict[str, torch.Tensor] = {"train_query_idx": torch.empty(0, dtype=torch.long, device=device)}
         if compute_pit:
+            assert u_test is not None and log_pdf_test is not None
             out.update({"z_test": _probit(u_test, eps), "log_pdf_test": log_pdf_test})
         if return_quantiles:
-            out.update(
-                {
-                    "q_test": q_test,
-                    **(
-                        {
-                            "u_test": u_test,
-                            "clamp_frac_test": ((u_test <= eps) | (u_test >= 1.0 - eps)).float().mean().detach(),
-                        }
-                        if compute_pit
-                        else {}
-                    ),
-                }
-            )
+            assert q_test is not None
+            out["q_test"] = q_test
+            if compute_pit:
+                assert u_test is not None
+                out["u_test"] = u_test
+                out["clamp_frac_test"] = _clamp_frac(u_test, eps)
             levels = _alpha_levels_of(tabicl, device)
             if levels is not None:
                 out["alpha_levels"] = levels  # (Q,)
@@ -433,6 +466,7 @@ def _run_pit_batched_impl(
 
     out = {}
     if compute_pit:
+        assert u_test is not None and log_pdf_test is not None
         out.update(
             {
                 "z_train": _probit(u_train, eps),
@@ -446,23 +480,16 @@ def _run_pit_batched_impl(
         q_train = torch.cat([qf for _, qf in q_train_parts], dim=1)
         if inv is not None:
             q_train = q_train[:, inv, :, :]
-        out.update(
-            {
-                "q_train": q_train,  # (B, P', d, Q)
-                "q_test": q_test,  # (B, N, d, Q)
-                **(
-                    {
-                        "u_train": u_train,
-                        "u_test": u_test,
-                        # Silent-failure counters: _probit hard-caps |z| at 4.7534.
-                        "clamp_frac_train": ((u_train <= eps) | (u_train >= 1.0 - eps)).float().mean().detach(),
-                        "clamp_frac_test": ((u_test <= eps) | (u_test >= 1.0 - eps)).float().mean().detach(),
-                    }
-                    if compute_pit
-                    else {}
-                ),
-            }
-        )
+        assert q_test is not None
+        out["q_train"] = q_train  # (B, P', d, Q)
+        out["q_test"] = q_test  # (B, N, d, Q)
+        if compute_pit:
+            assert u_test is not None
+            out["u_train"] = u_train
+            out["u_test"] = u_test
+            # Silent-failure counters: _probit hard-caps |z| at 4.7534.
+            out["clamp_frac_train"] = _clamp_frac(u_train, eps)
+            out["clamp_frac_test"] = _clamp_frac(u_test, eps)
         levels = _alpha_levels_of(tabicl, device)
         if levels is not None:
             out["alpha_levels"] = levels  # (Q,)
@@ -471,7 +498,7 @@ def _run_pit_batched_impl(
 
 @torch.no_grad()
 def run_pit_batched(
-    tabicl: nn.Module,
+    tabicl: TabICLLike,
     X_train: torch.Tensor,
     Y_train: torch.Tensor,
     X_test: torch.Tensor,
@@ -512,7 +539,7 @@ def run_pit_batched(
 
 
 def run_pit_batched_grad(
-    tabicl: nn.Module,
+    tabicl: TabICLLike,
     X_train: torch.Tensor,
     Y_train: torch.Tensor,
     X_test: torch.Tensor,
@@ -545,7 +572,7 @@ def run_pit_batched_grad(
 
 @torch.no_grad()
 def run_pit_calib_split_batched(
-    tabicl: nn.Module,
+    tabicl: TabICLLike,
     X_query: torch.Tensor,
     Y_query: torch.Tensor,
     X_calib: torch.Tensor,

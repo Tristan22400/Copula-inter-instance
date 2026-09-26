@@ -12,7 +12,7 @@ import os
 import random
 from collections import OrderedDict
 from glob import glob
-from typing import List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -47,7 +47,7 @@ class CopulaDataset(Dataset):
         episode_dir: Optional[str] = None,
         file_list: Optional[List[str]] = None,
         shard_cache_size: Optional[int] = None,
-    ):
+    ) -> None:
         # Cache size (size it to hold a ShardBlockSampler block).
         if shard_cache_size is not None:
             self._SHARD_CACHE_SIZE = shard_cache_size
@@ -296,7 +296,7 @@ class ShardBlockSampler(Sampler[int]):
     positions to global dataset indices.
     """
 
-    def __init__(self, subset_indices: Sequence[int], shard_size: int, block_shards: int = 16):
+    def __init__(self, subset_indices: Sequence[int], shard_size: int, block_shards: int = 16) -> None:
         self.subset_indices = list(subset_indices)
         self.shard_size = shard_size
         self.block_shards = block_shards
@@ -304,7 +304,7 @@ class ShardBlockSampler(Sampler[int]):
     def __len__(self) -> int:
         return len(self.subset_indices)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator:
         groups: dict[int, list[int]] = {}
         for local_pos, global_idx in enumerate(self.subset_indices):
             groups.setdefault(global_idx // self.shard_size, []).append(local_pos)
@@ -334,7 +334,7 @@ class ShardHomogeneousBatchSampler(Sampler[List[int]]):
         batch_size: int,
         shuffle: bool = True,
         drop_last: bool = False,
-    ):
+    ) -> None:
         self.subset_indices = list(subset_indices)
         self.shard_size = shard_size
         self.batch_size = batch_size
@@ -356,7 +356,7 @@ class ShardHomogeneousBatchSampler(Sampler[List[int]]):
                 total += (len(members) + self.batch_size - 1) // self.batch_size
         return total
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator:
         groups = self._groups()
         shard_ids = list(groups.keys())
         if self.shuffle:

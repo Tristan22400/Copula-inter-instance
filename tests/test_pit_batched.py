@@ -31,7 +31,7 @@ from inference.copula_inference import loo_pit
 class RowIndependentFakeTabICL(nn.Module):
     """Fake TabICL whose output for each (episode, target) row depends only on that row's (X, y)."""
 
-    def __init__(self, q: int = 3):
+    def __init__(self, q: int = 3) -> None:
         super().__init__()
         self.q = q
 
@@ -55,7 +55,7 @@ class RowIndependentFakeTabICL(nn.Module):
 class FoldScaleProbe(nn.Module):
     """A marginal whose prediction is sensitive to the context label scale."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
 
@@ -68,7 +68,7 @@ class FoldScaleProbe(nn.Module):
         return torch.distributions.Normal(logits_flat[:, 0], torch.ones_like(logits_flat[:, 0]))
 
 
-def test_fold_target_scaling_uses_only_context_labels():
+def test_fold_target_scaling_uses_only_context_labels() -> None:
     model = FoldScaleProbe()
     x = torch.arange(6, dtype=torch.float32)[:, None]
     y = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
@@ -94,7 +94,7 @@ def test_fold_target_scaling_uses_only_context_labels():
         assert torch.allclose(out["z_train"][0, :, 0], torch.tensor(expected), atol=1e-5)
 
 
-def test_fold_quantiles_return_on_callers_scale():
+def test_fold_quantiles_return_on_callers_scale() -> None:
     model = FoldScaleProbe()
     x = torch.arange(6, dtype=torch.float32)[:, None]
     y = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
@@ -117,7 +117,7 @@ def test_fold_quantiles_return_on_callers_scale():
     assert torch.allclose(out["q_train"][0, :2, 0, 0], expected.expand(2), atol=1e-6)
 
 
-def test_single_context_fold_uses_raw_label_units():
+def test_single_context_fold_uses_raw_label_units() -> None:
     model = FoldScaleProbe()
     x = torch.tensor([[0.0], [1.0]])
     y = torch.tensor([1.0, 2.0])
@@ -135,7 +135,7 @@ def test_single_context_fold_uses_raw_label_units():
     assert torch.allclose(out["z_train"][0, 0], torch.tensor(-1.0), atol=1e-5)
 
 
-def test_fused_grad_folds_preserve_raw_fold_scaling():
+def test_fused_grad_folds_preserve_raw_fold_scaling() -> None:
     model = FoldScaleProbe()
     x = torch.arange(16, dtype=torch.float32).reshape(2, 8, 1)
     raw = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [4.0, 1.0, 6.0, 2.0, 9.0, 3.0, 8.0, 5.0]])
@@ -160,7 +160,7 @@ def test_fused_grad_folds_preserve_raw_fold_scaling():
     assert torch.allclose(plain["q_test"], fused["q_test"], atol=0)
 
 
-def test_run_pit_batched_b1_matches_run_pit():
+def test_run_pit_batched_b1_matches_run_pit() -> None:
     torch.manual_seed(0)
     tabicl = RowIndependentFakeTabICL()
     P, N, p_x, d = 7, 3, 2, 2
@@ -184,7 +184,7 @@ def test_run_pit_batched_b1_matches_run_pit():
     assert torch.allclose(batched["log_pdf_test"].squeeze(0), single["log_pdf_test"], atol=1e-5)
 
 
-def test_run_pit_batched_matches_looped_run_pit():
+def test_run_pit_batched_matches_looped_run_pit() -> None:
     torch.manual_seed(1)
     tabicl = RowIndependentFakeTabICL()
     B, P, N, p_x, d = 4, 9, 5, 3, 2
@@ -202,7 +202,7 @@ def test_run_pit_batched_matches_looped_run_pit():
         assert torch.allclose(batched["log_pdf_test"][b], single["log_pdf_test"], atol=1e-5)
 
 
-def test_run_pit_calib_split_batched_matches_run_pit_batched_test_side():
+def test_run_pit_calib_split_batched_matches_run_pit_batched_test_side() -> None:
     torch.manual_seed(2)
     tabicl = RowIndependentFakeTabICL()
     B, P_C, P_Q, p_x, d = 3, 6, 4, 2, 2
@@ -227,7 +227,7 @@ def test_run_pit_calib_split_batched_matches_run_pit_batched_test_side():
     assert torch.allclose(split["z_train"], reference["z_test"], atol=1e-6)
 
 
-def test_calibration_split_query_labels_do_not_scale_context():
+def test_calibration_split_query_labels_do_not_scale_context() -> None:
     model = FoldScaleProbe()
     x_calib = torch.arange(3, dtype=torch.float32)[None, :, None]
     y_calib = torch.tensor([3.0, 4.0, 8.0])[None, :, None]
@@ -256,7 +256,7 @@ def test_calibration_split_query_labels_do_not_scale_context():
         assert torch.allclose(scaled_out["z_train"][0, 0], torch.tensor(-1.0), atol=1e-5)
 
 
-def test_run_pit_calib_split_batched_finite():
+def test_run_pit_calib_split_batched_finite() -> None:
     torch.manual_seed(3)
     tabicl = RowIndependentFakeTabICL()
     B, P_C, P_Q, p_x, d = 2, 5, 7, 3, 1
@@ -269,7 +269,7 @@ def test_run_pit_calib_split_batched_finite():
     assert torch.isfinite(out["z_train"]).all()
 
 
-def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg):
+def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -309,7 +309,7 @@ def test_generate_gp_batch_raw_tabicl_split_z_train_override(small_cfg):
             assert torch.allclose(ep_a[key], ep_t[key], atol=1e-6), key
 
 
-def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg):
+def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg) -> None:
     """z_train_split_calib_frac > 1 works."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -330,7 +330,7 @@ def test_generate_gp_batch_raw_tabicl_split_calib_frac_can_exceed_one(small_cfg)
         assert ep["z_train"].shape == ep["y_train"].shape
 
 
-def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg):
+def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg) -> None:
     """tabicl_split_calib_frac=0 with a model uses the K-fold path."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -359,7 +359,7 @@ def test_generate_gp_batch_raw_tabicl_split_calib_frac_zero_is_noop(small_cfg):
         assert torch.allclose(ep_a["z_train"], ep_b["z_train"], atol=1e-6)
 
 
-def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg):
+def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg) -> None:
     """The "tabicl" override replaces z_train, z_test and log_pdf_test with TabICL's PIT and leaves every other field unchanged."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -401,7 +401,7 @@ def test_generate_gp_batch_raw_tabicl_z_train_override(small_cfg):
             assert torch.allclose(ep_a[key], ep_t[key], atol=1e-6), key
 
 
-def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(small_cfg):
+def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(small_cfg) -> None:
     """The override's z_test/log_pdf_test equal run_pit_batched on the episode with train-only scaling and the Jacobian."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -437,7 +437,7 @@ def test_generate_gp_batch_raw_tabicl_z_test_matches_direct_run_pit_batched(smal
         assert torch.allclose(ep["log_pdf_test"], expected_log_pdf.squeeze(0), atol=1e-5)
 
 
-def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg):
+def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg) -> None:
     """Without tabicl_model, z_train/z_test/log_pdf_test are unchanged."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -454,7 +454,7 @@ def test_generate_gp_batch_raw_tabicl_noop_without_tabicl_model(small_cfg):
             assert torch.allclose(ep_p[key], ep_a[key], atol=1e-6), key
 
 
-def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg):
+def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg) -> None:
     """ "tabicl_split" replaces z_train only; z_test/log_pdf_test stay analytic."""
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -479,7 +479,7 @@ def test_generate_gp_batch_raw_tabicl_split_keeps_oracle_z_test(small_cfg):
             assert torch.allclose(ep_a[key], ep_s[key], atol=1e-6), key
 
 
-def _pit_inputs(B=2, P=9, N=4, seed=0):
+def _pit_inputs(B: int = 2, P: int = 9, N: int = 4, seed: int = 0):
     torch.manual_seed(seed)
     return (
         torch.randn(B, P, 3),
@@ -489,7 +489,7 @@ def _pit_inputs(B=2, P=9, N=4, seed=0):
     )
 
 
-def test_run_pit_batched_grad_matches_the_no_grad_version():
+def test_run_pit_batched_grad_matches_the_no_grad_version() -> None:
     """run_pit_batched_grad and run_pit_batched give identical results."""
     tabicl = RowIndependentFakeTabICL()
     Xtr, Ytr, Xte, Yte = _pit_inputs()
@@ -504,7 +504,7 @@ def test_run_pit_batched_grad_matches_the_no_grad_version():
 class GradProbeFakeTabICL(nn.Module):
     """Differentiable fake (output from a Parameter) that records grad mode and train/eval mode."""
 
-    def __init__(self, q: int = 3):
+    def __init__(self, q: int = 3) -> None:
         super().__init__()
         self.q = q
         self.w = nn.Parameter(torch.randn(q))
@@ -525,7 +525,7 @@ class GradProbeFakeTabICL(nn.Module):
         return torch.distributions.Normal(loc, scale)
 
 
-def test_run_pit_batched_grad_builds_a_graph_and_the_public_one_does_not():
+def test_run_pit_batched_grad_builds_a_graph_and_the_public_one_does_not() -> None:
     """Only run_pit_batched_grad builds an autograd graph."""
     Xtr, Ytr, Xte, Yte = _pit_inputs()
 
@@ -543,7 +543,7 @@ def test_run_pit_batched_grad_builds_a_graph_and_the_public_one_does_not():
     assert live.w.grad is not None and torch.isfinite(live.w.grad).all()
 
 
-def test_grad_pit_forces_train_mode_and_restores_it():
+def test_grad_pit_forces_train_mode_and_restores_it() -> None:
     """The grad path runs in train mode and restores the module's mode."""
     Xtr, Ytr, Xte, Yte = _pit_inputs()
     probe = GradProbeFakeTabICL()
@@ -555,7 +555,7 @@ def test_grad_pit_forces_train_mode_and_restores_it():
     assert not probe.training, "grad path must restore the caller's original mode"
 
 
-def test_return_quantiles_is_additive_and_self_consistent():
+def test_return_quantiles_is_additive_and_self_consistent() -> None:
     tabicl = RowIndependentFakeTabICL(q=7)
     Xtr, Ytr, Xte, Yte = _pit_inputs(seed=3)
 
@@ -576,7 +576,7 @@ def test_return_quantiles_is_additive_and_self_consistent():
     assert torch.allclose(_probit(extra["u_train"], 1e-6), extra["z_train"], atol=0)
 
 
-def test_fold_subset_scores_only_the_requested_folds():
+def test_fold_subset_scores_only_the_requested_folds() -> None:
     """fold_subset scores only its folds, bit-identical to the same rows of a full pass."""
     tabicl = RowIndependentFakeTabICL()
     Xtr, Ytr, Xte, Yte = _pit_inputs(B=2, P=12, N=3, seed=5)

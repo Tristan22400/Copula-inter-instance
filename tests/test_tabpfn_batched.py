@@ -36,7 +36,7 @@ def regressor():
     return make_regressor("tabpfn", device="cpu")
 
 
-def test_tabpfn_batched_matches_per_episode(regressor):
+def test_tabpfn_batched_matches_per_episode(regressor) -> None:
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.marginal_backends import loo_pit, quantiles
     from eval.spatial.tabpfn_batched import tabpfn_run_pit_batched

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,7 +23,7 @@ from inference.copula_inference import (  # noqa: E402
 from tabicl._model.quantile_dist import QuantileDistribution  # noqa: E402
 
 
-def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path):
+def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path: Path) -> None:
     """A checkpoint directory selects the last numerical training snapshot."""
     (tmp_path / "step_0000010.pt").touch()
     (tmp_path / "step_0000020.pt").touch()
@@ -33,14 +34,14 @@ def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path):
     assert _resolve_copula_checkpoint(str(tmp_path)) == str(final)
 
 
-def test_resolve_copula_checkpoint_file_is_unchanged(tmp_path):
+def test_resolve_copula_checkpoint_file_is_unchanged(tmp_path: Path) -> None:
     checkpoint = tmp_path / "arbitrary-name.pt"
     checkpoint.touch()
 
     assert _resolve_copula_checkpoint(str(checkpoint)) == str(checkpoint)
 
 
-def test_pit_recovers_standard_normal_from_exact_quantile_grid():
+def test_pit_recovers_standard_normal_from_exact_quantile_grid() -> None:
     """cdf + probit on an exact Gaussian quantile grid recovers ~N(0, 1)."""
     rng = np.random.default_rng(0)
     probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
@@ -62,7 +63,7 @@ def test_pit_recovers_standard_normal_from_exact_quantile_grid():
     assert abs(z.std() - 1.0) < 0.1
 
 
-def test_pit_recovers_standard_normal_from_skewnorm_grid():
+def test_pit_recovers_standard_normal_from_skewnorm_grid() -> None:
     """Same with a skew-normal marginal."""
     from scipy.stats import skewnorm
 
@@ -90,7 +91,7 @@ def _standard_normal_grid(n_test: int, probs: np.ndarray) -> np.ndarray:
     return np.tile(norm.ppf(probs), (n_test, 1))
 
 
-def test_sample_trajectories_recovers_known_correlation():
+def test_sample_trajectories_recovers_known_correlation() -> None:
     n_test = 4
     probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
     quantile_grid = _standard_normal_grid(n_test, probs)
@@ -108,7 +109,7 @@ def test_sample_trajectories_recovers_known_correlation():
     assert err_large < err_small
 
 
-def test_sample_trajectories_identity_gives_near_zero_cross_correlation():
+def test_sample_trajectories_identity_gives_near_zero_cross_correlation() -> None:
     n_test = 5
     probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
     quantile_grid = _standard_normal_grid(n_test, probs)
@@ -121,7 +122,7 @@ def test_sample_trajectories_identity_gives_near_zero_cross_correlation():
     assert np.abs(off_diag).max() < 0.1
 
 
-def test_sample_trajectories_clip_diagnostic_flags_narrow_grid():
+def test_sample_trajectories_clip_diagnostic_flags_narrow_grid() -> None:
     n_test = 3
     R = np.eye(n_test)
 
@@ -144,7 +145,7 @@ def test_sample_trajectories_clip_diagnostic_flags_narrow_grid():
 class _FakeCopulaModel(torch.nn.Module):
     """Stands in for CopulaTabICL: forward(batch) -> {"W", "s"}, ignoring the batch."""
 
-    def __init__(self, W: torch.Tensor, s: torch.Tensor):
+    def __init__(self, W: torch.Tensor, s: torch.Tensor) -> None:
         super().__init__()
         self.W = W
         self.s = s
@@ -154,7 +155,7 @@ class _FakeCopulaModel(torch.nn.Module):
         return {"W": self.W, "s": self.s}
 
 
-def test_get_test_correlation_is_symmetric_and_unit_diagonal():
+def test_get_test_correlation_is_symmetric_and_unit_diagonal() -> None:
     torch.manual_seed(0)
     n_test, rank = 6, 2
     W = torch.randn(1, n_test, rank) * 0.3
@@ -173,7 +174,7 @@ def test_get_test_correlation_is_symmetric_and_unit_diagonal():
     assert eigvals.min() > -1e-6
 
 
-def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing():
+def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing() -> None:
     """get_test_correlation is low_rank_correlation plus symmetrization and a unit diagonal."""
     torch.manual_seed(1)
     n_test, rank = 5, 3
@@ -194,7 +195,7 @@ def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing(
     assert np.allclose(R, Sigma_expected, atol=1e-6)
 
 
-def test_normalize_features_gives_zero_mean_unit_std_jointly_over_train_and_test():
+def test_normalize_features_gives_zero_mean_unit_std_jointly_over_train_and_test() -> None:
     rng = np.random.default_rng(0)
     X_train = rng.uniform(10.0, 20.0, size=(7, 2))  # arbitrary raw scale/offset
     X_test = rng.uniform(10.0, 20.0, size=(13, 2))
@@ -208,7 +209,7 @@ def test_normalize_features_gives_zero_mean_unit_std_jointly_over_train_and_test
     assert X_test_norm.shape == X_test.shape
 
 
-def test_normalize_features_uses_joint_not_train_only_statistics():
+def test_normalize_features_uses_joint_not_train_only_statistics() -> None:
     """normalize_features uses the joint train+test mean and std."""
     X_test = np.linspace(0.0, 1.0, 50).reshape(-1, 1)
     X_train = X_test[:5]  # narrow, non-representative subset

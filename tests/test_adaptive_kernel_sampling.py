@@ -17,7 +17,7 @@ def _uniform_weights() -> torch.Tensor:
     return torch.full((n,), 1.0 / n, dtype=torch.float32)
 
 
-def test_update_weights_sums_to_one():
+def test_update_weights_sums_to_one() -> None:
     prev = _uniform_weights()
     metrics = {
         "oracle_diag/kernel_fit/rbf/gap_nll": 0.4,
@@ -27,7 +27,7 @@ def test_update_weights_sums_to_one():
     assert torch.isclose(out.sum(), torch.tensor(1.0), atol=1e-5)
 
 
-def test_update_weights_biases_toward_worse_family():
+def test_update_weights_biases_toward_worse_family() -> None:
     """A family with a larger gap gains more weight."""
     prev = _uniform_weights()
     metrics = {
@@ -41,7 +41,7 @@ def test_update_weights_biases_toward_worse_family():
     assert out[i_rbf] > prev[i_rbf]  # rbf's share grew from uniform
 
 
-def test_update_weights_respects_floor():
+def test_update_weights_respects_floor() -> None:
     """No family drops below floor / n_families."""
     n = len(_COMPOSABLE_KERNELS)
     prev = _uniform_weights()
@@ -54,7 +54,7 @@ def test_update_weights_respects_floor():
     assert (out >= min_allowed - 1e-6).all()
 
 
-def test_update_weights_missing_or_nan_signal_is_neutral():
+def test_update_weights_missing_or_nan_signal_is_neutral() -> None:
     """Missing or NaN gaps count as 0."""
     prev = _uniform_weights()
     metrics = {
@@ -65,7 +65,7 @@ def test_update_weights_missing_or_nan_signal_is_neutral():
     assert torch.isclose(out.sum(), torch.tensor(1.0), atol=1e-5)
 
 
-def test_update_weights_extreme_gap_does_not_overflow():
+def test_update_weights_extreme_gap_does_not_overflow() -> None:
     prev = _uniform_weights()
     metrics = {
         "oracle_diag/kernel_fit/rbf/gap_nll": -2e9,
@@ -75,7 +75,7 @@ def test_update_weights_extreme_gap_does_not_overflow():
     assert torch.isclose(out.sum(), torch.tensor(1.0), atol=1e-5)
 
 
-def test_update_weights_ignores_excluded_family_gap():
+def test_update_weights_ignores_excluded_family_gap() -> None:
     """An excluded family stays uniform whatever its gap."""
     prev = _uniform_weights()
     metrics = {
@@ -90,7 +90,7 @@ def test_update_weights_ignores_excluded_family_gap():
     assert torch.isclose(out_excluded.sum(), torch.tensor(1.0), atol=1e-5)
 
 
-def test_signal_tabicl_uses_tabicl_gap_not_oracle_gap():
+def test_signal_tabicl_uses_tabicl_gap_not_oracle_gap() -> None:
     """signal="tabicl" uses gap_nll_tabicl."""
     prev = _uniform_weights()
     metrics = {
@@ -106,7 +106,7 @@ def test_signal_tabicl_uses_tabicl_gap_not_oracle_gap():
     assert out[i_rbf] > prev[i_rbf]
 
 
-def test_signal_tabicl_falls_back_to_oracle_gap_when_missing():
+def test_signal_tabicl_falls_back_to_oracle_gap_when_missing() -> None:
     """signal="tabicl" falls back to the oracle gap where gap_nll_tabicl is missing."""
     prev = _uniform_weights()
     metrics_tabicl_missing = {
@@ -122,7 +122,7 @@ def test_signal_tabicl_falls_back_to_oracle_gap_when_missing():
     assert torch.equal(out_tabicl, out_oracle)
 
 
-def test_signal_default_is_oracle():
+def test_signal_default_is_oracle() -> None:
     """signal defaults to "oracle"."""
     prev = _uniform_weights()
     metrics = {
@@ -143,7 +143,7 @@ def _base_cfg(**data_overrides):
     return OmegaConf.create({"data": data})
 
 
-def test_sample_kernel_chain_none_reproduces_uniform_given_same_seed():
+def test_sample_kernel_chain_none_reproduces_uniform_given_same_seed() -> None:
     cfg_a = _base_cfg()
     cfg_b = _base_cfg()
     random.seed(12345)
@@ -153,7 +153,7 @@ def test_sample_kernel_chain_none_reproduces_uniform_given_same_seed():
     assert (names_a, ops_a, chain_a) == (names_b, ops_b, chain_b)
 
 
-def test_sample_kernel_chain_skewed_weights_shift_frequency():
+def test_sample_kernel_chain_skewed_weights_shift_frequency() -> None:
     n = len(_COMPOSABLE_KERNELS)
     weights = torch.full((n,), 0.01, dtype=torch.float32)
     target = "matern52"
@@ -168,11 +168,11 @@ def test_sample_kernel_chain_skewed_weights_shift_frequency():
     assert counts[target] > 400
 
 
-def test_weights_for_pool_none_passthrough():
+def test_weights_for_pool_none_passthrough() -> None:
     assert _weights_for_pool(["rbf", "matern32"], None) is None
 
 
-def test_weights_for_pool_renormalizes_over_subset():
+def test_weights_for_pool_renormalizes_over_subset() -> None:
     n = len(_COMPOSABLE_KERNELS)
     weights = torch.zeros(n, dtype=torch.float32)
     weights[_COMPOSABLE_KERNELS.index("rbf")] = 3.0

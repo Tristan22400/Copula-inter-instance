@@ -18,7 +18,7 @@ pytest.importorskip("tabldm", reason="Xiaomi-TabLDM not installed")
         ("_model.kv_cache", "KVCacheEntry"),
     ],
 )
-def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path, symbol):
+def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path, symbol) -> None:
     """TabLDM's attention classes and functions have the same source as TabICL's."""
     import importlib
 
@@ -32,7 +32,7 @@ def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path, symbo
     )
 
 
-def test_get_mha_class_includes_both():
+def test_get_mha_class_includes_both() -> None:
     from tabldm._model.layers import MultiheadAttention as TabLDMMHA
 
     from copula_inter.lora import _get_mha_class
@@ -44,7 +44,7 @@ def test_get_mha_class_includes_both():
     assert TabLDMMHA in classes
 
 
-def test_apply_lora_installs_adapters_on_a_tabldm_backbone():
+def test_apply_lora_installs_adapters_on_a_tabldm_backbone() -> None:
     """apply_lora installs adapters on a TabLDM backbone, only on the requested stage."""
     import numpy as np
     from tabldm import TabLDMRegressor

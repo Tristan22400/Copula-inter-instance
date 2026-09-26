@@ -21,7 +21,7 @@ from copula_inter.train import _reserve_gpu_headroom_for_live_tabicl
 
 
 @pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train"])
-def test_validate_z_train_source_accepts_known_values(value):
+def test_validate_z_train_source_accepts_known_values(value) -> None:
     _validate_z_train_source(value)  # must not raise
 
 
@@ -35,12 +35,12 @@ def test_validate_z_train_source_accepts_known_values(value):
         "tabicl_splitt",
     ],
 )
-def test_validate_z_train_source_rejects_unknown_values(value):
+def test_validate_z_train_source_rejects_unknown_values(value) -> None:
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
         _validate_z_train_source(value)
 
 
-def test_valid_z_train_sources_matches_documented_set():
+def test_valid_z_train_sources_matches_documented_set() -> None:
     # _VALID_Z_TRAIN_SOURCES matches the documented values.
     assert set(_VALID_Z_TRAIN_SOURCES) == {
         "analytic",
@@ -60,21 +60,21 @@ def _cfg_with_bad_z_train_source():
     return OmegaConf.create({"data": {"z_train_source": "tabicl-split"}})
 
 
-def test_build_live_train_loader_raises_on_typo():
+def test_build_live_train_loader_raises_on_typo() -> None:
     cfg = _cfg_with_bad_z_train_source()
     t = OmegaConf.create({"batch_size": 4})
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
         build_live_train_loader(cfg, t, device="cpu")
 
 
-def test_build_fixed_live_val_batches_raises_on_typo():
+def test_build_fixed_live_val_batches_raises_on_typo() -> None:
     cfg = _cfg_with_bad_z_train_source()
     t = OmegaConf.create({"val_episodes": 4, "batch_size": 4})
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
         build_fixed_live_val_batches(cfg, t, device="cpu")
 
 
-def test_reserve_gpu_headroom_raises_on_typo():
+def test_reserve_gpu_headroom_raises_on_typo() -> None:
     cfg = _cfg_with_bad_z_train_source()
     t = OmegaConf.create({})
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
@@ -84,7 +84,7 @@ def test_reserve_gpu_headroom_raises_on_typo():
 # "y_train": z_train is the z-scored target; z_test/log_pdf_test stay analytic.
 
 
-def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg):
+def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg) -> None:
     import torch
     from omegaconf import OmegaConf as OC
 
@@ -102,7 +102,7 @@ def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg):
         assert torch.allclose(ep["z_train"], expected, atol=1e-5)
 
 
-def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg):
+def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg) -> None:
     import torch
     from omegaconf import OmegaConf as OC
 
@@ -125,7 +125,7 @@ def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg):
         assert not torch.allclose(raw_ep["z_train"], an_ep["z_train"])
 
 
-def test_generate_pit_dataset_rejects_y_train_on_disk():
+def test_generate_pit_dataset_rejects_y_train_on_disk() -> None:
     from copula_inter.generate_pit_dataset import _reject_disk_unsupported_z_train_source
 
     with pytest.raises(ValueError, match="only supported under training.live_generation"):
@@ -133,7 +133,7 @@ def test_generate_pit_dataset_rejects_y_train_on_disk():
     _reject_disk_unsupported_z_train_source("analytic")  # must not raise
 
 
-def test_missing_z_train_source_defaults_to_tabicl():
+def test_missing_z_train_source_defaults_to_tabicl() -> None:
     from copula_inter.backend_registry import z_train_source
 
     assert z_train_source(OmegaConf.create({"data": {}})) == "tabicl"

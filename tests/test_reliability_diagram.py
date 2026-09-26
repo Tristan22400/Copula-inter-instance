@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import pytest
+from pytest import MonkeyPatch
 from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -13,7 +14,7 @@ _TESTS = os.path.dirname(os.path.abspath(__file__))
 from eval.spatial import calibration as gp  # noqa: E402
 
 
-def test_compute_quantile_ece_perfect_calibration():
+def test_compute_quantile_ece_perfect_calibration() -> None:
     quantiles = np.arange(0.1, 1.0, 0.1)
     rng = np.random.default_rng(0)
     mu, sigma = 15.0, 5.0
@@ -28,7 +29,7 @@ def test_compute_quantile_ece_perfect_calibration():
     assert np.all(np.diff(empirical_coverage) > 0)
 
 
-def test_compute_quantile_ece_detects_miscalibration():
+def test_compute_quantile_ece_detects_miscalibration() -> None:
     quantiles = np.arange(0.1, 1.0, 0.1)
     rng = np.random.default_rng(0)
     mu, sigma = 15.0, 5.0
@@ -43,7 +44,7 @@ def test_compute_quantile_ece_detects_miscalibration():
     assert ece > 0.02
 
 
-def test_compute_quantile_ece_shape_validation():
+def test_compute_quantile_ece_shape_validation() -> None:
     quantiles = np.arange(0.1, 1.0, 0.1)
     y_true = np.zeros(10)
     bad_pred = np.zeros((9, len(quantiles)))  # wrong n_samples vs. y_true
@@ -54,7 +55,7 @@ def test_compute_quantile_ece_shape_validation():
 class _FakeTabICLRegressor:
     """Deterministic stand-in for TabICLRegressor that counts calls."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.fit_calls = 0
         self.predict_alphas = []
         self._X = None
@@ -65,7 +66,7 @@ class _FakeTabICLRegressor:
         self._X, self._y = np.asarray(X), np.asarray(y)
         return self
 
-    def predict(self, X_test, output_type="quantiles", alphas=None):
+    def predict(self, X_test, output_type: str = "quantiles", alphas=None):
         assert output_type == "quantiles"
         self.predict_alphas.append(list(alphas))
         X_test = np.asarray(X_test)
@@ -74,11 +75,11 @@ class _FakeTabICLRegressor:
         return np.broadcast_to(nearest[:, None], (X_test.shape[0], len(alphas))).copy()
 
 
-def test_reliability_diagram_excludes_context_and_batches_alphas(monkeypatch):
+def test_reliability_diagram_excludes_context_and_batches_alphas(monkeypatch: MonkeyPatch) -> None:
     created = {}
 
     class _Tracked(_FakeTabICLRegressor):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__()
             created["reg"] = self
 
@@ -86,7 +87,7 @@ def test_reliability_diagram_excludes_context_and_batches_alphas(monkeypatch):
 
     captured = {}
 
-    def fake_generate(y_true, y_pred_quantiles, quantiles, out_path):
+    def fake_generate(y_true, y_pred_quantiles, quantiles, out_path) -> float:
         captured["y_true"] = y_true
         captured["y_pred_quantiles"] = y_pred_quantiles
         return 0.0

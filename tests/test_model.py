@@ -56,7 +56,7 @@ def permute_train(batch: dict, perm: list) -> dict:
     return b
 
 
-def test_output_shape(model_and_cfg):
+def test_output_shape(model_and_cfg) -> None:
     model, cfg = model_and_cfg
     B, P, N = 2, 10, 5
     batch = make_batch(B=B, P=P, N=N)
@@ -67,7 +67,7 @@ def test_output_shape(model_and_cfg):
     assert out["s"].shape == (B, N), f"Expected s {(B, N)}, got {out['s'].shape}"
 
 
-def test_correlation_unit_diagonal(model_and_cfg):
+def test_correlation_unit_diagonal(model_and_cfg) -> None:
     """low_rank_correlation(W, s) has an exactly unit diagonal."""
     model, _ = model_and_cfg
     batch = make_batch(B=2, P=10, N=5)
@@ -78,7 +78,7 @@ def test_correlation_unit_diagonal(model_and_cfg):
     assert torch.allclose(diag, torch.ones_like(diag), atol=1e-6), f"Diagonal not 1: {diag}"
 
 
-def test_correlation_is_psd(model_and_cfg):
+def test_correlation_is_psd(model_and_cfg) -> None:
     """low_rank_correlation(W, s) must be PSD (all eigenvalues >= 0)."""
     model, _ = model_and_cfg
     batch = make_batch(B=2, P=10, N=5)
@@ -90,7 +90,7 @@ def test_correlation_is_psd(model_and_cfg):
         assert (eigvals >= -1e-4).all(), f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
 
 
-def test_permutation_equivariance_test_instances(model_and_cfg):
+def test_permutation_equivariance_test_instances(model_and_cfg) -> None:
     """Permuting test instances should permute (W, s) rows by the same permutation."""
     model, _ = model_and_cfg
     torch.manual_seed(42)
@@ -109,7 +109,7 @@ def test_permutation_equivariance_test_instances(model_and_cfg):
     )
 
 
-def test_permutation_invariance_train_instances(model_and_cfg):
+def test_permutation_invariance_train_instances(model_and_cfg) -> None:
     """Permuting train instances should not change the output (W, s)."""
     model, _ = model_and_cfg
     torch.manual_seed(42)
@@ -128,7 +128,7 @@ def test_permutation_invariance_train_instances(model_and_cfg):
     )
 
 
-def test_test_instances_are_independent(model_and_cfg):
+def test_test_instances_are_independent(model_and_cfg) -> None:
     """Perturbing one test instance's input must not change any other test
     instance's output — the ICL stage must not let test rows attend to
     each other."""
@@ -159,7 +159,7 @@ def test_test_instances_are_independent(model_and_cfg):
     )
 
 
-def test_forward_with_padding(model_and_cfg):
+def test_forward_with_padding(model_and_cfg) -> None:
     """Model should handle batches with different P and N per sample (via padding)."""
     model, _ = model_and_cfg
     torch.manual_seed(3)

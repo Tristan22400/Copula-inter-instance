@@ -59,7 +59,7 @@ BATCH_SIZES = [1, 4]
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_unit_diagonal(name, batch):
+def test_unit_diagonal(name, batch) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -69,7 +69,7 @@ def test_unit_diagonal(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_symmetry(name, batch):
+def test_symmetry(name, batch) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -78,7 +78,7 @@ def test_symmetry(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_strictly_positive_definite(name, batch):
+def test_strictly_positive_definite(name, batch) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -89,7 +89,7 @@ def test_strictly_positive_definite(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_log_det_matches_dense(name, batch):
+def test_log_det_matches_dense(name, batch) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -100,7 +100,7 @@ def test_log_det_matches_dense(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_inverse_matches_dense(name, batch):
+def test_inverse_matches_dense(name, batch) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -113,7 +113,7 @@ def test_inverse_matches_dense(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_solve_matches_dense(name, batch):
+def test_solve_matches_dense(name, batch) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -128,7 +128,7 @@ def test_solve_matches_dense(name, batch):
 
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
-def test_gradients_are_finite(name):
+def test_gradients_are_finite(name) -> None:
     inputs = _random_inputs(batch=4, requires_grad=True)
     factor = _build(name, inputs)
     loss = factor.dense().sum() + factor.log_det().sum()

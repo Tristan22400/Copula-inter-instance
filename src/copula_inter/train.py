@@ -739,7 +739,7 @@ def main(cfg: DictConfig) -> None:
             return ev
         return time.perf_counter()
 
-    def _phase_end(name, start):
+    def _phase_end(name, start) -> None:
         if device == "cuda":
             end = torch.cuda.Event(enable_timing=True)
             end.record()

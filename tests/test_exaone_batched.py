@@ -25,7 +25,7 @@ def regressor():
     return make_regressor("exaone", device="cuda")
 
 
-def test_exaone_batched_matches_per_episode(regressor):
+def test_exaone_batched_matches_per_episode(regressor) -> None:
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.exaone_batched import exaone_run_pit_batched
     from eval.spatial.marginal_backends import loo_pit, quantiles

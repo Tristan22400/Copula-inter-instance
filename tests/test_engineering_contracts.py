@@ -7,11 +7,13 @@ import os
 import subprocess
 import sys
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from omegaconf import OmegaConf
+from pytest import MonkeyPatch
 
 from copula_inter.artifacts import atomic_torch_save
 from copula_inter.backend_registry import BACKENDS, COPULA_BACKBONES, GENERIC_MARGINAL_BACKENDS, require_capability
@@ -71,7 +73,7 @@ def test_episode_contract_and_padding() -> None:
         validate_episode(broken)
 
 
-def test_manifest_rejects_changed_settings_and_checkpoint_bytes(tmp_path) -> None:
+def test_manifest_rejects_changed_settings_and_checkpoint_bytes(tmp_path: Path) -> None:
     checkpoint = tmp_path / "marginal.pt"
     checkpoint.write_bytes(b"weights A")
     cfg = OmegaConf.create(
@@ -103,7 +105,7 @@ def test_manifest_rejects_changed_settings_and_checkpoint_bytes(tmp_path) -> Non
         ensure_manifest(directory, generation_spec(cfg, str(checkpoint)))
 
 
-def test_dataset_identity_changes_for_same_path_replacement(tmp_path) -> None:
+def test_dataset_identity_changes_for_same_path_replacement(tmp_path: Path) -> None:
     shard = tmp_path / "shard_000000.pt"
     _save_shard_atomic([_episode()], str(shard))
     first = dataset_identity(tmp_path)
@@ -130,7 +132,7 @@ def test_assembly_keeps_metadata_aligned_after_discard() -> None:
     assert [float(ep["kernel_component_params"][0]["lengthscale"]) for ep in result] == [10.0, 30.0]
 
 
-def test_manifest_dataset_rejects_stale_meta_count(tmp_path) -> None:
+def test_manifest_dataset_rejects_stale_meta_count(tmp_path: Path) -> None:
     _save_shard_atomic([_episode(), _episode()], str(tmp_path / "shard_000000.pt"))
     (tmp_path / "manifest.json").write_text(json.dumps({"digest": "dataset A"}))
     torch.save({"n_total": 1, "shard_size": 2, "manifest_digest": "dataset A"}, tmp_path / "meta.pt")
@@ -138,7 +140,7 @@ def test_manifest_dataset_rejects_stale_meta_count(tmp_path) -> None:
         CopulaDataset(episode_dir=str(tmp_path))
 
 
-def test_meta_exposes_only_completed_contiguous_shards(tmp_path) -> None:
+def test_meta_exposes_only_completed_contiguous_shards(tmp_path: Path) -> None:
     manifest = ensure_manifest(tmp_path, {"seed": 7})
     _save_shard_atomic([_episode(), _episode()], str(tmp_path / "shard_000000.pt"))
     torch.save([_episode(), _episode()], tmp_path / "shard_000001.pt")  # crash before sidecar
@@ -149,7 +151,7 @@ def test_meta_exposes_only_completed_contiguous_shards(tmp_path) -> None:
     assert len(CopulaDataset(episode_dir=str(tmp_path))) == 4
 
 
-def test_atomic_save_keeps_old_file_on_failure(tmp_path, monkeypatch) -> None:
+def test_atomic_save_keeps_old_file_on_failure(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     path = tmp_path / "checkpoint.pt"
     atomic_torch_save({"step": 1}, path)
     real_save = torch.save
@@ -167,7 +169,7 @@ def test_atomic_save_keeps_old_file_on_failure(tmp_path, monkeypatch) -> None:
     assert sorted(item.name for item in tmp_path.iterdir()) == ["checkpoint.pt"]
 
 
-def test_scored_fingerprint_tracks_checkpoint_and_resolved_marginal(tmp_path) -> None:
+def test_scored_fingerprint_tracks_checkpoint_and_resolved_marginal(tmp_path: Path) -> None:
     checkpoint = tmp_path / "copula.pt"
     marginal = tmp_path / "marginal.pt"
     checkpoint.write_bytes(b"model A")
@@ -220,14 +222,14 @@ def test_result_ties_and_coverage_are_explicit() -> None:
     assert "1/2" in table
 
 
-def test_results_cache_reuses_only_matching_artifact_identity(tmp_path) -> None:
+def test_results_cache_reuses_only_matching_artifact_identity(tmp_path: Path) -> None:
     path = str(tmp_path / "scores.json")
     save_results_cache(path, {"checkpoint": "A"}, {"7": {"icl": 0.5}})
     assert load_results_cache(path, {"checkpoint": "A"}) == {"7": {"icl": 0.5}}
     assert load_results_cache(path, {"checkpoint": "B"}) == {}
 
 
-def test_eval_spec_parses_without_loading_models(tmp_path) -> None:
+def test_eval_spec_parses_without_loading_models(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.touch()
     spec = parse_eval_spec(["--ckpt", str(checkpoint), "--no-autoregressive", "--n_episodes", "2"])
@@ -235,7 +237,7 @@ def test_eval_spec_parses_without_loading_models(tmp_path) -> None:
     assert spec.n_episodes == 2
 
 
-def test_default_eval_config_resolves_outside_checkout(tmp_path, monkeypatch) -> None:
+def test_default_eval_config_resolves_outside_checkout(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     assert _load_full_config("conf/config.yaml").data.n_tasks > 0
 

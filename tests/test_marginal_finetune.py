@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from pytest import MonkeyPatch
 
 from copula_inter.data_gen import build_kernel_fn, gp_posterior
 from copula_inter.finetune_marginal import (
@@ -34,14 +35,14 @@ from copula_inter.pit import _probit, run_pit_batched, run_pit_batched_grad
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch):
+def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch: MonkeyPatch) -> None:
     from omegaconf import OmegaConf
 
     from copula_inter import finetune_marginal as entrypoint
 
     calls = []
 
-    def episode(P, N=3, d=2):
+    def episode(P, N: int = 3, d: int = 2):
         return {"x_norm_train": torch.zeros(P, d), "x_norm_test": torch.zeros(N, d)}
 
     def fake_generate(cfg, B, device, **kwargs):
@@ -115,7 +116,7 @@ def _rbf_task(
     }
 
 
-def test_tier0_selects_label_path_norms_and_decoder_only():
+def test_tier0_selects_label_path_norms_and_decoder_only() -> None:
     m = _tiny_tabicl()
     report = apply_tier(m, 0)
 
@@ -138,7 +139,7 @@ def test_tier0_selects_label_path_norms_and_decoder_only():
     assert 0.0 < report["trainable_frac"] < 0.5
 
 
-def test_tier1_adds_lora_on_icl_only_and_keeps_tier0():
+def test_tier1_adds_lora_on_icl_only_and_keeps_tier0() -> None:
     m = _tiny_tabicl()
     report = apply_tier(m, 1, lora_rank=4, lora_alpha=8.0)
     assert report["lora_modules_replaced"] > 0
@@ -154,7 +155,7 @@ def test_tier1_adds_lora_on_icl_only_and_keeps_tier0():
     assert report["n_trainable_params"] > apply_tier(_tiny_tabicl(), 0)["n_trainable_params"]
 
 
-def test_tier3_adds_lora_to_every_backbone_stage():
+def test_tier3_adds_lora_to_every_backbone_stage() -> None:
     m = _tiny_tabicl()
     report = apply_tier(m, 3, lora_rank=2, lora_alpha=4.0)
     lora_names = {
@@ -166,12 +167,12 @@ def test_tier3_adds_lora_to_every_backbone_stage():
     assert any(name.startswith("icl_predictor.") for name in lora_names)
 
 
-def test_unknown_tier_rejected():
+def test_unknown_tier_rejected() -> None:
     with pytest.raises(ValueError):
         apply_tier(_tiny_tabicl(), 99)
 
 
-def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward():
+def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward() -> None:
     from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
     torch.manual_seed(0)
@@ -222,7 +223,7 @@ def test_merged_base_state_dict_loads_into_plain_tabicl_and_matches_forward():
     assert not torch.allclose(a, c, atol=1e-5), "adapter perturbation had no effect"
 
 
-def test_analytic_marginal_matches_brute_force_mvn_conditional():
+def test_analytic_marginal_matches_brute_force_mvn_conditional() -> None:
     """analytic_marginal_targets matches the Gaussian conditional from the full joint covariance."""
     task = _rbf_task(P=10, N=4, seed=1)
     x_ctx, y_ctx = task["x_norm_train"], task["y_train"]
@@ -244,7 +245,7 @@ def test_analytic_marginal_matches_brute_force_mvn_conditional():
     assert torch.allclose(sigma, Sig_bf.diagonal().sqrt().float(), atol=1e-4)
 
 
-def test_analytic_target_is_observable_y_not_latent_f():
+def test_analytic_target_is_observable_y_not_latent_f() -> None:
     """The target variance includes the nugget (observed y, not latent f)."""
     task = _rbf_task(P=10, N=4, seed=2)
     kfn = build_kernel_fn("rbf", 0.7, 1.3, active_dims=[0, 1])
@@ -260,7 +261,7 @@ def test_analytic_target_is_observable_y_not_latent_f():
     assert torch.allclose(sigma**2 - S_lat.diagonal(), torch.full_like(sigma, nug), atol=1e-4)
 
 
-def test_analytic_target_contracts_with_more_context():
+def test_analytic_target_contracts_with_more_context() -> None:
     """The target variance shrinks as context grows."""
     task = _rbf_task(P=24, N=4, seed=3)
     x, y = task["x_norm_train"], task["y_train"]
@@ -280,7 +281,7 @@ def _with_cached_full_factors(task: dict) -> dict:
     return task
 
 
-def test_cached_full_context_target_matches_direct_recomputation():
+def test_cached_full_context_target_matches_direct_recomputation() -> None:
     task = _with_cached_full_factors(_rbf_task(P=18, N=7, seed=31))
     args = (task, task["x_norm_train"], task["y_train"], task["x_norm_test"])
     direct = analytic_marginal_targets(*args)
@@ -290,7 +291,7 @@ def test_cached_full_context_target_matches_direct_recomputation():
 
 
 @pytest.mark.parametrize("K", [3, 5, 10])
-def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K):
+def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K) -> None:
     """A row's target is conditioned on a context without that row."""
     P = 12
     task = _rbf_task(P=P, N=2, seed=4)
@@ -308,7 +309,7 @@ def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K):
 
 
 @pytest.mark.parametrize("K", [3, 5, 10])
-def test_cached_precision_fold_targets_match_direct_conditioning(K):
+def test_cached_precision_fold_targets_match_direct_conditioning(K) -> None:
     task = _with_cached_full_factors(_rbf_task(P=17, N=2, seed=32 + K))
     idx = torch.tensor([0, 1, 5, 8, 12, 16])
     direct_task = {k: v for k, v in task.items() if k not in ("_L_ff", "_alpha")}
@@ -318,7 +319,7 @@ def test_cached_precision_fold_targets_match_direct_conditioning(K):
     assert torch.allclose(cached[1], direct[1], atol=1e-5, rtol=1e-5)
 
 
-def test_fold_subset_rows_match_a_full_pit_pass():
+def test_fold_subset_rows_match_a_full_pit_pass() -> None:
     """fold_subset rows equal the same rows of a full pass."""
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
@@ -341,7 +342,7 @@ def test_fold_subset_rows_match_a_full_pit_pass():
     assert torch.allclose(sub["z_test"], full["z_test"], atol=0)
 
 
-def test_fold_subset_empty_returns_test_only():
+def test_fold_subset_empty_returns_test_only() -> None:
     from copula_inter.pit import _run_pit_batched_impl
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
@@ -356,7 +357,7 @@ def test_fold_subset_empty_returns_test_only():
     assert only["q_test"].shape[:3] == (1, 3, 1)
 
 
-def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output():
+def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output() -> None:
     from copula_inter.pit import _run_pit_batched_impl
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
@@ -393,7 +394,7 @@ def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output():
     assert not ({"z_train", "z_test", "log_pdf_test", "u_train", "u_test"} & fast.keys())
 
 
-def test_fused_fold_forward_matches_separate_forwards():
+def test_fused_fold_forward_matches_separate_forwards() -> None:
     from copula_inter.pit import _run_pit_batched_impl
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
@@ -409,7 +410,7 @@ def test_fused_fold_forward_matches_separate_forwards():
     assert torch.equal(fused["q_test"], separate["q_test"])
 
 
-def test_distillation_is_zero_at_the_analytic_optimum():
+def test_distillation_is_zero_at_the_analytic_optimum() -> None:
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
     alpha = qd.alpha_levels
@@ -427,7 +428,7 @@ def test_distillation_is_zero_at_the_analytic_optimum():
     assert float(worse["distill"]) > 1e-4
 
 
-def test_distillation_respects_target_mask():
+def test_distillation_respects_target_mask() -> None:
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
     alpha = qd.alpha_levels
@@ -449,7 +450,7 @@ def test_distillation_respects_target_mask():
     assert float(none["distill"]) == 0.0
 
 
-def test_zero_nll_weight_excludes_nll_from_training_loss_but_still_reports_it():
+def test_zero_nll_weight_excludes_nll_from_training_loss_but_still_reports_it() -> None:
     """With nll weight 0 the NLL is reported but not in the loss."""
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
@@ -469,7 +470,7 @@ def test_zero_nll_weight_excludes_nll_from_training_loss_but_still_reports_it():
     assert (grad != 0).all(), "pinball/distillation should provide dense quantile gradients"
 
 
-def test_pinball_uses_raw_quantile_identity_and_penalizes_permutation():
+def test_pinball_uses_raw_quantile_identity_and_penalizes_permutation() -> None:
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
     alpha = qd.alpha_levels
@@ -484,7 +485,7 @@ def test_pinball_uses_raw_quantile_identity_and_penalizes_permutation():
     assert crossed > good * 2
 
 
-def test_exact_distillation_can_overfit_one_predictive_distribution():
+def test_exact_distillation_can_overfit_one_predictive_distribution() -> None:
     """Optimizing the distillation loss recovers the analytic quantiles."""
     torch.manual_seed(7)
     m = _tiny_tabicl(num_quantiles=33)
@@ -508,7 +509,7 @@ def test_exact_distillation_can_overfit_one_predictive_distribution():
     assert final < initial * 1e-2, (initial, final)
 
 
-def test_distillation_does_not_inverse_variance_weight_sharp_rows():
+def test_distillation_does_not_inverse_variance_weight_sharp_rows() -> None:
     """Equal quantile errors give equal gradients regardless of the target sigma."""
     m = _tiny_tabicl(num_quantiles=33)
     qd = m.quantile_dist
@@ -529,7 +530,7 @@ def test_distillation_does_not_inverse_variance_weight_sharp_rows():
     assert torch.allclose(grad[0], grad[1], rtol=1e-5, atol=1e-8)
 
 
-def test_full_phase_a_path_overfits_one_fixed_synthetic_episode():
+def test_full_phase_a_path_overfits_one_fixed_synthetic_episode() -> None:
     """The full path (model, PIT, targets, loss, optimizer) overfits one episode."""
     torch.manual_seed(11)
     model = _tiny_tabicl(num_quantiles=33)
@@ -554,7 +555,7 @@ def test_full_phase_a_path_overfits_one_fixed_synthetic_episode():
     assert final < initial * 0.2, (initial, final)
 
 
-def test_quantile_level_weights_downweight_the_tails_and_average_to_one():
+def test_quantile_level_weights_downweight_the_tails_and_average_to_one() -> None:
     a = torch.linspace(0.001, 0.999, 999)
     w = quantile_level_weights(a, tail_power=0.5)
     assert abs(float(w.mean()) - 1.0) < 1e-5
@@ -564,7 +565,7 @@ def test_quantile_level_weights_downweight_the_tails_and_average_to_one():
     assert torch.allclose(flat, torch.ones_like(flat))
 
 
-def test_oracle_marginal_nll_matches_closed_form_gaussian():
+def test_oracle_marginal_nll_matches_closed_form_gaussian() -> None:
     y = torch.tensor([0.3, -1.2])
     mu = torch.tensor([0.0, -1.0])
     sd = torch.tensor([1.0, 2.0])
@@ -572,7 +573,7 @@ def test_oracle_marginal_nll_matches_closed_form_gaussian():
     assert abs(oracle_marginal_nll(y, mu, sd) - expect) < 1e-6
 
 
-def test_anchor_penalty_is_zero_at_init_and_grows_with_drift():
+def test_anchor_penalty_is_zero_at_init_and_grows_with_drift() -> None:
     m = _tiny_tabicl()
     apply_tier(m, 0)
     anchor = AnchorPenalty(m)
@@ -584,7 +585,7 @@ def test_anchor_penalty_is_zero_at_init_and_grows_with_drift():
     assert anchor(m).detach().item() > 0.0
 
 
-def test_grad_pit_matches_nograd_pit_and_produces_finite_grads():
+def test_grad_pit_matches_nograd_pit_and_produces_finite_grads() -> None:
     torch.manual_seed(0)
     m = _tiny_tabicl(num_quantiles=33)
     apply_tier(m, 0)
@@ -608,7 +609,7 @@ def test_grad_pit_matches_nograd_pit_and_produces_finite_grads():
     assert any(float(g.abs().sum()) > 0 for g in grads)
 
 
-def test_grad_path_leaves_train_mode_as_it_found_it():
+def test_grad_path_leaves_train_mode_as_it_found_it() -> None:
     m = _tiny_tabicl(num_quantiles=33)
     m.eval()
     Xtr, Ytr = torch.randn(1, 6, 2), torch.randn(1, 6, 1)
@@ -617,14 +618,14 @@ def test_grad_path_leaves_train_mode_as_it_found_it():
     assert not m.training, "_train_mode must restore the module's original mode"
 
 
-def test_ks_uniform_small_for_uniform_large_for_shifted():
+def test_ks_uniform_small_for_uniform_large_for_shifted() -> None:
     rng = np.random.default_rng(0)
     u = rng.uniform(size=4000)
     assert ks_uniform(u) < 0.05
     assert ks_uniform(rng.beta(2.0, 5.0, size=4000)) > 0.15
 
 
-def test_rank_histogram_flat_for_uniform():
+def test_rank_histogram_flat_for_uniform() -> None:
     rng = np.random.default_rng(0)
     h = rank_histogram(rng.uniform(size=20000), n_bins=10)
     assert abs(h.sum() - 1.0) < 1e-9
@@ -641,7 +642,7 @@ def _corpus_months(dirname: str) -> set[str]:
     return out
 
 
-def test_era5_train_and_val_corpora_are_disjoint():
+def test_era5_train_and_val_corpora_are_disjoint() -> None:
     """The ERA5 train and val corpora share no months."""
     train = _corpus_months("era5_global_train")
     val = _corpus_months("era5_global_val")

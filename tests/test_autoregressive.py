@@ -28,7 +28,7 @@ from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: E402
 class RecordingFakeTabICL(RowIndependentFakeTabICL):
     """RowIndependentFakeTabICL that records the shape of every table it is called with."""
 
-    def __init__(self, q: int = 3):
+    def __init__(self, q: int = 3) -> None:
         super().__init__(q)
         self.calls: list[tuple[int, int]] = []  # (n_context, n_query)
 
@@ -37,7 +37,7 @@ class RecordingFakeTabICL(RowIndependentFakeTabICL):
         return super().forward(X, y)
 
 
-def _episodes(B=2, P=6, N=5, d_x=3, seed=0):
+def _episodes(B: int = 2, P: int = 6, N: int = 5, d_x: int = 3, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     return (
         torch.randn(B, P, d_x, generator=g),
@@ -47,7 +47,7 @@ def _episodes(B=2, P=6, N=5, d_x=3, seed=0):
     )
 
 
-def test_ar_step0_matches_the_one_shot_marginal():
+def test_ar_step0_matches_the_one_shot_marginal() -> None:
     torch.manual_seed(0)
     tabicl = RowIndependentFakeTabICL()
     x_tr, y_tr, x_te, y_te = _episodes()
@@ -70,7 +70,7 @@ def test_ar_step0_matches_the_one_shot_marginal():
     assert not torch.allclose(ar["log_pdf"][:, 1:], one_shot["log_pdf_test"][:, 1:], atol=1e-5)
 
 
-def test_teacher_forcing_appends_the_truth_in_visit_order():
+def test_teacher_forcing_appends_the_truth_in_visit_order() -> None:
     tabicl = RowIndependentFakeTabICL()
     x_tr, y_tr, x_te, y_te = _episodes(seed=1)
 
@@ -88,7 +88,7 @@ def test_teacher_forcing_appends_the_truth_in_visit_order():
     assert torch.allclose(ar["appended"], expected, atol=1e-4)
 
 
-def test_sample_conditioning_departs_from_the_truth_but_is_reproducible():
+def test_sample_conditioning_departs_from_the_truth_but_is_reproducible() -> None:
     tabicl = RowIndependentFakeTabICL()
     x_tr, y_tr, x_te, y_te = _episodes(seed=2)
 
@@ -101,7 +101,7 @@ def test_sample_conditioning_departs_from_the_truth_but_is_reproducible():
     assert not torch.allclose(a["appended"], y_te.gather(1, a["order"]), atol=1e-3)
 
 
-def test_orderings_are_permutations_keyed_on_the_global_episode_index():
+def test_orderings_are_permutations_keyed_on_the_global_episode_index() -> None:
     B, N = 3, 9
     o = _orderings(B, N, "random", seed=5, episode_indices=[100, 101, 102])
     for b in range(B):
@@ -122,7 +122,7 @@ def test_orderings_are_permutations_keyed_on_the_global_episode_index():
     )
 
 
-def test_unknown_order_and_conditioning_are_rejected():
+def test_unknown_order_and_conditioning_are_rejected() -> None:
     tabicl = RowIndependentFakeTabICL()
     x_tr, y_tr, x_te, y_te = _episodes(seed=3)
     with pytest.raises(ValueError, match="order must be one of"):
@@ -131,7 +131,7 @@ def test_unknown_order_and_conditioning_are_rejected():
         autoregressive_log_pdf(tabicl, x_tr, y_tr, x_te, y_te, conditioning="beam")
 
 
-def test_max_context_caps_the_table_and_keeps_the_episodes_own_context():
+def test_max_context_caps_the_table_and_keeps_the_episodes_own_context() -> None:
     P, N = 6, 5
     x_tr, y_tr, x_te, y_te = _episodes(B=1, P=P, N=N, seed=4)
 
@@ -156,7 +156,7 @@ def test_max_context_caps_the_table_and_keeps_the_episodes_own_context():
     assert max(c[0] for c in capped.calls) == cap
 
 
-def test_ar_parts_split_is_exact_and_independence_is_copula_zero():
+def test_ar_parts_split_is_exact_and_independence_is_copula_zero() -> None:
     ar = torch.tensor([-1.0, -2.0, -3.0])
     marg = torch.tensor([-1.5, -1.5, -1.5])
 
@@ -169,7 +169,7 @@ def test_ar_parts_split_is_exact_and_independence_is_copula_zero():
     assert math.isclose(same["copula"], 0.0, abs_tol=1e-12)
 
 
-def test_autoregressive_is_a_total_table_row_only():
+def test_autoregressive_is_a_total_table_row_only() -> None:
     from eval.runners.eval_tables import (
         _METHOD_ORDER,
         _TOTAL_NLL_ORDER,
@@ -184,7 +184,7 @@ def test_autoregressive_is_a_total_table_row_only():
     assert "best_gp_total" in dict(_TOTAL_RANK_ORDER)
 
 
-def test_ar_note_warns_on_sampled_conditioning():
+def test_ar_note_warns_on_sampled_conditioning() -> None:
     from eval.runners.eval_tables import _NAN_PARTS, _ar_note
 
     rows = [{"autoregressive": {"total": 0.5, "marginal": 1.0, "copula": -0.5}}, {"autoregressive": _NAN_PARTS.copy()}]

@@ -26,3 +26,6 @@ eval/data/beijing_pm25/
 build/
 *.egg-info/
 *.token
+
+# mypy daemon state
+.dmypy.json

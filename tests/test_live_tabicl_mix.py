@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import torch
 from omegaconf import OmegaConf
-from test_pit_batched import RowIndependentFakeTabICL
 
 from copula_inter.data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw, _tabicl_mix_prob_for_kernel
+from tests.test_pit_batched import RowIndependentFakeTabICL
 
 
 def _mix_weights(**by_family: float) -> torch.Tensor:
@@ -26,19 +26,19 @@ def _mix_weights(**by_family: float) -> torch.Tensor:
     return w
 
 
-def test_tabicl_mix_prob_for_kernel_none_is_unconditional():
+def test_tabicl_mix_prob_for_kernel_none_is_unconditional() -> None:
     assert _tabicl_mix_prob_for_kernel("rbf", None) == 1.0
     assert _tabicl_mix_prob_for_kernel("rbf*periodic+matern32", None) == 1.0
 
 
-def test_tabicl_mix_prob_for_kernel_bare_family():
+def test_tabicl_mix_prob_for_kernel_bare_family() -> None:
     w = _mix_weights(rbf=0.2, periodic=0.8)
     assert abs(_tabicl_mix_prob_for_kernel("rbf", w) - 0.2) < 1e-6
     assert abs(_tabicl_mix_prob_for_kernel("periodic", w) - 0.8) < 1e-6
     assert _tabicl_mix_prob_for_kernel("matern32", w) == 0.0
 
 
-def test_tabicl_mix_prob_for_kernel_composite_uses_max():
+def test_tabicl_mix_prob_for_kernel_composite_uses_max() -> None:
     # Maximum component weight (periodic 0.8), not the mean.
     w = _mix_weights(rbf=0.2, periodic=0.8)
     assert abs(_tabicl_mix_prob_for_kernel("rbf*periodic", w) - 0.8) < 1e-6
@@ -46,7 +46,7 @@ def test_tabicl_mix_prob_for_kernel_composite_uses_max():
     assert abs(_tabicl_mix_prob_for_kernel("matern32*rbf*periodic", w) - 0.8) < 1e-6
 
 
-def test_zero_mix_weights_is_noop_vs_pure_analytic(small_cfg):
+def test_zero_mix_weights_is_noop_vs_pure_analytic(small_cfg) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -69,7 +69,7 @@ def test_zero_mix_weights_is_noop_vs_pure_analytic(small_cfg):
         assert torch.allclose(ep_a["z_train"], ep_z["z_train"], atol=1e-6)
 
 
-def test_one_mix_weights_matches_legacy_full_override(small_cfg):
+def test_one_mix_weights_matches_legacy_full_override(small_cfg) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -92,7 +92,7 @@ def test_one_mix_weights_matches_legacy_full_override(small_cfg):
         assert torch.allclose(ep_l["z_train"], ep_m["z_train"], atol=1e-6)
 
 
-def test_mix_hit_rate_matches_configured_fraction(small_cfg):
+def test_mix_hit_rate_matches_configured_fraction(small_cfg) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -120,7 +120,7 @@ def test_mix_hit_rate_matches_configured_fraction(small_cfg):
     assert abs(empirical_frac - target_frac) < 0.08, empirical_frac
 
 
-def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg):
+def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg) -> None:
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.systematic_composition = False
@@ -193,7 +193,7 @@ def _import_train():
     return train
 
 
-def test_compute_tabicl_z_train_gap_runs_on_declared_device(small_cfg):
+def test_compute_tabicl_z_train_gap_runs_on_declared_device(small_cfg) -> None:
     """_compute_tabicl_z_train_gap runs both paired calls on the given device (CPU here) with finite gaps."""
     train = _import_train()
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
@@ -213,7 +213,7 @@ def test_compute_tabicl_z_train_gap_runs_on_declared_device(small_cfg):
         assert g == g and g >= 0.0  # finite, non-negative
 
 
-def test_tabicl_gap_to_mix_frac():
+def test_tabicl_gap_to_mix_frac() -> None:
     train = _import_train()
     _tabicl_gap_to_mix_frac = train._tabicl_gap_to_mix_frac
 

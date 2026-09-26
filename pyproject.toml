@@ -90,9 +90,20 @@ select = ["E9", "F", "I"]
 known-first-party = ["copula_inter", "eval", "inference", "conf", "debug", "experiments", "scripts", "tabicl"]
 
 [tool.mypy]
+files = ["src/copula_inter", "eval", "inference", "conf", "debug", "experiments", "scripts", "tests"]
 mypy_path = ["src", ".", "tabicl_upstream/src"]
 python_version = "3.12"
+explicit_package_bases = true
 ignore_missing_imports = true
-follow_imports = "silent"
-check_untyped_defs = false
+follow_imports = "normal"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
 exclude = ["tabicl_upstream/", "_upstream/"]
+
+[[tool.mypy.overrides]]
+# Vendored upstream code: analysed for the types our code uses, never reported.
+module = ["tabicl.*", "pfns4bo.*"]
+ignore_errors = true

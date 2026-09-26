@@ -22,7 +22,7 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
     if not getattr(regressor, "_load_model_cached", False):
         orig_load = regressor._load_model
 
-        def _cached_load():
+        def _cached_load() -> None:
             if getattr(regressor, "model_", None) is None:
                 orig_load()
 

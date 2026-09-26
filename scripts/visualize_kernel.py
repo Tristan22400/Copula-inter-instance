@@ -38,7 +38,7 @@ def _load_cfg(kernel_name: str):
     return cfg
 
 
-def visualize(kernel_name: str):
+def visualize(kernel_name: str) -> None:
     print(f"[*] Generating posterior R* visualization for {kernel_name}...")
     if kernel_name not in KERNEL_REGISTRY:
         print(f"[!] Kernel {kernel_name} not found in KERNEL_REGISTRY. Available: {sorted(KERNEL_REGISTRY)}")

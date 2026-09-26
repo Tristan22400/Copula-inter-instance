@@ -31,7 +31,7 @@ def regressor():
 
 
 @pytest.mark.parametrize("constant_column", [False, True])
-def test_tabldm_batched_matches_per_episode(regressor, constant_column):
+def test_tabldm_batched_matches_per_episode(regressor, constant_column) -> None:
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.marginal_backends import loo_pit, quantiles
     from eval.spatial.tabldm_batched import tabldm_run_pit_batched
@@ -75,7 +75,7 @@ def test_tabldm_batched_matches_per_episode(regressor, constant_column):
     np.testing.assert_allclose(out["log_pdf_test"], log_pdf_ref, atol=1e-2)
 
 
-def test_tabldm_batched_rejects_unsupported_regressor_modes(regressor):
+def test_tabldm_batched_rejects_unsupported_regressor_modes(regressor) -> None:
     """The two predict() branches this module deliberately does not mirror
     must fail loudly rather than silently fusing the wrong thing."""
     from eval.spatial.tabldm_batched import _episode_member_batch

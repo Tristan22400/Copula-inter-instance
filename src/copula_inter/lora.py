@@ -10,21 +10,24 @@ from __future__ import annotations
 
 import math
 import re
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+if TYPE_CHECKING:
+    from tabicl._model.layers import MultiheadAttention
 
-def _get_mha_class():
+
+def _get_mha_class() -> tuple[type[nn.Module], ...]:
     """Tuple of MultiheadAttention classes LoRAMultiheadAttention can replace (TabICL's, plus TabLDM's if installed)."""
-    from tabicl._model.layers import MultiheadAttention  # type: ignore[import]
+    from tabicl._model.layers import MultiheadAttention
 
-    classes = [MultiheadAttention]
+    classes: list[type[nn.Module]] = [MultiheadAttention]
     try:
-        from tabldm._model.layers import MultiheadAttention as TabLDMMHA  # type: ignore[import]
+        from tabldm._model.layers import MultiheadAttention as TabLDMMHA
     except Exception:
         pass
     else:
@@ -33,15 +36,15 @@ def _get_mha_class():
     return tuple(classes)
 
 
-def _get_mha_forward():
-    from tabicl._model.attention import multi_head_attention_forward  # type: ignore[import]
+def _get_mha_forward() -> Callable[..., Any]:
+    from tabicl._model.attention import multi_head_attention_forward
 
     return multi_head_attention_forward
 
 
-def _get_kv_types():
-    from tabicl._model.kv_cache import KVCacheEntry  # type: ignore[import]
-    from tabicl._model.rope import RotaryEmbedding  # type: ignore[import]
+def _get_kv_types() -> tuple[type, type]:
+    from tabicl._model.kv_cache import KVCacheEntry
+    from tabicl._model.rope import RotaryEmbedding
 
     return KVCacheEntry, RotaryEmbedding
 
@@ -59,9 +62,23 @@ class LoRAMultiheadAttention(nn.Module):
         target: projections to adapt, a subset of "qkvo".
     """
 
+    in_proj_weight: Tensor
+    in_proj_bias: Optional[Tensor]
+    out_proj_weight: Tensor
+    out_proj_bias: Optional[Tensor]
+    ssmax_layer: Optional[nn.Module]
+    lora_A_q: Tensor
+    lora_B_q: Tensor
+    lora_A_k: Tensor
+    lora_B_k: Tensor
+    lora_A_v: Tensor
+    lora_B_v: Tensor
+    lora_A_o: Tensor
+    lora_B_o: Tensor
+
     def __init__(
         self,
-        mha: nn.Module,
+        mha: MultiheadAttention,
         rank: int,
         alpha: float,
         target: str = "qkvo",
@@ -81,14 +98,14 @@ class LoRAMultiheadAttention(nn.Module):
         if mha.in_proj_bias is not None:
             self.register_buffer("in_proj_bias", mha.in_proj_bias.data.clone())
         else:
-            self.in_proj_bias = None  # type: ignore[assignment]
+            self.in_proj_bias = None
 
         # out_proj: store weight/bias as buffers, expose via thin wrapper
         self.register_buffer("out_proj_weight", mha.out_proj.weight.data.clone())
         if mha.out_proj.bias is not None:
             self.register_buffer("out_proj_bias", mha.out_proj.bias.data.clone())
         else:
-            self.out_proj_bias = None  # type: ignore[assignment]
+            self.out_proj_bias = None
 
         # ssmax_layer: keep reference, freeze
         self.ssmax_layer = mha.ssmax_layer  # nn.Module or None
@@ -129,10 +146,10 @@ class LoRAMultiheadAttention(nn.Module):
         query: Tensor,
         key: Optional[Tensor] = None,
         value: Optional[Tensor] = None,
-        cached_kv=None,
+        cached_kv: Any = None,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
-        rope=None,
+        rope: Any = None,
         need_kv: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
         # Replicate the mask canonicalization from the upstream forward
@@ -187,21 +204,23 @@ def _replace_mha_in_module(
     alpha: float,
     target: str,
     stages: List[str],
-    MultiheadAttention,
+    mha_classes: type[nn.Module] | tuple[type[nn.Module], ...],
 ) -> int:
     """Recursively replace MultiheadAttention children; return replacement count."""
     replaced = 0
     for child_name, child in list(parent.named_children()):
         full_name = f"{prefix}.{child_name}" if prefix else child_name
-        if isinstance(child, MultiheadAttention):
+        if isinstance(child, mha_classes):
             # Only replace if the full name contains one of the requested stage keywords
             stage_match = any(_STAGE_KEYWORDS[s] in full_name for s in stages if s in _STAGE_KEYWORDS)
             if stage_match:
-                lora_mha = LoRAMultiheadAttention(child, rank=rank, alpha=alpha, target=target)
+                # TabLDM's class is a byte-identical fork of TabICL's.
+                mha = cast("MultiheadAttention", child)
+                lora_mha = LoRAMultiheadAttention(mha, rank=rank, alpha=alpha, target=target)
                 setattr(parent, child_name, lora_mha)
                 replaced += 1
         else:
-            replaced += _replace_mha_in_module(child, full_name, rank, alpha, target, stages, MultiheadAttention)
+            replaced += _replace_mha_in_module(child, full_name, rank, alpha, target, stages, mha_classes)
     return replaced
 
 
@@ -272,8 +291,8 @@ def apply_lora(
 
     n_replaced = 0
     if adapters_requested:
-        MultiheadAttention = _get_mha_class()
-        n_replaced = _replace_mha_in_module(backbone, "", int(rank), alpha, target, stages, MultiheadAttention)
+        mha_classes = _get_mha_class()
+        n_replaced = _replace_mha_in_module(backbone, "", int(rank), alpha, target, stages, mha_classes)
         if n_replaced == 0:
             raise RuntimeError(
                 f"apply_lora found 0 MultiheadAttention modules in stages={stages}. "
@@ -334,16 +353,15 @@ def merged_base_state_dict(backbone: nn.Module) -> dict:
     Loads strictly into a stock TabICL; the live module keeps its adapters.
     Returns detached CPU tensors.
     """
-    lora_paths = [name for name, m in backbone.named_modules() if isinstance(m, LoRAMultiheadAttention)]
+    lora_mods = {name: m for name, m in backbone.named_modules() if isinstance(m, LoRAMultiheadAttention)}
 
     sd: dict = {}
     for key, val in backbone.state_dict().items():
-        if any(key.startswith(p + ".") for p in lora_paths):
+        if any(key.startswith(p + ".") for p in lora_mods):
             continue  # re-emitted below under its base-model name
         sd[key] = val.detach().cpu().clone()
 
-    for path in lora_paths:
-        mod = backbone.get_submodule(path)
+    for path, mod in lora_mods.items():
         sd[f"{path}.in_proj_weight"] = mod._effective_in_proj_weight().detach().cpu().clone()
         if mod.in_proj_bias is not None:
             sd[f"{path}.in_proj_bias"] = mod.in_proj_bias.detach().cpu().clone()
@@ -366,7 +384,7 @@ class LoRAParametrization(nn.Module):
     so the weight is unchanged at step 0.
     """
 
-    def __init__(self, weight: Tensor, rank: int, alpha: float):
+    def __init__(self, weight: Tensor, rank: int, alpha: float) -> None:
         super().__init__()
         out_features, in_features = weight.shape[-2], weight.shape[-1]
         self.A = nn.Parameter(torch.zeros(rank, in_features, dtype=torch.float32, device=weight.device))
@@ -430,7 +448,7 @@ def merged_base_state_dict_parametrized(backbone: nn.Module) -> dict:
     for mod_name, module in backbone.named_modules():
         if not P.is_parametrized(module):
             continue
-        for p_name in list(module.parametrizations.keys()):  # type: ignore[union-attr]
+        for p_name in list(module.parametrizations.keys()):
             full = f"{mod_name}.{p_name}" if mod_name else p_name
             effective[full] = getattr(module, p_name).detach().cpu().clone()
 

@@ -51,15 +51,15 @@ class Muon(torch.optim.Optimizer):
     def __init__(
         self,
         param_groups,
-        lr=2e-2,
-        weight_decay=0.1,
-        matched_adamw_rms=0.2,
-        momentum=0.95,
-        nesterov=True,
-        ns_steps=5,
+        lr: float = 2e-2,
+        weight_decay: float = 0.1,
+        matched_adamw_rms: float = 0.2,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_steps: int = 5,
         adamw_betas=(0.95, 0.95),
-        adamw_eps=1e-8,
-    ):
+        adamw_eps: float = 1e-8,
+    ) -> None:
         defaults = dict(
             lr=lr,
             weight_decay=weight_decay,
@@ -72,7 +72,7 @@ class Muon(torch.optim.Optimizer):
         )
         super().__init__(param_groups, defaults)
 
-    def step(self):
+    def step(self) -> None:
         # ---- Muon groups ----
         for group in self.param_groups:
             if not group.get("use_muon", False):

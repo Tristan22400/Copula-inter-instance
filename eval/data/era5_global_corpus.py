@@ -42,7 +42,7 @@ class GlobalERA5Corpus:
         max_months: int | None = None,
         lazy: bool | None = None,
         _shared: dict | None = None,
-    ):
+    ) -> None:
         """max_months keeps only the most recent monthly files (None = all). lazy=None memory-maps on demand when there are more than 60 months."""
         if _shared is not None:
             # Attach to shared storage (zero-copy numpy views).

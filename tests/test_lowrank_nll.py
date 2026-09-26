@@ -22,7 +22,7 @@ def _exact_copula_nll(Sigma, z, mask):
     return torch.stack(vals).mean()
 
 
-def _inputs(B=3, N=17, r=5, seed=0, dtype=torch.float64):
+def _inputs(B: int = 3, N: int = 17, r: int = 5, seed: int = 0, dtype=torch.float64):
     g = torch.Generator().manual_seed(seed)
     W = torch.randn(B, N, r, generator=g, dtype=dtype)
     s = torch.randn(B, N, generator=g, dtype=dtype)
@@ -38,7 +38,7 @@ def _inputs(B=3, N=17, r=5, seed=0, dtype=torch.float64):
 
 
 @pytest.mark.parametrize("param", PARAMS)
-def test_factor_dense_matches_low_rank_correlation(param):
+def test_factor_dense_matches_low_rank_correlation(param) -> None:
     W, s, lam, *_ = _inputs()
     dense = low_rank_correlation(W, s, jitter=1e-4, parametrization=param, lam=lam)
     factor = low_rank_correlation_factor(W, s, jitter=1e-4, parametrization=param, lam=lam)
@@ -47,7 +47,7 @@ def test_factor_dense_matches_low_rank_correlation(param):
 
 
 @pytest.mark.parametrize("param", PARAMS)
-def test_lowrank_nll_matches_dense(param):
+def test_lowrank_nll_matches_dense(param) -> None:
     W, s, lam, z, log_pdf, mask = _inputs()
     dense = low_rank_correlation(W, s, jitter=1e-4, parametrization=param, lam=lam)
     factor = low_rank_correlation_factor(W, s, jitter=1e-4, parametrization=param, lam=lam)
@@ -59,7 +59,7 @@ def test_lowrank_nll_matches_dense(param):
     torch.testing.assert_close(got["total"], ref["total"], rtol=1e-3, atol=1e-3)
 
 
-def test_lowrank_nll_gradients_match_dense():
+def test_lowrank_nll_gradients_match_dense() -> None:
     W, s, _, z, log_pdf, mask = _inputs(seed=1)
     grads = []
     for build in (low_rank_correlation, low_rank_correlation_factor):
@@ -70,7 +70,7 @@ def test_lowrank_nll_gradients_match_dense():
     torch.testing.assert_close(grads[1][1], grads[0][1], rtol=1e-4, atol=1e-6)
 
 
-def test_lowrank_nll_fp32_near_singular():
+def test_lowrank_nll_fp32_near_singular() -> None:
     """fp32 inputs with a ~jitter diagonal still match a float64 dense reference."""
     W, s, _, z, log_pdf, mask = _inputs(N=60, r=4, seed=2)
     s = torch.full_like(s, -30.0)  # softplus ≈ 1e-13: Σ ≈ rank-4 + 1e-4 I
@@ -81,7 +81,7 @@ def test_lowrank_nll_fp32_near_singular():
     torch.testing.assert_close(got["copula"].double(), ref, rtol=1e-4, atol=1e-3)
 
 
-def test_lowrank_nll_all_padding_is_zero_and_differentiable():
+def test_lowrank_nll_all_padding_is_zero_and_differentiable() -> None:
     W, s, _, z, log_pdf, mask = _inputs()
     mask = torch.zeros_like(mask)
     Wg = W.clone().requires_grad_()

@@ -9,13 +9,14 @@ import weakref
 import pytest
 import torch
 from omegaconf import OmegaConf
+from pytest import MonkeyPatch
 from torch import nn
 
 from copula_inter import train
 
 
 class _TinyModel(nn.Module):
-    def __init__(self, n_test: int):
+    def __init__(self, n_test: int) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.randn(1, n_test, 2))
 
@@ -26,7 +27,7 @@ class _TinyModel(nn.Module):
         }
 
 
-def test_oom_unwinds_train_step_graph(monkeypatch):
+def test_oom_unwinds_train_step_graph(monkeypatch: MonkeyPatch) -> None:
     """A failed optimizer step must not keep the step graph alive."""
     n_test = 3
     model = _TinyModel(n_test)
@@ -98,7 +99,7 @@ def _fake_device_properties(total_gb: float):
     return lambda _device: _Props()
 
 
-def test_reserve_headroom_noop_when_tabicl_not_live(monkeypatch):
+def test_reserve_headroom_noop_when_tabicl_not_live(monkeypatch: MonkeyPatch) -> None:
     """No live-generation TabICL workers -> nothing should cap this process."""
     calls = []
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
@@ -108,7 +109,7 @@ def test_reserve_headroom_noop_when_tabicl_not_live(monkeypatch):
     assert calls == []
 
 
-def test_reserve_headroom_noop_on_cpu(monkeypatch):
+def test_reserve_headroom_noop_on_cpu(monkeypatch: MonkeyPatch) -> None:
     """TabICL mix enabled but device=cpu (no GPU workers to protect) -> no-op."""
     calls = []
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
@@ -118,7 +119,7 @@ def test_reserve_headroom_noop_on_cpu(monkeypatch):
     assert calls == []
 
 
-def test_reserve_headroom_noop_when_zero_workers(monkeypatch):
+def test_reserve_headroom_noop_when_zero_workers(monkeypatch: MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
@@ -128,7 +129,7 @@ def test_reserve_headroom_noop_when_zero_workers(monkeypatch):
     assert calls == []
 
 
-def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
+def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch: MonkeyPatch) -> None:
     """2 workers * 2.5GB + 1.0GB flat = 6GB headroom on a 24GB card -> 75%.
 
     The 2.5GB/worker is 0.5 fixed + 0.02 * group_size, where group_size is
@@ -151,7 +152,7 @@ def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
     assert captured["fraction"] == pytest.approx(0.75)
 
 
-def test_reserve_headroom_clamps_fraction_floor(monkeypatch):
+def test_reserve_headroom_clamps_fraction_floor(monkeypatch: MonkeyPatch) -> None:
     """A huge worker count shouldn't starve this process itself below 50%."""
     captured = {}
     monkeypatch.setattr(

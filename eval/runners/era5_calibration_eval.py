@@ -283,7 +283,7 @@ def build_calibration_figure(
     output_path: str,
     exceedance_thresholds: Optional[np.ndarray] = None,
     nominal_coverages: Optional[np.ndarray] = None,
-):
+) -> None:
     """Build and save the 2x2 multivariate spatial calibration figure."""
     N, D, K = all_quantiles.shape
     flat_q = all_quantiles.reshape(N * D, K)

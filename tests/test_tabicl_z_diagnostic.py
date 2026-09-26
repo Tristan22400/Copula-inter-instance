@@ -19,7 +19,7 @@ from copula_inter.probe_batches import _build_tabicl_val_z
 class FakeTabICL(nn.Module):
     """Deterministic stand-in for run_pit's interface: forward(X, y) -> logits (d, N, Q), quantile_dist(logits) -> distribution with cdf/log_prob."""
 
-    def __init__(self, q: int = 2):
+    def __init__(self, q: int = 2) -> None:
         super().__init__()
         self.q = q
 
@@ -68,7 +68,7 @@ def make_val_batch(
     }
 
 
-def test_cache_shape_and_padding():
+def test_cache_shape_and_padding() -> None:
     tabicl = FakeTabICL()
     batch = make_val_batch(B=3, P_max=6, n_train=[6, 4, 2])
     cache = _build_tabicl_val_z([batch], tabicl, k_folds=3, device="cpu")
@@ -81,14 +81,14 @@ def test_cache_shape_and_padding():
     assert torch.equal(z[2, 2:], torch.zeros(4))
 
 
-def test_short_context_skipped_stays_zero():
+def test_short_context_skipped_stays_zero() -> None:
     tabicl = FakeTabICL()
     batch = make_val_batch(B=1, P_max=5, n_train=[1])  # n_train < 2 -> skipped
     cache = _build_tabicl_val_z([batch], tabicl, k_folds=3, device="cpu")
     assert torch.equal(cache[0]["z_train"], torch.zeros(1, 5))
 
 
-def test_deterministic_across_calls():
+def test_deterministic_across_calls() -> None:
     """Two calls with the same model and batches give identical z_train."""
     tabicl = FakeTabICL()
     batch = make_val_batch(B=4, P_max=8, n_train=[8, 6, 3, 8])
@@ -101,7 +101,7 @@ def test_deterministic_across_calls():
 class _FakeTabiclGroup:
     """Stand-in for cfg.tabicl with only .get."""
 
-    def __init__(self, **kw):
+    def __init__(self, **kw) -> None:
         self._d = kw
 
     def get(self, key, default=None):
@@ -109,28 +109,28 @@ class _FakeTabiclGroup:
 
 
 class _FakeCfg:
-    def __init__(self, **tabicl_kw):
+    def __init__(self, **tabicl_kw) -> None:
         self.tabicl = _FakeTabiclGroup(**tabicl_kw)
 
 
-def test_resolve_pit_ckpt_pretrained_backbone_defaults_to_its_own_ckpt():
+def test_resolve_pit_ckpt_pretrained_backbone_defaults_to_its_own_ckpt() -> None:
     """pretrained=true without pit_ckpt resolves to tabicl.ckpt."""
     cfg = _FakeCfg(pretrained=True, ckpt="tabicl-regressor-v2-20260212.ckpt")
     assert _resolve_pit_ckpt(cfg) == "tabicl-regressor-v2-20260212.ckpt"
 
 
-def test_resolve_pit_ckpt_scratch_backbone_opts_in_via_pit_ckpt():
+def test_resolve_pit_ckpt_scratch_backbone_opts_in_via_pit_ckpt() -> None:
     """pretrained=false with pit_ckpt resolves to pit_ckpt."""
     cfg = _FakeCfg(pretrained=False, pit_ckpt="tabicl-regressor-v2-20260212.ckpt")
     assert _resolve_pit_ckpt(cfg) == "tabicl-regressor-v2-20260212.ckpt"
 
 
-def test_resolve_pit_ckpt_scratch_backbone_without_override_disables_diagnostic():
+def test_resolve_pit_ckpt_scratch_backbone_without_override_disables_diagnostic() -> None:
     """pretrained=false without pit_ckpt resolves to None."""
     cfg = _FakeCfg(pretrained=False)
     assert _resolve_pit_ckpt(cfg) is None
 
 
-def test_resolve_pit_ckpt_explicit_override_wins_over_backbone_ckpt():
+def test_resolve_pit_ckpt_explicit_override_wins_over_backbone_ckpt() -> None:
     cfg = _FakeCfg(pretrained=True, ckpt="backbone.ckpt", pit_ckpt="other-marginal.ckpt")
     assert _resolve_pit_ckpt(cfg) == "other-marginal.ckpt"

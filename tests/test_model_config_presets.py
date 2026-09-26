@@ -25,7 +25,7 @@ def _compose(model_name: str):
         return hydra.compose(config_name="config", overrides=[f"model={model_name}"])
 
 
-def test_copula_prod_resolves_pretrained_backbone():
+def test_copula_prod_resolves_pretrained_backbone() -> None:
     cfg = _compose("copula_prod")
     assert cfg.model.unfreeze_backbone is True
     assert cfg.tabicl.pretrained is True
@@ -36,7 +36,7 @@ def test_copula_prod_resolves_pretrained_backbone():
     assert _resolve_pit_ckpt(cfg) == cfg.tabicl.ckpt
 
 
-def test_copula_nano_resolves_scratch_backbone():
+def test_copula_nano_resolves_scratch_backbone() -> None:
     cfg = _compose("copula_nano")
     assert cfg.tabicl.pretrained is False
     # Shrunk width and depth.
@@ -50,7 +50,7 @@ def test_copula_nano_resolves_scratch_backbone():
     assert cfg.model.correlation_parametrization == "covnorm"
 
 
-def test_copula_nano_builds_and_runs_forward():
+def test_copula_nano_builds_and_runs_forward() -> None:
     """copula_nano builds via build_copula_transformer and runs a CPU forward."""
     cfg = _compose("copula_nano")
     torch.manual_seed(0)
@@ -75,7 +75,7 @@ def test_copula_nano_builds_and_runs_forward():
         assert (eigvals >= -1e-4).all(), f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
 
 
-def test_copula_head_accepts_half_precision_backbone_features():
+def test_copula_head_accepts_half_precision_backbone_features() -> None:
     """Backbone inference may return half precision on CPU without autocast."""
     model = build_copula_transformer(_compose("copula_nano"))
     model.train()
@@ -93,7 +93,7 @@ def test_copula_head_accepts_half_precision_backbone_features():
 
 
 @pytest.mark.parametrize("parametrization", ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"])
-def test_copula_nano_builds_and_runs_forward_per_parametrization(parametrization):
+def test_copula_nano_builds_and_runs_forward_per_parametrization(parametrization) -> None:
     """copula_nano builds and runs for every correlation_parametrization."""
     cfg = _compose("copula_nano")
     cfg.model.correlation_parametrization = parametrization

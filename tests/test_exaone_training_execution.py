@@ -14,7 +14,7 @@ from copula_inter.marginal_backbones import MarginalBackbone, _exaone_grad_forwa
 
 
 class RepeatedWeightModel(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.randn(3, 3))
         parametrize.register_parametrization(self, "weight", LoRAParametrization(self.weight, 2, 4))
@@ -27,7 +27,7 @@ class RepeatedWeightModel(nn.Module):
 
 @pytest.mark.parametrize("checkpointing", [True, False])
 @pytest.mark.parametrize("chunk_size", [1, 2, 8])
-def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_size):
+def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_size) -> None:
     torch.manual_seed(42)
     reference = RepeatedWeightModel()
     actual = deepcopy(reference)
@@ -61,7 +61,7 @@ def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_si
             )
 
 
-def test_invalid_chunk_size():
+def test_invalid_chunk_size() -> None:
     model = RepeatedWeightModel()
     bb = MarginalBackbone("exaone", model, SimpleNamespace(model=model), exaone_chunk_size=0)
     with pytest.raises(ValueError, match="positive"):

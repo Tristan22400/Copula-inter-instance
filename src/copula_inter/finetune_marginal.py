@@ -19,7 +19,7 @@ import os
 import random
 import time
 import zlib
-from typing import Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, cast
 
 import hydra
 import numpy as np
@@ -28,7 +28,7 @@ import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from copula_inter.artifacts import atomic_torch_save
-from copula_inter.config_path import config_dir
+from copula_inter.config_path import config_dict, config_dir
 from copula_inter.data_gen import generate_gp_batch  # noqa: E402
 from copula_inter.lora import (
     apply_lora,
@@ -53,6 +53,10 @@ from copula_inter.pit import (
     run_pit_batched_grad,
 )
 from copula_inter.training_core import cosine_lr_lambda  # noqa: E402
+
+if TYPE_CHECKING:
+    from tabicl._model.quantile_dist import QuantileToDistribution
+    from tabicl._model.tabicl import TabICL
 
 # Tier 0: the label path, the ICL-stage norms and the decoder (per architecture
 # in marginal_backbones.py; re-exported here).
@@ -305,7 +309,7 @@ def _standard_normal_icdf(alpha: torch.Tensor) -> torch.Tensor:
 def marginal_objective(
     q: torch.Tensor,
     y: torch.Tensor,
-    quantile_dist: nn.Module,
+    quantile_dist: QuantileToDistribution,
     weights: MarginalLossWeights,
     *,
     mu: Optional[torch.Tensor] = None,
@@ -360,6 +364,7 @@ def marginal_objective(
     if have_target and target_mask is not None:
         have_target = bool(target_mask.any())
     if have_target:
+        assert mu is not None and sigma is not None
         if target_mask is not None:
             q_d, mu_d, sig_d = q[target_mask], mu[target_mask], sigma[target_mask]
         else:
@@ -422,7 +427,7 @@ def rank_histogram(u: np.ndarray, n_bins: int = 20) -> np.ndarray:
 def marginal_metrics(
     q: torch.Tensor,
     y: torch.Tensor,
-    quantile_dist: nn.Module,
+    quantile_dist: QuantileToDistribution,
     *,
     log_std: float | torch.Tensor = 0.0,
     y_std: float | torch.Tensor = 1.0,
@@ -498,8 +503,13 @@ def stack_episodes(episodes: Sequence[dict], device: str | torch.device) -> dict
     }
 
 
+def _tabicl_module(tabicl: TabICL | MarginalBackbone) -> TabICL:
+    """The TabICL module itself (a tabicl MarginalBackbone wraps one)."""
+    return cast("TabICL", tabicl.module) if isinstance(tabicl, MarginalBackbone) else tabicl
+
+
 def phase_a_batch_loss(
-    tabicl: "nn.Module | MarginalBackbone",
+    tabicl: "TabICL | MarginalBackbone",
     episodes: Sequence[dict],
     weights: MarginalLossWeights,
     *,
@@ -560,6 +570,7 @@ def phase_a_batch_loss(
                 marginal_probs_n,
             )
         )
+        assert isinstance(tabicl, MarginalBackbone)
         out = kfold_quantiles_grad(
             tabicl,
             batch["x_train"],
@@ -573,7 +584,7 @@ def phase_a_batch_loss(
         quantile_dist = tabicl.quantile_dist_module(probs)
         q_test, q_train = out["q_test"], out["q_train"]
     else:
-        module = tabicl.module if isinstance(tabicl, MarginalBackbone) else tabicl
+        module = _tabicl_module(tabicl)
         out = run_pit_batched_grad(
             module,
             batch["x_train"],
@@ -709,7 +720,7 @@ def build_era5_marginal_val_batches(vcfg, device: str | torch.device) -> dict:
 
 @torch.no_grad()
 def validate_era5_marginal(
-    tabicl: "nn.Module | MarginalBackbone",
+    tabicl: "TabICL | MarginalBackbone",
     batches: dict,
     *,
     eps: float = 1e-6,
@@ -728,21 +739,22 @@ def validate_era5_marginal(
             if marginal_probs_n is None
             else np.linspace(1.0 / (marginal_probs_n + 1), marginal_probs_n / (marginal_probs_n + 1), marginal_probs_n)
         )
+        assert isinstance(tabicl, MarginalBackbone)
         quantile_dist = tabicl.quantile_dist_module(probs)
 
     for region, b in batches.items():
-        y_tr_s, y_te_s, mean, std = [], [], [], []
+        y_tr_list, y_te_list, std = [], [], []
         for d in range(b["y_train"].shape[0]):
-            a, c, m, sd = normalize_targets(b["y_train"][d], b["y_test"][d])
-            y_tr_s.append(a)
-            y_te_s.append(c)
-            mean.append(m)
+            a, c, _, sd = normalize_targets(b["y_train"][d], b["y_test"][d])
+            y_tr_list.append(a)
+            y_te_list.append(c)
             std.append(sd)
-        y_tr_s = torch.stack(y_tr_s)
-        y_te_s = torch.stack(y_te_s)
+        y_tr_s = torch.stack(y_tr_list)
+        y_te_s = torch.stack(y_te_list)
         std_t = torch.stack(std)
 
         if is_backbone:
+            assert isinstance(tabicl, MarginalBackbone)
             xtr = b["x_train"].detach().cpu().numpy()
             ytr = y_tr_s.detach().cpu().numpy()
             xte = b["x_test"].detach().cpu().numpy()
@@ -754,7 +766,7 @@ def validate_era5_marginal(
                 probs,
             )
         else:
-            module = tabicl.module if isinstance(tabicl, MarginalBackbone) else tabicl
+            module = _tabicl_module(tabicl)
             out = run_pit_batched_grad(
                 module,
                 b["x_train"],
@@ -775,7 +787,7 @@ def validate_era5_marginal(
         n_q = q.shape[1]
         log_std = std_t.log().unsqueeze(1).expand(-1, n_q).reshape(-1)
         y_std = std_t.unsqueeze(1).expand(-1, n_q).reshape(-1)
-        m = marginal_metrics(
+        per_region[region] = marginal_metrics(
             q.reshape(-1, q.shape[-1]),
             y_te_s.reshape(-1),
             quantile_dist,
@@ -783,7 +795,6 @@ def validate_era5_marginal(
             y_std=y_std,
             eps=eps,
         )
-        per_region[region] = m
 
     metrics: dict[str, float] = {}
     for region, m in per_region.items():
@@ -797,7 +808,7 @@ def validate_era5_marginal(
 
 @torch.no_grad()
 def validate_synthetic_marginal(
-    tabicl: "nn.Module | MarginalBackbone",
+    tabicl: "TabICL | MarginalBackbone",
     episode_batches: Sequence[Sequence[dict]],
     *,
     k_folds: int = DEFAULT_K_FOLDS,
@@ -980,6 +991,8 @@ def main(cfg: DictConfig) -> None:
     backbone_name = str(cfg.marginal.get("backbone", "tabicl"))
     _probs_n_cfg = cfg.marginal.get("probs_n", None)
     marginal_probs_n = None if _probs_n_cfg is None else int(_probs_n_cfg)
+    tabicl: TabICL | MarginalBackbone
+    trainable_module: nn.Module
     if backbone_name == "tabicl":
         # Unchanged path: load_tabicl owns TabICL's own checkpoint schema.
         tabicl, tabicl_config = load_tabicl(str(cfg.marginal.ckpt), device, trainable=True, return_config=True)
@@ -1108,8 +1121,8 @@ def main(cfg: DictConfig) -> None:
         run = wandb.init(
             project=str(cfg.wandb.project),
             entity=cfg.wandb.entity,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            mode=str(cfg.wandb.mode),
+            config=config_dict(cfg),
+            mode=cfg.wandb.mode,
         )
         wandb.watch(trainable_module, log="gradients", log_freq=max(1, int(cfg.training.log_every)))
         wandb.log({f"model/{k}": v for k, v in report.items() if isinstance(v, (int, float))}, step=0)
@@ -1223,6 +1236,7 @@ def main(cfg: DictConfig) -> None:
         data_started = step_started
         use_era5 = era5_sampler is not None and rng.random() < mix_frac
         if use_era5:
+            assert era5_sampler is not None
             episodes = era5_sampler.batch(B)
             episodes = [{k: v.to(device) for k, v in ep.items()} for ep in episodes]
             w = era5_weights

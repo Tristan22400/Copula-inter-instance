@@ -210,7 +210,7 @@ def _plot_field_grid(
 
     vmax = float(np.max(np.abs(true_fields + pred_grids + pred2_grids + indep_grids + oracle_grids)))
 
-    def _annotate_morans_i(ax, field):
+    def _annotate_morans_i(ax, field) -> None:
         ax.text(
             0.97,
             0.95,
@@ -495,7 +495,7 @@ def plot_marginal_variance_grid(
     )
     mesh = None
 
-    def _plot_row(row_idx, row_grids, ylabel, show_col_titles):
+    def _plot_row(row_idx, row_grids, ylabel, show_col_titles) -> None:
         nonlocal mesh
         for j, field in enumerate(row_grids):
             mesh = axes[row_idx][j].pcolormesh(lon, lat, field, cmap="viridis", vmin=0.0, vmax=vmax, shading="auto")

@@ -21,14 +21,14 @@ def _random_correlation(n, seed, rank=None):
 
 
 @pytest.mark.parametrize("n", [3, 8, 25])
-def test_zero_iff_identical(n):
+def test_zero_iff_identical(n) -> None:
     """The floor: KL(R || R) == 0 exactly."""
     R = _random_correlation(n, seed=n)
     assert abs(gaussian_corr_kl(R, R)) < 1e-9
 
 
 @pytest.mark.parametrize("n", [3, 8, 25])
-def test_strictly_positive_when_different(n):
+def test_strictly_positive_when_different(n) -> None:
     """Positive in both argument orders when the matrices differ."""
     A = _random_correlation(n, seed=n)
     B = _random_correlation(n, seed=n + 100)
@@ -37,7 +37,7 @@ def test_strictly_positive_when_different(n):
 
 
 @pytest.mark.parametrize("n", [4, 12])
-def test_matches_torch_kl_divergence(n):
+def test_matches_torch_kl_divergence(n) -> None:
     """Matches torch.distributions: gaussian_corr_kl(R_model, R_post) = KL(N(0, R_post) || N(0, R_model))."""
     R_model = _random_correlation(n, seed=n + 7)
     R_post = _random_correlation(n, seed=n + 21)
@@ -47,7 +47,7 @@ def test_matches_torch_kl_divergence(n):
     assert math.isclose(gaussian_corr_kl(R_model, R_post), expected, rel_tol=1e-8, abs_tol=1e-10)
 
 
-def test_scales_with_distance_from_the_target():
+def test_scales_with_distance_from_the_target() -> None:
     """Increases monotonically as R_model moves from R_post toward the identity."""
     n = 12
     R_post = _random_correlation(n, seed=3)
@@ -60,7 +60,7 @@ def test_scales_with_distance_from_the_target():
     assert all(b > a for a, b in zip(vals, vals[1:])), vals
 
 
-def test_singular_model_returns_inf_not_an_exception():
+def test_singular_model_returns_inf_not_an_exception() -> None:
     """A singular R_model returns inf."""
     n = 6
     R_post = _random_correlation(n, seed=11)
@@ -68,7 +68,7 @@ def test_singular_model_returns_inf_not_an_exception():
     assert gaussian_corr_kl(singular, R_post) == float("inf")
 
 
-def test_accepts_float32_inputs():
+def test_accepts_float32_inputs() -> None:
     """float32 inputs give the float64 result."""
     n = 10
     R_post = _random_correlation(n, seed=5)

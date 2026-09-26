@@ -39,7 +39,7 @@ _TINY_BINS = 4
 class FakeTabICL(nn.Module):
     """Deterministic stand-in for run_pit's interface: forward(X, y) -> logits, quantile_dist(logits) -> distribution with cdf/log_prob."""
 
-    def __init__(self, q: int = 2):
+    def __init__(self, q: int = 2) -> None:
         super().__init__()
         self.q = q
 
@@ -61,13 +61,13 @@ def tabicl_fake():
     return FakeTabICL()
 
 
-def test_weighted_corr_identical_curves_is_one():
+def test_weighted_corr_identical_curves_is_one() -> None:
     rho = np.array([0.9, 0.5, 0.2, 0.05])
     w = np.array([10.0, 8.0, 5.0, 2.0])
     assert weighted_corr(rho, rho, w) == pytest.approx(1.0)
 
 
-def test_weighted_rmse_bias_zero_for_identical_curves():
+def test_weighted_rmse_bias_zero_for_identical_curves() -> None:
     rho = np.array([0.9, 0.5, 0.2, 0.05])
     w = np.array([10.0, 8.0, 5.0, 2.0])
     rmse, bias = weighted_rmse_bias(rho, rho, w)
@@ -75,20 +75,20 @@ def test_weighted_rmse_bias_zero_for_identical_curves():
     assert bias == pytest.approx(0.0, abs=1e-8)
 
 
-def test_weighted_r2_perfect_fit_is_one():
+def test_weighted_r2_perfect_fit_is_one() -> None:
     rho = np.array([0.9, 0.5, 0.2, 0.05])
     w = np.array([10.0, 8.0, 5.0, 2.0])
     assert weighted_r2(rho, rho, w) == pytest.approx(1.0)
 
 
-def test_weighted_corr_nan_with_too_few_valid_points():
+def test_weighted_corr_nan_with_too_few_valid_points() -> None:
     a = np.array([0.9, np.nan, np.nan, np.nan])
     b = np.array([0.9, 0.5, 0.2, 0.05])
     w = np.array([10.0, 8.0, 5.0, 2.0])
     assert np.isnan(weighted_corr(a, b, w))
 
 
-def test_build_era5_probe_shapes_and_finite(tabicl_fake):
+def test_build_era5_probe_shapes_and_finite(tabicl_fake) -> None:
     probe = build_era5_probe(
         _TINY_REGION,
         _TINY_GRID,
@@ -118,7 +118,7 @@ def test_build_era5_probe_shapes_and_finite(tabicl_fake):
     assert np.isfinite(probe["rho_emp"][0])
 
 
-def test_build_era5_probe_deterministic(tabicl_fake):
+def test_build_era5_probe_deterministic(tabicl_fake) -> None:
     """build_era5_probe gives the same probe for the same seed."""
     p1 = build_era5_probe(
         _TINY_REGION,
@@ -147,7 +147,7 @@ def test_build_era5_probe_deterministic(tabicl_fake):
     np.testing.assert_array_equal(p1["x_train_norm"], p2["x_train_norm"])
 
 
-def test_build_era5_probe_none_marginal_uses_naive_standardization():
+def test_build_era5_probe_none_marginal_uses_naive_standardization() -> None:
     probe = build_era5_probe(
         _TINY_REGION,
         _TINY_GRID,
@@ -185,7 +185,7 @@ def _tiny_era5_cfg(seed: int = 555) -> "OmegaConf":
     )
 
 
-def test_build_era5_val_batches_shapes(tabicl_fake):
+def test_build_era5_val_batches_shapes(tabicl_fake) -> None:
     batches = _build_era5_val_batches(_tiny_era5_cfg(), tabicl_fake, "cpu")
     assert set(batches.keys()) == {_TINY_REGION}
 
@@ -213,7 +213,7 @@ def test_build_era5_val_batches_shapes(tabicl_fake):
     assert torch.isfinite(probe["nll_test_log_pdf"]).all()
 
 
-def test_build_era5_val_batches_none_marginal_skips_nll():
+def test_build_era5_val_batches_none_marginal_skips_nll() -> None:
     """Without a marginal the probe has no nll_test_* keys."""
     batches = _build_era5_val_batches(_tiny_era5_cfg(), None, "cpu")
     probe = batches[_TINY_REGION]
@@ -222,7 +222,7 @@ def test_build_era5_val_batches_none_marginal_skips_nll():
     assert "nll_test_idx" not in probe
 
 
-def test_build_era5_val_batches_gp_baseline(tabicl_fake):
+def test_build_era5_val_batches_gp_baseline(tabicl_fake) -> None:
     """era5_gp_baseline=True adds a GP-MLE baseline NLL per kernel to each probe (tiny settings)."""
     cfg = _tiny_era5_cfg()
     cfg.baselines.era5_gp_baseline = True
@@ -242,7 +242,7 @@ def test_build_era5_val_batches_gp_baseline(tabicl_fake):
     assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
-def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake):
+def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake) -> None:
     """era5_gp_baseline defaults to True when the key is absent."""
     cfg = OmegaConf.create(
         {
@@ -264,7 +264,7 @@ def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake)
     assert "gp_baseline_nll" in batches[_TINY_REGION]
 
 
-def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake):
+def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake) -> None:
     cfg = OmegaConf.create(
         {
             "baselines": {"era5_regions": ["not_a_real_region"]},
@@ -274,7 +274,7 @@ def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake):
     assert _build_era5_val_batches(cfg, tabicl_fake, "cpu") == {}
 
 
-def test_era5_fit_scoring_with_tiny_model(small_model_cfg, tabicl_fake):
+def test_era5_fit_scoring_with_tiny_model(small_model_cfg, tabicl_fake) -> None:
     torch.manual_seed(0)
     model = build_copula_transformer(small_model_cfg)
     # No model.eval(), as in validate().

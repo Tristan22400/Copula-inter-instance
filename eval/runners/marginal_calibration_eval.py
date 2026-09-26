@@ -33,6 +33,7 @@ from copula_inter.finetune_marginal import (  # noqa: E402
 )
 from copula_inter.pit import (  # noqa: E402
     DEFAULT_K_FOLDS,
+    PRETRAINED_TABICL_CKPT,
     _kernel_fn_from_task,
     gp_analytical_pit,
     load_tabicl,
@@ -54,14 +55,14 @@ def _episode_metrics(tabicl, episodes, k_folds: int, eps: float, device: str) ->
     x_te = torch.stack([e["x_norm_test"] for e in episodes]).to(device)
     y_te = torch.stack([e["y_test"] for e in episodes]).to(device)
 
-    y_tr_s, y_te_s, stds = [], [], []
+    y_tr_list, y_te_list, stds = [], [], []
     for b in range(B):
         a, c, _m, sd = normalize_targets(y_tr[b], y_te[b])
-        y_tr_s.append(a)
-        y_te_s.append(c)
+        y_tr_list.append(a)
+        y_te_list.append(c)
         stds.append(sd)
-    y_tr_s = torch.stack(y_tr_s)
-    y_te_s = torch.stack(y_te_s)
+    y_tr_s = torch.stack(y_tr_list)
+    y_te_s = torch.stack(y_te_list)
     std_t = torch.stack(stds)
 
     out = run_pit_batched(
@@ -84,9 +85,9 @@ def _episode_metrics(tabicl, episodes, k_folds: int, eps: float, device: str) ->
 
     records = []
     for b, ep in enumerate(episodes):
-        sd = float(std_t[b])
+        std_b = float(std_t[b])
         # Back to raw-y nats: log p_raw = log p_scaled - log sd.
-        nll_raw = float(-(logp_scaled[b] - math.log(sd)).mean())
+        nll_raw = float(-(logp_scaled[b] - math.log(std_b)).mean())
 
         rec = {
             "kernel": str(ep.get("kernel", "unknown")),
@@ -162,7 +163,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--ckpt",
-        default="tabicl-regressor-v2-20260212.ckpt",
+        default=PRETRAINED_TABICL_CKPT,
         help="HF filename in jingang/TabICL, a local .pt/.ckpt path, or a name "
         "registered in eval/configs/checkpoints.py::MARGINAL_FAMILIES.",
     )

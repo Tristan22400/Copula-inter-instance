@@ -8,7 +8,7 @@ frozen TabICL (or another marginal backend) PIT, so a checkpoint is required.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig
@@ -256,7 +256,7 @@ class LiveERA5Dataset(IterableDataset):
         tabicl_inference_amp: bool = True,
         marginal_backend: Optional[str] = None,
         marginal_probs_n: int = 99,
-    ):
+    ) -> None:
         self.shared_corpus = shared_corpus
         self.tabicl_ckpt = tabicl_ckpt
         self.tabicl_device = tabicl_device
@@ -271,7 +271,7 @@ class LiveERA5Dataset(IterableDataset):
         self.marginal_backend = marginal_backend
         self.marginal_probs_n = int(marginal_probs_n)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator:
         import numpy as np
 
         info = get_worker_info()

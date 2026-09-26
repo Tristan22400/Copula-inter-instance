@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 import os
+from pathlib import Path
 
 import pytest
 import torch
 from omegaconf import OmegaConf
+from pytest import MonkeyPatch
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,7 +56,7 @@ def tiny_episode():
 class _FakeICLModel(torch.nn.Module):
     """Stands in for CopulaTabICL: forward(batch) -> {"W", "s"}, ignoring the batch."""
 
-    def __init__(self, n_test: int, rank: int):
+    def __init__(self, n_test: int, rank: int) -> None:
         super().__init__()
         self.W = torch.randn(1, n_test, rank) * 0.3
         self.s = torch.randn(1, n_test)
@@ -64,7 +66,7 @@ class _FakeICLModel(torch.nn.Module):
         return {"W": self.W, "s": self.s}
 
 
-def _assert_valid_correlation(R: torch.Tensor, n: int, atol: float = 1e-3):
+def _assert_valid_correlation(R: torch.Tensor, n: int, atol: float = 1e-3) -> None:
     assert R.shape == (n, n)
     assert torch.allclose(R, R.T, atol=atol)
     assert torch.allclose(R.diagonal(), torch.ones(n), atol=1e-2)
@@ -80,7 +82,7 @@ def _contains_tensor(value) -> bool:
     return False
 
 
-def test_pool_episode_payload_encodes_nested_metadata_tensors():
+def test_pool_episode_payload_encodes_nested_metadata_tensors() -> None:
     """Pool payloads contain no tensors, including inside kernel_component_params."""
     episode = {
         "x_norm_train": torch.tensor([[1.0]]),
@@ -104,7 +106,7 @@ def test_pool_episode_payload_encodes_nested_metadata_tensors():
     )
 
 
-def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode, tmp_path):
+def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode, tmp_path: Path) -> None:
     """The spawned pool transports episodes with nested tensor metadata."""
     episode = dict(tiny_episode)
     episode["kernel_component_params"] = [{"l": torch.tensor([0.5])}]
@@ -134,7 +136,7 @@ def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode, tmp_path):
     assert all(isinstance(R, torch.Tensor) for R in fitted["nested-metadata"]["R_dict"].values())
 
 
-def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode):
+def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode) -> None:
     """Every baseline fits (or falls back) on a tiny episode with finite NLLs and valid correlation matrices."""
     n_test = tiny_episode["x_norm_test"].shape[0]
 
@@ -193,7 +195,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
-def test_eval_icl_episode_scores_against_oracle(tiny_episode):
+def test_eval_icl_episode_scores_against_oracle(tiny_episode) -> None:
     n_test = tiny_episode["x_norm_test"].shape[0]
     fake_model = _FakeICLModel(n_test=n_test, rank=2)
 
@@ -221,7 +223,7 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode):
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
-def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode):
+def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode) -> None:
     """With a marginal PIT, icl_y_parts is finite and total = marginal + copula."""
     n_train = tiny_episode["x_norm_train"].shape[0]
     n_test = tiny_episode["x_norm_test"].shape[0]
@@ -251,7 +253,7 @@ def test_eval_icl_episode_with_tabicl_pit_populates_total_nll(tiny_episode):
     )
 
 
-def test_gp_oracle_posterior_total_nll_bayes_optimal(tiny_episode):
+def test_gp_oracle_posterior_total_nll_bayes_optimal(tiny_episode) -> None:
     """The per-point oracle rows keep posterior <= prior."""
     post = gp_analytical_posterior(tiny_episode)
     assert post["nll_post"] <= post["nll_prior"] + 1e-6
@@ -284,7 +286,7 @@ def _near_duplicate_rbf_task(alpha2: float) -> dict:
     }
 
 
-def test_gp_analytical_posterior_eig_floor_scale_invariant():
+def test_gp_analytical_posterior_eig_floor_scale_invariant() -> None:
     """The eigenvalue floor scales with Sigma_post, so a large-alpha2 repaired episode gets a sensible NLL."""
     task = _near_duplicate_rbf_task(alpha2=1e8)
     post = gp_analytical_posterior(task)
@@ -296,7 +298,7 @@ def test_gp_analytical_posterior_eig_floor_scale_invariant():
     assert post["nll_post"] / n < 50.0
 
 
-def test_gp_analytical_posterior_eig_floor_nugget_bound():
+def test_gp_analytical_posterior_eig_floor_nugget_bound() -> None:
     """The eigenvalue floor is never below the nugget (small-scale Sigma_post, alpha2=1e-2)."""
     task = _near_duplicate_rbf_task(alpha2=1e-2)
     post = gp_analytical_posterior(task)
@@ -312,7 +314,7 @@ def test_gp_analytical_posterior_eig_floor_nugget_bound():
     assert repaired_min_eig >= 1e-4 - 1e-9, "post-repair eigenvalues must respect the nugget lower bound"
 
 
-def test_baseline_cache_round_trip(tiny_episode, tmp_path):
+def test_baseline_cache_round_trip(tiny_episode, tmp_path: Path) -> None:
     """save_baseline_cache / load_baseline_cache round-trip on a matching fingerprint and miss otherwise."""
     cache_path = str(tmp_path / "baseline_cache.pt")
 
@@ -378,7 +380,7 @@ def test_baseline_cache_round_trip(tiny_episode, tmp_path):
     assert load_baseline_cache(cache_path, other_fingerprint) == {}
 
 
-def test_failed_baseline_fit_still_yields_nan_parts_dict(tiny_episode, monkeypatch):
+def test_failed_baseline_fit_still_yields_nan_parts_dict(tiny_episode, monkeypatch: MonkeyPatch) -> None:
     """A baseline whose fit raises records a {total, marginal, copula} NaN dict, not a bare float."""
     import eval.baselines.classical as classical
 

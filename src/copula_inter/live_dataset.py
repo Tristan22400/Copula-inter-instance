@@ -129,7 +129,7 @@ class LiveGPDataset(IterableDataset):
         marginal_backend: Optional[str] = None,
         marginal_device: Optional[str] = None,
         marginal_probs_n: int = 99,
-    ):
+    ) -> None:
         # Deep copy so per-call seed changes don't touch the caller's cfg.
         self._cfg = copy.deepcopy(cfg)
         self._base_seed = int(getattr(cfg, "seed", None) or 0)

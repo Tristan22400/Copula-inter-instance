@@ -9,6 +9,7 @@ import os
 
 import numpy as np
 import pytest
+from pytest import MonkeyPatch
 from scipy.stats import kstest, norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -18,7 +19,7 @@ from eval.spatial import calibration as gp  # noqa: E402
 _SEED = 0
 
 
-def test_kendall_pit_null():
+def test_kendall_pit_null() -> None:
     """Y ~ N(0, I_D) scored against standard-normal marginal CDFs: the
     resulting Kendall PIT values must be indistinguishable from Uniform(0, 1)."""
     rng = np.random.default_rng(_SEED)
@@ -35,7 +36,7 @@ def test_kendall_pit_null():
     assert p_value > 0.05, f"Kendall PIT failed KS-test against Uniform(0,1): stat={stat:.4f}, p={p_value:.4f}"
 
 
-def test_kendall_pit_null_various_dims():
+def test_kendall_pit_null_various_dims() -> None:
     """The Kendall transform must hold under H0 for D=1 (identity case) and larger D."""
     rng = np.random.default_rng(_SEED + 1)
     n = 4000
@@ -47,7 +48,7 @@ def test_kendall_pit_null_various_dims():
         assert p_value > 0.01, f"D={D}: Kendall PIT failed KS-test, p={p_value:.4f}"
 
 
-def test_kendall_pit_detects_miscalibration():
+def test_kendall_pit_detects_miscalibration() -> None:
     """An overconfident independence copula (true correlation ignored, CDFs
     computed from too-narrow marginals) must be rejected by the KS-test."""
     rng = np.random.default_rng(_SEED)
@@ -62,7 +63,7 @@ def test_kendall_pit_detects_miscalibration():
     assert p_value < 0.05
 
 
-def test_mahalanobis_null():
+def test_mahalanobis_null() -> None:
     """Y ~ N(0, I_D) with mu=0, sigma^2=1: d^2 must pass a KS-test against chi2(df=D)."""
     rng = np.random.default_rng(_SEED)
     n, D = 4000, 5
@@ -81,7 +82,7 @@ def test_mahalanobis_null():
     )
 
 
-def test_mahalanobis_shape_mismatch_raises():
+def test_mahalanobis_shape_mismatch_raises() -> None:
     y = np.zeros((10, 3))
     means = np.zeros((10, 3))
     variances = np.ones((9, 3))  # wrong n_samples
@@ -89,7 +90,7 @@ def test_mahalanobis_shape_mismatch_raises():
         gp.calc_mahalanobis_distances(y, means, variances)
 
 
-def test_mahalanobis_detects_miscalibration():
+def test_mahalanobis_detects_miscalibration() -> None:
     """Declaring variance=1 when the true generating variance is 4 must
     inflate d^2 well beyond a chi2_D null, and get rejected by the KS-test."""
     rng = np.random.default_rng(_SEED)
@@ -104,7 +105,7 @@ def test_mahalanobis_detects_miscalibration():
     assert p_value < 0.05
 
 
-def test_spatial_coverage_null():
+def test_spatial_coverage_null() -> None:
     """Independent Uniform(0, 1) marginals, nominal bounds [0.05, 0.95]:
     empirical joint coverage should be approximately 0.90^D."""
     rng = np.random.default_rng(_SEED)
@@ -123,7 +124,7 @@ def test_spatial_coverage_null():
     )
 
 
-def test_spatial_coverage_curve_matches_calc(monkeypatch):
+def test_spatial_coverage_curve_matches_calc(monkeypatch: MonkeyPatch) -> None:
     """plot_spatial_coverage_curve must query quantile_func at alpha/2 and
     1 - alpha/2 for each nominal coverage and reproduce calc_spatial_coverage."""
     rng = np.random.default_rng(_SEED)
@@ -150,7 +151,7 @@ def test_spatial_coverage_curve_matches_calc(monkeypatch):
         assert abs(expected - (1 - alpha) ** D) < 0.05
 
 
-def test_exceedance_probs_null():
+def test_exceedance_probs_null() -> None:
     """Independence copula with correctly-specified Gaussian marginals: the
     predicted exceedance probability must equal the true exceedance frequency
     within Monte Carlo error, i.e. the reliability curve lies on y = x."""

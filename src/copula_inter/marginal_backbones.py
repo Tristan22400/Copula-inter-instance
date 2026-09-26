@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from tabicl._model.quantile_dist import QuantileToDistribution
 
 from copula_inter.artifacts import atomic_torch_save
 from copula_inter.backend_registry import BACKENDS
@@ -154,7 +157,7 @@ class MarginalBackbone:
         """
         return _QUANTILE_FORWARDS[self.name](self, X_context, y_context, X_query, probs)
 
-    def quantile_dist_module(self, probs: "np.ndarray | None" = None) -> nn.Module:
+    def quantile_dist_module(self, probs: "np.ndarray | None" = None) -> QuantileToDistribution:
         """Quantile-grid-to-distribution module for the grid quantile_forward(probs) returns.
 
         The model's own quantile_dist for the native grid (TabICL's class for EXAONE).
@@ -164,7 +167,8 @@ class MarginalBackbone:
         if probs is None:
             own = getattr(self.module, "quantile_dist", None)
             if own is not None:
-                return own
+                # TabLDM's class is a byte-identical fork of TabICL's.
+                return cast("QuantileToDistribution", own)
             probs = self.native_probs
         return QuantileToDistribution(alpha_levels=list(probs)).to(next(self.module.parameters()).device)
 
@@ -217,7 +221,7 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
     B = len(X_context)
     per_episode = [_episode_member_batch(bb.handle, X_context[b], y_context[b], X_query[b]) for b in range(B)]
     device = next(bb.module.parameters()).device
-    banks = [None] * B
+    banks: list[torch.Tensor | None] = [None] * B
     for indices in _group_episode_batches(per_episode):
         members = per_episode[indices[0]][0].shape[0]
         xs = torch.from_numpy(np.concatenate([per_episode[b][0] for b in indices], axis=0)).float().to(device)
@@ -246,7 +250,9 @@ def _tabldm_quantile_forward(bb, X_context, y_context, X_query, probs) -> torch.
             scale = float(scaler.scale_[0]) if scaler.scale_ is not None else 1.0
             mean = float(scaler.mean_[0]) if scaler.mean_ is not None else 0.0
             banks[b] = (out[local] * scale + mean).mean(dim=0)
-    return torch.stack(banks, dim=0)  # (B, n_query, Q)
+    filled = [bank for bank in banks if bank is not None]
+    assert len(filled) == B
+    return torch.stack(filled, dim=0)  # (B, n_query, Q)
 
 
 def _exaone_grad_forward(
@@ -372,10 +378,10 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
         raise ValueError(f"Unknown marginal backbone {name!r}; expected one of {list(BACKBONE_NAMES)}.")
 
     if name == "tabicl":
-        from copula_inter.pit import load_tabicl
+        from copula_inter.pit import PRETRAINED_TABICL_CKPT, load_tabicl
 
-        module, config = load_tabicl(ckpt, device, return_config=True) if ckpt else load_tabicl(ckpt, device)
-        return MarginalBackbone(name=name, module=module, handle=None, config=config or {})
+        tabicl, config = load_tabicl(ckpt or PRETRAINED_TABICL_CKPT, device, return_config=True)
+        return MarginalBackbone(name=name, module=tabicl, handle=None, config=config)
 
     if name == "tabpfn":
         raise NotImplementedError(

@@ -251,7 +251,7 @@ class SignModulatedKernel(gpytorch.kernels.Kernel):
         a: Tensor,
         active_dims: Optional[List[int]] = None,
         **kwargs,
-    ):
+    ) -> None:
         # batch_shape comes from w's leading dim (B,).
         super().__init__(batch_shape=torch.Size([w.shape[0]]), **kwargs)
         self.base_kernel = base_kernel
@@ -287,7 +287,7 @@ class _DenseComposedKernel(gpytorch.kernels.Kernel):
     near-singular sums that dot_product/polynomial components produce.
     """
 
-    def __init__(self, kernel_a: gpytorch.kernels.Kernel, op: str, kernel_b: gpytorch.kernels.Kernel, **kwargs):
+    def __init__(self, kernel_a: gpytorch.kernels.Kernel, op: str, kernel_b: gpytorch.kernels.Kernel, **kwargs) -> None:
         super().__init__(**kwargs)
         assert op in ("+", "*"), f"op must be '+' or '*', got {op!r}"
         self.kernel_a = kernel_a
@@ -919,7 +919,7 @@ class _MeanFunctionBank(gpytorch.means.Mean):
         anomaly_threshold: Tensor,
         anomaly_magnitude: Tensor,
         family_onehot: Tensor,
-    ):
+    ) -> None:
         super().__init__()
         self.register_buffer("weight", weight)  # (B, d)
         self.register_buffer("bias", bias)  # (B,)

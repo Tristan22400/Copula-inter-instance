@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from importlib.resources import files
 from pathlib import Path
+from typing import Any, cast
+
+from omegaconf import DictConfig, OmegaConf
 
 
 def config_dir(caller_file: str) -> str:
@@ -11,3 +14,11 @@ def config_dir(caller_file: str) -> str:
         if (parent / "conf" / "config.yaml").is_file():
             return str(parent / "conf")
     return str(files("conf"))
+
+
+def config_dict(cfg: DictConfig) -> dict[str, Any]:
+    """cfg resolved into a plain dict."""
+    out = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(out, dict):
+        raise TypeError(f"expected a mapping config, got {type(out).__name__}")
+    return cast(dict[str, Any], out)

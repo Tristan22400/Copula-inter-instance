@@ -5,13 +5,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from pytest import MonkeyPatch
 
 from copula_inter.marginal_backbones import _tabldm_quantile_forward
 from eval.spatial import tabldm_batched
 
 
 class Scaler:
-    def __init__(self, value):
+    def __init__(self, value) -> None:
         self.scale_ = np.array([value + 1.0])
         self.mean_ = np.array([value * 10.0])
 
@@ -20,7 +21,7 @@ class Scaler:
 
 
 class Model(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(2.0))
         self.calls = []
@@ -33,7 +34,7 @@ class Model(torch.nn.Module):
 
 @pytest.mark.parametrize("widths", [(11, 10, 11), (11, 11, 11)])
 @pytest.mark.parametrize("probs", [None, [0.1, 0.9]])
-def test_grouped_predictions_and_gradients_match_separate_episodes(monkeypatch, widths, probs):
+def test_grouped_predictions_and_gradients_match_separate_episodes(monkeypatch: MonkeyPatch, widths, probs) -> None:
     episodes = [
         (np.full((2, 5, width), b + 1, dtype=np.float32), np.zeros((2, 3), dtype=np.float32), Scaler(b + 1))
         for b, width in enumerate(widths)

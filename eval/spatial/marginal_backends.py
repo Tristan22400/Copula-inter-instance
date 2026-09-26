@@ -96,7 +96,7 @@ def _make_pretrained_regressor(name: str, device: "str | None" = None):
         # Avoid reloading the ~300MB checkpoint from disk on every .fit() call.
         orig_load = reg._load_model
 
-        def _cached_load():
+        def _cached_load() -> None:
             if getattr(reg, "model_", None) is None:
                 orig_load()
 

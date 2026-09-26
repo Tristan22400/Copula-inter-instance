@@ -159,7 +159,7 @@ class CopulaTabICL(nn.Module):
         rank: int,
         correlation_parametrization: str = "covnorm",
         backbone_name: str = "tabicl",
-    ):
+    ) -> None:
         super().__init__()
         # Discover the feature dimension, then replace the quantile decoder with Identity.
         in_features = copula_backbones.strip_decoder(base)

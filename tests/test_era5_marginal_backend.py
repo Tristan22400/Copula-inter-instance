@@ -18,7 +18,7 @@ from omegaconf import OmegaConf
         ("tabldm", "tabldm"),
     ],
 )
-def test_resolve_marginal_maps_z_train_source(source, expected):
+def test_resolve_marginal_maps_z_train_source(source, expected) -> None:
     from copula_inter.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": source}})
@@ -27,14 +27,14 @@ def test_resolve_marginal_maps_z_train_source(source, expected):
     assert probs_n == 99
 
 
-def test_resolve_marginal_reads_probs_n():
+def test_resolve_marginal_reads_probs_n() -> None:
     from copula_inter.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": "tabldm", "z_train_marginal_probs_n": 33}})
     assert _resolve_marginal(cfg) == ("tabldm", 33)
 
 
-def test_resolve_marginal_rejects_typo():
+def test_resolve_marginal_rejects_typo() -> None:
     """_resolve_marginal rejects unknown z_train_source values."""
     from copula_inter.era5_live_dataset import _resolve_marginal
 
@@ -44,7 +44,7 @@ def test_resolve_marginal_rejects_typo():
 
 
 @pytest.mark.parametrize("backend", ["tabldm"])
-def test_pit_group_and_episode_agree_under_backend(backend):
+def test_pit_group_and_episode_agree_under_backend(backend) -> None:
     """A backend reaches the PIT, and the grouped and single-episode paths agree."""
     pytest.importorskip(backend, reason=f"{backend} not installed")
     from copula_inter.era5_live_dataset import _pit_episode, _pit_group

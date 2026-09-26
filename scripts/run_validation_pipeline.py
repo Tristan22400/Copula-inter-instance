@@ -23,7 +23,7 @@ def _is_oscillatory(kernel: str) -> bool:
 failures = []
 
 
-def run_command(command: list, description: str, env: dict | None = None):
+def run_command(command: list, description: str, env: dict | None = None) -> bool:
     print(f"\n{'=' * 60}")
     print(f"🚀 RUNNING: {description}")
     print(f"💻 Command: {' '.join(command)}")
@@ -41,7 +41,7 @@ def run_command(command: list, description: str, env: dict | None = None):
         return False
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Automated Kernel Validation Pipeline")
     parser.add_argument("--kernel", type=str, default="rbf", help="Kernel to validate (e.g., rbf)")
     parser.add_argument(

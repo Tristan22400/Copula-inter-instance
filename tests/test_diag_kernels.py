@@ -24,7 +24,7 @@ def cfg():
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_kernel_produces_valid_r_star(cfg, kernel_name):
+def test_kernel_produces_valid_r_star(cfg, kernel_name) -> None:
     """Every kernel gives finite, unit-diagonal, PSD, non-trivial R_star."""
     torch.manual_seed(SEED)
     random.seed(SEED)
@@ -46,7 +46,7 @@ N_TASKS_STAGE3 = 100
 
 
 @pytest.mark.parametrize("kernel_name", ALL_KERNELS)
-def test_kernel_off_diagonal_not_degenerate(cfg, kernel_name):
+def test_kernel_off_diagonal_not_degenerate(cfg, kernel_name) -> None:
     torch.manual_seed(SEED)
     random.seed(SEED)
     cfg.data.kernel = kernel_name

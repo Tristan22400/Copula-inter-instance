@@ -30,20 +30,20 @@ def make_identity_w(B: int, N: int, rank: int):
     return torch.zeros(B, N, rank + 1)
 
 
-def test_copula_nll_is_finite():
+def test_copula_nll_is_finite() -> None:
     """copula_nll should return a finite scalar for valid inputs."""
     W, z, mask = make_w_and_z(B=4, N=10, rank=2)
     loss = copula_nll(W, z, mask)
     assert torch.isfinite(loss), f"copula_nll returned non-finite: {loss}"
 
 
-def test_copula_nll_is_scalar():
+def test_copula_nll_is_scalar() -> None:
     W, z, mask = make_w_and_z(B=4, N=10, rank=2)
     loss = copula_nll(W, z, mask)
     assert loss.shape == (), f"Expected scalar, got shape {loss.shape}"
 
 
-def test_copula_nll_gradients_flow():
+def test_copula_nll_gradients_flow() -> None:
     """Gradients must flow from loss to W_tilde."""
     W, z, mask = make_w_and_z(B=4, N=10, rank=2)
     W = W.requires_grad_(True)
@@ -53,7 +53,7 @@ def test_copula_nll_gradients_flow():
     assert torch.isfinite(W.grad).all(), "Non-finite gradients"
 
 
-def test_copula_nll_zero_mask():
+def test_copula_nll_zero_mask() -> None:
     """copula_nll with all-False mask should return zero (no valid tasks)."""
     B, N, rank = 2, 5, 2
     W = torch.randn(B, N, rank + 1)
@@ -64,7 +64,7 @@ def test_copula_nll_zero_mask():
     assert loss.item() == 0.0
 
 
-def test_oracle_copula_nll_is_finite():
+def test_oracle_copula_nll_is_finite() -> None:
     """oracle_copula_nll should be finite for valid inputs."""
     B, N = 4, 8
     torch.manual_seed(5)
@@ -81,7 +81,7 @@ def test_oracle_copula_nll_is_finite():
     assert torch.isfinite(loss), f"oracle_copula_nll not finite: {loss}"
 
 
-def test_oracle_le_independence_on_average():
+def test_oracle_le_independence_on_average() -> None:
     """Oracle (R=R_star) should beat independence (R=I) on average over many tasks."""
     torch.manual_seed(42)
     B, N, rank = 8, 20, 4
@@ -120,7 +120,7 @@ def test_oracle_le_independence_on_average():
     )
 
 
-def test_copula_nll_smaller_for_better_w():
+def test_copula_nll_smaller_for_better_w() -> None:
     """copula_nll should be smaller when W_tilde encodes the true correlation."""
     torch.manual_seed(99)
     N, rank = 10, 3
@@ -158,7 +158,7 @@ def test_copula_nll_smaller_for_better_w():
     assert mean_true < mean_rand, f"True W NLL ({mean_true:.4f}) should be lower than random W NLL ({mean_rand:.4f})"
 
 
-def test_woodbury_matches_direct_cholesky():
+def test_woodbury_matches_direct_cholesky() -> None:
     """copula_nll (Woodbury) matches oracle_copula_nll for R = W W^T + eps I (eps=0.5 keeps it well-conditioned)."""
     torch.manual_seed(7)
     B, N, rank = 1, 8, 3
