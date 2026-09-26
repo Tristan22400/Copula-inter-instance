@@ -1,19 +1,4 @@
-"""calibration.py — TabICL calibration diagnostics: per-quantile-level
-Expected Calibration Error (marginal calibration — is any single grid
-cell's quantile forecast correct on its own?) plus independence-copula
-multivariate calibration (given only per-cell MARGINAL quantile
-predictions, no correlation/copula model — is the INDEPENDENCE JOINT
-implied by those marginals correct?). Promoted from plots/generate_plots.py
-(compute_quantile_ece, generate_era5_reliability_diagram,
-plot_era5_quantile_reliability, calc_kendall_pit,
-calc_mahalanobis_distances, calc_exceedance_probs, calc_spatial_coverage and
-their plot_* counterparts), used by eval/runners/era5_calibration_eval.py.
-`plot_era5_quantile_reliability` uses the real eval.tabicl_utils
-TabICLRegressor wrapper instead of generate_plots.py's local
-TabICLv2_Regressor (a thin, non-mock wrapper around the same
-tabicl.TabICLRegressor — same swap as era5_calibration_eval.py's
-MockTabICLv2 replacement).
-"""
+"""TabICL calibration diagnostics: per-quantile ECE (marginal calibration) and independence-copula joint calibration (Kendall PIT, Mahalanobis, exceedance, spatial coverage)."""
 
 from __future__ import annotations
 

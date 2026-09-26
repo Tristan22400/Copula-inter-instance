@@ -1,6 +1,4 @@
-"""checkpoints.py — canonical checkpoint-family registry: paths, French
-report labels, and plot colors, single-sourced here instead of the
-CHECKPOINTS list duplicated across every plots/*.py sweep/report script."""
+"""Checkpoint-family registry: paths, report labels and plot colours."""
 
 from __future__ import annotations
 
@@ -10,23 +8,8 @@ _CHECKPOINTS_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "checkpoints"
 )
 
-# name -> {dir, default_step, label, color}. `dir` is the run directory under
-# checkpoints/ (may itself be several path segments, e.g. the
-# "copula_prod/canonical/..." nesting the checkpoints/ reorg -- commit
-# 902d35c, "Reorganize checkpoint structure..." -- introduced; every entry
-# below was re-pointed at its post-reorg location then, so keep `dir` in
-# sync with wherever a family's step_*.pt actually lives on disk, not just
-# its bare run-directory name); `default_step` picks which step_*.pt file
-# `diagnose`/`sweep` use when a bare family name (not "family:step") is
-# given.
-#
-# Kept to the best-performing checkpoint per training lineage (per the
-# spatial-correlation model_r2 sweeps -- see project memory): dropped
-# kernel-sweep-all@500k (worst overall, negative model_r2 almost everywhere
-# despite the longest training), kernel-sweep-all-tabicl-retrain-60k
-# (regresses vs. its own 15k-step sibling), and kernel-sweep-classic-prod@110k
-# (flat, distance-blind correlation prediction, dominated by its own 5k-step
-# TabICL finetune below).
+# name -> {dir, default_step, label, color}. dir is relative to checkpoints/;
+# default_step is used when no "family:step" is given.
 CHECKPOINT_FAMILIES = {
     "kernel-sweep-all-noisy-mae": {
         "dir": "copula_prod/canonical/kernel-sweep-all-noisy-mae",
@@ -64,23 +47,9 @@ CHECKPOINT_FAMILIES = {
         "label": "zcorrupt bigN retrain (210k steps)",
         "color": "#937860",
     },
-    # The only NANO-backbone entry here, and the only one whose copula head is
-    # rank 512 rather than 32 (feature_dim 128, 386K params total against the
-    # prod families' 27M). Trained with P and N both PINNED -- P 32..32,
-    # N 256..256, d_features 10 -- and with tabicl.pretrained=false, its
-    # marginal coming from tabicl.pit_ckpt (the ERA5 run1 fine-tune, see
-    # MARGINAL_FAMILIES["era5-run1"] below).
-    #
-    # One consequence worth knowing before scoring it: rank 512 enters
-    # baseline_fingerprint (it sizes per_ep_transformer's low-rank factor), so
-    # this checkpoint CANNOT reuse a rank-32 --baseline_cache -- give it its
-    # own and expect a full fit pass.
-    #
-    # Its training P/N being pinned at 32/256 is a fact about the checkpoint,
-    # NOT a reason to score it on a different geometry from every other entry
-    # here: eval runs are compared across checkpoints, so the geometry stays at
-    # eval_checkpoint.py --era5's defaults and the pinning is a caveat to state
-    # alongside the numbers, not a knob to turn.
+    # Nano backbone, rank 512, trained with P=32, N=256, d_features=10 and the
+    # era5-run1 marginal. Its rank changes the baseline fingerprint, so it needs its
+    # own --baseline_cache.
     "copula-nano-finetune-marginal-float32": {
         "dir": "copula_nano/copula-finetune-marginal-float32",
         "default_step": 630000,
@@ -112,31 +81,14 @@ def resolve_checkpoint(name_or_path: str) -> str:
 
 
 def all_family_names() -> list[str]:
-    """Every registered family name, in registry order -- what `--checkpoints
-    all` (the default for `sweep`) auto-discovers."""
+    """Every registered copula family name, in registry order."""
     return list(CHECKPOINT_FAMILIES)
 
 
-# ---------------------------------------------------------------------------
-# Marginal (Phase A) checkpoints — a SEPARATE registry, on purpose
-# ---------------------------------------------------------------------------
-#
-# These are plain TabICL checkpoints ({"config", "state_dict"}) produced by
-# src/copula_inter/finetune_marginal.py and consumed by pit.load_tabicl. CHECKPOINT_FAMILIES
-# above holds COPULA checkpoints, consumed by builders that construct a
-# CopulaTabICL and load a copula state dict into it. Putting a marginal entry in
-# that dict would make `sweep --checkpoints all` (which iterates
-# all_family_names()) try to load a TabICL state dict into a copula model and
-# fail -- so the two kinds get two registries and two resolvers rather than one
-# dict with a type tag nothing checks.
-#
-# `dir` is under checkpoints/; `default_step` picks the step_*.pt file for a
-# bare family name. `tabicl.pit_ckpt` in a copula run takes the resolved path.
+# Marginal (Phase A) checkpoints: TabICL {"config", "state_dict"} files for
+# pit.load_tabicl, kept separate from the copula families.
 MARGINAL_FAMILIES: dict[str, dict] = {
-    # The frozen pretrained marginal every copula run has used so far -- the
-    # baseline row in eval/runners/marginal_calibration_eval.py, and the thing
-    # a Phase-A run has to beat. Not a local path: pit.load_tabicl resolves a
-    # bare name through the jingang/TabICL HF repo.
+    # Pretrained TabICL from the jingang/TabICL HF repo.
     "pretrained": {
         "hf_name": "tabicl-regressor-v2-20260212.ckpt",
         "label": "TabICL v2 pretrained (frozen baseline)",
@@ -153,13 +105,7 @@ MARGINAL_FAMILIES: dict[str, dict] = {
         "default_step": 16200,
         "label": "TabICL v2 fine-tune ERA5 12m (step 16.2k final)",
     },
-    # THE CONFIGURED DEFAULT. conf/model/copula_prod.yaml's tabicl.ckpt and
-    # conf/model/copula_nano.yaml's tabicl.pit_ckpt both already point at this
-    # file, so it is what eval_checkpoint.py --z_train_source=tabicl loads when
-    # no --tabicl_ckpt is passed. Registered here so it can also be named
-    # ("--tabicl_ckpt era5-run1") instead of only spelled as a path, and so the
-    # registry stops implying era5-33y/era5-12m are the only fine-tuned
-    # marginals that exist.
+    # Default marginal (conf/model/copula_prod.yaml tabicl.ckpt, copula_nano tabicl.pit_ckpt).
     "era5-run1": {
         "dir": "marginal/ablations/marginal_finetune_era5_run1",
         "filename": "step_0177600_final.pt",
@@ -168,24 +114,16 @@ MARGINAL_FAMILIES: dict[str, dict] = {
     },
 }
 
-# The marginal every copula run resolves to when nothing overrides it, kept as
-# a name rather than a duplicated path so callers can refer to "the default"
-# without re-spelling conf/model/*.yaml. Changing the configs without changing
-# this (or vice versa) is the drift this constant exists to make obvious.
+# Name of the default marginal (keep in sync with conf/model/*.yaml).
 DEFAULT_MARGINAL_FAMILY = "era5-run1"
 
 
 def resolve_marginal_checkpoint(name_or_path: str) -> str:
-    """Resolve a marginal-checkpoint token to something ``pit.load_tabicl`` takes.
+    """Resolve a marginal-checkpoint token for pit.load_tabicl.
 
-    Accepts, in order:
-      - a raw path that exists on disk (returned unchanged)
-      - a MARGINAL_FAMILIES name with an ``hf_name`` -> that HF filename
-      - "family" / "family:step" -> that family's dir + step under checkpoints/
-      - anything else -> returned unchanged, so a bare HF filename still works
-        without needing a registry entry (load_tabicl treats a non-path as an
-        HF filename anyway, and failing here would be a worse error than the
-        one the HF hub gives).
+    An existing path is returned as is; a MARGINAL_FAMILIES name maps to its HF
+    filename or checkpoint file ("family:step" picks a step); anything else is
+    returned unchanged (treated as an HF filename).
     """
     if os.path.exists(name_or_path):
         return name_or_path

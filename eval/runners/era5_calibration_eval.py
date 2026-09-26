@@ -1,32 +1,15 @@
-"""era5_calibration_eval.py — real-ERA5 driver for the independence-copula
-multivariate spatial calibration diagnostics in eval/spatial/calibration.py
-(calc_kendall_pit, calc_mahalanobis_distances, calc_exceedance_probs,
-calc_spatial_coverage and their plot_* counterparts). Promoted from
-plots/run_era5_eval.py.
+"""Real-ERA5 independence-copula calibration of TabICL's marginals (eval/spatial/calibration.py).
 
-All four calibration metrics are, by their own docstrings, testing whether
-TabICL's MARGINALS ALONE (ignoring spatial correlation — the independence
-copula) are calibrated: they only need real per-cell marginal quantile
-predictions, not the correlation/copula model. So the promotion from
-plots/run_era5_eval.py's placeholder `MockTabICLv2` to a real model is a
-contained swap of the quantile source — via eval/tabicl_utils.py's
-make_tabicl_regressor + tabicl_quantiles (the same helpers
-eval/runners/run_benchmarks.py already uses) — not new inference logic.
-
-For each timestamp, an in-context-learning episode is built with
-`sample_icl_task_from_era5`: a dense target patch inside a lat/lon box, and
-a global context of `n_ctx` points from the rest of the grid at that same
-timestamp.
+For each timestamp, an episode has a dense target patch inside a lat/lon box
+and n_ctx context points from the rest of the grid.
 
 Usage:
-    python eval/runners/era5_calibration_eval.py \\
-        --nc-path /path/to/era5_temperature.nc \\
+    python eval/runners/era5_calibration_eval.py \
+        --nc-path /path/to/era5_temperature.nc \
         --target-lat-bounds 45 50 --target-lon-bounds 0 5
 
-If --nc-path is omitted, a small real ERA5 sample (Western Europe, 10 daily
-snapshots from Jan 2023) is auto-downloaded from the public no-auth
-ARCO-ERA5 Zarr archive on GCS and cached under eval/data/cache/, so the
-script produces real results out of the box with no arguments.
+Without --nc-path a small ERA5 sample (Western Europe, 10 days of Jan 2023) is
+downloaded from the public ARCO-ERA5 archive and cached in eval/data/cache/.
 """
 
 from __future__ import annotations
@@ -56,9 +39,7 @@ _ELEV_VAR_CANDIDATES = (
     "orography", "elevation", "altitude",
 )
 
-# Public, no-auth ARCO-ERA5 archive used to auto-fetch a default real-data
-# sample when --nc-path is omitted (see reference memory: no CDS API key
-# needed).
+# Public ARCO-ERA5 archive (no credentials needed).
 _ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
 _CACHE_DIR = os.path.join(_REPO_ROOT, "eval", "data", "cache")
 _DEFAULT_CACHE_NC = os.path.join(_CACHE_DIR, "era5_calibration_default.nc")
@@ -69,25 +50,12 @@ _DEFAULT_FETCH_LON_BOUNDS = (0.0, 40.0)  # kept in [0, 360) to match ARCO-ERA5's
 _DEFAULT_FETCH_TIME_RANGE = ("2023-01-01", "2023-01-10")  # 10 daily (00:00 UTC) snapshots
 _DEFAULT_FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")
 
-# Quantile levels TabICL is queried at for every ICL episode. Dense enough
-# to (a) fit a Gaussian mean/std per target cell via least squares, (b)
-# invert the quantile function at an arbitrary threshold by linear
-# interpolation, and (c) read off arbitrary alpha/2, 1-alpha/2 central-
-# interval bounds for the coverage curve.
+# Quantile levels TabICL is queried at.
 ALPHA_GRID = np.round(np.linspace(0.01, 0.99, 99), 2)
 
 
 def _fetch_default_era5_subset(cache_path: str = _DEFAULT_CACHE_NC) -> str:
-    """Download a small real ERA5 sample (2m temperature + surface
-    geopotential, Europe box, 10 daily snapshots from Jan 2023) from the
-    public no-auth ARCO-ERA5 Zarr archive and cache it as a local NetCDF
-    file, so this only runs once. Returns `cache_path`.
-
-    A separate fetch routine from eval/data/fetch_era5.py: this needs a
-    real datetime64 'time' coordinate and elevation, which that
-    diagnostics-focused fetcher's minimal (t2m/lat/lon/integer-day-index)
-    NetCDF3-classic schema deliberately doesn't carry.
-    """
+    """Download and cache a small ERA5 sample (2 m temperature and surface geopotential, Europe, 10 days of Jan 2023) as NetCDF; return its path."""
     if os.path.exists(cache_path):
         return cache_path
     os.makedirs(_CACHE_DIR, exist_ok=True)
@@ -107,9 +75,6 @@ def _fetch_default_era5_subset(cache_path: str = _DEFAULT_CACHE_NC) -> str:
     return cache_path
 
 
-# ---------------------------------------------------------------------------
-# ERA5 -> ICL episode
-# ---------------------------------------------------------------------------
 def _find_var(ds: xr.Dataset, candidates: Sequence[str]) -> Optional[str]:
     for name in candidates:
         if name in ds.variables:
@@ -229,9 +194,6 @@ def sample_icl_task_from_era5(
     return X_ctx, Y_ctx, X_target, Y_target
 
 
-# ---------------------------------------------------------------------------
-# Quantile-grid adapters (shared by all 4 calibration metrics)
-# ---------------------------------------------------------------------------
 def _invert_quantile_cdf(y_values: np.ndarray, quantile_values: np.ndarray, alpha_grid: np.ndarray) -> np.ndarray:
     """Per-row inverse of a piecewise-linear quantile function: row i's
     (quantile_values[i], alpha_grid) pairs are the model's declared
@@ -264,9 +226,6 @@ def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray)
     return means, sigmas**2
 
 
-# ---------------------------------------------------------------------------
-# Evaluation loop + figure
-# ---------------------------------------------------------------------------
 def run_era5_eval(
     nc_path: str,
     target_lat_bounds: Tuple[float, float],
