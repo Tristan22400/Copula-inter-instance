@@ -1,47 +1,16 @@
-"""marginal_calibration_eval.py — Deliverable 2: make the marginal's defect
-MEASURABLE, before any weight moves.
+"""Marginal calibration of a TabICL checkpoint on GP episodes, against the analytic posterior.
 
-    python eval/runners/marginal_calibration_eval.py                  # pretrained baseline
-    python eval/runners/marginal_calibration_eval.py --ckpt ./checkpoints/marginal_finetune/step_0020000_final.pt
+    python eval/runners/marginal_calibration_eval.py
+    python eval/runners/marginal_calibration_eval.py --ckpt <marginal checkpoint>
     python eval/runners/marginal_calibration_eval.py --p-values 32 --n-episodes 256
 
-Why this runner exists
-----------------------
-No existing runner reports marginal calibration on the production PIT path.
-``eval/spatial/calibration.py::compute_quantile_ece`` has been in the repo the
-whole time but is orphaned — reachable only from
-``tests/test_reliability_diagram.py``. So the size of the marginal's error, the
-thing the whole Phase-A workstream is aimed at, was never a number anyone could
-quote. This runner is that number, and it is deliberately zero-training: run it
-once on the pretrained checkpoint to get the baseline row, run it again on a
-Phase-A output, subtract.
-
-What it reports, and why each one
----------------------------------
-* ``nll`` vs ``nll_oracle`` -> ``gap``. **The headline.** ``y`` is a pure GP draw,
-  so the exact marginal posterior predictive is known in closed form; the gap is
-  how many nats/point the frozen marginal is above the analytic floor. This is
-  exactly the part of ``loss.y_space_nll``'s marginal term that no copula run can
-  ever improve, because that term contains no trainable parameters.
-* ``ks`` / rank histogram — is ``u = F(y)`` actually Uniform(0,1)? KS gives a
-  scalar; the rank histogram says *how* it fails (U-shaped = over-sharp,
-  dome = under-sharp), which a scalar cannot.
-* ``ece`` — ``compute_quantile_ece`` over TabICL's native 999-level grid. Reuses
-  the orphan rather than reimplementing it.
-* ``z_gap`` — ``mean|z_tabicl - z_analytic|``, the same quantity
-  ``train.py::_compute_tabicl_z_train_gap`` tracks, against the "two independent
-  standard normals" reference of ``2/sqrt(pi) ~ 1.128``. This is the number that
-  matters to the *copula*: z-space distortion is why this repo forbids comparing
-  a learned Sigma against the oracle R_star at all.
-* ``probit_clamp`` / ``slope_clamp`` — **silent failures**, currently invisible.
-  ``pit._probit``'s ``eps=1e-6`` hard-caps ``|z| <= 4.7534``, and
-  ``QuantileDistribution``'s ``MIN_SLOPE/MAX_SLOPE = 1e-+6`` bounds ``|log f| <=
-  13.8``. Both saturate silently and both kill the gradient there, so a nonzero
-  fraction is a real constraint on what Phase A can even learn.
-
-Everything is broken out per kernel family and per context size ``P`` — the two
-axes the defect is expected to vary along, and the two the fix is expected to
-vary along too.
+Reported per kernel family and context size P:
+    nll, nll_oracle and gap: marginal NLL vs the exact GP marginal posterior.
+    ks and the rank histogram of u = F(y).
+    ece over the native 999-level grid.
+    z_gap: mean |z_tabicl - z_analytic| (independent normals give ~1.128).
+    probit_clamp / slope_clamp: fractions hitting the probit clamp
+        (|z| <= 4.7534) or the density clamp (|log f| <= 13.8).
 """
 
 from __future__ import annotations
@@ -73,27 +42,14 @@ from copula_inter.pit import (  # noqa: E402
     run_pit_batched,
 )
 
-# |log f| ceiling implied by QuantileDistribution's MIN_SLOPE/MAX_SLOPE = 1e-+6:
-# the density is 1 / (dQ/dalpha), so clamping the slope to [1e-6, 1e6] clamps
-# log f to [-13.8155, +13.8155]. Hitting it means the spline could not resolve
-# the density at that point at all -- and the gradient there is exactly zero.
+# |log f| bound implied by QuantileDistribution's slope clamp [1e-6, 1e6].
 _LOG_F_CEILING = math.log(1e6)
 
 
 def _episode_metrics(
     tabicl, episodes, k_folds: int, eps: float, device: str
 ) -> list[dict]:
-    """Score one shared-(P, N) batch of GP episodes on the EXACT production PIT
-    path, and return one record per episode.
-
-    ``run_pit_batched`` (not a hand-rolled forward) so this measures what
-    training and deployment actually compute, including the K-fold geometry and
-    the ``normalize_targets`` scaling every real call site applies. Three
-    different ``u = F(y)`` implementations coexist in this repo -- this one,
-    ``era5_calibration_eval.py``'s 99-knot ``np.interp``, and
-    ``joint_nll.py``'s ``np.interp`` + finite difference -- and they disagree in
-    the tails. This deliberately uses ``pit.py``'s.
-    """
+    """Score one shared-(P, N) batch of GP episodes through pit.run_pit_batched; one record per episode."""
     B = len(episodes)
     x_tr = torch.stack([e["x_norm_train"] for e in episodes]).to(device)
     y_tr = torch.stack([e["y_train"] for e in episodes]).to(device)
@@ -125,9 +81,7 @@ def _episode_metrics(
     records = []
     for b, ep in enumerate(episodes):
         sd = float(std_t[b])
-        # Jacobian back to raw-y nats: log p_raw(y) = log p_scaled(y_s) - log sd.
-        # Same convention as train.py::_tabicl_pit_batch and data_gen, so these
-        # numbers are directly comparable to val/y_nll_marginal.
+        # Back to raw-y nats: log p_raw = log p_scaled - log sd.
         nll_raw = float(-(logp_scaled[b] - math.log(sd)).mean())
 
         rec = {
@@ -150,8 +104,7 @@ def _episode_metrics(
             "rank_hist": rank_histogram(u_test[b].cpu().numpy(), 20).tolist(),
         }
 
-        # --- analytic references (skipped for kernel families this repo cannot
-        # --- reconstruct; see gp_analytical_posterior's own callers).
+        # Analytic references (skipped for kernels that cannot be rebuilt).
         try:
             kfn, nugget = _kernel_fn_from_task(ep)
             mu, sigma = analytic_marginal_targets(
@@ -242,9 +195,7 @@ def main() -> None:
 
     from hydra import compose, initialize_config_dir
 
-    # Compose the SAME prior Phase A trains against, rather than re-declaring
-    # one here -- a measurement taken on a different prior than the fine-tuning
-    # would not be a before/after of anything.
+    # Same prior as Phase A training.
     with initialize_config_dir(config_dir=os.path.join(_REPO_ROOT, "conf"), version_base=None):
         full = compose(config_name="finetune_marginal")
 

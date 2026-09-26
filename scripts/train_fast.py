@@ -1,49 +1,18 @@
 #!/usr/bin/env python3
-"""
-train_fast.py — instant-startup debug trainer for the Copula Transformer.
+"""Fast-start debug trainer for the copula model.
 
-train.py's startup (baselines.enabled's 8 synthetic-kernel probes + a TabICL
-K-fold PIT pass over every one of them, a real ERA5 fetch + classical-GP-MLE
-baseline fit, a second frozen-TabICL "sim-to-real diagnostic" load, a
-500-episode fixed validation set built through TabICL's own K-fold PIT, live
-DataLoader worker spawn, wandb.init's network round-trip) takes ~7 minutes
-before the first training step runs. That's dead time when what you actually
-need is "is this model/config training at all, and does the loss move" —
-e.g. debugging a run that looks stuck.
+Builds the same Hydra config, model, optimizer, schedule, AMP setup and
+training step as copula_inter.train, but skips the startup probes, wandb and
+persistent workers, and validates on the first DEBUG_VAL_N_BATCHES batches of
+the live validation set, whose z comes from a TabICL PIT regardless of
+data.z_train_source. Checkpoints use the same format.
 
-This script builds the exact same Hydra config train.py would (same
-`model=`/`data=` groups and CLI overrides), the exact same model, optimizer
-(Muon), LR schedule, AMP setup, and per-step forward/loss/backward/clip/step
-logic — imported directly from src/copula_inter/train.py, not reimplemented, so a step
-here behaves identically to a step in the real run. It only diverges from
-train.py in what it skips: no baselines/era5 probes, no wandb, no persistent
-DataLoader workers, and a small in-process-generated validation set instead
-of the fixed 500-episode one. First step happens in seconds, most of that
-being CUDA context init + (if data.z_train_source=tabicl, the default) one
-frozen-TabICL load.
-
-The debug val set's z_test always comes from real TabICL K-fold PIT,
-unconditionally, regardless of what data.z_train_source/z_train_tabicl_mix_*
-the TRAINING steps use (matches eval_checkpoint.py's own default of scoring
-against the real deployment signal) -- so it needs a resolvable TabICL
-checkpoint even when training itself is pure data.z_train_source=analytic.
-
-Not a replacement for train.py — no wandb logging, no baselines/era5
-validation metrics. Checkpointing (training.ckpt_dir/training.resume_ckpt)
-uses train.py's own save_checkpoint/load_checkpoint, so a checkpoint saved
-here is a normal checkpoint train.sh can resume, and training.resume_ckpt
-here can load the actual stuck run's checkpoint to debug from where it left
-off. For a full production run, use train.sh.
-
-Usage (same Hydra override syntax as train.py):
+Usage:
     python scripts/train_fast.py
-    python scripts/train_fast.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
+    python scripts/train_fast.py training.resume_ckpt=<checkpoint.pt>
     python scripts/train_fast.py model=copula_nano training.steps=200
-    python scripts/train_fast.py data.z_train_source=analytic   # train on the analytic oracle -- val z_test still always uses real TabICL
-    python scripts/train_fast.py training.batch_size=8 data.N_max=64  # shrink episodes for an even faster loop
-    # Alternate per-episode between the analytic z_train and real-TabICL PIT
-    # z_train at a fixed 50/50 rate (every kernel family, no adaptive gap
-    # measurement -- see the z_train_tabicl_mix_enabled block below):
+    python scripts/train_fast.py data.z_train_source=analytic
+    python scripts/train_fast.py training.batch_size=8 data.N_max=64
     python scripts/train_fast.py data.z_train_tabicl_mix_enabled=true \
         data.z_train_tabicl_mix_floor_frac=0.5 data.z_train_tabicl_mix_max_frac=0.5
 """
@@ -58,10 +27,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("WANDB_MODE", "disabled")
 
-# Force line-buffered stdout even when piped/redirected (e.g. `| tee log.txt`)
-# -- this script's entire point is watching output live to tell a genuinely
-# stuck run apart from one that's just quiet because Python block-buffers
-# non-tty stdout. Without this, output can sit in the buffer indefinitely.
+# Line-buffered stdout even when piped.
 sys.stdout.reconfigure(line_buffering=True)
 
 
@@ -81,61 +47,22 @@ from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.checkpointing import load_checkpoint, save_checkpoint
 from copula_inter.probe_batches import _sigma_stats
 
-# Debug-loop cadence -- deliberately NOT tied to training.log_every/val_every
-# (those default to 200/1000, tuned for multi-day production runs, not a
-# "watch it start" debug session). Override by editing these constants
-# directly if you want a different cadence.
+# Debug logging and validation cadence.
 DEBUG_LOG_EVERY = 1
 DEBUG_VAL_EVERY = 20
-# How many of live_dataset.py::build_fixed_live_val_batches' fixed val
-# batches to reproduce here (see _build_debug_val_batch below) -- 2 keeps
-# startup near-instant; raise for a lower-variance (but slower to build)
-# val estimate.
+# Number of validation batches reproduced.
 DEBUG_VAL_N_BATCHES = 2
 
 
 def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_device: str,
                             tabicl_model, tabicl_k_folds: int, tabicl_split_calib_frac: float):
-    """The first `DEBUG_VAL_N_BATCHES` batches of train.py's own fixed
-    live-generation validation set (see live_dataset.py::
-    build_fixed_live_val_batches) -- NOT an independent sample.
+    """The first DEBUG_VAL_N_BATCHES batches of the live validation set (same seeds), PIT'd with tabicl_model.
 
-    `tabicl_model` here is ALWAYS applied unconditionally (this function
-    never receives a tabicl_mix_weights -- see the call site in main(),
-    which passes a val-only TabICL load decoupled from whatever
-    data.z_train_source/z_train_tabicl_mix_* the training loop itself uses).
-    So z_test (and hence z_train) in every val batch comes from real TabICL
-    K-fold PIT, always -- scoring against the same approximate marginal real
-    deployment data would produce, regardless of what the model trained on.
-
-    generate_gp_batch fully reseeds python/numpy/torch RNGs from cfg.seed on
-    every call (see data_gen.py's module docstring), so batch i there is a
-    deterministic function of (cfg, val_seed + i*104_729, batch_size,
-    tabicl checkpoint weights) alone. Reusing that exact seed formula here
-    with the same training.live_val_seed/training.batch_size/data config/
-    tabicl checkpoint as the run being debugged reproduces those episodes
-    byte-for-byte -- so this val loss is a genuine (if smaller/higher-
-    variance) subsample of whatever train.sh logs as val/y_nll_total, not a
-    different validation distribution. That equivalence breaks the moment
-    training.batch_size, training.live_val_seed, the data.* config, or the
-    resolved TabICL checkpoint differ from the run you're comparing against.
-
-    Also computes the copula gap's fixed operand here, once: pit.
-    gp_analytical_posterior's exact Schur-complement GP posterior per raw
-    episode (return_kernel_metadata=True gives it the kernel metadata it
-    needs), Sklar-split via its own nll_post_copula -- the same
-    per-point-normalized quantity train.py::validate() averages into
-    oracle_diag/copula_nll. This is a property of the fixed episodes alone,
-    independent of the model being trained, so it's computed once here
-    rather than every validation call (mirrors train.py's own
-    posterior_probe/val_episodes_meta split).
+    Returns (n_episodes, val_seed, batch_size, batches, oracle_copula_nll), the
+    last being the mean per-point analytic posterior copula NLL
+    (gp_analytical_posterior), the fixed operand of the copula gap.
     """
-    # Each batch is kept SEPARATELY collated, exactly like
-    # build_fixed_live_val_batches's own `batches: List[dict]` -- d_features
-    # is sampled once per generate_gp_batch call (data_gen.py::
-    # _sample_d_features) and can differ across the two calls below, so
-    # concatenating their episodes into one collate_fn call would crash the
-    # same way a cross-shard variable-d training batch would.
+    # Keep batches separately collated (d_features may differ between calls).
     val_seed = int(t.get("live_val_seed", 20260723))
     batch_size = int(t.batch_size)
     batches = []
@@ -154,9 +81,7 @@ def _build_debug_val_batch(cfg: DictConfig, t: DictConfig, device: str, gen_devi
             try:
                 post = gp_analytical_posterior(ep)
             except (NotImplementedError, KeyError):
-                # Rare unsupported kernel schema (see gp_analytical_posterior's
-                # docstring) -- skip this one episode's oracle rather than
-                # crash the whole debug run over it.
+                # Skip the oracle for kernels that cannot be rebuilt.
                 continue
             n_test_ep = int(ep["x_norm_test"].shape[0])
             oracle_copula_per_point.append(float(post["nll_post_copula"]) / n_test_ep)
@@ -195,11 +120,7 @@ def main(cfg: DictConfig) -> None:
         else ("cpu" if t.device == "auto" else t.device)
     )
 
-    # conf/config.yaml's training.steps default (1_000_000) is sized for a
-    # real production run, not a "watch it start" debug session -- if the
-    # caller didn't lower it explicitly, cap it here instead of silently
-    # looping for days. Explicit training.steps=N overrides always win since
-    # they replace this value before this check ever runs.
+    # Cap training.steps unless it was overridden.
     if int(t.steps) >= 100_000:
         print(f"[train_fast] training.steps={int(t.steps)} looks like the production default -- capping to 60 for this debug run (pass training.steps=N to override).")
         t.steps = 60
@@ -213,16 +134,7 @@ def main(cfg: DictConfig) -> None:
         if z_train_source == "tabicl_split" else 0.0
     )
 
-    # Fixed-fraction z_train mixing (alternate per-episode between the
-    # analytic residual and real-TabICL PIT instead of committing the whole
-    # run to one source). Reuses train.py's data.z_train_tabicl_mix_enabled/
-    # _floor_frac/_max_frac knobs (see conf/data/gp_tasks.yaml) rather than
-    # inventing new ones, but train_fast.py only supports the FIXED-fraction
-    # case (floor_frac == max_frac): train.py's floor != max path measures a
-    # real per-kernel-family TabICL-vs-analytic gap via
-    # train.py::_compute_tabicl_z_train_gap first, which runs its own
-    # synthetic-kernel probes -- exactly the slow startup this script exists
-    # to skip. Use train.py directly if you need that adaptive weighting.
+    # Fixed-fraction TabICL z_train mixing only (floor_frac == max_frac).
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_mix_weights = None
     if mix_enabled:
@@ -261,16 +173,7 @@ def main(cfg: DictConfig) -> None:
         f"z_train_source={z_train_source}{mix_desc} device={device}"
     )
 
-    # Debug val set's z_test (and hence z_train too -- data_gen.py couples
-    # them, see generate_gp_batch's z_train-source-override comment) always
-    # comes from real-TabICL PIT, unconditionally -- decoupled from whatever
-    # z_train_source/z_train_tabicl_mix_* the TRAINING steps above use. This
-    # matches eval_checkpoint.py's own --z_train_source tabicl default ("the
-    # real deployment" signal): you can train cheaply on the analytic oracle
-    # (or a mix) while still validating against the actual approximate
-    # TabICL marginal the model will see once deployed. Reuses tabicl_model
-    # if training already loaded one (z_train_source=tabicl/tabicl_split or
-    # mixing enabled); otherwise loads a second copy just for val.
+    # Validation z always comes from a TabICL PIT (reuses the training marginal if loaded).
     if tabicl_model is not None:
         val_tabicl_model, val_gen_device = tabicl_model, gen_device
     else:

@@ -1,7 +1,4 @@
-"""tabicl_utils.py — thin wrappers around the public ``tabicl.TabICLRegressor``
-sklearn-compatible interface, shared by every benchmark that needs TabICL
-marginals (as opposed to inference/copula_inference.py's low-level TabICL
-model class, which does no target scaling of its own)."""
+"""Helpers around the public tabicl.TabICLRegressor (which scales y itself)."""
 
 from __future__ import annotations
 
@@ -15,22 +12,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_tabicl_regressor(checkpoint: str | None = None, device: str | None = None):
-    """Construct one ``tabicl.TabICLRegressor``, meant to be reused across
-    every ``.fit()`` call in a run (as ``plots/generate_plots.py::
-    TabICLv2_Regressor`` documents: "Loading it once and reusing the
-    instance across repeated .fit() calls ... avoids reloading the backbone
-    weights every time"). K-fold PIT alone needs ~10 fit/predict calls per
-    episode, so a fresh instance per call would be wasteful.
+    """Build one TabICLRegressor to reuse across .fit() calls.
 
-    ``checkpoint`` is either a filename inside the ``jingang/TabICL`` HF repo
-    (``checkpoint_version``, TabICLRegressor's own download-and-cache path)
-    or a local ``.ckpt``/``.pt`` file (``model_path``, loaded directly) —
-    dispatched on ``os.path.isfile``, the same local-path-first convention
-    ``src/copula_inter/pit.py::load_tabicl`` uses, so a checkpoint-specific marginal
-    (e.g. a Phase-A-finetuned ``tabicl.pit_ckpt``, or anything
-    ``src/copula_inter/pit.py::resolve_pit_ckpt`` resolves) is a genuine drop-in here
-    too, not just for the low-level TabICL object ``load_marginal_tabicl``
-    loads.
+    checkpoint is a local .ckpt/.pt file (model_path) or a jingang/TabICL HF
+    filename (checkpoint_version).
     """
     from tabicl import TabICLRegressor
 
@@ -55,31 +40,17 @@ def make_tabicl_regressor(checkpoint: str | None = None, device: str | None = No
 def tabicl_quantiles(
     regressor, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray, probs: np.ndarray
 ) -> np.ndarray:
-    """Fit the public ``tabicl.TabICLRegressor`` in-context and return its
-    quantile grid at X_query, in RAW y-units.
-
-    Deliberately uses the sklearn-compatible ``TabICLRegressor`` (as
-    ``plots/generate_plots.py::TabICLv2_Regressor`` does) rather than the
-    low-level ``TabICL`` model class ``inference/copula_inference.py`` calls
-    directly. The low-level class does no target scaling of its own — see
-    ``tabicl_upstream/src/tabicl/_model/tabicl.py`` (no normalize/scale in
-    its forward pass) vs. ``tabicl_upstream/src/tabicl/_sklearn/regressor.py``
-    (``fit()`` step 1 fits a fresh ``StandardScaler`` on y, ``predict()`` step
-    5 inverse-transforms back) — so callers of the low-level class must
-    replicate that scaling themselves to get sane quantiles on real-scale
-    targets. Going through ``TabICLRegressor`` directly means that scaling
-    (plus its outlier clipping and ensembling) is the canonical, tested
-    implementation instead of a hand-rolled stand-in.
+    """Fit TabICLRegressor on the context and return its quantiles at X_query.
 
     Args:
-        regressor : a TabICLRegressor instance (see make_tabicl_regressor)
-        X_context : (n_ctx, d)
-        y_context : (n_ctx,) — RAW scale, not pre-normalized
-        X_query   : (n_q, d)
-        probs     : (Q,) — probability levels to query
+        regressor: TabICLRegressor.
+        X_context: (n_ctx, d).
+        y_context: (n_ctx,) raw targets.
+        X_query: (n_q, d).
+        probs: (Q,) levels.
 
     Returns:
-        quantile_grid: (n_q, Q), RAW y-units
+        (n_q, Q) quantile grid in raw y units.
     """
     regressor.fit(X_context, y_context)
     return regressor.predict(X_query, output_type="quantiles", alphas=list(probs))
@@ -94,17 +65,10 @@ def tabicl_loo_pit(
     eps: float = 1e-6,
     seed: int = 0,
 ) -> np.ndarray:
-    """K-fold leave-fold-out PIT via TabICLRegressor: the same idea as
-    inference/copula_inference.py::loo_pit, but through the public,
-    canonically-scaled TabICLRegressor interface instead of the low-level
-    TabICL model class. For each fold, fits on the other folds and PIT-
-    transforms the held-out fold's true y against the fitted quantile grid.
-    The fold-splitting/PIT recipe itself lives in
-    eval/metrics/joint_nll.py::kfold_loo_pit, shared with every other
-    marginal backend (see eval/spatial/marginal_backends.py::loo_pit).
+    """K-fold PIT of the training set through TabICLRegressor (eval/metrics/joint_nll.kfold_loo_pit).
 
     Returns:
-        Z_train: (n_train,) — Gaussianized PIT residuals
+        (n_train,) Gaussianized residuals.
     """
     from eval.metrics.joint_nll import kfold_loo_pit
 

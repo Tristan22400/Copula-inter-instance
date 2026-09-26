@@ -1,23 +1,10 @@
-"""fetch_era5_global.py — fetch the FULL global 2m-temperature grid (every
-latitude/longitude ARCO-ERA5 carries, no region crop) from the same public,
-no-auth ARCO-ERA5 Zarr archive eval/data/fetch_era5.py uses, one calendar
-month at a time, cached locally as NetCDF3-classic files compatible with
-eval.data.era5_io.load_era5_data's schema (t2m/latitude/longitude/time).
+"""Fetch the full global ERA5 2 m temperature grid, one month per NetCDF3 file, from the public ARCO-ERA5 archive.
 
-Why global + monthly instead of fetch_era5.py's per-region cache: this feeds
-src/copula_inter/era5_live_dataset.py's worldwide finetuning corpus (random region AND
-random resolution sampled fresh every training episode, see
-eval/data/era5_global_corpus.py) — cropping/coarsening a fixed local global
-archive per-episode is far cheaper than a GCS round-trip per episode, and
-"a few hundred small regional pulls" would re-download heavily overlapping
-lat/lon ranges from GCS many times over. One month of the full 0.25 deg
-global grid (721x1440 points, one 00:00 UTC snapshot/day, float32) is
-~125 MB, safely under NetCDF3-classic's ~2GiB single-file limit and small
-enough that fetching is resumable at monthly granularity (skip whatever is
-already cached, like fetch_era5.py's fetch() does per-region).
+One 00:00 UTC snapshot per day (~125 MB per month). Months already cached are
+skipped.
 
 Usage:
-  python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
+    python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
 """
 
 from __future__ import annotations
@@ -40,10 +27,7 @@ def cache_path_for(year: int, month: int, cache_dir: str = _CACHE_DIR) -> str:
 
 
 def fetch_month(year: int, month: int, cache_dir: str = _CACHE_DIR, force: bool = False) -> str:
-    """Return the local NetCDF path for the full global grid, every daily
-    (00:00 UTC) snapshot in (year, month), fetching from ARCO-ERA5 and
-    writing it to the on-disk cache on a miss. `force=True` bypasses the
-    cache and re-fetches."""
+    """Path of the cached NetCDF for (year, month), fetching it first if missing (force re-fetches)."""
     target_path = cache_path_for(year, month, cache_dir)
     if os.path.exists(target_path) and not force:
         return target_path
@@ -107,10 +91,7 @@ def fetch_month(year: int, month: int, cache_dir: str = _CACHE_DIR, force: bool 
 
 
 def fetch_range(start_year: int, start_month: int, n_months: int, cache_dir: str = _CACHE_DIR, force: bool = False) -> list[str]:
-    """Fetch n_months consecutive calendar months starting at (start_year,
-    start_month), skipping months already cached (unless force=True).
-    Resumable: re-running with the same args after a partial/interrupted run
-    only re-fetches what's missing."""
+    """Fetch n_months consecutive months from (start_year, start_month), skipping cached ones unless force."""
     paths = []
     year, month = start_year, start_month
     for _ in range(n_months):

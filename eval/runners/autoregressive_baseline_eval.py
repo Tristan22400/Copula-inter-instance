@@ -1,30 +1,11 @@
-"""eval/runners/autoregressive_baseline_eval.py — compare the trained Copula
-Model against an autoregressive marginal-chain baseline
-(eval/baselines/autoregressive.py) that uses ONLY the same frozen/finetuned
-TabICL marginal, no copula head at all: for a query set of size N, it chains
-N single-point forward passes, growing the context by one row after each
-query point is processed (Bruinsma et al., ICLR 2023's "Autoregressive
-Conditional Neural Process" construction).
+"""Compare the copula model with the autoregressive marginal chain (eval/baselines/autoregressive.py) on live GP episodes.
 
-Both methods condition on the same synthetic GP episodes eval_checkpoint.py
-already generates (--live_generate) and are scored in the same raw-nats,
-per-point convention eval_checkpoint.py's _print_total_nll_table uses
-(src/copula_inter/loss.py::y_space_nll's "total" is already averaged over each episode's
-own N), so the two printed numbers are directly comparable.
-
-NLL uses TEACHER FORCING (the true past target is appended to the context at
-each autoregressive step) — the exact chain-rule decomposition of the true
-joint density. Sampling (for the comparison plot) uses ANCESTRAL SAMPLING
-(the drawn value is appended instead) — a different quantity by design, a
-draw from the model's implied joint rather than a density evaluation. Query
-order is the episode's existing x_norm_test order, not randomized/averaged
-over permutations.
+Both are scored in per-point raw nats; the chain uses teacher forcing in the
+episode's own test order. Sample plots use ancestral sampling.
 
 Usage:
-    python eval/runners/autoregressive_baseline_eval.py \
-        --ckpt checkpoints/copula_nano/copula-finetune-marginal-float32/step_0630000.pt \
-        --tabicl_marginal_ckpt era5-33y \
-        --n_episodes 20 --n_plot_episodes 3
+    python eval/runners/autoregressive_baseline_eval.py --ckpt <copula checkpoint> \
+        --tabicl_marginal_ckpt era5-33y --n_episodes 20 --n_plot_episodes 3
 """
 
 from __future__ import annotations
@@ -69,17 +50,7 @@ _DEFAULT_CKPT = os.path.join(
 def _one_sample_pair(
     tabicl_marginal, icl_model, R_icl, X_train, y_train, X_test, y_train_scaled, mean, std, device,
 ):
-    """One joint sample from each method, unscaled back to raw y-units.
-
-    Copula Model: one batched marginal forward pass over all of X_test
-    (fixed, shared context — the whole point of an explicit copula is not
-    needing to grow the context), combined with the copula's own Sigma via
-    Cholesky + a single shared white-noise vector (same pattern as
-    src/copula_inter/train.py::_era5_viz_field, generalized off its ERA5-specific bits).
-
-    Autoregressive marginal-chain: autoregressive_log_pdf's ancestral
-    sampling (conditioning="sample"), in the episode's own test order.
-    """
+    """One joint sample per method in raw y units: the copula model (one marginal pass plus chol(Sigma) noise) and the chain (ancestral sampling)."""
     N = X_test.shape[0]
     Sigma_np = R_icl.detach().to(torch.float64).cpu().numpy()
     L = torch.from_numpy(safe_cholesky(Sigma_np)).to(device=device, dtype=X_test.dtype)
@@ -91,10 +62,7 @@ def _one_sample_pair(
         tabicl_marginal, torch.cat([X_train, X_test]).unsqueeze(0), y_train_scaled.unsqueeze(0),
     ).to(device)
     marginal_dist = tabicl_marginal.quantile_dist(logits[0])
-    # icdf treats a plain (n,) alpha as n shared quantile levels broadcast
-    # across the whole batch (-> a (batch, n) grid), not one alpha per
-    # distribution -- an explicit trailing size-1 axis (src/copula_inter/train.py's
-    # _era5_viz_field:855-857) selects one quantile per distribution instead.
+    # Trailing size-1 axis: one quantile level per distribution.
     y_copula_scaled = marginal_dist.icdf(u_copula.unsqueeze(-1)).squeeze(-1)
     y_copula_sample = (mean + std * y_copula_scaled).detach().cpu().numpy()
 

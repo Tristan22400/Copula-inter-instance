@@ -1,29 +1,11 @@
-"""summarize_results_cache.py — reprint eval_checkpoint.py's summary tables
-from a --results_cache file, without re-running anything.
+"""Reprint eval_checkpoint.py's summary tables from one or more --results_cache files.
 
-eval_checkpoint.py only prints its tables after its episode loop finishes, so
-a run killed at its OAR walltime leaves behind every episode it scored (the
---results_cache is written after each one) and no table to read them from.
-This prints exactly the same tables from that file, over however many
-episodes actually completed.
+Usage:
+    python eval/runners/summarize_results_cache.py <results_cache.json> [...] \
+        [--era5] [--max_episodes N]
 
-It is also the cheapest way to compare two checkpoints that were scored over
-the same episodes: point it at each one's --results_cache in turn.
-
-Usage
------
-    python eval/runners/summarize_results_cache.py <results_cache.json> [...]
-
-        [--era5]   # label the tables as real-ERA5 (see eval_checkpoint.py's
-                   # --era5: the oracle rows are structurally nan and the
-                   # shared z_test is the frozen-TabICL PIT, not ground truth).
-                   # Inferred automatically when the cached fingerprint says so.
-        [--max_episodes N]   # summarize only the first N by episode index
-
-The tables' own row semantics are documented on _print_table and
-_print_total_nll_table in eval_checkpoint.py — this module deliberately calls
-those rather than reimplementing them, so a change to either shows up here
-too.
+--era5 labels the tables as real ERA5 (inferred from the cached fingerprint).
+--max_episodes keeps the first N by episode index.
 """
 
 from __future__ import annotations
@@ -49,19 +31,14 @@ def summarize(path: str, era5: bool | None = None, max_episodes: int | None = No
         print(f"{path}: no scored episodes in this cache.")
         return
 
-    # The fingerprint carries the whole run config, so the labels below are
-    # read off the file rather than guessed from the filename.
+    # Labels come from the cached fingerprint.
     if era5 is None:
-        # The stored fingerprint is eval_checkpoint.py's _results_fingerprint,
-        # which nests the baseline fingerprint under "baseline" -- and the
-        # era5 sub-dict is set on that baseline fingerprint. There is no
-        # top-level "era5" key to fall back to.
+        # The era5 settings live under the fingerprint's "baseline" entry.
         era5 = bool((fp.get("baseline") or {}).get("era5"))
     z_src = fp.get("z_train_source") or "tabicl"
     ckpt = fp.get("ckpt")
 
-    # Sort by episode index, not by dict order: a resumed run appends its new
-    # episodes after the reused ones, so insertion order is not episode order.
+    # Sort by episode index.
     keys = sorted(entries, key=lambda k: int(k))
     if max_episodes is not None:
         keys = keys[:max_episodes]
@@ -75,9 +52,7 @@ def summarize(path: str, era5: bool | None = None, max_episodes: int | None = No
     print(f"episodes scored: {len(keys)} (indices {keys[0]}..{keys[-1]})")
 
     _print_table(all_nlls, z_train_source=z_src, era5=era5)
-    # The chain's settings are in the fingerprint too, so the autoregressive
-    # row keeps its footnote (including the --ar_conditioning=sample warning)
-    # when the table is reprinted from a cache instead of from a live run.
+    # Autoregressive footnote settings come from the fingerprint.
     _print_total_nll_table(
         all_total, z_train_source=z_src, era5=era5,
         ar_note=_ar_note(all_total, fp.get("ar_order") or "random",

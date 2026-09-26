@@ -1,26 +1,13 @@
-"""spatial_correlation_eval.py — single CLI entrypoint for the whole
-spatial-correlation diagnostic/sweep/baseline/report toolchain, replacing
-the 22 ad-hoc scripts that used to live in plots/.
+"""Spatial-correlation diagnostics CLI.
 
 Subcommands:
-  diagnose  — single/multi-checkpoint deep-dive plots for ONE (region,
-              grid_size) real-ERA5 config or ONE synthetic kernel config:
-              distance-vs-correlation, correlation heatmaps, and a
-              small-multiples residual-field panel. Loops over --ckpt
-              in-process (shared model cache), auto-fetches/caches ERA5.
-  sweep     — batch scalar+curve metrics over every (checkpoint, config) in
-              a named profile (eval/configs/regions.py /
-              eval/configs/constants.py), persisted to eval/results/*.json.
-              --checkpoints all (default) auto-discovers every registered
-              checkpoint family.
-  baseline  — direct (non-learned) theoretical-law curve fits against
-              ground truth, for the same profiles `sweep` uses. No model/GPU.
-  report    — reads eval/results/*.json + eval/configs/checkpoints.py labels
-              /colors, writes bar-chart + curve-overlay figures to
-              eval/reports/figures/.
-  all       — chains sweep (real+synthetic) -> baseline (real+synthetic) ->
-              report in one process, using every default above: the
-              minimal-intervention, single-command entrypoint.
+    diagnose: correlation-vs-distance, heatmaps and field panels for one
+        real-ERA5 or synthetic config, for one or more --ckpt.
+    sweep: scalar and curve metrics for every (checkpoint, config) in a
+        profile, written to eval/results/*.json (--checkpoints all by default).
+    baseline: theoretical-law fits to the ground truth for the same profiles.
+    report: figures in eval/reports/figures/ from eval/results/*.json.
+    all: sweep, baseline and report, real and synthetic.
 
 Usage:
     python eval/runners/spatial_correlation_eval.py all
@@ -72,10 +59,7 @@ _DIAGNOSE_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "diagnose")
 
 
 def _safe_ckpt_tag(token: str) -> str:
-    """Filesystem-safe identifier for `token` (a checkpoint family name or a
-    raw .pt path) used in output filenames — a raw path's '/' would
-    otherwise be interpreted as directory separators and create bogus
-    nested directories instead of a flat file."""
+    """Filesystem-safe tag for a checkpoint name or path (no '/')."""
     if os.sep in token or (os.altsep and os.altsep in token):
         run_dir = os.path.basename(os.path.dirname(os.path.abspath(token)))
         step_name = os.path.splitext(os.path.basename(token))[0]
@@ -83,9 +67,6 @@ def _safe_ckpt_tag(token: str) -> str:
     return token
 
 
-# ---------------------------------------------------------------------------
-# diagnose
-# ---------------------------------------------------------------------------
 def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_context: int,
                     device: "str | None", seed: int, out_dir: str) -> None:
     ckpt = resolve_checkpoint(ckpt_token)
@@ -125,15 +106,8 @@ def _diagnose_real(ckpt_token: str, region: str, grid_size: int, n_days: int, n_
             predict_copula_residual_field(marginal, context_coords, context_values, coords, R_indep, resolved_device, z_shared)
         )
 
-        # Y-space (not z-space) empirical correlation -- see
-        # pool_yspace_samples_and_correlate's docstring for why this pools
-        # N_YSPACE_MC_SAMPLES draws per day. R_dummy needs the SAME real
-        # context/marginal as R_context to produce an honest y-space sample
-        # at all (there's no y-space meaning to "no context") -- what
-        # varies is which correlation matrix (context-conditioned vs.
-        # unconditional) gets injected, isolating exactly what conditioning
-        # on real context buys, the same way independent_fields above
-        # isolates R_indep.
+        # Y-space correlation from pooled samples, with the context-conditioned and
+        # the unconditional correlation under the same context and marginal.
         z_batch = rng.standard_normal((constants.N_YSPACE_MC_SAMPLES, D))
         model_yspace_samples.append(
             sample_copula_residual_fields(marginal, context_coords, context_values, coords, R_context, resolved_device, z_batch)
@@ -253,9 +227,6 @@ def cmd_diagnose(args) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# sweep
-# ---------------------------------------------------------------------------
 def _sweep(mode: str, profile: str, checkpoints_arg: "str | None", n_context: int, n_days: int,
            n_draws: int, device: "str | None", seed: int, out_path: "str | None" = None,
            compute_gp_baseline: bool = True, gp_kernels: "list | None" = None,
@@ -297,9 +268,6 @@ def cmd_sweep(args) -> None:
            gp_n_steps_mle=args.gp_n_steps_mle, gp_lr_mle=args.gp_lr_mle, gp_n_restarts_mle=args.gp_n_restarts_mle)
 
 
-# ---------------------------------------------------------------------------
-# baseline
-# ---------------------------------------------------------------------------
 def _baseline(mode: str, profile: str, laws: list, n_days: int, ckpt_token: "str | None",
               device: "str | None", seed: int, out_path: "str | None" = None) -> str:
     out_path = out_path or os.path.join(_RESULTS_DIR, f"baseline_{mode}.json")
@@ -369,9 +337,6 @@ def cmd_baseline(args) -> None:
     _baseline(args.mode, args.profile, args.laws, args.n_days, args.ckpt, args.device, args.seed, args.out)
 
 
-# ---------------------------------------------------------------------------
-# report
-# ---------------------------------------------------------------------------
 def _family_style(family_token: str) -> tuple:
     entry = CHECKPOINT_FAMILIES.get(family_token)
     if entry is not None:
@@ -418,17 +383,9 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
     plt.close(fig)
     print(f"Saved {bar_path}")
 
-    # --- bar chart: total (marginal+copula) joint NLL per config, grouped by
-    # family — only present for mode="real" results (sweep_core.py::
-    # run_real_config); model_r2 above is a binned correlation-curve-shape
-    # diagnostic and not a proper scoring rule, so it can't answer "how many
-    # nats worse is the real predictive density" the way this can. ---
+    # Bar chart of total Y-space joint NLL per config (real mode only).
     if all("nll_total" in r for r in results):
-        # GP-MLE baseline kernels present in the results (real-ERA5 mode
-        # only, sweep_core.py::run_real_config's "gp_baseline_nll" field —
-        # same value for every family/config row thanks to
-        # _fit_gp_baseline_nll's cross-checkpoint cache, so any one matching
-        # row's fit works as the lookup source).
+        # GP-MLE baseline kernels present in the results (real mode).
         gp_kernels = sorted({k for r in results for k in r.get("gp_baseline_nll", {})})
         n_series_nll = len(families) + len(gp_kernels)
         width_nll = 0.8 / max(n_series_nll, 1)
@@ -457,13 +414,7 @@ def _report_mode(results: list, mode: str, out_dir: str, baseline_path: str) -> 
         plt.close(fig)
         print(f"Saved {nll_bar_path}")
 
-    # --- curve overlays: ground truth vs. every family's predicted curve, one figure per config ---
-    # Both real-mode keys are now in the SAME (raw-y) space: rho_emp is
-    # np.corrcoef of the actual observed days, rho_model_yspace is
-    # np.corrcoef of MC samples drawn from each family's own implied Sklar
-    # model (see sweep_core.py::run_real_config) -- comparable across
-    # families regardless of which marginal each one uses, since raw-y
-    # correlation needs no PIT/marginal at all on the ground-truth side.
+    # Curve overlays per config: rho_emp and each family's rho_model_yspace, both raw-y correlations.
     gt_key = "rho_emp" if mode == "real" else "rho_true"
     pred_key = "rho_model_yspace" if mode == "real" else "rho_pred"
     for config_name in configs:
@@ -520,9 +471,6 @@ def cmd_report(args) -> None:
     _report(args.out_dir, args.real_results, args.synthetic_results, args.baseline_real, args.baseline_synthetic)
 
 
-# ---------------------------------------------------------------------------
-# all — the minimal-intervention entrypoint
-# ---------------------------------------------------------------------------
 def cmd_all(args) -> None:
     checkpoints = args.checkpoints or "all"
     baseline_synthetic_ckpt = (
@@ -547,9 +495,6 @@ def cmd_all(args) -> None:
     print(f"=== [all] done. Figures in {_FIGURES_DIR} ===")
 
 
-# ---------------------------------------------------------------------------
-# argparse
-# ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)

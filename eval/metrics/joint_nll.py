@@ -1,40 +1,12 @@
-"""joint_nll.py — Joint NLL under Sklar's theorem, for arbitrary (quantile_grid, probs, R).
+"""Joint NLL under Sklar's theorem for any (quantile_grid, probs, R), via loss.y_space_nll.
 
-Thin wrapper around ``src/copula_inter/loss.py::y_space_nll`` — the copula-NLL + marginal-NLL
-decomposition is NOT re-derived here; ``y_space_nll`` already implements it
-(dense Cholesky via ``_safe_cholesky``, masked padding) and is reused verbatim.
-The only new code is turning a generic ``(quantile_grid, probs)`` marginal
-representation (which may come from TabICL, a fitted GP, or anything else)
-into the ``(z, log_pdf)`` pair ``y_space_nll`` expects — via the same
-finite-difference PIT recipe already used in
-``experiments/experiment_b_quantitative.py::_quantile_grid_pit`` (ported
-verbatim rather than imported, since ``experiments/`` is a script directory,
-not a stable package boundary).
-
-NAMING TRAP — two different "copula"/"marginal" conventions share the same
-key names across this codebase; grabbing one by key without checking which
-convention produced it silently mixes incomparable numbers:
-
-  1. OWN-MARGINAL (this module's ``compute_joint_nll``, ``src/copula_inter/loss.py::
-     y_space_nll``, ``eval/baselines/classical.py``'s ``y_space_nlls``,
-     ``eval/runners/eval_checkpoint.py``'s ``total_nlls``): each method
-     supplies its OWN fitted/estimated marginal, so its own ``z`` differs
-     method-to-method — "copula" here is that method's own PIT-residual
-     copula NLL, "total" = copula + marginal is a genuine proper-scoring-
-     rule comparison across methods (every method scored at the same real
-     y_test under its own full predictive density).
-  2. SHARED-MARGINAL (``eval/baselines/classical.py``'s ``nlls`` /
-     ``corr_nll_single``, ``eval/runners/eval_checkpoint.py``'s
-     ``_print_table``): every method is scored against the SAME
-     (typically ground-truth) ``z_test`` — only the predicted correlation
-     matrix R differs — so "copula" here ranks correlation-structure
-     quality alone, valid only because z is held fixed, and is NOT the
-     same quantity as (1)'s "copula" despite the identical key name. There
-     is no "marginal"/"total" key in this convention at all.
-
-See ``eval/runners/eval_checkpoint.py``'s ``_print_table`` vs.
-``_print_total_nll_table`` docstrings for the concrete case where both
-conventions are printed side by side.
+Two conventions share the key names "copula"/"marginal":
+    own marginal (compute_joint_nll, loss.y_space_nll, classical
+        y_space_nlls, eval_checkpoint total_nlls): each method uses its own
+        marginal and z; "total" is comparable across methods.
+    shared marginal (classical nlls / corr_nll_single, eval_checkpoint
+        _print_table): every method uses the same z_test and only R differs;
+        there is no marginal or total.
 """
 
 from __future__ import annotations
@@ -53,14 +25,11 @@ __all__ = ["compute_joint_nll", "compute_pit", "kfold_loo_pit"]
 def compute_pit(
     quantile_grid: np.ndarray, probs: np.ndarray, y_true: np.ndarray, eps: float = 1e-6
 ) -> tuple[np.ndarray, np.ndarray]:
-    """PIT (Z-values) and log-density for true targets from an ALREADY-BUILT
-    (quantile_grid, probs) pair, via linear interpolation for u = F(y) and a
-    local finite-difference slope of the quantile function for the density
-    (f(z) = 1/Q'(F(z))). Verbatim port of
-    experiments/experiment_b_quantitative.py::_quantile_grid_pit. Public (not
-    prefixed with ``_``) because callers outside this module use it directly
-    to get Z-space residuals for real datasets that have no known generative
-    kernel — e.g. as an empirical ground-truth correlation proxy."""
+    """PIT z-values and log-densities of y_true from a (quantile_grid, probs) pair.
+
+    u = F(y) by linear interpolation; density f = 1 / Q'(u) from a local finite
+    difference of the quantile function.
+    """
     n = quantile_grid.shape[0]
     u = np.empty(n)
     log_pdf = np.empty(n)
@@ -86,16 +55,10 @@ def kfold_loo_pit(
     eps: float = 1e-6,
     seed: int = 0,
 ) -> np.ndarray:
-    """K-fold leave-fold-out PIT, generic over how the quantile grid for the
-    held-out fold is produced. ``quantile_fn(X_context, y_context, X_query,
-    fold_idx) -> quantile_grid`` fits/predicts on one fold split; this
-    function only owns the fold assignment and the compute_pit call, shared
-    by every regressor backend that needs the same recipe (originally
-    duplicated per-backend, see eval/tabicl_utils.py::tabicl_loo_pit and
-    eval/spatial/marginal_backends.py::loo_pit, now both thin wrappers here).
+    """K-fold PIT of the training set with quantile_fn(X_context, y_context, X_query, fold_idx) -> quantile_grid.
 
     Returns:
-        Z_train: (n_train,) — Gaussianized PIT residuals
+        (n_train,) Gaussianized residuals.
     """
     n = len(y_train)
     k_folds = min(k_folds, n)
@@ -121,20 +84,17 @@ def compute_joint_nll(
     y_true: np.ndarray,
     eps: float = 1e-6,
 ) -> dict:
-    """Joint NLL of y_true under Sklar's theorem: marginals from
-    (quantile_grid, probs), dependency structure from correlation matrix R.
+    """Joint NLL of y_true: marginals from (quantile_grid, probs), dependence from R.
 
     Args:
-        quantile_grid: (N, Q) — quantile_grid[i, j] = F_i^{-1}(probs[j])
-        probs        : (Q,)
-        R            : (N, N) — correlation matrix
-        y_true       : (N,)
-        eps          : clamp before probit transform
+        quantile_grid: (N, Q), quantile_grid[i, j] = F_i^{-1}(probs[j]).
+        probs: (Q,).
+        R: (N, N) correlation matrix.
+        y_true: (N,).
+        eps: probit clamp.
 
     Returns:
-        {"total": float, "copula": float, "marginal": float} — literally
-        y_space_nll's own return dict (per-instance-averaged), unpacked to
-        Python floats.
+        {"total", "copula", "marginal"} per-instance floats.
     """
     n = quantile_grid.shape[0]
     z, log_pdf = compute_pit(quantile_grid, probs, y_true, eps)
