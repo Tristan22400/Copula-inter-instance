@@ -12,6 +12,8 @@ from omegaconf import OmegaConf
 from torch import nn
 
 from copula_inter import train
+
+
 class _TinyModel(nn.Module):
     def __init__(self, n_test: int):
         super().__init__()

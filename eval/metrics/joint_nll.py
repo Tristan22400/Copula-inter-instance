@@ -11,11 +11,9 @@ Two conventions share the key names "copula"/"marginal":
 
 from __future__ import annotations
 
-
 import numpy as np
 import torch
 from scipy.stats import norm
-
 
 from copula_inter.loss import y_space_nll  # noqa: E402
 

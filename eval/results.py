@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import math
-import json
-import os
 import argparse
+import json
+import math
+import os
 from collections.abc import Mapping, Sequence
 
 import numpy as np
 from torch import Tensor
+
 from copula_inter.artifacts import atomic_json_save
 
 NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}

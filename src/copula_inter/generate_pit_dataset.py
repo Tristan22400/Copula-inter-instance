@@ -16,8 +16,8 @@ Usage:
 
 from __future__ import annotations
 
-import gc
 import fcntl
+import gc
 import os
 import time
 import warnings
@@ -30,11 +30,11 @@ import torch
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-
-from copula_inter.data_gen import generate_gp_batch
 from copula_inter.artifacts import atomic_json_save, atomic_torch_save, file_digest
+from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
-from copula_inter.episode_contracts import validate_episode
+from copula_inter.data_gen import generate_gp_batch
 from copula_inter.dataset_manifest import (
     contiguous_shard_counts,
     ensure_manifest,
@@ -42,10 +42,8 @@ from copula_inter.dataset_manifest import (
     shard_count_path,
     verified_shard_digest,
 )
+from copula_inter.episode_contracts import validate_episode
 from copula_inter.live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
-from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
-from copula_inter.backend_registry import z_train_source as z_train_source_of
-
 
 _MAX_CUSOLVER_RETRIES = 8
 

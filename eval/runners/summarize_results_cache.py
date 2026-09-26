@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 
-
 from eval.runners.eval_checkpoint import (  # noqa: E402
     _ar_note,
     _print_table,

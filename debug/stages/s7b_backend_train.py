@@ -16,7 +16,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-
 from debug import common
 from debug.config import DebugConfig, add_common_args, build_config
 from debug.stages.s5_kfold import _pit_at_k
@@ -70,7 +69,6 @@ def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: 
     model = build_copula_transformer(dcfg.cfg).to(dcfg.device)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.0)
     jitter = float(dcfg.cfg.model.get("sigma_jitter", 1e-4))
-    parametrization = str(dcfg.cfg.model.get("correlation_parametrization", "covnorm"))
 
     tabicl_model = common.load_frozen_tabicl(dcfg) if backend == "tabicl" else None
     regressor = None

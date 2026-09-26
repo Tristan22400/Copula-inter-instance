@@ -17,6 +17,9 @@ from omegaconf import OmegaConf
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
+from copula_inter.era5_probes import _build_era5_val_batches  # noqa: E402
+from copula_inter.loss import y_space_nll  # noqa: E402
+from copula_inter.model import build_copula_transformer, build_sigma  # noqa: E402
 from eval.spatial.diagnostics import bin_correlation_by_distance  # noqa: E402
 from eval.spatial.sweep_core import (  # noqa: E402
     build_era5_probe,
@@ -24,9 +27,6 @@ from eval.spatial.sweep_core import (  # noqa: E402
     weighted_r2,
     weighted_rmse_bias,
 )
-from copula_inter.loss import y_space_nll  # noqa: E402
-from copula_inter.model import build_copula_transformer, build_sigma  # noqa: E402
-from copula_inter.era5_probes import _build_era5_val_batches  # noqa: E402
 
 _TINY_REGION = "western_europe"
 _TINY_GRID = 4
@@ -269,6 +269,7 @@ def test_era5_fit_scoring_with_tiny_model(small_model_cfg, tabicl_fake):
     model_r2 = weighted_r2(rho_context, probe["rho_emp"], probe["pair_counts"])
 
     assert math.isfinite(rmse)
+    assert math.isfinite(model_r2)
     assert math.isfinite(bias)
     # Bounded shape_corr/model_r2 (formulas are tested above).
     if not math.isnan(shape_corr):

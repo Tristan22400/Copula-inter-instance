@@ -14,10 +14,9 @@ from __future__ import annotations
 
 import torch
 from omegaconf import OmegaConf
+from test_pit_batched import RowIndependentFakeTabICL
 
 from copula_inter.data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw, _tabicl_mix_prob_for_kernel
-
-from test_pit_batched import RowIndependentFakeTabICL
 
 
 def _mix_weights(**by_family: float) -> torch.Tensor:

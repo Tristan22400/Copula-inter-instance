@@ -17,9 +17,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-
 from copula_inter.pit import normalize_targets, run_pit  # noqa: E402
-
 from experiments.experiment_b_quantitative import _compute_r_true, _sample_one_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402
     get_test_correlation,
@@ -41,7 +39,7 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
     kernel_name, lengthscale, n_train, X_train_t, y_train_t, X_test_t, y_test_t, kernel_fn = _sample_one_function(
         rng_np, rng_torch, args.n_test, (args.n_train_min, args.n_train_max), args.kernels
     )
-    X_train, y_train = X_train_t.numpy(), y_train_t.numpy()
+    X_train = X_train_t.numpy()
     X_test = X_test_t.numpy()
     n_test = X_test.shape[0]
 

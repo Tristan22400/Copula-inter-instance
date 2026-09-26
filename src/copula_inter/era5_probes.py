@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
+import matplotlib
 
 from copula_inter.probe_batches import _name_seed, _tabicl_pit_batch
-
-
-import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

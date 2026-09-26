@@ -25,7 +25,6 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 from eval.configs import constants  # noqa: E402
 from eval.configs.checkpoints import resolve_checkpoint  # noqa: E402
 from eval.metrics.joint_nll import compute_joint_nll  # noqa: E402
-from inference.copula_inference import load_copula_model  # noqa: E402
 from eval.spatial.diagnostics import (  # noqa: E402
     _exact_gp_loo_z_train,
     _forward_correlation,
@@ -34,7 +33,10 @@ from eval.spatial.diagnostics import (  # noqa: E402
 )
 from eval.spatial.marginal_backends import BACKEND_NAMES, loo_pit, make_regressor, quantiles  # noqa: E402
 from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias  # noqa: E402
-from inference.copula_inference import normalize_features  # noqa: E402
+from inference.copula_inference import (
+    load_copula_model,  # noqa: E402
+    normalize_features,  # noqa: E402
+)
 
 _RESULTS_DIR = os.path.join(_REPO_ROOT, "eval", "results")
 _FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")

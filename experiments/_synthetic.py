@@ -8,10 +8,8 @@ need.
 
 from __future__ import annotations
 
-
 import numpy as np
 import torch
-
 
 from copula_inter.data_gen import _safe_cholesky, build_kernel_fn  # noqa: E402
 

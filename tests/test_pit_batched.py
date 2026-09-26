@@ -17,15 +17,15 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 from copula_inter.data_gen import _generate_gp_batch_raw
-from inference.copula_inference import loo_pit
 from copula_inter.pit import (
     _run_pit_batched_impl,
+    normalize_targets,
     run_pit,
     run_pit_batched,
     run_pit_batched_grad,
     run_pit_calib_split_batched,
-    normalize_targets,
 )
+from inference.copula_inference import loo_pit
 
 
 class RowIndependentFakeTabICL(nn.Module):

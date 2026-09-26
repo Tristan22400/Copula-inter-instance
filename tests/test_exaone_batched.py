@@ -6,11 +6,9 @@ observed float noise and far below the error of a real bug.
 
 from __future__ import annotations
 
-
 import numpy as np
 import pytest
 import torch
-
 
 pytest.importorskip("exaonetabular", reason="exaonetabular not installed")
 

@@ -12,15 +12,14 @@ from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
-from tabicl._model.quantile_dist import QuantileDistribution  # noqa: E402
-
+from copula_inter.model import low_rank_correlation  # noqa: E402
 from inference.copula_inference import (  # noqa: E402
     _resolve_copula_checkpoint,
     get_test_correlation,
     normalize_features,
     sample_trajectories,
 )
-from copula_inter.model import low_rank_correlation  # noqa: E402
+from tabicl._model.quantile_dist import QuantileDistribution  # noqa: E402
 
 
 def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path):

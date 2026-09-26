@@ -16,7 +16,6 @@ import math
 import pytest
 import torch
 
-
 from copula_inter.era5_live_dataset import _pit_group  # noqa: E402
 from eval.baselines.autoregressive import (  # noqa: E402
     _orderings,
@@ -158,7 +157,9 @@ def test_ar_parts_split_is_exact_and_independence_is_copula_zero():
 
 def test_autoregressive_is_a_total_table_row_only():
     from eval.runners.eval_tables import (
-        _METHOD_ORDER, _TOTAL_NLL_ORDER, _TOTAL_RANK_ORDER,
+        _METHOD_ORDER,
+        _TOTAL_NLL_ORDER,
+        _TOTAL_RANK_ORDER,
     )
 
     assert "autoregressive" in dict(_TOTAL_NLL_ORDER)

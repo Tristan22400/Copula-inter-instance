@@ -6,7 +6,6 @@ import inspect
 
 import pytest
 
-
 pytest.importorskip("tabldm", reason="Xiaomi-TabLDM not installed")
 
 
@@ -34,10 +33,10 @@ def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path, symbo
 
 
 def test_get_mha_class_includes_both():
-    from copula_inter.lora import _get_mha_class
-
-    from tabicl._model.layers import MultiheadAttention as TabICLMHA
     from tabldm._model.layers import MultiheadAttention as TabLDMMHA
+
+    from copula_inter.lora import _get_mha_class
+    from tabicl._model.layers import MultiheadAttention as TabICLMHA
 
     classes = _get_mha_class()
     assert isinstance(classes, tuple)

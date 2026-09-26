@@ -13,8 +13,8 @@ import torch
 
 from copula_inter.correlation_factory import (
     LowRankCorrelationFactor,
-    covnorm_correlation,
     cossim_correlation,
+    covnorm_correlation,
     sparse_covnorm_correlation,
     tanhnorm_correlation,
 )

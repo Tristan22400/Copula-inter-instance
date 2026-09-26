@@ -7,8 +7,8 @@ with mmap into a small per-worker LRU cache.
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import random
 from collections import OrderedDict
 from glob import glob
@@ -16,6 +16,7 @@ from typing import List, Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset, Sampler
+
 from copula_inter.episode_contracts import validate_episode
 
 # Keys checked for NaN/Inf when an episode is loaded (older shards may contain some).

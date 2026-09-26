@@ -20,8 +20,9 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
-from copula_inter.backend_registry import BACKENDS
+
 from copula_inter.artifacts import atomic_torch_save
+from copula_inter.backend_registry import BACKENDS
 
 __all__ = [
     "BACKBONE_NAMES",

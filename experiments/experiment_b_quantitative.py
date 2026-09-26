@@ -24,11 +24,9 @@ import torch
 from omegaconf import OmegaConf
 from scipy.stats import norm
 
-
 from copula_inter.data_gen import gp_posterior, sigma_to_correlation  # noqa: E402
 from copula_inter.loss import y_space_nll  # noqa: E402
 from copula_inter.pit import normalize_targets, run_pit  # noqa: E402
-
 from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402
     get_marginal_quantiles_pfn4bo,

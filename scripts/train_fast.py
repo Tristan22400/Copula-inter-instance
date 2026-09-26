@@ -36,16 +36,16 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 
+from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import z_train_source as z_train_source_of
+from copula_inter.checkpointing import load_checkpoint, save_checkpoint
 from copula_inter.data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from copula_inter.dataset import collate_fn
 from copula_inter.model import build_copula_transformer
 from copula_inter.muon import Muon
 from copula_inter.pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
-from copula_inter.training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
-from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
-from copula_inter.backend_registry import z_train_source as z_train_source_of
-from copula_inter.checkpointing import load_checkpoint, save_checkpoint
 from copula_inter.probe_batches import _sigma_stats
+from copula_inter.training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
 
 # Debug logging and validation cadence.
 DEBUG_LOG_EVERY = 1

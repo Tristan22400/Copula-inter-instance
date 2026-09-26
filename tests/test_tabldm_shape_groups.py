@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from eval.spatial import tabldm_batched
 from copula_inter.marginal_backbones import _tabldm_quantile_forward
+from eval.spatial import tabldm_batched
 
 
 class Scaler:

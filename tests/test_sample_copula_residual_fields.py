@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-
 import numpy as np
 import pytest
-
 
 from eval.spatial.diagnostics import (  # noqa: E402
     predict_copula_residual_field,

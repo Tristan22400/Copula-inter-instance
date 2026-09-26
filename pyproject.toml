@@ -87,7 +87,7 @@ extend-exclude = ["tabicl_upstream", "*_upstream", ".claude/worktrees", ".codex"
 select = ["E9", "F", "I"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["eval", "inference", "conf", "tabicl"]
+known-first-party = ["copula_inter", "eval", "inference", "conf", "debug", "experiments", "scripts", "tabicl"]
 
 [tool.mypy]
 mypy_path = ["src", ".", "tabicl_upstream/src"]

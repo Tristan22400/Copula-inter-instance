@@ -40,11 +40,11 @@ from torch.optim import Adam
 warnings.filterwarnings("ignore", category=NumericalWarning)
 
 
-from copula_inter.loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
 from copula_inter.artifacts import atomic_torch_save  # noqa: E402
 from copula_inter.dataset_manifest import dataset_identity  # noqa: E402
-from eval.results import NAN_PARTS as _NAN_PARTS  # noqa: E402
+from copula_inter.loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
 from copula_inter.model import low_rank_correlation  # noqa: E402
+from eval.results import NAN_PARTS as _NAN_PARTS  # noqa: E402
 
 __all__ = [
     "corr_nll_single",
@@ -434,7 +434,9 @@ def fit_and_eval_gpytorch(
             N, dtype=Sigma_post.dtype, device=Sigma_post.device
         )
 
-    from copula_inter.data_gen import sigma_to_correlation  # noqa: E402  (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
+    from copula_inter.data_gen import (
+        sigma_to_correlation,  # noqa: E402  (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
+    )
 
     R, _ = sigma_to_correlation(Sigma_post)
     return {"R": R, "mean": mean_post, "Sigma": Sigma_post}

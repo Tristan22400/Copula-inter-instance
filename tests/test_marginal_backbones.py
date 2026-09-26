@@ -5,11 +5,9 @@ tabpfn is not tested (licence-gated weights).
 
 from __future__ import annotations
 
-
 import numpy as np
 import pytest
 import torch
-
 
 BACKENDS = ["tabldm", "exaone"]
 

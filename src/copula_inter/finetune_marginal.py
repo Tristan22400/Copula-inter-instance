@@ -18,45 +18,41 @@ import math
 import os
 import random
 import time
+import zlib
+from typing import Callable, Optional, Sequence
 
 import hydra
 import numpy as np
 import torch
+import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
-
-from copula_inter.data_gen import generate_gp_batch  # noqa: E402
 from copula_inter.artifacts import atomic_torch_save
 from copula_inter.config_path import config_dir
-from copula_inter.marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0  # noqa: E402
-from copula_inter.marginal_backbones import MarginalBackbone  # noqa: E402
-from copula_inter.marginal_backbones import (  # noqa: E402
-    assert_patterns_match,
-    kfold_quantiles_grad,
-    load_backbone,
-    resolve_tier,
-)
-from copula_inter.pit import load_tabicl  # noqa: E402
-from copula_inter.training_core import cosine_lr_lambda  # noqa: E402
-
-
-import zlib
-from typing import Callable, Optional, Sequence
-import torch.nn as nn
+from copula_inter.data_gen import generate_gp_batch  # noqa: E402
 from copula_inter.lora import (
     apply_lora,
     apply_lora_all_layers,
     merged_base_state_dict_any,
+)
+from copula_inter.marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0  # noqa: E402
+from copula_inter.marginal_backbones import (  # noqa: E402
+    MarginalBackbone,  # noqa: E402
+    assert_patterns_match,
+    kfold_quantiles_grad,
+    load_backbone,
+    resolve_tier,
 )
 from copula_inter.pit import (
     DEFAULT_K_FOLDS,
     _kernel_fn_from_task,
     _mean_train_from_task,
     _safe_cholesky,
+    load_tabicl,  # noqa: E402
     normalize_targets,
     run_pit_batched_grad,
 )
-
+from copula_inter.training_core import cosine_lr_lambda  # noqa: E402
 
 # Tier 0: the label path, the ICL-stage norms and the decoder (per architecture
 # in marginal_backbones.py; re-exported here).

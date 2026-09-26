@@ -23,10 +23,8 @@ import os
 import numpy as np
 import torch
 
-
+from copula_inter.config_path import config_dir  # noqa: E402
 from copula_inter.data_gen import generate_gp_batch  # noqa: E402
-from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
-from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
 from copula_inter.finetune_marginal import (  # noqa: E402
     analytic_marginal_targets,
     ks_uniform,
@@ -41,6 +39,8 @@ from copula_inter.pit import (  # noqa: E402
     normalize_targets,
     run_pit_batched,
 )
+from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
+from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
 
 # |log f| bound implied by QuantileDistribution's slope clamp [1e-6, 1e6].
 _LOG_F_CEILING = math.log(1e6)
@@ -196,7 +196,7 @@ def main() -> None:
     from hydra import compose, initialize_config_dir
 
     # Same prior as Phase A training.
-    with initialize_config_dir(config_dir=os.path.join(_REPO_ROOT, "conf"), version_base=None):
+    with initialize_config_dir(config_dir=config_dir(__file__), version_base=None):
         full = compose(config_name="finetune_marginal")
 
     from omegaconf import OmegaConf

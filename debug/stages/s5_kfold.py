@@ -16,7 +16,6 @@ import argparse
 import numpy as np
 import torch
 
-
 from debug import common
 from debug.config import DebugConfig, add_common_args, build_config
 
@@ -59,7 +58,6 @@ def _score_variant(model, episodes: list[dict], z_train, z_test, log_pdf_test, p
 
     batch = {k: v.to(device) for k, v in collate_fn(variant_eps).items()}
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
-    parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     with torch.no_grad():
         out = model(batch)
         Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])

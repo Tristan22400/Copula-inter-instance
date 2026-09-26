@@ -4,7 +4,6 @@
 import pytest
 import torch
 
-
 from copula_inter.loss import y_space_nll  # noqa: E402
 from copula_inter.model import low_rank_correlation, low_rank_correlation_factor  # noqa: E402
 

@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
+    import torch
 
 __all__ = [
     "collect_pair_distances_and_values",

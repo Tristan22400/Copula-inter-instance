@@ -22,6 +22,7 @@ import os
 import types
 
 import numpy as np
+
 from copula_inter.backend_registry import BACKENDS, require_capability
 
 __all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
@@ -70,10 +71,9 @@ def _make_pretrained_regressor(name: str, device: "str | None" = None):
         # n_estimators=1: only one quantile grid is read, so ensemble members are wasted work.
         return TabPFNRegressor(device=device or "cpu", n_estimators=1)
     if name == "exaone":
-        from exaonetabular import EXAONETabularRegressor
-
         # CUDA only on sm80+ (exaone's attention has no fallback kernel below that); else CPU.
         import torch
+        from exaonetabular import EXAONETabularRegressor
 
         use_cuda = (
             (device or "").startswith("cuda")

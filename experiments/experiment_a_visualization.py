@@ -18,9 +18,7 @@ import os
 import numpy as np
 import torch
 
-
 from copula_inter.data_gen import _safe_cholesky, gp_posterior  # noqa: E402
-
 from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
 from inference.copula_inference import (  # noqa: E402
     get_marginal_quantiles,
@@ -33,7 +31,6 @@ from inference.copula_inference import (  # noqa: E402
     normalize_features,
     sample_trajectories,
 )
-
 
 TEST_FUNCTIONS = [
     ("rbf", 0.5, "RBF (l=0.5)"),

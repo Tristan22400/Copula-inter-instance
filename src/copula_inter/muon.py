@@ -6,9 +6,10 @@ single-GPU only, weights reshaped to 2-D for Newton-Schulz, Newton-Schulz
 batched across parameters of the same shape, fused momentum updates
 (torch._foreach_*), and a torch.compile'd Newton-Schulz kernel.
 """
-import torch
 import math
 from collections import defaultdict
+
+import torch
 
 
 @torch.compile

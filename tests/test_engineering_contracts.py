@@ -18,17 +18,22 @@ from copula_inter.backend_registry import BACKENDS, COPULA_BACKBONES, GENERIC_MA
 from copula_inter.dataset import CopulaDataset, collate_fn
 from copula_inter.dataset_manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
 from copula_inter.episode_contracts import assemble_episodes, validate_episode
-from eval.results import (
-    competition_ranks, load_results_cache, render_saved_totals,
-    require_coverage, save_results_cache,
-)
-from eval.runners.eval_checkpoint import (
-    _dataset_dir_for_eval, _load_full_config, _results_fingerprint, parse_eval_spec,
-)
-from eval.spatial.marginal_backends import _exaone_capture_quantile_bank
-from eval.spatial.marginal_backends import BACKEND_NAMES
 from copula_inter.generate_pit_dataset import _refresh_meta, _save_shard_atomic
 from copula_inter.marginal_backbones import TIER0_PATTERNS
+from eval.results import (
+    competition_ranks,
+    load_results_cache,
+    render_saved_totals,
+    require_coverage,
+    save_results_cache,
+)
+from eval.runners.eval_checkpoint import (
+    _dataset_dir_for_eval,
+    _load_full_config,
+    _results_fingerprint,
+    parse_eval_spec,
+)
+from eval.spatial.marginal_backends import BACKEND_NAMES, _exaone_capture_quantile_bank
 
 
 def _episode(p: int = 3, n: int = 2, d: int = 4) -> dict:

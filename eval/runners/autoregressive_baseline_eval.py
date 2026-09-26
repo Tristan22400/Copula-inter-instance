@@ -20,7 +20,6 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-from inference.copula_inference import load_copula_model  # noqa: E402
 from copula_inter.pit import (  # noqa: E402
     DEFAULT_K_FOLDS,
     configure_tabicl_inference_amp,
@@ -28,7 +27,6 @@ from copula_inter.pit import (  # noqa: E402
     normalize_targets,
     tabicl_forward,
 )
-
 from eval.baselines.autoregressive import autoregressive_log_pdf  # noqa: E402
 from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
 from eval.data.era5_io import safe_cholesky  # noqa: E402
@@ -40,6 +38,7 @@ from eval.runners.eval_checkpoint import (  # noqa: E402
     _set_seed,
 )
 from eval.viz.sample_comparison_plots import plot_sample_comparison  # noqa: E402
+from inference.copula_inference import load_copula_model  # noqa: E402
 
 _DEFAULT_CKPT = os.path.join(
     _REPO_ROOT, "checkpoints", "copula_nano", "copula-finetune-marginal-float32",

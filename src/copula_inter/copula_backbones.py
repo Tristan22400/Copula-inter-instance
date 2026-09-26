@@ -14,9 +14,8 @@ import torch.nn as nn
 from omegaconf import DictConfig
 from torch import Tensor
 
-
-from tabicl._model.tabicl import TabICL  # type: ignore[import]
 from copula_inter.backend_registry import COPULA_BACKBONES
+from tabicl._model.tabicl import TabICL  # type: ignore[import]
 
 __all__ = [
     "BACKBONE_NAMES",

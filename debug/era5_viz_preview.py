@@ -82,7 +82,7 @@ def main() -> None:
     R_indep = np.eye(vb["D"])
     x_tr = torch.as_tensor(vb["x_train_norm"], dtype=torch.float32, device=device).unsqueeze(0)
     x_te = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
-    print(f"\nMoran's I (spatial autocorrelation; rows 2-4 are posterior samples)")
+    print("\nMoran's I (spatial autocorrelation; rows 2-4 are posterior samples)")
     print(f"{'day':>6} {'truth':>9} {'GP post':>9} {'model':>9} {'indep':>9}")
     with torch.no_grad():
         for i, d in enumerate(vb["days"]):

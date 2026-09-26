@@ -17,10 +17,8 @@ whether the numbers agree.
 
 from __future__ import annotations
 
-
 import numpy as np
 import pytest
-
 
 pytest.importorskip("tabldm", reason="Xiaomi-TabLDM not installed")
 

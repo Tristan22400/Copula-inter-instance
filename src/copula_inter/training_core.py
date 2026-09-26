@@ -11,6 +11,7 @@ from torch.utils.flop_counter import FlopCounterMode
 from copula_inter.loss import y_space_nll
 from copula_inter.model import low_rank_correlation_factor
 
+
 def cosine_lr_lambda(step: int, warmup: int, total: int, lr_min_frac: float) -> float:
     if step < warmup:
         return step / max(1, warmup)

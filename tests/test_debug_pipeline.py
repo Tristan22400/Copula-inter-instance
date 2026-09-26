@@ -95,8 +95,8 @@ def test_build_config_rejects_malformed_override():
 
 def test_s0_posterior_signal_uses_per_point_normalization():
     """S0 divides the posterior copula NLL by n_test."""
-    from debug.stages.s0_signal import run_one_P
     from debug.config import build_config
+    from debug.stages.s0_signal import run_one_P
 
     dcfg = build_config(overrides=["data.P_min=8", "data.P_max=8"], n_episodes=2, device="cpu", seed=42)
     result = run_one_P(dcfg, P=8, n_episodes=2)

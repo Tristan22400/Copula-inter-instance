@@ -1,9 +1,9 @@
-import re
-import subprocess
 import argparse
-import shutil
-import sys
 import os
+import re
+import shutil
+import subprocess
+import sys
 import tempfile
 
 # Kernels whose prior can be negative (oscillatory) get the wider-tolerance
@@ -32,7 +32,7 @@ def run_command(command: list, description: str, env: dict | None = None):
     run_env = {**os.environ, **env} if env else None
     try:
         # Stream output directly to the console
-        result = subprocess.run(command, check=True, env=run_env)
+        subprocess.run(command, check=True, env=run_env)
         print(f"\n✅ SUCCESS: {description}\n")
         return True
     except subprocess.CalledProcessError as e:

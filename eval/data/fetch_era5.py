@@ -92,8 +92,9 @@ def fetch(
     n_time = t2m.shape[0]
     print(f"Final grid: {n_time} days x {lat.size}x{lon.size} ({lat.size * lon.size} points).")
 
-    from eval.data.fetch_era5_static import STATIC_VARS, load_static
     from scipy.interpolate import RegularGridInterpolator
+
+    from eval.data.fetch_era5_static import STATIC_VARS, load_static
     static_dict = load_static()
     lat_asc = static_dict["latitude"][::-1]
     lon_grid, lat_grid = np.meshgrid(lon % 360.0, lat)

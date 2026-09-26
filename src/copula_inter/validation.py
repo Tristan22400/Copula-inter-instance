@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import math
 
+import matplotlib
+
 from copula_inter.era5_probes import _era5_marginal_variance_fig, _era5_viz_fig, _era5_z_samples_fig
 from copula_inter.probe_batches import _corr_quality, _macro_average
-
-
-import matplotlib
 
 matplotlib.use("Agg")
 import numpy as np

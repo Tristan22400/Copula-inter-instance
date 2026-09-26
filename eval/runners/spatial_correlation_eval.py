@@ -27,8 +27,10 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-from eval.configs import constants  # noqa: E402
-from eval.configs import regions  # noqa: E402
+from eval.configs import (
+    constants,  # noqa: E402
+    regions,  # noqa: E402
+)
 from eval.configs.checkpoints import CHECKPOINT_FAMILIES, all_family_names, resolve_checkpoint  # noqa: E402
 from eval.data.era5_io import haversine_distance_km, load_era5_data, safe_cholesky  # noqa: E402
 from eval.data.fetch_era5 import fetch as fetch_era5  # noqa: E402

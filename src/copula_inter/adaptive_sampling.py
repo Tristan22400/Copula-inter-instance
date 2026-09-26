@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import gc
 import math
-
-from copula_inter.probe_batches import _name_seed
-
-
 from typing import Optional
 
 import matplotlib
+
+from copula_inter.probe_batches import _name_seed
 
 matplotlib.use("Agg")
 import torch

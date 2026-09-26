@@ -37,7 +37,7 @@ import random
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import gpytorch
 import numpy as np
@@ -47,11 +47,12 @@ from gpytorch.utils.cholesky import psd_safe_cholesky
 from gpytorch.utils.errors import NanError, NotPSDError
 from torch import Tensor
 
-from copula_inter.loss import _safe_cholesky
 from copula_inter.episode_contracts import assemble_episodes
 from copula_inter.feature_transforms import (
-    apply_mlp_feature_mixing, apply_kernel_hidden_warp,
+    apply_kernel_hidden_warp,
+    apply_mlp_feature_mixing,
 )
+from copula_inter.loss import _safe_cholesky
 
 # Force exact Cholesky solves for every covariance up to this size (gpytorch uses CG above max_cholesky_size).
 _MAX_CHOLESKY = 8192
@@ -1857,7 +1858,6 @@ def _generate_gp_batch_raw(
     T = P + N + P_C
     # Cap B so the (B, T, T) buffers fit in free memory.
     B = _max_batch_for_context(B, T, device)
-    batch_shape = torch.Size([B])
 
     # active_dims (and k) are shared by all episodes in the call. periodic is capped
     # to k=1 (the period is not identifiable in higher dimensions).

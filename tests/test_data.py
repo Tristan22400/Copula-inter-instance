@@ -11,16 +11,16 @@ import torch
 from omegaconf import OmegaConf
 
 from copula_inter.data_gen import (
-    ALL_KERNELS,
     _CATEGORY_OPS,
     _DEFAULT_CATEGORY_WEIGHTS,
+    _STRUCTURAL_CATEGORIES,
+    ALL_KERNELS,
     _generate_gp_batch_raw,
     _kernel_needs_scalar_input,
     _sample_mean_module,
     _sample_structural_category_mask,
     _sample_structural_ops,
     _structural_warp_column,
-    _STRUCTURAL_CATEGORIES,
     apply_kernel_hidden_warp,
     apply_mlp_feature_mixing,
     apply_structural_feature_warp,
@@ -49,7 +49,7 @@ def test_tabiclv2_warp_features_all_11_choices_reachable():
     seen = set()
     for trial in range(200):
         torch.manual_seed(trial)
-        x = torch.randn(1, 32, 1)
+        torch.randn(1, 32, 1)  # advances the RNG stream the draw below depends on
         choices = torch.randint(0, 11, (1, 1))
         seen.add(int(choices.item()))
     assert seen == set(range(11))
@@ -552,8 +552,8 @@ def test_topup_round_reuses_first_round_d_features(small_cfg, monkeypatch):
 
 def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg, monkeypatch):
     """_generate_shard_with_oom_retry's retry chunks reuse the first chunk's d_features."""
-    from copula_inter import generate_pit_dataset as gpd
     from copula_inter import data_gen as dg
+    from copula_inter import generate_pit_dataset as gpd
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
     cfg.data.d_features_lognormal_loc = 2.302585  # log(10)

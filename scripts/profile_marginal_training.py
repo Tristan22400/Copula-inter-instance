@@ -13,8 +13,14 @@ from hydra import compose, initialize_config_dir
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from copula_inter.finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg, _seed_everything
-from copula_inter.finetune_marginal import MarginalLossWeights, apply_tier, phase_a_batch_loss
+from copula_inter.finetune_marginal import (
+    MarginalLossWeights,
+    _generate_phase_a_gp_batch,
+    _gp_cfg,
+    _seed_everything,
+    apply_tier,
+    phase_a_batch_loss,
+)
 from copula_inter.pit import load_tabicl
 
 

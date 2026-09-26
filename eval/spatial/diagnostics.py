@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-
 import numpy as np
 from scipy.optimize import curve_fit
-from scipy.special import gamma as gamma_fn, kv as bessel_k
+from scipy.special import gamma as gamma_fn
+from scipy.special import kv as bessel_k
 
 from eval.data.era5_io import safe_cholesky
-
 
 __all__ = [
     "compute_persistence_residuals",
@@ -100,8 +99,8 @@ def sample_copula_residual_fields(
 
     import torch
 
-    from inference.copula_inference import normalize_features
     from copula_inter.pit import normalize_targets
+    from inference.copula_inference import normalize_features
 
     x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
 
@@ -194,8 +193,7 @@ def compute_context_z_train(
 
     import torch
 
-    from copula_inter.pit import normalize_targets
-    from copula_inter.pit import run_pit
+    from copula_inter.pit import normalize_targets, run_pit
 
     X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
     context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
@@ -255,7 +253,7 @@ def sample_simple_kernel_covariance(
     import torch
     from omegaconf import OmegaConf
 
-    from copula_inter.data_gen import _build_kernel_component, _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS
+    from copula_inter.data_gen import _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS, _build_kernel_component
 
     if seed is not None:
         _random.seed(seed)

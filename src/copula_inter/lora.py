@@ -40,7 +40,7 @@ def _get_mha_forward():
 
 def _get_kv_types():
     from tabicl._model.kv_cache import KVCacheEntry  # type: ignore[import]
-    from tabicl._model.rope import RotaryEmbedding   # type: ignore[import]
+    from tabicl._model.rope import RotaryEmbedding  # type: ignore[import]
     return KVCacheEntry, RotaryEmbedding
 
 

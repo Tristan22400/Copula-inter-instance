@@ -17,8 +17,7 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 
-
-from copula_inter.data_gen import build_kernel_fn, _safe_cholesky, sigma_to_correlation  # noqa: E402
+from copula_inter.data_gen import _safe_cholesky, build_kernel_fn, sigma_to_correlation  # noqa: E402
 from tabicl._model.inference_config import InferenceConfig  # noqa: E402
 
 DEFAULT_K_FOLDS = 10

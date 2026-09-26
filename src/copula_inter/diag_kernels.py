@@ -19,7 +19,7 @@ from typing import List
 
 import torch
 
-from copula_inter.data_gen import generate_gp_task, ALL_KERNELS  # noqa: E402
+from copula_inter.data_gen import ALL_KERNELS, generate_gp_task  # noqa: E402
 
 # Minimal config (mirrors gp_tasks.yaml defaults).
 
@@ -56,7 +56,6 @@ class Cfg:
 
 def check_task(task: dict, kernel_name: str, task_idx: int) -> dict:
     R = task["R_star"]        # (N, N)
-    Sigma = None              # we don't return Sigma from generate_gp_task
     N = R.shape[0]
     issues: List[str] = []
 

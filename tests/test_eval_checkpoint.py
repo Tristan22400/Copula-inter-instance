@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
 from copula_inter.data_gen import generate_gp_batch  # noqa: E402
-
+from copula_inter.pit import gp_analytical_posterior  # noqa: E402
 from eval.baselines.classical import (  # noqa: E402
     baseline_fingerprint,
     episode_cache_key,
@@ -21,13 +21,12 @@ from eval.baselines.classical import (  # noqa: E402
     save_baseline_cache,
 )
 from eval.baselines.prefit import (  # noqa: E402
-    _PoolTensor,
     _episode_to_pool_payload,
     _pool_decode_tensors,
+    _PoolTensor,
     _prefit_baselines_parallel,
 )
 from eval.runners.eval_checkpoint import _eval_icl_episode  # noqa: E402
-from copula_inter.pit import gp_analytical_posterior  # noqa: E402
 
 _TINY_DATA_CFG = {
     "d_features": 1,

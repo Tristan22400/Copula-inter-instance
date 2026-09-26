@@ -21,7 +21,6 @@ import os
 import numpy as np
 import pytest
 
-
 pytest.importorskip("tabpfn", reason="tabpfn not installed")
 
 pytestmark = pytest.mark.skipif(
