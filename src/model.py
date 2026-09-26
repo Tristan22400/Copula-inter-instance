@@ -299,7 +299,11 @@ class CopulaTabICL(nn.Module):
         # Backbone in training/eval mode returns (B, N_test, out_dim). With
         # decoder replaced by Identity, out_dim == feature_dim.
         features = self.feature_extractor(X, z_train)      # (B, N_max, feature_dim)
-
+        # Pretrained TabICL inference can return float16 features even when
+        # the copula model runs on CPU without autocast. Match the head's
+        # parameter dtype at this boundary; autocast still controls the
+        # actual linear precision on supported devices.
+        features = features.to(dtype=self.copula_head.weight.dtype)
         head_out = self.copula_head(features)              # (B, N_max, head_out_dim)
         W = head_out[..., : self.rank]                      # (B, N_max, r)
 

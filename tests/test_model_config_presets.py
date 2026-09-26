@@ -100,6 +100,23 @@ def test_copula_nano_builds_and_runs_forward():
         assert (eigvals >= -1e-4).all(), f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
 
 
+def test_copula_head_accepts_half_precision_backbone_features():
+    """Backbone inference may return half precision on CPU without autocast."""
+    model = build_copula_transformer(_compose("copula_nano"))
+    model.train()
+    handle = model.feature_extractor.register_forward_hook(
+        lambda _module, _inputs, output: output.to(dtype=torch.float16)
+    )
+    try:
+        with torch.no_grad():
+            out = model(make_batch(B=2, P=10, N=5))
+    finally:
+        handle.remove()
+
+    assert out["W"].dtype == model.copula_head.weight.dtype
+    assert torch.isfinite(out["W"]).all()
+
+
 @pytest.mark.parametrize(
     "parametrization", ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
 )
