@@ -39,7 +39,6 @@ __all__ = [
     "predict_copula_residual_field",
     "sample_copula_residual_fields",
     "pool_yspace_samples_and_correlate",
-    "load_copula_model",
     "load_marginal_tabicl",
     "extract_model_dummy_context_correlation",
     "compute_context_z_train",
@@ -206,21 +205,6 @@ def predict_copula_residual_field(
 # ---------------------------------------------------------------------------
 # TabICLv2 / CopulaTabICL: shared checkpoint loading + dummy/real-context extraction
 # ---------------------------------------------------------------------------
-def load_copula_model(ckpt_path: str, device: "str | None" = None):
-    """Load a CopulaTabICL checkpoint via the repo's single canonical loader
-    (inference/copula_inference.py::load_copula_model); resolves the auto
-    ("cuda" if available else "cpu") device default."""
-    import torch
-
-    from inference.copula_inference import load_copula_model as _load_copula_model
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model, cfg = _load_copula_model(ckpt_path, device=device)
-    return model, cfg, device
-
-
 def load_marginal_tabicl(cfg, device: str):
     """Load the frozen TabICL quantile regressor used ONLY as a marginal-CDF
     oracle for the PIT transform in extract_model_context_correlation — NOT

@@ -65,7 +65,7 @@ for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src"),
 from data_gen import generate_gp_batch  # noqa: E402
 from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
 from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
-from marginal_finetune import (  # noqa: E402
+from finetune_marginal import (  # noqa: E402
     analytic_marginal_targets,
     ks_uniform,
     oracle_marginal_nll,

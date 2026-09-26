@@ -38,21 +38,13 @@ _REPO_ROOT = os.path.dirname(_HERE)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from live_dataset import resolve_live_tabicl_num_workers
+from live_dataset import _limit_worker_threads, resolve_live_tabicl_num_workers, worker_seed
 from pit import configure_tabicl_inference_amp, load_tabicl, normalize_targets, resolve_pit_ckpt, run_pit, run_pit_batched
 from backend_registry import z_train_source as z_train_source_of
 
 from eval.data.era5_global_corpus import GlobalERA5Corpus, load_shared_corpus_arrays
 
 __all__ = ["build_era5_train_loader", "build_era5_fixed_val_batches", "era5_collate_fn"]
-
-
-def _limit_worker_threads(_worker_id: int) -> None:
-    # Same rationale as live_dataset.py's _limit_worker_threads: each worker
-    # runs its own TabICL forward pass, no need for machine-wide BLAS fan-out.
-    torch.set_num_threads(1)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
 
 
 def era5_collate_fn(samples: List[dict]) -> dict:
@@ -314,10 +306,6 @@ class LiveERA5Dataset(IterableDataset):
         self.marginal_backend = marginal_backend
         self.marginal_probs_n = int(marginal_probs_n)
 
-    def _seed_for(self, worker_id: int, call_idx: int) -> int:
-        raw = (self.base_seed + 1) * 1_000_003 + worker_id * 1_000_000_007 + call_idx
-        return raw % (2**32)
-
     def __iter__(self):
         import numpy as np
 
@@ -340,7 +328,7 @@ class LiveERA5Dataset(IterableDataset):
 
         call_idx = 0
         while True:
-            rng = np.random.default_rng(self._seed_for(worker_id, call_idx))
+            rng = np.random.default_rng(worker_seed(self.base_seed, worker_id, call_idx))
             call_idx += 1
 
             # Roll grid_size/n_context ONCE per group -- every episode in
@@ -383,7 +371,7 @@ class LiveERA5Dataset(IterableDataset):
                 marginal_backend=self.marginal_backend,
                 marginal_regressor=marginal_regressor,
                 marginal_probs_n=self.marginal_probs_n,
-                seed=self._seed_for(worker_id, call_idx),
+                seed=worker_seed(self.base_seed, worker_id, call_idx),
             )
             if pit is None:
                 continue

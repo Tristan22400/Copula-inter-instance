@@ -190,9 +190,11 @@ def test_results_cache_reuses_only_matching_artifact_identity(tmp_path) -> None:
     assert load_results_cache(path, {"checkpoint": "B"}) == {}
 
 
-def test_eval_spec_parses_without_loading_models() -> None:
-    spec = parse_eval_spec(["--ckpt", "absent.pt", "--no-autoregressive", "--n_episodes", "2"])
-    assert spec.ckpt == "absent.pt"
+def test_eval_spec_parses_without_loading_models(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.touch()
+    spec = parse_eval_spec(["--ckpt", str(checkpoint), "--no-autoregressive", "--n_episodes", "2"])
+    assert spec.ckpt == str(checkpoint)
     assert spec.n_episodes == 2
 
 

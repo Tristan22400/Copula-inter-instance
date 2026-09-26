@@ -24,7 +24,7 @@ Tests verify:
      the oracle values, unlike the plain "tabicl" path in (3) -- same
      never-perturbs-n_train guarantee as tabicl_k_folds's override.
   6. run_pit_batched_grad (the Phase-A marginal-finetuning entry point, see
-     src/marginal_finetune.py) is numerically identical to run_pit_batched --
+     src/finetune_marginal.py) is numerically identical to run_pit_batched --
      they share one private body precisely so they cannot drift, and this is
      what proves the sharing actually holds.
   7. return_quantiles=True is purely additive: it does not perturb z_train/

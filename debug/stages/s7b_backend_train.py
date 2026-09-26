@@ -47,30 +47,9 @@ for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
 
 import common
 from config import DebugConfig, add_common_args, build_config
+from stages.s5_kfold import _pit_at_k
 
 DEFAULT_PROBS_N = 99  # coarser than TabICL's 999 -- TabPFN's per-fold .fit()+.predict() dominates wall-clock
-
-
-def _tabicl_pit_batch(tabicl_model, episodes: list[dict], k_folds: int, device: str):
-    """Same convention as debug/stages/s5_kfold.py::_pit_at_k -- reused
-    inline (not imported) since it's a five-line wrapper and s5's version
-    is documented in terms of the K-fold sweep, not the training loop."""
-    from pit import run_pit_batched
-
-    x_train = torch.stack([ep["x_norm_train"] for ep in episodes]).to(device)
-    x_test = torch.stack([ep["x_norm_test"] for ep in episodes]).to(device)
-    y_train = torch.stack([ep["y_train"] for ep in episodes]).to(device)
-    y_test = torch.stack([ep["y_test"] for ep in episodes]).to(device)
-    y_mean = y_train.mean(dim=1, keepdim=True)
-    y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-    out = run_pit_batched(
-        tabicl_model, x_train, ((y_train - y_mean) / y_std).unsqueeze(-1), x_test,
-        ((y_test - y_mean) / y_std).unsqueeze(-1), k_folds=k_folds,
-    )
-    z_train = out["z_train"].squeeze(-1).cpu()
-    z_test = out["z_test"].squeeze(-1).cpu()
-    log_pdf_test = (out["log_pdf_test"].squeeze(-1) - y_std.log()).cpu()
-    return z_train, z_test, log_pdf_test
 
 
 def _generic_pit_episode(backend: str, regressor, ep: dict, k_folds: int, probs_n: int, seed: int):
@@ -107,7 +86,7 @@ def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offse
 
     episodes = common.generate_episodes(dcfg, n, tabicl_model=None, seed_offset=seed_offset)
     if backend == "tabicl":
-        z_train, z_test, log_pdf_test = _tabicl_pit_batch(tabicl_model, episodes, k_folds, dcfg.device)
+        z_train, z_test, log_pdf_test = (t.cpu() for t in _pit_at_k(tabicl_model, episodes, k_folds, dcfg.device))
         for i, ep in enumerate(episodes):
             ep["z_train"], ep["z_test"], ep["log_pdf_test"] = z_train[i], z_test[i], log_pdf_test[i]
     else:

@@ -28,6 +28,7 @@ from eval.configs.regions import REGIONS
 from eval.data.era5_io import haversine_distance_km, load_era5_data
 from eval.data.fetch_era5 import fetch as fetch_era5
 from eval.metrics.joint_nll import compute_joint_nll
+from inference.copula_inference import load_copula_model
 from eval.spatial.diagnostics import (
     bin_correlation_by_distance,
     build_synthetic_grid_task,
@@ -37,7 +38,6 @@ from eval.spatial.diagnostics import (
     extract_model_dummy_context_correlation,
     fit_theoretical_law,
     get_ground_truth_observations,
-    load_copula_model,
     load_marginal_tabicl,
     pair_counts_by_distance,
     pool_yspace_samples_and_correlate,
@@ -75,7 +75,8 @@ def get_model(ckpt: str, device: "str | None" = None):
         print(f"Loading checkpoint '{ckpt}'...")
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, cfg, resolved_device = load_copula_model(ckpt, device=device)
+        model, cfg = load_copula_model(ckpt, device=device)
+        resolved_device = device
         marginal = load_marginal_tabicl(cfg, resolved_device)
         _MODEL_CACHE[ckpt] = (model, cfg, resolved_device, marginal)
     return _MODEL_CACHE[ckpt]

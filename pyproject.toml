@@ -31,7 +31,7 @@ dependencies = [
 dev = ["pytest>=8,<10", "pytest-xdist>=3.6,<4", "ruff>=0.16,<0.17", "mypy>=1.11,<2"]
 cpu = ["torch>=2.5,<3"]
 gpu = ["torch>=2.5,<3"]
-era5 = ["netCDF4>=1.7,<2"]
+era5 = ["netCDF4>=1.7,<2", "dask[array]>=2024.1", "zarr>=3,<4", "gcsfs>=2024.1"]
 
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
@@ -55,13 +55,13 @@ explicit = true
 [tool.setuptools]
 include-package-data = true
 py-modules = [
-  "artifacts", "autoregressive_baseline", "backend_registry",
+  "artifacts", "backend_registry",
   "classical_kernels", "config_path", "copula_backbones", "correlation_factory", "data_gen",
   "dataset", "dataset_manifest", "diag_kernels", "episode_contracts",
   "feature_transforms",
   "era5_live_dataset", "finetune_era5", "finetune_marginal",
   "generate_pit_dataset", "live_dataset", "lora", "loss",
-  "marginal_backbones", "marginal_finetune", "model", "muon", "pit",
+  "marginal_backbones", "model", "muon", "pit",
   "train", "training_core",
 ]
 

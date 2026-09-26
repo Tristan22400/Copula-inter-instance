@@ -459,7 +459,7 @@ def _run_pit_batched_impl(
     TabICL's decoder emits -- for ``max_classes=0`` the model's output IS the
     999-quantile vector at ``tabicl.quantile_dist.alpha_levels`` -- plus the
     pre-probit CDF values and probit-clamp saturation fractions. Phase-A
-    marginal fine-tuning (``src/marginal_finetune.py``) needs the quantiles to
+    marginal fine-tuning (``src/finetune_marginal.py``) needs the quantiles to
     build its own ``QuantileDistribution`` for NLL/CRPS/distillation without a
     second forward pass. Fold quantiles are mapped back to the caller's target
     scale so they can be scored alongside test quantiles. The saturation

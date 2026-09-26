@@ -371,16 +371,6 @@ class LiveGPDataset(IterableDataset):
         self.marginal_device = marginal_device
         self.marginal_probs_n = marginal_probs_n
 
-    def _seed_for(self, worker_id: int, call_idx: int) -> int:
-        # Not a cryptographic mix — just enough spread that (worker_id, call_idx)
-        # collisions are astronomically unlikely over a training run. A
-        # collision would only cost a moment of duplicated episodes, not
-        # correctness, so this doesn't need to be bulletproof.
-        # _seed_everything (data_gen.py) forwards this to np.random.seed, which
-        # requires 0 <= seed < 2**32 — mod into that range, not a wider one.
-        raw = (self._base_seed + 1) * 1_000_003 + worker_id * 1_000_000_007 + call_idx
-        return raw % (2**32)
-
     def __iter__(self) -> Iterator[dict]:
         info = get_worker_info()
         worker_id = info.id if info is not None else 0
@@ -452,7 +442,7 @@ class LiveGPDataset(IterableDataset):
             marginal_regressor = make_regressor(self.marginal_backend, device=self.marginal_device)
 
         while True:
-            cfg.seed = self._seed_for(worker_id, call_idx)
+            cfg.seed = worker_seed(self._base_seed, worker_id, call_idx)
             call_idx += 1
             episodes = generate_gp_batch(
                 cfg, self.group_size, device=gen_device, kernel_weights=self.kernel_weights,
@@ -465,6 +455,12 @@ class LiveGPDataset(IterableDataset):
             )
             for ep in episodes:
                 yield ep
+
+
+def worker_seed(base_seed: int, worker_id: int, call_idx: int) -> int:
+    """Per-(worker, call) seed in [0, 2**32), the range np.random.seed accepts."""
+    raw = (base_seed + 1) * 1_000_003 + worker_id * 1_000_000_007 + call_idx
+    return raw % (2**32)
 
 
 def _limit_worker_threads(_worker_id: int) -> None:

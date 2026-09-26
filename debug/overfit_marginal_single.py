@@ -29,7 +29,7 @@ for _path in (_ROOT, os.path.join(_ROOT, "src"), os.path.join(_ROOT, "tabicl_ups
         sys.path.insert(0, _path)
 
 from finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg  # noqa: E402
-from marginal_finetune import (  # noqa: E402
+from finetune_marginal import (  # noqa: E402
     MarginalLossWeights,
     apply_tier,
     phase_a_batch_loss,

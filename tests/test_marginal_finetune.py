@@ -45,7 +45,7 @@ import torch.nn as nn
 from data_gen import build_kernel_fn, gp_posterior
 from finetune_marginal import _generate_phase_a_gp_batch
 from lora import merged_base_state_dict
-from marginal_finetune import (
+from finetune_marginal import (
     TIER0_PATTERNS,
     AnchorPenalty,
     MarginalLossWeights,

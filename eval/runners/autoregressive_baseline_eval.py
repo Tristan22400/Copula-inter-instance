@@ -1,6 +1,6 @@
 """eval/runners/autoregressive_baseline_eval.py — compare the trained Copula
 Model against an autoregressive marginal-chain baseline
-(src/autoregressive_baseline.py) that uses ONLY the same frozen/finetuned
+(eval/baselines/autoregressive.py) that uses ONLY the same frozen/finetuned
 TabICL marginal, no copula head at all: for a query set of size N, it chains
 N single-point forward passes, growing the context by one row after each
 query point is processed (Bruinsma et al., ICLR 2023's "Autoregressive
@@ -44,19 +44,16 @@ for _p in (_REPO_ROOT, _SRC):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from autoregressive_baseline import (  # noqa: E402
-    _marginal_forward_dist,
-    run_autoregressive_chain_nll,
-    run_autoregressive_chain_sample,
-)
 from inference.copula_inference import load_copula_model  # noqa: E402
 from pit import (  # noqa: E402
     DEFAULT_K_FOLDS,
     configure_tabicl_inference_amp,
     load_tabicl,
     normalize_targets,
+    tabicl_forward,
 )
 
+from eval.baselines.autoregressive import autoregressive_log_pdf  # noqa: E402
 from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
 from eval.data.era5_io import safe_cholesky  # noqa: E402
 from eval.runners.eval_checkpoint import (  # noqa: E402
@@ -85,8 +82,8 @@ def _one_sample_pair(
     Cholesky + a single shared white-noise vector (same pattern as
     src/train.py::_era5_viz_field, generalized off its ERA5-specific bits).
 
-    Autoregressive marginal-chain: run_autoregressive_chain_sample's
-    sequential ancestral-sampling loop.
+    Autoregressive marginal-chain: autoregressive_log_pdf's ancestral
+    sampling (conditioning="sample"), in the episode's own test order.
     """
     N = X_test.shape[0]
     Sigma_np = R_icl.detach().to(torch.float64).cpu().numpy()
@@ -95,7 +92,10 @@ def _one_sample_pair(
     z_copula = L @ z_shared
     u_copula = torch.clamp(0.5 * (1.0 + torch.erf(z_copula / (2.0 ** 0.5))), 1e-6, 1.0 - 1e-6)
 
-    marginal_dist = _marginal_forward_dist(tabicl_marginal, X_train, y_train_scaled.unsqueeze(-1), X_test)
+    logits = tabicl_forward(
+        tabicl_marginal, torch.cat([X_train, X_test]).unsqueeze(0), y_train_scaled.unsqueeze(0),
+    ).to(device)
+    marginal_dist = tabicl_marginal.quantile_dist(logits[0])
     # icdf treats a plain (n,) alpha as n shared quantile levels broadcast
     # across the whole batch (-> a (batch, n) grid), not one alpha per
     # distribution -- an explicit trailing size-1 axis (src/train.py's
@@ -103,10 +103,11 @@ def _one_sample_pair(
     y_copula_scaled = marginal_dist.icdf(u_copula.unsqueeze(-1)).squeeze(-1)
     y_copula_sample = (mean + std * y_copula_scaled).detach().cpu().numpy()
 
-    ar_sample_scaled = run_autoregressive_chain_sample(
-        tabicl_marginal, X_train, y_train_scaled.unsqueeze(-1), X_test,
+    ar = autoregressive_log_pdf(
+        tabicl_marginal, X_train[None], y_train[None], X_test[None], torch.zeros_like(X_test[None, :, 0]),
+        order="natural", conditioning="sample",
     )
-    ar_sample = (mean + std * ar_sample_scaled).detach().cpu().numpy()
+    ar_sample = ar["appended"][0].detach().cpu().numpy()
     return y_copula_sample, ar_sample
 
 
@@ -178,12 +179,10 @@ def main() -> None:
         N = X_test.shape[0]
         y_train_scaled, y_test_scaled, mean, std = normalize_targets(y_train, y_test)
 
-        log_probs = run_autoregressive_chain_nll(
-            tabicl_marginal,
-            X_train, y_train_scaled.unsqueeze(-1),
-            X_test, y_test_scaled.unsqueeze(-1),
-        )
-        ar_total = float((-log_probs.sum() + N * std.log()).item()) / N
+        log_pdf = autoregressive_log_pdf(
+            tabicl_marginal, X_train[None], y_train[None], X_test[None], y_test[None], order="natural",
+        )["log_pdf"]
+        ar_total = float(-log_pdf.sum().item()) / N
 
         copula_totals.append(copula_total)
         ar_totals.append(ar_total)

@@ -18,7 +18,7 @@ for path in (ROOT, os.path.join(ROOT, "src"), os.path.join(ROOT, "tabicl_upstrea
         sys.path.insert(0, path)
 
 from finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg, _seed_everything
-from marginal_finetune import MarginalLossWeights, apply_tier, phase_a_batch_loss
+from finetune_marginal import MarginalLossWeights, apply_tier, phase_a_batch_loss
 from pit import load_tabicl
 
 

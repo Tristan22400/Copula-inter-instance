@@ -65,12 +65,12 @@ for _p in (_REPO_ROOT, _SRC):
 from eval.configs import constants  # noqa: E402
 from eval.configs.checkpoints import resolve_checkpoint  # noqa: E402
 from eval.metrics.joint_nll import compute_joint_nll  # noqa: E402
+from inference.copula_inference import load_copula_model  # noqa: E402
 from eval.spatial.diagnostics import (  # noqa: E402
     _exact_gp_loo_z_train,
     _forward_correlation,
     bin_correlation_by_distance,
     build_synthetic_grid_task,
-    load_copula_model,
 )
 from eval.spatial.marginal_backends import BACKEND_NAMES, loo_pit, make_regressor, quantiles  # noqa: E402
 from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias  # noqa: E402
@@ -210,7 +210,8 @@ def main() -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = resolve_checkpoint(args.ckpt)
     print(f"Loading checkpoint '{args.ckpt}' -> {ckpt} on {device} ...")
-    model, cfg, resolved_device = load_copula_model(ckpt, device=device)
+    model, cfg = load_copula_model(ckpt, device=device)
+    resolved_device = device
 
     print(f"Building regressors for backends: {backends}")
     regressors = {name: make_regressor(name, device=resolved_device) for name in backends}

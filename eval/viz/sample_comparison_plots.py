@@ -1,6 +1,6 @@
 """sample_comparison_plots.py — one-dimensional sample-comparison plot for
 the Copula Model vs. the autoregressive marginal-chain baseline
-(src/autoregressive_baseline.py). Kept separate from correlation_plots.py,
+(eval/baselines/autoregressive.py). Kept separate from correlation_plots.py,
 which draws ERA5 lat/lon field grids (pcolormesh) — a different shape of
 plot from this generic per-point line/scatter chart over an arbitrary GP
 episode's covariates."""
