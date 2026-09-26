@@ -17,10 +17,16 @@ import argparse
 import os
 import traceback
 from collections import defaultdict
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -49,7 +55,9 @@ BENCHMARK_NAMES = ["spatial_housing", "sensor_imputation", "synthetic_bbo"]
 DEFAULT_PROBS = np.arange(1, 1000) / 1001
 
 
-def _load_episode(benchmark_name: str, seed: int, synthetic_bbo_cfg=None):
+def _load_episode(
+    benchmark_name: str, seed: int, synthetic_bbo_cfg: DictConfig | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Returns (X_train, y_train, X_test, y_test, R_true_or_None)."""
     if benchmark_name == "spatial_housing":
         X_train, y_train, X_test, y_test = spatial_housing.load_split(n_ctx=64, n_test=32, seed=seed)
@@ -65,11 +73,11 @@ def _load_episode(benchmark_name: str, seed: int, synthetic_bbo_cfg=None):
 def run_episode(
     benchmark_name: str,
     seed: int,
-    tabicl_reg,
-    copula_model,
+    tabicl_reg: Any,
+    copula_model: CopulaTabICL,
     n_samples: int,
     rng: np.random.Generator,
-    synthetic_bbo_cfg=None,
+    synthetic_bbo_cfg: DictConfig | None = None,
 ) -> tuple[list[dict], dict[str, np.ndarray], dict[str, tuple[np.ndarray, np.ndarray]]]:
     X_train, y_train, X_test, y_test, R_true = _load_episode(benchmark_name, seed, synthetic_bbo_cfg)
     n_test = X_test.shape[0]

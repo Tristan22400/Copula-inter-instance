@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from scipy.special import gammaln, logsumexp
 from scipy.stats import chi2
 
 from eval.tabicl_utils import make_tabicl_regressor
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 __all__ = [
     "compute_quantile_ece",
@@ -73,12 +77,12 @@ def generate_era5_reliability_diagram(
     y_true: np.ndarray,
     y_pred_quantiles: np.ndarray,
     quantiles: "list | np.ndarray",
-    output_path: str,
+    output_path: str | None,
 ) -> float:
     """
-    Build and save a reliability diagram for TabICL's ERA5 quantile
-    predictions, with nominal quantile on the x-axis and empirical coverage
-    on the y-axis.
+    Build a reliability diagram for TabICL's ERA5 quantile predictions, with
+    nominal quantile on the x-axis and empirical coverage on the y-axis, and
+    save it to output_path when one is given.
 
     Returns:
         The scalar ECE score (also annotated on the figure).
@@ -111,10 +115,11 @@ def generate_era5_reliability_diagram(
     )
     ax.legend(loc="lower right")
     plt.tight_layout()
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    fig.savefig(output_path, bbox_inches="tight")
+    if output_path is not None:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        fig.savefig(output_path, bbox_inches="tight")
+        print(f"Saved {output_path} (ECE={ece:.4f})")
     plt.close(fig)
-    print(f"Saved {output_path} (ECE={ece:.4f})")
     return ece
 
 
@@ -153,7 +158,8 @@ def plot_era5_quantile_reliability(
 
     quantiles = np.asarray(quantiles, dtype=float)
     regressor = make_tabicl_regressor(checkpoint=tabicl_ckpt, device=device)
-    y_true_chunks, y_pred_chunks = [], []
+    y_true_chunks: list[np.ndarray] = []
+    y_pred_chunks: list[np.ndarray] = []
     for d in range(n_days):
         context_values = field_all[d].ravel()[context_idx]
         regressor.fit(context_coords, context_values)
@@ -161,7 +167,7 @@ def plot_era5_quantile_reliability(
             target_coords, output_type="quantiles", alphas=list(quantiles)
         )  # (n_target, n_quantiles)
         y_true_chunks.append(field_all[d].ravel()[target_idx])
-        y_pred_chunks.append(preds)
+        y_pred_chunks.append(np.asarray(preds))
 
     y_true = np.concatenate(y_true_chunks)
     y_pred_quantiles = np.concatenate(y_pred_chunks, axis=0)
@@ -208,7 +214,7 @@ def calc_kendall_pit(cdf_values: np.ndarray) -> np.ndarray:
     return np.clip(z, 0.0, 1.0)
 
 
-def plot_kendall_pit(z_values: np.ndarray, ax, n_bins: int = 20):
+def plot_kendall_pit(z_values: np.ndarray, ax: Axes, n_bins: int = 20) -> Axes:
     """Histogram of Kendall PIT values against the theoretical Uniform(0, 1) density."""
     z_values = np.asarray(z_values, dtype=np.float64)
     ax.hist(
@@ -253,7 +259,7 @@ def calc_mahalanobis_distances(y_true: np.ndarray, means: np.ndarray, variances:
     return np.sum((y_true - means) ** 2 / variances, axis=1)
 
 
-def plot_mahalanobis_pp(distances: np.ndarray, dim_d: int, ax):
+def plot_mahalanobis_pp(distances: np.ndarray, dim_d: int, ax: Axes) -> Axes:
     """
     PP-plot (probability-probability plot) of squared Mahalanobis distances
     against the theoretical chi^2_D CDF. Points on the y = x diagonal
@@ -275,7 +281,9 @@ def plot_mahalanobis_pp(distances: np.ndarray, dim_d: int, ax):
     return ax
 
 
-def calc_exceedance_probs(y_true: np.ndarray, cdf_func, thresholds: np.ndarray):
+def calc_exceedance_probs(
+    y_true: np.ndarray, cdf_func: Callable[[float], np.ndarray], thresholds: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Spatial exceedance events and their independence-copula predicted
     probabilities, for a set of thresholds tau_m:
@@ -305,7 +313,7 @@ def calc_exceedance_probs(y_true: np.ndarray, cdf_func, thresholds: np.ndarray):
     return predicted_probs, true_events
 
 
-def plot_spatial_reliability(predicted_probs: np.ndarray, true_events: np.ndarray, num_bins: int, ax):
+def plot_spatial_reliability(predicted_probs: np.ndarray, true_events: np.ndarray, num_bins: int, ax: Axes) -> Axes:
     """Binned reliability diagram of predicted vs. empirical spatial exceedance probability."""
     pred_flat = np.asarray(predicted_probs, dtype=np.float64).ravel()
     true_flat = np.asarray(true_events, dtype=np.float64).ravel()
@@ -349,7 +357,12 @@ def calc_spatial_coverage(y_true: np.ndarray, q_lower: np.ndarray, q_upper: np.n
     return float(inside.all(axis=1).mean())
 
 
-def plot_spatial_coverage_curve(y_true: np.ndarray, quantile_func, nominal_coverages: np.ndarray, ax):
+def plot_spatial_coverage_curve(
+    y_true: np.ndarray,
+    quantile_func: Callable[[float], tuple[np.ndarray, np.ndarray]],
+    nominal_coverages: np.ndarray,
+    ax: Axes,
+) -> Axes:
     """
     Spatial central coverage curve: for each nominal coverage c = 1 - alpha,
     query `quantile_func(alpha)` for the per-dimension central interval

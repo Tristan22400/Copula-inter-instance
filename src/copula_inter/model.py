@@ -241,7 +241,7 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
 
     lora_cfg = cfg.get("lora", {})
     if bool(lora_cfg.get("enabled", False)):
-        from copula_inter.lora import apply_lora  # type: ignore[import]
+        from copula_inter.lora import apply_lora
 
         n = apply_lora(
             backbone=model.feature_extractor,

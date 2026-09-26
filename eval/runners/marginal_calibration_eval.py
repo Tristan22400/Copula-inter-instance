@@ -19,6 +19,7 @@ import argparse
 import json
 import math
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -43,11 +44,14 @@ from copula_inter.pit import (  # noqa: E402
 from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
 from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
 
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
+
 # |log f| bound implied by QuantileDistribution's slope clamp [1e-6, 1e6].
 _LOG_F_CEILING = math.log(1e6)
 
 
-def _episode_metrics(tabicl, episodes, k_folds: int, eps: float, device: str) -> list[dict]:
+def _episode_metrics(tabicl: TabICLLike, episodes: list[dict], k_folds: int, eps: float, device: str) -> list[dict]:
     """Score one shared-(P, N) batch of GP episodes through pit.run_pit_batched; one record per episode."""
     B = len(episodes)
     x_tr = torch.stack([e["x_norm_train"] for e in episodes]).to(device)

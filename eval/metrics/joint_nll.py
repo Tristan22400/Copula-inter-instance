@@ -11,6 +11,8 @@ Two conventions share the key names "copula"/"marginal":
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 import torch
 from scipy.stats import norm
@@ -44,7 +46,7 @@ def compute_pit(
 
 
 def kfold_loo_pit(
-    quantile_fn,
+    quantile_fn: Callable[..., np.ndarray],
     X_train: np.ndarray,
     y_train: np.ndarray,
     probs: np.ndarray,

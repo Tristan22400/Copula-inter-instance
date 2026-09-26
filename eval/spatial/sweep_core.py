@@ -6,6 +6,7 @@ Loaded models are cached per process (_MODEL_CACHE).
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -48,6 +49,14 @@ from eval.spatial.diagnostics import (
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 from inference.copula_inference import load_copula_model, normalize_features
 
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
+    from copula_inter.pit import TabICLLike
+    from tabicl import TabICLRegressor
+    from tabicl._model.tabicl import TabICL
+
 __all__ = [
     "get_model",
     "run_real_config",
@@ -66,7 +75,7 @@ _GP_BASELINE_CACHE: dict = {}
 _TABICL_REGRESSOR_CACHE: dict = {}
 
 
-def get_model(ckpt: str, device: "str | None" = None):
+def get_model(ckpt: str, device: "str | None" = None) -> tuple[CopulaTabICL, DictConfig, str, TabICL | None]:
     if ckpt not in _MODEL_CACHE:
         print(f"Loading checkpoint '{ckpt}'...")
         if device is None:
@@ -78,7 +87,7 @@ def get_model(ckpt: str, device: "str | None" = None):
     return _MODEL_CACHE[ckpt]
 
 
-def _get_tabicl_regressor(source: "str | None", device: str):
+def _get_tabicl_regressor(source: "str | None", device: str) -> TabICLRegressor:
     """TabICLRegressor for source (pit.resolve_pit_ckpt(cfg) of the checkpoint it is paired with), cached per (source, device)."""
     key = (source, device)
     if key not in _TABICL_REGRESSOR_CACHE:
@@ -441,7 +450,7 @@ def build_era5_probe(
     n_days_probe: int,
     n_context: int,
     n_bins: int,
-    tabicl_marginal,
+    tabicl_marginal: TabICLLike | None,
     device: str,
     seed: int = SEED,
 ) -> dict:

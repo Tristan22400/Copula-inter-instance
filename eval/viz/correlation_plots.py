@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
     import torch
+    from matplotlib.axes import Axes
+    from matplotlib.collections import QuadMesh
+    from matplotlib.figure import Figure
 
 __all__ = [
     "collect_pair_distances_and_values",
@@ -96,6 +99,7 @@ def plot_correlation_heatmaps(R_by_method: dict[str, np.ndarray], out_path: str)
         ax.set_title(method)
         ax.set_xticks([])
         ax.set_yticks([])
+    assert im is not None
     fig.colorbar(im, ax=axes.tolist(), fraction=0.046, pad=0.04)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, bbox_inches="tight")
@@ -183,7 +187,7 @@ def _plot_field_grid(
     oracle_row_label: str = "Oracle correlation\n+ marginal\nLatitude",
     xlabel: str = "Longitude",
     cbar_label: str = "Residual (deg C)",
-):
+) -> Figure | None:
     """Render rows of fields on grid_shape with one color scale and Moran's I per panel.
 
     Rows: true_fields, then optional oracle, predicted, predicted_2 and
@@ -203,14 +207,14 @@ def _plot_field_grid(
     has_oracle = oracle_fields is not None
     # Reshape true_fields to grid_shape (they may arrive flat).
     true_fields = [np.asarray(f).reshape(grid_shape) for f in true_fields]
-    pred_grids = [f.reshape(grid_shape) for f in predicted_fields] if has_pred else []
-    pred2_grids = [f.reshape(grid_shape) for f in predicted_fields_2] if has_pred2 else []
-    indep_grids = [f.reshape(grid_shape) for f in independent_fields] if has_indep else []
-    oracle_grids = [f.reshape(grid_shape) for f in oracle_fields] if has_oracle else []
+    pred_grids = [f.reshape(grid_shape) for f in predicted_fields] if predicted_fields is not None else []
+    pred2_grids = [f.reshape(grid_shape) for f in predicted_fields_2] if predicted_fields_2 is not None else []
+    indep_grids = [f.reshape(grid_shape) for f in independent_fields] if independent_fields is not None else []
+    oracle_grids = [f.reshape(grid_shape) for f in oracle_fields] if oracle_fields is not None else []
 
     vmax = float(np.max(np.abs(true_fields + pred_grids + pred2_grids + indep_grids + oracle_grids)))
 
-    def _annotate_morans_i(ax, field) -> None:
+    def _annotate_morans_i(ax: Axes, field: np.ndarray) -> None:
         ax.text(
             0.97,
             0.95,
@@ -227,14 +231,14 @@ def _plot_field_grid(
     fig, axes = plt.subplots(
         n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False
     )
-    mesh = None
+    mesh: QuadMesh | None = None
     for j, (title, field) in enumerate(zip(col_titles, true_fields)):
         mesh = axes[0][j].pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
         axes[0][j].set_title(title, fontsize=9)
         _annotate_morans_i(axes[0][j], field)
     axes[0][0].set_ylabel(row0_label)
 
-    def _plot_row(row_idx, grids, ylabel):
+    def _plot_row(row_idx: int, grids: Sequence[np.ndarray], ylabel: str) -> QuadMesh:
         for j, field in enumerate(grids):
             mesh_local = axes[row_idx][j].pcolormesh(
                 lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto"
@@ -273,6 +277,7 @@ def _plot_field_grid(
         axes[-1][j].set_xlabel(xlabel)
     fig.suptitle(suptitle)
     plt.tight_layout(rect=(0.0, 0.0, 0.93, 0.96))
+    assert mesh is not None
     fig.colorbar(mesh, ax=axes.ravel().tolist(), shrink=0.85, label=cbar_label)
     if output_path is None:
         return fig
@@ -295,7 +300,7 @@ def plot_residual_grid(
     oracle_row_label: str = "Fitted GP posterior\n(fitted kernel)\nsample\nLatitude",
     pred2_row_label: str = "Second model\n(predicted)\nLatitude",
     target: str = "raw",
-):
+) -> Figure | None:
     """Grid of ERA5 fields, one column per day: ground truth (raw or 24 h residual), then optional reference (oracle_fields), model, second model and independent (R = I) rows.
 
     context_coords are overlaid on the model rows. data["t2m"] is an
@@ -358,7 +363,7 @@ def plot_mean_removed_grid(
     context_coords: "np.ndarray | None" = None,
     oracle_row_label: str = "Fitted GP posterior\nsample minus\nGP mean\nLatitude",
     pred2_row_label: str = "Fitted GP correlation\n+ TabICLv2 marginal\nsample minus\nmarginal mean\nLatitude",
-):
+) -> Figure | None:
     """Like plot_residual_grid with each row's own predictive mean subtracted at every location.
 
     output_path=None returns the figure.
@@ -440,7 +445,7 @@ def plot_z_predictor_samples(
     gp_fields: list,
     output_path: "str | None" = None,
     context_coords: "np.ndarray | None" = None,
-):
+) -> Figure | None:
     """Samples of the latent z for one day: rows are independent, copula-model and GP correlation, columns share white noise.
 
     independent_fields must already be (H, W).
@@ -477,7 +482,7 @@ def plot_marginal_variance_grid(
     output_path: "str | None" = None,
     context_coords: "np.ndarray | None" = None,
     gp_row_label: str = "Fitted GP\nposterior",
-):
+) -> Figure | None:
     """Per-location predictive variance (sequential colormap from 0) per day: the TabICL marginal and, optionally, the fitted GP; context overlaid."""
     import matplotlib
 
@@ -486,16 +491,16 @@ def plot_marginal_variance_grid(
 
     has_gp = gp_var_fields is not None
     grids = [f.reshape(grid_shape) for f in var_fields]
-    gp_grids = [f.reshape(grid_shape) for f in gp_var_fields] if has_gp else []
+    gp_grids = [f.reshape(grid_shape) for f in gp_var_fields] if gp_var_fields is not None else []
     vmax = float(np.max(grids + gp_grids)) if (grids or gp_grids) else 1.0
     n_cols = len(grids)
     n_rows = 1 + int(has_gp)
     fig, axes = plt.subplots(
         n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows), sharex=True, sharey=True, squeeze=False
     )
-    mesh = None
+    mesh: QuadMesh | None = None
 
-    def _plot_row(row_idx, row_grids, ylabel, show_col_titles) -> None:
+    def _plot_row(row_idx: int, row_grids: Sequence[np.ndarray], ylabel: str, show_col_titles: bool) -> None:
         nonlocal mesh
         for j, field in enumerate(row_grids):
             mesh = axes[row_idx][j].pcolormesh(lon, lat, field, cmap="viridis", vmin=0.0, vmax=vmax, shading="auto")
@@ -523,6 +528,7 @@ def plot_marginal_variance_grid(
         axes[-1][j].set_xlabel("Longitude")
     fig.suptitle("Predictive Variance vs. Distance from Context")
     plt.tight_layout(rect=(0.0, 0.0, 0.93, 0.94))
+    assert mesh is not None
     fig.colorbar(mesh, ax=axes.ravel().tolist(), shrink=0.85, label="Var[y | x] (deg C²)")
     if output_path is None:
         return fig

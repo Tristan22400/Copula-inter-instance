@@ -7,6 +7,7 @@ import time
 import zlib
 from collections import Counter
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -135,7 +136,7 @@ def _select_best_baseline_cv(
     for i, test_idx in enumerate(folds):
         val_idx = torch.cat([f for j, f in enumerate(folds) if j != i])
         val_nll = {key: _sub_nll(key, val_idx) for key in keys}
-        selected = min(val_nll, key=val_nll.get)
+        selected = min(val_nll, key=lambda k: val_nll[k])
         test_nll = _sub_nll(selected, test_idx)
         weighted_sum += test_idx.numel() * test_nll
         fold_details.append(
@@ -164,7 +165,7 @@ class _PoolTensor:
     value: np.ndarray
 
 
-def _pool_encode_tensors(value):
+def _pool_encode_tensors(value: Any) -> Any:
     """Recursively replace every tensor in an episode with NumPy storage (avoids torch's shared-memory transport)."""
     if isinstance(value, Tensor):
         return _PoolTensor(value.detach().cpu().contiguous().numpy().copy())
@@ -177,7 +178,7 @@ def _pool_encode_tensors(value):
     return value
 
 
-def _pool_decode_tensors(value):
+def _pool_decode_tensors(value: Any) -> Any:
     """Inverse of _pool_encode_tensors."""
     if isinstance(value, _PoolTensor):
         return torch.from_numpy(value.value)

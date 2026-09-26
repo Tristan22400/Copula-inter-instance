@@ -18,11 +18,14 @@ random permutation per episode).
 from __future__ import annotations
 
 import zlib
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from copula_inter.pit import tabicl_forward
+
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
 
 __all__ = [
     "autoregressive_log_pdf",
@@ -58,7 +61,7 @@ def _orderings(
 
 @torch.no_grad()
 def autoregressive_log_pdf(
-    tabicl,
+    tabicl: TabICLLike,
     x_train: torch.Tensor,
     y_train: torch.Tensor,
     x_test: torch.Tensor,

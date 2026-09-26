@@ -20,6 +20,7 @@ import contextlib
 import copy
 import os
 import random
+from typing import TYPE_CHECKING, Any, Iterator
 
 import hydra
 import numpy as np
@@ -50,6 +51,10 @@ from eval.runners.eval_tables import (
     _print_total_nll_table,
     _print_y_space_oracle,
 )
+
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from copula_inter.type_aliases import Device
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -128,7 +133,7 @@ def _set_seed(seed: int) -> None:
 
 
 @contextlib.contextmanager
-def _snapshot_rng_and_threads(seed: int | None = None, cpu_threads: int | None = None):
+def _snapshot_rng_and_threads(seed: int | None = None, cpu_threads: int | None = None) -> Iterator[None]:
     """Context manager: save and restore the torch RNG; optionally reseed and cap intra-op threads meanwhile."""
     rng_cpu = torch.get_rng_state()
     rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -160,7 +165,7 @@ def _load_full_config(config_path: str) -> DictConfig:
         return hydra.compose(config_name=config_name)
 
 
-def _dataset_dir_for_eval(args, cfg, live_generate: bool, era5: bool) -> str | None:
+def _dataset_dir_for_eval(args: argparse.Namespace, cfg: DictConfig, live_generate: bool, era5: bool) -> str | None:
     """The on-disk dataset directory used for loading and cache keys."""
     return None if live_generate or era5 else str(args.dataset_dir or cfg.training.dataset_dir)
 
@@ -273,7 +278,7 @@ def _marginal_pit(
     k_folds: int,
     device: torch.device,
     marginal_backend: str | None = None,
-    marginal_regressor=None,
+    marginal_regressor: Any = None,
     marginal_probs_n: int = 99,
     seed: int = 0,
 ) -> dict[str, Tensor] | None:
@@ -332,7 +337,7 @@ def _marginal_pit(
 
 def _results_fingerprint(
     baseline_fp: dict,
-    args,
+    args: argparse.Namespace,
     tabicl_pit_k_folds: int,
     resolved_marginal: str | None = None,
 ) -> dict:
@@ -366,9 +371,9 @@ def _results_fingerprint(
 
 
 def _live_generate_alternating(
-    gen_cfg,
+    gen_cfg: DictConfig,
     n_ep: int,
-    device,
+    device: Device,
     seed: int,
     offset: int = 0,
     alternate_noncomposite: bool = True,
@@ -993,20 +998,20 @@ def _validate_eval_spec(args: argparse.Namespace) -> None:
 
 
 def _report_results(
-    all_episode_meta,
-    all_nlls,
-    all_total_nlls,
-    all_y_space_nlls,
-    args,
-    dataset_dir,
-    era5,
-    live_generate,
-    n_ep,
-    plot_R_dict,
-    plot_R_oracle,
-    plot_best_R,
-    plot_best_key,
-):
+    all_episode_meta: list[dict],
+    all_nlls: list[dict[str, float]],
+    all_total_nlls: list[dict[str, dict[str, float]]],
+    all_y_space_nlls: list[dict[str, dict[str, float]]],
+    args: argparse.Namespace,
+    dataset_dir: str | None,
+    era5: bool,
+    live_generate: bool,
+    n_ep: int,
+    plot_R_dict: dict[str, Tensor] | None,
+    plot_R_oracle: Tensor | None,
+    plot_best_R: Tensor | None,
+    plot_best_key: str | None,
+) -> None:
     """Print the result tables, enforce --min_icl_coverage, dump per-episode scores, and plot correlation grids."""
     if not all_nlls:
         raise RuntimeError(f"no episodes evaluated successfully out of {n_ep} requested")
@@ -1075,7 +1080,7 @@ def _report_results(
         # Plot order: fitted baselines, then oracle, best baseline and icl side by side.
         estimators = {k: v for k, v in plot_R_dict.items() if k != "oracle"}
         icl_panel = estimators.pop("icl", None)
-        if plot_best_key is not None:
+        if plot_best_key is not None and plot_best_R is not None:
             best_label = f"best_baseline ({_METHOD_LABELS.get(plot_best_key, plot_best_key)})"
             estimators[best_label] = plot_best_R
         if icl_panel is not None:
@@ -1093,19 +1098,19 @@ def _report_results(
 
 
 def _load_episodes(
-    args,
-    cfg,
-    dataset_dir,
-    device,
-    era5,
-    live_generate,
-    marginal_backend,
-    marginal_regressor,
-    min_test_points,
-    n_ep,
-    tabicl_marginal,
-    tabicl_pit_k_folds,
-):
+    args: argparse.Namespace,
+    cfg: DictConfig,
+    dataset_dir: str | None,
+    device: torch.device,
+    era5: bool,
+    live_generate: bool,
+    marginal_backend: str | None,
+    marginal_regressor: Any,
+    min_test_points: int,
+    n_ep: int,
+    tabicl_marginal: TabICLLike | None,
+    tabicl_pit_k_folds: int,
+) -> tuple[CopulaDataset | None, dict[str, Any] | None, list[dict] | None, Any, int | None, TabICLLike | None]:
     """Load the evaluation episodes: fixed-geometry ERA5, live-generated GP, or an on-disk dataset."""
     dataset = None
     era5_geometry = None
@@ -1200,7 +1205,9 @@ def _load_episodes(
     return dataset, era5_geometry, live_episodes, marginal_regressor, n_available, tabicl_marginal
 
 
-def _load_models(args, cfg, device):
+def _load_models(
+    args: argparse.Namespace, cfg: DictConfig, device: torch.device
+) -> tuple[CopulaTabICL, int, str | None, Any, str | None, TabICLLike | None, int]:
     """Load the copula checkpoint and the marginal that PITs each episode's z_train."""
     tabicl_ckpt = None
     # ---- Load ICL model ----
@@ -1362,6 +1369,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         n_restarts_dkl=args.n_restarts_dkl,
     )
     if era5:
+        assert era5_geometry is not None
         # ERA5 fingerprint also includes the corpus, geometry and marginal.
         fingerprint["era5"] = era5_episode_fingerprint(
             args.era5_corpus_dir,
@@ -1404,16 +1412,19 @@ def run_evaluation(args: argparse.Namespace) -> None:
     episode_plan: list[tuple[int, int, str, dict, int]] = []
     for local_i in range(n_ep):
         if era5:
+            assert live_episodes is not None
             # ERA5 may return fewer episodes; use each episode's own global index.
             if local_i >= len(live_episodes):
                 continue
             ep = live_episodes[local_i]
             ep_i = int(ep["era5_meta"]["ep_i"])
         elif live_generate:
+            assert live_episodes is not None
             # Global index (offset + local index).
             ep_i = args.episode_offset + local_i
             ep = live_episodes[local_i]
         else:
+            assert dataset is not None and n_available is not None
             ep_i = args.episode_idx + local_i
             if ep_i >= n_available:
                 print(f"  [ep {ep_i}] index out of range ({n_available} available), skipping")

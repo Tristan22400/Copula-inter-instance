@@ -25,7 +25,7 @@ import hashlib
 import math
 import os
 import warnings
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import gpytorch
 import torch
@@ -35,6 +35,9 @@ from linear_operator.utils.warnings import NumericalWarning
 from omegaconf import OmegaConf
 from torch import Tensor
 from torch.optim import Adam
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 # Silence psd_safe_cholesky's jitter warnings during fitting.
 warnings.filterwarnings("ignore", category=NumericalWarning)
@@ -420,10 +423,12 @@ def fit_and_eval_gpytorch(
                             )
 
                 if use_val:
+                    assert best_step_state is not None
                     model.load_state_dict(best_step_state[0])
                     likelihood.load_state_dict(best_step_state[1])
                     final_loss = best_step_val
                 else:
+                    assert loss is not None
                     final_loss = loss.item()
 
                 if best_loss is None or final_loss < best_loss:
@@ -438,6 +443,7 @@ def fit_and_eval_gpytorch(
             f"fit_and_eval_gpytorch(kernel_name={kernel_name!r}): every candidate degree/restart "
             f"combination in {poly_powers} failed (see printed exceptions above)."
         )
+    assert best_likelihood is not None
     model, likelihood = best_model, best_likelihood
     if use_val:
         # Condition on the full training set for the final evaluation.
@@ -872,7 +878,7 @@ def eval_baselines_episode(
 
 
 def baseline_fingerprint(
-    gen_cfg,
+    gen_cfg: DictConfig,
     live_generate: bool,
     dataset_dir: str | None,
     seed: int,
@@ -937,6 +943,8 @@ def episode_cache_key(
         return f"{source}:seed{seed}:idx{ep_i}"
     if live_generate:
         return f"live:seed{seed}:idx{ep_i}"
+    if dataset_dir is None:
+        raise ValueError("an on-disk episode needs dataset_dir")
     return f"dataset:{os.path.abspath(dataset_dir)}:idx{ep_i}"
 
 

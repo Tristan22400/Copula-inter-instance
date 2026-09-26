@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -260,7 +260,7 @@ def _patch_pfns4bo_torch_compat() -> None:
 def load_pfn4bo(model_name: str = "hebo_plus_model", device: str = "cpu") -> torch.nn.Module:
     """Load a pretrained PFN4BO model from pfns4bo_upstream by attribute name (downloads on first use)."""
     _patch_pfns4bo_torch_compat()
-    import pfns4bo  # type: ignore[import]
+    import pfns4bo
 
     model_path = getattr(pfns4bo, model_name)
     model = torch.load(model_path, map_location=device, weights_only=False)
@@ -269,7 +269,7 @@ def load_pfn4bo(model_name: str = "hebo_plus_model", device: str = "cpu") -> tor
     return model
 
 
-def _vectorized_bar_icdf(criterion, logits: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+def _vectorized_bar_icdf(criterion: Any, logits: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
     """BarDistribution.icdf at many probability levels at once.
 
     Args:

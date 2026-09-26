@@ -7,6 +7,8 @@ its training distribution.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Callable
+
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -22,6 +24,9 @@ from copula_inter.data_gen import (  # noqa: E402
     gp_posterior,
     sigma_to_correlation,
 )
+
+if TYPE_CHECKING:
+    from copula_inter.type_aliases import HasDataConfig
 
 __all__ = ["load_split"]
 
@@ -50,7 +55,9 @@ _DEFAULT_CFG = OmegaConf.create(
 )
 
 
-def _sample_episode_kernel_fn(cfg, d: int, rng_np: np.random.Generator):
+def _sample_episode_kernel_fn(
+    cfg: HasDataConfig, d: int, rng_np: np.random.Generator
+) -> tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]:
     """One episode's (kernel_fn, noise_variance) from cfg's priors; scalar-only and periodic components use one column, others all d."""
     chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg)
     if _kernel_needs_scalar_input(kernel_name) or "periodic" in kernel_name:
@@ -75,7 +82,7 @@ def load_split(
     n_ctx: int,
     n_test: int,
     seed: int | None = None,
-    cfg=None,
+    cfg: HasDataConfig | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return (X_train, y_train, X_test, y_test, R_ground_truth).
 

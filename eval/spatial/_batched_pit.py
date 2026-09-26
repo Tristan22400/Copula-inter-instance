@@ -13,13 +13,15 @@ inside bank_fn.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 
 __all__ = ["run_kfold_pit_batched"]
 
 
 def run_kfold_pit_batched(
-    bank_fn,
+    bank_fn: Callable[..., np.ndarray],
     X_train: np.ndarray,
     Y_train: np.ndarray,
     X_test: np.ndarray,

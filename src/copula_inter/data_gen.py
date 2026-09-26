@@ -1851,7 +1851,7 @@ def corrupt_z_train(z_train: Tensor, data_cfg: Any) -> Tensor:
     return torch.where(apply_ep.unsqueeze(-1), z_blend, z_train)
 
 
-def _max_batch_for_context(B: int, T: int, device: str) -> int:
+def _max_batch_for_context(B: int, T: int, device: Device) -> int:
     """Largest episode batch that fits in free CUDA memory for context length T = P + N (<= B)."""
     if not torch.cuda.is_available() or not str(device).startswith("cuda"):
         return B
@@ -1871,7 +1871,7 @@ def _evaluate_kernel_dense(kernel_obj: gpytorch.kernels.Kernel, x_norm: Tensor) 
 def _generate_gp_batch_raw(
     cfg: HasDataConfig,
     B: int,
-    device: str = "cpu",
+    device: Device = "cpu",
     *,
     return_kernel_metadata: bool = False,
     d_override: Optional[int] = None,
@@ -1939,6 +1939,7 @@ def _generate_gp_batch_raw(
 
     # active_dims (and k) are shared by all episodes in the call. periodic is capped
     # to k=1 (the period is not identifiable in higher dimensions).
+    kernel_cols: Optional[List[int]]
     if _kernel_needs_scalar_input(kernel_name) or "periodic" in kernel_name:
         kernel_cols = [random.randint(0, d - 1)]
     elif kernel_name == "dot_product":
@@ -2336,7 +2337,7 @@ def _generate_gp_batch_raw(
 def generate_gp_batch(
     cfg: HasDataConfig,
     B: int,
-    device: str = "cpu",
+    device: Device = "cpu",
     *,
     return_kernel_metadata: bool = False,
     tabicl_model: Optional[TabICLLike] = None,

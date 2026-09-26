@@ -87,7 +87,7 @@ def _diagnose_real(
     lat, lon = data["latitude"], data["longitude"]
     lon_grid, lat_grid = np.meshgrid(lon, lat)
     coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
-    D = coords.shape[0]
+    D = int(coords.shape[0])
 
     R_emp = empirical_spatial_correlation(data, target="raw")
     R_dummy = extract_model_dummy_context_correlation(model, resolved_device, coords)
@@ -188,11 +188,11 @@ def _diagnose_synthetic(
     axis = np.linspace(-1.0, 1.0, grid_size)
     x_grid, y_grid = np.meshgrid(axis, axis)
     coords = np.column_stack([x_grid.ravel(), y_grid.ravel()])
-    D = coords.shape[0]
+    D = int(coords.shape[0])
 
     true_cov, kernel_name = sample_simple_kernel_covariance(cfg, coords, kernel, seed)
-    R_true, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
-    R_true = R_true.numpy()
+    R_true_t, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
+    R_true = R_true_t.numpy()
 
     n_context_eff = max(1, min(n_context, D - 1))
     context_idx = rng.choice(D, size=n_context_eff, replace=False)
@@ -298,7 +298,7 @@ def _diagnose(
             _diagnose_synthetic(token, kernel, grid_size, n_context, n_draws, device, seed, out_dir)
 
 
-def cmd_diagnose(args) -> None:
+def cmd_diagnose(args: argparse.Namespace) -> None:
     tokens = [t.strip() for t in args.ckpt.split(",") if t.strip()]
     _diagnose(
         args.mode,
@@ -333,7 +333,7 @@ def _sweep(
 ) -> str:
     tokens = (
         all_family_names()
-        if (checkpoints_arg in (None, "all"))
+        if checkpoints_arg is None or checkpoints_arg == "all"
         else [t.strip() for t in checkpoints_arg.split(",") if t.strip()]
     )
 
@@ -381,7 +381,7 @@ def _sweep(
     return out_path
 
 
-def cmd_sweep(args) -> None:
+def cmd_sweep(args: argparse.Namespace) -> None:
     _sweep(
         args.mode,
         args.profile,
@@ -446,11 +446,11 @@ def _baseline(
             axis = np.linspace(-1000.0, 1000.0, grid_size)
             x_grid, y_grid = np.meshgrid(axis, axis)
             coords = np.column_stack([x_grid.ravel(), y_grid.ravel()])
-            D = coords.shape[0]
+            D = int(coords.shape[0])
 
             true_cov, _ = sample_simple_kernel_covariance(cfg, coords, kernel_name, seed)
-            R_true, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
-            R_true = R_true.numpy()
+            R_true_t, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
+            R_true = R_true_t.numpy()
 
             dist = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(-1))
             dist_iu = dist[np.triu_indices(D, k=1)]
@@ -473,7 +473,7 @@ def _baseline(
     return out_path
 
 
-def cmd_baseline(args) -> None:
+def cmd_baseline(args: argparse.Namespace) -> None:
     _baseline(args.mode, args.profile, args.laws, args.n_days, args.ckpt, args.device, args.seed, args.out)
 
 
@@ -640,11 +640,11 @@ def _report(
         )
 
 
-def cmd_report(args) -> None:
+def cmd_report(args: argparse.Namespace) -> None:
     _report(args.out_dir, args.real_results, args.synthetic_results, args.baseline_real, args.baseline_synthetic)
 
 
-def cmd_all(args) -> None:
+def cmd_all(args: argparse.Namespace) -> None:
     checkpoints = args.checkpoints or "all"
     baseline_synthetic_ckpt = (
         [t.strip() for t in checkpoints.split(",") if t.strip()][-1] if checkpoints != "all" else all_family_names()[-1]

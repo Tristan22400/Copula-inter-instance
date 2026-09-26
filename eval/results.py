@@ -7,6 +7,7 @@ import json
 import math
 import os
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 from torch import Tensor
@@ -56,7 +57,7 @@ def require_coverage(valid: int, attempted: int, minimum_fraction: float) -> Non
         raise RuntimeError(f"evaluation coverage {valid}/{attempted} is below {minimum_fraction:.0%}")
 
 
-def jsonable(obj):
+def jsonable(obj: Any) -> Any:
     """Convert nested numeric results, including scalar tensors, to JSON values."""
     if isinstance(obj, dict):
         return {key: jsonable(value) for key, value in obj.items()}

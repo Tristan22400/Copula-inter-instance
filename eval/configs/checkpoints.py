@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 _CHECKPOINTS_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "checkpoints"
@@ -10,7 +11,7 @@ _CHECKPOINTS_ROOT = os.path.join(
 
 # name -> {dir, default_step, label, color}. dir is relative to checkpoints/;
 # default_step is used when no "family:step" is given.
-CHECKPOINT_FAMILIES = {
+CHECKPOINT_FAMILIES: dict[str, dict[str, Any]] = {
     "kernel-sweep-all-noisy-mae": {
         "dir": "copula_prod/canonical/kernel-sweep-all-noisy-mae",
         "default_step": 355000,

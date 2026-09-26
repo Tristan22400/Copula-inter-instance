@@ -7,13 +7,15 @@ path.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 __all__ = ["tabpfn_run_pit_batched"]
 
 
 def _quantile_bank_batched(
-    regressor,
+    regressor: Any,
     X_context: list,
     y_context: list,
     X_query: list,
@@ -32,7 +34,7 @@ def _quantile_bank_batched(
 
 
 def tabpfn_run_pit_batched(
-    regressor,
+    regressor: Any,
     X_train: np.ndarray,
     Y_train: np.ndarray,
     X_test: np.ndarray,

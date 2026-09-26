@@ -20,6 +20,7 @@ import dataclasses
 import logging
 import os
 import types
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -34,7 +35,7 @@ BACKEND_NAMES = list(BACKENDS)
 
 
 # Regressor construction (one instance reused across folds and tasks).
-def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = None):
+def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = None) -> Any:
     """Build a backend regressor, optionally loading a Phase-A checkpoint (MarginalBackbone.save format) into its trainable module."""
     require_capability(name, "name")
     regressor = _make_pretrained_regressor(name, device)
@@ -43,7 +44,7 @@ def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = 
     return regressor
 
 
-def _load_finetuned_weights(name: str, regressor, ckpt: str, device: "str | None") -> None:
+def _load_finetuned_weights(name: str, regressor: Any, ckpt: str, device: "str | None") -> None:
     import torch
 
     from copula_inter.marginal_backbones import _trainable_module
@@ -55,7 +56,7 @@ def _load_finetuned_weights(name: str, regressor, ckpt: str, device: "str | None
     _trainable_module(name, regressor).load_state_dict(payload["state_dict"], strict=True)
 
 
-def _make_pretrained_regressor(name: str, device: "str | None" = None):
+def _make_pretrained_regressor(name: str, device: "str | None" = None) -> Any:
     if name == "tabicl":
         from eval.tabicl_utils import make_tabicl_regressor
 
@@ -119,7 +120,7 @@ def _require_tabpfn_token() -> None:
 # quantiles(): (X_context, y_context, X_query, probs) -> (n_query, Q) in raw y units.
 def quantiles(
     name: str,
-    regressor,
+    regressor: Any,
     X_context: np.ndarray,
     y_context: np.ndarray,
     X_query: np.ndarray,
@@ -143,7 +144,7 @@ def quantiles(
 
 
 @contextlib.contextmanager
-def _exaone_capture_quantile_bank(regressor):
+def _exaone_capture_quantile_bank(regressor: Any) -> Iterator[None]:
     """Context manager making EXAONE's .predict() return the full (n_query, quantile_count) bank.
 
     Replaces _collapse_members' per-row reduction with a per-member sort. Not
@@ -154,7 +155,7 @@ def _exaone_capture_quantile_bank(regressor):
     original = regressor.__dict__.get("_collapse_members")
     had_override = "_collapse_members" in regressor.__dict__
 
-    def _passthrough(self, output, query_count):
+    def _passthrough(self: Any, output: Any, query_count: int) -> Any:
         expected = (self.manifest.runtime.ensemble_count, query_count, self.manifest.output_width)
         if (
             not isinstance(output, torch.Tensor)
@@ -175,7 +176,7 @@ def _exaone_capture_quantile_bank(regressor):
 
 
 def _exaone_quantiles(
-    regressor,
+    regressor: Any,
     X_context: np.ndarray,
     y_context: np.ndarray,
     X_query: np.ndarray,
@@ -208,7 +209,7 @@ def _exaone_quantiles(
 
 
 def _tabldm_quantiles(
-    regressor,
+    regressor: Any,
     X_context: np.ndarray,
     y_context: np.ndarray,
     X_query: np.ndarray,
@@ -225,7 +226,7 @@ def _tabldm_quantiles(
 # Generic K-fold PIT through quantiles().
 def loo_pit(
     name: str,
-    regressor,
+    regressor: Any,
     X_train: np.ndarray,
     y_train: np.ndarray,
     probs: np.ndarray,

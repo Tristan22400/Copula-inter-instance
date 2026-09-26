@@ -16,7 +16,7 @@ from sklearn.datasets import fetch_california_housing
 __all__ = ["load_split"]
 
 
-def _get_data():
+def _get_data() -> tuple[np.ndarray, np.ndarray, int, int]:
     ds = fetch_california_housing()
     X = ds.data
     y = ds.target

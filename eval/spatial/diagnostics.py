@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import math
+from typing import TYPE_CHECKING, Callable
+
 import numpy as np
 from scipy.optimize import curve_fit
 from scipy.special import gamma as gamma_fn
 from scipy.special import kv as bessel_k
 
 from eval.data.era5_io import safe_cholesky
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
+    from copula_inter.pit import TabICLLike
+    from copula_inter.type_aliases import Device, HasDataConfig
+    from tabicl._model.tabicl import TabICL
 
 __all__ = [
     "compute_persistence_residuals",
@@ -77,7 +88,7 @@ def morans_i(field: np.ndarray) -> float:
 
 
 def sample_copula_residual_fields(
-    tabicl_marginal,
+    tabicl_marginal: TabICLLike | None,
     context_coords: np.ndarray,
     context_values: np.ndarray,
     coords_test: np.ndarray,
@@ -129,7 +140,7 @@ def pool_yspace_samples_and_correlate(samples_per_day: list) -> np.ndarray:
 
 
 def predict_copula_residual_field(
-    tabicl_marginal,
+    tabicl_marginal: TabICLLike | None,
     context_coords: np.ndarray,
     context_values: np.ndarray,
     coords_test: np.ndarray,
@@ -149,7 +160,7 @@ def predict_copula_residual_field(
     )[0]
 
 
-def load_marginal_tabicl(cfg, device: str):
+def load_marginal_tabicl(cfg: DictConfig, device: str) -> TabICL | None:
     """Load the frozen TabICL marginal named by pit.resolve_pit_ckpt(cfg), or None (with a warning) if none or loading fails."""
     from copula_inter.pit import load_tabicl, resolve_pit_ckpt
 
@@ -173,7 +184,7 @@ def load_marginal_tabicl(cfg, device: str):
 
 
 def _forward_correlation(
-    model, device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray
+    model: CopulaTabICL, device: Device, x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray
 ) -> np.ndarray:
     """Model forward (x_train, z_train, x_test) -> dense Sigma."""
     import torch
@@ -191,7 +202,7 @@ def _forward_correlation(
     return Sigma[0].cpu().numpy()
 
 
-def extract_model_dummy_context_correlation(model, device, coords_test: np.ndarray) -> np.ndarray:
+def extract_model_dummy_context_correlation(model: CopulaTabICL, device: Device, coords_test: np.ndarray) -> np.ndarray:
     """Model correlation with a single dummy context row (x = 0, z = 0)."""
     coords_test = np.asarray(coords_test, dtype=np.float64)
     x_mean = coords_test.mean(axis=0, keepdims=True)
@@ -206,8 +217,8 @@ def extract_model_dummy_context_correlation(model, device, coords_test: np.ndarr
 def compute_context_z_train(
     x_train_norm: np.ndarray,
     context_values: np.ndarray,
-    tabicl_marginal,
-    device: str,
+    tabicl_marginal: TabICLLike | None,
+    device: Device,
     k_folds: int = 10,
 ) -> np.ndarray:
     """K-fold PIT z_train of a real context sample under tabicl_marginal (standardized values when it is None)."""
@@ -237,9 +248,9 @@ def compute_context_z_train(
 
 
 def extract_model_context_correlation(
-    model,
-    device,
-    tabicl_marginal,
+    model: CopulaTabICL,
+    device: Device,
+    tabicl_marginal: TabICLLike | None,
     context_coords: np.ndarray,
     context_values: np.ndarray,
     coords_test: np.ndarray,
@@ -265,8 +276,8 @@ def _exact_gp_loo_z_train(K_ff: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 def extract_model_true_z_train_correlation(
-    model,
-    device,
+    model: CopulaTabICL,
+    device: Device,
     context_coords: np.ndarray,
     K_ff_context: np.ndarray,
     context_values: np.ndarray,
@@ -281,7 +292,7 @@ def extract_model_true_z_train_correlation(
 
 
 def sample_simple_kernel_covariance(
-    cfg,
+    cfg: HasDataConfig,
     coordinates: np.ndarray,
     kernel_name: "str | None" = None,
     seed: "int | None" = None,
@@ -327,7 +338,7 @@ def sample_simple_kernel_covariance(
 
 
 def build_synthetic_grid_task(
-    cfg,
+    cfg: HasDataConfig,
     kernel_name: str,
     grid_size: int,
     n_context: int,
@@ -351,8 +362,8 @@ def build_synthetic_grid_task(
     D = coords.shape[0]
 
     true_cov, _ = sample_simple_kernel_covariance(cfg, coords, kernel_name, seed)
-    R_true, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
-    R_true = R_true.numpy()
+    R_true_t, _ = sigma_to_correlation(torch.as_tensor(true_cov, dtype=torch.float64))
+    R_true = R_true_t.numpy()
 
     dist = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(-1))
     bin_edges = np.linspace(0.0, dist[np.triu_indices(D, k=1)].max(), n_bins + 1)
@@ -459,7 +470,7 @@ def rational_quadratic_law(r: np.ndarray, L: float, alpha: float) -> np.ndarray:
 
 
 # name -> (callable(r, *params), ordered param names)
-THEORY_LAWS = {
+THEORY_LAWS: dict[str, tuple[Callable[..., np.ndarray], list[str]]] = {
     "exponential": (exponential_law, ["L"]),
     "gaussian": (gaussian_law, ["L"]),
     "whittle": (whittle_law, ["L"]),
@@ -487,14 +498,14 @@ def _correlation_length_guess(dist_centers: np.ndarray, rho: np.ndarray) -> floa
     """Distance where the empirical curve crosses 1/e (linear interpolation), as a starting L."""
     valid = np.isfinite(rho)
     d, r = dist_centers[valid], rho[valid]
-    below = np.where(r <= 1.0 / np.e)[0]
+    below = np.where(r <= 1.0 / math.e)[0]
     if len(below) == 0 or below[0] == 0:
         return float(d[-1] / 2.0) if len(d) else 1000.0
     i = below[0]
     d0, d1, r0, r1 = d[i - 1], d[i], r[i - 1], r[i]
     if r0 == r1:
         return float(d0)
-    frac = (1.0 / np.e - r0) / (r1 - r0)
+    frac = (1.0 / math.e - r0) / (r1 - r0)
     return float(d0 + frac * (d1 - d0))
 
 

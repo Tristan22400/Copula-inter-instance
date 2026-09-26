@@ -15,10 +15,13 @@ d_x = 6: lon, lat and the four fetch_era5_static.STATIC_VARS fields.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -86,12 +89,12 @@ def build_era5_eval_episodes(
     vary_geometry: bool = False,
     grid_size_range: tuple[int, int] = (8, 28),
     n_context_frac_range: tuple[float, float] = (0.05, 0.4),
-    tabicl_model=None,
+    tabicl_model: TabICLLike | None = None,
     k_folds: int = 10,
     device: str | torch.device = "cpu",
     pit_group_size: int = 8,
     marginal_backend: Optional[str] = None,
-    marginal_regressor=None,
+    marginal_regressor: Any = None,
     marginal_probs_n: int = 99,
     max_months: Optional[int] = None,
     lazy: Optional[bool] = None,
@@ -196,6 +199,7 @@ def build_era5_eval_episodes(
         n_ar = len(chunk) if ar_n_episodes is None else max(0, min(len(chunk), int(ar_n_episodes) - start))
         if autoregressive and out is not None and n_ar > 0:
             sub = chunk[:n_ar]
+            assert tabicl_model is not None  # autoregressive rejects every other backend above
             ar_out = autoregressive_log_pdf(
                 tabicl_model,
                 torch.stack([r["x_norm_train"] for r in sub]).to(dev),

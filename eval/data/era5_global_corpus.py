@@ -35,6 +35,13 @@ class GlobalERA5Corpus:
     load_shared_corpus_arrays (used by DataLoader workers).
     """
 
+    lat: np.ndarray
+    lon: np.ndarray
+    static: dict[str, np.ndarray]
+    # None when months are memory-mapped from _paths on demand.
+    _t2m_by_month: list[np.ndarray] | None
+    _paths: list[str] | None
+
     def __init__(
         self,
         cache_dir: str | None = None,
@@ -50,9 +57,11 @@ class GlobalERA5Corpus:
             self.lon = _shared["lon"].numpy()
             self._t2m_by_month = [t.numpy() for t in _shared["t2m_by_month"]]
             self.static = {k: v.numpy() for k, v in _shared["static"].items()}
-            self._paths: list[str] | None = None
+            self._paths = None
             day_counts = [a.shape[0] for a in self._t2m_by_month]
         else:
+            if cache_dir is None:
+                raise ValueError("GlobalERA5Corpus needs cache_dir unless attaching to shared arrays")
             paths = sorted(glob.glob(os.path.join(cache_dir, "era5_global_t2m_*.nc")))
             if not paths:
                 raise FileNotFoundError(
@@ -67,9 +76,9 @@ class GlobalERA5Corpus:
             if lazy is None:
                 lazy = len(paths) > 60
 
-            self.lat: np.ndarray | None = None
-            self.lon: np.ndarray | None = None
-            self.static: dict[str, np.ndarray] = {}
+            lat_arr: np.ndarray | None = None
+            lon_arr: np.ndarray | None = None
+            static_arrs: dict[str, np.ndarray] = {}
 
             if lazy:
                 self._t2m_by_month = None
@@ -77,15 +86,12 @@ class GlobalERA5Corpus:
                 import re
 
                 f0 = netcdf_file(paths[0], "r", mmap=True)
-                self.lat = f0.variables["latitude"][:].astype(np.float64).copy()
-                self.lon = f0.variables["longitude"][:].astype(np.float64).copy()
+                lat_arr = f0.variables["latitude"][:].astype(np.float64).copy()
+                lon_arr = f0.variables["longitude"][:].astype(np.float64).copy()
                 for v in STATIC_VARS:
                     if v in f0.variables:
-                        self.static[v] = f0.variables[v][:].astype(np.float32).copy()
+                        static_arrs[v] = f0.variables[v][:].astype(np.float32).copy()
                 f0.close()
-                if not self.static:
-                    st = load_static()
-                    self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
 
                 day_counts = []
                 for p in paths:
@@ -97,18 +103,21 @@ class GlobalERA5Corpus:
                         day_counts.append(f.variables["t2m"].shape[0])
                         f.close()
             else:
-                self._t2m_by_month: list[np.ndarray] = []
+                months: list[np.ndarray] = []
                 for p in paths:
                     t2m, lat, lon, static = _load_month(p)
-                    if self.lat is None:
-                        self.lat, self.lon = lat, lon
+                    if lat_arr is None:
+                        lat_arr, lon_arr = lat, lon
                         if static:
-                            self.static = static
-                    self._t2m_by_month.append(t2m)
-                if not self.static:
-                    st = load_static()
-                    self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
-                day_counts = [a.shape[0] for a in self._t2m_by_month]
+                            static_arrs = static
+                    months.append(t2m)
+                self._t2m_by_month = months
+                day_counts = [a.shape[0] for a in months]
+            if not static_arrs:
+                st = load_static()
+                static_arrs = {k: st[k].astype(np.float32) for k in STATIC_VARS}
+            assert lat_arr is not None and lon_arr is not None
+            self.lat, self.lon, self.static = lat_arr, lon_arr, static_arrs
 
         self.n_days_total = int(sum(day_counts))
         self._cum_days = np.cumsum([0] + day_counts)
@@ -123,6 +132,7 @@ class GlobalERA5Corpus:
         d = day_global_idx - int(self._cum_days[m])
         if self._t2m_by_month is not None:
             return self._t2m_by_month[m][d]
+        assert self._paths is not None
         f = netcdf_file(self._paths[m], "r", mmap=True)
         slice_2d = f.variables["t2m"][d].astype(np.float32).copy()
         f.close()
@@ -251,7 +261,9 @@ class GlobalERA5Corpus:
 
 def load_shared_corpus_arrays(cache_dir: str) -> dict:
     """Load the corpus once in the main process and move its arrays to shared memory, for workers to attach to via GlobalERA5Corpus.from_shared."""
-    corpus = GlobalERA5Corpus(cache_dir)
+    # Shared memory needs the months in RAM: never the memory-mapped (lazy) layout.
+    corpus = GlobalERA5Corpus(cache_dir, lazy=False)
+    assert corpus._t2m_by_month is not None
     return {
         "lat": torch.from_numpy(corpus.lat).share_memory_(),
         "lon": torch.from_numpy(corpus.lon).share_memory_(),

@@ -13,9 +13,15 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from copula_inter.pit import TabICLLike
+    from copula_inter.type_aliases import Device
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -50,17 +56,17 @@ _DEFAULT_CKPT = os.path.join(
 
 
 def _one_sample_pair(
-    tabicl_marginal,
-    icl_model,
-    R_icl,
-    X_train,
-    y_train,
-    X_test,
-    y_train_scaled,
-    mean,
-    std,
-    device,
-):
+    tabicl_marginal: TabICLLike,
+    icl_model: CopulaTabICL,
+    R_icl: torch.Tensor,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_test: torch.Tensor,
+    y_train_scaled: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: Device,
+) -> tuple[np.ndarray, np.ndarray]:
     """One joint sample per method in raw y units: the copula model (one marginal pass plus chol(Sigma) noise) and the chain (ancestral sampling)."""
     N = X_test.shape[0]
     Sigma_np = R_icl.detach().to(torch.float64).cpu().numpy()

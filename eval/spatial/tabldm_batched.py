@@ -10,12 +10,16 @@ tests/test_tabldm_batched.py checks it against the per-episode path.
 
 from __future__ import annotations
 
+from typing import Any, Sequence
+
 import numpy as np
 
 __all__ = ["tabldm_run_pit_batched"]
 
 
-def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarray, x_query: np.ndarray):
+def _episode_member_batch(
+    regressor: Any, x_support: np.ndarray, y_support: np.ndarray, x_query: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, Any]:
     """Fit the regressor on one episode and return its (members, T, H) / (members, train_size) inputs and its y scaler."""
     from tabldm._sklearn.sklearn_utils import validate_data
 
@@ -55,16 +59,16 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
     return xs, ys, regressor.y_scaler_
 
 
-def _group_episode_batches(per_episode):
+def _group_episode_batches(per_episode: Sequence[tuple[np.ndarray, np.ndarray, Any]]) -> list[list[int]]:
     """Group episodes whose preprocessed inputs have the same shape."""
-    groups = {}
+    groups: dict[tuple[tuple[int, ...], tuple[int, ...]], list[int]] = {}
     for b, (xs, ys, _) in enumerate(per_episode):
         groups.setdefault((xs.shape, ys.shape), []).append(b)
     return list(groups.values())
 
 
 def _quantile_bank_batched(
-    regressor,
+    regressor: Any,
     X_context: list,
     y_context: list,
     X_query: list,
@@ -73,7 +77,7 @@ def _quantile_bank_batched(
     """(B, n_query, len(probs)) quantiles in raw y units, one fused forward per shape group."""
     B = len(X_context)
     per_episode = [_episode_member_batch(regressor, X_context[b], y_context[b], X_query[b]) for b in range(B)]
-    banks = [None] * B
+    banks: list[np.ndarray | None] = [None] * B
     for indices in _group_episode_batches(per_episode):
         members = per_episode[indices[0]][0].shape[0]
         xs = np.concatenate([per_episode[b][0] for b in indices], axis=0)
@@ -83,12 +87,14 @@ def _quantile_bank_batched(
         for local, b in enumerate(indices):
             arr = per_episode[b][2].inverse_transform(out[local].reshape(-1, 1)).reshape(out[local].shape)
             banks[b] = arr.mean(axis=0)
-    bank = np.stack(banks).astype(np.float64)
+    filled = [bank for bank in banks if bank is not None]
+    assert len(filled) == B
+    bank = np.stack(filled).astype(np.float64)
     return bank
 
 
 def tabldm_run_pit_batched(
-    regressor,
+    regressor: Any,
     X_train: np.ndarray,
     Y_train: np.ndarray,
     X_test: np.ndarray,

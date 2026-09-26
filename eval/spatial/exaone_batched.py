@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from typing import Any
 
 import numpy as np
 import torch
@@ -22,7 +23,9 @@ __all__ = ["exaone_run_pit_batched"]
 logging.getLogger("exaonetabular.regressor").setLevel(logging.ERROR)
 
 
-def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarray, x_query: np.ndarray):
+def _episode_member_batch(
+    regressor: Any, x_support: np.ndarray, y_support: np.ndarray, x_query: np.ndarray
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], float, float]:
     """Fit one episode and return, per (n_svd, seed) pass, its (support, label, query) member tensors plus its (center, scale)."""
     from exaonetabular.ensemble import EnsemblePlan, build_ensemble_inputs
 
@@ -58,7 +61,7 @@ def _episode_member_batch(regressor, x_support: np.ndarray, y_support: np.ndarra
     return passes, float(state["center"]), float(state["scale"])
 
 
-def _quantile_bank_batched(regressor, X_context: list, y_context: list, X_query: list) -> np.ndarray:
+def _quantile_bank_batched(regressor: Any, X_context: list, y_context: list, X_query: list) -> np.ndarray:
     """(B, query_rows, quantile_count) quantile bank in raw y units, mean-pooled over members, from one forward."""
     B = len(X_context)
     per_episode = [_episode_member_batch(regressor, X_context[b], y_context[b], X_query[b]) for b in range(B)]
@@ -91,7 +94,7 @@ def _quantile_bank_batched(regressor, X_context: list, y_context: list, X_query:
 
 
 def _quantile_bank_on_probs(
-    regressor, X_context: list, y_context: list, X_query: list, probs: np.ndarray
+    regressor: Any, X_context: list, y_context: list, X_query: list, probs: np.ndarray
 ) -> np.ndarray:
     """_quantile_bank_batched interpolated from EXAONE's native 999-level grid onto probs."""
     quantile_count = regressor.manifest.regression.quantile_count
@@ -105,7 +108,7 @@ def _quantile_bank_on_probs(
 
 
 def exaone_run_pit_batched(
-    regressor,
+    regressor: Any,
     X_train: np.ndarray,
     Y_train: np.ndarray,
     X_test: np.ndarray,

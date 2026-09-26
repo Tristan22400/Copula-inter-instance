@@ -123,7 +123,7 @@ def sample_icl_task_from_era5(
     target_lon_bounds: Tuple[float, float],
     n_ctx: int = 1000,
     rng: Optional[np.random.Generator] = None,
-):
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Build one in-context-learning episode from `ds` at a single timestamp:
     a dense target patch inside the given lat/lon box (the D-dimensional
@@ -166,7 +166,7 @@ def sample_icl_task_from_era5(
     elev_field = _elevation_field(ds, time_idx, temp_field.shape)
     cos_day, sin_day, cos_hour, sin_hour = _time_features(ds, time_idx)
 
-    def _features(mask):
+    def _features(mask: np.ndarray) -> np.ndarray:
         n = int(mask.sum())
         return np.column_stack(
             [
@@ -223,7 +223,7 @@ def _quantile_at_alpha(alpha: float, quantile_values: np.ndarray, alpha_grid: np
     return q0 + w * (q1 - q0)
 
 
-def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray):
+def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-row Gaussian (mu, sigma^2) fit by least squares against the
     standard-normal z-scores of alpha_grid: q_i(alpha) ~= mu_i + sigma_i * z(alpha)."""
     z = norm.ppf(alpha_grid)
@@ -243,7 +243,7 @@ def run_era5_eval(
     n_ctx: int = 1000,
     n_timestamps: Optional[int] = None,
     seed: int = 0,
-):
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Loop over the first `n_timestamps` (default: all) timestamps in
     `nc_path`, running one ICL episode + real TabICL marginal inference per
@@ -296,14 +296,14 @@ def build_calibration_figure(
 
     distances = cal.calc_mahalanobis_distances(y_true, means, variances)
 
-    def cdf_func(tau):
+    def cdf_func(tau: float) -> np.ndarray:
         return _invert_quantile_cdf(np.full(N * D, tau), flat_q, alpha_grid).reshape(N, D)
 
     if exceedance_thresholds is None:
         exceedance_thresholds = np.quantile(y_true, [0.5, 0.75, 0.9, 0.95, 0.99])
     predicted_probs, true_events = cal.calc_exceedance_probs(y_true, cdf_func, exceedance_thresholds)
 
-    def quantile_func(alpha):
+    def quantile_func(alpha: float) -> tuple[np.ndarray, np.ndarray]:
         lo = _quantile_at_alpha(alpha / 2, flat_q, alpha_grid).reshape(N, D)
         hi = _quantile_at_alpha(1 - alpha / 2, flat_q, alpha_grid).reshape(N, D)
         return lo, hi

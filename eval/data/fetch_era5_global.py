@@ -57,10 +57,8 @@ def fetch_month(year: int, month: int, cache_dir: str = _CACHE_DIR, force: bool 
     lon = sub["longitude"].values.astype(np.float64)
     n_time = t2m.shape[0]
 
-    try:
-        from eval.data.fetch_era5_static import STATIC_VARS, load_static
-    except ModuleNotFoundError:
-        from fetch_era5_static import STATIC_VARS, load_static
+    from eval.data.fetch_era5_static import STATIC_VARS, load_static
+
     static_dict = load_static()
 
     f = netcdf_file(target_path, "w")
