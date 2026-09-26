@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 
 from copula_inter.pit import resolve_pit_ckpt as _resolve_pit_ckpt
-from copula_inter.train import _build_tabicl_val_z
+from copula_inter.probe_batches import _build_tabicl_val_z
 
 
 class FakeTabICL(nn.Module):

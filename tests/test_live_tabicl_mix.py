@@ -183,7 +183,7 @@ def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg):
 
 
 def _import_train():
-    from copula_inter import train
+    from copula_inter import adaptive_sampling as train
     return train
 
 

@@ -78,11 +78,8 @@ from copula_inter.pit import gp_analytical_posterior, load_tabicl, resolve_pit_c
 from copula_inter.training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
 from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
-from copula_inter.train import (
-    _sigma_stats,
-    load_checkpoint,
-    save_checkpoint,
-)
+from copula_inter.checkpointing import load_checkpoint, save_checkpoint
+from copula_inter.probe_batches import _sigma_stats
 
 # Debug-loop cadence -- deliberately NOT tied to training.log_every/val_every
 # (those default to 200/1000, tuned for multi-day production runs, not a

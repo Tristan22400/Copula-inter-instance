@@ -29,13 +29,13 @@ from eval.baselines.classical import (  # noqa: E402
     load_baseline_cache,
     save_baseline_cache,
 )
-from eval.runners.eval_checkpoint import (  # noqa: E402
+from eval.baselines.prefit import (  # noqa: E402
     _PoolTensor,
     _episode_to_pool_payload,
-    _prefit_baselines_parallel,
     _pool_decode_tensors,
-    _eval_icl_episode,
+    _prefit_baselines_parallel,
 )
+from eval.runners.eval_checkpoint import _eval_icl_episode  # noqa: E402
 from copula_inter.pit import gp_analytical_posterior  # noqa: E402
 
 _TINY_DATA_CFG = {

@@ -186,7 +186,7 @@ def test_ar_parts_split_is_exact_and_independence_is_copula_zero():
 
 
 def test_autoregressive_is_a_total_table_row_only():
-    from eval.runners.eval_checkpoint import (
+    from eval.runners.eval_tables import (
         _METHOD_ORDER, _TOTAL_NLL_ORDER, _TOTAL_RANK_ORDER,
     )
 
@@ -203,7 +203,7 @@ def test_autoregressive_is_a_total_table_row_only():
 
 
 def test_ar_note_warns_on_sampled_conditioning():
-    from eval.runners.eval_checkpoint import _NAN_PARTS, _ar_note
+    from eval.runners.eval_tables import _NAN_PARTS, _ar_note
 
     rows = [{"autoregressive": {"total": 0.5, "marginal": 1.0, "copula": -0.5}},
             {"autoregressive": _NAN_PARTS.copy()}]

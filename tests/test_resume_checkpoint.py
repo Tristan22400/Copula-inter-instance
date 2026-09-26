@@ -40,7 +40,8 @@ import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
-from copula_inter.train import cosine_lr_lambda, load_checkpoint, save_checkpoint
+from copula_inter.checkpointing import load_checkpoint, save_checkpoint
+from copula_inter.training_core import cosine_lr_lambda
 
 
 def make_model_optimizer_scheduler(seed: int):

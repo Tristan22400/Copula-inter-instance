@@ -59,7 +59,7 @@ from eval.spatial.sweep_core import (  # noqa: E402
 )
 from copula_inter.loss import y_space_nll  # noqa: E402
 from copula_inter.model import build_copula_transformer, build_sigma  # noqa: E402
-from copula_inter.train import _build_era5_val_batches  # noqa: E402
+from copula_inter.era5_probes import _build_era5_val_batches  # noqa: E402
 
 _TINY_REGION = "western_europe"
 _TINY_GRID = 4

@@ -20,6 +20,24 @@ import math
 import os
 import traceback
 
+from copula_inter.adaptive_sampling import (
+    _compute_tabicl_z_train_gap,
+    _refresh_tabicl_mix_weights,
+    _tabicl_gap_to_mix_frac,
+    _update_adaptive_kernel_weights,
+)
+from copula_inter.checkpointing import load_checkpoint, save_checkpoint
+from copula_inter.era5_probes import _build_era5_val_batches, _build_era5_viz_batch
+from copula_inter.probe_batches import (
+    _build_analytic_val_z,
+    _build_posterior_probe_batches,
+    _build_synthetic_kernel_batches,
+    _build_tabicl_kernel_fit_z,
+    _build_tabicl_val_z,
+    _sigma_stats,
+)
+from copula_inter.validation import validate
+
 # P/N (hence attention sequence length T=P+N) are sampled per-shard from a wide
 # range (see conf/data/gp_tasks.yaml P_min/P_max, N_min/N_max), so batches vary
 # a lot in size while batch_size stays fixed — some shards get much closer to
@@ -35,54 +53,33 @@ import traceback
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import time
-import zlib
 from glob import glob
-from typing import Optional
 
 import hydra
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.nn as nn
+import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
-import wandb
-
+from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import z_train_source as z_train_source_of
 
 # eval/ (regions.py, spatial-correlation probe helpers -- see
 # _build_era5_val_batches below) lives at the repo root, not under src/.
-
-from copula_inter.classical_kernels import DEFAULT_FAMILIES
-from copula_inter.artifacts import atomic_torch_save
 from copula_inter.config_path import config_dir
-from copula_inter.training_core import (
-    _measure_step_flops, _run_train_step, cosine_lr_lambda,
-)
-from copula_inter.data_gen import _COMPOSABLE_KERNELS, KERNEL_REGISTRY, _generate_gp_batch_raw, generate_gp_batch
+from copula_inter.data_gen import _COMPOSABLE_KERNELS
 from copula_inter.dataset import (
     CopulaDataset,
     ShardBlockSampler,
     ShardHomogeneousBatchSampler,
     collate_fn,
 )
-from eval.configs.constants import GP_LR_MLE
-from eval.configs.regions import REGIONS as ERA5_REGIONS
 from copula_inter.era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
-from eval.data.era5_io import load_era5_data, safe_cholesky
-from eval.data.fetch_era5 import fetch as fetch_era5
-from eval.spatial.diagnostics import compute_context_z_train
-from eval.spatial.sweep_core import _fit_gp_baseline_nll, build_era5_probe
-from eval.viz.correlation_plots import (
-    plot_marginal_variance_grid,
-    plot_mean_removed_grid,
-    plot_residual_grid,
-    plot_z_predictor_samples,
-)
-from inference.copula_inference import normalize_features
 from copula_inter.live_dataset import (
     _GENERIC_MARGINAL_BACKENDS,
     _LIVE_TABICL_FLAT_HEADROOM_GB,
@@ -91,28 +88,21 @@ from copula_inter.live_dataset import (
     _validate_z_train_source,
     build_fixed_live_val_batches,
     build_live_train_loader,
-    limited_main_process_threads,
     resolve_live_tabicl_num_workers,
 )
-from copula_inter.loss import y_space_nll
-from copula_inter.model import build_copula_transformer, build_sigma
+from copula_inter.model import build_copula_transformer
 from copula_inter.muon import Muon
-from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
-from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.pit import (
     DEFAULT_K_FOLDS,
-    gaussian_corr_kl,
-    gp_analytical_pit,
-    gp_analytical_posterior,
-    load_tabicl,
-    normalize_targets,
-    resolve_pit_ckpt,
     configure_tabicl_inference_amp,
-    tabicl_forward,
-    run_pit,
+    load_tabicl,
+    resolve_pit_ckpt,
 )
-
-_PLOT_COLLECT_BATCHES = 5
+from copula_inter.training_core import (
+    _measure_step_flops,
+    _run_train_step,
+    cosine_lr_lambda,
+)
 
 # Peak dense FP16/BF16 tensor-core throughput (TFLOPS) per NVIDIA datasheets.
 # torch has no API to query this, so match torch.cuda.get_device_name() against
@@ -255,1319 +245,6 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     )
 
 
-def _sigma_stats(Sigma: torch.Tensor, mask: torch.Tensor) -> dict:
-    """Cheap off-diagonal and diagonal statistics over a batch of correlation matrices.
-
-    Key diagnostic: if offdiag_mean ≈ 0, the model is outputting near-identity
-    matrices and has not learned any inter-instance correlation structure.
-
-    Args:
-        Sigma : (B, N_max, N_max) float32 — predicted correlation matrices
-        mask  : (B, N_max) bool           — True for valid (non-padded) instances
-
-    Returns dict with float scalars: offdiag_mean, offdiag_std, diag_mean
-    """
-    B, N, _ = Sigma.shape
-    ri, ci = torch.triu_indices(N, N, offset=1, device=Sigma.device)
-    mask_2d = mask.unsqueeze(-1) & mask.unsqueeze(-2)  # (B, N, N)
-    valid_off = mask_2d[:, ri, ci]                     # (B, n_pairs)
-    off_vals = Sigma[:, ri, ci][valid_off]             # flat valid off-diagonal entries
-    diag_vals = Sigma.diagonal(dim1=-2, dim2=-1)[mask] # flat valid diagonal entries
-    if off_vals.numel() == 0:
-        return {"offdiag_mean": 0.0, "offdiag_std": 0.0, "diag_mean": 1.0}
-    return {
-        "offdiag_mean": off_vals.mean().item(),
-        "offdiag_std":  off_vals.std().item(),
-        "diag_mean":    diag_vals.mean().item(),
-    }
-
-
-def _corr_quality(off_pred: np.ndarray, off_ora: np.ndarray) -> dict:
-    """MSE, MAE, Pearson r, and signed bias between predicted and oracle off-diagonal values.
-
-    Args:
-        off_pred : 1-D float array — predicted off-diagonal correlations
-        off_ora  : 1-D float array — oracle off-diagonal correlations (same length)
-
-    Returns dict with float scalars: mse, mae, pearson, bias
-    """
-    diff = off_pred - off_ora
-    mse  = float(np.mean(diff ** 2))
-    mae  = float(np.mean(np.abs(diff)))
-    bias = float(np.mean(diff))
-    std_p, std_o = off_pred.std(), off_ora.std()
-    pearson = float(np.corrcoef(off_pred, off_ora)[0, 1]) if (std_p > 1e-12 and std_o > 1e-12) else 0.0
-    return {"mse": mse, "mae": mae, "pearson": pearson, "bias": bias}
-
-
-def _name_seed(base_seed: int, name: str) -> int:
-    """Deterministic per-name seed offset from a run-level base seed, so each
-    kernel family / ERA5 region gets its own fixed-but-different probe draw
-    instead of all of them sharing one seed."""
-    return base_seed + (zlib.crc32(name.encode()) % 10_000)
-
-
-def _macro_average(values: list[float]) -> float:
-    """Unweighted mean of a metric collected across kernel families /
-    regions, NaN if none were finite — used for the kernel_fit/era5_fit
-    mean_* cross-run-comparable scalars in validate()."""
-    return float(np.mean(values)) if values else float("nan")
-
-
-def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, dict]:
-    """Fixed per-kernel-family synthetic probe episodes for the
-    ``kernel_fit/<family>`` validation metrics (see validate()).
-
-    Generates B episodes per family via data_gen.generate_gp_batch — the same
-    (x_train, z_train, x_test, R_star, ...) construction used for real
-    training/val data, but with the generative kernel forced to one classical
-    family instead of this run's usual composite/systematic mixture. Built
-    once, with a fixed per-family seed, and reused every validation call, so
-    kernel_fit/<family> only reflects the model's changing predictions on a
-    frozen probe set — not resampling noise.
-
-    P_min/P_max/N_min/N_max are pinned to baselines.probe_* (NOT read from
-    cfg.data.*): this run's own gp_tasks.yaml can change its context/test-size
-    ranges (it has, repeatedly) without silently reshaping the probe episodes
-    underneath kernel_fit/<family> — otherwise two runs with different
-    data.P_min/P_max would each get a "frozen" probe that's fixed-per-run but
-    different-across-runs, defeating the entire point of a cross-run-
-    comparable benchmark.
-
-    return_kernel_metadata=True so validate() can also run
-    pit.gp_analytical_posterior per episode (oracle_diag/kernel_fit/<family>/
-    gap_nll) — the same true Bayes-optimal ceiling used by the top-level
-    posterior_probe, but scored per kernel family instead of on the run's
-    own composite mixture.
-    """
-    bcfg = cfg.get("baselines", {}) or {}
-    families = list(bcfg.get("kernels") or DEFAULT_FAMILIES)
-    n_episodes = int(bcfg.get("synth_n_episodes", 64))
-    base_seed = int(bcfg.get("synth_seed", 20260718))
-    probe_P_min = int(bcfg.get("probe_P_min", 32))
-    probe_P_max = int(bcfg.get("probe_P_max", 512))
-    probe_N_min = int(bcfg.get("probe_N_min", 8))
-    probe_N_max = int(bcfg.get("probe_N_max", 1024))
-
-    batches: dict[str, dict] = {}
-    for family in families:
-        if family not in KERNEL_REGISTRY:
-            continue  # not standalone-generatable (e.g. an unregistered composite)
-        family_seed = _name_seed(base_seed, family)
-        synth_cfg = OmegaConf.merge(
-            cfg,
-            OmegaConf.create({
-                "seed": family_seed,
-                "data": {
-                    "kernel": family,
-                    "systematic_composition": False,
-                    "P_min": probe_P_min,
-                    "P_max": probe_P_max,
-                    "N_min": probe_N_min,
-                    "N_max": probe_N_max,
-                },
-            }),
-        )
-        episodes = generate_gp_batch(synth_cfg, n_episodes, device=device, return_kernel_metadata=True)
-        batch = collate_fn(episodes)
-        batches[family] = {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
-    return batches
-
-
-def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
-    """Fallback probe set for the true-Bayes-optimal-ceiling validation
-    metrics (see validate()'s oracle_diag/gap_nll / oracle_diag/corr_pearson)
-    when val_loader itself can't supply the needed kernel metadata.
-
-    data_gen.py's own oracle_mode="prior" R_star/Sigma_star (what every other
-    "oracle" quantity in this file is scored against) is context-blind by
-    construction — see data_gen.py:3359-3382 — so it is NOT the Bayes-optimal
-    lower bound achievable given (x_train, y_train), only a weaker,
-    beatable one. pit.gp_analytical_posterior computes the real one (Schur
-    complement, float64, PSD-repaired), but it only runs one episode at a
-    time and needs return_kernel_metadata=True episodes (kernel name +
-    hyperparameters). The live-generation val_loader (train.py's
-    build_fixed_live_val_batches) now requests exactly that, so validate()
-    scores oracle_diag/gap_nll directly against val_loader's own episodes in
-    that (default) case — see validate()'s val_episodes_meta parameter. This
-    function only still runs as the fallback for the two cases where
-    val_loader can't carry that metadata: on-disk training
-    (training.live_generation=false, CopulaDataset's shards were never
-    written with it) and the real-ERA5 live_source (no GP kernel to
-    reconstruct a posterior from at all). This builds a fixed set of such
-    episodes once at startup — unlike _build_synthetic_kernel_batches,
-    cfg.data's own kernel mixture (systematic_composition etc.) is left
-    untouched, since the point here is to measure the ceiling on the SAME
-    kind of episode the model actually trains on, not an isolated classical
-    kernel family.
-
-    baselines.posterior_probe_n_episodes defaults (conf/config.yaml) to
-    ${training.val_episodes} — same episode count as val_loader, drawn fresh
-    from the same cfg.data distribution val_loader itself samples from, so
-    oracle_diag/gap_nll is a same-size, same-distribution stand-in for "gap
-    on the full validation set" in these fallback cases (not literally the
-    same episodes as val_loader). Override the config key directly for a
-    different size (e.g. smaller, for faster iteration).
-
-    Returns {"episodes": [...] (CPU dicts, consumed by gp_analytical_posterior
-    one at a time), "batch": {...} (device-resident, collated/padded,
-    consumed by the model forward pass — same episodes, same order)}.
-    """
-    bcfg = cfg.get("baselines", {}) or {}
-    n_episodes = int(bcfg.get("posterior_probe_n_episodes", 64))
-    base_seed = int(bcfg.get("synth_seed", 20260718)) + 2  # +1 is _compute_tabicl_z_train_gap's
-    probe_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": base_seed}))
-    episodes = generate_gp_batch(probe_cfg, n_episodes, device=device, return_kernel_metadata=True)
-    batch = collate_fn(episodes)
-    return {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
-
-
-def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal, device: str) -> dict[str, dict]:
-    """Fixed per-region real-ERA5 probes for the ``era5_fit/<region>``
-    validation metrics (see validate()) — the real-data analogue of
-    _build_synthetic_kernel_batches above.
-
-    Unlike a kernel_fit/<family> synthetic probe, real ERA5 has no known GP
-    oracle (no Sigma_star/R_star), so there is no NLL-gap metric to compute
-    here. Instead, eval.spatial.sweep_core.build_era5_probe freezes a ground-
-    truth correlation-vs-distance curve (empirical Pearson correlation, the
-    same convention eval/runners/spatial_correlation_eval.py's real-mode
-    sweep uses) plus a fixed real in-context sample (context coords/values,
-    PIT'd once against `tabicl_marginal`) for a handful of ERA5 days per
-    region. validate() re-runs only the CURRENT model's forward pass on this
-    frozen input every call and scores the resulting correlogram against the
-    frozen curve — the ERA5 fetch + PIT cost is paid once, here, not on the
-    training loop's hot path.
-
-    `tabicl_marginal` may be None (no PIT checkpoint configured): falls back
-    to naive per-context standardization, same as
-    eval.spatial.diagnostics.extract_model_context_correlation. In that case
-    there is no real predictive density to score a Y-space NLL against, so
-    the returned probe carries no "nll_test_z"/"nll_test_log_pdf" and
-    validate()'s era5_fit/<region>/y_nll_total block is skipped for every
-    region.
-
-    When `tabicl_marginal` IS given, this also runs TabICL's own PIT
-    (_tabicl_pit_batch) once on the probe's held-out (never-in-context)
-    points (build_era5_probe's nll_test_idx/context_values_per_day/
-    nll_test_values_per_day) — the same real-marginal z_test/log_pdf_test
-    val/y_nll_total is scored against for the general val set, just frozen
-    here alongside z_train since tabicl_marginal doesn't change during
-    training either.
-
-    Also fits a classical-GP-MLE baseline (region_batch["gp_baseline_nll"],
-    scored by validate() alongside the model's own era5_fit/<region>/
-    y_nll_total for a live comparison) via eval.spatial.sweep_core::
-    _fit_gp_baseline_nll, independent of tabicl_marginal — same
-    fit-once-here-not-per-validate()-call rationale, at deliberately lighter
-    settings than that module's own rigor defaults (see the era5_gp_* cfg
-    reads below for why).
-    """
-    ecfg = cfg.get("baselines", {}) or {}
-    region_names = list(ecfg.get("era5_regions") or list(ERA5_REGIONS.keys()))
-    grid_size = int(ecfg.get("era5_grid_size", 10))
-    n_days_fetch = int(ecfg.get("era5_n_days_fetch", 60))
-    n_days_probe = int(ecfg.get("era5_n_days_probe", 3))
-    n_context = int(ecfg.get("era5_n_context", 30))
-    n_bins = int(ecfg.get("era5_n_bins", 12))
-    base_seed = int(ecfg.get("era5_seed", 20260818))
-    pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
-
-    # Classical-GP-MLE baseline (era5_fit/<region>/gp_baseline_<kernel>_nll_*
-    # in validate()) -- a training-time-affordable version of
-    # spatial_correlation_eval.py real-mode sweep's own GP_BASELINE_KERNELS
-    # fit (eval/spatial/sweep_core.py::_fit_gp_baseline_nll), reused here
-    # directly rather than duplicated. That sweep's rigor defaults (all of
-    # GP_BASELINE_KERNELS, GP_N_STEPS_MLE=1000, GP_N_RESTARTS_MLE=5) are NOT
-    # reused as-is: measured ~17s/kernel/restart/1000-steps on CPU, ~8s on
-    # GPU, so 5 kernels x 5 restarts x era5_n_days_probe(3) days x 5 regions
-    # would add 30-100+ minutes to every train.py startup. Only 2 of
-    # GP_BASELINE_KERNELS by default (matern32 -- this codebase's other
-    # standard default kernel -- + rational_quadratic), 1 of the probe's
-    # frozen days, 1 restart, and 300 steps keeps this to roughly 20-30s
-    # total (still a one-time cost paid here, not on validate()'s hot path
-    # -- same precompute-once rationale as the PIT/fetch cost above). Bump
-    # era5_gp_baseline_kernels/era5_gp_n_restarts_mle/era5_gp_n_steps_mle
-    # back up via cfg for a rarer, higher-fidelity run if the extra startup
-    # time is worth it.
-    gp_baseline_enabled = bool(ecfg.get("era5_gp_baseline", True))
-    gp_baseline_kernels = list(ecfg.get("era5_gp_baseline_kernels") or ["matern32", "rational_quadratic"])
-    gp_baseline_n_days = int(ecfg.get("era5_gp_baseline_n_days", 1))
-    gp_n_steps_mle = int(ecfg.get("era5_gp_n_steps_mle", 300))
-    gp_lr_mle = float(ecfg.get("era5_gp_lr_mle", GP_LR_MLE))
-    gp_n_restarts_mle = int(ecfg.get("era5_gp_n_restarts_mle", 1))
-
-    batches: dict[str, dict] = {}
-    for region_name in region_names:
-        if region_name not in ERA5_REGIONS:
-            continue  # not a registered eval/configs/regions.py entry
-        region_seed = _name_seed(base_seed, region_name)
-        probe = build_era5_probe(
-            region_name, grid_size, n_days_fetch, n_days_probe, n_context, n_bins,
-            tabicl_marginal, device, seed=region_seed,
-        )
-        n_days_p = probe["z_train_per_day"].shape[0]
-        x_train = torch.as_tensor(probe["x_train_norm"], dtype=torch.float32, device=device)
-        x_test = torch.as_tensor(probe["x_test_norm"], dtype=torch.float32, device=device)
-        z_train = torch.as_tensor(probe["z_train_per_day"], dtype=torch.float32, device=device)
-        model_batch = {
-            "x_train": x_train.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
-            "x_test": x_test.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
-            "z_train": z_train,
-            "test_mask": torch.ones(n_days_p, probe["D"], dtype=torch.bool, device=device),
-        }
-        region_batch = {
-            "batch": model_batch,
-            "dist": probe["dist"],
-            "bin_edges": probe["bin_edges"],
-            "pair_counts": probe["pair_counts"],
-            "rho_emp": probe["rho_emp"],
-        }
-        if tabicl_marginal is not None:
-            n_nll = probe["x_nll_test_norm"].shape[0]
-            x_nll_test = torch.as_tensor(probe["x_nll_test_norm"], dtype=torch.float32, device=device)
-            nll_pit_batch = {
-                "x_train": model_batch["x_train"],
-                "y_train": torch.as_tensor(probe["context_values_per_day"], dtype=torch.float32, device=device),
-                "train_mask": torch.ones(n_days_p, probe["n_context"], dtype=torch.bool, device=device),
-                "x_test": x_nll_test.unsqueeze(0).expand(n_days_p, -1, -1).contiguous(),
-                "y_test": torch.as_tensor(probe["nll_test_values_per_day"], dtype=torch.float32, device=device),
-                "test_mask": torch.ones(n_days_p, n_nll, dtype=torch.bool, device=device),
-            }
-            nll_pit = _tabicl_pit_batch(nll_pit_batch, tabicl_marginal, pit_k_folds, device)
-            region_batch["nll_test_idx"] = probe["nll_test_idx"]
-            region_batch["nll_test_z"] = nll_pit["z_test"].to(device)
-            region_batch["nll_test_log_pdf"] = nll_pit["log_pdf_test"].to(device)
-
-        if gp_baseline_enabled:
-            n_gp_days = max(1, min(gp_baseline_n_days, n_days_p))
-            gp_nll_per_day: dict = {k: {"total": [], "marginal": [], "copula": []} for k in gp_baseline_kernels}
-            for d in range(n_gp_days):
-                gp_day = _fit_gp_baseline_nll(
-                    cache_key=(region_name, d, region_seed, n_context),
-                    x_train_norm=probe["x_train_norm"],
-                    context_values=probe["context_values_per_day"][d],
-                    x_test_norm=probe["x_nll_test_norm"],
-                    y_test=probe["nll_test_values_per_day"][d],
-                    kernel_names=gp_baseline_kernels,
-                    n_steps=gp_n_steps_mle, lr=gp_lr_mle, n_restarts=gp_n_restarts_mle,
-                    device=device,
-                )
-                for kname, parts in gp_day.items():
-                    for comp in ("total", "marginal", "copula"):
-                        gp_nll_per_day[kname][comp].append(parts[comp])
-            region_batch["gp_baseline_nll"] = {
-                kname: {comp: float(np.nanmean(vals)) for comp, vals in parts.items()}
-                for kname, parts in gp_nll_per_day.items()
-            }
-        batches[region_name] = region_batch
-    return batches
-
-
-def _build_era5_viz_batch(cfg: DictConfig, tabicl_marginal, device: str) -> "dict | None":
-    """Fixed sparse-context real-ERA5 probe for the qualitative
-    ``val/era5_predictions`` figure in validate()'s do_plot block --
-    replaces the old val/corr_density_analytic_z + val/corr_grid
-    correlation-matrix-vs-oracle plots (see this repo's
-    feedback_no_raw_correlation_vs_oracle_comparison note: comparing the
-    model's Sigma directly against the GP's exact R_star isn't a valid
-    diagnostic once TabICL's PIT is in the loop, since Sigma lives in
-    TabICL's own approximate z-space, not the GP's exact one) with
-    something directly interpretable: the model's predicted temperature
-    field against the real ground truth, on a handful of frozen days, from
-    a context sparse enough (< baselines.era5_viz_context_frac, default
-    5%, of the grid) to be a genuine spatial-extrapolation test rather than
-    near-complete coverage.
-
-    Unlike _build_era5_val_batches (era5_fit/<region>'s NLL probe, which
-    uses a denser ~5% context tuned for a stable NLL estimate, not a
-    strictly-below-5% one), this picks ONE region and keeps the grid/days/
-    context sample fixed across every do_plot call -- only the model's
-    forward pass changes step to step, so the figure is directly
-    comparable across training.
-
-    Splits precompute (here, once) from live (validate()'s do_plot block,
-    every call) the same way _build_era5_val_batches does: the context
-    sample, its PIT z_train, and each day's TabICL marginal quantile
-    function are all independent of the (still-training) copula model, so
-    they're computed once. The marginal quantile function in particular
-    (TabICL's QuantileDistribution) is a pure function of its own stored
-    tensors once built -- see tabicl's quantile_dist.py:icdf -- so caching
-    the `dist` object per day here means validate() never needs to keep
-    the (VRAM-heavy) tabicl_marginal net resident, or re-run its forward
-    pass, for the rest of training; it only reruns the copula model's own
-    forward pass plus a cheap Cholesky sample + icdf lookup.
-
-    Also caches each day's `dist.variance()` (rescaled to real Kelvin^2 by
-    the same y_mean/y_std) for val/era5_marginal_variance, and `dist.mean()`
-    (rescaled the same way) for val/era5_residuals' mean-removal -- both are
-    properties of the frozen marginal alone, so they're likewise computed
-    once here rather than in validate()'s do_plot block.
-    """
-    ecfg = cfg.get("baselines", {}) or {}
-    region_pool = list(ecfg.get("era5_regions") or ERA5_REGIONS.keys())
-    if not region_pool:
-        return None
-    region_name = str(ecfg.get("era5_viz_region") or region_pool[0])
-    if region_name not in ERA5_REGIONS:
-        return None
-    grid_size = int(ecfg.get("era5_viz_grid_size", 24))
-    n_days_fetch = int(ecfg.get("era5_n_days_fetch", 60))
-    n_days_viz = int(ecfg.get("era5_viz_n_days", 4))
-    context_frac = float(ecfg.get("era5_viz_context_frac", 0.05))
-    seed = int(ecfg.get("era5_viz_seed", 20260825))
-    pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
-    # Fitted-GP reference row (see _era5_viz_gp_posterior). Reuses the
-    # era5_gp_*_mle knobs the era5_fit NLL probe's baseline already reads,
-    # so there's one place to tune fit fidelity for both.
-    gp_row_enabled = bool(ecfg.get("era5_viz_gp", True))
-    gp_row_kernel = str(ecfg.get("era5_viz_gp_kernel", "matern32"))
-    gp_row_n_steps = int(ecfg.get("era5_gp_n_steps_mle", 300))
-    gp_row_lr = float(ecfg.get("era5_gp_lr_mle", GP_LR_MLE))
-    gp_row_n_restarts = int(ecfg.get("era5_gp_n_restarts_mle", 1))
-
-    lat_bounds, lon_bounds = ERA5_REGIONS[region_name]
-    nc_path = fetch_era5(region_name, lat_bounds, lon_bounds, grid_size, n_days_fetch)
-    data = load_era5_data(nc_path)
-    lat, lon = data["latitude"], data["longitude"]
-    lon_grid, lat_grid = np.meshgrid(lon, lat)
-    coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
-    D = coords.shape[0]
-
-    rng = np.random.default_rng(seed)
-    n_time = data["t2m"].shape[0]
-    n_pick = min(n_days_viz, n_time)
-    days = sorted(set(np.linspace(0, n_time - 1, n_pick).round().astype(int).tolist()))
-
-    # int() truncates (not rounds), so this can never land ON the 5%
-    # boundary the way a round() could -- strictly < context_frac of D.
-    n_context = max(1, min(int(context_frac * D), D - 1))
-    context_idx = rng.choice(D, size=n_context, replace=False)
-    context_coords = coords[context_idx]
-    x_train_norm, x_test_norm = normalize_features(context_coords, coords)
-    x_full = np.concatenate([x_train_norm, x_test_norm], axis=0)
-    x_batch = torch.as_tensor(x_full, dtype=torch.float32, device=device).unsqueeze(0)
-
-    true_fields, z_train_per_day = [], []
-    dists_per_day, y_mean_per_day, y_std_per_day = [], [], []
-    gp_post_per_day: list = []
-    gp_post_z_per_day: list = []
-    marginal_var_per_day: list = []
-    marginal_mean_per_day: list = []
-    for d in days:
-        frame = data["t2m"][d]
-        true_fields.append(frame)
-        context_values = frame.ravel()[context_idx]
-        z_train_d = compute_context_z_train(x_train_norm, context_values, tabicl_marginal, device, k_folds=pit_k_folds)
-        z_train_per_day.append(z_train_d)
-        gp_post_per_day.append(
-            _era5_viz_gp_posterior(
-                x_train_norm, context_values, x_test_norm, gp_row_kernel,
-                gp_row_n_steps, gp_row_lr, gp_row_n_restarts, device,
-            ) if gp_row_enabled else None
-        )
-        gp_post_z_per_day.append(
-            _era5_viz_gp_posterior_on_z(
-                x_train_norm, z_train_d, x_test_norm, gp_row_kernel,
-                gp_row_n_steps, gp_row_lr, gp_row_n_restarts, device,
-            ) if gp_row_enabled else None
-        )
-        context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
-        context_values_scaled_t, _, y_mean_t, y_std_t = normalize_targets(context_values_t)
-        y_mean_per_day.append(y_mean_t.double())
-        y_std_per_day.append(y_std_t.double())
-        if tabicl_marginal is None:
-            dists_per_day.append(None)
-            marginal_var_per_day.append(None)
-            marginal_mean_per_day.append(None)
-            continue
-        with torch.no_grad():
-            logits = tabicl_forward(
-                tabicl_marginal, x_batch, context_values_scaled_t.unsqueeze(0)
-            )  # (1, D, Q)
-            dist_d = tabicl_marginal.quantile_dist(logits.reshape(D, -1))
-            dists_per_day.append(dist_d)
-            # Var[y|x] in real Kelvin^2 = Var[y_scaled|x] * y_std^2 -- dist_d
-            # lives in the same context-normalized scale normalize_targets
-            # put context_values_scaled_t in (see _era5_viz_field's inverse
-            # rescale). QuantileDistribution.variance() is the analytic
-            # tail-corrected E[Z^2]-E[Z]^2 formula (quantile_dist.py), so this
-            # is exact given the fitted spline/tails, not a sampling estimate.
-            marginal_var_per_day.append((dist_d.variance() * y_std_t.double() ** 2).cpu().numpy())
-            # E[y|x] in real Kelvin, same rescale as _era5_viz_field's return
-            # line (linear, so y_std scales rather than y_std^2) -- the
-            # per-location mean val/era5_residuals subtracts off every row.
-            marginal_mean_per_day.append((y_mean_t.double() + y_std_t.double() * dist_d.mean().double()).cpu().numpy())
-
-    return {
-        "region": region_name, "lat": lat, "lon": lon, "grid_shape": data["t2m"][days[0]].shape,
-        "days": days, "true_fields": true_fields, "coords": coords,
-        "context_coords": context_coords, "D": D, "n_context": n_context,
-        "x_train_norm": x_train_norm, "x_test_norm": x_test_norm,
-        "z_train_per_day": z_train_per_day,
-        "dists_per_day": dists_per_day, "y_mean_per_day": y_mean_per_day, "y_std_per_day": y_std_per_day,
-        "marginal_var_per_day": marginal_var_per_day, "marginal_mean_per_day": marginal_mean_per_day,
-        "gp_post_per_day": gp_post_per_day, "gp_post_z_per_day": gp_post_z_per_day,
-        "gp_row_kernel": gp_row_kernel,
-        "seed": seed,
-    }
-
-
-def _era5_viz_gp_posterior(
-    x_train_norm: np.ndarray, context_values: np.ndarray, x_test_norm: np.ndarray,
-    kernel_name: str, n_steps: int, lr: float, n_restarts: int, device: str,
-) -> "dict | None":
-    """Fitted-GP posterior (mean, Cholesky factor) at the viz grid, fitted by
-    MLE+MAP on the SAME sparse context the copula model sees -- the reference
-    predictor behind val/era5_predictions' "Fitted GP posterior sample" row.
-
-    Same fit as the era5_fit/<region> NLL probe's GP baseline
-    (eval/spatial/sweep_core.py::_fit_gp_baseline_nll): identical
-    fit_and_eval_gpytorch call, oracle_mode="posterior" (a real
-    context-conditioned spatial predictor, not the unconditioned prior), and
-    the same z-score-fit-rescale dance -- fit_and_eval_gpytorch's MAP priors
-    are tuned to data_gen.py's ~unit-variance synthetic y-scale, so raw
-    Kelvin has to be standardized before fitting and the posterior rescaled
-    back afterwards, or the prior drags the outputscale/noise to the wrong
-    magnitude.
-
-    Precomputed once per viz day (this is a pure function of the frozen
-    context sample, not of the still-training copula model, exactly like
-    _build_era5_viz_batch's z_train/dists), and the O(D^3) Cholesky is done
-    here rather than per do_plot call so drawing the sample later is one
-    matvec. Returns None -- caller drops the GP row and the figure renders
-    as it did before -- if the fit or the factorization fails, since a
-    reference panel is never worth killing a validation pass over.
-    """
-    from eval.baselines.classical import fit_and_eval_gpytorch
-
-    try:
-        mu_y = float(context_values.mean())
-        sigma_y = max(float(context_values.std(ddof=1)), 1e-6) if len(context_values) > 1 else 1.0
-        X_tr = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
-        X_te = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
-        y_tr = torch.as_tensor((context_values - mu_y) / sigma_y, dtype=torch.float32, device=device)
-        fit = fit_and_eval_gpytorch(
-            X_tr, y_tr, X_te, kernel_name, n_steps=n_steps, lr=lr,
-            oracle_mode="posterior", n_restarts=n_restarts,
-        )
-        mean = (fit["mean"].double() * sigma_y + mu_y).cpu().numpy()
-        Sigma = (fit["Sigma"].double() * (sigma_y ** 2)).cpu().numpy()
-        return {"mean": mean, "L": safe_cholesky(Sigma), "kernel": kernel_name}
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [era5_viz_gp:{kernel_name}] fit failed, dropping GP row: {exc}")
-        return None
-
-
-def _era5_viz_gp_posterior_on_z(
-    x_train_norm: np.ndarray, z_train: np.ndarray, x_test_norm: np.ndarray,
-    kernel_name: str, n_steps: int, lr: float, n_restarts: int, device: str,
-) -> "dict | None":
-    """Fitted-GP CORRELATION ONLY, MLE-fit directly on the PIT latent
-    z_train instead of raw Kelvin -- a SEPARATE fit from
-    _era5_viz_gp_posterior, backing val/era5_predictions' "Fitted GP
-    correlation + TabICLv2 marginal" row and val/era5_predictions_z's GP
-    row, in place of that other function's correlation.
-
-    Why a second fit rather than reusing _era5_viz_gp_posterior's: that fit's
-    kernel hyperparameters (lengthscale/outputscale/noise) are a Gaussian-
-    likelihood MLE against raw Kelvin, only mean/std-normalized -- real T2m
-    still has whatever skew/heteroscedasticity mean/std normalization
-    doesn't remove, so a Gaussian likelihood is somewhat misspecified against
-    it, which can bias the fitted correlation (e.g. heavy tails inflating
-    the noise estimate, over-shrinking off-diagonal correlation). z_train has
-    already been Gaussianized by TabICL's own conditional PIT
-    (compute_context_z_train) -- fitting the SAME kernel family's
-    hyperparameters against it instead removes that marginal-shape
-    contamination from the correlation-only estimate, which is the fairest
-    classical-GP reference for isolating whether the neural copula's
-    correlation beats a classical GP's, holding the (TabICL) marginal fixed
-    on both sides.
-
-    No y_mean/y_std rescale-back needed (unlike _era5_viz_gp_posterior):
-    z_train is already ~zero-mean/unit-variance by construction (PIT
-    output), matching the MAP priors' assumed scale as-is, and only the
-    fit's correlation matrix R is kept -- its posterior MEAN is never used
-    by either downstream row (both draw a zero-mean copula sample and let
-    TabICL's marginal supply location/scale), so it isn't computed here.
-
-    Returns None (caller drops the row) on fit/factorization failure, same
-    convention as _era5_viz_gp_posterior.
-    """
-    from eval.baselines.classical import fit_and_eval_gpytorch
-
-    try:
-        X_tr = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
-        X_te = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
-        z_tr = torch.as_tensor(z_train, dtype=torch.float32, device=device)
-        fit = fit_and_eval_gpytorch(
-            X_tr, z_tr, X_te, kernel_name, n_steps=n_steps, lr=lr,
-            oracle_mode="posterior", n_restarts=n_restarts,
-        )
-        R = fit["R"].double().cpu().numpy()
-        return {"L": safe_cholesky(R), "kernel": kernel_name}
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [era5_viz_gp_z:{kernel_name}] fit failed, dropping GP-on-z row: {exc}")
-        return None
-
-
-def _era5_viz_gp_field(gp: dict, z_shared: np.ndarray) -> np.ndarray:
-    """One joint draw (D,) from the fitted GP posterior of
-    _era5_viz_gp_posterior, using the SAME latent white-noise vector
-    `z_shared` that _era5_viz_field injects into the copula model's Sigma.
-
-    Sharing z_shared is the point: the GP row and the copula row then differ
-    ONLY in their correlation structure (and in the GP's own Gaussian
-    marginal), not in which realization of the noise they happened to draw,
-    so a visible difference in smoothness is attributable to the model
-    rather than to sampling luck.
-    """
-    return gp["mean"] + gp["L"] @ z_shared
-
-
-def _era5_viz_gp_correlation(gp: dict) -> np.ndarray:
-    """Convert the fitted GP posterior covariance into its correlation matrix."""
-    Sigma = gp["L"] @ gp["L"].T
-    std = np.sqrt(np.maximum(np.diag(Sigma), 1e-12))
-    return Sigma / np.outer(std, std)
-
-
-def _era5_viz_field(Sigma: np.ndarray, dist, y_mean: torch.Tensor, y_std: torch.Tensor, z_shared: np.ndarray, device: str) -> np.ndarray:
-    """One joint draw (D,) from the copula model's implied field for one
-    ERA5 viz day: inject the CURRENT model correlation matrix `Sigma` into
-    the shared latent Gaussian vector `z_shared` via Cholesky, then map
-    through the frozen per-day marginal quantile function `dist` (see
-    _build_era5_viz_batch) -- i.e. y = F_hat^{-1}(Phi(z)), the same
-    construction as eval.spatial.diagnostics.predict_copula_residual_field,
-    just split so only this (cheap) step reruns every do_plot call instead
-    of also repeating the (expensive) TabICL forward pass that built `dist`.
-    Falls back to a naive Gaussian(mean, std) marginal if `dist` is None
-    (no PIT checkpoint configured -- see _build_era5_viz_batch).
-    """
-    from scipy.stats import norm
-
-    L = safe_cholesky(Sigma)
-    z_copula = L @ z_shared
-    if dist is None:
-        return y_mean.cpu().numpy() + y_std.cpu().numpy() * z_copula
-    u_copula = np.clip(norm.cdf(z_copula), 1e-6, 1.0 - 1e-6)
-    u_t = torch.as_tensor(u_copula, dtype=torch.float32, device=device).unsqueeze(-1)
-    with torch.no_grad():
-        y_pred_scaled = dist.icdf(u_t).squeeze(-1).double()
-    return (y_mean + y_std * y_pred_scaled).cpu().numpy()
-
-
-def _era5_viz_fig(
-    model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str,
-) -> "tuple[plt.Figure | None, plt.Figure | None]":
-    """Builds the ``val/era5_predictions`` figure (and its mean-removed
-    ``val/era5_residuals`` companion) from a frozen _build_era5_viz_batch
-    probe: reruns the CURRENT model's forward pass (the only per-step-
-    changing input) to get Sigma for each of the probe's few frozen days,
-    samples one field from it via _era5_viz_field, and renders ground-truth
-    vs. fitted-GP-posterior vs. predicted (vs. independent, copula switched
-    off) small multiples via eval.viz.correlation_plots.plot_residual_grid.
-    Returns (None, None) if the probe's grid was degenerate (e.g. 0 valid
-    days).
-
-    The fitted-GP row (precomputed by _build_era5_viz_batch, drawn here with
-    the SAME z_shared as the copula row) is the reference that makes the
-    figure readable: both it and the model row are posterior SAMPLES at <5%
-    context, whereas the ground-truth row is a fully-observed realization.
-    Comparing a sample against the truth rewards whichever model is most
-    overconfident -- emitting the prior correlation rather than the
-    posterior gives beautiful smooth fields and a much WORSE held-out NLL.
-    Against the GP's own sample, that trade is visible instead of hidden.
-
-    The residual companion figure subtracts each row's OWN predictive mean
-    (the frozen TabICL marginal's mean field -- see _build_era5_viz_batch's
-    marginal_mean_per_day -- for the ground-truth/predicted/independent
-    rows, the fitted GP's own posterior mean for the GP row) at every
-    location before plotting, via eval.viz.correlation_plots.
-    plot_mean_removed_grid. Raw ERA5 temperature is dominated by a smooth
-    lat/lon gradient that swamps the finer cross-location structure Sigma is
-    actually scored on; removing the mean isolates that structure so the
-    model's residual texture can be compared by eye against the ground
-    truth's and the fitted GP's own residual samples. Reuses this
-    function's per-day forward pass and z_shared draws rather than
-    resampling, so the two figures are built from the identical fields (the
-    residual panel is a strict function of the ones the raw panel already
-    plots) at no extra model-forward cost. Silently drops (None) if any
-    day's marginal mean is missing (no PIT checkpoint configured).
-    """
-    if not vb["days"]:
-        return None, None
-    x_train_v = torch.as_tensor(vb["x_train_norm"], dtype=torch.float32, device=device).unsqueeze(0)
-    x_test_v = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
-    rng_v = np.random.default_rng(vb["seed"])
-    R_indep = np.eye(vb["D"])
-    predicted_fields, gp_tabicl_fields, independent_fields, gp_fields = [], [], [], []
-    predicted_resid, gp_tabicl_resid, independent_resid, gp_resid, true_resid = [], [], [], [], []
-    gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
-    marginal_mean = vb.get("marginal_mean_per_day") or [None] * len(vb["days"])
-    gp_post_z = vb.get("gp_post_z_per_day") or [None] * len(vb["days"])
-    for i in range(len(vb["days"])):
-        z_train_v = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
-        out_v = model({"x_train": x_train_v, "z_train": z_train_v, "x_test": x_test_v})
-        Sigma_v = build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
-        z_shared = rng_v.standard_normal(vb["D"])
-        dist_i, y_mean_i, y_std_i = vb["dists_per_day"][i], vb["y_mean_per_day"][i], vb["y_std_per_day"][i]
-        pred_field = _era5_viz_field(Sigma_v, dist_i, y_mean_i, y_std_i, z_shared, device)
-        indep_field = _era5_viz_field(R_indep, dist_i, y_mean_i, y_std_i, z_shared, device)
-        predicted_fields.append(pred_field)
-        independent_fields.append(indep_field)
-        mean_i = marginal_mean[i]
-        if mean_i is not None:
-            predicted_resid.append(pred_field - mean_i)
-            independent_resid.append(indep_field - mean_i)
-            true_resid.append(vb["true_fields"][i].ravel() - mean_i)
-        if gp_post[i] is not None:
-            gp_field = _era5_viz_gp_field(gp_post[i], z_shared)
-            gp_fields.append(gp_field)
-            if mean_i is not None:
-                gp_resid.append(gp_field - gp_post[i]["mean"])
-        # gp_post_z (correlation fit on z_train) is a SEPARATE fit from
-        # gp_post (correlation+mean fit on raw y) -- see
-        # _era5_viz_gp_posterior_on_z -- so it fails/succeeds independently
-        # and gets its own all-or-nothing gate below.
-        if gp_post_z[i] is not None:
-            gp_tabicl_field = _era5_viz_field(
-                _era5_viz_gp_correlation(gp_post_z[i]), dist_i, y_mean_i, y_std_i, z_shared, device,
-            )
-            gp_tabicl_fields.append(gp_tabicl_field)
-            if mean_i is not None:
-                gp_tabicl_resid.append(gp_tabicl_field - mean_i)
-    # All-or-nothing: a partially populated oracle row would silently pair
-    # day j's GP draw with day k's column (_plot_field_grid zips rows against
-    # true_fields positionally), so one failed per-day fit drops the row.
-    oracle_fields = gp_fields if len(gp_fields) == len(vb["days"]) else None
-    gp_tabicl_row = gp_tabicl_fields if len(gp_tabicl_fields) == len(vb["days"]) else None
-    data_like = {"latitude": vb["lat"], "longitude": vb["lon"], "t2m": dict(zip(vb["days"], vb["true_fields"]))}
-    fig_raw = plot_residual_grid(
-        data_like, vb["days"], predicted_fields, output_path=None,
-        context_coords=vb["context_coords"], independent_fields=independent_fields,
-        oracle_fields=oracle_fields, predicted_fields_2=gp_tabicl_row,
-        oracle_row_label=f"Fitted GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample\nLatitude",
-        pred2_row_label="Fitted GP correlation\n+ TabICLv2 marginal\nsample\nLatitude",
-        target="raw",
-    )
-    fig_resid = None
-    if len(true_resid) == len(vb["days"]):
-        oracle_resid = gp_resid if len(gp_resid) == len(vb["days"]) else None
-        gp_tabicl_resid_row = gp_tabicl_resid if len(gp_tabicl_resid) == len(vb["days"]) else None
-        fig_resid = plot_mean_removed_grid(
-            vb["lat"], vb["lon"], vb["grid_shape"], vb["days"], true_resid, output_path=None,
-            predicted_fields=predicted_resid, predicted_fields_2=gp_tabicl_resid_row,
-            independent_fields=independent_resid, oracle_fields=oracle_resid,
-            context_coords=vb["context_coords"],
-            oracle_row_label=f"Fitted GP posterior\n({vb.get('gp_row_kernel', 'gp')})\nsample minus\nGP mean\nLatitude",
-        )
-    return fig_raw, fig_resid
-
-
-def _era5_z_samples_fig(
-    model: nn.Module, cfg: DictConfig, vb: dict, jitter: float, device: str, n_samples: int = 3,
-) -> "plt.Figure | None":
-    """Builds the ``val/era5_predictions_z`` figure: `n_samples` posterior
-    draws of the COPULA LATENT z (no marginal, no ground truth -- a real
-    field has no observed z) on ONE fixed day, vb["days"][0] -- the SAME day
-    as val/era5_predictions' first column, so the two figures are directly
-    comparable. Rows are the three predictors' correlation structures:
-    independent (R=I), the copula model's current Sigma (one forward pass,
-    reused for all n_samples columns since Sigma doesn't depend on the
-    sample), and the fitted-GP baseline's correlation -- the LATTER from
-    _era5_viz_gp_posterior_on_z (MLE-fit directly on z_train), not
-    _era5_viz_gp_posterior's raw-y fit, since this whole figure lives in
-    z-space already and z_train is the honest target for a z-space
-    correlation baseline. Every column shares one white-noise draw z_shared
-    across all three rows (own RNG, seeded off vb["seed"] + 1 so it never
-    perturbs, or is perturbed by, _era5_viz_fig's own per-day z_shared
-    sequence), so column-to-column differences are sampling variation and
-    row-to-row differences are the correlation structure alone.
-
-    Returns None if the probe has no days, or if the fixed day's GP-on-z fit
-    failed/was disabled -- 2 of 3 requested predictors isn't this figure.
-    """
-    if not vb["days"]:
-        return None
-    gp0 = (vb.get("gp_post_z_per_day") or [None])[0]
-    if gp0 is None:
-        return None
-    day0 = vb["days"][0]
-    x_train_v = torch.as_tensor(vb["x_train_norm"], dtype=torch.float32, device=device).unsqueeze(0)
-    x_test_v = torch.as_tensor(vb["x_test_norm"], dtype=torch.float32, device=device).unsqueeze(0)
-    z_train_v = torch.as_tensor(vb["z_train_per_day"][0], dtype=torch.float32, device=device).unsqueeze(0)
-    out_v = model({"x_train": x_train_v, "z_train": z_train_v, "x_test": x_test_v})
-    Sigma_v = build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
-    L_indep = np.eye(vb["D"])
-    L_model = safe_cholesky(Sigma_v)
-    L_gp = safe_cholesky(_era5_viz_gp_correlation(gp0))
-
-    rng_s = np.random.default_rng(vb["seed"] + 1)
-    independent_fields, predicted_fields, gp_fields = [], [], []
-    for _ in range(n_samples):
-        z_shared = rng_s.standard_normal(vb["D"])
-        independent_fields.append(L_indep @ z_shared)
-        predicted_fields.append(L_model @ z_shared)
-        gp_fields.append(L_gp @ z_shared)
-
-    return plot_z_predictor_samples(
-        vb["lat"], vb["lon"], vb["grid_shape"], day0,
-        independent_fields, predicted_fields, gp_fields,
-        output_path=None, context_coords=vb["context_coords"],
-    )
-
-
-def _era5_marginal_variance_fig(vb: dict) -> "plt.Figure | None":
-    """Builds the ``val/era5_marginal_variance`` figure: the frozen per-day
-    TabICL marginal's predictive Var[y|x] (real Kelvin^2, cached per day by
-    _build_era5_viz_batch) at every grid location, one column per probe day,
-    context locations overlaid, plus a second row for the fitted-GP
-    baseline's own posterior Var[y|x] -- diag(Sigma_gp) read straight off
-    gp_post_per_day[i]["L"] (the SAME fitted covariance _era5_viz_gp_field
-    draws samples from, already rescaled to real Kelvin^2 by
-    _era5_viz_gp_posterior), no refit needed. Both rows are pure functions
-    of the frozen marginal/GP fit + context sample -- no model forward pass,
-    no copula, unaffected by training -- so this answers a narrower question
-    than val/era5_predictions: does either predictor's OWN uncertainty grow
-    with distance from context the way a calibrated spatial predictor's
-    should, and does the frozen TabICL marginal track the classical GP's
-    behavior or diverge from it?
-
-    Returns None if the probe has no days, or if any day's marginal variance
-    is missing (no PIT checkpoint configured -- see _build_era5_viz_batch's
-    tabicl_marginal is None branch). The GP row is dropped (all-or-nothing,
-    same convention as _era5_viz_fig's oracle row) rather than the whole
-    figure if any day's GP fit failed or era5_viz_gp is disabled.
-    """
-    var_fields = vb.get("marginal_var_per_day") or []
-    if not vb["days"] or len(var_fields) != len(vb["days"]) or any(v is None for v in var_fields):
-        return None
-    gp_post = vb.get("gp_post_per_day") or [None] * len(vb["days"])
-    gp_var_fields = [np.sum(gp["L"] ** 2, axis=1) for gp in gp_post if gp is not None]
-    if len(gp_var_fields) != len(vb["days"]):
-        gp_var_fields = None
-    return plot_marginal_variance_grid(
-        vb["lat"], vb["lon"], vb["grid_shape"], vb["days"], var_fields,
-        gp_var_fields=gp_var_fields,
-        output_path=None, context_coords=vb["context_coords"],
-        gp_row_label=f"Fitted GP\nposterior\n({vb.get('gp_row_kernel', 'gp')})",
-    )
-
-
-def _update_adaptive_kernel_weights(
-    prev_weights: torch.Tensor, metrics: dict, lr: float, floor: float,
-    exclude: Optional[set] = None, signal: str = "oracle",
-) -> torch.Tensor:
-    """DoReMi/GroupDRO-style exponentiated-gradient update of per-kernel-family
-    live-generation sampling weights (see training.adaptive_kernel_sampling),
-    ordered to match data_gen._COMPOSABLE_KERNELS.
-
-    Signal is the per-family excess loss (regret) already computed by
-    validate()'s kernel_fit/<family> probes, selected by `signal`
-    (training.adaptive_kernel_signal):
-
-      "oracle" (default) — oracle_diag/kernel_fit/<family>/gap_nll =
-        total_nll - oracle_posterior_total_nll, both scored against the
-        exact analytic-GP PIT (NLL is lower-is-better, and
-        oracle_posterior_total_nll is pit.gp_analytical_posterior's true
-        Schur-complement Bayes-optimal ceiling for that family's probe
-        episodes — see validate()'s kernel_fit loop — so this is typically
-        >=0, bigger when the model is further from the true posterior on
-        that family = more room to improve).
-      "tabicl" — kernel_fit/<family>/gap_nll_tabicl instead: the identical
-        gap construction, but total_nll is scored against TabICL's own
-        frozen K-fold PIT (a real, imperfect marginal) rather than the
-        exact analytic one — see _build_tabicl_kernel_fit_z /
-        validate()'s TabICL-conditioned kernel_fit block. Only present
-        when a PIT checkpoint is configured (pit.py::resolve_pit_ckpt);
-        falls back per-family to the oracle gap wherever it's missing (no
-        PIT checkpoint at all, or that family's probe had no valid
-        episodes), rather than silently zeroing the signal for every
-        family the moment the run has no PIT checkpoint.
-
-    Previously used copula_nll - oracle_copula_nll against data_gen.py's
-    context-blind oracle_mode="prior" R_star, a weaker, beatable bound;
-    gap_nll is in Y-space total-NLL units either way, so it stays a valid
-    regret signal regardless of which marginal produced z_test, unlike a
-    z-space-only copula gap. Families with no probe (metrics missing the key
-    — e.g. not in cfg.baselines.kernels, or gp_analytical_posterior raised on
-    every episode) get gap=0, i.e. no update pressure, only the floor's
-    implicit pull toward uniform.
-
-    exclude (optional): family names to hold out of the gap-driven update
-    entirely (gap forced to 0), regardless of whether a kernel_fit probe
-    exists for them. Meant for cfg.data.composite_exclude_kernels — those
-    families are never in _sample_kernel_chain_structure's sampling pool
-    (data_gen.py::_weights_for_pool already renormalizes over the
-    post-exclude pool, so their tensor entry is inert either way), so
-    driving their weight off model performance is just noise: it moves the
-    number without moving anything the number controls.
-
-    w' = prev_weights * exp(lr * gap), renormalized, then blended with a
-    uniform floor: w = (1 - floor) * w' + floor * uniform — prevents any
-    family's weight collapsing toward 0 and being effectively dropped from
-    the curriculum. Pure function: caller is responsible for writing the
-    result into the shared-memory tensor DataLoader workers read from
-    (`kernel_weights_tensor.copy_(...)`, never rebind).
-    """
-    exclude = exclude or set()
-    n = len(_COMPOSABLE_KERNELS)
-    gaps = torch.zeros(n, dtype=torch.float32)
-    for i, family in enumerate(_COMPOSABLE_KERNELS):
-        if family in exclude:
-            continue
-        gap_nll = metrics.get(f"oracle_diag/kernel_fit/{family}/gap_nll")
-        if signal == "tabicl":
-            gap_nll_tabicl = metrics.get(f"kernel_fit/{family}/gap_nll_tabicl")
-            if gap_nll_tabicl is not None:
-                gap_nll = gap_nll_tabicl
-        if gap_nll is not None and math.isfinite(gap_nll):
-            gaps[i] = gap_nll
-    # Clamp the exponent, not the gap itself, so a single wild probe can't
-    # overflow exp() into inf and NaN out every family's weight via the
-    # shared normalization below.
-    exponent = torch.clamp(lr * gaps, min=-30.0, max=30.0)
-    raw = prev_weights.float() * torch.exp(exponent)
-    total = raw.sum()
-    uniform = torch.full((n,), 1.0 / n, dtype=torch.float32)
-    if not torch.isfinite(total) or total <= 0:
-        raw = uniform.clone()
-    else:
-        raw = raw / total
-    return (1.0 - floor) * raw + floor * uniform
-
-
-@torch.no_grad()
-def _compute_tabicl_z_train_gap(
-    cfg: DictConfig, tabicl_marginal: nn.Module, k_folds: int, device: str = "cpu",
-) -> dict[str, float]:
-    """Measure, once per data_gen._COMPOSABLE_KERNELS family, how far the
-    frozen TabICL marginal's own K-fold PIT diverges from the exact
-    analytic GP-LOO z_train on the SAME episodes -- the signal
-    data.z_train_tabicl_mix_* (conf/data/gp_tasks.yaml) uses to set each
-    family's live-generation mixing fraction (see _tabicl_gap_to_mix_frac
-    below).
-
-    Calls _generate_gp_batch_raw directly (not the public generate_gp_batch
-    top-up wrapper) TWICE per family with the identical cfg.seed -- once
-    with tabicl_model=None (exact analytic z_train), once with
-    tabicl_model=tabicl_marginal (real TabICL K-fold PIT) -- so both calls
-    draw byte-identical kernel/hyperparameters/x/y (see
-    _generate_gp_batch_raw's seeding-contract docstring) and differ ONLY in
-    which z_train ends up in the returned episode dicts. The discard mask
-    that determines which episodes survive is itself computed from the
-    exact analytic residual before either call's z_train override runs
-    (see _generate_gp_batch_raw's z_train-override comment), so it's
-    identical across both calls too -- episode i in one list is the same
-    episode as index i in the other, safe to pair up directly without
-    needing generate_gp_batch's reseeding top-up loop (which would risk
-    the two calls discarding different subsets on a retry round).
-
-    This is a property of TabICL's frozen marginal-quantile approximation
-    for that kernel family, not of the copula model being trained -- unlike
-    train.py::_update_adaptive_kernel_weights's regret signal, which chases
-    a moving target as the model trains, this doesn't move with the model,
-    so by default it's computed once, up front (train.py's startup
-    sequence, alongside _build_tabicl_val_z, before `tabicl_marginal` is
-    freed) and not re-measured again. data.z_train_tabicl_mix_adaptive
-    opts into periodic re-measurement anyway (see _refresh_tabicl_mix_weights,
-    called on the training.save_every cadence), e.g. to track drift in
-    TabICL's own approximation quality if the checkpoint backing it changes
-    meaning over a long run -- either way this is never called from inside
-    validate() itself, since it needs its own fresh episode generation, not
-    validate()'s fixed probe batches.
-
-    Uses cfg.baselines.synth_n_episodes/synth_seed/probe_P_*/probe_N_* (the
-    same fixed-probe-set knobs _build_synthetic_kernel_batches uses) offset
-    by +1 so this draws an independent episode stream from that function's
-    own kernel_fit/<family> probes, rather than silently reusing the exact
-    same seed for a different purpose.
-
-    device: must match wherever tabicl_marginal itself lives (train.py's
-    startup sequence passes its own `device`, typically "cuda") -- BOTH
-    paired calls below run on this same device, not just the tabicl one.
-    torch's CPU and CUDA generators are separate RNG streams that do not
-    produce identical draws from the same torch.manual_seed/cuda.manual_seed
-    even though _seed_everything seeds both every call (different underlying
-    algorithms) -- running the analytic call on "cpu" while tabicl_marginal
-    lives on "cuda" would silently break the byte-identical-pairing
-    guarantee above (and, separately, crash outright once the override
-    branch tries to mix cuda-resident TabICL weights with cpu-resident
-    x_norm_train).
-
-    Returns {family: mean |z_tabicl - z_analytic|} (CPU floats) for every
-    family that produced at least one valid paired episode. Two independent
-    standard normals have E|Z1-Z2| = 2/sqrt(pi) ~= 1.13, so this gap is
-    typically O(0-1) in these units: near 0 means TabICL's PIT tracks the
-    analytic residual closely for that family, growing toward ~1.1+ means
-    it's close to uninformative.
-    """
-    bcfg = cfg.get("baselines", {}) or {}
-    n_episodes = int(bcfg.get("synth_n_episodes", 64))
-    base_seed = int(bcfg.get("synth_seed", 20260718)) + 1
-    probe_P_min = int(bcfg.get("probe_P_min", 32))
-    probe_P_max = int(bcfg.get("probe_P_max", 512))
-    probe_N_min = int(bcfg.get("probe_N_min", 8))
-    probe_N_max = int(bcfg.get("probe_N_max", 1024))
-
-    gaps: dict[str, float] = {}
-    with limited_main_process_threads():
-        # This function is a main-process caller of _generate_gp_batch_raw
-        # (two calls per _COMPOSABLE_KERNELS family), never a DataLoader
-        # worker -- see limited_main_process_threads' docstring for why that
-        # needs an explicit thread cap here (OS-default thread count causes
-        # ~2-3x slowdown on generate_gp_batch's CPU-bound tensor ops).
-        for family in _COMPOSABLE_KERNELS:
-            family_seed = _name_seed(base_seed, family)
-            probe_cfg = OmegaConf.merge(
-                cfg,
-                OmegaConf.create({
-                    "seed": family_seed,
-                    "data": {
-                        "kernel": family,
-                        "systematic_composition": False,
-                        "P_min": probe_P_min, "P_max": probe_P_max,
-                        "N_min": probe_N_min, "N_max": probe_N_max,
-                    },
-                }),
-            )
-            analytic_eps = _generate_gp_batch_raw(probe_cfg, n_episodes, device=device)
-            probe_cfg.seed = family_seed  # _generate_gp_batch_raw mutates nothing, but stay explicit
-            tabicl_eps = _generate_gp_batch_raw(
-                probe_cfg, n_episodes, device=device,
-                tabicl_model=tabicl_marginal, tabicl_k_folds=k_folds,
-            )
-            n = min(len(analytic_eps), len(tabicl_eps))
-            if n == 0:
-                continue
-            diffs = [
-                (tabicl_eps[i]["z_train"] - analytic_eps[i]["z_train"]).abs().mean().item()
-                for i in range(n)
-            ]
-            gaps[family] = float(sum(diffs) / len(diffs))
-    return gaps
-
-
-def _tabicl_gap_to_mix_frac(
-    gaps: dict[str, float], floor_frac: float, max_frac: float,
-) -> torch.Tensor:
-    """Map _compute_tabicl_z_train_gap's per-family gap to a
-    `_COMPOSABLE_KERNELS`-ordered live-generation mixing-fraction tensor
-    (see data.z_train_tabicl_mix_* in conf/data/gp_tasks.yaml).
-
-    Min-max normalizes gaps across the families that were actually measured
-    (missing/degenerate families -- e.g. a family with 0 valid probe
-    episodes -- fall back to floor_frac, the same anti-starvation treatment
-    _update_adaptive_kernel_weights's floor gives an unmeasured family), then
-    linearly interpolates each family's normalized gap into
-    [floor_frac, max_frac]. If every measured gap is equal (or only one
-    family was measured), normalization is undefined -- every family gets
-    floor_frac instead, since there's no relative signal to differentiate on.
-    """
-    n = len(_COMPOSABLE_KERNELS)
-    frac = torch.full((n,), floor_frac, dtype=torch.float32)
-    if len(gaps) < 2:
-        return frac
-    values = list(gaps.values())
-    lo, hi = min(values), max(values)
-    spread = hi - lo
-    if spread <= 1e-12:
-        return frac
-    for i, family in enumerate(_COMPOSABLE_KERNELS):
-        if family not in gaps:
-            continue
-        normalized = (gaps[family] - lo) / spread
-        frac[i] = floor_frac + (max_frac - floor_frac) * normalized
-    return frac
-
-
-def _refresh_tabicl_mix_weights(
-    cfg: DictConfig, pit_ckpt: str, tabicl_mix_weights: torch.Tensor, device: str,
-) -> tuple[dict[str, float], torch.Tensor]:
-    """data.z_train_tabicl_mix_adaptive's periodic analogue of the one-shot
-    startup measurement above: reloads the frozen TabICL marginal, re-runs
-    _compute_tabicl_z_train_gap / _tabicl_gap_to_mix_frac, and .copy_()'s the
-    result into tabicl_mix_weights in place (same shared-memory-tensor
-    convention as _update_adaptive_kernel_weights's own in-place update --
-    rebinding the name would leave LiveGPDataset workers pointed at the old
-    tensor).
-
-    Unlike _update_adaptive_kernel_weights, which reuses metrics validate()
-    already computed, there's no cheap reusable signal here: measuring the
-    gap needs a live TabICL forward pass, so this loads tabicl_marginal fresh
-    and frees it again around the measurement rather than keeping a second
-    frozen TabICL resident for the whole run (this repo runs close to the
-    VRAM ceiling -- see the comment above the training loop's autograd-graph
-    release). That reload + ~1k-episode remeasurement is why callers gate
-    this on training.save_every (already 10x rarer than training.val_every
-    by default) rather than every validate() call.
-
-    floor_frac == max_frac short-circuit: see the matching comment at this
-    function's startup-time sibling call site in main() -- when the two
-    fracs are equal, _tabicl_gap_to_mix_frac's interpolation collapses to
-    floor_frac for every family regardless of the measured gap, so the
-    reload + remeasurement below would be pure wasted work every
-    training.save_every steps for the life of the run.
-    """
-    floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
-    max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
-    if math.isclose(floor_frac, max_frac, abs_tol=1e-12):
-        new_mix_frac = torch.full(
-            (len(_COMPOSABLE_KERNELS),), floor_frac, dtype=torch.float32
-        )
-        tabicl_mix_weights.copy_(new_mix_frac)
-        return {}, new_mix_frac
-    tabicl_marginal = load_tabicl(pit_ckpt, device)
-    pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
-    z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
-    new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
-    tabicl_mix_weights.copy_(new_mix_frac)
-    del tabicl_marginal
-    if device == "cuda":
-        # gc.collect() before empty_cache() (see this repo's OOM-handler
-        # gotcha): del alone doesn't free CUDA storage until any reference
-        # cycles in the eval-mode forward graph are collected.
-        gc.collect()
-        torch.cuda.empty_cache()
-    return z_gap, new_mix_frac
-
-
-@torch.no_grad()
-def _tabicl_pit_batch(
-    batch: dict, tabicl_marginal: nn.Module, k_folds: int, device: str,
-) -> dict[str, torch.Tensor]:
-    """Run TabICL's own K-fold PIT (pit.py::run_pit) once per episode in a
-    single already-collated batch, returning the same real (non-oracle)
-    z_train/z_test/log_pdf_test triple _build_tabicl_val_z caches for the
-    main val loader. Factored out of that function so kernel_fit/<family>'s
-    fixed probe batches (_build_synthetic_kernel_batches) can reuse the
-    identical PIT/scaling logic instead of duplicating it — see
-    _build_tabicl_val_z and _build_tabicl_kernel_fit_z below, the two
-    callers.
-
-    `batch` must carry x_train/y_train/train_mask/x_test/y_test/test_mask
-    (collate_fn's schema); may live on any device, moved to `device` here.
-    Returns CPU tensors {"z_train": (B, P_max), "z_test": (B, N_max),
-    "log_pdf_test": (B, N_max)}, zero-padded outside each episode's true
-    train/test length (matching train_mask/test_mask).
-
-    y_train/y_test are z-scored via pit.normalize_targets (y_test scaled
-    with y_train's own mean/std, never its own — see that function's
-    docstring) before reaching the raw TabICL module: run_pit does no
-    target scaling of its own (unlike tabicl.TabICLRegressor.fit(), which
-    fits a fresh StandardScaler before ever calling this same underlying
-    model). Every other run_pit call site in the repo
-    (inference/copula_inference.py::loo_pit,
-    eval_checkpoint.py::_tabicl_pit) goes through the same helper, so this
-    conditioning input is computed identically everywhere. Episode y's
-    scale is not fixed — outputscale is drawn from a GammaPrior
-    (data_gen.py's generative process) — so an unscaled call risks
-    saturating the pretrained quantile head's CDF into its extreme tail for
-    every point alike on high-outputscale episodes, collapsing the PIT
-    residuals' spread instead of reflecting the true per-point rank.
-
-    log_pdf_test comes back in that same normalize_targets-scaled space —
-    a Jacobian correction (log p_raw(y) = log p_scaled(y_scaled) -
-    log(std), per normalize_targets' own docstring) is applied here so
-    every caller of this cache's log_pdf_test gets raw-nats units, matching
-    the oracle's log_pdf_test (data_gen.py's z_test/log_pdf_test are always
-    raw-nats — see y_space_nll's Args).
-    """
-    x_train = batch["x_train"].to(device)
-    y_train = batch["y_train"].to(device)
-    x_test = batch["x_test"].to(device)
-    y_test = batch["y_test"].to(device)
-    train_mask = batch["train_mask"].to(device)
-    test_mask = batch["test_mask"].to(device)
-    B, P_max = y_train.shape
-    N_max = y_test.shape[1]
-    z_tabicl = torch.zeros(B, P_max, device=device)
-    z_test_tabicl = torch.zeros(B, N_max, device=device)
-    log_pdf_test_tabicl = torch.zeros(B, N_max, device=device)
-    for b in range(B):
-        n = int(train_mask[b].sum())
-        n_te = int(test_mask[b].sum())
-        if n < 2 or n_te < 1:
-            continue  # run_pit's fold split needs >=2 context points
-        X_b = x_train[b, :n]
-        X_te = x_test[b, :n_te]
-        y_b_scaled, y_te_scaled, _, std = normalize_targets(y_train[b, :n], y_test[b, :n_te])
-        Y_b = y_b_scaled.unsqueeze(-1)
-        Y_te = y_te_scaled.unsqueeze(-1)
-        pit_out = run_pit(
-            tabicl_marginal, X_b, Y_b, X_te, Y_te, k_folds=k_folds,
-            Y_train_raw=y_train[b, :n].unsqueeze(-1),
-        )
-        z_tabicl[b, :n] = pit_out["z_train"].squeeze(-1)
-        z_test_tabicl[b, :n_te] = pit_out["z_test"].squeeze(-1)
-        log_pdf_test_tabicl[b, :n_te] = pit_out["log_pdf_test"].squeeze(-1) - std.log()
-    return {
-        "z_train": z_tabicl.cpu(),
-        "z_test": z_test_tabicl.cpu(),
-        "log_pdf_test": log_pdf_test_tabicl.cpu(),
-    }
-
-
-@torch.no_grad()
-def _build_tabicl_val_z(
-    val_loader, tabicl_marginal: nn.Module, k_folds: int, device: str,
-) -> dict[int, dict[str, torch.Tensor]]:
-    """Precompute the frozen TabICL marginal's K-fold PIT once per val_loader
-    episode (see _tabicl_pit_batch / pit.py::run_pit), instead of re-running
-    it every validate() call.
-
-    tabicl_marginal never changes during training and val_loader itself is
-    fixed across every call (live mode: build_fixed_live_val_batches
-    generates it once up front; disk mode: val_dataset + shuffle=False
-    iterate in the same order every time) — so this is the same value every
-    validate() call and only needs computing once, here, before the training
-    loop starts.
-
-    Covers every batch in val_loader (not just the first _PLOT_COLLECT_BATCHES
-    used for plotting) — val/y_nll_total below is meant to be the "real
-    deployment" headline number, so it needs the same episode count as the
-    rest of val/'s metrics (training.val_episodes), not a smaller plot-sized
-    sub-sample. This is a one-time startup cost (not per-validate() call), so
-    the extra episodes here are cheap relative to re-running it every
-    validate() call would be.
-
-    Queries each episode's REAL x_test/y_test (not a throwaway probe), so
-    run_pit's test-side forward pass also returns a genuine TabICL marginal
-    at the test points (z_test, log_pdf_test) — the missing ingredient for
-    scoring the model's own total (marginal+copula) Y-space NLL under a
-    real, non-oracle marginal (validate()'s val/y_nll_total), the same way
-    eval_checkpoint.py::_tabicl_pit does for --z_train_source=tabicl. z_train
-    alone still drives the sim-to-real correlation check (validate()'s
-    do_plot block / corr_*_tabicl_z).
-
-    What this is a contrast AGAINST depends on data.z_train_source, and the
-    distinction matters when reading val/y_nll_*:
-
-      - "analytic": the batch carries the exact GP-LOO PIT, so this really is
-        the sim-to-real substitution it was written for -- oracle marginal
-        replaced by a real, imperfect one.
-      - "tabicl"/"tabicl_split" (the production default): the batch ALREADY
-        carries a TabICL PIT (live_dataset.build_fixed_live_val_batches passes
-        the frozen TabICL into generate_gp_batch). This is then a second
-        estimate of the same thing, not a contrast, and the two only agree if
-        they use the same fold count -- hence `k_folds` is passed as
-        data.z_train_tabicl_k_folds rather than tabicl.pit_k_folds in that case
-        (see train()'s val_pit_k_folds). A K-fold PIT's sharpness moves with K,
-        so scoring at a different K than the model was conditioned on shifts
-        val/y_nll_total by an amount that has nothing to do with the model.
-
-    The oracle-side counterpart is _build_analytic_val_z, which supplies the
-    exact GP PIT for oracle_diag/* regardless of which of those two the batch
-    happens to carry.
-
-    Returns {batch_idx: {"z_train": (B, P_max), "z_test": (B, N_max),
-    "log_pdf_test": (B, N_max)}}, CPU, zero-padded outside each episode's
-    true train/test length (matching train_mask/test_mask) — moved to
-    device and sliced per-episode inside validate().
-    """
-    cache: dict[int, dict[str, torch.Tensor]] = {}
-    for batch_idx, batch in enumerate(val_loader):
-        cache[batch_idx] = _tabicl_pit_batch(batch, tabicl_marginal, k_folds, device)
-    return cache
-
-
-@torch.no_grad()
-def _build_analytic_val_z(
-    val_loader, val_episodes_meta: dict[int, list[dict]], device: str,
-) -> dict[int, dict[str, torch.Tensor]]:
-    """The EXACT analytic GP PIT (pit.gp_analytical_pit) for every val episode,
-    cached once at startup -- the oracle counterpart of _build_tabicl_val_z.
-
-    Why this exists at all, given val_loader already carries a z_train/z_test/
-    log_pdf_test triple. Under data.z_train_source="tabicl" (the production
-    default, and the regime this repo actually deploys in),
-    live_dataset.build_fixed_live_val_batches hands the frozen TabICL to
-    generate_gp_batch, and data_gen's TabICL branch overwrites z_train AND
-    z_test/log_pdf_test with TabICL's K-fold PIT. So batch["z_test"] is in
-    TABICL's z-space, while gp_analytical_posterior's ceiling
-    (val/y_nll_oracle_posterior*) is in the exact GP-POSTERIOR z-space. Two
-    Sklar splits taken at DIFFERENT marginals are not comparable term by term
-    -- only a Y-space total is (see eval/metrics/joint_nll.py's module
-    docstring) -- so scoring oracle_diag/gap_nll or the oracle_diag/corr_*
-    statistics across that boundary compares two different quantities and the
-    "gap" is not a bound. This cache restores the missing operand: the same
-    episodes, standardized the way the ceiling is.
-
-    No regeneration and no TabICL forward pass. val_episodes_meta's episode
-    dicts are the ones val_loader's batches were built from, kernel metadata
-    and cached _L_ff/_alpha intact, so gp_analytical_pit is one triangular
-    solve per episode.
-
-    Returns _build_tabicl_val_z's shape -- {batch_idx: {"z_train": (B, P_max),
-    "z_test": (B, N_max), "log_pdf_test": (B, N_max)}}, CPU, zero-padded
-    outside each episode's true train/test length (matching train_mask/
-    test_mask) -- so validate() consumes the two caches identically.
-
-    Callers should skip this entirely when data.z_train_source="analytic":
-    the batch then already carries exactly these tensors, and paying for them
-    twice buys nothing (see train()'s call site).
-
-    `device` is unused -- the episodes' cached _L_ff/_alpha are CPU tensors
-    (build_fixed_live_val_batches moves them there deliberately) and the
-    result is cached on CPU like _build_tabicl_val_z's, so there is nothing
-    to move. Kept in the signature for call-site symmetry with that function.
-    """
-    cache: dict[int, dict[str, torch.Tensor]] = {}
-    for batch_idx, batch in enumerate(val_loader):
-        eps_b = val_episodes_meta.get(batch_idx)
-        if not eps_b:
-            continue
-        B, P_max = batch["y_train"].shape
-        N_max = int(batch["y_test"].shape[1])
-        z_train = torch.zeros(B, P_max)
-        z_test = torch.zeros(B, N_max)
-        log_pdf_test = torch.zeros(B, N_max)
-        for b, ep in enumerate(eps_b[:B]):
-            try:
-                pit_out = gp_analytical_pit(ep)
-            except (KeyError, NotImplementedError):
-                continue  # rare unsupported kernel schema, as elsewhere
-            zt = pit_out["z_train"].detach().float().cpu().reshape(-1)
-            zs = pit_out["z_test"].detach().float().cpu().reshape(-1)
-            lp = pit_out["log_pdf_test"].detach().float().cpu().reshape(-1)
-            z_train[b, : zt.shape[0]] = zt
-            z_test[b, : zs.shape[0]] = zs
-            log_pdf_test[b, : lp.shape[0]] = lp
-        cache[batch_idx] = {
-            "z_train": z_train,
-            "z_test": z_test,
-            "log_pdf_test": log_pdf_test,
-        }
-    return cache
-
-
-@torch.no_grad()
-def _build_tabicl_kernel_fit_z(
-    synth_kernel_batches: dict, tabicl_marginal: nn.Module, k_folds: int, device: str,
-) -> dict[str, dict[str, torch.Tensor]]:
-    """Per-kernel-family analogue of _build_tabicl_val_z: TabICL's own
-    K-fold PIT on each kernel_fit/<family> fixed probe set
-    (_build_synthetic_kernel_batches), computed once at startup alongside
-    it, on the SAME probe episodes oracle_diag/kernel_fit/<family>/total_nll
-    scores against the exact analytic PIT.
-
-    Feeds validate()'s kernel_fit/<family>/total_nll_tabicl and
-    gap_nll_tabicl — the "how does this family perform once a real,
-    imperfect (TabICL) marginal replaces the oracle one" numbers, the
-    alternate training.adaptive_kernel_signal="tabicl" curriculum signal
-    (see _update_adaptive_kernel_weights) exists to chase.
-
-    Returns {family: {"z_train": (B, P_max), "z_test": (B, N_max),
-    "log_pdf_test": (B, N_max)}}, same shapes/padding as
-    _build_tabicl_val_z's per-batch entries.
-    """
-    return {
-        family: _tabicl_pit_batch(probe["batch"], tabicl_marginal, k_folds, device)
-        for family, probe in synth_kernel_batches.items()
-    }
-
-
 def _fmt_run_value(value) -> str:
     if isinstance(value, bool):
         return str(value).lower()
@@ -1631,766 +308,277 @@ def _live_data_segment(data_cfg: DictConfig) -> str:
     return "_d_" + "-".join(parts)
 
 
-@torch.no_grad()
-def validate(
-    model: nn.Module,
-    val_loader: DataLoader,
-    cfg: DictConfig,
-    device: str,
-    step: int = 0,
-    do_plot: bool = False,
-    synth_kernel_batches: dict | None = None,
-    tabicl_val_z: dict | None = None,
-    analytic_val_z: dict | None = None,
-    tabicl_kernel_fit_z: dict | None = None,
-    era5_val_batches: dict | None = None,
-    era5_viz_batch: dict | None = None,
-    posterior_probe: dict | None = None,
-    val_episodes_meta: dict[int, list[dict]] | None = None,
-) -> tuple[dict, list]:
-    # Do NOT call model.eval() here: TabICL's eval mode triggers _inference_forward
-    # which uses InferenceManager with its own float16 autocast on CUDA, producing
-    # NaN for certain inputs. There is no dropout in this model so eval mode has no
-    # benefit. Use torch.no_grad() for efficiency instead.
-    jitter = float(cfg.model.get("sigma_jitter", 1e-4))
+def _build_model_and_optimizer(cfg, device, resume_ckpt, t):
+    """Build the copula model, Muon/AdamW optimizer, AMP scaler and LR schedule; resume from training.resume_ckpt if set."""
+    model = build_copula_transformer(cfg).to(device)
+    if bool(t.get("compile", False)):
+        torch._dynamo.config.capture_scalar_outputs = True
+        model = torch.compile(model, dynamic=True)
+    wandb.watch(model, log="gradients", log_freq=5000)
 
-    cop_per_task: list[float] = []
-    all_W_norms: list[float] = []
-    all_s_vals: list[float] = []
-    all_sigma_off: list[float] = []
-    all_sigma_diag: list[float] = []
-    all_tabicl_marginal_total: list[float] = []
-    all_tabicl_marginal_marginal: list[float] = []
-    all_tabicl_marginal_copula: list[float] = []
+    n_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable params: {n_train_params:,}")
+    wandb.config.update({"n_trainable_params": n_train_params})
 
-    # ---- True Bayes-optimal ceiling accumulators (pit.gp_analytical_posterior) ----
-    # Filled either inline below (val_episodes_meta present -- live-generation
-    # val_loader, which now carries kernel metadata) or, if that's absent, by
-    # the posterior_probe fallback pass after the main loop (disk-mode /
-    # real-ERA5 live_source). Same accumulators either way, so the metrics
-    # block after the main loop needs only one code path regardless of which
-    # source filled them -- see this function's oracle_diag/gap_nll comment
-    # further down.
-    all_oracle_total: list[float] = []
-    all_oracle_copula: list[float] = []
-    nll_post_per_point: list[float] = []
-    nll_post_marginal_per_point: list[float] = []
-    nll_post_copula_per_point: list[float] = []
-    off_p_post: list[np.ndarray] = []
-    off_o_post: list[np.ndarray] = []
-    # KL(N(0,R_post) || N(0,Sigma))/n per episode -- see pit.gaussian_corr_kl.
-    corr_kl_vals: list[float] = []
-    corr_kl_nonfinite = 0
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    muon_params  = [p for p in trainable if p.ndim >= 2]
+    adamw_params = [p for p in trainable if p.ndim < 2]
+    optimizer = Muon(
+        [
+            {
+                "params": muon_params,
+                "use_muon": True,
+                "lr": t.muon_lr,
+                "weight_decay": t.muon_weight_decay,
+                "momentum": t.muon_momentum,
+                "matched_adamw_rms": t.muon_matched_adamw_rms,
+                "ns_steps": t.muon_ns_steps,
+                "nesterov": t.muon_nesterov,
+                "adamw_betas": tuple(t.muon_adamw_betas),
+                "adamw_eps": t.muon_adamw_eps,
+            },
+            {
+                "params": adamw_params,
+                "use_muon": False,
+                "lr": t.muon_lr,
+                "weight_decay": 0.0,
+                "adamw_betas": tuple(t.muon_adamw_betas),
+                "adamw_eps": t.muon_adamw_eps,
+            },
+        ]
+    )
+    lr_min_frac = t.muon_lr_min / t.muon_lr
 
-    for batch_idx, batch in enumerate(val_loader):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            out = model(batch)
-        Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
+    use_amp = (device == "cuda") and bool(t.get("use_amp", True))
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
 
-        # ---- Put every oracle_diag/* quantity in the ORACLE z-space --------
-        # Everything below this point in the loop (all_oracle_*, cop_per_task,
-        # the sigma_*_analytic_z / W_norm / s statistics, off_p_post, and the
-        # corr_kl accumulation) is scored against, or compared to, the exact
-        # analytic GP -- gp_analytical_posterior's R_post and its
-        # nll_post/nll_post_copula ceiling. Under data.z_train_source="tabicl"
-        # the batch itself carries TABICL's PIT instead (data_gen's tabicl
-        # branch overwrites z_train, z_test AND log_pdf_test -- see
-        # _build_analytic_val_z's docstring), so scoring those against the
-        # GP-posterior ceiling would be a cross-z-space comparison: the two
-        # Sklar splits are taken at different marginals, so their copula terms
-        # live on different, non-additive scales and their difference is not a
-        # gap. `analytic_val_z` supplies the missing operand.
-        #
-        # The model is re-conditioned on the analytic z_train as well, not just
-        # re-scored on the analytic z_test: oracle_diag/ answers "how far is
-        # this model from Bayes-optimal when handed the ORACLE marginal", which
-        # needs oracle z on both sides. One extra forward pass per val batch
-        # (not per episode); `out`/`Sigma` are rebound so every consumer below
-        # picks it up. val/y_nll_* -- the real-deployment TabICL headline --
-        # is built further down from tabicl_val_z and is untouched by this.
-        an_b = analytic_val_z.get(batch_idx) if analytic_val_z else None
-        if an_b is None:
-            # data.z_train_source="analytic": the batch IS the analytic PIT.
-            z_test_an = batch["z_test"].float()
-            log_pdf_an = batch["log_pdf_test"].float()
+    # Resume weights + optimizer/scaler state first (if requested) so we know
+    # what step the LR schedule should continue from before building the
+    # scheduler below. Default: continue the cosine schedule from the
+    # checkpoint's step, instead of re-running warmup from a from-scratch
+    # peak LR on top of already-warmed-up Adam/Muon moments — the two
+    # combined were spiking effective step size right after resume.
+    # `resume_reset_schedule=true` opts back into the old behavior, for the
+    # deliberate "warm-start a new experiment from these weights" case where
+    # a fresh warmup/cosine schedule (not a continuation) is actually wanted.
+    start_step = 0
+    if resume_ckpt:
+        ckpt_step = load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
+        if bool(t.get("resume_reset_schedule", False)):
+            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} (step {ckpt_step}) — resetting to step 0 with a fresh warmup/cosine schedule (resume_reset_schedule=true)")
         else:
-            batch_an = dict(batch)
-            batch_an["z_train"] = an_b["z_train"].to(device)
-            with torch.no_grad():
-                out = model(batch_an)
-            Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
-            z_test_an = an_b["z_test"].to(device).float()
-            log_pdf_an = an_b["log_pdf_test"].to(device).float()
+            start_step = ckpt_step
+            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — continuing cosine schedule from step {start_step}")
 
-        # ---- Oracle-posterior batch-level total/copula NLL (vectorized) ----
-        # Same y_space_nll(Sigma, z_test, log_pdf_test, test_mask) call the old
-        # separate posterior_probe pass used, just run here on val_loader's own
-        # Sigma/z_test instead -- one call per val batch, appended and averaged
-        # across batches below, rather than the old single call over a whole
-        # separately-drawn probe. Only when val_episodes_meta is available
-        # (live-generation val_loader); otherwise the posterior_probe fallback
-        # after the main loop fills the same accumulators.
-        eps_b = val_episodes_meta.get(batch_idx) if val_episodes_meta is not None else None
-        if val_episodes_meta is not None:
-            parts_o = y_space_nll(
-                Sigma, z_test_an, log_pdf_an, batch["test_mask"]
-            )
-            all_oracle_total.append(parts_o["total"].item())
-            all_oracle_copula.append(parts_o["copula"].item())
-
-        # ---- Per-task diagnostics (vectorized — no Python loop over batch) ----
-        n_test_cur = batch["test_mask"].sum(-1).float()   # (B,)
-        valid_cur = n_test_cur >= 2
-
-        if valid_cur.any():
-            mask_2d_cur = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
-            n_safe_cur = n_test_cur.clamp(min=1)
-            N_cur = Sigma.shape[1]
-
-            # Per-task copula NLL against batch["z_test"] (the exact
-            # analytic-GP PIT this val set was generated with) -> feeds
-            # oracle_diag/copula_nll_std below: this DOES test the trained
-            # model (Sigma is the model's own output) against ground truth,
-            # so it belongs in oracle_diag/, not among the Sigma-only stats
-            # below (which don't reference z_test at all).
-            eye_cur = torch.eye(N_cur, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
-            S_safe_cur = torch.where(mask_2d_cur, Sigma, eye_cur)
-            L_cur, info_cur = torch.linalg.cholesky_ex(S_safe_cur)
-            if info_cur.any():
-                S_safe_cur = S_safe_cur + 1e-4 * eye_cur
-                L_cur = torch.linalg.cholesky(S_safe_cur)
-            log_det_cur = 2.0 * L_cur.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)
-            z_f = z_test_an
-            tmp_cur = torch.linalg.solve_triangular(L_cur, z_f.unsqueeze(-1), upper=False)
-            S_inv_z_cur = torch.linalg.solve_triangular(L_cur.mT, tmp_cur, upper=True).squeeze(-1)
-            cop_cur = 0.5 * (log_det_cur + (z_f * S_inv_z_cur).sum(-1) - (z_f ** 2).sum(-1)) / n_safe_cur
-            cop_per_task.extend(cop_cur[valid_cur].cpu().tolist())
-
-            # W row-norms and s means (masked mean over valid test instances).
-            # "s" is absent for "tanhnorm" (see model.py's _NO_SCALAR_COLUMN /
-            # build_sigma's out.get("s") pattern) — skip the s-diagnostic for
-            # that parametrization instead of KeyError-ing.
-            W_f = out["W"].float()
-            mask_f = batch["test_mask"].float()
-            W_norm_cur = (W_f.norm(dim=-1) * mask_f).sum(-1) / n_safe_cur
-            all_W_norms.extend(W_norm_cur[valid_cur].cpu().tolist())
-            s_raw = out.get("s")
-            if s_raw is not None:
-                s_f = s_raw.float()
-                s_mean_cur = (s_f * mask_f).sum(-1) / n_safe_cur
-                all_s_vals.extend(s_mean_cur[valid_cur].cpu().tolist())
-
-            # Off-diagonal and diagonal statistics (all valid entries in one shot)
-            ri_cur, ci_cur = torch.triu_indices(N_cur, N_cur, offset=1, device=Sigma.device)
-            valid_off_cur = mask_2d_cur[:, ri_cur, ci_cur]  # (B, n_pairs) bool
-            off_vals_cur = Sigma[:, ri_cur, ci_cur][valid_off_cur]
-            all_sigma_off.extend(off_vals_cur.cpu().tolist())
-            all_sigma_diag.extend(Sigma.diagonal(dim1=-2, dim2=-1)[batch["test_mask"]].cpu().tolist())
-
-        # ---- TabICL-marginal real (non-oracle) NLL scoring ----
-        # Runs on EVERY val_loader batch every val_every step: this is what
-        # feeds val/y_nll_total below, which is meant to be sized like the
-        # rest of val/'s metrics (training.val_episodes), not a small
-        # plot-sized sub-sample — tabicl_val_z now has an entry for every
-        # batch (see _build_tabicl_val_z).
-        B = Sigma.shape[0]
-        z_cache_b = tabicl_val_z.get(batch_idx) if tabicl_val_z else None
-        for b in range(B):
-            n = int(batch["test_mask"][b].sum())
-            if n < 2:
-                continue
-
-            # Re-run the model on this SAME episode (same x_train/
-            # x_test) conditioned on TabICL's own K-fold PIT z_train,
-            # precomputed once by _build_tabicl_val_z. Under
-            # data.z_train_source="analytic" this is the sim-to-real
-            # substitution (oracle GP-LOO z_train -> real TabICL z_train);
-            # under "tabicl" the batch already carries a TabICL PIT, so it
-            # is instead a second estimate at the same fold count -- see
-            # _build_tabicl_val_z's docstring. Either way it is what
-            # val/y_nll_* is built from, and the oracle-side numbers
-            # (oracle_diag/*) come from `Sigma`/`z_test_an` above, which
-            # are always in the exact-GP z-space.
-            if z_cache_b is not None:
-                n_tr = int(batch["train_mask"][b].sum())
-                if n_tr >= 2:
-                    z_tabicl_b = z_cache_b["z_train"][b, :n_tr].to(device).unsqueeze(0)
-                    sub_batch = {
-                        "x_train": batch["x_train"][b : b + 1, :n_tr],
-                        "z_train": z_tabicl_b,
-                        "x_test":  batch["x_test"][b : b + 1, :n],
-                    }
-                    out_tabicl = model(sub_batch)
-                    Sigma_tabicl = build_sigma(out_tabicl, cfg, jitter=jitter)
-
-                    # Genuine (non-oracle) total Y-space NLL: score this
-                    # same TabICL-conditioned Sigma against TabICL's OWN
-                    # marginal at the test points
-                    # (z_cache_b["z_test"]/["log_pdf_test"], also from
-                    # _build_tabicl_val_z), not the oracle's — the number
-                    # that actually answers "is this checkpoint correct
-                    # once a real (imperfect) marginal replaces the
-                    # oracle one," which no z-space-only copula NLL can
-                    # (see eval_checkpoint.py's _print_total_nll_table
-                    # for why: two different marginals' z-transforms put
-                    # z-space copula NLL on different, non-additive
-                    # scales — only a same-basis Y-space total is
-                    # comparable). This is what val/y_nll_total below is
-                    # built from.
-                    z_test_tabicl_b = z_cache_b["z_test"][b, :n].to(device).unsqueeze(0)
-                    log_pdf_tabicl_b = z_cache_b["log_pdf_test"][b, :n].to(device).unsqueeze(0)
-                    mask_tabicl_b = torch.ones(1, n, dtype=torch.bool, device=device)
-                    parts_tabicl_b = y_space_nll(
-                        Sigma_tabicl, z_test_tabicl_b, log_pdf_tabicl_b, mask_tabicl_b
-                    )
-                    all_tabicl_marginal_total.append(parts_tabicl_b["total"].item())
-                    all_tabicl_marginal_marginal.append(parts_tabicl_b["marginal"].item())
-                    all_tabicl_marginal_copula.append(parts_tabicl_b["copula"].item())
-
-            # True Bayes-optimal ceiling (pit.gp_analytical_posterior), one
-            # episode at a time (float64 eigendecomposition-based PSD repair
-            # -- no batched implementation) using THIS val episode's own
-            # kernel metadata (val_episodes_meta[batch_idx][b]) instead of a
-            # separately-drawn probe. Independent of z_cache_b/do_plot above.
-            if eps_b is not None and b < len(eps_b):
-                try:
-                    post = gp_analytical_posterior(eps_b[b])
-                except (KeyError, NotImplementedError):
-                    pass  # rare unsupported kernel schema — see gp_analytical_posterior's docstring
-                else:
-                    nll_post_per_point.append(post["nll_post"] / n)  # raw-sum -> nats/point, matching y_space_nll
-                    nll_post_marginal_per_point.append(post["nll_post_marginal"] / n)
-                    nll_post_copula_per_point.append(post["nll_post_copula"] / n)
-                    ri_p, ci_p = np.triu_indices(n, k=1)
-                    off_p_post.append(Sigma[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
-                    off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
-                    # Noise-free convergence signal: gap_nll is a one-draw
-                    # Monte-Carlo estimate (its per-episode value is often
-                    # negative), this is a functional of the two matrices
-                    # alone. See pit.gaussian_corr_kl.
-                    ckl = gaussian_corr_kl(
-                        Sigma[b, :n, :n].cpu(), post["R_post"].cpu()
-                    )
-                    if math.isfinite(ckl):
-                        corr_kl_vals.append(ckl)
-                    else:
-                        corr_kl_nonfinite += 1
-
-    # metrics starts empty. The old y_nll_total/y_nll_copula here scored the
-    # model against batch["z_test"]/["log_pdf_test"] — the exact analytic-GP
-    # PIT this val set was generated with, i.e. a ground-truth marginal no
-    # real deployment ever provides — so they moved to oracle_diag/ below (a
-    # sibling of val/, not nested under it — see the wandb.log prefixing in
-    # the training loop): oracle_diag/ holds every diagnostic that runs the
-    # trained model and scores/compares its output against this ground-truth
-    # z_test/z_train, nothing else. Pure reference numbers that don't
-    # exercise the model at all (e.g. y_nll_oracle_posterior, kernel_fit's
-    # marginal_nll/oracle_posterior_total_nll — gp_analytical_posterior's
-    # ceiling and data_gen.py's oracle marginal are both independent of the
-    # model) stay in val/ instead, even though they're also ground-truth-
-    # scored, since they aren't testing the model. val/'s own headline NLL
-    # numbers (y_nll_total/y_nll_marginal/y_nll_copula, set below from
-    # all_tabicl_marginal_*) are scored against TabICL's own frozen PIT
-    # instead — a real, imperfect marginal, the same kind deployment would
-    # actually supply — so they only populate when a PIT checkpoint is
-    # configured (tabicl_val_z non-empty; see resolve_pit_ckpt in train()).
-    metrics: dict = {}
-
-    # Per-task copula NLL std (against ground truth z_test) — high value
-    # means unstable or heterogeneous tasks. Tests the trained model, so
-    # lives in oracle_diag/, not val/.
-    metrics["oracle_diag/copula_nll_std"] = float(np.std(cop_per_task)) if cop_per_task else float("nan")
-
-    # Sigma statistics — offdiag_mean ≈ 0 means model outputs near-identity.
-    # "_analytic_z" suffix: these come from the single model(batch) forward
-    # above, which is conditioned on val_loader's own z_train — the exact
-    # analytic GP-LOO PIT (data.z_train_source="analytic" by default), NOT
-    # TabICL's K-fold PIT. Unlike y_nll_total/kernel_fit's *_tabicl metrics
-    # below, there is no TabICL-conditioned counterpart for these, so the
-    # suffix exists purely to stop them from being mistaken for one.
-    if all_sigma_off:
-        off_arr = np.array(all_sigma_off, dtype=np.float32)
-        metrics["sigma_offdiag_mean_analytic_z"] = float(off_arr.mean())
-        metrics["sigma_offdiag_std_analytic_z"]  = float(off_arr.std())
-        metrics["sigma_offdiag_abs_mean_analytic_z"] = float(np.abs(off_arr).mean())
-    else:
-        metrics["sigma_offdiag_mean_analytic_z"] = metrics["sigma_offdiag_std_analytic_z"] = metrics["sigma_offdiag_abs_mean_analytic_z"] = 0.0
-    metrics["sigma_diag_mean_analytic_z"] = float(np.mean(all_sigma_diag)) if all_sigma_diag else 1.0
-
-    # Model output statistics (same analytic-z_train caveat as above)
-    metrics["W_norm_mean_analytic_z"] = float(np.mean(all_W_norms)) if all_W_norms else 0.0
-    metrics["s_mean_analytic_z"]      = float(np.mean(all_s_vals))  if all_s_vals  else 0.0
-
-    # ---- True Bayes-optimal ceiling (pit.gp_analytical_posterior) --------
-    # Replaces the old full-val-set oracle_gap/copula_gap/copula_improvement
-    # (deleted above along with y_nll_oracle*): those were scored against
-    # data_gen.py's oracle_mode="prior" R_star/Sigma_star, which is
-    # context-blind by construction (never conditions on x_train/y_train —
-    # see data_gen.py:3359-3382) and therefore NOT the Bayes-optimal lower
-    # bound achievable given the context the model actually receives, only
-    # a weaker, beatable one — a model that legitimately exploits context
-    # could (and should) beat it, which the old "copula_improvement"
-    # (0=identity, 1=oracle) had no way to express as anything but a
-    # confusing ">1". gp_analytical_posterior computes the real Schur-
-    # complement posterior instead, so oracle_gap_posterior >= 0 in
-    # expectation is a genuine inequality (see its docstring), not a
-    # convention that can be beaten by a better model.
-    #
-    # all_oracle_total/all_oracle_copula/nll_post_per_point/etc. were already
-    # filled inline in the main loop above when val_episodes_meta was
-    # available (today's live-generation default: val_loader's own episodes,
-    # same Sigma the rest of this function scores). When it isn't (disk-mode
-    # CopulaDataset, or real-ERA5 live_source — neither carries kernel
-    # metadata), fall back to the separately-drawn posterior_probe here
-    # instead, filling the exact same accumulators via one extra forward
-    # pass, so the metrics block below needs only one path regardless of
-    # which source supplied it.
-    #
-    # copula_nll/total_nll/gap_nll/corr_pearson/corr_mae below all run the
-    # model and score its output against ground truth, so they're grouped
-    # under the "oracle_diag/" key prefix (see this function's return + the
-    # training loop's wandb.log call), a sibling of val/. y_nll_oracle_posterior
-    # does NOT run the model at all — it's gp_analytical_posterior's ceiling,
-    # a fixed property of the episodes alone — so it stays in val/ instead,
-    # right beside gap_nll's other operand (oracle_diag/total_nll) for easy
-    # side-by-side reading.
-    if posterior_probe is not None and val_episodes_meta is None:
-        pb = posterior_probe["batch"]
-        out_p = model(pb)
-        Sigma_p = build_sigma(out_p, cfg, jitter=jitter, test_mask=pb["test_mask"])
-        parts_p = y_space_nll(
-            Sigma_p, pb["z_test"].float(), pb["log_pdf_test"].float(), pb["test_mask"]
-        )
-        all_oracle_total.append(parts_p["total"].item())
-        all_oracle_copula.append(parts_p["copula"].item())
-        for b, ep in enumerate(posterior_probe["episodes"]):
-            n = int(ep["x_norm_test"].shape[0])
-            if n < 1:
-                continue
-            try:
-                post = gp_analytical_posterior(ep)
-            except (KeyError, NotImplementedError):
-                continue  # rare unsupported kernel schema — see gp_analytical_posterior's docstring
-            nll_post_per_point.append(post["nll_post"] / n)  # raw-sum -> nats/point, matching y_space_nll
-            # Sklar split of the same raw sum (nll_post = nll_post_marginal + nll_post_copula,
-            # see gp_analytical_posterior's docstring) -- same /n normalization as the total above.
-            nll_post_marginal_per_point.append(post["nll_post_marginal"] / n)
-            nll_post_copula_per_point.append(post["nll_post_copula"] / n)
-            if n >= 2:
-                ri_p, ci_p = np.triu_indices(n, k=1)
-                off_p_post.append(Sigma_p[b, :n, :n].float().cpu().numpy()[ri_p, ci_p])
-                off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
-
-    if all_oracle_total:
-        metrics["oracle_diag/copula_nll"] = float(np.mean(all_oracle_copula))
-        metrics["oracle_diag/total_nll"] = float(np.mean(all_oracle_total))
-        # y_space_nll's "total" is copula+marginal exactly (loss.py:729-730),
-        # and that identity survives averaging by linearity, so this is a
-        # subtraction of two quantities already computed above, not new
-        # compute — no separate all_oracle_marginal accumulator needed.
-        metrics["oracle_diag/marginal_nll"] = metrics["oracle_diag/total_nll"] - metrics["oracle_diag/copula_nll"]
-    if nll_post_per_point:
-        # total_nll and y_nll_oracle_posterior are scored on the SAME
-        # episode population (whichever source supplied it above) — gap_nll,
-        # their difference, is therefore a valid same-population comparison:
-        # >= 0 in expectation, and this pair can't drift apart the way two
-        # different-population NLLs could.
-        oracle_posterior_nll = float(np.mean(nll_post_per_point))
-        metrics["y_nll_oracle_posterior"] = oracle_posterior_nll
-        # Sklar split of y_nll_oracle_posterior, for side-by-side reading against
-        # oracle_diag/copula_nll and oracle_diag/total_nll's own marginal component.
-        metrics["y_nll_oracle_posterior_marginal"] = float(np.mean(nll_post_marginal_per_point))
-        metrics["y_nll_oracle_posterior_copula"] = float(np.mean(nll_post_copula_per_point))
-        if "oracle_diag/total_nll" in metrics:
-            metrics["oracle_diag/gap_nll"] = metrics["oracle_diag/total_nll"] - oracle_posterior_nll
-            # ---- The named limits ---------------------------------------
-            # Both operands are now in the same (GP-posterior) z-space, so
-            # the marginal terms cancel exactly and copula_gap == gap_nll to
-            # float precision (asserted in tests/test_oracle_diag_analytic_z.py).
-            # copula_gap is kept as the primary name because it says what the
-            # quantity IS: the model's copula NLL minus the Bayes-optimal one.
-            #
-            # copula_headroom is the entire Bayes-optimal copula reward
-            # (-y_nll_oracle_posterior_copula, i.e. how many nats/point the
-            # perfect correlation buys over predicting independence). A
-            # copula_gap ABOVE it means the model is worse than the identity.
-            # It is logged beside the gap always, because a gap quoted alone
-            # is unreadable: the headroom collapses steeply with context size,
-            # since each added context point is one the posterior has already
-            # explained away. Measured on RBF episodes at N_test=256, 24
-            # episodes/row, l in [0.5, 1.5], noise in [0.05, 0.2]:
-            # P=4 -> 0.836, P=8 -> 0.482, P=16 -> 0.240, P=32 -> 0.099,
-            # P=64 -> 0.058, P=128 -> 0.024 nats/pt. The exact numbers move
-            # with the generator config (lengthscale and noise ranges above
-            # all), which is why this is logged per run rather than assumed --
-            # but the ordering does not, so "0.05 nats off" is mediocre at
-            # P=4 and hopeless at P=64.
-            metrics["oracle_diag/copula_gap"] = (
-                metrics["oracle_diag/copula_nll"] - metrics["y_nll_oracle_posterior_copula"]
-            )
-            metrics["oracle_diag/copula_headroom"] = -metrics["y_nll_oracle_posterior_copula"]
-            # Sanity only: with both sides on the analytic marginal this is
-            # ~0 by construction. A non-zero value means the oracle_diag
-            # z-space routing above has broken -- e.g. the model is being
-            # scored against TabICL's log_pdf_test again.
-            metrics["oracle_diag/marginal_gap"] = (
-                metrics["oracle_diag/total_nll"] - metrics["oracle_diag/copula_nll"]
-            ) - metrics["y_nll_oracle_posterior_marginal"]
-    if off_p_post:
-        cq_p = _corr_quality(np.concatenate(off_p_post), np.concatenate(off_o_post))
-        metrics["oracle_diag/corr_pearson"] = cq_p["pearson"]
-        metrics["oracle_diag/corr_mae"] = cq_p["mae"]
-    if corr_kl_vals:
-        # p90 alongside the mean: corr_kl is heavy-tailed across episodes
-        # (a handful of near-degenerate R_post dominate), so a falling mean
-        # with a flat p90 is a real and different story from both falling.
-        metrics["oracle_diag/corr_kl"] = float(np.mean(corr_kl_vals))
-        metrics["oracle_diag/corr_kl_p90"] = float(np.percentile(corr_kl_vals, 90))
-    metrics["oracle_diag/corr_kl_nonfinite"] = float(corr_kl_nonfinite)
-
-    # Genuine (non-oracle) total Y-space NLL under TabICL's own frozen
-    # marginal — see the loop above (all_tabicl_marginal_total), populated
-    # every val_every step (not gated on do_plot; only the plot-only pieces
-    # collected alongside it are). This is val/'s real headline NLL: unlike
-    # the deleted ground-truth-z_test y_nll_total, it needs no reference
-    # matrix and scores against a real, imperfect (TabICL) marginal — the
-    # "does this checkpoint actually work once you plug in a real marginal
-    # at deployment" number. Only populated when a PIT checkpoint is
-    # configured (resolve_pit_ckpt(cfg) resolves -> tabicl_val_z non-empty);
-    # otherwise val/ has no total-NLL headline, which is the honest outcome
-    # rather than falling back to a ground-truth-scored substitute.
-    if all_tabicl_marginal_total:
-        metrics["y_nll_total"] = float(np.mean(all_tabicl_marginal_total))
-        # Sklar split of the same total: y_nll_marginal is TabICL's own
-        # frozen marginal NLL (moves only if the PIT checkpoint or these
-        # episodes change, not with this run's training) while y_nll_copula
-        # is the model's copula NLL evaluated against TabICL's z_test
-        # instead of the oracle's — the piece that actually reflects whether
-        # the model's Sigma is still well-calibrated once conditioned on a
-        # real (imperfect) marginal.
-        metrics["y_nll_marginal"] = float(np.mean(all_tabicl_marginal_marginal))
-        metrics["y_nll_copula"] = float(np.mean(all_tabicl_marginal_copula))
-
-    # Model-fit-to-classical-kernel metrics: runs the CURRENT model on a fixed
-    # synthetic probe set per kernel family (see _build_synthetic_kernel_batches),
-    # so these move with training progress (unlike a fixed data-only baseline).
-    # copula_nll/total_nll run the model and score it against ground truth ->
-    # oracle_diag/. marginal_nll (data_gen.py's oracle marginal) and
-    # oracle_posterior_total_nll (gp_analytical_posterior's ceiling) don't
-    # involve the model at all -> val/, same split as the top-level
-    # posterior_probe block above.
-    for family, probe_s in (synth_kernel_batches or {}).items():
-        sbatch = probe_s["batch"]
-        out_s = model(sbatch)
-        Sigma_s = build_sigma(out_s, cfg, jitter=jitter, test_mask=sbatch["test_mask"])
-        parts_s = y_space_nll(
-            Sigma_s, sbatch["z_test"].float(), sbatch["log_pdf_test"].float(), sbatch["test_mask"]
-        )
-        cop_s = parts_s["copula"].item()
-        mar_s = parts_s["marginal"].item()
-        tot_s = parts_s["total"].item()
-        metrics[f"oracle_diag/kernel_fit/{family}/copula_nll"] = cop_s
-        metrics[f"oracle_diag/kernel_fit/{family}/total_nll"]  = tot_s
-        metrics[f"kernel_fit/{family}/marginal_nll"] = mar_s
-
-        # True Bayes-optimal ceiling for this family, same construction as
-        # the top-level y_nll_oracle_posterior but restricted to this
-        # family's own probe episodes (needs return_kernel_metadata=True —
-        # see _build_synthetic_kernel_batches).
-        nll_post_per_point_s: list[float] = []
-        for ep in probe_s["episodes"]:
-            n_s = int(ep["x_norm_test"].shape[0])
-            if n_s < 1:
-                continue
-            try:
-                post_s = gp_analytical_posterior(ep)
-            except (KeyError, NotImplementedError):
-                continue
-            nll_post_per_point_s.append(post_s["nll_post"] / n_s)
-        oracle_post_s = None
-        if nll_post_per_point_s:
-            oracle_post_s = float(np.mean(nll_post_per_point_s))
-            metrics[f"kernel_fit/{family}/oracle_posterior_total_nll"] = oracle_post_s
-            metrics[f"oracle_diag/kernel_fit/{family}/gap_nll"] = tot_s - oracle_post_s
-
-        # Real (non-oracle) counterpart of the block above: re-run the model
-        # on this SAME family's probe episodes but conditioned on TabICL's
-        # own K-fold PIT z_train (_build_tabicl_kernel_fit_z, precomputed
-        # once at startup) instead of the exact analytic one, and score
-        # against TabICL's own z_test/log_pdf_test — the same substitution
-        # the top-level y_nll_total/all_tabicl_marginal_* block above makes
-        # for the general val set. Doesn't touch ground truth (TabICL's PIT
-        # is a real, imperfect marginal, not the oracle), so -> val/, not
-        # oracle_diag/, same reasoning as y_nll_total. Feeds
-        # training.adaptive_kernel_signal="tabicl" (see
-        # _update_adaptive_kernel_weights) — a curriculum signal driven by
-        # how the model performs under a real deployment-like marginal
-        # instead of the idealized analytic one.
-        z_cache_fam = (tabicl_kernel_fit_z or {}).get(family)
-        if z_cache_fam is not None:
-            n_train_s = sbatch["train_mask"].sum(-1)
-            n_test_s = sbatch["test_mask"].sum(-1)
-            tot_tabicl_list: list[float] = []
-            mar_tabicl_list: list[float] = []
-            cop_tabicl_list: list[float] = []
-            for b in range(sbatch["x_train"].shape[0]):
-                n_tr = int(n_train_s[b])
-                n_te = int(n_test_s[b])
-                if n_tr < 2 or n_te < 1:
-                    continue
-                z_train_b = z_cache_fam["z_train"][b, :n_tr].to(device).unsqueeze(0)
-                sub_batch = {
-                    "x_train": sbatch["x_train"][b : b + 1, :n_tr],
-                    "z_train": z_train_b,
-                    "x_test": sbatch["x_test"][b : b + 1, :n_te],
-                }
-                out_tb = model(sub_batch)
-                Sigma_tb = build_sigma(out_tb, cfg, jitter=jitter)
-                z_test_b = z_cache_fam["z_test"][b, :n_te].to(device).unsqueeze(0)
-                log_pdf_b = z_cache_fam["log_pdf_test"][b, :n_te].to(device).unsqueeze(0)
-                mask_b = torch.ones(1, n_te, dtype=torch.bool, device=device)
-                parts_tb = y_space_nll(Sigma_tb, z_test_b, log_pdf_b, mask_b)
-                tot_tabicl_list.append(parts_tb["total"].item())
-                mar_tabicl_list.append(parts_tb["marginal"].item())
-                cop_tabicl_list.append(parts_tb["copula"].item())
-            if tot_tabicl_list:
-                tot_s_tabicl = float(np.mean(tot_tabicl_list))
-                metrics[f"kernel_fit/{family}/total_nll_tabicl"] = tot_s_tabicl
-                metrics[f"kernel_fit/{family}/marginal_nll_tabicl"] = float(np.mean(mar_tabicl_list))
-                metrics[f"kernel_fit/{family}/copula_nll_tabicl"] = float(np.mean(cop_tabicl_list))
-                if oracle_post_s is not None:
-                    metrics[f"kernel_fit/{family}/gap_nll_tabicl"] = tot_s_tabicl - oracle_post_s
-
-    # Real-ERA5 spatial-correlation probe per region (see
-    # _build_era5_val_batches / eval/spatial/sweep_core.py::build_era5_probe).
-    # There is no GP oracle for real data, so — unlike kernel_fit/<family>'s
-    # NLL gap against Sigma_star — this scores the CURRENT model's
-    # real, non-oracle Y-space NLL against the region's frozen held-out
-    # points (see below); the shape_corr/rmse/bias/model_r2 curve-shape
-    # comparison against rho_emp eval/runners/spatial_correlation_eval.py's
-    # real-mode sweep reports was dropped from the training-time loop —
-    # too noisy at the loop's small per-region day count to track.
-    region_y_nll_total: list[float] = []
-    region_y_nll_marginal: list[float] = []
-    region_y_nll_copula: list[float] = []
-    region_gp_baseline_total: dict[str, list[float]] = {}
-    for region, probe in (era5_val_batches or {}).items():
-        out_e = model(probe["batch"])
-        Sigma_e = build_sigma(out_e, cfg, jitter=jitter, test_mask=probe["batch"]["test_mask"])
-
-        # Real, non-oracle Y-space NLL on this region's held-out
-        # (never-in-context) points — the era5_fit analogue of
-        # kernel_fit/<family>'s *_tabicl block, minus the gap (no GP oracle
-        # for real data to gap against; see build_era5_probe's docstring).
-        # Reuses the SAME Sigma_e forward pass above (it already covers the
-        # full D-point grid, which nll_test_idx indexes into), just scored
-        # against TabICL's own frozen PIT (nll_test_z/nll_test_log_pdf,
-        # precomputed once in _build_era5_val_batches) — only present when a
-        # PIT checkpoint was configured for the probe.
-        if "nll_test_z" in probe:
-            idx = torch.as_tensor(probe["nll_test_idx"], dtype=torch.long, device=Sigma_e.device)
-            Sigma_nll = Sigma_e.index_select(1, idx).index_select(2, idx)
-            z_nll, log_pdf_nll = probe["nll_test_z"], probe["nll_test_log_pdf"]
-            mask_nll = torch.ones_like(z_nll, dtype=torch.bool)
-            parts_e = y_space_nll(Sigma_nll, z_nll, log_pdf_nll, mask_nll)
-            y_nll_total = parts_e["total"].item()
-            y_nll_marginal = parts_e["marginal"].item()
-            y_nll_copula = parts_e["copula"].item()
-            metrics[f"era5_fit/{region}/y_nll_total"] = y_nll_total
-            metrics[f"era5_fit/{region}/y_nll_marginal"] = y_nll_marginal
-            metrics[f"era5_fit/{region}/y_nll_copula"] = y_nll_copula
-            if not math.isnan(y_nll_total):
-                region_y_nll_total.append(y_nll_total)
-                region_y_nll_marginal.append(y_nll_marginal)
-                region_y_nll_copula.append(y_nll_copula)
-
-        # Classical-GP-MLE baseline, frozen once per region in
-        # _build_era5_val_batches (see its docstring for why it's not
-        # refit here) — logged alongside y_nll_total/marginal/copula above
-        # for a live "is the model beating a classical spatial GP on this
-        # region" comparison during training.
-        if "gp_baseline_nll" in probe:
-            for kname, parts in probe["gp_baseline_nll"].items():
-                metrics[f"era5_fit/{region}/gp_baseline_{kname}_nll_total"] = parts["total"]
-                metrics[f"era5_fit/{region}/gp_baseline_{kname}_nll_marginal"] = parts["marginal"]
-                metrics[f"era5_fit/{region}/gp_baseline_{kname}_nll_copula"] = parts["copula"]
-                if not math.isnan(parts["total"]):
-                    region_gp_baseline_total.setdefault(kname, []).append(parts["total"])
-
-    metrics["era5_fit/mean_y_nll_total"] = _macro_average(region_y_nll_total)
-    metrics["era5_fit/mean_y_nll_marginal"] = _macro_average(region_y_nll_marginal)
-    metrics["era5_fit/mean_y_nll_copula"] = _macro_average(region_y_nll_copula)
-    for kname, vals in region_gp_baseline_total.items():
-        metrics[f"era5_fit/mean_gp_baseline_{kname}_nll_total"] = _macro_average(vals)
-
-    model.train()
-
-    plot_figs: dict = {}
-    if do_plot and era5_viz_batch is not None:
-        # Real-ERA5 predicted-vs-ground-truth temperature field, sparse
-        # context (< baselines.era5_viz_context_frac, default 5%, of the
-        # grid — see _build_era5_viz_batch) on a handful of frozen days.
-        # Replaces the old val/corr_density_analytic_z (hexbin of predicted
-        # vs. oracle off-diagonal correlation) and val/corr_grid (oracle vs.
-        # predicted correlation-matrix heatmaps): both compared the model's
-        # Sigma directly against the GP's exact R_star, which this repo's
-        # feedback_no_raw_correlation_vs_oracle_comparison note rules out as
-        # a diagnostic once TabICL's PIT is in the loop (Sigma lives in
-        # TabICL's own approximate z-space, not the GP's exact one) — an
-        # ERA5 field reconstruction has no such mismatch: it's judged (by
-        # eye) in the same real Y-space the model is actually deployed in.
-        fig_era5, fig_era5_resid = _era5_viz_fig(model, cfg, era5_viz_batch, jitter, device)
-        if fig_era5 is not None:
-            plot_figs["val/era5_predictions"] = fig_era5
-        # Companion figure, same probe/day/forward-pass/z_shared draws as
-        # val/era5_predictions: each row's OWN per-location predictive mean
-        # (frozen TabICL marginal, or the fitted GP's own posterior mean for
-        # the GP row) subtracted off, isolating the cross-location
-        # correlation structure from the smooth mean field that otherwise
-        # dominates the raw-temperature panel (see _era5_viz_fig).
-        if fig_era5_resid is not None:
-            plot_figs["val/era5_residuals"] = fig_era5_resid
-        # Companion figure, same probe, same fixed first day: 3 posterior
-        # SAMPLES of the copula LATENT z itself (no marginal) so the three
-        # predictors' correlation structures — independent / copula model /
-        # GP baseline — are compared directly, isolated from any marginal
-        # differences (see _era5_z_samples_fig).
-        fig_era5_z = _era5_z_samples_fig(model, cfg, era5_viz_batch, jitter, device)
-        if fig_era5_z is not None:
-            plot_figs["val/era5_predictions_z"] = fig_era5_z
-        # Companion figure, same probe, all days: per-location predictive
-        # VARIANCE of the frozen TabICL marginal vs. the fitted-GP baseline
-        # — no model forward pass, unaffected by training — to check
-        # whether either predictor's uncertainty actually grows with
-        # distance from the sparse context (see _era5_marginal_variance_fig).
-        fig_era5_var = _era5_marginal_variance_fig(era5_viz_batch)
-        if fig_era5_var is not None:
-            plot_figs["val/era5_marginal_variance"] = fig_era5_var
-
-    return metrics, plot_figs
+    if start_step > 0:
+        # LambdaLR requires 'initial_lr' on each param group to resume at a
+        # non-zero last_epoch. Rebase it to this run's configured base LR
+        # (not whatever raw 'lr' the checkpoint's optimizer state restored,
+        # which is the previous run's already-decayed value) so the cosine
+        # curve below reflects this run's schedule at start_step.
+        for group in optimizer.param_groups:
+            group["initial_lr"] = t.muon_lr
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda s: cosine_lr_lambda(s, t.warmup_steps, t.steps, lr_min_frac),
+        last_epoch=start_step - 1 if start_step > 0 else -1,
+    )
+    return amp_dtype, model, optimizer, scaler, scheduler, start_step, trainable, use_amp
 
 
-def save_checkpoint(model, optimizer, scheduler, cfg, step: int, scaler=None) -> None:
-    if cfg.training.ckpt_dir is None:
-        return
-    os.makedirs(cfg.training.ckpt_dir, exist_ok=True)
-    path = os.path.join(cfg.training.ckpt_dir, f"step_{step:07d}.pt")
-    raw = getattr(model, "_orig_mod", model)
-    atomic_torch_save(
-        {
-            "step": step,
-            "state_dict": raw.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict() if scaler is not None else None,
-            "cfg": OmegaConf.to_container(cfg),
-        },
-        path,
+def _build_validation_probes(cfg, device, t, tabicl_mix_weights, val_episodes_meta, val_loader):
+    """Build the fixed validation probes (synthetic kernel families, posterior probes, ERA5) and their TabICL/analytic z_train."""
+    baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
+    synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
+    # Only needed as the oracle_diag/gap_nll fallback when val_loader itself
+    # can't supply kernel metadata (disk-mode CopulaDataset, or the real-ERA5
+    # live_source) -- see val_episodes_meta's own comment above and
+    # validate()'s posterior_probe/val_episodes_meta handling.
+    posterior_probe = (
+        _build_posterior_probe_batches(cfg, device)
+        if (baselines_on and val_episodes_meta is None)
+        else None
     )
 
-
-def load_checkpoint(
-    ckpt_path: str,
-    model: nn.Module,
-    device: str,
-    optimizer: torch.optim.Optimizer | None = None,
-    scaler: GradScaler | None = None,
-) -> int:
-    """Restore model weights and optimizer/scaler state from a checkpoint.
-
-    Optimizer moments (Adam/Muon) and the AMP grad scaler state are restored
-    so the run doesn't have to relearn gradient statistics from scratch.
-    Returns the step the checkpoint was saved at (0 for legacy checkpoints
-    without a "step" key), which the caller uses to decide where the LR
-    schedule resumes — see the `resume_reset_schedule` handling in train().
-
-    If the checkpoint predates an architecture change (e.g. a head gaining
-    extra layers), its state_dict keys won't match the live model 1:1. We
-    load non-strict in that case (matching tensors restored, new ones keep
-    their random init) and skip restoring optimizer state entirely — Muon/
-    Adam match state to params by position in the flattened param list, and
-    an inserted/removed tensor shifts every param after it, which would
-    silently apply the wrong param's moments downstream of the changed layer.
-    """
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"resume_ckpt not found: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-    raw = getattr(model, "_orig_mod", model)
-    ckpt_state = ckpt["state_dict"]
-    model_keys = set(raw.state_dict().keys())
-    ckpt_keys = set(ckpt_state.keys())
-    if model_keys != ckpt_keys:
-        missing, unexpected = sorted(model_keys - ckpt_keys), sorted(ckpt_keys - model_keys)
+    # z_train sim-to-real diagnostic (see _build_tabicl_val_z / validate()'s
+    # do_plot block): needs a second, frozen TabICL copy with its native
+    # quantile head intact (unlike the copula model's backbone, which has it
+    # stripped — see model.py:CopulaTabICL) to PIT the val episodes the same
+    # way real (non-GP) deployment data would be. See pit.py::resolve_pit_ckpt
+    # for which checkpoint (if any) that uses.
+    pit_ckpt = resolve_pit_ckpt(cfg)
+    tabicl_val_z: dict = {}
+    tabicl_kernel_fit_z: dict = {}
+    # Oracle z for every oracle_diag/* metric, independent of pit_ckpt and of
+    # data.z_train_source. Only needed when the val batches are NOT already
+    # analytic: under z_train_source="tabicl"/"tabicl_split",
+    # build_fixed_live_val_batches routes generate_gp_batch through TabICL and
+    # the batch's z_train/z_test/log_pdf_test are TabICL's, not the exact GP's
+    # -- see _build_analytic_val_z's docstring for why comparing those against
+    # gp_analytical_posterior's ceiling is a cross-z-space comparison rather
+    # than a gap. Cheap: one triangular solve per episode, once, at startup,
+    # reusing the _L_ff/_alpha factors the episodes already carry.
+    analytic_val_z: dict = {}
+    if val_episodes_meta is not None and z_train_source_of(cfg) != "analytic":
         print(
-            f"[load_checkpoint] {ckpt_path} was saved by a different model architecture: "
-            f"missing key(s) (kept at random init) {missing}; unexpected key(s) (dropped) {unexpected}. "
-            f"Loading weights non-strict and skipping optimizer state restore (param positions "
-            f"downstream of the changed layer would otherwise be misaligned)."
+            "[train] Building the exact analytic-GP PIT cache for oracle_diag/* "
+            f"(data.z_train_source={z_train_source_of(cfg)} puts the val "
+            "batches in TabICL's z-space)..."
         )
-        raw.load_state_dict(ckpt_state, strict=False)
-    else:
-        raw.load_state_dict(ckpt_state)
-        if optimizer is not None and ckpt.get("optimizer") is not None:
-            optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
-    return int(ckpt.get("step", 0))
+        analytic_val_z = _build_analytic_val_z(val_loader, val_episodes_meta, device)
+    # Real-ERA5 spatial-correlation probes (see _build_era5_val_batches):
+    # built here too, alongside tabicl_val_z, so the one-time PIT cost on the
+    # frozen context sample is paid before `tabicl_marginal` is discarded.
+    # Not strictly gated on pit_ckpt existing -- if pit_ckpt is None (e.g.
+    # tabicl.pretrained=false with no explicit tabicl.pit_ckpt), the elif
+    # branch below still tries tabicl.ckpt directly for era5_fit alone
+    # before falling back to build_era5_probe's naive-standardization path.
+    era5_val_batches: dict = {}
+    era5_viz_batch: "dict | None" = None
+    era5_on = baselines_on and bool(cfg.get("baselines", {}).get("era5_enabled", True))
+    # Only worth the fetch+PIT cost (paid once, here) if do_plot will ever
+    # actually fire and consume it -- see validate()'s do_plot block /
+    # _build_era5_viz_batch.
+    era5_viz_on = era5_on and int(t.get("plot_val_every", 5000)) > 0
+    # tabicl_mix_weights is not None only when live_generation + data.
+    # z_train_tabicl_mix_enabled=true (see build_live_train_loader) -- needs
+    # tabicl_marginal loaded below regardless of baselines_on, since the
+    # gap measurement it drives is independent of the kernel_fit/<family>
+    # baseline probes.
+    if (baselines_on or tabicl_mix_weights is not None) and pit_ckpt:
+        print("[train] Loading frozen TabICL marginal for the z_train sim-to-real diagnostic...")
+        tabicl_marginal = load_tabicl(pit_ckpt, device)
+        pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
+        # val/y_nll_* must be scored against the SAME TabICL marginal the model
+        # was conditioned on. Under data.z_train_source="tabicl"/"tabicl_split"
+        # the val episodes were generated with data.z_train_tabicl_k_folds folds
+        # (5 by default -- a documented throughput tradeoff in
+        # conf/data/gp_tasks.yaml), while tabicl.pit_k_folds defaults to
+        # DEFAULT_K_FOLDS=10. Recomputing the val PIT at 10 folds put
+        # val/y_nll_total -- the real-deployment headline -- on a marginal the
+        # model never saw, and the fold count is not a free parameter of a
+        # comparison: a K-fold PIT's sharpness moves with K, so the total NLL
+        # moves with it too. Follow the data's fold count in that case;
+        # tabicl.pit_k_folds still governs everywhere the fold count is a free
+        # choice (kernel_fit probes, the z_train mix-gap measurement).
+        val_pit_k_folds = pit_k_folds
+        if z_train_source_of(cfg) in ("tabicl", "tabicl_split"):
+            val_pit_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", pit_k_folds))
+            if val_pit_k_folds != pit_k_folds:
+                print(
+                    f"[train] val PIT k_folds={val_pit_k_folds} (from "
+                    f"data.z_train_tabicl_k_folds), matching how the val episodes "
+                    f"were generated, not tabicl.pit_k_folds={pit_k_folds}."
+                )
+        tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, val_pit_k_folds, device)
+        if synth_kernel_batches:
+            print(
+                "[train] Building TabICL PIT cache for kernel_fit/<family> "
+                "probes (feeds training.adaptive_kernel_signal='tabicl')..."
+            )
+            tabicl_kernel_fit_z = _build_tabicl_kernel_fit_z(
+                synth_kernel_batches, tabicl_marginal, pit_k_folds, device
+            )
+        if tabicl_mix_weights is not None:
+            floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
+            max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
+            if math.isclose(floor_frac, max_frac, abs_tol=1e-12):
+                # _tabicl_gap_to_mix_frac(gaps, floor, max)'s interpolation
+                # frac[i] = floor + (max - floor) * normalized collapses to
+                # floor for every family whenever floor == max, independent
+                # of the measured gap -- so the gap measurement below (a full
+                # _generate_gp_batch_raw pass PER _COMPOSABLE_KERNELS family,
+                # one of the two calls running real TabICL k-fold PIT) would
+                # spend several minutes computing a value this run can never
+                # use. tabicl_mix_weights is already initialized to
+                # floor_frac uniformly by build_live_train_loader, so there's
+                # nothing left to write here either.
+                print(
+                    f"[train] data.z_train_tabicl_mix_floor_frac == max_frac "
+                    f"({floor_frac:.3f}) -- mix fraction is fixed regardless "
+                    "of the TabICL-vs-analytic gap, skipping the gap "
+                    "measurement pass."
+                )
+            else:
+                print(
+                    "[train] Measuring per-family TabICL-vs-analytic z_train gap "
+                    "for data.z_train_tabicl_mix_* (this runs once, up front)..."
+                )
+                z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
+                new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
+                # In-place: tabicl_mix_weights is the shared-memory tensor
+                # LiveGPDataset workers already hold a reference to (built
+                # before the DataLoader forks/spawns -- see build_live_train_
+                # loader's docstring). Workers haven't started iterating yet at
+                # this point in train.py's startup sequence, so there's no
+                # torn-read race, but .copy_() (not rebind) is used anyway to
+                # match kernel_weights's own update convention below.
+                tabicl_mix_weights.copy_(new_mix_frac)
+                for family, gap in sorted(z_gap.items(), key=lambda kv: -kv[1]):
+                    idx = _COMPOSABLE_KERNELS.index(family)
+                    print(
+                        f"[train]   {family}: z_train_tabicl_gap={gap:.3f} "
+                        f"-> mix_frac={float(new_mix_frac[idx]):.3f}"
+                    )
+                wandb.log(
+                    {f"data/z_train_tabicl_gap/{f}": g for f, g in z_gap.items()}
+                    | {
+                        f"data/tabicl_mix_frac/{family}": float(new_mix_frac[i])
+                        for i, family in enumerate(_COMPOSABLE_KERNELS)
+                    },
+                    step=0,
+                )
+        if era5_on:
+            print("[train] Building frozen real-ERA5 spatial-correlation probes...")
+            era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)
+        if era5_viz_on:
+            print("[train] Building frozen real-ERA5 prediction-viz probe...")
+            era5_viz_batch = _build_era5_viz_batch(cfg, tabicl_marginal, device)
+        del tabicl_marginal  # only the caches built above are needed from here on
+        if device == "cuda":
+            # gc.collect() before empty_cache() (see this repo's OOM-handler
+            # gotcha): del alone doesn't free CUDA storage until any
+            # reference cycles in the eval-mode forward graph are collected.
+            gc.collect()
+            torch.cuda.empty_cache()
+    elif era5_on:
+        # No general pit_ckpt (e.g. tabicl.pretrained=false with no explicit
+        # tabicl.pit_ckpt override -- see pit.py::resolve_pit_ckpt). era5_fit
+        # doesn't care whether the run's OWN backbone is pretrained; it just
+        # wants a real quantile-head marginal to PIT the ERA5 context with if
+        # one is named, so it reuses tabicl.ckpt directly here rather than
+        # going through resolve_pit_ckpt's pretrained-gated default.
+        era5_ckpt = cfg.tabicl.get("ckpt", None)
+        if era5_ckpt:
+            print(
+                f"[train] Loading frozen TabICL marginal ({era5_ckpt}) for "
+                "era5_fit only (tabicl.pretrained="
+                f"{bool(cfg.tabicl.get('pretrained', True))}, no general PIT "
+                "checkpoint configured otherwise)..."
+            )
+            era5_tabicl_marginal = load_tabicl(era5_ckpt, device)
+            era5_val_batches = _build_era5_val_batches(cfg, era5_tabicl_marginal, device)
+            if era5_viz_on:
+                era5_viz_batch = _build_era5_viz_batch(cfg, era5_tabicl_marginal, device)
+            del era5_tabicl_marginal
+            if device == "cuda":
+                gc.collect()
+                torch.cuda.empty_cache()
+        else:
+            print(
+                "[train] Building frozen real-ERA5 spatial-correlation probes "
+                "(no tabicl.ckpt configured -- context z_train falls back to "
+                "naive standardization)..."
+            )
+            era5_val_batches = _build_era5_val_batches(cfg, None, device)
+            if era5_viz_on:
+                era5_viz_batch = _build_era5_viz_batch(cfg, None, device)
+    return analytic_val_z, era5_val_batches, era5_viz_batch, pit_ckpt, posterior_probe, synth_kernel_batches, tabicl_kernel_fit_z, tabicl_val_z
 
 
-@hydra.main(config_path=config_dir(__file__), config_name="config", version_base=None)
-def main(cfg: DictConfig) -> None:
-    torch.manual_seed(cfg.seed)
-    device = (
-        "cuda" if cfg.training.device == "auto" and torch.cuda.is_available()
-        else ("cpu" if cfg.training.device == "auto" else cfg.training.device)
-    )
-    gpu_peak_flops = get_gpu_peak_flops() if device == "cuda" else None
-    if device == "cuda":
-        # TF32 tensor-core matmul on Ampere+/Ada+/Hopper: NOT enabled by torch
-        # by default, even though the model's own forward already runs under
-        # bf16 autocast. What that autocast doesn't cover — Muon's Newton-
-        # Schulz orthogonalization (src/copula_inter/muon.py, fp32 grad-derived matmuls,
-        # confirmed the single most expensive part of each step: bwd+opt time
-        # is several times forward time in profiling) and y_space_nll's
-        # Cholesky/logdet path — still runs fp32 matmuls at full CUDA-core
-        # precision without this. One-line, ~free win (negligible accuracy
-        # cost, standard recommendation for Ampere+) that raises MFU's
-        # numerator directly. See torch.set_float32_matmul_precision docs.
-        torch.set_float32_matmul_precision("high")
-        print(
-            f"[train] GPU: {torch.cuda.get_device_name(0)} — assumed peak "
-            f"{gpu_peak_flops / 1e12:.0f} TFLOPS (dense bf16/fp16 tensor core) for MFU"
-        )
-
-    t = cfg.training
-    tabicl_amp = bool(t.get("tabicl_inference_amp", True))
-    configure_tabicl_inference_amp(tabicl_amp)
-    print(f"[train] frozen TabICL marginal inference AMP={'on' if tabicl_amp else 'off (float32)'}")
-    live_generation = bool(t.get("live_generation", False))
-    live_source = str(t.get("live_source", "gp"))
-    if live_generation and live_source == "era5" and float(t.get("aux_mae_weight", 0.0)) > 0.0:
-        # No oracle R_star exists for real ERA5 (data_gen.py's kernel-generated
-        # ground truth has no real-data analogue) -- see era5_live_dataset.py's
-        # module docstring and _build_era5_val_batches' docstring for the same
-        # constraint on the validation-probe side.
-        print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
-        t.aux_mae_weight = 0.0
-    if live_generation:
-        # dataset_dir is ignored entirely in this mode (see below) — naming the
-        # run after it would be misleading, so summarize cfg.data.* instead.
-        # Also fold in ckpt_dir's basename since it's often the only
-        # user-chosen, human-readable identifier for a live-generation run.
-        ckpt_dir = t.get("ckpt_dir", None)
-        ckpt_str = f"_ckpt-{os.path.basename(os.path.normpath(ckpt_dir))}" if ckpt_dir else ""
-        dataset_name = "live" + _live_data_segment(cfg.data) + ckpt_str
-    else:
-        dataset_path = os.path.normpath(t.dataset_dir)
-        # Include the parent folder so runs pointing at same-named shard dirs
-        # under different parents (e.g. runA/shards vs runB/shards) stay distinct.
-        parent_name = os.path.basename(os.path.dirname(dataset_path))
-        shard_name = os.path.basename(dataset_path)
-        dataset_name = f"{parent_name}/{shard_name}" if parent_name else shard_name
+def _init_wandb_run(cfg, dataset_name, t):
+    """Name the run from its model/training settings and start wandb."""
     lora_cfg = cfg.get("lora", None)
     lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
     if lora_enabled:
@@ -2452,7 +640,11 @@ def main(cfg: DictConfig) -> None:
         name=run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
     )
+    return resume_ckpt
 
+
+def _build_data_loaders(cfg, device, live_generation, live_source, t):
+    """Build the training iterator and validation loader for live (GP or ERA5) or on-disk data."""
     adaptive_kernel_weights = None  # set below only when live_generation + adaptive_kernel_sampling
     tabicl_mix_weights = None  # set below only when live_generation + data.z_train_tabicl_mix_enabled
     train_iter = None  # possibly kicked off early below (live_generation only) -- see there
@@ -2729,267 +921,69 @@ def main(cfg: DictConfig) -> None:
                 else {"batch_size": t.batch_size, "shuffle": False}
             ),
         )
+    return adaptive_kernel_weights, tabicl_mix_weights, train_iter, train_loader, val_episodes_meta, val_loader
 
-    baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
-    synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
-    # Only needed as the oracle_diag/gap_nll fallback when val_loader itself
-    # can't supply kernel metadata (disk-mode CopulaDataset, or the real-ERA5
-    # live_source) -- see val_episodes_meta's own comment above and
-    # validate()'s posterior_probe/val_episodes_meta handling.
-    posterior_probe = (
-        _build_posterior_probe_batches(cfg, device)
-        if (baselines_on and val_episodes_meta is None)
-        else None
+
+@hydra.main(config_path=config_dir(__file__), config_name="config", version_base=None)
+def main(cfg: DictConfig) -> None:
+    torch.manual_seed(cfg.seed)
+    device = (
+        "cuda" if cfg.training.device == "auto" and torch.cuda.is_available()
+        else ("cpu" if cfg.training.device == "auto" else cfg.training.device)
     )
-
-    # z_train sim-to-real diagnostic (see _build_tabicl_val_z / validate()'s
-    # do_plot block): needs a second, frozen TabICL copy with its native
-    # quantile head intact (unlike the copula model's backbone, which has it
-    # stripped — see model.py:CopulaTabICL) to PIT the val episodes the same
-    # way real (non-GP) deployment data would be. See pit.py::resolve_pit_ckpt
-    # for which checkpoint (if any) that uses.
-    pit_ckpt = resolve_pit_ckpt(cfg)
-    tabicl_val_z: dict = {}
-    tabicl_kernel_fit_z: dict = {}
-    # Oracle z for every oracle_diag/* metric, independent of pit_ckpt and of
-    # data.z_train_source. Only needed when the val batches are NOT already
-    # analytic: under z_train_source="tabicl"/"tabicl_split",
-    # build_fixed_live_val_batches routes generate_gp_batch through TabICL and
-    # the batch's z_train/z_test/log_pdf_test are TabICL's, not the exact GP's
-    # -- see _build_analytic_val_z's docstring for why comparing those against
-    # gp_analytical_posterior's ceiling is a cross-z-space comparison rather
-    # than a gap. Cheap: one triangular solve per episode, once, at startup,
-    # reusing the _L_ff/_alpha factors the episodes already carry.
-    analytic_val_z: dict = {}
-    if val_episodes_meta is not None and z_train_source_of(cfg) != "analytic":
+    gpu_peak_flops = get_gpu_peak_flops() if device == "cuda" else None
+    if device == "cuda":
+        # TF32 tensor-core matmul on Ampere+/Ada+/Hopper: NOT enabled by torch
+        # by default, even though the model's own forward already runs under
+        # bf16 autocast. What that autocast doesn't cover — Muon's Newton-
+        # Schulz orthogonalization (src/copula_inter/muon.py, fp32 grad-derived matmuls,
+        # confirmed the single most expensive part of each step: bwd+opt time
+        # is several times forward time in profiling) and y_space_nll's
+        # Cholesky/logdet path — still runs fp32 matmuls at full CUDA-core
+        # precision without this. One-line, ~free win (negligible accuracy
+        # cost, standard recommendation for Ampere+) that raises MFU's
+        # numerator directly. See torch.set_float32_matmul_precision docs.
+        torch.set_float32_matmul_precision("high")
         print(
-            "[train] Building the exact analytic-GP PIT cache for oracle_diag/* "
-            f"(data.z_train_source={z_train_source_of(cfg)} puts the val "
-            "batches in TabICL's z-space)..."
+            f"[train] GPU: {torch.cuda.get_device_name(0)} — assumed peak "
+            f"{gpu_peak_flops / 1e12:.0f} TFLOPS (dense bf16/fp16 tensor core) for MFU"
         )
-        analytic_val_z = _build_analytic_val_z(val_loader, val_episodes_meta, device)
-    # Real-ERA5 spatial-correlation probes (see _build_era5_val_batches):
-    # built here too, alongside tabicl_val_z, so the one-time PIT cost on the
-    # frozen context sample is paid before `tabicl_marginal` is discarded.
-    # Not strictly gated on pit_ckpt existing -- if pit_ckpt is None (e.g.
-    # tabicl.pretrained=false with no explicit tabicl.pit_ckpt), the elif
-    # branch below still tries tabicl.ckpt directly for era5_fit alone
-    # before falling back to build_era5_probe's naive-standardization path.
-    era5_val_batches: dict = {}
-    era5_viz_batch: "dict | None" = None
-    era5_on = baselines_on and bool(cfg.get("baselines", {}).get("era5_enabled", True))
-    # Only worth the fetch+PIT cost (paid once, here) if do_plot will ever
-    # actually fire and consume it -- see validate()'s do_plot block /
-    # _build_era5_viz_batch.
-    era5_viz_on = era5_on and int(t.get("plot_val_every", 5000)) > 0
-    # tabicl_mix_weights is not None only when live_generation + data.
-    # z_train_tabicl_mix_enabled=true (see build_live_train_loader) -- needs
-    # tabicl_marginal loaded below regardless of baselines_on, since the
-    # gap measurement it drives is independent of the kernel_fit/<family>
-    # baseline probes.
-    if (baselines_on or tabicl_mix_weights is not None) and pit_ckpt:
-        print("[train] Loading frozen TabICL marginal for the z_train sim-to-real diagnostic...")
-        tabicl_marginal = load_tabicl(pit_ckpt, device)
-        pit_k_folds = int(cfg.tabicl.get("pit_k_folds", DEFAULT_K_FOLDS))
-        # val/y_nll_* must be scored against the SAME TabICL marginal the model
-        # was conditioned on. Under data.z_train_source="tabicl"/"tabicl_split"
-        # the val episodes were generated with data.z_train_tabicl_k_folds folds
-        # (5 by default -- a documented throughput tradeoff in
-        # conf/data/gp_tasks.yaml), while tabicl.pit_k_folds defaults to
-        # DEFAULT_K_FOLDS=10. Recomputing the val PIT at 10 folds put
-        # val/y_nll_total -- the real-deployment headline -- on a marginal the
-        # model never saw, and the fold count is not a free parameter of a
-        # comparison: a K-fold PIT's sharpness moves with K, so the total NLL
-        # moves with it too. Follow the data's fold count in that case;
-        # tabicl.pit_k_folds still governs everywhere the fold count is a free
-        # choice (kernel_fit probes, the z_train mix-gap measurement).
-        val_pit_k_folds = pit_k_folds
-        if z_train_source_of(cfg) in ("tabicl", "tabicl_split"):
-            val_pit_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", pit_k_folds))
-            if val_pit_k_folds != pit_k_folds:
-                print(
-                    f"[train] val PIT k_folds={val_pit_k_folds} (from "
-                    f"data.z_train_tabicl_k_folds), matching how the val episodes "
-                    f"were generated, not tabicl.pit_k_folds={pit_k_folds}."
-                )
-        tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, val_pit_k_folds, device)
-        if synth_kernel_batches:
-            print(
-                "[train] Building TabICL PIT cache for kernel_fit/<family> "
-                "probes (feeds training.adaptive_kernel_signal='tabicl')..."
-            )
-            tabicl_kernel_fit_z = _build_tabicl_kernel_fit_z(
-                synth_kernel_batches, tabicl_marginal, pit_k_folds, device
-            )
-        if tabicl_mix_weights is not None:
-            floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
-            max_frac = float(cfg.data.get("z_train_tabicl_mix_max_frac", 0.35))
-            if math.isclose(floor_frac, max_frac, abs_tol=1e-12):
-                # _tabicl_gap_to_mix_frac(gaps, floor, max)'s interpolation
-                # frac[i] = floor + (max - floor) * normalized collapses to
-                # floor for every family whenever floor == max, independent
-                # of the measured gap -- so the gap measurement below (a full
-                # _generate_gp_batch_raw pass PER _COMPOSABLE_KERNELS family,
-                # one of the two calls running real TabICL k-fold PIT) would
-                # spend several minutes computing a value this run can never
-                # use. tabicl_mix_weights is already initialized to
-                # floor_frac uniformly by build_live_train_loader, so there's
-                # nothing left to write here either.
-                print(
-                    f"[train] data.z_train_tabicl_mix_floor_frac == max_frac "
-                    f"({floor_frac:.3f}) -- mix fraction is fixed regardless "
-                    "of the TabICL-vs-analytic gap, skipping the gap "
-                    "measurement pass."
-                )
-            else:
-                print(
-                    "[train] Measuring per-family TabICL-vs-analytic z_train gap "
-                    "for data.z_train_tabicl_mix_* (this runs once, up front)..."
-                )
-                z_gap = _compute_tabicl_z_train_gap(cfg, tabicl_marginal, pit_k_folds, device)
-                new_mix_frac = _tabicl_gap_to_mix_frac(z_gap, floor_frac, max_frac)
-                # In-place: tabicl_mix_weights is the shared-memory tensor
-                # LiveGPDataset workers already hold a reference to (built
-                # before the DataLoader forks/spawns -- see build_live_train_
-                # loader's docstring). Workers haven't started iterating yet at
-                # this point in train.py's startup sequence, so there's no
-                # torn-read race, but .copy_() (not rebind) is used anyway to
-                # match kernel_weights's own update convention below.
-                tabicl_mix_weights.copy_(new_mix_frac)
-                for family, gap in sorted(z_gap.items(), key=lambda kv: -kv[1]):
-                    idx = _COMPOSABLE_KERNELS.index(family)
-                    print(
-                        f"[train]   {family}: z_train_tabicl_gap={gap:.3f} "
-                        f"-> mix_frac={float(new_mix_frac[idx]):.3f}"
-                    )
-                wandb.log(
-                    {f"data/z_train_tabicl_gap/{f}": g for f, g in z_gap.items()}
-                    | {
-                        f"data/tabicl_mix_frac/{family}": float(new_mix_frac[i])
-                        for i, family in enumerate(_COMPOSABLE_KERNELS)
-                    },
-                    step=0,
-                )
-        if era5_on:
-            print("[train] Building frozen real-ERA5 spatial-correlation probes...")
-            era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)
-        if era5_viz_on:
-            print("[train] Building frozen real-ERA5 prediction-viz probe...")
-            era5_viz_batch = _build_era5_viz_batch(cfg, tabicl_marginal, device)
-        del tabicl_marginal  # only the caches built above are needed from here on
-        if device == "cuda":
-            # gc.collect() before empty_cache() (see this repo's OOM-handler
-            # gotcha): del alone doesn't free CUDA storage until any
-            # reference cycles in the eval-mode forward graph are collected.
-            gc.collect()
-            torch.cuda.empty_cache()
-    elif era5_on:
-        # No general pit_ckpt (e.g. tabicl.pretrained=false with no explicit
-        # tabicl.pit_ckpt override -- see pit.py::resolve_pit_ckpt). era5_fit
-        # doesn't care whether the run's OWN backbone is pretrained; it just
-        # wants a real quantile-head marginal to PIT the ERA5 context with if
-        # one is named, so it reuses tabicl.ckpt directly here rather than
-        # going through resolve_pit_ckpt's pretrained-gated default.
-        era5_ckpt = cfg.tabicl.get("ckpt", None)
-        if era5_ckpt:
-            print(
-                f"[train] Loading frozen TabICL marginal ({era5_ckpt}) for "
-                "era5_fit only (tabicl.pretrained="
-                f"{bool(cfg.tabicl.get('pretrained', True))}, no general PIT "
-                "checkpoint configured otherwise)..."
-            )
-            era5_tabicl_marginal = load_tabicl(era5_ckpt, device)
-            era5_val_batches = _build_era5_val_batches(cfg, era5_tabicl_marginal, device)
-            if era5_viz_on:
-                era5_viz_batch = _build_era5_viz_batch(cfg, era5_tabicl_marginal, device)
-            del era5_tabicl_marginal
-            if device == "cuda":
-                gc.collect()
-                torch.cuda.empty_cache()
-        else:
-            print(
-                "[train] Building frozen real-ERA5 spatial-correlation probes "
-                "(no tabicl.ckpt configured -- context z_train falls back to "
-                "naive standardization)..."
-            )
-            era5_val_batches = _build_era5_val_batches(cfg, None, device)
-            if era5_viz_on:
-                era5_viz_batch = _build_era5_viz_batch(cfg, None, device)
 
-    model = build_copula_transformer(cfg).to(device)
-    if bool(t.get("compile", False)):
-        torch._dynamo.config.capture_scalar_outputs = True
-        model = torch.compile(model, dynamic=True)
-    wandb.watch(model, log="gradients", log_freq=5000)
+    t = cfg.training
+    tabicl_amp = bool(t.get("tabicl_inference_amp", True))
+    configure_tabicl_inference_amp(tabicl_amp)
+    print(f"[train] frozen TabICL marginal inference AMP={'on' if tabicl_amp else 'off (float32)'}")
+    live_generation = bool(t.get("live_generation", False))
+    live_source = str(t.get("live_source", "gp"))
+    if live_generation and live_source == "era5" and float(t.get("aux_mae_weight", 0.0)) > 0.0:
+        # No oracle R_star exists for real ERA5 (data_gen.py's kernel-generated
+        # ground truth has no real-data analogue) -- see era5_live_dataset.py's
+        # module docstring and _build_era5_val_batches' docstring for the same
+        # constraint on the validation-probe side.
+        print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
+        t.aux_mae_weight = 0.0
+    if live_generation:
+        # dataset_dir is ignored entirely in this mode (see below) — naming the
+        # run after it would be misleading, so summarize cfg.data.* instead.
+        # Also fold in ckpt_dir's basename since it's often the only
+        # user-chosen, human-readable identifier for a live-generation run.
+        ckpt_dir = t.get("ckpt_dir", None)
+        ckpt_str = f"_ckpt-{os.path.basename(os.path.normpath(ckpt_dir))}" if ckpt_dir else ""
+        dataset_name = "live" + _live_data_segment(cfg.data) + ckpt_str
+    else:
+        dataset_path = os.path.normpath(t.dataset_dir)
+        # Include the parent folder so runs pointing at same-named shard dirs
+        # under different parents (e.g. runA/shards vs runB/shards) stay distinct.
+        parent_name = os.path.basename(os.path.dirname(dataset_path))
+        shard_name = os.path.basename(dataset_path)
+        dataset_name = f"{parent_name}/{shard_name}" if parent_name else shard_name
+    resume_ckpt = _init_wandb_run(cfg=cfg, dataset_name=dataset_name, t=t)
 
-    n_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable params: {n_train_params:,}")
-    wandb.config.update({"n_trainable_params": n_train_params})
+    (adaptive_kernel_weights, tabicl_mix_weights, train_iter, train_loader, val_episodes_meta, val_loader) = _build_data_loaders(cfg=cfg, device=device, live_generation=live_generation, live_source=live_source, t=t)
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    muon_params  = [p for p in trainable if p.ndim >= 2]
-    adamw_params = [p for p in trainable if p.ndim < 2]
-    optimizer = Muon(
-        [
-            {
-                "params": muon_params,
-                "use_muon": True,
-                "lr": t.muon_lr,
-                "weight_decay": t.muon_weight_decay,
-                "momentum": t.muon_momentum,
-                "matched_adamw_rms": t.muon_matched_adamw_rms,
-                "ns_steps": t.muon_ns_steps,
-                "nesterov": t.muon_nesterov,
-                "adamw_betas": tuple(t.muon_adamw_betas),
-                "adamw_eps": t.muon_adamw_eps,
-            },
-            {
-                "params": adamw_params,
-                "use_muon": False,
-                "lr": t.muon_lr,
-                "weight_decay": 0.0,
-                "adamw_betas": tuple(t.muon_adamw_betas),
-                "adamw_eps": t.muon_adamw_eps,
-            },
-        ]
-    )
-    lr_min_frac = t.muon_lr_min / t.muon_lr
+    (analytic_val_z, era5_val_batches, era5_viz_batch, pit_ckpt, posterior_probe, synth_kernel_batches, tabicl_kernel_fit_z, tabicl_val_z) = _build_validation_probes(cfg=cfg, device=device, t=t, tabicl_mix_weights=tabicl_mix_weights, val_episodes_meta=val_episodes_meta, val_loader=val_loader)
 
-    use_amp = (device == "cuda") and bool(t.get("use_amp", True))
-    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
-    scaler = GradScaler(device=device) if (use_amp and amp_dtype == torch.float16) else None
-
-    # Resume weights + optimizer/scaler state first (if requested) so we know
-    # what step the LR schedule should continue from before building the
-    # scheduler below. Default: continue the cosine schedule from the
-    # checkpoint's step, instead of re-running warmup from a from-scratch
-    # peak LR on top of already-warmed-up Adam/Muon moments — the two
-    # combined were spiking effective step size right after resume.
-    # `resume_reset_schedule=true` opts back into the old behavior, for the
-    # deliberate "warm-start a new experiment from these weights" case where
-    # a fresh warmup/cosine schedule (not a continuation) is actually wanted.
-    start_step = 0
-    if resume_ckpt:
-        ckpt_step = load_checkpoint(resume_ckpt, model, device, optimizer=optimizer, scaler=scaler)
-        if bool(t.get("resume_reset_schedule", False)):
-            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} (step {ckpt_step}) — resetting to step 0 with a fresh warmup/cosine schedule (resume_reset_schedule=true)")
-        else:
-            start_step = ckpt_step
-            print(f"Resumed weights + optimizer/scaler state from {resume_ckpt} — continuing cosine schedule from step {start_step}")
-
-    if start_step > 0:
-        # LambdaLR requires 'initial_lr' on each param group to resume at a
-        # non-zero last_epoch. Rebase it to this run's configured base LR
-        # (not whatever raw 'lr' the checkpoint's optimizer state restored,
-        # which is the previous run's already-decayed value) so the cosine
-        # curve below reflects this run's schedule at start_step.
-        for group in optimizer.param_groups:
-            group["initial_lr"] = t.muon_lr
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda s: cosine_lr_lambda(s, t.warmup_steps, t.steps, lr_min_frac),
-        last_epoch=start_step - 1 if start_step > 0 else -1,
-    )
+    (amp_dtype, model, optimizer, scaler, scheduler, start_step, trainable, use_amp) = _build_model_and_optimizer(cfg=cfg, device=device, resume_ckpt=resume_ckpt, t=t)
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
