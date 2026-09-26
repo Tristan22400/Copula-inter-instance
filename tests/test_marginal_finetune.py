@@ -14,23 +14,22 @@ import torch
 from pytest import MonkeyPatch
 
 from copula_inter.data_gen import gp_posterior
-from copula_inter.finetune_marginal import (
-    TIER0_PATTERNS,
+from copula_inter.finetune_marginal import phase_a_batch_loss
+from copula_inter.gp_kernels import build_kernel_fn
+from copula_inter.lora import merged_base_state_dict
+from copula_inter.marginal_data import _generate_phase_a_gp_batch
+from copula_inter.marginal_objective import (
     AnchorPenalty,
     MarginalLossWeights,
-    _generate_phase_a_gp_batch,
     analytic_marginal_targets,
-    apply_tier,
     episode_fold_targets,
     ks_uniform,
     marginal_objective,
     oracle_marginal_nll,
-    phase_a_batch_loss,
     quantile_level_weights,
     rank_histogram,
 )
-from copula_inter.gp_kernels import build_kernel_fn
-from copula_inter.lora import merged_base_state_dict
+from copula_inter.marginal_tiers import TIER0_PATTERNS, apply_tier
 from copula_inter.pit import _probit, run_pit_batched, run_pit_batched_grad
 
 if TYPE_CHECKING:
@@ -42,7 +41,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch: MonkeyPatch) -> None:
     from omegaconf import OmegaConf
 
-    from copula_inter import finetune_marginal as entrypoint
+    from copula_inter import marginal_data as entrypoint
 
     calls = []
 

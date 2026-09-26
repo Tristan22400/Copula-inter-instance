@@ -26,7 +26,7 @@ import torch
 
 from copula_inter.config_path import config_dir  # noqa: E402
 from copula_inter.data_gen import generate_gp_batch  # noqa: E402
-from copula_inter.finetune_marginal import (  # noqa: E402
+from copula_inter.marginal_objective import (  # noqa: E402
     analytic_marginal_targets,
     ks_uniform,
     oracle_marginal_nll,

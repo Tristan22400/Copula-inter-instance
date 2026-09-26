@@ -29,13 +29,10 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 
-from copula_inter.finetune_marginal import (  # noqa: E402  # noqa: E402
-    MarginalLossWeights,
-    _generate_phase_a_gp_batch,
-    _gp_cfg,
-    apply_tier,
-    phase_a_batch_loss,
-)
+from copula_inter.finetune_marginal import phase_a_batch_loss  # noqa: E402
+from copula_inter.marginal_data import _generate_phase_a_gp_batch, _gp_cfg  # noqa: E402
+from copula_inter.marginal_objective import MarginalLossWeights  # noqa: E402
+from copula_inter.marginal_tiers import apply_tier  # noqa: E402
 from copula_inter.pit import load_tabicl  # noqa: E402
 
 
