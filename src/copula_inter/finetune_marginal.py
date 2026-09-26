@@ -17,7 +17,8 @@ from __future__ import annotations
 import math
 import os
 import time
-from typing import TYPE_CHECKING, Optional, Sequence, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, Sequence, cast
 
 import hydra
 import numpy as np
@@ -30,8 +31,8 @@ from copula_inter.config_path import config_dict, config_dir
 from copula_inter.lora import (
     merged_base_state_dict_any,
 )
-from copula_inter.marginal_backbones import (  # noqa: E402
-    MarginalBackbone,  # noqa: E402
+from copula_inter.marginal_backbones import (
+    MarginalBackbone,
     kfold_quantiles_grad,
     load_backbone,
 )
@@ -56,12 +57,12 @@ from copula_inter.marginal_tiers import apply_tier
 from copula_inter.pit import (
     DEFAULT_K_FOLDS,
     _kernel_fn_from_task,
-    load_tabicl,  # noqa: E402
+    load_tabicl,
     normalize_targets,
     run_pit_batched_grad,
 )
 from copula_inter.rng import seed_everything
-from copula_inter.training_core import cosine_lr_lambda  # noqa: E402
+from copula_inter.training_core import cosine_lr_lambda
 
 if TYPE_CHECKING:
     from tabicl._model.tabicl import TabICL
@@ -396,17 +397,19 @@ def _resolve_device(spec: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-@hydra.main(config_path=config_dir(__file__), config_name="finetune_marginal", version_base=None)
-def main(cfg: DictConfig) -> None:
-    device = _resolve_device(str(cfg.training.device))
-    torch.set_float32_matmul_precision(str(cfg.training.matmul_precision))
-    seed_everything(int(cfg.seed))
-    print(OmegaConf.to_yaml(cfg))
+@dataclass
+class _PhaseAModel:
+    """The marginal being fine-tuned, the module holding its trainable weights, and its tier report."""
 
-    # ---- model + tier routing -------------------------------------------
+    tabicl: TabICL | MarginalBackbone
+    tabicl_config: dict
+    trainable: nn.Module
+    report: dict[str, Any]
+
+
+def _load_phase_a_model(cfg: DictConfig, device: str) -> _PhaseAModel:
+    """Load the configured backbone, route its trainable parameters by tier and move it to device."""
     backbone_name = str(cfg.marginal.get("backbone", "tabicl"))
-    _probs_n_cfg = cfg.marginal.get("probs_n", None)
-    marginal_probs_n = None if _probs_n_cfg is None else int(_probs_n_cfg)
     tabicl: TabICL | MarginalBackbone
     trainable_module: nn.Module
     if backbone_name == "tabicl":
@@ -440,7 +443,11 @@ def main(cfg: DictConfig) -> None:
         f"({100 * report['trainable_frac']:.2f}%), "
         f"{report['lora_modules_replaced']} LoRA module(s) at rank {report['lora_rank']}"
     )
+    return _PhaseAModel(tabicl, tabicl_config, trainable_module, report)
 
+
+def _loss_weights(cfg: DictConfig) -> tuple[MarginalLossWeights, MarginalLossWeights]:
+    """Synthetic-batch and ERA5-batch loss weights (ERA5 has no analytic target, so no distillation)."""
     weights = MarginalLossWeights(
         distill=float(cfg.marginal.loss.distill),
         nll=float(cfg.marginal.loss.nll),
@@ -450,7 +457,6 @@ def main(cfg: DictConfig) -> None:
         huber_delta=float(cfg.marginal.loss.huber_delta),
         tail_power=float(cfg.marginal.loss.tail_power),
     )
-    # Separate loss weights for synthetic and ERA5 batches.
     era5_loss_cfg = cfg.marginal.era5.loss
     era5_weights = MarginalLossWeights(
         distill=0.0,
@@ -461,10 +467,13 @@ def main(cfg: DictConfig) -> None:
         huber_delta=weights.huber_delta,
         tail_power=weights.tail_power,
     )
-    anchor = AnchorPenalty(trainable_module) if weights.anchor > 0 else None
+    return weights, era5_weights
 
-    # AdamW over all trainable parameters in one group.
-    params = [p for p in trainable_module.parameters() if p.requires_grad]
+
+def _make_optimizer(
+    cfg: DictConfig, params: list[nn.Parameter]
+) -> tuple[torch.optim.AdamW, torch.optim.lr_scheduler.LambdaLR]:
+    """AdamW over all trainable parameters in one group, with warmup + cosine decay."""
     if not params:
         raise RuntimeError("Tier routing left no trainable parameters.")
     adam_eps = 1e-4 if any(p.dtype == torch.float16 for p in params) else 1e-8
@@ -484,285 +493,271 @@ def main(cfg: DictConfig) -> None:
             float(cfg.training.lr_min_frac),
         ),
     )
+    return opt, sched
 
-    # ---- data ------------------------------------------------------------
-    gp_cfg = _gp_cfg(cfg)
-    eps = float(cfg.marginal.pit_eps)
-    k_folds = int(cfg.marginal.k_folds)
-    folds_per_step = cfg.marginal.folds_per_step
-    folds_per_step = None if folds_per_step is None else int(folds_per_step)
-    mix_frac = float(cfg.marginal.era5.mix_frac)
+
+def _has_sample_objective(w: MarginalLossWeights) -> bool:
+    return any(value != 0.0 for value in (w.distill, w.nll, w.crps, w.pinball))
+
+
+def _check_mixture(mix_frac: float, weights: MarginalLossWeights, era5_weights: MarginalLossWeights) -> None:
+    """Fail if the mixture fraction is out of range or a batch type that can occur has all-zero loss weights."""
     if not 0.0 <= mix_frac <= 1.0:
         raise ValueError(f"marginal.era5.mix_frac must be in [0, 1], got {mix_frac}")
-
-    def _has_sample_objective(w: MarginalLossWeights) -> bool:
-        return any(value != 0.0 for value in (w.distill, w.nll, w.crps, w.pinball))
-
-    # Fail if every loss weight is zero.
     if mix_frac < 1.0 and not _has_sample_objective(weights):
         raise ValueError("Synthetic batches have no non-zero marginal loss weight.")
     if mix_frac > 0.0 and not _has_sample_objective(era5_weights):
         raise ValueError("ERA5 batches have no non-zero marginal loss weight.")
 
-    era5_sampler = None
-    if mix_frac > 0:
-        from eval.data.era5_global_corpus import GlobalERA5Corpus
 
-        corpus = GlobalERA5Corpus(
-            str(cfg.marginal.era5.corpus_dir),
-            max_months=int(cfg.marginal.era5.max_months),
-        )
-        era5_sampler = ERA5EpisodeSampler(
-            corpus,
-            grid_size=int(cfg.marginal.era5.grid_size),
-            n_context=int(cfg.marginal.era5.n_context),
-            box_deg_range=(
-                float(cfg.marginal.era5.box_deg_min),
-                float(cfg.marginal.era5.box_deg_max),
-            ),
-            seed=int(cfg.seed) + 7717,
-        )
-        print(f"[era5] mixture on: {corpus.n_days_total} days loaded, mix_frac={mix_frac}")
+def _make_era5_sampler(cfg: DictConfig, mix_frac: float) -> ERA5EpisodeSampler | None:
+    if mix_frac <= 0:
+        return None
+    from eval.data.era5_global_corpus import GlobalERA5Corpus
 
-    print("[val] building fixed validation sets (one-off ERA5 fetch/crop)...")
-    era5_val = build_era5_marginal_val_batches(cfg.validation, device)
-    gp_val = _build_gp_val_batches(cfg, device)
-    print(f"[val] {len(era5_val)} ERA5 region(s), {len(gp_val)} synthetic GP batch(es)")
+    corpus = GlobalERA5Corpus(
+        str(cfg.marginal.era5.corpus_dir),
+        max_months=int(cfg.marginal.era5.max_months),
+    )
+    sampler = ERA5EpisodeSampler(
+        corpus,
+        grid_size=int(cfg.marginal.era5.grid_size),
+        n_context=int(cfg.marginal.era5.n_context),
+        box_deg_range=(
+            float(cfg.marginal.era5.box_deg_min),
+            float(cfg.marginal.era5.box_deg_max),
+        ),
+        seed=int(cfg.seed) + 7717,
+    )
+    print(f"[era5] mixture on: {corpus.n_days_total} days loaded, mix_frac={mix_frac}")
+    return sampler
 
-    # ---- wandb -----------------------------------------------------------
-    run = None
-    if str(cfg.wandb.mode) != "disabled":
-        import wandb
 
-        run = wandb.init(
-            project=str(cfg.wandb.project),
-            entity=cfg.wandb.entity,
-            config=config_dict(cfg),
-            mode=cfg.wandb.mode,
-        )
-        wandb.watch(trainable_module, log="gradients", log_freq=max(1, int(cfg.training.log_every)))
-        wandb.log({f"model/{k}": v for k, v in report.items() if isinstance(v, (int, float))}, step=0)
+def _init_wandb(cfg: DictConfig, model: _PhaseAModel) -> Any:
+    """Start a wandb run unless wandb.mode is "disabled"; returns the run or None."""
+    if str(cfg.wandb.mode) == "disabled":
+        return None
+    import wandb
 
-    def _log(payload: dict, step: int) -> None:
-        if run is not None:
-            run.log(payload, step=step)
+    run = wandb.init(
+        project=str(cfg.wandb.project),
+        entity=cfg.wandb.entity,
+        config=config_dict(cfg),
+        mode=cfg.wandb.mode,
+    )
+    wandb.watch(model.trainable, log="gradients", log_freq=max(1, int(cfg.training.log_every)))
+    wandb.log({f"model/{k}": v for k, v in model.report.items() if isinstance(v, (int, float))}, step=0)
+    return run
 
-    def _validate(step: int) -> dict[str, float]:
+
+def _print_validation(step: int, metrics: dict[str, float]) -> None:
+    print(
+        f"[val step {step}] "
+        f"era5 nll={metrics.get('val_marginal/mean_nll', float('nan')):.4f} "
+        f"ece={metrics.get('val_marginal/mean_ece', float('nan')):.4f} "
+        f"ks={metrics.get('val_marginal/mean_ks', float('nan')):.4f} | "
+        f"gp nll={metrics.get('val_marginal/gp/nll', float('nan')):.4f} "
+        f"distill={metrics.get('val_marginal/gp/distill', float('nan')):.4f} "
+        f"oracle={metrics.get('val_marginal/gp/nll_oracle', float('nan')):.4f} "
+        f"gap={metrics.get('val_marginal/gp/nll_gap_to_oracle', float('nan')):.4f} | "
+        f"{metrics['val_marginal/seconds']:.2f}s "
+        f"(era5 {metrics['val_marginal/era5_seconds']:.2f}s, "
+        f"gp {metrics['val_marginal/gp_seconds']:.2f}s)"
+    )
+
+
+class _BestSelector:
+    """Track the best validation value of one metric and keep an in-memory copy of its trainable weights."""
+
+    def __init__(self, module: nn.Module, metric: str, initial: dict[str, float], min_delta: float) -> None:
+        if metric not in initial:
+            raise KeyError(
+                f"training.selection_metric={metric!r} was not emitted by "
+                f"validation. Available metrics: {sorted(initial)}"
+            )
+        self.module = module
+        self.metric = metric
+        self.min_delta = min_delta
+        self.best_value = float(initial[metric])
+        if not math.isfinite(self.best_value):
+            raise RuntimeError(f"Initial selection metric {metric} is non-finite: {self.best_value}")
+        self.best_step = 0
+        self.best_state = self._snapshot()
+
+    def _snapshot(self) -> dict[str, torch.Tensor]:
+        # Keep only the trainable tensors for best-checkpoint selection.
+        return {name: p.detach().cpu().clone() for name, p in self.module.named_parameters() if p.requires_grad}
+
+    def consider(self, step: int, metrics: dict[str, float]) -> None:
+        value = float(metrics[self.metric])
+        if math.isfinite(value) and value < self.best_value - self.min_delta:
+            self.best_step = step
+            self.best_value = value
+            self.best_state = self._snapshot()
+            print(f"[selection] new best {self.metric}={self.best_value:.6f} at step {self.best_step}")
+
+    def restore(self) -> None:
+        named = dict(self.module.named_parameters())
+        with torch.no_grad():
+            for name, value in self.best_state.items():
+                named[name].copy_(value.to(device=named[name].device))
+
+
+class _StepProfiler:
+    """Synchronized per-component timings for the first `n_steps` steps, then a logged mean."""
+
+    def __init__(self, n_steps: int, device: str) -> None:
+        self.n_steps = n_steps
+        self.device = device
+        self.totals: dict[str, float] = {}
+
+    def active(self, step: int) -> bool:
+        return step <= self.n_steps
+
+    def sync(self, step: int) -> None:
+        if self.active(step) and self.device.startswith("cuda"):
+            torch.cuda.synchronize(self.device)
+
+    def record(self, step: int, measured: dict[str, float]) -> dict[str, float] | None:
+        """Accumulate one step's timings; on the last profiled step return the per-step means."""
+        for key, value in measured.items():
+            self.totals[key] = self.totals.get(key, 0.0) + value
+        print("[profile step %d] %s" % (step, " ".join(f"{key}={value:.4f}s" for key, value in measured.items())))
+        if step != self.n_steps:
+            return None
+        means = {key: value / self.n_steps for key, value in self.totals.items()}
+        print("[profile mean] " + " ".join(f"{key}={value:.4f}s" for key, value in means.items()))
+        return means
+
+
+class _PhaseARun:
+    """Everything the training loop shares: model, fixed validation sets, logging and checkpointing."""
+
+    def __init__(self, cfg: DictConfig, device: str, model: _PhaseAModel) -> None:
+        self.cfg = cfg
+        self.device = device
+        self.model = model
+        probs_n_cfg = cfg.marginal.get("probs_n", None)
+        self.marginal_probs_n = None if probs_n_cfg is None else int(probs_n_cfg)
+        self.eps = float(cfg.marginal.pit_eps)
+        self.k_folds = int(cfg.marginal.k_folds)
+        folds_per_step = cfg.marginal.folds_per_step
+        self.folds_per_step = None if folds_per_step is None else int(folds_per_step)
+        self.run: Any = None
+        self.era5_val: dict = {}
+        self.gp_val: list[list[dict]] = []
+
+    def build_validation_sets(self) -> None:
+        print("[val] building fixed validation sets (one-off ERA5 fetch/crop)...")
+        self.era5_val = build_era5_marginal_val_batches(self.cfg.validation, self.device)
+        self.gp_val = _build_gp_val_batches(self.cfg, self.device)
+        print(f"[val] {len(self.era5_val)} ERA5 region(s), {len(self.gp_val)} synthetic GP batch(es)")
+
+    def log(self, payload: dict, step: int) -> None:
+        if self.run is not None:
+            self.run.log(payload, step=step)
+
+    def validate(self, step: int) -> dict[str, float]:
         t0 = time.time()
         t_era5 = time.time()
-        metrics = validate_era5_marginal(tabicl, era5_val, eps=eps, marginal_probs_n=marginal_probs_n)
+        tabicl = self.model.tabicl
+        metrics = validate_era5_marginal(tabicl, self.era5_val, eps=self.eps, marginal_probs_n=self.marginal_probs_n)
         metrics["val_marginal/era5_seconds"] = time.time() - t_era5
         t_gp = time.time()
         metrics.update(
             validate_synthetic_marginal(
                 tabicl,
-                gp_val,
-                k_folds=k_folds,
-                eps=eps,
-                device=device,
-                marginal_probs_n=marginal_probs_n,
+                self.gp_val,
+                k_folds=self.k_folds,
+                eps=self.eps,
+                device=self.device,
+                marginal_probs_n=self.marginal_probs_n,
             )
         )
         metrics["val_marginal/gp_seconds"] = time.time() - t_gp
         metrics["val_marginal/seconds"] = time.time() - t0
-        _log(metrics, step)
-        print(
-            f"[val step {step}] "
-            f"era5 nll={metrics.get('val_marginal/mean_nll', float('nan')):.4f} "
-            f"ece={metrics.get('val_marginal/mean_ece', float('nan')):.4f} "
-            f"ks={metrics.get('val_marginal/mean_ks', float('nan')):.4f} | "
-            f"gp nll={metrics.get('val_marginal/gp/nll', float('nan')):.4f} "
-            f"distill={metrics.get('val_marginal/gp/distill', float('nan')):.4f} "
-            f"oracle={metrics.get('val_marginal/gp/nll_oracle', float('nan')):.4f} "
-            f"gap={metrics.get('val_marginal/gp/nll_gap_to_oracle', float('nan')):.4f} | "
-            f"{metrics['val_marginal/seconds']:.2f}s "
-            f"(era5 {metrics['val_marginal/era5_seconds']:.2f}s, "
-            f"gp {metrics['val_marginal/gp_seconds']:.2f}s)"
-        )
+        self.log(metrics, step)
+        _print_validation(step, metrics)
         return metrics
 
-    def _save(step: int, tag: str = "") -> str | None:
-        if cfg.training.ckpt_dir is None:
+    def save(self, step: int, tag: str = "") -> str | None:
+        if self.cfg.training.ckpt_dir is None:
             return None
         name = f"step_{step:07d}{tag}.pt"
-        path = os.path.join(str(cfg.training.ckpt_dir), name)
+        path = os.path.join(str(self.cfg.training.ckpt_dir), name)
+        report = self.model.report
         tier_extra = {"tier_report": {k: v for k, v in report.items() if isinstance(v, (int, float, str))}}
+        tabicl = self.model.tabicl
         if isinstance(tabicl, MarginalBackbone):
             # Non-TabICL backbones write their own checkpoint format.
-            tabicl.save(path, step=step, cfg=cfg, extra=tier_extra)
+            tabicl.save(path, step=step, cfg=self.cfg, extra=tier_extra)
         else:
             save_marginal_checkpoint(
                 path,
                 tabicl,
-                tabicl_config,
+                self.model.tabicl_config,
                 step=step,
-                cfg=cfg,
+                cfg=self.cfg,
                 extra=tier_extra,
             )
         print(f"[ckpt] {path}")
         return path
 
-    # ---- train -----------------------------------------------------------
-    initial_metrics = _validate(0)
-    selection_metric = str(cfg.training.get("selection_metric", "val_marginal/mean_nll"))
-    if selection_metric not in initial_metrics:
-        raise KeyError(
-            f"training.selection_metric={selection_metric!r} was not emitted by "
-            f"validation. Available metrics: {sorted(initial_metrics)}"
+
+def _log_train_step(
+    run: _PhaseARun,
+    step: int,
+    loss: torch.Tensor,
+    res: dict,
+    *,
+    anchor_val: float,
+    gnorm: torch.Tensor,
+    lr: float,
+    dt: float,
+    use_era5: bool,
+    n_context: int,
+) -> None:
+    payload = {
+        "train/loss": loss.detach().item(),
+        "train/nll": res["nll"].detach().item(),
+        "train/crps": res["crps"].detach().item(),
+        "train/pinball": res["pinball"].detach().item(),
+        "train/distill": res["distill"].detach().item(),
+        "train/raw_crossing_frac": res["raw_crossing_frac"],
+        "train/anchor": anchor_val,
+        "train/grad_norm": gnorm.detach().item(),
+        "train/lr": lr,
+        "train/sec_per_step": dt,
+        "train/is_era5_batch": float(use_era5),
+        "train/P": n_context,
+    }
+    if not use_era5:
+        payload["train/nll_oracle"] = res["oracle_nll"]
+        payload["train/nll_gap_to_oracle"] = res["nll_gap_to_oracle"]
+    run.log(payload, step)
+    print(
+        f"step {step:>7} loss={loss.detach().item():.4f} "
+        f"nll={res['nll'].detach().item():.4f} "
+        f"distill={res['distill'].detach().item():.4f} "
+        f"pinball={res['pinball'].detach().item():.4f} "
+        f"cross={res['raw_crossing_frac']:.3%} "
+        f"gap={res.get('nll_gap_to_oracle', float('nan')):.4f} "
+        f"lr={lr:.2e} {dt:.2f}s/step" + ("  [era5]" if use_era5 else "")
+    )
+
+
+def _export_final(run: _PhaseARun, selector: _BestSelector, total_steps: int) -> None:
+    """Optionally restore the best weights, then write the _final checkpoint and print how to use it."""
+    if bool(run.cfg.training.get("restore_best", True)):
+        selector.restore()
+        print(
+            f"[selection] restored step {selector.best_step} with "
+            f"{selector.metric}={selector.best_value:.6f} before final export"
         )
-    best_value = float(initial_metrics[selection_metric])
-    if not math.isfinite(best_value):
-        raise RuntimeError(f"Initial selection metric {selection_metric} is non-finite: {best_value}")
-    best_step = 0
-    selection_min_delta = float(cfg.training.get("selection_min_delta", 0.0))
-
-    def _snapshot_trainable() -> dict[str, torch.Tensor]:
-        # Keep only the trainable tensors for best-checkpoint selection.
-        return {name: p.detach().cpu().clone() for name, p in trainable_module.named_parameters() if p.requires_grad}
-
-    def _restore_trainable(state: dict[str, torch.Tensor]) -> None:
-        named = dict(trainable_module.named_parameters())
-        with torch.no_grad():
-            for name, value in state.items():
-                named[name].copy_(value.to(device=named[name].device))
-
-    best_state = _snapshot_trainable()
-
-    def _consider_validation(step: int, metrics: dict[str, float]) -> None:
-        nonlocal best_step, best_value, best_state
-        value = float(metrics[selection_metric])
-        if math.isfinite(value) and value < best_value - selection_min_delta:
-            best_step = step
-            best_value = value
-            best_state = _snapshot_trainable()
-            print(f"[selection] new best {selection_metric}={best_value:.6f} at step {best_step}")
-
-    rng = np.random.default_rng(int(cfg.seed) + 991)
-    gen = torch.Generator().manual_seed(int(cfg.seed) + 13)
-    B = int(cfg.training.batch_size)
-    t_last = time.time()
-    profile_steps = int(cfg.training.get("profile_steps", 0))
-    profile_totals: dict[str, float] = {}
-
-    for step in range(1, total_steps + 1):
-        profiling = step <= profile_steps
-        if profiling and device.startswith("cuda"):
-            torch.cuda.synchronize(device)
-        step_started = time.perf_counter()
-        data_started = step_started
-        use_era5 = era5_sampler is not None and rng.random() < mix_frac
-        if use_era5:
-            assert era5_sampler is not None
-            episodes = era5_sampler.batch(B)
-            episodes = [{k: v.to(device) for k, v in ep.items()} for ep in episodes]
-            w = era5_weights
-        else:
-            gp_cfg.seed = int(cfg.seed) * 1_000_003 + step
-            episodes = _generate_phase_a_gp_batch(gp_cfg, B, device)
-            w = weights
-        if profiling and device.startswith("cuda"):
-            torch.cuda.synchronize(device)
-        data_seconds = time.perf_counter() - data_started
-
-        part_timings: dict[str, float] | None = {} if profiling else None
-        res = phase_a_batch_loss(
-            tabicl,
-            episodes,
-            w,
-            k_folds=k_folds,
-            folds_per_step=folds_per_step,
-            generator=gen,
-            device=device,
-            eps=eps,
-            timings=part_timings,
-            marginal_probs_n=marginal_probs_n,
-        )
-        loss = res["loss"]
-        anchor_val = 0.0
-        if anchor is not None:
-            a = anchor(trainable_module)
-            loss = loss + weights.anchor * a
-            anchor_val = a.detach().item()
-
-        backward_started = time.perf_counter()
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(params, float(cfg.training.clip_grad_norm))
-        if profiling and device.startswith("cuda"):
-            torch.cuda.synchronize(device)
-        backward_seconds = time.perf_counter() - backward_started
-        optimizer_started = time.perf_counter()
-        opt.step()
-        sched.step()
-        if profiling and device.startswith("cuda"):
-            torch.cuda.synchronize(device)
-        optimizer_seconds = time.perf_counter() - optimizer_started
-
-        if profiling:
-            measured = {
-                "data": data_seconds,
-                **(part_timings or {}),
-                "backward_and_clip": backward_seconds,
-                "optimizer": optimizer_seconds,
-                "total": time.perf_counter() - step_started,
-            }
-            for key, value in measured.items():
-                profile_totals[key] = profile_totals.get(key, 0.0) + value
-            print("[profile step %d] %s" % (step, " ".join(f"{key}={value:.4f}s" for key, value in measured.items())))
-            if step == profile_steps:
-                means = {key: value / profile_steps for key, value in profile_totals.items()}
-                print("[profile mean] " + " ".join(f"{key}={value:.4f}s" for key, value in means.items()))
-                _log({f"profile/{key}_seconds": value for key, value in means.items()}, step)
-
-        if step % int(cfg.training.log_every) == 0:
-            dt = (time.time() - t_last) / int(cfg.training.log_every)
-            t_last = time.time()
-            payload = {
-                "train/loss": loss.detach().item(),
-                "train/nll": res["nll"].detach().item(),
-                "train/crps": res["crps"].detach().item(),
-                "train/pinball": res["pinball"].detach().item(),
-                "train/distill": res["distill"].detach().item(),
-                "train/raw_crossing_frac": res["raw_crossing_frac"],
-                "train/anchor": anchor_val,
-                "train/grad_norm": gnorm.detach().item(),
-                "train/lr": sched.get_last_lr()[0],
-                "train/sec_per_step": dt,
-                "train/is_era5_batch": float(use_era5),
-                "train/P": int(episodes[0]["x_norm_train"].shape[0]),
-            }
-            if not use_era5:
-                payload["train/nll_oracle"] = res["oracle_nll"]
-                payload["train/nll_gap_to_oracle"] = res["nll_gap_to_oracle"]
-            _log(payload, step)
-            print(
-                f"step {step:>7} loss={loss.detach().item():.4f} "
-                f"nll={res['nll'].detach().item():.4f} "
-                f"distill={res['distill'].detach().item():.4f} "
-                f"pinball={res['pinball'].detach().item():.4f} "
-                f"cross={res['raw_crossing_frac']:.3%} "
-                f"gap={res.get('nll_gap_to_oracle', float('nan')):.4f} "
-                f"lr={sched.get_last_lr()[0]:.2e} {dt:.2f}s/step" + ("  [era5]" if use_era5 else "")
-            )
-
-        hooks_started = time.time()
-        if step % int(cfg.training.val_every) == 0:
-            _consider_validation(step, _validate(step))
-        if step % int(cfg.training.save_every) == 0:
-            _save(step)
-        # Do not charge validation/checkpoint I/O to the next sec_per_step window.
-        t_last += time.time() - hooks_started
-
-    if total_steps % int(cfg.training.val_every) != 0:
-        _consider_validation(total_steps, _validate(total_steps))
-
-    if bool(cfg.training.get("restore_best", True)):
-        _restore_trainable(best_state)
-        print(f"[selection] restored step {best_step} with {selection_metric}={best_value:.6f} before final export")
-        export_step = best_step
+        export_step = selector.best_step
     else:
         export_step = total_steps
-    final = _save(export_step, tag="_final")
+    final = run.save(export_step, tag="_final")
     if final:
         print(
             "\nPhase A done. Use it as the copula run's marginal with:\n"
@@ -770,8 +765,135 @@ def main(cfg: DictConfig) -> None:
             "and measure it first with:\n"
             f"    python eval/runners/marginal_calibration_eval.py --ckpt {os.path.abspath(final)}"
         )
-    if run is not None:
-        run.finish()
+
+
+@hydra.main(config_path=config_dir(__file__), config_name="finetune_marginal", version_base=None)
+def main(cfg: DictConfig) -> None:
+    device = _resolve_device(str(cfg.training.device))
+    torch.set_float32_matmul_precision(str(cfg.training.matmul_precision))
+    seed_everything(int(cfg.seed))
+    print(OmegaConf.to_yaml(cfg))
+
+    model = _load_phase_a_model(cfg, device)
+    weights, era5_weights = _loss_weights(cfg)
+    anchor = AnchorPenalty(model.trainable) if weights.anchor > 0 else None
+    params = [p for p in model.trainable.parameters() if p.requires_grad]
+    opt, sched = _make_optimizer(cfg, params)
+    total_steps = int(cfg.training.steps)
+
+    gp_cfg = _gp_cfg(cfg)
+    run = _PhaseARun(cfg, device, model)
+    mix_frac = float(cfg.marginal.era5.mix_frac)
+    _check_mixture(mix_frac, weights, era5_weights)
+    era5_sampler = _make_era5_sampler(cfg, mix_frac)
+    run.build_validation_sets()
+    run.run = _init_wandb(cfg, model)
+
+    selector = _BestSelector(
+        model.trainable,
+        str(cfg.training.get("selection_metric", "val_marginal/mean_nll")),
+        run.validate(0),
+        float(cfg.training.get("selection_min_delta", 0.0)),
+    )
+
+    rng = np.random.default_rng(int(cfg.seed) + 991)
+    gen = torch.Generator().manual_seed(int(cfg.seed) + 13)
+    B = int(cfg.training.batch_size)
+    log_every = int(cfg.training.log_every)
+    t_last = time.time()
+    profiler = _StepProfiler(int(cfg.training.get("profile_steps", 0)), device)
+
+    for step in range(1, total_steps + 1):
+        profiling = profiler.active(step)
+        profiler.sync(step)
+        step_started = time.perf_counter()
+        use_era5 = era5_sampler is not None and rng.random() < mix_frac
+        if era5_sampler is not None and use_era5:
+            episodes = [{k: v.to(device) for k, v in ep.items()} for ep in era5_sampler.batch(B)]
+            w = era5_weights
+        else:
+            gp_cfg.seed = int(cfg.seed) * 1_000_003 + step
+            episodes = _generate_phase_a_gp_batch(gp_cfg, B, device)
+            w = weights
+        profiler.sync(step)
+        data_seconds = time.perf_counter() - step_started
+
+        part_timings: dict[str, float] | None = {} if profiling else None
+        res = phase_a_batch_loss(
+            model.tabicl,
+            episodes,
+            w,
+            k_folds=run.k_folds,
+            folds_per_step=run.folds_per_step,
+            generator=gen,
+            device=device,
+            eps=run.eps,
+            timings=part_timings,
+            marginal_probs_n=run.marginal_probs_n,
+        )
+        loss = res["loss"]
+        anchor_val = 0.0
+        if anchor is not None:
+            a = anchor(model.trainable)
+            loss = loss + weights.anchor * a
+            anchor_val = a.detach().item()
+
+        backward_started = time.perf_counter()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        gnorm = torch.nn.utils.clip_grad_norm_(params, float(cfg.training.clip_grad_norm))
+        profiler.sync(step)
+        backward_seconds = time.perf_counter() - backward_started
+        optimizer_started = time.perf_counter()
+        opt.step()
+        sched.step()
+        profiler.sync(step)
+        optimizer_seconds = time.perf_counter() - optimizer_started
+
+        if profiling:
+            means = profiler.record(
+                step,
+                {
+                    "data": data_seconds,
+                    **(part_timings or {}),
+                    "backward_and_clip": backward_seconds,
+                    "optimizer": optimizer_seconds,
+                    "total": time.perf_counter() - step_started,
+                },
+            )
+            if means is not None:
+                run.log({f"profile/{key}_seconds": value for key, value in means.items()}, step)
+
+        if step % log_every == 0:
+            dt = (time.time() - t_last) / log_every
+            t_last = time.time()
+            _log_train_step(
+                run,
+                step,
+                loss,
+                res,
+                anchor_val=anchor_val,
+                gnorm=gnorm,
+                lr=float(sched.get_last_lr()[0]),
+                dt=dt,
+                use_era5=use_era5,
+                n_context=int(episodes[0]["x_norm_train"].shape[0]),
+            )
+
+        hooks_started = time.time()
+        if step % int(cfg.training.val_every) == 0:
+            selector.consider(step, run.validate(step))
+        if step % int(cfg.training.save_every) == 0:
+            run.save(step)
+        # Do not charge validation/checkpoint I/O to the next sec_per_step window.
+        t_last += time.time() - hooks_started
+
+    if total_steps % int(cfg.training.val_every) != 0:
+        selector.consider(total_steps, run.validate(total_steps))
+
+    _export_final(run, selector, total_steps)
+    if run.run is not None:
+        run.run.finish()
 
 
 if __name__ == "__main__":
