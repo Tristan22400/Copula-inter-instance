@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from typing import Any
 
 import numpy as np
 import torch
@@ -66,10 +67,10 @@ def _clamp_stats(u_per_episode: "list[np.ndarray]") -> dict:
     }
 
 
-def _audit_source(u_train_per_ep, u_test_per_ep) -> dict:
+def _audit_source(u_train_per_ep: list[np.ndarray], u_test_per_ep: list[np.ndarray]) -> dict:
     from scipy.stats import kstest
 
-    out = {}
+    out: dict[str, dict[str, Any]] = {}
     for name, per_ep in (("z_train", u_train_per_ep), ("z_test", u_test_per_ep)):
         pooled = np.concatenate(per_ep) if per_ep else np.array([])
         if pooled.size == 0:
@@ -107,10 +108,10 @@ def _degeneracy_rate(z_train_per_ep: "list[np.ndarray]") -> float:
 def run(dcfg: DebugConfig) -> dict:
     analytic_eps, tabicl_eps = common.generate_paired_episodes(dcfg, dcfg.n_episodes)
 
-    def _z_arrays(episodes, key):
+    def _z_arrays(episodes: list[dict], key: str) -> list[np.ndarray]:
         return [ep[key].detach().cpu().numpy() for ep in episodes]
 
-    result = {}
+    result: dict[str, Any] = {}
     for label, episodes in (("analytic", analytic_eps), ("tabicl", tabicl_eps)):
         z_train_np = _z_arrays(episodes, "z_train")
         z_test_np = _z_arrays(episodes, "z_test")

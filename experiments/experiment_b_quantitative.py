@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import torch
@@ -36,6 +37,10 @@ from inference.copula_inference import (  # noqa: E402
     load_tabicl_marginal,
     normalize_features,
 )
+
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from tabicl._model.tabicl import TabICL
 
 KERNELS = ["rbf", "matern32"]
 LENGTHSCALE_LOG_RANGE = (np.log(0.05), np.log(1.2))
@@ -62,7 +67,16 @@ def _quantile_grid_pit(
 
 def _sample_one_function(
     rng_np: np.random.Generator, rng_torch: torch.Generator, n_test: int, n_train_range: tuple, kernels: list[str]
-):
+) -> tuple[
+    str,
+    float,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+]:
     kernel_name = rng_np.choice(kernels)
     lengthscale = float(np.exp(rng_np.uniform(*LENGTHSCALE_LOG_RANGE)))
     n_train = int(rng_np.integers(n_train_range[0], n_train_range[1] + 1))
@@ -77,7 +91,13 @@ def _sample_one_function(
     return kernel_name, lengthscale, n_train, X_train_t, y_train_t, X_test_t, y_test_t, kernel_fn
 
 
-def _compute_r_true(oracle_mode: str, X_train_t, y_train_t, X_test_t, kernel_fn) -> np.ndarray:
+def _compute_r_true(
+    oracle_mode: str,
+    X_train_t: torch.Tensor,
+    y_train_t: torch.Tensor,
+    X_test_t: torch.Tensor,
+    kernel_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> np.ndarray:
     if oracle_mode == "posterior":
         _, Sigma_star = gp_posterior(X_train_t, y_train_t, X_test_t, kernel_fn, noise=OBS_NOISE_STD**2, latent=False)
     else:  # "prior": raw kernel structure among test points, ignoring train conditioning
@@ -87,7 +107,14 @@ def _compute_r_true(oracle_mode: str, X_train_t, y_train_t, X_test_t, kernel_fn)
 
 
 @torch.no_grad()
-def run_one_function(seed: int, tabicl_model, copula_model, pfn4bo_model, oracle_mode: str, args) -> tuple[dict, tuple]:
+def run_one_function(
+    seed: int,
+    tabicl_model: TabICL,
+    copula_model: CopulaTabICL,
+    pfn4bo_model: Any,
+    oracle_mode: str,
+    args: argparse.Namespace,
+) -> tuple[dict, tuple]:
     rng_np = np.random.default_rng(seed)
     rng_torch = torch.Generator().manual_seed(seed)
 
@@ -195,7 +222,13 @@ def _print_summary(results: list[dict]) -> None:
     print(f"{'-' * 70}\n")
 
 
-def _plot_locality_aggregate(all_dists, all_r_test, all_r_true, out_path: str, n_bins: int = 15) -> None:
+def _plot_locality_aggregate(
+    all_dists: np.ndarray,
+    all_r_test: np.ndarray,
+    all_r_true: np.ndarray,
+    out_path: str,
+    n_bins: int = 15,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")

@@ -1,5 +1,7 @@
 """Mixed preprocessed feature widths must preserve predictions and gradients."""
 
+from __future__ import annotations
+
 from types import SimpleNamespace
 
 import numpy as np

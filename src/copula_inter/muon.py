@@ -7,6 +7,8 @@ batched across parameters of the same shape, fused momentum updates
 (torch._foreach_*), and a torch.compile'd Newton-Schulz kernel.
 """
 
+from __future__ import annotations
+
 import math
 from collections import defaultdict
 from typing import Any, Callable, Sequence, overload

@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -32,7 +33,7 @@ def fit_rank_ceiling(
     lr: float = 0.05,
     jitter: float = 1e-4,
     device: str = "cpu",
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fit a rank-r covnorm model to R_post (B, N, N) by the closed-form expected copula NLL.
 
     Returns (loss per episode (B,), Sigma_hat).
@@ -49,7 +50,7 @@ def fit_rank_ceiling(
 
     trace_R = R_post.diagonal(dim1=-2, dim2=-1).sum(-1)  # (B,) -- constant w.r.t. W/s
 
-    def _loss(W_, s_):
+    def _loss(W_: torch.Tensor, s_: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         Sigma = low_rank_correlation(W_, s_, jitter=jitter, parametrization="covnorm")
         L = _safe_cholesky(Sigma)
         logdet = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)
@@ -71,7 +72,7 @@ def fit_rank_ceiling(
     return per_ep_final.detach().cpu(), Sigma_final.detach()
 
 
-def run(dcfg: DebugConfig, ranks=None, steps: int = 300, lr: float = 0.05) -> dict:
+def run(dcfg: DebugConfig, ranks: Sequence[int] | None = None, steps: int = 300, lr: float = 0.05) -> dict:
     ranks = ranks or RANK_SWEEP_DEFAULT
     pairs = common.collect_posteriors(dcfg, dcfg.n_episodes)
     if not pairs:

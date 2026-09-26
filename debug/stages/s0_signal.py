@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -87,7 +88,7 @@ def run_one_P(dcfg: DebugConfig, P: int, n_episodes: int) -> dict:
     }
 
 
-def run(dcfg: DebugConfig, P_sweep=None) -> dict:
+def run(dcfg: DebugConfig, P_sweep: Sequence[int] | None = None) -> dict:
     P_sweep = P_sweep or P_SWEEP_DEFAULT
     per_P = [run_one_P(dcfg, P, dcfg.n_episodes) for P in P_sweep]
     return {"P_sweep": P_sweep, "per_P": per_P}

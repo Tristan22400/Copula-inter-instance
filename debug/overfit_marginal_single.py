@@ -17,9 +17,14 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import TYPE_CHECKING
 
 import torch
 from hydra import compose, initialize_config_dir
+
+if TYPE_CHECKING:
+    from copula_inter.marginal_backbones import MarginalBackbone
+    from tabicl._model.tabicl import TabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -46,7 +51,7 @@ def _args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _metrics(model, episode, weights, device: str) -> dict:
+def _metrics(model: TabICL | MarginalBackbone, episode: dict, weights: MarginalLossWeights, device: str) -> dict:
     with torch.no_grad():
         result = phase_a_batch_loss(
             model,

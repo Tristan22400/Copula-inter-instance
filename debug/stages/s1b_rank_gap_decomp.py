@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -33,7 +34,7 @@ def oracle_nll(R: torch.Tensor) -> torch.Tensor:
     return (0.5 * logdet / R.shape[-1]).float().cpu()
 
 
-def spectrum_fraction(R: torch.Tensor, ranks) -> dict:
+def spectrum_fraction(R: torch.Tensor, ranks: Sequence[int]) -> dict:
     ev = torch.linalg.eigvalsh(R.double()).flip(-1).clamp_min(0)  # (B,N) descending
     cum = ev.cumsum(-1) / ev.sum(-1, keepdim=True)
     return {r: float(cum[:, min(r, cum.shape[1]) - 1].mean()) for r in ranks}
@@ -60,7 +61,7 @@ def fit_decomposition(
     lr: float = 0.05,
     jitter: float = 1e-4,
     device: str = "cpu",
-):
+) -> tuple[torch.Tensor, int]:
     """Fit the inducing-point basis to R_post by the expected copula NLL. X: (B, N, d) test inputs."""
     from copula_inter.loss import _safe_cholesky
 
@@ -79,7 +80,7 @@ def fit_decomposition(
     opt = torch.optim.Adam([U, log_ls, log_out, mix, a, s], lr=lr)
     eye_N = torch.eye(N, device=device)
 
-    def _loss():
+    def _loss() -> torch.Tensor:
         Kss = _ard_kernel(X, X, log_ls, log_out, mix)
         Ksu = _ard_kernel(X, U, log_ls, log_out, mix)
         Kuu = _ard_kernel(U, U, log_ls, log_out, mix)

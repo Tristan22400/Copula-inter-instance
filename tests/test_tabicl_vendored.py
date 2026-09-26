@@ -1,5 +1,7 @@
 """The vendored tabicl_upstream is the TabICL every entrypoint imports."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 import tabicl

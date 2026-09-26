@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from copula_inter.pit import TabICLLike
+    from tabicl._model.tabicl import TabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 
 from omegaconf import OmegaConf
 
+from copula_inter.config_path import merge_configs
 from debug.config import DebugConfig  # noqa: E402
 
 
@@ -26,7 +32,7 @@ def resolve_ckpt_path(ckpt: Optional[str]) -> Optional[str]:
     return resolve_checkpoint(ckpt)
 
 
-def load_model(dcfg: DebugConfig):
+def load_model(dcfg: DebugConfig) -> CopulaTabICL:
     """Build CopulaTabICL from dcfg.cfg and load dcfg.ckpt's weights if set (non-strict on key mismatch)."""
     from copula_inter.model import build_copula_transformer
 
@@ -43,10 +49,10 @@ def load_model(dcfg: DebugConfig):
     return model
 
 
-_TABICL_CACHE: dict[str, torch.nn.Module] = {}
+_TABICL_CACHE: dict[str, TabICL] = {}
 
 
-def load_frozen_tabicl(dcfg: DebugConfig):
+def load_frozen_tabicl(dcfg: DebugConfig) -> TabICL:
     """Frozen TabICL marginal, cached per (ckpt, device)."""
     from copula_inter.pit import load_tabicl, resolve_pit_ckpt
 
@@ -66,18 +72,18 @@ def generate_episodes(
     dcfg: DebugConfig,
     n: int,
     *,
-    tabicl_model=None,
+    tabicl_model: TabICLLike | None = None,
     return_kernel_metadata: bool = True,
     seed_offset: int = 0,
     P_override: Optional[int] = None,
-):
+) -> list[dict]:
     """generate_gp_batch with the debug seed; P_override temporarily sets cfg.data.P_min/P_max."""
     from copula_inter.data_gen import generate_gp_batch
 
     cfg = dcfg.cfg
     if P_override is not None:
-        cfg = OmegaConf.merge(cfg, OmegaConf.create({"data": {"P_min": P_override, "P_max": P_override}}))
-    cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": dcfg.seed + seed_offset}))
+        cfg = merge_configs(cfg, OmegaConf.create({"data": {"P_min": P_override, "P_max": P_override}}))
+    cfg = merge_configs(cfg, OmegaConf.create({"seed": dcfg.seed + seed_offset}))
     return generate_gp_batch(
         cfg,
         n,
@@ -88,7 +94,7 @@ def generate_episodes(
     )
 
 
-def generate_paired_episodes(dcfg: DebugConfig, n: int, *, seed_offset: int = 0):
+def generate_paired_episodes(dcfg: DebugConfig, n: int, *, seed_offset: int = 0) -> tuple[list[dict], list[dict]]:
     """Analytic-z and TabICL-PIT episodes from the same seed (identical except z_train, z_test, log_pdf_test).
 
     Returns (episodes_analytic, episodes_tabicl).
@@ -99,7 +105,7 @@ def generate_paired_episodes(dcfg: DebugConfig, n: int, *, seed_offset: int = 0)
     return analytic, tabicl
 
 
-def posterior_oracle(episode: dict):
+def posterior_oracle(episode: dict) -> dict | None:
     """gp_analytical_posterior(episode), or None for unsupported kernels."""
     from copula_inter.pit import gp_analytical_posterior
 
@@ -111,7 +117,7 @@ def posterior_oracle(episode: dict):
 
 def collect_posteriors(
     dcfg: DebugConfig, n: int, *, P_override: Optional[int] = None, seed_offset: int = 0, batch_size: int = 32
-):
+) -> list[tuple[dict, dict]]:
     """Generate n analytic episodes in chunks of batch_size and pair each with its posterior (unsupported ones skipped)."""
     pairs = []
     remaining = n
@@ -134,7 +140,7 @@ def collect_posteriors(
     return pairs
 
 
-def _to_jsonable(obj):
+def _to_jsonable(obj: Any) -> Any:
     if isinstance(obj, (np.floating, np.integer)):
         return obj.item()
     if isinstance(obj, np.ndarray):

@@ -8,6 +8,8 @@ need.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 import torch
 
@@ -16,7 +18,9 @@ from copula_inter.data_gen import _safe_cholesky, build_kernel_fn  # noqa: E402
 OBS_NOISE_STD = 0.05
 
 
-def sample_gp_function(kernel_name: str, lengthscale: float, n_test: int, rng: torch.Generator):
+def sample_gp_function(
+    kernel_name: str, lengthscale: float, n_test: int, rng: torch.Generator
+) -> tuple[torch.Tensor, torch.Tensor, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]:
     """Draw one true function from a GP prior on a dense [0,1] grid.
 
     Returns:

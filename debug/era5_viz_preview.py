@@ -44,7 +44,13 @@ def main() -> None:
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
-    from copula_inter import train as T
+    from copula_inter.era5_probes import (
+        _build_era5_viz_batch,
+        _era5_viz_field,
+        _era5_viz_fig,
+        _era5_viz_gp_field,
+    )
+    from copula_inter.model import build_sigma
 
     model, cfg, device, marginal = get_model(args.ckpt, args.device)
     OmegaConf.set_struct(cfg, False)
@@ -56,7 +62,7 @@ def main() -> None:
     if args.grid_size is not None:
         cfg.baselines.era5_viz_grid_size = args.grid_size
 
-    vb = T._build_era5_viz_batch(cfg, marginal, device)
+    vb = _build_era5_viz_batch(cfg, marginal, device)
     if vb is None:
         raise SystemExit("era5 viz probe unavailable (check baselines.era5_regions)")
     print(
@@ -66,7 +72,7 @@ def main() -> None:
 
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     with torch.no_grad():
-        fig, fig_resid = T._era5_viz_fig(model, cfg, vb, jitter, device)
+        fig, fig_resid = _era5_viz_fig(model, cfg, vb, jitter, device)
     if fig is None:
         raise SystemExit("figure unavailable (degenerate probe grid)")
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -92,16 +98,16 @@ def main() -> None:
         for i, d in enumerate(vb["days"]):
             z_tr = torch.as_tensor(vb["z_train_per_day"][i], dtype=torch.float32, device=device).unsqueeze(0)
             out_v = model({"x_train": x_tr, "z_train": z_tr, "x_test": x_te})
-            Sigma = T.build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
+            Sigma = build_sigma(out_v, cfg, jitter=jitter)[0].float().cpu().numpy()
             z = rng.standard_normal(vb["D"])
             di, ym, ys = vb["dists_per_day"][i], vb["y_mean_per_day"][i], vb["y_std_per_day"][i]
             m_gp = (
-                morans_i(T._era5_viz_gp_field(gp_post[i], z).reshape(shape)) if gp_post[i] is not None else float("nan")
+                morans_i(_era5_viz_gp_field(gp_post[i], z).reshape(shape)) if gp_post[i] is not None else float("nan")
             )
             print(
                 f"{d:>6} {morans_i(vb['true_fields'][i]):>9.3f} {m_gp:>9.3f} "
-                f"{morans_i(T._era5_viz_field(Sigma, di, ym, ys, z, device).reshape(shape)):>9.3f} "
-                f"{morans_i(T._era5_viz_field(R_indep, di, ym, ys, z, device).reshape(shape)):>9.3f}"
+                f"{morans_i(_era5_viz_field(Sigma, di, ym, ys, z, device).reshape(shape)):>9.3f} "
+                f"{morans_i(_era5_viz_field(R_indep, di, ym, ys, z, device).reshape(shape)):>9.3f}"
             )
 
     print(f"\nwrote {args.out}")

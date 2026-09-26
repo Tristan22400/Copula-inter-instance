@@ -1,5 +1,7 @@
 """Execution optimizations must preserve LoRA gradients across optimizer steps."""
 
+from __future__ import annotations
+
 from copy import deepcopy
 from types import SimpleNamespace
 

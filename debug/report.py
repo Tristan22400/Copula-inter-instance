@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_ROOT = os.path.join(_HERE, "results")
@@ -33,7 +34,7 @@ STAGE_ORDER = [
 ]
 
 
-def _load(run_id: str, stage: str):
+def _load(run_id: str, stage: str) -> Any:
     path = os.path.join(RESULTS_ROOT, run_id, f"{stage}.json")
     if not os.path.isfile(path):
         return None

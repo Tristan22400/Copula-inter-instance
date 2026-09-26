@@ -19,16 +19,22 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("WANDB_MODE", "disabled")
 
 # Line-buffered stdout even when piped.
-sys.stdout.reconfigure(line_buffering=True)
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(line_buffering=True)
 
 
 import hydra
@@ -39,6 +45,7 @@ from torch.amp import GradScaler
 from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.checkpointing import load_checkpoint, save_checkpoint
+from copula_inter.config_path import merge_configs
 from copula_inter.data_gen import _COMPOSABLE_KERNELS, generate_gp_batch
 from copula_inter.dataset import collate_fn
 from copula_inter.model import build_copula_transformer
@@ -59,10 +66,10 @@ def _build_debug_val_batch(
     t: DictConfig,
     device: str,
     gen_device: str,
-    tabicl_model,
+    tabicl_model: TabICLLike | None,
     tabicl_k_folds: int,
     tabicl_split_calib_frac: float,
-):
+) -> tuple[int, int, int, list[dict], float]:
     """The first DEBUG_VAL_N_BATCHES batches of the live validation set (same seeds), PIT'd with tabicl_model.
 
     Returns (n_episodes, val_seed, batch_size, batches, oracle_copula_nll), the
@@ -76,7 +83,7 @@ def _build_debug_val_batch(
     n_episodes = 0
     oracle_copula_per_point: list[float] = []
     for i in range(DEBUG_VAL_N_BATCHES):
-        val_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": val_seed + i * 104_729}))
+        val_cfg = merge_configs(cfg, OmegaConf.create({"seed": val_seed + i * 104_729}))
         episodes = generate_gp_batch(
             val_cfg,
             batch_size,
@@ -108,14 +115,14 @@ def _build_episode_batch(
     n: int,
     seed: int,
     device: str,
-    tabicl_model,
+    tabicl_model: TabICLLike | None,
     tabicl_k_folds: int,
     tabicl_split_calib_frac: float,
     gen_device: str,
     return_kernel_metadata: bool = False,
-    tabicl_mix_weights=None,
-):
-    call_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": seed}))
+    tabicl_mix_weights: torch.Tensor | None = None,
+) -> tuple[list[dict[str, torch.Tensor]], dict]:
+    call_cfg = merge_configs(cfg, OmegaConf.create({"seed": seed}))
     episodes = generate_gp_batch(
         call_cfg,
         n,

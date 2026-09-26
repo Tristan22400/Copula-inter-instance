@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -31,6 +32,10 @@ from inference.copula_inference import (  # noqa: E402
     normalize_features,
     sample_trajectories,
 )
+
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from tabicl._model.tabicl import TabICL
 
 TEST_FUNCTIONS = [
     ("rbf", 0.5, "RBF (l=0.5)"),
@@ -54,10 +59,10 @@ def run_one_function(
     kernel_name: str,
     lengthscale: float,
     label: str,
-    tabicl_model,
-    copula_model,
-    pfn4bo_model,
-    args,
+    tabicl_model: TabICL,
+    copula_model: CopulaTabICL,
+    pfn4bo_model: Any,
+    args: argparse.Namespace,
     seed: int,
 ) -> None:
     import matplotlib

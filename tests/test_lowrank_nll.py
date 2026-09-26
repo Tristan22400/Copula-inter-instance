@@ -1,5 +1,7 @@
 """Low-rank (Matrix Determinant Lemma + Woodbury) y_space_nll vs the dense path: same Sigma, values and gradients."""
 
+from __future__ import annotations
+
 import pytest
 import torch
 

@@ -8,6 +8,8 @@ Usage:
     python scripts/visualize_kernel.py --kernel rbf
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys
@@ -18,7 +20,9 @@ matplotlib.use("Agg")  # headless: must be set before importing pyplot
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.cluster.hierarchy as sch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
+
+from copula_inter.config_path import merge_configs
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 from copula_inter.data_gen import KERNEL_REGISTRY, generate_gp_batch  # noqa: E402
@@ -27,12 +31,12 @@ N_SAMPLES = 8  # print at least 8 generated posterior draws along the way
 N_PLOT = 4  # number of those draws to actually plot (raw + sorted each)
 
 
-def _load_cfg(kernel_name: str):
+def _load_cfg(kernel_name: str) -> DictConfig:
     """The project config (same YAML files as training) fixed to one kernel."""
     base_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "config.yaml"))
     data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
-    cfg = OmegaConf.merge(base_cfg, OmegaConf.create({"data": data_cfg}))
+    cfg = merge_configs(base_cfg, OmegaConf.create({"data": data_cfg}))
     cfg.data.kernel = kernel_name
     cfg.data.kernels = []
     return cfg

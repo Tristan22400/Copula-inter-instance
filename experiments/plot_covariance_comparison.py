@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -26,9 +27,20 @@ from inference.copula_inference import (  # noqa: E402
     normalize_features,
 )
 
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from tabicl._model.tabicl import TabICL
+
 
 @torch.no_grad()
-def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_dir: str) -> None:
+def plot_one(
+    seed: int,
+    tabicl_model: TabICL,
+    copula_model: CopulaTabICL,
+    oracle_mode: str,
+    args: argparse.Namespace,
+    out_dir: str,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")

@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import torch
@@ -20,10 +21,18 @@ import torch
 from debug import common
 from debug.config import DebugConfig, add_common_args, build_config
 
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
+    from copula_inter.pit import TabICLLike
+
 K_SWEEP_DEFAULT = [2, 5, 10]  # "P" (true K-fold LOO through TabICL) is appended in run()
 
 
-def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
+def _pit_at_k(
+    tabicl_model: TabICLLike, episodes: list[dict], k_folds: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """run_pit_batched at K over a shared-P/N batch, with data_gen's per-episode y scaling."""
     from copula_inter.pit import run_pit_batched
 
@@ -46,7 +55,16 @@ def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
     return z_train, z_test, log_pdf_test
 
 
-def _score_variant(model, episodes: list[dict], z_train, z_test, log_pdf_test, posts, cfg, device):
+def _score_variant(
+    model: CopulaTabICL,
+    episodes: list[dict],
+    z_train: torch.Tensor,
+    z_test: torch.Tensor,
+    log_pdf_test: torch.Tensor,
+    posts: list[dict | None],
+    cfg: DictConfig,
+    device: str,
+) -> dict:
     from copula_inter.dataset import collate_fn
     from copula_inter.loss import y_space_nll
     from copula_inter.model import build_sigma
@@ -88,7 +106,7 @@ def _score_variant(model, episodes: list[dict], z_train, z_test, log_pdf_test, p
     }
 
 
-def run(dcfg: DebugConfig, k_sweep=None) -> dict:
+def run(dcfg: DebugConfig, k_sweep: Sequence[int] | None = None) -> dict:
     if dcfg.ckpt is None:
         return {"error": "S5 needs a trained --ckpt (frozen-checkpoint probe, no retraining here)."}
 

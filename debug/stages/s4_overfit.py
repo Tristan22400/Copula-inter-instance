@@ -17,14 +17,20 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import TYPE_CHECKING
 
 import matplotlib
+
+if TYPE_CHECKING:
+    from tabicl._model.tabicl import TabICL
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
+
+from copula_inter.config_path import merge_configs
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -177,7 +183,7 @@ def build_synthetic_dataset_from_R(episode: dict, R: torch.Tensor, K: int) -> li
     return realizations
 
 
-def build_tabicl_dataset(episode: dict, post: dict, K: int, tabicl_model, device: str) -> list[dict]:
+def build_tabicl_dataset(episode: dict, post: dict, K: int, tabicl_model: TabICL, device: str) -> list[dict]:
     """K episodes whose z_test are posterior y_test draws PIT'd through TabICL (s3_pit_floor.sample_and_pit)."""
     n_test = int(episode["n_test"].item())
     z_samples = sample_and_pit(tabicl_model, episode, post, K, device).cpu()  # (n_test, K)
@@ -200,7 +206,7 @@ def main() -> None:
     data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
     # The model presets are `# @package _global_`: merge at the top level.
-    cfg = OmegaConf.merge(base_cfg, model_cfg, OmegaConf.create({"data": data_cfg}))
+    cfg = merge_configs(base_cfg, model_cfg, OmegaConf.create({"data": data_cfg}))
     if args.freeze_backbone:
         cfg.model.unfreeze_backbone = False
     if args.parametrization is not None:

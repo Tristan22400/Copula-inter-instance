@@ -23,7 +23,9 @@ import subprocess
 import time
 from typing import Optional
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
+
+from copula_inter.config_path import merge_configs
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
@@ -33,7 +35,7 @@ RESULTS_ROOT = os.path.join(_HERE, "results")
 
 @dataclasses.dataclass
 class DebugConfig:
-    cfg: "OmegaConf"  # merged Hydra-style config (cfg.data/model/tabicl/training)
+    cfg: DictConfig  # merged Hydra-style config (cfg.data/model/tabicl/training)
     n_episodes: int = 200
     ckpt: Optional[str] = None  # checkpoint name/dir under ./checkpoints, or None (fresh model)
     out_dir: str = RESULTS_ROOT
@@ -89,7 +91,7 @@ def build_config(
     model_cfg = OmegaConf.load(os.path.join(_REPO_ROOT, "conf", "model", f"{model_preset}.yaml"))
     data_cfg = OmegaConf.load(os.path.join(_REPO_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
-    cfg = OmegaConf.merge(base_cfg, model_cfg, OmegaConf.create({"data": data_cfg}))
+    cfg = merge_configs(base_cfg, model_cfg, OmegaConf.create({"data": data_cfg}))
     cfg.seed = seed
     for ov in overrides:
         key, sep, val = ov.partition("=")
@@ -112,7 +114,7 @@ def build_config(
     )
 
 
-def _coerce(val: str):
+def _coerce(val: str) -> int | float | bool | str | None:
     """Best-effort str -> int/float/bool/str, matching Hydra CLI override semantics closely
     enough for the debug pipeline's own use (no lists/dicts needed here)."""
     low = val.lower()

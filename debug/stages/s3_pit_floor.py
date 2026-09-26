@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -22,8 +23,14 @@ from debug import common
 from debug.config import DebugConfig, add_common_args, build_config
 from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
+if TYPE_CHECKING:
+    from tabicl._model.quantile_dist import QuantileDistribution
+    from tabicl._model.tabicl import TabICL
 
-def _build_quantile_dist(tabicl_model, x_train: torch.Tensor, y_train_scaled: torch.Tensor, x_test: torch.Tensor):
+
+def _build_quantile_dist(
+    tabicl_model: TabICL, x_train: torch.Tensor, y_train_scaled: torch.Tensor, x_test: torch.Tensor
+) -> QuantileDistribution:
     """One TabICL forward -> quantile distribution with batch_shape (N,)."""
     X_concat = torch.cat([x_train, x_test], dim=0).unsqueeze(0)  # (1, P+N, d_x)
     y_train_batch = y_train_scaled.unsqueeze(0)  # (1, P)
@@ -34,7 +41,7 @@ def _build_quantile_dist(tabicl_model, x_train: torch.Tensor, y_train_scaled: to
     return tabicl_model.quantile_dist(logits.reshape(N, Q))
 
 
-def sample_and_pit(tabicl_model, episode: dict, post: dict, M: int, device: str) -> torch.Tensor:
+def sample_and_pit(tabicl_model: TabICL, episode: dict, post: dict, M: int, device: str) -> torch.Tensor:
     """z_samples (N, M): M posterior draws at the episode's test points, PIT'd through TabICL."""
     from copula_inter.loss import _safe_cholesky
     from copula_inter.pit import _probit
@@ -73,7 +80,7 @@ def _shrunk_correlation(z_fit: torch.Tensor) -> tuple[torch.Tensor, float]:
     return torch.from_numpy(R).to(z_fit.device, dtype=z_fit.dtype), float(lw.shrinkage_)
 
 
-def run(dcfg: DebugConfig, M: int = 2048, m_fit: int = None, rank: int = 32) -> dict:
+def run(dcfg: DebugConfig, M: int = 2048, m_fit: int | None = None, rank: int = 32) -> dict:
     from copula_inter.loss import oracle_copula_nll
 
     m_fit = m_fit or M // 2
@@ -117,7 +124,7 @@ def run(dcfg: DebugConfig, M: int = 2048, m_fit: int = None, rank: int = 32) -> 
             }
         )
 
-    def _mean(key):
+    def _mean(key: str) -> float:
         return float(np.mean([e[key] for e in per_episode]))
 
     return {

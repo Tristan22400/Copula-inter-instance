@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -21,10 +22,15 @@ from debug import common
 from debug.config import DebugConfig, add_common_args, build_config
 from debug.stages.s5_kfold import _pit_at_k
 
+if TYPE_CHECKING:
+    from copula_inter.pit import TabICLLike
+
 DEFAULT_PROBS_N = 99  # coarser than TabICL's 999 -- TabPFN's per-fold .fit()+.predict() dominates wall-clock
 
 
-def _generic_pit_episode(backend: str, regressor, ep: dict, k_folds: int, probs_n: int, seed: int):
+def _generic_pit_episode(
+    backend: str, regressor: Any, ep: dict, k_folds: int, probs_n: int, seed: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-episode PIT through a non-TabICL backend (marginal_backends loo_pit/quantiles and joint_nll.compute_pit)."""
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.marginal_backends import loo_pit, quantiles
@@ -49,15 +55,16 @@ def _build_batch_for_backend(
     backend: str,
     n: int,
     seed_offset: int,
-    tabicl_model=None,
-    regressor=None,
+    tabicl_model: TabICLLike | None = None,
+    regressor: Any = None,
     k_folds: int = 5,
     probs_n: int = DEFAULT_PROBS_N,
-):
+) -> dict:
     from copula_inter.dataset import collate_fn
 
     episodes = common.generate_episodes(dcfg, n, tabicl_model=None, seed_offset=seed_offset)
     if backend == "tabicl":
+        assert tabicl_model is not None
         z_train, z_test, log_pdf_test = (t.cpu() for t in _pit_at_k(tabicl_model, episodes, k_folds, dcfg.device))
         for i, ep in enumerate(episodes):
             ep["z_train"], ep["z_test"], ep["log_pdf_test"] = z_train[i], z_test[i], log_pdf_test[i]
@@ -79,7 +86,7 @@ def _train_one_backend(
     n_eval: int,
     k_folds: int,
     probs_n: int,
-):
+) -> list[dict[str, float]]:
     from copula_inter.loss import y_space_nll
     from copula_inter.model import build_copula_transformer, build_sigma
 

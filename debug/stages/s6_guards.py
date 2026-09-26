@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from typing import Any, Iterator
 
 import numpy as np
 import torch
@@ -23,7 +24,7 @@ from debug.config import DebugConfig, add_common_args, build_config
 
 
 @contextlib.contextmanager
-def _cholesky_instrumentation():
+def _cholesky_instrumentation() -> Iterator[dict[str, int]]:
     """Context manager counting jitter retries and non-finite slices in loss._safe_cholesky (monkey-patched, restored on exit)."""
     from copula_inter import loss as loss_mod
 
@@ -31,11 +32,11 @@ def _cholesky_instrumentation():
     orig_cholesky = torch.linalg.cholesky
     orig_safe_cholesky = loss_mod._safe_cholesky
 
-    def counting_cholesky(K, *a, **kw):
+    def counting_cholesky(K: torch.Tensor, *a: Any, **kw: Any) -> torch.Tensor:
         counters["cholesky_calls"] += 1
         return orig_cholesky(K, *a, **kw)
 
-    def counting_safe_cholesky(K, *a, **kw):
+    def counting_safe_cholesky(K: torch.Tensor, *a: Any, **kw: Any) -> torch.Tensor:
         counters["safe_cholesky_calls"] += 1
         calls_before = counters["cholesky_calls"]
         finite = torch.isfinite(K).flatten(-2).all(-1)

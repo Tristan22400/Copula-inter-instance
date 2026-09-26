@@ -65,7 +65,7 @@ def normalize_features(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndar
     return norm_tr, norm_te
 
 
-def load_tabicl_marginal(ckpt_name: str, device: str) -> torch.nn.Module:
+def load_tabicl_marginal(ckpt_name: str, device: str) -> TabICL:
     """Load a frozen TabICL regressor (pit.load_tabicl)."""
     return load_tabicl(ckpt_name, device)
 

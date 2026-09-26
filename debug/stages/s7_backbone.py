@@ -15,9 +15,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -62,9 +68,9 @@ def _z_train_gap(z_true: np.ndarray, z_hat: np.ndarray) -> dict:
 
 
 def run_task(
-    model,
-    cfg,
-    device,
+    model: CopulaTabICL,
+    cfg: DictConfig,
+    device: str,
     backends: list,
     regressors: dict,
     kernel_name: str,
