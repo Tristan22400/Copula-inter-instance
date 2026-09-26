@@ -16,9 +16,9 @@ def config_dir(caller_file: str) -> str:
     return str(files("conf"))
 
 
-def config_dict(cfg: DictConfig) -> dict[str, Any]:
-    """cfg resolved into a plain dict."""
-    out = OmegaConf.to_container(cfg, resolve=True)
+def config_dict(cfg: DictConfig, resolve: bool = True) -> dict[str, Any]:
+    """cfg as a plain dict, interpolations resolved unless resolve=False."""
+    out = OmegaConf.to_container(cfg, resolve=resolve)
     if not isinstance(out, dict):
         raise TypeError(f"expected a mapping config, got {type(out).__name__}")
     return cast(dict[str, Any], out)

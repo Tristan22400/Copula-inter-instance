@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -26,6 +26,9 @@ _PFNS4BO_ROOT = os.path.join(_REPO_ROOT, "pfns4bo_upstream")
 
 from copula_inter.model import CopulaTabICL, build_copula_transformer, low_rank_correlation  # noqa: E402
 from copula_inter.pit import load_tabicl, normalize_targets, run_pit  # noqa: E402
+
+if TYPE_CHECKING:
+    from tabicl._model.tabicl import TabICL
 
 __all__ = [
     "normalize_features",
@@ -69,7 +72,7 @@ def load_tabicl_marginal(ckpt_name: str, device: str) -> torch.nn.Module:
 
 @torch.no_grad()
 def get_marginal_quantiles(
-    tabicl: torch.nn.Module,
+    tabicl: TabICL,
     X_context: np.ndarray,
     y_context: np.ndarray,
     X_query: np.ndarray,
@@ -117,7 +120,7 @@ def get_marginal_quantiles(
 
 
 def loo_pit(
-    tabicl: torch.nn.Module,
+    tabicl: TabICL,
     X_train: np.ndarray,
     y_train: np.ndarray,
     k_folds: int = 10,
@@ -251,7 +254,7 @@ def _patch_pfns4bo_torch_compat() -> None:
     import torch.nn.modules.transformer as _t
 
     if not hasattr(_t, "Optional"):
-        _t.Optional = typing.Optional
+        setattr(_t, "Optional", typing.Optional)
 
 
 def load_pfn4bo(model_name: str = "hebo_plus_model", device: str = "cpu") -> torch.nn.Module:

@@ -9,7 +9,6 @@ import matplotlib
 matplotlib.use("Agg")
 import numpy as np
 import torch
-import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from copula_inter.classical_kernels import DEFAULT_FAMILIES
@@ -18,6 +17,7 @@ from copula_inter.dataset import (
     collate_fn,
 )
 from copula_inter.pit import (
+    TabICLLike,
     gp_analytical_pit,
     normalize_targets,
     run_pit,
@@ -135,7 +135,7 @@ def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
 @torch.no_grad()
 def _tabicl_pit_batch(
     batch: dict,
-    tabicl_marginal: nn.Module,
+    tabicl_marginal: TabICLLike,
     k_folds: int,
     device: str,
 ) -> dict[str, torch.Tensor]:
@@ -191,7 +191,7 @@ def _tabicl_pit_batch(
 @torch.no_grad()
 def _build_tabicl_val_z(
     val_loader,
-    tabicl_marginal: nn.Module,
+    tabicl_marginal: TabICLLike,
     k_folds: int,
     device: str,
 ) -> dict[int, dict[str, torch.Tensor]]:
@@ -255,7 +255,7 @@ def _build_analytic_val_z(
 @torch.no_grad()
 def _build_tabicl_kernel_fit_z(
     synth_kernel_batches: dict,
-    tabicl_marginal: nn.Module,
+    tabicl_marginal: TabICLLike,
     k_folds: int,
     device: str,
 ) -> dict[str, dict[str, torch.Tensor]]:

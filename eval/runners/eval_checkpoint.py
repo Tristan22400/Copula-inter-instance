@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from hydra.core.global_hydra import GlobalHydra
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from eval.baselines.prefit import (
@@ -56,6 +56,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
 from copula_inter.artifacts import artifact_identity, atomic_json_save  # noqa: E402
 from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES, GENERIC_MARGINAL_BACKENDS  # noqa: E402
+from copula_inter.config_path import config_dict  # noqa: E402
 from copula_inter.config_path import config_dir as project_config_dir  # noqa: E402
 from copula_inter.data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from copula_inter.dataset import CopulaDataset  # noqa: E402
@@ -63,6 +64,7 @@ from copula_inter.loss import y_space_nll  # noqa: E402
 from copula_inter.model import low_rank_correlation  # noqa: E402
 from copula_inter.pit import (  # noqa: E402
     DEFAULT_K_FOLDS,
+    TabICLLike,
     configure_tabicl_inference_amp,
     gp_analytical_posterior,
     load_tabicl,
@@ -145,7 +147,7 @@ def _snapshot_rng_and_threads(seed: int | None = None, cpu_threads: int | None =
             torch.cuda.set_rng_state_all(rng_cuda)
 
 
-def _load_full_config(config_path: str) -> OmegaConf:
+def _load_full_config(config_path: str) -> DictConfig:
     """Compose --config through Hydra's defaults list (model and data groups), independent of any checkpoint."""
     if config_path == "conf/config.yaml" and not os.path.isfile(config_path):
         config_path = os.path.join(project_config_dir(__file__), "config.yaml")
@@ -168,7 +170,7 @@ def _eval_icl_episode(
     icl_model: nn.Module,
     device: torch.device,
     marginal_pit: dict[str, Tensor] | None = None,
-) -> tuple[dict[str, float], dict[str, Tensor], Tensor, dict[str, dict[str, float]], dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, Tensor], Tensor | None, dict[str, dict[str, float]], dict[str, float]]:
     """Score the ICL model and the oracle on one episode.
 
     marginal_pit, when given, replaces the episode's z_train as the model input
@@ -267,7 +269,7 @@ def _eval_icl_episode(
 
 def _marginal_pit(
     ep: dict,
-    tabicl_marginal: nn.Module | None,
+    tabicl_marginal: TabICLLike | None,
     k_folds: int,
     device: torch.device,
     marginal_backend: str | None = None,
@@ -311,6 +313,7 @@ def _marginal_pit(
         }
     Y_train = y_train_scaled.unsqueeze(-1)  # (P, 1)
     Y_test = y_test_scaled.unsqueeze(-1)  # (N, 1)
+    assert tabicl_marginal is not None
     pit_out = run_pit(
         tabicl_marginal,
         X_train,
@@ -1207,7 +1210,7 @@ def _load_models(args, cfg, device):
     n_params = sum(p.numel() for p in icl_model.parameters())
     print(f"ICL model parameters: {n_params:,}  rank={icl_rank}")
 
-    tabicl_marginal: nn.Module | None = None
+    tabicl_marginal: TabICLLike | None = None
     marginal_backend: str | None = args.z_train_source if args.z_train_source in GENERIC_MARGINAL_BACKENDS else None
     marginal_regressor = None
     tabicl_pit_k_folds = DEFAULT_K_FOLDS
@@ -1272,7 +1275,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     # Baseline hyperpriors from cfg.data, falling back to classical._DEFAULT_PRIOR_CFG.
     data_cfg = OmegaConf.select(cfg, "data", default=None)
-    prior_cfg = OmegaConf.to_container(data_cfg) if data_cfg is not None else {}
+    prior_cfg = config_dict(data_cfg, resolve=False) if data_cfg is not None else {}
     print(f"GP-MLE restarts: {args.n_restarts_mle}")
     print(f"DKL restarts: {args.n_restarts_dkl}")
 

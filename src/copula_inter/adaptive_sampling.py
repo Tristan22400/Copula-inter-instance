@@ -12,7 +12,6 @@ from copula_inter.probe_batches import _name_seed
 
 matplotlib.use("Agg")
 import torch
-import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from copula_inter.data_gen import _COMPOSABLE_KERNELS, _generate_gp_batch_raw
@@ -21,6 +20,7 @@ from copula_inter.live_dataset import (
 )
 from copula_inter.pit import (
     DEFAULT_K_FOLDS,
+    TabICLLike,
     load_tabicl,
 )
 
@@ -73,7 +73,7 @@ def _update_adaptive_kernel_weights(
 @torch.no_grad()
 def _compute_tabicl_z_train_gap(
     cfg: DictConfig,
-    tabicl_marginal: nn.Module,
+    tabicl_marginal: TabICLLike,
     k_folds: int,
     device: str = "cpu",
 ) -> dict[str, float]:
