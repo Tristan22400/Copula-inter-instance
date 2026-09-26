@@ -27,5 +27,3 @@ build/
 *.egg-info/
 *.token
 
-# mypy daemon state
-.dmypy.json

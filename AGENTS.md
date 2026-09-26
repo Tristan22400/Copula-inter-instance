@@ -29,6 +29,10 @@ as `python -m copula_inter.<module>` with the checkout on `PYTHONPATH`
   `.github/workflows/ci.yml`: fast CPU gate.
 
 Use Python 3.12 and `uv sync --locked --extra dev --extra cpu` for CPU work.
+Every function in every package, tests included, carries parameter and return
+annotations, and `mypy` (strict settings and file list in `pyproject.toml`) must
+report no errors; `ruff check` and `ruff format --check` must pass too. The
+Claude hook `.claude/hooks/check_python.sh` runs all three after each edit.
 Run the focused tests
 for changed code, then the CI command for cross-module changes. Training and
 generation examples in `README.md` and `CLAUDE.md` use Hydra keys `data.n_tasks`

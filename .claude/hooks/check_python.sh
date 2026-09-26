@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # PostToolUse hook for Edit|Write: format the edited .py file with ruff, then
-# report (exit 2 -> shown to the agent) lint errors in the file and mypy errors
-# on the lines that differ from HEAD. Pre-existing type errors elsewhere in the
-# file are not reported.
+# report (exit 2 -> shown to the agent) its lint errors and every mypy error in
+# the project. The project type-checks clean, so any mypy error is new --
+# including callers in other files broken by a signature change.
 set -uo pipefail
 
 f=$(jq -r '.tool_input.file_path // .tool_response.filePath // empty')
@@ -14,7 +14,10 @@ case "$f" in
 esac
 
 env_bin=${COPULA_ENV_BIN:-/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/miniconda3/envs/multivariate-icl/bin}
-tool() { command -v "$1" 2>/dev/null || { [[ -x "$env_bin/$1" ]] && echo "$env_bin/$1"; }; }
+tool() {
+  if [[ -x "$root/.venv/bin/$1" ]]; then echo "$root/.venv/bin/$1"; return; fi
+  command -v "$1" 2>/dev/null || { [[ -x "$env_bin/$1" ]] && echo "$env_bin/$1"; }
+}
 ruff=$(tool ruff)
 mypy=$(tool mypy)
 
@@ -27,24 +30,22 @@ else
   echo "check_python.sh: ruff not found (pip install ruff)" >&2
 fi
 
-if [[ -n "$mypy" && "$f" == "$root"/@(src|eval|inference)/* ]]; then
-  changed=$(git -C "$root" diff -U0 HEAD -- "$f" 2>/dev/null |
-    sed -n 's/^@@ .*+\([0-9]*\)\(,\([0-9]*\)\)\? @@.*/\1 \3/p')
-  if ! git -C "$root" ls-files --error-unmatch "$f" >/dev/null 2>&1; then
-    changed="1 1000000"
+if [[ -n "$mypy" ]]; then
+  # Local-disk cache (the checkout may sit on network storage): ~2 s warm.
+  cache="${TMPDIR:-/tmp}/mypy-cache-$(printf '%s' "$root" | md5sum | cut -c1-8)"
+  out=$(cd "$root" && timeout 150 "$mypy" --cache-dir "$cache" --no-error-summary 2>&1)
+  rc=$?
+  if (( rc == 124 )); then
+    # Cold cache: finish it in the background instead of blocking this edit.
+    (cd "$root" && setsid nohup "$mypy" --cache-dir "$cache" >/dev/null 2>&1 &)
+    echo "check_python.sh: mypy cache is cold; warming it in the background, types unchecked for this edit" >&2
+  elif (( rc != 0 )); then
+    errors=$(grep -E ": (error|note):" <<<"$out")
+    n=$(grep -c ": error:" <<<"$errors")
+    problems+="mypy: $n error(s)"$'\n'"$(head -n 40 <<<"$errors")"$'\n'
   fi
-  if [[ -n "$changed" ]]; then
-    rel=${f#"$root"/}
-    out=$(cd "$root" && timeout 60 "$mypy" --no-error-summary "$rel" 2>/dev/null | grep ": error:")
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      ln=$(cut -d: -f2 <<<"$line")
-      while read -r start count; do
-        count=${count:-1}
-        if (( ln >= start && ln < start + count )); then problems+="$line"$'\n'; break; fi
-      done <<<"$changed"
-    done <<<"$out"
-  fi
+else
+  echo "check_python.sh: mypy not found (uv sync --extra dev)" >&2
 fi
 
 if [[ -n "$problems" ]]; then

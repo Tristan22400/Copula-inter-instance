@@ -84,7 +84,7 @@ target-version = "py312"
 extend-exclude = ["tabicl_upstream", "*_upstream", ".claude/worktrees", ".codex"]
 
 [tool.ruff.lint]
-select = ["E9", "F", "I"]
+select = ["E9", "F", "I", "TC004"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["copula_inter", "eval", "inference", "conf", "debug", "experiments", "scripts", "tabicl"]
