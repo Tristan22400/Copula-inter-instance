@@ -1,40 +1,15 @@
-"""
-experiment_b_quantitative.py — Experiment B: quantitative joint comparison.
+"""Experiment B: TabICL marginals + copula R vs PFN4BO (own marginals, R = I) on synthetic 1-D GP draws.
 
-Across many synthetic 1D GP draws (varied kernel, lengthscale, train-set size
-/ placement), compares "your model" (TabICL marginals + copula R_test)
-against PFN4BO (own marginals, R=I — the independence assumption baked into
-PFN4BO's use in this comparison) on:
-
-  1. Joint NLPD — see the "NLPD proxy" note below for exactly what's computed.
-  2. Correlation recovery — ||R_test - R_true||_F / N, where R_true follows
-     whatever ``oracle_mode`` (prior vs. posterior) the loaded copula
-     checkpoint was actually trained under (read from its own saved cfg).
-  3. Locality-vs-distance aggregate — binned predicted correlation vs. true
-     kernel correlation, by |x_i - x_j|.
-
-All non-trivial inference logic (marginal quantiles, PIT, correlation query)
-is imported from inference/copula_inference.py.
-
-NLPD proxy note: a true joint density under quantile-grid (non-Gaussian)
-marginals has no closed form. Both models' marginal PIT (Z-values and
-log-densities) are computed by interpolating their OWN returned
-``(quantile_grid, probs)`` pair (linear interpolation for Z, local
-finite-difference slope of the quantile function for log-density — the same
-"f(z) = 1/Q'(F(z))" identity TabICL's own ``QuantileDistribution.log_prob``
-uses, just via finite differences on the grid instead of the exact
-spline/tail machinery) — this keeps the two models' marginal-density
-treatment symmetric/fair rather than giving one an exact method and the other
-an approximation. The joint density is then the Gaussian-copula-in-Z-space
-proxy (``loss.y_space_nll``): copula term + marginal term, exactly 0 copula
-term for the PFN4BO (R=I) baseline.
+Reports the joint NLPD (Gaussian-copula proxy via loss.y_space_nll, marginal
+densities from each model's quantile grid), ||R_test - R_true||_F / N with
+R_true following the checkpoint's oracle_mode, and binned predicted vs true
+correlation by distance.
 
 Usage:
-    python experiments/experiment_b_quantitative.py \\
-        [--copula-ckpt ./checkpoints/systematic-composition/step_0180000.pt] \\
-        [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \\
-        [--n-functions 60] [--n-test 40] [--n-train-min 5] [--n-train-max 15] \\
-        [--out-csv ./results/quantitative_comparison.csv] \\
+    python experiments/experiment_b_quantitative.py \
+        [--copula-ckpt <checkpoint>] [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \
+        [--n-functions 60] [--n-test 40] [--n-train-min 5] [--n-train-max 15] \
+        [--out-csv ./results/quantitative_comparison.csv] \
         [--out-dir ./results/figures] [--device auto] [--seed 0]
 """
 
@@ -71,12 +46,7 @@ LENGTHSCALE_LOG_RANGE = (np.log(0.05), np.log(1.2))
 def _quantile_grid_pit(
     quantile_grid: np.ndarray, probs: np.ndarray, y_true: np.ndarray, eps: float = 1e-6
 ) -> tuple[np.ndarray, np.ndarray]:
-    """PIT (Z-values) and log-density for true targets from an ALREADY-BUILT
-    (quantile_grid, probs) pair (whichever backend produced it), via linear
-    interpolation for u = F(y) and a local finite-difference slope of the
-    quantile function for the density (f(z) = 1/Q'(F(z))). Applied
-    identically to TabICL's and PFN4BO's own quantile grids for a fair
-    marginal-density comparison (see module docstring)."""
+    """PIT z-values and log-densities of y_true from a (quantile_grid, probs) pair (linear interpolation, finite-difference density)."""
     n = quantile_grid.shape[0]
     u = np.empty(n)
     log_pdf = np.empty(n)
@@ -132,34 +102,14 @@ def run_one_function(
     X_test, y_test = X_test_t.numpy(), y_test_t.numpy()
     n_test = X_test.shape[0]
 
-    # R_true and the locality distances below use the RAW [0, 1] grid — the
-    # true kernel correlation depends on real distance in that domain, not
-    # the standardized one below. Only the features fed to the models get
-    # normalized (see normalize_features's docstring: data_gen.py z-scores
-    # x jointly over train+test before ever calling TabICL/CopulaTabICL;
-    # neither model normalizes internally).
+    # R_true and distances use the raw [0, 1] grid; only model inputs are standardized.
     R_true = _compute_r_true(oracle_mode, X_train_t, y_train_t, X_test_t, kernel_fn)
 
     X_train_norm, X_test_norm = normalize_features(X_train, X_test)
     X_train_norm_t = torch.as_tensor(X_train_norm, dtype=X_train_t.dtype)
     X_test_norm_t = torch.as_tensor(X_test_norm, dtype=X_test_t.dtype)
 
-    # Use TabICL's own exact PIT (pit.run_pit — QuantileDistribution.cdf/log_prob,
-    # not the coarser quantile-grid-interpolation approximation) for "ours",
-    # since this is the exact convention Z_train/Z_test were computed with when
-    # this copula checkpoint was trained — anything cruder would make R_test's
-    # evaluation unfair to the model. PFN4BO has no such training-time coupling,
-    # so its simpler self-consistent approximation (_quantile_grid_pit) is fine.
-    #
-    # y is z-scored via pit.normalize_targets before reaching the raw TabICL
-    # module -- the same helper every other run_pit/raw-TabICL call site in
-    # the repo uses (inference/copula_inference.py::loo_pit,
-    # eval_checkpoint.py::_tabicl_z_train, train.py::_build_tabicl_val_z) --
-    # or this GP draw's random outputscale saturates the pretrained quantile
-    # head's CDF into its extreme tail, collapsing Z_train/z_ours' spread
-    # instead of reflecting the true per-point rank. y_test is scaled with
-    # y_train's own mean/std (never its own), matching a real deployment
-    # where test targets are unknown at normalization time.
+    # "Ours" uses TabICL's exact PIT (pit.run_pit) on normalized targets; PFN4BO uses _quantile_grid_pit.
     tabicl_device = next(tabicl_model.parameters()).device
     y_train_scaled, y_test_scaled, y_mean, y_std = normalize_targets(
         y_train_t.to(tabicl_device), y_test_t.to(tabicl_device)
@@ -173,11 +123,7 @@ def run_one_function(
     )
     Z_train = pit_out["z_train"].squeeze(-1).cpu().numpy()
     z_ours = pit_out["z_test"].squeeze(-1).cpu().numpy()
-    # log_pdf_test is the density of the SCALED y_test under the scaled call;
-    # convert back to raw y-units via the standardization's Jacobian
-    # (log p_raw(y) = log p_scaled(y_scaled) - log(std)) to match
-    # loss.y_space_nll's "raw y-unit marginal log-density" contract -- the
-    # same convention data_gen.py's analytic GP-LOO log_pdf_test uses.
+    # Back to raw-y nats: log p_raw = log p_scaled - log(std).
     log_pdf_ours = (pit_out["log_pdf_test"].squeeze(-1) - y_std.log()).cpu().numpy()
 
     R_test = get_test_correlation(copula_model, X_train_norm, Z_train, X_test_norm)

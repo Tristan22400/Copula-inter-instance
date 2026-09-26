@@ -1,50 +1,16 @@
-"""
-s4_overfit.py — Overfit on K synthetic realizations from one episode's
-correlation target (R* the prior, or R_post the exact GP posterior).
-Debug pipeline stage S4; see debug/README.md. Moved from
-src/overfit_single.py (2026-08-26) — nothing outside this file imports it.
+"""Debug stage S4: overfit the model on K realizations of one episode's correlation target.
 
-To recover the correlation matrix from NLL alone you need multiple z_test samples
-from N(0, R) — a single sample gives the rank-1 MLE z*z^T, not R.
-
-This script:
-  1. Loads one .pt episode (or draws a fresh one via --kernel) and picks a
-     correlation target: R* (--target prior, the default, unconditioned
-     kernel correlation) or R_post (--target posterior, the exact
-     Schur-complement GP posterior conditioned on the realized context --
-     see pit.py::gp_analytical_posterior; requires --kernel, since
-     gp_analytical_posterior needs kernel metadata not guaranteed to be
-     saved in an arbitrary on-disk episode).
-  2. Draws K synthetic z_test realizations, either exactly from N(0, R)
-     (--z-source oracle, default) or by drawing K y_test ~ N(mu_post,
-     Sigma_post) and PIT-ing each through a frozen TabICL (--z-source
-     tabicl, --target posterior only) -- reusing
-     debug.stages.s3_pit_floor.sample_and_pit so a realization here carries
-     the SAME PIT distortion S3 measures, rather than an idealized
-     synthetic Gaussian.
-  3. Trains on those K realizations (cycling), so the expected gradient
-     pushes R̂ toward R (or, under z-source=tabicl, toward whatever
-     correlation TabICL's own PIT distortion lets the model see).
-  4. Tracks convergence via ||R̂ - R||_F and copula NLL vs three references:
-     the full-rank oracle (R itself), debug.stages.s1_rank_ceiling's exact
-     rank-r ceiling on R (cfg.model.rank), and -- for --z-source tabicl --
-     a pointer to debug/stages/s3_pit_floor.py for the PIT-distorted floor
-     (not recomputed here to avoid duplicating its Ledoit-Wolf shrinkage
-     logic; run it directly on the same episode for that number).
-
-Healthy run: copula_gap (vs. the full-rank oracle) -> 0 and ||R̂ - R||_F -> 0
-IF cfg.model.rank is not the binding constraint -- if S1 showed rank IS
-binding, the achievable gap here is the rank-r ceiling, not 0; compare
-against that reference instead.
+Target: R_star (--target prior) or the exact posterior R_post (--target
+posterior, needs --kernel). Realizations: z_test ~ N(0, R) (--z-source oracle)
+or K posterior y_test draws PIT'd through TabICL (--z-source tabicl, via
+s3_pit_floor.sample_and_pit). Reports ||R_hat - R||_F and the copula NLL
+against the full-rank oracle and the rank-r ceiling (s1_rank_ceiling).
 
 Usage:
-    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt
-    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt --task-idx 3
-    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt --k-realizations 500 --steps 5000 --lr 1e-3
-    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt --freeze-backbone
-    python debug/stages/s4_overfit.py --kernel rbf   # fresh episode, no dataset needed
-    python debug/stages/s4_overfit.py --kernel rbf --target posterior              # overfit to R_post instead of R*
-    python debug/stages/s4_overfit.py --kernel rbf --target posterior --z-source tabicl  # + real PIT distortion
+    python debug/stages/s4_overfit.py --episode data/pit_episodes/shard_000000.pt [--task-idx 3]
+    python debug/stages/s4_overfit.py --episode <shard> --k-realizations 500 --steps 5000 --lr 1e-3
+    python debug/stages/s4_overfit.py --episode <shard> --freeze-backbone
+    python debug/stages/s4_overfit.py --kernel rbf [--target posterior] [--z-source tabicl]
 """
 
 from __future__ import annotations
@@ -191,9 +157,7 @@ def build_synthetic_dataset(episode: dict, K: int) -> list[dict]:
 
 
 def build_synthetic_dataset_from_R(episode: dict, R: torch.Tensor, K: int) -> list[dict]:
-    """Generalizes build_synthetic_dataset to an arbitrary unit-diagonal
-    correlation target R (e.g. R_post under --target posterior) by exact
-    Cholesky sampling of K synthetic z_test vectors from N(0, R)."""
+    """K synthetic episodes with z_test ~ N(0, R) for a unit-diagonal R."""
     n_test = R.shape[0]
     L = _safe_cholesky(R)
     eps = torch.randn(n_test, K, device=R.device, dtype=L.dtype)  # (n_test, K)
@@ -210,12 +174,7 @@ def build_synthetic_dataset_from_R(episode: dict, R: torch.Tensor, K: int) -> li
 
 
 def build_tabicl_dataset(episode: dict, post: dict, K: int, tabicl_model, device: str) -> list[dict]:
-    """--z-source tabicl: K realizations whose z_test comes from PIT-ing K
-    draws of y_test ~ N(mu_post, Sigma_post) through a frozen TabICL, via
-    debug.stages.s3_pit_floor.sample_and_pit (reused, not reimplemented) --
-    the same procedure S3 uses to measure the attainable PIT floor. Unlike
-    build_synthetic_dataset_from_R, these z_test carry real TabICL marginal
-    distortion instead of an idealized synthetic Gaussian draw."""
+    """K episodes whose z_test are posterior y_test draws PIT'd through TabICL (s3_pit_floor.sample_and_pit)."""
     n_test = int(episode["n_test"].item())
     z_samples = sample_and_pit(tabicl_model, episode, post, K, device).cpu()  # (n_test, K)
 
@@ -238,11 +197,7 @@ def main() -> None:
     )
     data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
-    # copula_prod.yaml/copula_nano.yaml use Hydra `# @package _global_`
-    # packaging, so they already have top-level `model:`/`tabicl:` keys —
-    # merge directly instead of nesting under `model:` a second time (which
-    # would have left cfg.tabicl missing, since this loader bypasses Hydra's
-    # defaults composition entirely).
+    # The model presets are `# @package _global_`: merge at the top level.
     cfg = OmegaConf.merge(base_cfg, model_cfg, OmegaConf.create({"data": data_cfg}))
     if args.freeze_backbone:
         cfg.model.unfreeze_backbone = False
@@ -261,8 +216,7 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Load episode: either a single fresh draw for --kernel, or a saved .pt file
-    # (single-episode task_*.pt or a sharded shard_*.pt list).
+    # Episode: a fresh draw (--kernel) or a saved task/shard file.
     if args.kernel is not None:
         cfg.data.kernel = args.kernel
         cfg.data.kernels = []
@@ -271,8 +225,7 @@ def main() -> None:
     elif args.episode is not None:
         loaded = torch.load(args.episode, map_location="cpu", weights_only=True)
         if isinstance(loaded, list):
-            # Sharded layout (shard_XXXXXX.pt from generate_pit_dataset.py): a list
-            # of B episode dicts, same convention as CopulaDataset._get_sharded.
+            # Shard: a list of episode dicts.
             task_idx = min(args.task_idx, len(loaded) - 1)
             episode = loaded[task_idx]
             print(f"Episode : {os.path.basename(args.episode)}  (shard of {len(loaded)}, task_idx={task_idx})")
@@ -324,10 +277,7 @@ def main() -> None:
         weight_decay=0.0,
     )
 
-    # Full-rank oracle NLL (true R_target, averaged over the K realizations'
-    # own z_test -- NOT the batch's collated "R_star" field, which under
-    # --target posterior would still hold the prior R*, not the R_post the
-    # realizations were actually drawn from).
+    # Full-rank oracle NLL under the actual target R.
     oracle_nll_vals = []
     for i in range(0, args.k_realizations, args.batch_size):
         chunk = realizations[i : i + args.batch_size]
@@ -340,8 +290,7 @@ def main() -> None:
             )
     oracle_nll = sum(oracle_nll_vals) / len(oracle_nll_vals)
 
-    # S1's exact rank-r ceiling on the SAME R_target -- the achievable floor
-    # if cfg.model.rank (not optimization) is the binding constraint.
+    # Rank-r ceiling on the same target.
     rank = int(cfg.model.get("rank", 32))
     ceiling_per_ep, _ = fit_rank_ceiling(
         R_target.unsqueeze(0).float(), min(rank, n_test - 1), jitter=jitter, device=device,

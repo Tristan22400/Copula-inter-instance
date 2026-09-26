@@ -1,48 +1,13 @@
-"""s7_backbone.py — z_train gap comparison across tabular foundation models,
-on top of the SAME trained copula head. Debug pipeline stage S7(a); see
-debug/README.md. Moved from eval/runners/compare_marginal_backbones.py
-(2026-08-26) — nothing outside this file imports it, only doc comments
-referenced its old path (eval/spatial/marginal_backends.py,
-eval/spatial/diagnostics.py, eval/spatial/sweep_core.py,
-eval/configs/constants.py, all updated to point here).
+"""Debug stage S7a: compare marginal backends' z_train through the same trained copula model.
 
-Per synthetic (kernel, grid_size) task (constants.SYNTHETIC_SWEEP_PROFILES,
-same profile spatial_correlation_eval.py's `sweep --mode synthetic` uses),
-the true generating GP kernel is known exactly, so two things are
-computable in closed form and used as a fixed reference point:
-  1. the EXACT GP leave-one-out z_train (eval.spatial.diagnostics.
-     _exact_gp_loo_z_train — Rasmussen & Williams Eq. 5.12), and
-  2. the true spatial correlation matrix R_true.
-
-For each marginal backend (eval.spatial.marginal_backends: tabicl, tabpfn,
-exaone), this script:
-  a) estimates z_train via that backend's own K-fold leave-fold-out PIT on
-     the SAME context points, and scores the gap against the exact z_train
-     (Pearson corr / RMSE / MAE / calibration mean+std);
-  b) feeds that estimated z_train through the SAME frozen, trained copula
-     head (--ckpt, default kernel-sweep-classic-prod) to get a predicted
-     spatial correlation matrix, and scores it against R_true the same way
-     eval/spatial/sweep_core.py::run_synthetic_config does (shape_corr,
-     rmse, bias, model_r2) — i.e. how much a worse z_train estimate
-     actually degrades the DOWNSTREAM spatial-correlation recovery task,
-     not just the z_train numbers in isolation;
-  c) additionally scores a genuine total (marginal+copula) Y-space NLL, in
-     nats/point, on a small held-out point set that was never in context —
-     this backend's own one-shot (non-K-fold) quantile grid there supplies
-     the marginal, this task's predicted R supplies the copula, combined
-     via eval/metrics/joint_nll.py::compute_joint_nll (Sklar decomposition).
-     spatial_model_r2 (b) is a curve-shape diagnostic on BINNED, distance-
-     averaged correlations — it never sees marginal calibration and isn't a
-     proper scoring rule, so it can't answer "how many nats worse is the
-     real predictive density with this backend"; nll_total here does.
-
-TabPFN requires a one-time license acceptance + `TABPFN_TOKEN` env var (see
-eval.spatial.marginal_backends._require_tabpfn_token) — omit "tabpfn" from
---backends to skip it without that.
+For each synthetic task (constants.SYNTHETIC_SWEEP_PROFILES) and backend
+(tabicl, tabpfn, exaone): the gap of the backend's K-fold PIT z_train to the
+exact GP LOO z_train; the correlation recovery (shape_corr, rmse, bias,
+model_r2) when that z_train is fed to --ckpt; and the Y-space joint NLL on
+held-out points. tabpfn needs TABPFN_TOKEN.
 
 Usage:
-    python debug/stages/s7_backbone.py \
-        --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone
+    python debug/stages/s7_backbone.py --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone
 """
 
 from __future__ import annotations
@@ -74,16 +39,10 @@ from inference.copula_inference import normalize_features  # noqa: E402
 _RESULTS_DIR = os.path.join(_REPO_ROOT, "eval", "results")
 _FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")
 
-# Coarser than run_benchmarks.py's 999-point DEFAULT_PROBS: this script pays
-# one quantile-grid forward pass per K-fold per backend per task, so a
-# 49-point grid keeps compute_pit's linear interpolation accurate to well
-# under the noise floor of a 25-30-point PIT estimate without paying for
-# needless quantile-query resolution.
+# Quantile grid size for the K-fold PIT.
 PROBS = np.linspace(0.02, 0.98, 49)
 
-# Size of the held-out (never-in-context) point set the joint-NLL score (c)
-# is computed on — see eval/configs/constants.py::N_NLL_TEST (shared with
-# sweep_core.py::run_real_config's real-ERA5 analogue).
+# Held-out points for the joint NLL.
 N_NLL_TEST = constants.N_NLL_TEST
 
 
@@ -119,9 +78,7 @@ def run_task(
     z_true = task["L"] @ task["rng"].standard_normal(D)
     context_values = z_true[context_idx]
 
-    # Held-out points (never in context) for the joint-NLL score below — see
-    # N_NLL_TEST. Drawn from the SAME seeded rng as context_idx, so the task
-    # stays fully deterministic per `seed`.
+    # Held-out points from the same rng as the context.
     remaining_idx = np.setdiff1d(np.arange(D), context_idx)
     nll_test_idx = task["rng"].choice(remaining_idx, size=min(n_nll_test, len(remaining_idx)), replace=False)
     y_nll_test = z_true[nll_test_idx]
@@ -133,12 +90,7 @@ def run_task(
     R_pred_true = _forward_correlation(model, device, x_train_norm, z_train_true, x_test_norm)
     rho_pred_true = bin_correlation_by_distance(R_pred_true, dist, bin_edges)
 
-    # Ground-truth-marginal reference NLL (upper bound), the NLL analogue of
-    # ground_truth_spatial_model_r2 below: z_true's per-point marginal is
-    # exactly N(0, true_cov_ii) by construction (z_true = L @ N(0,I)), no
-    # fitting needed, so this isolates how much of any backend's total-NLL
-    # gap is really a copula (R_pred_true vs. R_pred) effect vs. a marginal
-    # (fitted quantile grid) effect.
+    # Reference NLL with the true marginal N(0, true_cov_ii).
     from scipy.stats import norm as _norm
     exact_std = np.sqrt(np.clip(np.diag(true_cov)[nll_test_idx], 1e-12, None))
     qgrid_exact = exact_std[:, None] * _norm.ppf(PROBS)[None, :]
@@ -166,10 +118,7 @@ def run_task(
         rmse, bias = weighted_rmse_bias(rho_pred, rho_true, pair_counts)
         gap["spatial_rmse"], gap["spatial_bias"] = rmse, bias
 
-        # Total (marginal+copula) Y-space NLL on the held-out points: this
-        # backend's own one-shot (non-K-fold — these points were never in
-        # context) quantile grid supplies the marginal, R_pred restricted to
-        # the same points supplies the copula. See module docstring (c).
+        # Y-space NLL on the held-out points: the backend's one-shot marginal plus R_pred.
         try:
             qgrid = quantiles(name, regressors[name], x_train_norm, context_values, x_nll_test_norm, PROBS, seed=seed)
             R_nll = R_pred[np.ix_(nll_test_idx, nll_test_idx)]

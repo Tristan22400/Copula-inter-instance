@@ -1,19 +1,10 @@
-"""
-plot_covariance_comparison.py — visualize predicted vs. oracle correlation matrices.
-
-For a handful of synthetic GP draws (same sampling logic as
-``experiment_b_quantitative.py``), plots side-by-side heatmaps of the copula
-model's predicted test-test correlation matrix (``R_test``) against the true
-kernel correlation (``R_true``), plus their difference — to see *where*
-(which distances / which functions) the model over- or under-estimates
-correlation, rather than just the aggregate Frobenius-norm summary.
+"""Heatmaps of the copula model's predicted test correlation, the true kernel correlation and their difference, for a few synthetic GP draws.
 
 Usage:
-    python experiments/plot_covariance_comparison.py \\
-        [--copula-ckpt ./checkpoints/systematic-composition/step_0180000.pt] \\
-        [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \\
-        [--kernels rbf,matern32] [--seeds 0,1,2,3] \\
-        [--n-test 40] [--n-train-min 5] [--n-train-max 15] \\
+    python experiments/plot_covariance_comparison.py \
+        [--copula-ckpt <checkpoint>] [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \
+        [--kernels rbf,matern32] [--seeds 0,1,2,3] \
+        [--n-test 40] [--n-train-min 5] [--n-train-max 15] \
         [--out-dir ./results/figures] [--device auto]
 """
 
@@ -60,11 +51,7 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
     X_train_norm_t = torch.as_tensor(X_train_norm, dtype=X_train_t.dtype)
     X_test_norm_t = torch.as_tensor(X_test_norm, dtype=X_test_t.dtype)
 
-    # y is z-scored via pit.normalize_targets before reaching the raw TabICL
-    # module -- the same helper every other run_pit/raw-TabICL call site in
-    # the repo uses -- or this GP draw's random outputscale saturates the
-    # pretrained quantile head's CDF into its extreme tail, collapsing
-    # Z_train's spread instead of reflecting the true per-point rank.
+    # Normalize targets before TabICL.
     tabicl_device = next(tabicl_model.parameters()).device
     with torch.no_grad():
         y_train_scaled, y_test_scaled, _, _ = normalize_targets(

@@ -1,40 +1,12 @@
-"""s1b_rank_gap_decomp.py — what rank COSTS, and whether a different basis
-would cost less. The companion to s1: s1 reports the rank-r ceiling in
-absolute copula-NLL units, this one reports it as a GAP to the exact GP
-posterior, which is the number that answers "is rank the binding
-constraint on this episode distribution?".
+"""Debug stage S1b: the rank-r ceiling as a gap to the exact GP posterior.
 
-Three numbers per rank r, all copula-NLL nats/point on synthetic episodes:
-  oracle   = 0.5*logdet(R_post)/N          (Bayes floor: Sigma == R_post)
-  ceiling  = best rank-r covnorm fit       (s1_rank_ceiling.fit_rank_ceiling)
-  gap      = ceiling - oracle              (what rank r forfeits)
-
-`oracle` is where the copula NLL bottoms out because at Sigma == R_post the
-trace term collapses (tr(R^-1 R) == N == tr(R), R_post being a correlation
-matrix), leaving 0.5*logdet(R_post)/N. It is negative, and its magnitude is
-the TOTAL copula signal available in the episode distribution -- worth
-reading first, since it bounds what any correlation model can ever win here.
-
-Also reports each rank's share of R_post's eigenvalue mass. Note that mass
-and NLL gap are NOT interchangeable: covnorm's free diagonal absorbs the
-residual, so eigenvalue mass badly overstates the damage of truncation
-(measured here: 79% mass at r=128 yet only 0.3% of the oracle forfeited).
-When the two disagree, the NLL gap is the one that means anything.
-
-The decomposition variant fits Sigma = covnorm(K_theta - K_su (K_uu+D)^-1
-K_us + diag) instead: an exact sparse-GP Schur complement (PSD by
-construction) over m learned inducing points, with an ARD RBF+Matern32
-mixture kernel. That is the "prior kernel minus rank-m correction" basis,
-motivated by the GP posterior's own algebra -- K_post = K_ss - K_sf K_ff^-1
-K_fs is exactly a full-rank prior minus a rank-P correction, so a global
-low-rank factor is being asked to represent a shape it does not have.
-Scored by the identical objective, so the columns are directly comparable;
-compare on `n_params` too, since a head has to EMIT these per episode.
-
-Caveat on the decomposition: its kernel is a fixed RBF+Matern32 mixture,
-so it carries an irreducible misspecification floor on episodes from other
-families (periodic, RQ, polynomial). It plateaus rather than going to zero,
-and that plateau is the kernel's fault, not the basis's.
+Per rank r (copula NLL nats/point):
+    oracle = 0.5 logdet(R_post) / N
+    ceiling = best rank-r covnorm fit (s1_rank_ceiling.fit_rank_ceiling)
+    gap = ceiling - oracle
+plus each rank's share of R_post's eigenvalue mass. Also fits an alternative
+basis, covnorm(K_theta - K_su (K_uu + D)^{-1} K_us + diag) with m learned
+inducing points and an ARD RBF+Matern32 kernel, by the same objective.
 
 Usage:
     python debug/run_debug.py s1b
@@ -67,9 +39,6 @@ def spectrum_fraction(R: torch.Tensor, ranks) -> dict:
     return {r: float(cum[:, min(r, cum.shape[1]) - 1].mean()) for r in ranks}
 
 
-# ---------------------------------------------------------------------------
-# Decomposition: covnorm( K_theta - K_su (K_uu + D)^-1 K_us + diag(softplus s) )
-# ---------------------------------------------------------------------------
 def _ard_kernel(a: torch.Tensor, b: torch.Tensor, log_ls: torch.Tensor,
                 log_out: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
     """Sum of ARD-RBF and ARD-Matern3/2 with learned positive weights."""
@@ -85,8 +54,7 @@ def _ard_kernel(a: torch.Tensor, b: torch.Tensor, log_ls: torch.Tensor,
 def fit_decomposition(R_post: torch.Tensor, X: torch.Tensor, m: int, *,
                       steps: int = 400, lr: float = 0.05, jitter: float = 1e-4,
                       device: str = "cpu"):
-    """Fit the sparse-GP-Schur basis to R_post by the same exact expected
-    copula NLL s1 minimizes. X: (B, N, d) test inputs."""
+    """Fit the inducing-point basis to R_post by the expected copula NLL. X: (B, N, d) test inputs."""
     from copula_inter.loss import _safe_cholesky
 
     B, N, _ = R_post.shape
@@ -156,9 +124,7 @@ def main():
         return
     print(f"scored {len(pairs)} episodes", flush=True)
 
-    # Rank fits need only R_post -> group by N. The decomposition also needs
-    # the test inputs, and d_features varies per shard (gp_tasks.yaml's
-    # d_features_lognormal_*), so that groups by (N, d).
+    # Rank fits group episodes by N; the decomposition by (N, d).
     by_N: dict[int, list] = {}
     by_Nd: dict[tuple, list] = {}
     for ep, post in pairs:

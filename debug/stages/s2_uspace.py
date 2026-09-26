@@ -1,32 +1,9 @@
-"""s2_uspace.py — PIT (u-space) audit + clamping census.
+"""Debug stage S2: PIT audit in u-space and clamping census.
 
-Works in u = F_hat(y) rather than z = Phi^-1(u): a well-calibrated marginal
-gives u ~ Uniform[0,1], which is directly visible as a flat histogram and a
-diagonal reliability curve, and the clamping question IS a question about
-where u piles up. z is only produced from pit.py::run_pit_batched (it
-returns z, not u); since u = 0.5*(1+erf(z/sqrt(2))) is the EXACT inverse of
-pit.py::_probit's forward transform, converting back is lossless for every
-point that didn't saturate, and recovers the exact clamp value (1e-6 or
-1-1e-6) for every point that did -- which is exactly what the census below
-needs, without touching pit.py.
-
-Reports, per marginal backend (default: analytic GP-LOO vs. TabICL PIT,
-paired same-seed via common.generate_paired_episodes):
-  - u histogram + PIT calibration curve/ECE (reusing eval/spatial/
-    calibration.py::compute_quantile_ece -- see _pit_ece's docstring for
-    how a generic quantile-coverage function also computes PIT-uniformity
-    ECE without modification)
-  - KS statistic vs Uniform[0,1], pooled and per-episode
-  - CLAMPING CENSUS: fraction of points at the hard _probit clamp
-    (u <= 1e-6 or u >= 1-1e-6, source of the exactly-+-4.7534 z spike) and
-    at TabICL's outermost spline knot (u <= 1e-3 or u >= 1-1e-3, beyond
-    which its quantile head switches to exponential-tail extrapolation --
-    see tabicl_upstream's quantile_dist.py), pooled AND per-episode, plus
-    the count of episodes with >1% of points saturated
-  - the fraction of episodes that would fail data_gen.py's own
-    z_std in [0.1, 3.0] degeneracy filter if applied post-PIT (it is
-    computed on the analytic residual only, data_gen.py:3429-3442, so a
-    degenerate TabICL z_train is never rejected today)
+For each marginal (analytic vs TabICL, paired seeds): u histogram, PIT ECE,
+KS against Uniform[0, 1], the fraction of points at the probit clamp
+(u <= 1e-6 or >= 1 - 1e-6) and beyond TabICL's outer spline knots (1e-3),
+and the fraction of episodes whose z_train std is outside [0.1, 3.0].
 
 Usage:
     python debug/run_debug.py s2
@@ -50,20 +27,14 @@ Z_STD_DEGEN_LO, Z_STD_DEGEN_HI = 0.1, 3.0  # data_gen.py's own post-hoc degenera
 
 
 def u_from_z(z: torch.Tensor) -> np.ndarray:
-    """Exact inverse of pit.py::_probit's forward transform (erfinv -> erf),
-    lossless everywhere z didn't saturate the clamp, and returns exactly
-    U_HARD_CLAMP / 1-U_HARD_CLAMP for every point that did."""
+    """u = Phi(z), the exact inverse of pit._probit (clamped points map to the clamp values)."""
     u = 0.5 * (1.0 + torch.special.erf(z / math.sqrt(2.0)))
     return u.detach().cpu().numpy()
 
 
 def _pit_ece(u: np.ndarray, n_levels: int = 19) -> tuple[float, np.ndarray, np.ndarray]:
-    """PIT-uniformity ECE via eval/spatial/calibration.py::compute_quantile_ece,
-    reused rather than reimplemented: that function's generic definition
-    (mean |nominal_level - P(y_true <= predicted_quantile)|) computes exactly
-    PIT calibration ECE when y_true=u and the "predicted quantile" at level
-    alpha is the constant alpha itself, since u <= alpha IFF the true value
-    falls at or below the alpha-quantile by u's own definition (u = F_hat(y)).
+    """PIT-uniformity ECE via calibration.compute_quantile_ece with y_true = u and quantile alpha = alpha.
+
     Returns (ece, alpha_grid, empirical_coverage).
     """
     from eval.spatial.calibration import compute_quantile_ece
@@ -118,10 +89,7 @@ def _audit_source(u_train_per_ep, u_test_per_ep) -> dict:
 
 
 def _degeneracy_rate(z_train_per_ep: "list[np.ndarray]") -> float:
-    """Fraction of episodes whose z_train std falls outside [0.1, 3.0] --
-    data_gen.py's own analytic-residual degeneracy filter (data_gen.py:
-    3429-3442), applied here post-hoc to the TabICL PIT output, which never
-    goes through that filter today."""
+    """Fraction of episodes whose z_train std is outside [0.1, 3.0]."""
     if not z_train_per_ep:
         return float("nan")
     stds = np.array([e.std() for e in z_train_per_ep if e.size >= 2])

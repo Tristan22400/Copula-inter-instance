@@ -1,22 +1,8 @@
-"""
-visualize_kernel.py — Step 3: Structural Diversity Visualization (headless).
+"""Headless visualization of a kernel's R_star (the prior test correlation) across episodes.
 
-Draws N_SAMPLES independent episodes for a given kernel via generate_gp_batch
-(the same code path generate_pit_dataset.py uses), printing a one-line summary
-of each episode's R_star — the GP *posterior* correlation matrix at the test
-points, i.e. what the model is actually trained to predict — as a quick
-multi-draw sanity check. It then hierarchically clusters N_PLOT of those
-draws (raw + sorted) and saves a grid plot to disk — one draw's matrix can
-look degenerate by chance, so seeing several side by side is what actually
-shows whether the kernel has healthy structural diversity.
-
-Deliberately does NOT plot the raw prior kernel K(X,X): the prior ignores
-conditioning on training data (K_st K_ff^-1 K_ts), so it can look structured
-even when the posterior the model must learn has been shrunk toward
-independence — checking the prior alone would validate the wrong quantity.
-
-Never opens a GUI window — safe to run over SSH on a host with no DISPLAY
-(matplotlib's Agg backend is forced before pyplot is imported).
+Prints a one-line summary per episode for N_SAMPLES generate_gp_batch draws and
+saves a grid of N_PLOT clustered matrices (raw and sorted). Uses the Agg
+backend.
 
 Usage:
     python scripts/visualize_kernel.py --kernel rbf
@@ -40,7 +26,7 @@ N_PLOT = 4     # number of those draws to actually plot (raw + sorted each)
 
 
 def _load_cfg(kernel_name: str):
-    """Build the real project config (same yaml files as training/generation), fixed to one kernel."""
+    """The project config (same YAML files as training) fixed to one kernel."""
     base_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "config.yaml"))
     data_cfg = OmegaConf.load(os.path.join(_ROOT, "conf", "data", "gp_tasks.yaml"))
     OmegaConf.set_struct(base_cfg, False)
@@ -71,8 +57,7 @@ def visualize(kernel_name: str):
         )
         all_R.append(R_i)
 
-    # Plot N_PLOT separate draws (raw + sorted each) so one lucky/unlucky
-    # draw doesn't stand in for the whole kernel's behaviour.
+    # Plot several draws, raw and sorted.
     n_plot = min(N_PLOT, len(all_R))
     fig, axes = plt.subplots(2, n_plot, figsize=(5 * n_plot, 10), squeeze=False)
 

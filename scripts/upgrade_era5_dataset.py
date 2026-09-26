@@ -1,19 +1,9 @@
-"""upgrade_era5_dataset.py — Strategy A implementation.
+"""Add the four static ERA5 fields to the cached NetCDF files in place.
 
-Upgrades all existing ERA5 NetCDF files in:
-  - eval/data/cache/era5_global_train/ (120 files, 10 years 2013-2022)
-  - eval/data/cache/era5_global_val/ (12 files, 2023)
-  - eval/data/cache/era5_*_g*_d*.nc (regional validation files)
-
-Injects the 4 static variables:
-  - geopotential_at_surface
-  - land_sea_mask
-  - standard_deviation_of_orography
-  - slope_of_sub_gridscale_orography
-
-Reads from eval/data/cache/era5_static.nc (which is cached once globally)
-and writes in-place to each NetCDF file. Idempotent: skips files that already
-contain the static fields.
+Targets eval/data/cache/era5_global_train/, era5_global_val/ and the regional
+era5_*_g*_d*.nc files. Fields (from eval/data/cache/era5_static.nc):
+geopotential_at_surface, land_sea_mask, standard_deviation_of_orography,
+slope_of_sub_gridscale_orography. Files that already have them are skipped.
 """
 
 from __future__ import annotations
@@ -78,9 +68,7 @@ def upgrade_regional_file(path: str, static_dict: dict[str, np.ndarray]) -> bool
     glob_lat = static_dict["latitude"]
     glob_lon = static_dict["longitude"]
 
-    # Match each regional lat/lon to nearest global grid index
-    # (or linear interpolation if coarsened)
-    # Using scipy RegularGridInterpolator
+    # Interpolate the static fields onto each regional lat/lon grid.
     from scipy.interpolate import RegularGridInterpolator
 
     # Note ARCO-ERA5 lat is descending: 90 down to -90. RegularGridInterpolator requires strictly ascending coords.

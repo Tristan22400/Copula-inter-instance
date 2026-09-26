@@ -1,25 +1,12 @@
-"""
-experiment_a_visualization.py — Experiment A: qualitative 1D sample plots.
+"""Experiment A: sampled 1-D trajectories for a few synthetic GP functions.
 
-For a handful of 1D synthetic GP test functions (RBF at a few lengthscales,
-one Matern-3/2), draws sparse training points, queries TabICL's marginal
-quantiles at a dense test grid, runs loo_pit + the copula model to get
-R_test, and samples trajectories under three/four conditions:
-
-  1. "your model"        — TabICL quantiles + copula R_test
-  2. "PFN4BO (R=I)"       — same TabICL quantiles, independence assumption
-  3. "PFN4BO (own marg.)" — PFN4BO's own marginal quantiles, R=I
-  4. "reference GP"       — exact GP posterior (known kernel), if available
-
-All non-trivial inference logic (PIT, correlation query, sampling) is
-imported from inference/copula_inference.py — this script is thin CLI +
-plotting only.
+Conditions: TabICL quantiles + copula R, TabICL quantiles with R = I, PFN4BO's
+own quantiles with R = I, and the exact GP posterior when available.
 
 Usage:
-    python experiments/experiment_a_visualization.py \\
-        [--copula-ckpt ./checkpoints/systematic-composition/step_0180000.pt] \\
-        [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \\
-        [--out-dir ./results/figures] [--device auto] [--seed 0] \\
+    python experiments/experiment_a_visualization.py \
+        [--copula-ckpt <checkpoint>] [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \
+        [--out-dir ./results/figures] [--device auto] [--seed 0] \
         [--n-samples 8] [--n-train 7] [--n-test 60]
 """
 
@@ -47,9 +34,6 @@ from inference.copula_inference import (  # noqa: E402
     sample_trajectories,
 )
 
-# ---------------------------------------------------------------------------
-# Synthetic test functions
-# ---------------------------------------------------------------------------
 
 TEST_FUNCTIONS = [
     ("rbf", 0.5, "RBF (l=0.5)"),
@@ -98,9 +82,7 @@ def run_one_function(
     X_test = X_test_t.numpy()
     true_f_np = true_f.numpy()
 
-    # Models expect zero-mean/unit-std features (data_gen.py's x_norm
-    # convention, computed jointly over train+test) — the raw [0, 1] grid
-    # used for the reference GP / plotting below is NOT on that scale.
+    # Standardize model inputs; the raw grid is kept for the reference GP and plots.
     X_train_norm, X_test_norm = normalize_features(X_train, X_test)
 
     # --- Reference exact GP posterior (known kernel) ---

@@ -1,27 +1,7 @@
-"""s7b_backend_train.py — actually train with a different marginal backend.
+"""Debug stage S7b: train small models from scratch with different marginal backends.
 
-s7_backbone.py (S7a) diagnoses the z_train gap across backends on a FROZEN,
-already-trained copula head. This stage instead trains fresh models under
-different marginal backends from scratch, to see whether the plateau is
-specific to TabICL's own PIT or shows up with any real (non-oracle)
-marginal.
-
-Originally scoped as a debug-local comparison trainer rather than a
-src/copula_inter/data_gen.py production knob, since TabPFN/EXAONE's API is per-task
-sklearn fit/predict (K-fold PIT means K separate .fit()+.predict() calls per
-episode, see eval/spatial/marginal_backends.py::quantiles), not a single
-batched GPU forward like TabICL's. That promotion has since happened:
-cfg.data.z_train_source now accepts "exaone"/"tabpfn" directly in
-src/copula_inter/train.py/live_dataset.py/data_gen.py (see data_gen.py::
-_generate_gp_batch_raw's marginal_backend arg and conf/data/gp_tasks.yaml),
-10-100x slower per episode and all -- this stage remains useful as a
-smaller, reduced-scale, single-process comparison good enough to read gap
-TRAJECTORIES off quickly, without needing a DataLoader/worker-pool spun up.
-
-Both backends' models start from the SAME initialization (torch.manual_seed
-reset before each build_copula_transformer call) for a fair comparison. The
-plain AdamW loop here (no Muon, no AMP) matches s4_overfit.py's convention
--- this is an exploratory comparison, not a production-parity run.
+All backends start from the same initialization and use a plain AdamW loop
+(no Muon, no AMP).
 
 Usage:
     python debug/run_debug.py s7b --backends tabicl,tabpfn --steps 200
@@ -45,15 +25,7 @@ DEFAULT_PROBS_N = 99  # coarser than TabICL's 999 -- TabPFN's per-fold .fit()+.p
 
 
 def _generic_pit_episode(backend: str, regressor, ep: dict, k_folds: int, probs_n: int, seed: int):
-    """Per-episode PIT for any eval/spatial/marginal_backends backend other
-    than "tabicl" (which gets its own batched path above) via that module's
-    shared {quantiles, loo_pit} contract + eval/metrics/joint_nll.compute_pit
-    -- reused, not reimplemented. Originally tabpfn-only (hence the name this
-    replaced, _tabpfn_pit_episode); generalized so "exaone" plugs in the
-    same way -- it already implements the same
-    (X_context, y_context, X_query, probs) -> quantile_grid contract, so
-    nothing backend-specific belongs in this function. Same y-scaling
-    convention as data_gen.py's tabicl branch."""
+    """Per-episode PIT through a non-TabICL backend (marginal_backends loo_pit/quantiles and joint_nll.compute_pit)."""
     from eval.metrics.joint_nll import compute_pit
     from eval.spatial.marginal_backends import loo_pit, quantiles
 
@@ -82,10 +54,7 @@ def _build_batch_for_backend(dcfg: DebugConfig, backend: str, n: int, seed_offse
         for i, ep in enumerate(episodes):
             ep["z_train"], ep["z_test"], ep["log_pdf_test"] = z_train[i], z_test[i], log_pdf_test[i]
     else:
-        # Any other eval/spatial/marginal_backends entry (tabpfn, exaone)
-        # -- one .fit()+.predict() (or K of them, for K-fold
-        # z_train) per episode, not a single batched GPU forward like
-        # tabicl's, so this loop is the real per-backend cost driver.
+        # Other backends: per-episode PIT.
         for i, ep in enumerate(episodes):
             zt, zte, lp = _generic_pit_episode(backend, regressor, ep, k_folds, probs_n, seed=seed_offset + i)
             ep["z_train"], ep["z_test"], ep["log_pdf_test"] = zt, zte, lp
@@ -108,12 +77,10 @@ def _train_one_backend(dcfg: DebugConfig, backend: str, steps: int, batch_size: 
     if backend != "tabicl":
         from eval.spatial.marginal_backends import make_regressor
 
-        # One instance reused across every fold/episode/step, same rationale
-        # as tabicl_model above (avoid reloading backbone weights per .fit()).
+        # One regressor reused across folds, episodes and steps.
         regressor = make_regressor(backend, device=dcfg.device)
 
-    # Fixed eval set: same episodes across both backends and every checkpoint
-    # (seed_offset far from the training stream), re-PIT'd per backend.
+    # Fixed evaluation episodes shared by every backend and checkpoint.
     eval_batch = _build_batch_for_backend(
         dcfg, backend, n_eval, seed_offset=9_999_999, tabicl_model=tabicl_model,
         regressor=regressor, k_folds=k_folds, probs_n=probs_n,

@@ -1,28 +1,13 @@
-"""era5_viz_preview.py — render validate()'s val/era5_predictions figure (and
-its mean-removed val/era5_residuals companion, as `<out>_residuals.png`) for
-a checkpoint WITHOUT launching training, and print the Moran's I table behind
-it.
+"""Render val/era5_predictions (and <out>_residuals.png) for a checkpoint without training, and print its Moran's I table.
 
-Same code path validate()'s do_plot block takes (_build_era5_viz_batch ->
-_era5_viz_fig), so what this writes to disk is what lands in wandb -- the
-point being that you can iterate on the figure, or eyeball a finished
-checkpoint, without a training run in the loop.
-
-The Moran's I table is the numeric version of the figure's central
-comparison. Rows 2-4 (fitted GP posterior / copula model / independent) are
-posterior SAMPLES on the same context and the same latent noise vector; row
-1 is a fully-observed realization. So the model row should be read against
-the GP row, never against the ground-truth row -- a model that emits the
-prior correlation rather than the posterior renders smoother than either and
-scores far worse on held-out NLL. Measured on western_europe at 5% context,
-the fitted-Matern32 GP posterior sample comes out SMOOTHER than the ground
-truth (I ~ 0.86-0.95 vs 0.82-0.92), so a copula sample that is visibly
-grainier than the GP row is a real deficit and not an artifact of sampling.
+Uses validate()'s path (_build_era5_viz_batch -> _era5_viz_fig). Compare the
+model row with the GP row (both are posterior samples), not with the ground
+truth.
 
 Usage:
     python debug/era5_viz_preview.py checkpoints/<run>/step_XXXXXXX.pt
     python debug/era5_viz_preview.py <ckpt> --n-days 4 --gp-kernel rational_quadratic
-    python debug/era5_viz_preview.py <ckpt> --no-gp        # old 3-row figure
+    python debug/era5_viz_preview.py <ckpt> --no-gp
 """
 from __future__ import annotations
 

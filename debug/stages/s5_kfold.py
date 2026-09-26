@@ -1,20 +1,9 @@
-"""s5_kfold.py — impact of K-fold noise on z_train, frozen checkpoint.
+"""Debug stage S5: effect of the K-fold count on z_train for a frozen checkpoint.
 
-K-folding only affects z_train (the model's INPUT context) -- z_test/
-log_pdf_test always come from one non-folded forward regardless of K (see
-pit.py::run_pit_batched's own docstring: "Test-set PIT stays a single
-forward pass"). So this is a frozen-checkpoint probe, not a training
-ablation: for a fixed batch of episodes (fixed context+test points, fixed
-z_test), re-run TabICL's K-fold PIT at several K to get several z_train
-variants, feed each through the SAME trained --ckpt, and score copula NLL /
-correlation-vs-R_post.
-
-Also scores an "oracle input" upper bound: the episode's own exact GP-LOO
-z_train (data_gen.py's analytic z_train field, Rasmussen & Williams Eq.
-5.12 -- computed for every episode regardless of z_train_source) paired
-with the SAME TabICL-PIT z_test used above. This isolates how much of the
-model's gap-to-oracle comes from z_train's K-fold noise specifically, vs.
-everything else (rank, PIT distortion in z_test, optimization).
+For fixed episodes, recompute TabICL's K-fold PIT z_train at several K (z_test
+does not depend on K), feed each to --ckpt, and score the copula NLL and the
+correlation against R_post; also with the exact GP LOO z_train as an upper
+bound.
 
 Usage:
     python debug/run_debug.py s5 --ckpt <name>
@@ -35,10 +24,7 @@ K_SWEEP_DEFAULT = [2, 5, 10]  # "P" (true K-fold LOO through TabICL) is appended
 
 
 def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
-    """run_pit_batched at a given K over one shared-P/N batch of episodes,
-    replicating data_gen.py's own y-scaling convention exactly (per-episode
-    y_train mean/std, y_test/log_pdf_test corrected the same way) so a
-    frozen checkpoint sees the same input distribution it was trained on."""
+    """run_pit_batched at K over a shared-P/N batch, with data_gen's per-episode y scaling."""
     from copula_inter.pit import run_pit_batched
 
     x_train = torch.stack([ep["x_norm_train"] for ep in episodes]).to(device)
@@ -120,9 +106,7 @@ def run(dcfg: DebugConfig, k_sweep=None) -> dict:
         label = "P (true LOO)" if K == P else str(K)
         results[label] = _score_variant(model, episodes, z_train, z_test, log_pdf_test, posts, dcfg.cfg, dcfg.device)
 
-    # Oracle-input upper bound: exact analytic GP-LOO z_train (data_gen.py's
-    # own field, untouched) + the SAME TabICL-PIT z_test/log_pdf_test from
-    # the last K-fold call above (z_test is K-invariant, see module docstring).
+    # Upper bound: exact GP LOO z_train with the same TabICL z_test.
     z_train_oracle = torch.stack([ep["z_train"] for ep in episodes]).to(dcfg.device)
     results["oracle_z_train"] = _score_variant(
         model, episodes, z_train_oracle, z_test, log_pdf_test, posts, dcfg.cfg, dcfg.device

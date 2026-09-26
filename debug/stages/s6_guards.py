@@ -1,31 +1,12 @@
-"""s6_guards.py — saturation-guard audit: covnorm escape ratio + Cholesky
-jitter escalation / non-finite-input fallback counts.
+"""Debug stage S6: saturation guards.
 
-Narrowed from the original debug list's broader "audit saturation guards":
-the jitter ceiling (1/(1+sigma_jitter) ~= 0.9999 at the default 1e-4) and
-rank's lack of a pairwise correlation ceiling are both closed-form facts,
-not worth instrumenting (see debug/README.md). What's left to actually
-MEASURE on a real model:
-
-  - covnorm escape ratio ||W_i||^2 / softplus(s_i) per test point -- this
-    ratio, not rank, sets how close a pair's correlation can get to +-1
-    (Sigma_ij bounded by sqrt((1-D_i/C_i)(1-D_j/C_j)) before the jitter
-    floor, model.py::low_rank_correlation's "covnorm" branch). At init
-    (s=0, W~N(0,0.02^2)) this ratio starts near 0 -- reports how far a
-    trained checkpoint has moved off that init.
-  - loss.py::_safe_cholesky's two failure paths, counted via monkey-patching
-    torch.linalg.cholesky and loss._safe_cholesky for the duration of one
-    y_space_nll call (no src/ edits): (a) how many (episode, retry) pairs
-    needed jitter escalation beyond the base 1e-6, (b) how many Sigma slices
-    had non-finite entries and were silently replaced with identity before
-    factorization. train/sigma_nonfinite_count already tracks (b) in
-    production (reads 0 in every run inspected) -- this stage exists to
-    confirm that at a chosen checkpoint/config rather than take it on faith,
-    and to add (a), which nothing in the repo counts today.
+Reports the covnorm escape ratio ||W_i||^2 / softplus(s_i) per test point and,
+for one y_space_nll call, how many Cholesky factorizations needed jitter
+escalation and how many Sigma slices were non-finite.
 
 Usage:
     python debug/run_debug.py s6 --ckpt <name>
-    python debug/stages/s6_guards.py --n-episodes 50   # fresh (untrained) model
+    python debug/stages/s6_guards.py --n-episodes 50
 """
 from __future__ import annotations
 
@@ -43,11 +24,7 @@ from debug.config import DebugConfig, add_common_args, build_config
 
 @contextlib.contextmanager
 def _cholesky_instrumentation():
-    """Monkey-patches torch.linalg.cholesky (counts calls per _safe_cholesky
-    invocation -> jitter-escalation count) and loss._safe_cholesky (counts
-    non-finite-input slices before it replaces them with identity) for the
-    duration of the `with` block. Restores both on exit regardless of
-    exceptions. No src/ files are edited."""
+    """Context manager counting jitter retries and non-finite slices in loss._safe_cholesky (monkey-patched, restored on exit)."""
     from copula_inter import loss as loss_mod
     counters = {"cholesky_calls": 0, "safe_cholesky_calls": 0, "escalated_calls": 0, "nonfinite_slices": 0}
     orig_cholesky = torch.linalg.cholesky
