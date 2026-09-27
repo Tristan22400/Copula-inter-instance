@@ -24,7 +24,7 @@ from __future__ import annotations
 import math
 import random
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import gpytorch
 import torch
@@ -39,9 +39,6 @@ from copula_inter.gp_kernels import (
     _maybe_wrap_sign_modulated,
 )
 from copula_inter.type_aliases import Device, HasDataConfig
-
-if TYPE_CHECKING:
-    pass
 
 
 def _sample_d_features(cfg: HasDataConfig) -> int:

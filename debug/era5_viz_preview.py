@@ -20,14 +20,14 @@ import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 
-import matplotlib  # noqa: E402
+import matplotlib
 
 matplotlib.use("Agg")
-import torch  # noqa: E402
-from omegaconf import OmegaConf  # noqa: E402
+import torch
+from omegaconf import OmegaConf
 
-from eval.spatial.diagnostics import morans_i  # noqa: E402
-from eval.spatial.sweep_core import get_model  # noqa: E402
+from eval.spatial.diagnostics import morans_i
+from eval.spatial.sweep_core import get_model
 
 
 def main() -> None:

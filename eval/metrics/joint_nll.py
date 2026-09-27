@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from scipy.stats import norm
 
-from copula_inter.loss import y_space_nll  # noqa: E402
+from copula_inter.loss import y_space_nll
 
 __all__ = ["compute_joint_nll", "compute_pit", "kfold_loo_pit"]
 

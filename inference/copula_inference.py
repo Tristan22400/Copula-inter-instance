@@ -24,8 +24,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 _PFNS4BO_ROOT = os.path.join(_REPO_ROOT, "pfns4bo_upstream")
 
-from copula_inter.model import CopulaTabICL, build_copula_transformer, low_rank_correlation  # noqa: E402
-from copula_inter.pit import load_tabicl, normalize_targets, run_pit  # noqa: E402
+from copula_inter.model import CopulaTabICL, build_copula_transformer, low_rank_correlation
+from copula_inter.pit import load_tabicl, normalize_targets, run_pit
 
 if TYPE_CHECKING:
     from tabicl._model.tabicl import TabICL

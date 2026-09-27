@@ -14,7 +14,7 @@ from scipy.stats import kstest, norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
-from eval.spatial import calibration as gp  # noqa: E402
+from eval.spatial import calibration as gp
 
 _SEED = 0
 

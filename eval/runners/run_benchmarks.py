@@ -30,21 +30,21 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-from eval.baselines import independent, standard_gp  # noqa: E402
-from eval.configs.checkpoints import resolve_checkpoint  # noqa: E402
-from eval.datasets import sensor_imputation, spatial_housing, synthetic_bbo  # noqa: E402
-from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_json  # noqa: E402
-from eval.metrics.energy_score import compute_energy_score  # noqa: E402
-from eval.metrics.joint_nll import compute_joint_nll, compute_pit  # noqa: E402
-from eval.results import require_coverage  # noqa: E402
-from eval.runners.hydra_cli import check_choices, hydra_entry  # noqa: E402
-from eval.tabicl_utils import make_tabicl_regressor, tabicl_loo_pit, tabicl_quantiles  # noqa: E402
-from eval.viz.correlation_plots import (  # noqa: E402
+from eval.baselines import independent, standard_gp
+from eval.configs.checkpoints import resolve_checkpoint
+from eval.datasets import sensor_imputation, spatial_housing, synthetic_bbo
+from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_json
+from eval.metrics.energy_score import compute_energy_score
+from eval.metrics.joint_nll import compute_joint_nll, compute_pit
+from eval.results import require_coverage
+from eval.runners.hydra_cli import check_choices, hydra_entry
+from eval.tabicl_utils import make_tabicl_regressor, tabicl_loo_pit, tabicl_quantiles
+from eval.viz.correlation_plots import (
     collect_pair_distances_and_values,
     plot_correlation_heatmaps,
     plot_correlation_vs_distance,
 )
-from inference.copula_inference import (  # noqa: E402
+from inference.copula_inference import (
     get_test_correlation,
     load_copula_model,
     normalize_features,

@@ -14,14 +14,14 @@ from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
-from copula_inter.model import low_rank_correlation  # noqa: E402
-from inference.copula_inference import (  # noqa: E402
+from copula_inter.model import low_rank_correlation
+from inference.copula_inference import (
     _resolve_copula_checkpoint,
     get_test_correlation,
     normalize_features,
     sample_trajectories,
 )
-from tabicl._model.quantile_dist import QuantileDistribution  # noqa: E402
+from tabicl._model.quantile_dist import QuantileDistribution
 
 
 def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path: Path) -> None:

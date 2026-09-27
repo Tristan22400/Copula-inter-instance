@@ -7,21 +7,21 @@ import time
 import zlib
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from copula_inter.loss import y_space_nll  # noqa: E402
-from eval.baselines.classical import (  # noqa: E402
+from copula_inter.loss import y_space_nll
+from eval.baselines.classical import (
     EXPECTED_BASELINE_KEYS,
     corr_nll_single,
     eval_baselines_episode,
     fit_zero_mean_gp_on_marginal,
     save_baseline_entry,
 )
-from eval.results import (  # noqa: E402
+from eval.results import (
     NAN_PARTS as _NAN_PARTS,
 )
 
@@ -165,30 +165,25 @@ class _PoolTensor:
     value: np.ndarray
 
 
-def _pool_encode_tensors(value: Any) -> Any:
-    """Recursively replace every tensor in an episode with NumPy storage (avoids torch's shared-memory transport)."""
-    if isinstance(value, Tensor):
-        return _PoolTensor(value.detach().cpu().contiguous().numpy().copy())
+def _map_leaves(value: Any, leaf_type: type, fn: Callable[[Any], Any]) -> Any:
+    """Apply fn to every leaf_type instance nested in dicts, lists and tuples."""
+    if isinstance(value, leaf_type):
+        return fn(value)
     if isinstance(value, dict):
-        return {key: _pool_encode_tensors(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_pool_encode_tensors(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_pool_encode_tensors(item) for item in value)
+        return {key: _map_leaves(item, leaf_type, fn) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_map_leaves(item, leaf_type, fn) for item in value)
     return value
+
+
+def _pool_encode_tensors(value: Any) -> Any:
+    """Replace every tensor with NumPy storage (avoids torch's shared-memory transport); pickling copies the bytes."""
+    return _map_leaves(value, Tensor, lambda t: _PoolTensor(t.detach().cpu().contiguous().numpy()))
 
 
 def _pool_decode_tensors(value: Any) -> Any:
     """Inverse of _pool_encode_tensors."""
-    if isinstance(value, _PoolTensor):
-        return torch.from_numpy(value.value)
-    if isinstance(value, dict):
-        return {key: _pool_decode_tensors(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_pool_decode_tensors(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_pool_decode_tensors(item) for item in value)
-    return value
+    return _map_leaves(value, _PoolTensor, lambda t: torch.from_numpy(t.value))
 
 
 def _fit_baselines_task(payload: tuple) -> tuple:
@@ -206,16 +201,7 @@ def _fit_baselines_task(payload: tuple) -> tuple:
         import traceback
 
         return cache_key, None, f"{exc}\n{traceback.format_exc()}"
-    return (
-        cache_key,
-        {
-            "nlls": nlls,
-            # Copy so the array owns its storage.
-            "R_dict": {k: v.detach().cpu().contiguous().numpy().copy() for k, v in R_dict.items()},
-            "y_nlls": y_nlls,
-        },
-        None,
-    )
+    return cache_key, _pool_encode_tensors({"nlls": nlls, "R_dict": R_dict, "y_nlls": y_nlls}), None
 
 
 def _count_physical_cores(cpus: set[int]) -> int:
@@ -256,11 +242,6 @@ def _valid_cached_entry(cache_entries: dict, cache_key: str, ep_i: int) -> dict 
     return cached
 
 
-def _episode_to_pool_payload(ep: dict) -> dict:
-    """Convert an episode to NumPy for the process pool."""
-    return _pool_encode_tensors(ep)
-
-
 def _prefit_baselines_parallel(
     pending: list[tuple[str, int, dict]],
     fit_kwargs: dict,
@@ -276,9 +257,8 @@ def _prefit_baselines_parallel(
     t0 = time.time()
 
     ctx = mp.get_context("spawn")
-    payloads = []
-    for key, fit_seed, ep in pending:
-        payloads.append((key, _episode_to_pool_payload(ep), fit_seed, fit_kwargs))
+    # Encoded lazily as the pool consumes them.
+    payloads = ((key, _pool_encode_tensors(ep), fit_seed, fit_kwargs) for key, fit_seed, ep in pending)
 
     with ctx.Pool(processes=n_workers) as pool:
         for cache_key, result, err in pool.imap_unordered(_fit_baselines_task, payloads):
@@ -287,8 +267,7 @@ def _prefit_baselines_parallel(
                 failures += 1
                 print(f"  [prefit] {cache_key} FAILED:\n{err}", flush=True)
             else:
-                # Convert NumPy results back to tensors for the cache.
-                result["R_dict"] = {k: torch.from_numpy(v) for k, v in result["R_dict"].items()}
+                result = _pool_decode_tensors(result)
                 fitted[cache_key] = result
                 if cache_path is not None:
                     # Write this episode's shard now.

@@ -2,48 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, NotRequired, TypedDict
+from typing import Any, Mapping
 
 from torch import Tensor
-
-
-class RawEpisode(TypedDict):
-    x_norm_train: Tensor  # (P, D), same normalization as x_norm_test
-    x_norm_test: Tensor  # (N, D)
-    y_train: Tensor  # (P,)
-    y_test: Tensor  # (N,)
-    n_train: Tensor
-    n_test: Tensor
-    R_star: Tensor  # (N, N), prior oracle when available
-    mu_star: Tensor  # (N,)
-    sigma_star: Tensor  # (N,)
-    x_kernel_train: NotRequired[Tensor]  # pre-normalization kernel space (P, Dk)
-    x_kernel_test: NotRequired[Tensor]  # same kernel space (N, Dk)
-
-
-class PITResult(TypedDict):
-    z_train: Tensor  # (P,)
-    z_test: Tensor  # (N,)
-    log_pdf_test: Tensor  # (N,), density on original y scale
-
-
-class PaddedBatch(TypedDict):
-    x_train: Tensor
-    x_test: Tensor
-    y_train: Tensor
-    y_test: Tensor
-    z_train: Tensor
-    z_test: Tensor
-    log_pdf_test: Tensor
-    train_mask: Tensor
-    test_mask: Tensor
-    R_star: Tensor
-    Sigma_star: Tensor
-    mu_star: Tensor
-    sigma_star: Tensor
-    n_train: Tensor
-    n_test: Tensor
-    R_prior: NotRequired[Tensor]
 
 
 def validate_episode(ep: Mapping[str, Any]) -> None:

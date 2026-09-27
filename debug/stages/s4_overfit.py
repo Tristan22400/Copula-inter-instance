@@ -41,8 +41,8 @@ from copula_inter.dataset import collate_fn
 from copula_inter.loss import _safe_cholesky, oracle_copula_nll, y_space_nll
 from copula_inter.model import build_copula_transformer, build_sigma
 from debug import common  # noqa: E402 -- debug/common.py, added to sys.path above
-from debug.stages.s1_rank_ceiling import fit_rank_ceiling  # noqa: E402
-from debug.stages.s3_pit_floor import sample_and_pit  # noqa: E402
+from debug.stages.s1_rank_ceiling import fit_rank_ceiling
+from debug.stages.s3_pit_floor import sample_and_pit
 
 
 def parse_args() -> argparse.Namespace:

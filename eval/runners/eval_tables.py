@@ -5,11 +5,11 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from copula_inter.gp_kernels import _parse_composite  # noqa: E402
+from copula_inter.gp_kernels import _parse_composite
 from eval.results import (
     NAN_PARTS as _NAN_PARTS,
 )
-from eval.results import (  # noqa: E402
+from eval.results import (
     competition_ranks,
     numeric_summary,
     score_summary,
@@ -276,11 +276,6 @@ def _print_total_nll_table(
     print(f"{'─' * total}\n")
 
 
-def _compute_ranks(values: list[dict[str, float]], keys: list[str]) -> dict[str, list[int]]:
-    """Tie-aware per-episode ranks (eval.results.competition_ranks)."""
-    return competition_ranks(values, keys)
-
-
 def _print_rank_table(
     values: list[dict[str, float]],
     order: list[tuple[str, str]],
@@ -290,7 +285,7 @@ def _print_rank_table(
     """Print mean and median per-episode rank of each method in order, sorted by mean rank."""
     keys = [k for k, _ in order]
     labels = dict(order)
-    ranks = _compute_ranks(values, keys)
+    ranks = competition_ranks(values, keys)
     rows = [(k, float(np.mean(rs)), float(np.median(rs)), len(rs)) for k, rs in ranks.items() if rs]
     rows.sort(key=lambda r: r[1])
     if not rows:

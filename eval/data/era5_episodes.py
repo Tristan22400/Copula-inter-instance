@@ -26,12 +26,12 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 from copula_inter.pit import normalize_targets
+from eval.configs.constants import ERA5_DEFAULT_CORPUS_DIR
 from eval.data.era5_global_corpus import GlobalERA5Corpus
 
 __all__ = ["build_era5_eval_episodes", "era5_episode_fingerprint", "DEFAULT_CORPUS_DIR"]
 
-# Held-out year, disjoint from the training corpus.
-DEFAULT_CORPUS_DIR = os.path.join(_HERE, "cache", "era5_global_val")
+DEFAULT_CORPUS_DIR = ERA5_DEFAULT_CORPUS_DIR
 
 
 def _episode_rng(seed: int, ep_i: int) -> np.random.Generator:

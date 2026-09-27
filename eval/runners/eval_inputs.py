@@ -240,12 +240,13 @@ def _load_models(
     )
     marginal_regressor = None
     tabicl_pit_k_folds = DEFAULT_K_FOLDS
+    configured_k_folds = spec.marginal.tabicl_pit_k_folds or int(
+        OmegaConf.select(cfg, "tabicl.pit_k_folds", default=DEFAULT_K_FOLDS)
+    )
     if marginal_backend is not None:
         from eval.spatial.marginal_backends import make_regressor
 
-        tabicl_pit_k_folds = spec.marginal.tabicl_pit_k_folds or int(
-            OmegaConf.select(cfg, "tabicl.pit_k_folds", default=DEFAULT_K_FOLDS)
-        )
+        tabicl_pit_k_folds = configured_k_folds
         print(
             f"\nBuilding {marginal_backend} marginal for marginal.z_train_source={marginal_backend} "
             f"(k_folds={tabicl_pit_k_folds}, probs_n={spec.marginal.probs_n})"
@@ -262,9 +263,7 @@ def _load_models(
                 "marginal.z_train_source=tabicl requires a TabICL checkpoint: set "
                 "marginal.tabicl_ckpt or tabicl.ckpt in the episode config."
             )
-        tabicl_pit_k_folds = spec.marginal.tabicl_pit_k_folds or int(
-            OmegaConf.select(cfg, "tabicl.pit_k_folds", default=DEFAULT_K_FOLDS)
-        )
+        tabicl_pit_k_folds = configured_k_folds
         print(
             f"\nLoading frozen TabICL marginal for marginal.z_train_source=tabicl: {tabicl_ckpt} "
             f"(k_folds={tabicl_pit_k_folds})"

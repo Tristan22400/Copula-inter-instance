@@ -14,22 +14,22 @@ from pytest import MonkeyPatch
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
-from copula_inter.data_gen import generate_gp_batch  # noqa: E402
-from copula_inter.pit import gp_analytical_posterior  # noqa: E402
-from eval.baselines.classical import (  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch
+from copula_inter.pit import gp_analytical_posterior
+from eval.baselines.classical import (
     baseline_fingerprint,
     episode_cache_key,
     eval_baselines_episode,
     load_baseline_cache,
     save_baseline_cache,
 )
-from eval.baselines.prefit import (  # noqa: E402
-    _episode_to_pool_payload,
+from eval.baselines.prefit import (
     _pool_decode_tensors,
+    _pool_encode_tensors,
     _PoolTensor,
     _prefit_baselines_parallel,
 )
-from eval.runners.episode_scoring import _eval_icl_episode  # noqa: E402
+from eval.runners.episode_scoring import _eval_icl_episode
 from eval.runners.eval_args import EvalSpec
 
 _TINY_DATA_CFG = {
@@ -93,7 +93,7 @@ def test_pool_episode_payload_encodes_nested_metadata_tensors() -> None:
         ],
     }
 
-    payload = _episode_to_pool_payload(episode)
+    payload = _pool_encode_tensors(episode)
 
     assert not _contains_tensor(payload)
     assert isinstance(payload["x_norm_train"], _PoolTensor)

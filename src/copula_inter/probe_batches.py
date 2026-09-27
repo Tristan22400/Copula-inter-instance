@@ -5,9 +5,6 @@ from __future__ import annotations
 import zlib
 from typing import Iterable
 
-import matplotlib
-
-matplotlib.use("Agg")
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf

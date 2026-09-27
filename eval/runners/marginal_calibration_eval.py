@@ -24,15 +24,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from copula_inter.config_path import config_dir  # noqa: E402
-from copula_inter.data_gen import generate_gp_batch  # noqa: E402
-from copula_inter.marginal_objective import (  # noqa: E402
+from copula_inter.config_path import config_dir
+from copula_inter.data_gen import generate_gp_batch
+from copula_inter.marginal_objective import (
     analytic_marginal_targets,
     ks_uniform,
     oracle_marginal_nll,
     rank_histogram,
 )
-from copula_inter.pit import (  # noqa: E402
+from copula_inter.pit import (
     DEFAULT_K_FOLDS,
     PRETRAINED_TABICL_CKPT,
     _kernel_fn_from_task,
@@ -41,9 +41,9 @@ from copula_inter.pit import (  # noqa: E402
     normalize_targets,
     run_pit_batched,
 )
-from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
-from eval.runners.hydra_cli import hydra_entry  # noqa: E402
-from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
+from eval.configs.checkpoints import resolve_marginal_checkpoint
+from eval.runners.hydra_cli import hydra_entry
+from eval.spatial.calibration import compute_quantile_ece
 
 if TYPE_CHECKING:
     from copula_inter.pit import TabICLLike

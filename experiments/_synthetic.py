@@ -13,8 +13,8 @@ from typing import Callable
 import numpy as np
 import torch
 
-from copula_inter.gp_kernels import build_kernel_fn  # noqa: E402
-from copula_inter.loss import _safe_cholesky  # noqa: E402
+from copula_inter.gp_kernels import build_kernel_fn
+from copula_inter.loss import _safe_cholesky
 
 OBS_NOISE_STD = 0.05
 

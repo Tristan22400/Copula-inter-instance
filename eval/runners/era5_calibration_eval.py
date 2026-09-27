@@ -28,9 +28,9 @@ from scipy.stats import norm
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-from eval.runners.hydra_cli import check_choice, hydra_entry  # noqa: E402
-from eval.spatial import calibration as cal  # noqa: E402
-from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles  # noqa: E402
+from eval.runners.hydra_cli import check_choice, hydra_entry
+from eval.spatial import calibration as cal
+from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 
 _G = 9.80665  # m/s^2, for geopotential (m^2/s^2) -> elevation (m)
 _TEMP_VAR_CANDIDATES = ("t2m", "2m_temperature", "temperature", "temp")

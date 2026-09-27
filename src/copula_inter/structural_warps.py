@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
 
 from copula_inter.type_aliases import Device, HasDataConfig
-
-if TYPE_CHECKING:
-    pass
-
 
 # Structural feature-warp categories, ported from TempoPFN's offline augmentor
 # but applied to the inputs x, so R_star stays exact. Two-level sampling: 2-6

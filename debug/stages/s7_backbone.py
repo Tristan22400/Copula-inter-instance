@@ -30,20 +30,20 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
 from copula_inter.backend_registry import MARGINAL_BACKENDS
-from eval.configs import constants  # noqa: E402
-from eval.configs.checkpoints import resolve_checkpoint  # noqa: E402
-from eval.metrics.joint_nll import compute_joint_nll  # noqa: E402
-from eval.spatial.diagnostics import (  # noqa: E402
+from eval.configs import constants
+from eval.configs.checkpoints import resolve_checkpoint
+from eval.metrics.joint_nll import compute_joint_nll
+from eval.spatial.diagnostics import (
     _exact_gp_loo_z_train,
     _forward_correlation,
     bin_correlation_by_distance,
     build_synthetic_grid_task,
 )
-from eval.spatial.marginal_backends import loo_pit, make_regressor, quantiles  # noqa: E402
-from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias  # noqa: E402
+from eval.spatial.marginal_backends import loo_pit, make_regressor, quantiles
+from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias
 from inference.copula_inference import (
-    load_copula_model,  # noqa: E402
-    normalize_features,  # noqa: E402
+    load_copula_model,
+    normalize_features,
 )
 
 _RESULTS_DIR = os.path.join(_REPO_ROOT, "eval", "results")

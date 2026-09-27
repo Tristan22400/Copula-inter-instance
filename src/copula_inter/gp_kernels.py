@@ -19,7 +19,7 @@ import math
 import random
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import gpytorch
 import torch
@@ -27,9 +27,6 @@ from gpytorch.priors import GammaPrior, LogNormalPrior, Prior
 from torch import Tensor
 
 from copula_inter.type_aliases import Device, HasDataConfig
-
-if TYPE_CHECKING:
-    pass
 
 
 def _sq_dist(X1: Tensor, X2: Tensor) -> Tensor:

@@ -20,7 +20,7 @@ _REPO_ROOT = os.path.dirname(_HERE)
 from omegaconf import OmegaConf
 
 from copula_inter.config_path import merge_configs
-from debug.config import DebugConfig  # noqa: E402
+from debug.config import DebugConfig
 
 
 def resolve_ckpt_path(ckpt: Optional[str]) -> Optional[str]:

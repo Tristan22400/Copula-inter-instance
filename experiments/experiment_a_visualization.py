@@ -19,10 +19,10 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from copula_inter.data_gen import gp_posterior  # noqa: E402
-from copula_inter.loss import _safe_cholesky  # noqa: E402
-from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
-from inference.copula_inference import (  # noqa: E402
+from copula_inter.data_gen import gp_posterior
+from copula_inter.loss import _safe_cholesky
+from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function
+from inference.copula_inference import (
     get_marginal_quantiles,
     get_marginal_quantiles_pfn4bo,
     get_test_correlation,

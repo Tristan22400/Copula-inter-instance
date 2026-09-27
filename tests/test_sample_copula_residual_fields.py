@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from eval.spatial.diagnostics import (  # noqa: E402
+from eval.spatial.diagnostics import (
     predict_copula_residual_field,
     sample_copula_residual_fields,
 )

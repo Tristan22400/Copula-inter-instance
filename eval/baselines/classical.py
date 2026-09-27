@@ -43,11 +43,12 @@ if TYPE_CHECKING:
 warnings.filterwarnings("ignore", category=NumericalWarning)
 
 
-from copula_inter.artifacts import atomic_torch_save  # noqa: E402
-from copula_inter.dataset_manifest import dataset_identity  # noqa: E402
-from copula_inter.loss import gp_oracle_y_nll, oracle_copula_nll  # noqa: E402
-from copula_inter.model import low_rank_correlation  # noqa: E402
-from eval.results import NAN_PARTS as _NAN_PARTS  # noqa: E402
+from copula_inter.artifacts import atomic_torch_save
+from copula_inter.dataset_manifest import dataset_identity
+from copula_inter.loss import gp_oracle_y_nll, oracle_copula_nll
+from copula_inter.model import low_rank_correlation
+from eval.configs.constants import GP_VAL_SELECT_MODES
+from eval.results import NAN_PARTS as _NAN_PARTS
 
 __all__ = [
     "corr_nll_single",
@@ -96,9 +97,6 @@ EXPECTED_BASELINE_KEYS = frozenset(
 
 # Bump when a fitting algorithm changes in a way the fingerprint cannot detect.
 _BASELINE_ALGO_VERSION = 4
-
-
-GP_VAL_SELECT_MODES = ("ard", "always", "never")
 
 
 def _resolve_val_select(mode: str, ard: bool) -> bool:
@@ -460,7 +458,7 @@ def fit_and_eval_gpytorch(
         )
 
     from copula_inter.data_gen import (
-        sigma_to_correlation,  # noqa: E402  (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
+        sigma_to_correlation,  # (lazy: keeps module import light for callers that only need corr_nll_single/gp_prior_corr_rbf)
     )
 
     R, _ = sigma_to_correlation(Sigma_post)
@@ -510,7 +508,7 @@ def fit_zero_mean_gp_on_marginal(
 
 def gp_prior_corr_rbf(X_test: Tensor) -> Tensor:
     """RBF prior correlation at the test points with a median bandwidth."""
-    from copula_inter.gp_kernels import _sq_dist  # noqa: E402
+    from copula_inter.gp_kernels import _sq_dist
 
     sq = _sq_dist(X_test, X_test)
     h2 = torch.pdist(X_test).pow(2).median().clamp(min=1e-6)

@@ -25,8 +25,8 @@ from omegaconf import DictConfig, OmegaConf
 from copula_inter.config_path import merge_configs
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-from copula_inter.data_gen import generate_gp_batch  # noqa: E402
-from copula_inter.gp_kernels import KERNEL_REGISTRY  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch
+from copula_inter.gp_kernels import KERNEL_REGISTRY
 
 N_SAMPLES = 8  # print at least 8 generated posterior draws along the way
 N_PLOT = 4  # number of those draws to actually plot (raw + sorted each)

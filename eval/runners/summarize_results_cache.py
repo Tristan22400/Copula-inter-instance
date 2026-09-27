@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from omegaconf import MISSING
 
-from eval.runners.eval_tables import _ar_note, _print_table, _print_total_nll_table  # noqa: E402
+from eval.runners.eval_tables import _ar_note, _print_table, _print_total_nll_table
 from eval.runners.hydra_cli import hydra_entry
 
 

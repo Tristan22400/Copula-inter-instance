@@ -17,13 +17,13 @@ from typing import Any
 import pytest
 import torch
 
-from copula_inter.era5_live_dataset import _pit_group  # noqa: E402
-from eval.baselines.autoregressive import (  # noqa: E402
+from copula_inter.era5_live_dataset import _pit_group
+from eval.baselines.autoregressive import (
     _orderings,
     ar_parts_from_log_pdf,
     autoregressive_log_pdf,
 )
-from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: E402
+from tests.test_pit_batched import RowIndependentFakeTabICL
 
 
 class RecordingFakeTabICL(RowIndependentFakeTabICL):

@@ -5,12 +5,9 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-import matplotlib
-
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-matplotlib.use("Agg")
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf

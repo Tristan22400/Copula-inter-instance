@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from copula_inter.pit import tabicl_forward
+from eval.configs.constants import AR_CONDITIONINGS, AR_ORDERS
 
 if TYPE_CHECKING:
     from copula_inter.pit import TabICLLike
@@ -33,9 +34,6 @@ __all__ = [
     "AR_ORDERS",
     "AR_CONDITIONINGS",
 ]
-
-AR_ORDERS = ("random", "natural")
-AR_CONDITIONINGS = ("teacher_forcing", "sample")
 
 
 def _orderings(

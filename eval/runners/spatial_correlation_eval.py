@@ -33,14 +33,14 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
 from eval.configs import (
-    constants,  # noqa: E402
-    regions,  # noqa: E402
+    constants,
+    regions,
 )
-from eval.configs.checkpoints import CHECKPOINT_FAMILIES, all_family_names, resolve_checkpoint  # noqa: E402
-from eval.data.era5_io import haversine_distance_km, load_era5_data, safe_cholesky  # noqa: E402
-from eval.data.fetch_era5 import fetch as fetch_era5  # noqa: E402
-from eval.runners.hydra_cli import check_choice, check_choices, hydra_entry  # noqa: E402
-from eval.spatial.diagnostics import (  # noqa: E402
+from eval.configs.checkpoints import CHECKPOINT_FAMILIES, all_family_names, resolve_checkpoint
+from eval.data.era5_io import haversine_distance_km, load_era5_data, safe_cholesky
+from eval.data.fetch_era5 import fetch as fetch_era5
+from eval.runners.hydra_cli import check_choice, check_choices, hydra_entry
+from eval.spatial.diagnostics import (
     bin_correlation_by_distance,
     empirical_spatial_correlation,
     extract_model_context_correlation,
@@ -53,8 +53,8 @@ from eval.spatial.diagnostics import (  # noqa: E402
     sample_copula_residual_fields,
     sample_simple_kernel_covariance,
 )
-from eval.spatial.sweep_core import get_model, run_real_config, run_synthetic_config  # noqa: E402
-from eval.viz.correlation_plots import (  # noqa: E402
+from eval.spatial.sweep_core import get_model, run_real_config, run_synthetic_config
+from eval.viz.correlation_plots import (
     plot_correlation_heatmaps,
     plot_correlation_vs_distance,
     plot_residual_grid,

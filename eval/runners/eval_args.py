@@ -12,11 +12,14 @@ from dataclasses import dataclass, field
 from omegaconf import MISSING
 
 from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES, get_backend
-from eval.baselines.autoregressive import AR_CONDITIONINGS, AR_ORDERS
-from eval.baselines.classical import GP_VAL_SELECT_MODES
 from eval.configs.checkpoints import resolve_checkpoint
-from eval.configs.constants import N_CONTEXT
-from eval.data.era5_episodes import DEFAULT_CORPUS_DIR as ERA5_DEFAULT_CORPUS_DIR
+from eval.configs.constants import (
+    AR_CONDITIONINGS,
+    AR_ORDERS,
+    ERA5_DEFAULT_CORPUS_DIR,
+    GP_VAL_SELECT_MODES,
+    N_CONTEXT,
+)
 from eval.runners.hydra_cli import check_choice, compose_spec
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

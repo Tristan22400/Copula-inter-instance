@@ -6,11 +6,6 @@ import gc
 import math
 from typing import Optional
 
-import matplotlib
-
-from copula_inter.probe_batches import _name_seed
-
-matplotlib.use("Agg")
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -24,6 +19,7 @@ from copula_inter.pit import (
     TabICLLike,
     load_tabicl,
 )
+from copula_inter.probe_batches import _name_seed
 
 
 def _update_adaptive_kernel_weights(

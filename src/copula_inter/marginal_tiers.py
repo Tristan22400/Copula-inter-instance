@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from typing import Sequence
 
 import torch.nn as nn
 
@@ -10,15 +10,11 @@ from copula_inter.lora import (
     apply_lora,
     apply_lora_all_layers,
 )
-from copula_inter.marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0  # noqa: E402
-from copula_inter.marginal_backbones import (  # noqa: E402
+from copula_inter.marginal_backbones import TIER0_PATTERNS as _BACKBONE_TIER0
+from copula_inter.marginal_backbones import (
     assert_patterns_match,
     resolve_tier,
 )
-
-if TYPE_CHECKING:
-    pass
-
 
 # Tier 0: the label path, the ICL-stage norms and the decoder (per architecture
 # in marginal_backbones.py; re-exported here).

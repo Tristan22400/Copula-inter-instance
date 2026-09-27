@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from copula_inter.data_gen import generate_gp_batch  # noqa: E402
+from copula_inter.data_gen import generate_gp_batch
 from copula_inter.pit import (
     normalize_targets,
 )

@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
+
+# eval_checkpoint choice lists, kept here so the config schema imports no model code.
+AR_ORDERS = ("random", "natural")
+AR_CONDITIONINGS = ("teacher_forcing", "sample")
+GP_VAL_SELECT_MODES = ("ard", "always", "never")
+# Held-out ERA5 year, disjoint from the training corpus.
+ERA5_DEFAULT_CORPUS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cache", "era5_global_val"
+)
 
 N_CONTEXT = 30  # in-context sample size for --profile sweeps (see regions.SWEEP_PROFILES)
 N_BINS = 15  # distance bins for correlation-vs-distance binning
