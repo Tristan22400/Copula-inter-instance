@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-xdist>=3.6,<4", "ruff>=0.16,<0.17", "mypy>=1.11,<2"]
+dev = ["pytest>=8,<10", "pytest-xdist>=3.6,<4", "ruff>=0.16,<0.17", "mypy>=1.11,<2", "pre-commit>=4,<5"]
 cpu = ["torch>=2.5,<3"]
 gpu = ["torch>=2.5,<3"]
 era5 = ["netCDF4>=1.7,<2", "dask[array]>=2024.1", "zarr>=3,<4", "gcsfs>=2024.1"]
