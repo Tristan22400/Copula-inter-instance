@@ -60,6 +60,7 @@ def _run_validate(
     batches: list[dict],
     episodes_by_batch: list[list[dict]],
     analytic_val_z: dict | None,
+    include_oracle_diagnostics: bool = True,
 ) -> dict:
     return validate(
         model,
@@ -70,6 +71,7 @@ def _run_validate(
         do_plot=False,
         val_episodes_meta=dict(enumerate(episodes_by_batch)),
         analytic_val_z=analytic_val_z,
+        include_oracle_diagnostics=include_oracle_diagnostics,
     )[0]
 
 
@@ -139,6 +141,22 @@ def test_without_the_cache_the_marginal_gap_is_nonzero(small_cfg: DictConfig, sm
     model = build_copula_transformer(cfg)
     m = _run_validate(cfg, model, batches, [eps], None)
     assert abs(m["oracle_diag/marginal_gap"]) > 1e-2
+
+
+def test_disabled_oracle_diagnostics_do_not_score_tabicl_pit_against_gp_ceiling(
+    small_cfg: DictConfig, small_model_cfg: DictConfig
+) -> None:
+    """Fast-start validation omits oracle metrics when it skips the analytic PIT cache."""
+    cfg = _cfg(small_cfg, small_model_cfg)
+    eps = _reprior_standardize(_episodes(cfg, b=4, seed=6))
+    batches = [collate_fn(eps)]
+    model = build_copula_transformer(cfg)
+
+    metrics = _run_validate(cfg, model, batches, [eps], None, include_oracle_diagnostics=False)
+
+    assert not any(key.startswith("oracle_diag/") for key in metrics)
+    assert not any(key.startswith("y_nll_oracle_") for key in metrics)
+    assert "sigma_offdiag_mean_val_z" in metrics
 
 
 def test_corr_kl_is_emitted_and_nonnegative(small_cfg: DictConfig, small_model_cfg: DictConfig) -> None:

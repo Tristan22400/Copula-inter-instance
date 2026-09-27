@@ -296,6 +296,7 @@ def _validate_and_log(
         era5_viz_batch=probes.era5_viz_batch,
         posterior_probe=probes.posterior_probe,
         val_episodes_meta=data.val_episodes_meta,
+        include_oracle_diagnostics=bool(cfg.training.get("startup_probes", True)),
     )
     # oracle_diag/* keys are logged as-is; others get the val/ prefix.
     log_dict: dict[str, Any] = {(k if k.startswith("oracle_diag/") else f"val/{k}"): v for k, v in metrics.items()}
@@ -312,12 +313,16 @@ def _validate_and_log(
     cop_gap = metrics.get("oracle_diag/copula_gap", float("nan"))
     headroom = metrics.get("oracle_diag/copula_headroom", float("nan"))
     cop_gap_str = f"{cop_gap:.4f}/{headroom:.4f}" if math.isfinite(cop_gap) and math.isfinite(headroom) else "n/a"
+    z_label = "analytic_z" if bool(cfg.training.get("startup_probes", True)) else "val_z"
+    sigma_off_mean = metrics[f"sigma_offdiag_mean_{z_label}"]
+    sigma_off_std = metrics[f"sigma_offdiag_std_{z_label}"]
+    sigma_off_abs_mean = metrics[f"sigma_offdiag_abs_mean_{z_label}"]
     print(
         f"[{step:6d}] VAL  "
         f"total={_fmt_metric(metrics, 'y_nll_total', '.4f')}  "
         f"gap_post={_fmt_metric(metrics, 'oracle_diag/gap_nll', '.4f')}  "
         f"corr_r={_fmt_metric(metrics, 'oracle_diag/corr_pearson', '.3f')}  "
-        f"od_μ={metrics['sigma_offdiag_mean_analytic_z']:+.4f} od_σ={metrics['sigma_offdiag_std_analytic_z']:.4f} od_|r|={metrics['sigma_offdiag_abs_mean_analytic_z']:.4f}  "
+        f"od_μ={sigma_off_mean:+.4f} od_σ={sigma_off_std:.4f} od_|r|={sigma_off_abs_mean:.4f}  "
         f"cop_std={_fmt_metric(metrics, 'oracle_diag/copula_nll_std', '.4f')}  "
         f"cop_tabicl={_fmt_metric(metrics, 'y_nll_copula', '.4f')}  "
         f"cop_gap={cop_gap_str}  "

@@ -56,9 +56,14 @@ def _extend_valid(dst: list[float], values: torch.Tensor, valid: torch.Tensor) -
 
 
 def _sigma_diagnostics(
-    acc: _ValAccumulators, out: dict, Sigma: torch.Tensor, z_test: torch.Tensor, test_mask: torch.Tensor
+    acc: _ValAccumulators,
+    out: dict,
+    Sigma: torch.Tensor,
+    z_test: torch.Tensor,
+    test_mask: torch.Tensor,
+    include_oracle_copula: bool = True,
 ) -> None:
-    """Per-task copula NLL against the analytic z_test, W/s norms and Sigma entry statistics."""
+    """Per-task copula NLL (when requested), W/s norms and Sigma entry statistics."""
     n_test = test_mask.sum(-1).float()  # (B,)
     valid = n_test >= 2
     if not valid.any():
@@ -67,17 +72,18 @@ def _sigma_diagnostics(
     n_safe = n_test.clamp(min=1)
     N = Sigma.shape[1]
 
-    eye = torch.eye(N, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
-    S_safe = torch.where(mask_2d, Sigma, eye)
-    L, info = torch.linalg.cholesky_ex(S_safe)
-    if info.any():
-        S_safe = S_safe + 1e-4 * eye
-        L = torch.linalg.cholesky(S_safe)
-    log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)
-    tmp = torch.linalg.solve_triangular(L, z_test.unsqueeze(-1), upper=False)
-    S_inv_z = torch.linalg.solve_triangular(L.mT, tmp, upper=True).squeeze(-1)
-    cop = 0.5 * (log_det + (z_test * S_inv_z).sum(-1) - (z_test**2).sum(-1)) / n_safe
-    _extend_valid(acc.cop_per_task, cop, valid)
+    if include_oracle_copula:
+        eye = torch.eye(N, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
+        S_safe = torch.where(mask_2d, Sigma, eye)
+        L, info = torch.linalg.cholesky_ex(S_safe)
+        if info.any():
+            S_safe = S_safe + 1e-4 * eye
+            L = torch.linalg.cholesky(S_safe)
+        log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12).log().sum(-1)
+        tmp = torch.linalg.solve_triangular(L, z_test.unsqueeze(-1), upper=False)
+        S_inv_z = torch.linalg.solve_triangular(L.mT, tmp, upper=True).squeeze(-1)
+        cop = 0.5 * (log_det + (z_test * S_inv_z).sum(-1) - (z_test**2).sum(-1)) / n_safe
+        _extend_valid(acc.cop_per_task, cop, valid)
 
     # W row norms and s means over valid test rows (no s for tanhnorm).
     mask_f = test_mask.float()
@@ -169,7 +175,7 @@ def _score_val_batch(
         acc.oracle_total.append(parts_o["total"].item())
         acc.oracle_copula.append(parts_o["copula"].item())
 
-    _sigma_diagnostics(acc, out, Sigma, z_test_an, batch["test_mask"])
+    _sigma_diagnostics(acc, out, Sigma, z_test_an, batch["test_mask"], include_oracle_copula=score_oracle)
 
     for b in range(Sigma.shape[0]):
         n = int(batch["test_mask"][b].sum())
@@ -183,7 +189,7 @@ def _score_val_batch(
                 acc.tabicl_total.append(parts["total"].item())
                 acc.tabicl_marginal.append(parts["marginal"].item())
                 acc.tabicl_copula.append(parts["copula"].item())
-        if eps_b is not None and b < len(eps_b):
+        if score_oracle and eps_b is not None and b < len(eps_b):
             _add_posterior_ceiling(acc, eps_b[b], Sigma[b], n)
 
 
@@ -213,27 +219,41 @@ def _posterior_probe_pass(
             acc.off_o_post.append(post["R_post"].cpu().numpy()[ri_p, ci_p])
 
 
-def _sigma_metrics(acc: _ValAccumulators) -> dict:
-    """Std of the per-task copula NLL and Sigma/W/s statistics (forward on val_loader's own z_train)."""
+def _sigma_metrics(acc: _ValAccumulators, *, include_oracle_diagnostics: bool, z_label: str) -> dict:
+    """Copula NLL dispersion (when requested) and Sigma/W/s stats for the validation z-space."""
     metrics: dict = {}
-    metrics["oracle_diag/copula_nll_std"] = float(np.std(acc.cop_per_task)) if acc.cop_per_task else float("nan")
+    if include_oracle_diagnostics:
+        metrics["oracle_diag/copula_nll_std"] = float(np.std(acc.cop_per_task)) if acc.cop_per_task else float("nan")
     if acc.sigma_off:
         off_arr = np.array(acc.sigma_off, dtype=np.float32)
-        metrics["sigma_offdiag_mean_analytic_z"] = float(off_arr.mean())
-        metrics["sigma_offdiag_std_analytic_z"] = float(off_arr.std())
-        metrics["sigma_offdiag_abs_mean_analytic_z"] = float(np.abs(off_arr).mean())
+        metrics[f"sigma_offdiag_mean_{z_label}"] = float(off_arr.mean())
+        metrics[f"sigma_offdiag_std_{z_label}"] = float(off_arr.std())
+        metrics[f"sigma_offdiag_abs_mean_{z_label}"] = float(np.abs(off_arr).mean())
     else:
-        metrics["sigma_offdiag_mean_analytic_z"] = 0.0
-        metrics["sigma_offdiag_std_analytic_z"] = 0.0
-        metrics["sigma_offdiag_abs_mean_analytic_z"] = 0.0
-    metrics["sigma_diag_mean_analytic_z"] = float(np.mean(acc.sigma_diag)) if acc.sigma_diag else 1.0
-    metrics["W_norm_mean_analytic_z"] = float(np.mean(acc.W_norms)) if acc.W_norms else 0.0
-    metrics["s_mean_analytic_z"] = float(np.mean(acc.s_vals)) if acc.s_vals else 0.0
+        metrics[f"sigma_offdiag_mean_{z_label}"] = 0.0
+        metrics[f"sigma_offdiag_std_{z_label}"] = 0.0
+        metrics[f"sigma_offdiag_abs_mean_{z_label}"] = 0.0
+    metrics[f"sigma_diag_mean_{z_label}"] = float(np.mean(acc.sigma_diag)) if acc.sigma_diag else 1.0
+    metrics[f"W_norm_mean_{z_label}"] = float(np.mean(acc.W_norms)) if acc.W_norms else 0.0
+    metrics[f"s_mean_{z_label}"] = float(np.mean(acc.s_vals)) if acc.s_vals else 0.0
     return metrics
 
 
-def _oracle_metrics(acc: _ValAccumulators) -> dict:
-    """Model NLL in the analytic z-space, the Bayes-optimal ceiling and the gaps between them."""
+def _tabicl_metrics(acc: _ValAccumulators) -> dict:
+    """TabICL-marginal total Y-space NLL, when available."""
+    metrics: dict = {}
+    if acc.tabicl_total:
+        metrics["y_nll_total"] = float(np.mean(acc.tabicl_total))
+        metrics["y_nll_marginal"] = float(np.mean(acc.tabicl_marginal))
+        metrics["y_nll_copula"] = float(np.mean(acc.tabicl_copula))
+    return metrics
+
+
+def _oracle_metrics(acc: _ValAccumulators, *, include_oracle_diagnostics: bool) -> dict:
+    """Model NLL in analytic z-space, the Bayes-optimal ceiling and their gaps."""
+    if not include_oracle_diagnostics:
+        return _tabicl_metrics(acc)
+
     metrics: dict = {}
     if acc.oracle_total:
         metrics["oracle_diag/copula_nll"] = float(np.mean(acc.oracle_copula))
@@ -264,12 +284,7 @@ def _oracle_metrics(acc: _ValAccumulators) -> dict:
         metrics["oracle_diag/corr_kl"] = float(np.mean(acc.corr_kl))
         metrics["oracle_diag/corr_kl_p90"] = float(np.percentile(acc.corr_kl, 90))
     metrics["oracle_diag/corr_kl_nonfinite"] = float(acc.corr_kl_nonfinite)
-
-    # TabICL-marginal total Y-space NLL, set only when a PIT checkpoint is configured.
-    if acc.tabicl_total:
-        metrics["y_nll_total"] = float(np.mean(acc.tabicl_total))
-        metrics["y_nll_marginal"] = float(np.mean(acc.tabicl_marginal))
-        metrics["y_nll_copula"] = float(np.mean(acc.tabicl_copula))
+    metrics.update(_tabicl_metrics(acc))
     return metrics
 
 
@@ -402,6 +417,7 @@ def validate(
     era5_viz_batch: dict | None = None,
     posterior_probe: dict | None = None,
     val_episodes_meta: dict[int, list[dict]] | None = None,
+    include_oracle_diagnostics: bool = True,
 ) -> tuple[dict, dict]:
     """Score the model on the validation batches and the optional probes.
 
@@ -427,13 +443,14 @@ def validate(
             an_b=analytic_val_z.get(batch_idx) if analytic_val_z else None,
             z_cache_b=tabicl_val_z.get(batch_idx) if tabicl_val_z else None,
             eps_b=val_episodes_meta.get(batch_idx) if val_episodes_meta is not None else None,
-            score_oracle=val_episodes_meta is not None,
+            score_oracle=include_oracle_diagnostics and val_episodes_meta is not None,
         )
 
-    metrics = _sigma_metrics(acc)
-    if posterior_probe is not None and val_episodes_meta is None:
+    z_label = "analytic_z" if include_oracle_diagnostics else "val_z"
+    metrics = _sigma_metrics(acc, include_oracle_diagnostics=include_oracle_diagnostics, z_label=z_label)
+    if include_oracle_diagnostics and posterior_probe is not None and val_episodes_meta is None:
         _posterior_probe_pass(acc, model, cfg, jitter, posterior_probe)
-    metrics.update(_oracle_metrics(acc))
+    metrics.update(_oracle_metrics(acc, include_oracle_diagnostics=include_oracle_diagnostics))
     for family, probe_s in (synth_kernel_batches or {}).items():
         z_cache_fam = (tabicl_kernel_fit_z or {}).get(family)
         metrics.update(_kernel_fit_metrics(model, cfg, jitter, device, family, probe_s, z_cache_fam))
