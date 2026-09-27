@@ -53,6 +53,7 @@ from copula_inter.model import build_copula_transformer
 from copula_inter.muon import Muon
 from copula_inter.pit import gp_analytical_posterior, load_tabicl, resolve_pit_ckpt
 from copula_inter.probe_batches import _sigma_stats
+from copula_inter.rng import resolve_device
 from copula_inter.training_core import _forward_and_loss, _run_train_step, cosine_lr_lambda
 
 # Debug logging and validation cadence.
@@ -143,7 +144,7 @@ def main(cfg: DictConfig) -> None:
     t_script0 = time.perf_counter()
     torch.manual_seed(cfg.seed)
     t = cfg.training
-    device = "cuda" if t.device == "auto" and torch.cuda.is_available() else ("cpu" if t.device == "auto" else t.device)
+    device = resolve_device(t.device)
 
     # Cap training.steps unless it was overridden.
     if int(t.steps) >= 100_000:

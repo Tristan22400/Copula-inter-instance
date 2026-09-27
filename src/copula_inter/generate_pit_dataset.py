@@ -170,12 +170,41 @@ def _save_shard_atomic(episodes: list, out_path: str) -> None:
     )
 
 
-def _scan_meta_total(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int) -> int:
-    """Episode count of the contiguous prefix of finished shards, written to meta.pt."""
-    counts = contiguous_shard_counts(pit_dir, n_shards, shard_size)
-    if len(counts) == n_shards and sum(counts) != n_tasks:
+def _shard_is_resumable(out_path: str, expected_count: int) -> bool:
+    """Return whether a shard and its sidecar form a completed, matching pair."""
+    sidecar = shard_count_path(out_path)
+    if not sidecar.is_file():
+        print(f"  [resume] {out_path} has no completed sidecar; regenerating it")
+        return False
+    try:
+        count, _ = verified_shard_digest(out_path, require_match=True)
+    except ValueError as exc:
+        if not str(exc).startswith("shard content differs from its sidecar:"):
+            raise
+        print(f"  [resume] {out_path} has a stale sidecar; regenerating it")
+        return False
+    if count != expected_count:
+        raise ValueError(f"cannot resume {out_path}: expected {expected_count} episodes, found {count}")
+    return True
+
+
+def _scan_meta_total(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int, manifest_digest: str) -> int:
+    """Episode count of the contiguous prefix of finished shards, written to meta.pt.
+
+    Resumes from the full shards the current meta.pt already published (shards are never
+    removed during generation), so each refresh reads only the new sidecars.
+    """
+    start = 0
+    meta_path = os.path.join(pit_dir, "meta.pt")
+    if os.path.isfile(meta_path):
+        meta = torch.load(meta_path, map_location="cpu", weights_only=True)
+        if meta.get("manifest_digest") == manifest_digest and meta.get("shard_size") == shard_size:
+            start = min(int(meta["n_total"]) // shard_size, n_shards)
+    counts = contiguous_shard_counts(pit_dir, n_shards, shard_size, start=start)
+    total = start * shard_size + sum(counts)
+    if start + len(counts) == n_shards and total != n_tasks:
         raise ValueError("final shard count does not match requested n_tasks")
-    return sum(counts)
+    return total
 
 
 def _refresh_meta(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int, digest: str) -> None:
@@ -185,7 +214,7 @@ def _refresh_meta(pit_dir: str, n_tasks: int, n_shards: int, shard_size: int, di
         try:
             _write_meta(
                 pit_dir,
-                _scan_meta_total(pit_dir, n_tasks, n_shards, shard_size),
+                _scan_meta_total(pit_dir, n_tasks, n_shards, shard_size, digest),
                 shard_size,
                 digest,
             )
@@ -284,13 +313,9 @@ def main(cfg: DictConfig) -> None:
             n_this = min(B, n_tasks - shard_idx * B)
 
             if cfg.data.resume and os.path.exists(out_path):
-                if shard_count_path(out_path).is_file():
-                    count, _ = verified_shard_digest(out_path, require_match=True)
-                    if count != n_this:
-                        raise ValueError(f"cannot resume {out_path}: expected {n_this} episodes, found {count}")
+                if _shard_is_resumable(out_path, n_this):
                     pbar.update(n_this)
                     continue
-                print(f"  [resume] {out_path} has no completed sidecar; regenerating it")
 
             # Per-shard seed from the global shard index.
             if base_seed is not None:

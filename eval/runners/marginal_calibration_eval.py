@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from copula_inter.config_path import config_dir
+from copula_inter.config_path import compose_config, config_dict, config_dir
 from copula_inter.data_gen import generate_gp_batch
 from copula_inter.marginal_objective import (
     analytic_marginal_targets,
@@ -41,6 +41,7 @@ from copula_inter.pit import (
     normalize_targets,
     run_pit_batched,
 )
+from copula_inter.rng import resolve_device
 from eval.configs.checkpoints import resolve_marginal_checkpoint
 from eval.runners.hydra_cli import hydra_entry
 from eval.spatial.calibration import compute_quantile_ece
@@ -186,27 +187,20 @@ class MarginalCalibrationSpec:
 
 
 def run(args: MarginalCalibrationSpec) -> None:
-    device = args.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device(args.device)
 
     ckpt = resolve_marginal_checkpoint(args.ckpt)
     print(f"[marginal_calibration_eval] ckpt={ckpt} device={device} k_folds={args.k_folds}")
     tabicl = load_tabicl(ckpt, device)
 
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
-
     # Same prior as Phase A training, composed in place of this runner's own config.
-    GlobalHydra.instance().clear()
-    with initialize_config_dir(config_dir=config_dir(__file__), version_base=None):
-        full = compose(config_name="finetune_marginal")
+    full = compose_config(config_dir(__file__), "finetune_marginal")
 
     from omegaconf import OmegaConf
 
     all_records: list[dict] = []
     for P in args.p_values:
-        gp_cfg = OmegaConf.create({"data": OmegaConf.to_container(full.data, resolve=True), "seed": args.seed})
+        gp_cfg = OmegaConf.create({"data": config_dict(full.data), "seed": args.seed})
         gp_cfg.data.P_min = int(P)
         gp_cfg.data.P_max = int(P)
         gp_cfg.data.N_min = int(args.n_test)

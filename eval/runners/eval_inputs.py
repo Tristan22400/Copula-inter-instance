@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import copy
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-import hydra
 import torch
-from hydra.core.global_hydra import GlobalHydra
 from omegaconf import DictConfig, OmegaConf
 
 from eval.baselines.prefit import (
@@ -25,6 +23,7 @@ if TYPE_CHECKING:
     from eval.runners.eval_args import EvalSpec
 
 from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS
+from copula_inter.config_path import compose_config
 from copula_inter.config_path import config_dir as project_config_dir
 from copula_inter.data_gen import generate_gp_batch
 from copula_inter.dataset import CopulaDataset
@@ -58,12 +57,7 @@ def resolve_config_path(config_path: str) -> str:
 def _load_full_config(config_path: str) -> DictConfig:
     """Compose the episode config through Hydra's defaults list (model and data groups), independent of any checkpoint."""
     config_path = os.path.abspath(resolve_config_path(config_path))
-    config_dir = os.path.dirname(config_path)
-    config_name = os.path.splitext(os.path.basename(config_path))[0]
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-    with hydra.initialize_config_dir(config_dir=config_dir, version_base=None):
-        return hydra.compose(config_name=config_name)
+    return compose_config(os.path.dirname(config_path), os.path.splitext(os.path.basename(config_path))[0])
 
 
 def _dataset_dir_for_eval(spec: EvalSpec, cfg: DictConfig, live_generate: bool, era5: bool) -> str | None:
@@ -278,24 +272,18 @@ def _resolve_episode_source(spec: EvalSpec, cfg: DictConfig) -> tuple[bool, bool
     """(era5, live_generate, dataset_dir) from era5.enabled, dataset_dir and live_generate."""
     era5 = bool(spec.era5.enabled)
     if era5:
-        if spec.dataset_dir is not None:
-            raise ValueError("era5.enabled and dataset_dir are mutually exclusive episode sources.")
-        if spec.live_generate:
-            raise ValueError("era5.enabled and live_generate are mutually exclusive episode sources.")
-        if spec.marginal.z_train_source == "oracle":
-            raise ValueError(
-                "era5.enabled has no oracle marginal: real ERA5 has no generating GP to take "
-                "an exact LOO-PIT residual from. Use marginal.z_train_source=tabicl (default) "
-                "or one of exaone/tabpfn/tabldm."
-            )
         live_generate = False
     else:
         live_generate = spec.live_generate if spec.live_generate is not None else (spec.dataset_dir is None)
     return era5, live_generate, _dataset_dir_for_eval(spec, cfg, live_generate, era5)
 
 
-# (local index, global episode index, baseline cache key, episode, baseline fit seed)
-_PlannedEpisode = tuple[int, int, str, dict, int]
+class _PlannedEpisode(NamedTuple):
+    local_i: int
+    ep_i: int
+    cache_key: str
+    ep: dict
+    fit_seed: int
 
 
 def _plan_episodes(
@@ -346,5 +334,5 @@ def _plan_episodes(
             ep_i,
             source="era5" if era5 else None,
         )
-        episode_plan.append((local_i, ep_i, cache_key, ep, _baseline_fit_seed(spec.seed, cache_key)))
+        episode_plan.append(_PlannedEpisode(local_i, ep_i, cache_key, ep, _baseline_fit_seed(spec.seed, cache_key)))
     return episode_plan

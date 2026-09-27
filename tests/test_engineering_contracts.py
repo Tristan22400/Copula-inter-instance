@@ -20,7 +20,7 @@ from copula_inter.backend_registry import BACKENDS, COPULA_BACKBONES, GENERIC_MA
 from copula_inter.dataset import CopulaDataset, collate_fn
 from copula_inter.dataset_manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
 from copula_inter.episode_contracts import assemble_episodes, validate_episode
-from copula_inter.generate_pit_dataset import _refresh_meta, _save_shard_atomic
+from copula_inter.generate_pit_dataset import _refresh_meta, _save_shard_atomic, _shard_is_resumable
 from copula_inter.marginal_backbones import TIER0_PATTERNS
 from eval.results import (
     competition_ranks,
@@ -153,6 +153,21 @@ def test_meta_exposes_only_completed_contiguous_shards(tmp_path: Path) -> None:
     _save_shard_atomic([_episode(), _episode()], str(tmp_path / "shard_000001.pt"))
     _refresh_meta(str(tmp_path), 4, 2, 2, manifest["digest"])
     assert len(CopulaDataset(episode_dir=str(tmp_path))) == 4
+
+
+def test_resume_regenerates_shard_with_stale_sidecar(tmp_path: Path) -> None:
+    shard = tmp_path / "shard_000000.pt"
+    _save_shard_atomic([_episode()], str(shard))
+    sidecar_path = shard.with_suffix(".count.json")
+    sidecar = json.loads(sidecar_path.read_text())
+
+    atomic_torch_save([_episode()], shard)
+    sidecar["mtime_ns"] = -1
+    sidecar_path.write_text(json.dumps(sidecar))
+
+    assert not _shard_is_resumable(str(shard), 1)
+    _save_shard_atomic([_episode()], str(shard))
+    assert _shard_is_resumable(str(shard), 1)
 
 
 def test_atomic_save_keeps_old_file_on_failure(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

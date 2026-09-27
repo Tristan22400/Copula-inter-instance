@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 
 from copula_inter.artifacts import artifact_identity, atomic_json_save
 from copula_inter.config_path import config_dict
-from copula_inter.rng import seed_everything
+from copula_inter.rng import resolve_device, seed_everything
 from eval.baselines.classical import (
     baseline_fingerprint,
     load_baseline_cache,
@@ -278,11 +278,7 @@ def run_evaluation(spec: EvalSpec) -> None:
     spec.config = resolve_config_path(spec.config)
     seed_everything(spec.seed)
 
-    device = torch.device(
-        "cuda"
-        if (spec.device == "auto" and torch.cuda.is_available())
-        else (spec.device if spec.device != "auto" else "cpu")
-    )
+    device = torch.device(resolve_device(spec.device))
     print(f"Device: {device}")
 
     # cfg: the episode-generating config from spec.config (not the checkpoint's).
@@ -360,11 +356,16 @@ def run_evaluation(spec: EvalSpec) -> None:
 
     # ---- Scored-results cache: the checkpoint-DEPENDENT half of a resume ----
     results_cache = spec.output.results_cache
-    results_fp = _results_fingerprint(
-        fingerprint,
-        spec,
-        tabicl_pit_k_folds,
-        resolved_marginal=tabicl_ckpt if spec.marginal.z_train_source == "tabicl" else None,
+    # Hashes the checkpoint, so only built when a results cache will use it.
+    results_fp = (
+        _results_fingerprint(
+            fingerprint,
+            spec,
+            tabicl_pit_k_folds,
+            resolved_marginal=tabicl_ckpt if spec.marginal.z_train_source == "tabicl" else None,
+        )
+        if results_cache is not None
+        else {}
     )
     results_entries = _load_results_cache(results_cache, results_fp) if results_cache is not None else {}
     if spec.baselines.refresh:

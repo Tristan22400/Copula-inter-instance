@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
 from omegaconf import OmegaConf
 
 if TYPE_CHECKING:
@@ -30,6 +29,7 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
+from copula_inter.rng import resolve_device
 from eval.baselines import independent, standard_gp
 from eval.configs.checkpoints import resolve_checkpoint
 from eval.datasets import sensor_imputation, spatial_housing, synthetic_bbo
@@ -167,11 +167,7 @@ def validate(args: BenchmarkSpec) -> None:
 
 
 def run(args: BenchmarkSpec) -> None:
-    device = (
-        "cuda"
-        if (args.device == "auto" and torch.cuda.is_available())
-        else (args.device if args.device != "auto" else "cpu")
-    )
+    device = resolve_device(args.device)
     print(f"Device: {device}")
 
     benchmark_names = list(args.benchmarks)

@@ -15,11 +15,10 @@ from typing import Any, Callable, TypeVar
 
 import hydra
 from hydra.core.config_store import ConfigStore
-from hydra.core.global_hydra import GlobalHydra
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import MissingMandatoryValue
 
-from copula_inter.config_path import config_dict, config_dir
+from copula_inter.config_path import compose_config, config_dict, config_dir
 
 T = TypeVar("T")
 
@@ -109,10 +108,7 @@ def reject_argparse_flags(
 def compose_spec(config_name: str, schema: type[T], overrides: list[str] | None = None) -> T:
     """Compose conf/eval/<config_name>.yaml with overrides into a schema instance, without running anything."""
     _register(config_name, schema)
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-    with hydra.initialize_config_dir(config_dir=EVAL_CONF_DIR, version_base=None):
-        return _to_spec(hydra.compose(config_name=config_name, overrides=overrides or []), schema)
+    return _to_spec(compose_config(EVAL_CONF_DIR, config_name, overrides), schema)
 
 
 def hydra_entry(

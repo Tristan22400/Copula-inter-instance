@@ -61,7 +61,7 @@ from copula_inter.pit import (
     normalize_targets,
     run_pit_batched_grad,
 )
-from copula_inter.rng import seed_everything
+from copula_inter.rng import resolve_device, seed_everything
 from copula_inter.training_core import cosine_lr_lambda
 
 if TYPE_CHECKING:
@@ -389,12 +389,6 @@ def save_marginal_checkpoint(
     if extra:
         payload.update(extra)
     atomic_torch_save(payload, path)
-
-
-def _resolve_device(spec: str) -> str:
-    if spec != "auto":
-        return spec
-    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @dataclass
@@ -769,7 +763,7 @@ def _export_final(run: _PhaseARun, selector: _BestSelector, total_steps: int) ->
 
 @hydra.main(config_path=config_dir(__file__), config_name="finetune_marginal", version_base=None)
 def main(cfg: DictConfig) -> None:
-    device = _resolve_device(str(cfg.training.device))
+    device = resolve_device(str(cfg.training.device))
     torch.set_float32_matmul_precision(str(cfg.training.matmul_precision))
     seed_everything(int(cfg.seed))
     print(OmegaConf.to_yaml(cfg))

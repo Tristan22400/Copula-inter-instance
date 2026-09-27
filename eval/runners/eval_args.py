@@ -188,6 +188,17 @@ def validate_eval_spec(spec: EvalSpec) -> None:
     check_choice("baselines.gp_val_select", spec.baselines.gp_val_select, GP_VAL_SELECT_MODES)
     check_choice("baselines.device", spec.baselines.device, ("cpu", "cuda", "auto"))
     check_choice("selection.oracle_mode", spec.selection.oracle_mode, ("prior", "posterior"))
+    if spec.era5.enabled:
+        if spec.dataset_dir is not None:
+            raise ValueError("era5.enabled and dataset_dir are mutually exclusive episode sources.")
+        if spec.live_generate:
+            raise ValueError("era5.enabled and live_generate are mutually exclusive episode sources.")
+        if spec.marginal.z_train_source == "oracle":
+            raise ValueError(
+                "era5.enabled has no oracle marginal: real ERA5 has no generating GP to take "
+                "an exact LOO-PIT residual from. Use marginal.z_train_source=tabicl (default) "
+                "or one of exaone/tabpfn/tabldm."
+            )
     if not 0 <= spec.min_icl_coverage <= 1:
         raise ValueError("min_icl_coverage must lie in [0, 1]")
     if spec.min_icl_coverage and spec.marginal.z_train_source == "oracle":

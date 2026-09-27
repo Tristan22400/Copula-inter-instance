@@ -23,6 +23,7 @@ from copula_inter.probe_batches import (
     _build_tabicl_kernel_fit_z,
     _build_tabicl_val_z,
 )
+from copula_inter.rng import resolve_device
 
 if TYPE_CHECKING:
     from copula_inter.model import CopulaTabICL
@@ -148,11 +149,7 @@ class ValidationProbes:
 
 def resolve_train_device(cfg: DictConfig) -> tuple[str, float | None]:
     """Resolve training.device; on CUDA enable TF32 matmuls and return the GPU's peak FLOPs for MFU."""
-    device = (
-        "cuda"
-        if cfg.training.device == "auto" and torch.cuda.is_available()
-        else ("cpu" if cfg.training.device == "auto" else cfg.training.device)
-    )
+    device = resolve_device(cfg.training.device)
     gpu_peak_flops: float | None = None
     if device == "cuda":
         gpu_peak_flops = get_gpu_peak_flops()

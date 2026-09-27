@@ -1,4 +1,4 @@
-"""Global RNG seeding."""
+"""Run setup: global RNG seeding and device selection."""
 
 from __future__ import annotations
 
@@ -14,3 +14,10 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(spec: str) -> str:
+    """spec, with "auto" meaning CUDA when available, else CPU."""
+    if spec != "auto":
+        return spec
+    return "cuda" if torch.cuda.is_available() else "cpu"

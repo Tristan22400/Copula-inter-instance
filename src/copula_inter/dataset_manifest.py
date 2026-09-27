@@ -101,10 +101,13 @@ def verified_shard_digest(
     return count, digest
 
 
-def contiguous_shard_counts(directory: str | os.PathLike[str], n_shards: int, shard_size: int) -> list[int]:
+def contiguous_shard_counts(
+    directory: str | os.PathLike[str], n_shards: int, shard_size: int, start: int = 0
+) -> list[int]:
+    """Episode counts of the finished shards from index start up to the first gap."""
     root = Path(directory)
     counts = []
-    for idx in range(n_shards):
+    for idx in range(start, n_shards):
         shard = root / f"shard_{idx:06d}.pt"
         sidecar = shard_count_path(shard)
         if not shard.is_file() or not sidecar.is_file():

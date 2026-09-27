@@ -33,7 +33,7 @@ from copula_inter.pit import (
     normalize_targets,
     tabicl_forward,
 )
-from copula_inter.rng import seed_everything
+from copula_inter.rng import resolve_device, seed_everything
 from eval.baselines.autoregressive import autoregressive_log_pdf
 from eval.configs.checkpoints import (
     resolve_checkpoint,
@@ -118,11 +118,7 @@ class AutoregressiveBaselineSpec:
 
 def run(args: AutoregressiveBaselineSpec) -> None:
     seed_everything(args.seed)
-    device = torch.device(
-        "cuda"
-        if (args.device == "auto" and torch.cuda.is_available())
-        else (args.device if args.device != "auto" else "cpu")
-    )
+    device = torch.device(resolve_device(args.device))
     print(f"Device: {device}")
 
     cfg = _load_full_config(args.config)

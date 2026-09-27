@@ -16,6 +16,17 @@ def config_dir(caller_file: str) -> str:
     return str(files("conf"))
 
 
+def compose_config(conf_dir: str, config_name: str, overrides: list[str] | None = None) -> DictConfig:
+    """Compose conf_dir/<config_name>.yaml outside a running Hydra app (resets Hydra's global state)."""
+    import hydra
+    from hydra.core.global_hydra import GlobalHydra
+
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    with hydra.initialize_config_dir(config_dir=conf_dir, version_base=None):
+        return hydra.compose(config_name=config_name, overrides=overrides or [])
+
+
 def config_dict(cfg: DictConfig, resolve: bool = True) -> dict[str, Any]:
     """cfg as a plain dict, interpolations resolved unless resolve=False."""
     out = OmegaConf.to_container(cfg, resolve=resolve)

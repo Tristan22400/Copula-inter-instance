@@ -295,12 +295,12 @@ def _prefit_baselines(ctx: _EvalContext, episode_plan: list[_PlannedEpisode], ca
     n_workers = _baseline_worker_count(spec, ctx.baseline_device)
     fitted: dict[str, dict] = {}
     if ctx.baseline_cache is not None and not spec.baselines.refresh:
-        for _, ep_i, cache_key, _, _ in episode_plan:
-            entry = _valid_cached_entry(cache_entries, cache_key, ep_i)
+        for planned in episode_plan:
+            entry = _valid_cached_entry(cache_entries, planned.cache_key, planned.ep_i)
             if entry is not None:
-                fitted[cache_key] = entry
+                fitted[planned.cache_key] = entry
 
-    pending = [(cache_key, fit_seed, ep) for _, _, cache_key, ep, fit_seed in episode_plan if cache_key not in fitted]
+    pending = [(p.cache_key, p.fit_seed, p.ep) for p in episode_plan if p.cache_key not in fitted]
     print(
         f"\nBaselines: {len(fitted)} episode(s) reused from cache, "
         f"{len(pending)} to fit on {ctx.baseline_device.type}"
