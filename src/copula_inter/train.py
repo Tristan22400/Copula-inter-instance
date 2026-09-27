@@ -35,6 +35,7 @@ from copula_inter.train_setup import (
     build_validation_probes,
     dataset_name,
     init_wandb_run,
+    prepare_training_inputs,
     resolve_train_device,
 )
 from copula_inter.validation import validate
@@ -344,6 +345,7 @@ def _refresh_tabicl_mix(
 
 @hydra.main(config_path=config_dir(__file__), config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
+    resume_ckpt = prepare_training_inputs(cfg)
     torch.manual_seed(cfg.seed)
     device, gpu_peak_flops = resolve_train_device(cfg)
 
@@ -357,7 +359,7 @@ def main(cfg: DictConfig) -> None:
         # Real ERA5 has no oracle R_star.
         print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
         t.aux_mae_weight = 0.0
-    resume_ckpt = init_wandb_run(cfg=cfg, dataset_name=dataset_name(t, cfg.data, live_generation), t=t)
+    init_wandb_run(cfg=cfg, dataset_name=dataset_name(t, cfg.data, live_generation), t=t)
 
     data = build_data_loaders(cfg=cfg, device=device, live_generation=live_generation, live_source=live_source, t=t)
     probes = build_validation_probes(

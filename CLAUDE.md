@@ -11,11 +11,14 @@ Workflow to run:
   # 2. Train
   python -m copula_inter.train training.live_generation=false training.dataset_dir=./data/pilot/pit
   # 3. Evaluate vs. classical baselines (synthetic GP episodes). Defaults to
-  #    --z_train_source tabicl (K-fold TabICL PIT context, matching real
+  #    marginal.z_train_source=tabicl (K-fold TabICL PIT context, matching real
   #    deployment) so the total marginal+copula NLL table is populated;
-  #    pass --z_train_source oracle for the exact-GP-LOO idealized upper bound,
-  #    or exaone/tabpfn/tabldm to score against the marginal a run trained with.
-  python eval/runners/eval_checkpoint.py --ckpt kernel-sweep-all-tabicl-retrain-15k
+  #    pass marginal.z_train_source=oracle for the exact-GP-LOO idealized upper
+  #    bound, or exaone/tabpfn/tabldm to score against the marginal a run
+  #    trained with (then also autoregressive.enabled=false).
+  #    Every eval runner takes Hydra key=value overrides (typed dataclass
+  #    configs, conf/eval/<runner>.yaml); `--cfg job` lists every key.
+  python -m eval.runners.eval_checkpoint ckpt=kernel-sweep-all-tabicl-retrain-15k
 
   # 3a. SAME comparison, REAL data: the identical baseline table on real
   #     ARCO-ERA5 2m-temperature episodes instead of synthetic GP draws
@@ -25,25 +28,25 @@ Workflow to run:
   #     GP prior/posterior Y-space rows are nan, and the shared z_test every
   #     row is scored against is the frozen-TabICL K-fold PIT rather than a
   #     ground-truth marginal -- read the TOTAL Y-space NLL table, which is a
-  #     proper scoring rule regardless. --z_train_source=oracle is rejected.
+  #     proper scoring rule regardless. marginal.z_train_source=oracle is rejected.
   #     Targets are z-scored per episode before the baselines are fitted
-  #     (--era5_standardize_y, on by default) and converted back to raw Kelvin
+  #     (era5.standardize_y, on by default) and converted back to raw Kelvin
   #     nats: ERA5 y is ~280 K while classical.py's GP hyperpriors assume
   #     data_gen.py's O(1) draws, so leaving them raw handicaps the baselines
   #     on units alone while our model normalizes internally.
   #     Needs the corpus cached once (defaults to the held-out val year):
   #       python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 \
   #           --cache-dir ./eval/data/cache/era5_global_val
-  python eval/runners/eval_checkpoint.py --era5 --n_episodes 400 \
-      --ckpt kernel-sweep-all-tabicl-retrain-15k
-  oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt <ckpt>"   # on Grid5000
+  python -m eval.runners.eval_checkpoint era5.enabled=true n_episodes=400 \
+      ckpt=kernel-sweep-all-tabicl-retrain-15k
+  oarsub -S "./scripts/eval_checkpoint_era5.sh ckpt=<ckpt>"   # on Grid5000
   #     Baseline fitting is ~98% of the runtime and is checkpoint-independent,
   #     so a SECOND checkpoint over the same episodes/geometry reuses the whole
-  #     --baseline_cache and only redoes the ICL forward pass. Give each
-  #     checkpoint its own --results_cache, share the --baseline_cache.
+  #     baselines.cache and only redoes the ICL forward pass. Give each
+  #     checkpoint its own output.results_cache, share the baselines.cache.
   #
   #     AUTOREGRESSIVE row (eval/baselines/autoregressive.py), ON BY DEFAULT
-  #     under --era5. Same marginal, no copula head: reveal the test points one
+  #     for the TabICL marginal. Same marginal, no copula head: reveal the test points one
   #     at a time so each prediction conditions on the ones already revealed.
   #     log p(y_1..y_N) = sum_i log p(y_s(i) | ctx, y_s(<i)) is an exact
   #     factorization of a joint density, so the row is directly comparable to
@@ -53,36 +56,39 @@ Workflow to run:
   #     what the sequencing bought. Step 0 reproduces the one-shot PIT's
   #     log_pdf_test bit-for-bit (the chain keeps the full P+N table at every
   #     step and only moves the context/query split) -- tests/test_
-  #     autoregressive.py pins that. Batched over --era5_pit_batch episodes at
+  #     autoregressive.py pins that. Batched over era5.pit_batch episodes at
   #     once; GPU-bound, so its cost tracks the card: measured 1.5 s/episode
   #     on an RTX PRO 6000 Blackwell, 3.6 s/episode on an RTX A5000.
-  #       --no-autoregressive          turn the row off
-  #       --ar_order natural           reveal in grid order instead of a seeded
+  #       autoregressive.enabled=false turn the row off
+  #       autoregressive.order=natural reveal in grid order instead of a seeded
   #                                    per-episode permutation (an ICL model is
   #                                    not a coherent joint, so the total really
   #                                    does depend on the order; "natural" hands
   #                                    nearly every step a just-revealed
   #                                    neighbour and reads as a best case)
-  #       --ar_conditioning sample     append a DRAW instead of the true y
+  #       autoregressive.conditioning=sample  append a DRAW instead of the true y
   #                                    (ancestral sampling). The printed number
   #                                    is then NOT a density of y_test and is
   #                                    NOT comparable to the other rows -- the
   #                                    table prints a warning saying so.
-  #       --ar_max_context K           cap the chain's context (the episode's
+  #       autoregressive.max_context=K cap the chain's context (the episode's
   #                                    own P are always kept; oldest revealed
   #                                    dropped first)
-  #       --ar_n_episodes M            run the chain on the first M episodes
+  #       autoregressive.n_episodes=M  run the chain on the first M episodes
   #     TabICL marginal only -- the exaone/tabpfn/tabldm backends expose no
   #     one-query-at-a-time entry point and raise rather than drop the row.
 
   # 3b. Evaluate on real-world datasets (UCI Beijing PM2.5, California Housing)
-  python eval/runners/run_benchmarks.py
+  python -m eval.runners.run_benchmarks
 
   # 4. Finetune an existing checkpoint on real, worldwide ARCO-ERA5 data
   #    (random geographic region + random grid resolution every episode,
   #    instead of synthetic GP kernels). One-time corpus fetch first, then:
   python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
-  python -m copula_inter.finetune_era5 --ckpt kernel-sweep-all-tabicl-retrain-15k
+  python -m copula_inter.train experiment=finetune_era5 training.resume_ckpt=kernel-sweep-all-tabicl-retrain-15k model.rank=32
+  #    model.* must match the checkpoint (that family is rank 32; the default
+  #    preset is 128). The preset (conf/experiment/finetune_era5.yaml) lists the usual extras;
+  #    oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=<ckpt> model.rank=32" on Grid5000 for this checkpoint family.
 
 Marginal fine-tuning (Phase A) — make the MARGINAL branch correct, separately from
 the copula. The loss is copula + marginal (Sklar), but the marginal comes from a
@@ -92,7 +98,7 @@ a checkpoint path. src/copula_inter/model.py and conf/config.yaml are untouched.
   # 1. Measure the defect first -- zero training, one table. The headline number is
   #    the marginal-NLL gap to the ANALYTIC GP oracle (y is a pure GP draw, so the
   #    correct marginal posterior is known in closed form).
-  python eval/runners/marginal_calibration_eval.py --ckpt pretrained
+  python -m eval.runners.marginal_calibration_eval ckpt=pretrained
   # 2. Fine-tune. Hydra-native (no argparse), own wandb project copula-inter-marginal.
   #    Tier 0 = label path + ICL norms + decoder (~1.6M/5.5%); escalate to tier 1
   #    (+ LoRA on icl_predictor) only if the oracle gap plateaus above zero.
@@ -119,8 +125,8 @@ a checkpoint path. src/copula_inter/model.py and conf/config.yaml are untouched.
   # 3. Re-measure, then gate on real data (must not regress -- the whole point of a
   #    TabICL marginal is non-Gaussian tabular transfer, which GP-only training can
   #    destroy), then hand the result to a normal copula run:
-  python eval/runners/marginal_calibration_eval.py --ckpt <the _final.pt>
-  python eval/runners/run_benchmarks.py
+  python -m eval.runners.marginal_calibration_eval ckpt=<the _final.pt>
+  python -m eval.runners.run_benchmarks
   python -m copula_inter.train tabicl.pit_ckpt=<the _final.pt>
 Phase A checkpoints for backbone=tabicl are plain TabICL ({"config","state_dict"});
 other backbones use the same shape plus a "backbone" tag. Both are registered in
@@ -131,21 +137,21 @@ iterates. Do not mix the two.
 Spatial-correlation diagnostics (real ERA5 + synthetic-kernel ground truth), one CLI:
   # One-shot: sweep every registered checkpoint (real + synthetic) -> baseline curve
   # fits -> report figures. Auto-fetches/caches ERA5, zero required flags.
-  # `sweep --mode real` (and hence `all`) also scores a real total (marginal+
+  # command=sweep command.mode=real (and hence the default command=all) also scores a real total (marginal+
   # copula) joint NLL per config on held-out real-ERA5 points, alongside the
   # correlation-curve-shape model_r2 -- model_r2 alone can't tell you how many
   # nats worse the actual predictive density is.
-  python eval/runners/spatial_correlation_eval.py all
+  python -m eval.runners.spatial_correlation_eval
 
-  # Individual subcommands (see --help on each for full flag list):
-  python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-15k --mode real --region western_europe --grid-size 24
-  python eval/runners/spatial_correlation_eval.py sweep --mode synthetic --checkpoints all
-  python eval/runners/spatial_correlation_eval.py baseline --mode real
-  python eval/runners/spatial_correlation_eval.py report
+  # Individual subcommands (command=<name> --cfg job lists that command's keys):
+  python -m eval.runners.spatial_correlation_eval command=diagnose command.ckpt=kernel-sweep-all-tabicl-retrain-15k command.mode=real command.region=western_europe command.grid_size=24
+  python -m eval.runners.spatial_correlation_eval command=sweep command.mode=synthetic command.checkpoints=all
+  python -m eval.runners.spatial_correlation_eval command=baseline command.mode=real
+  python -m eval.runners.spatial_correlation_eval command=report
 
   # Real ERA5 marginal-quantile calibration (independence-copula + per-quantile ECE
-  # diagnostics), real TabICL, auto-fetches a small ERA5 sample if --nc-path omitted:
-  python eval/runners/era5_calibration_eval.py
+  # diagnostics), real TabICL, auto-fetches a small ERA5 sample if nc_path is unset:
+  python -m eval.runners.era5_calibration_eval
 
 Checkpoint families, named regions, and shared constants for the above live in
 eval/configs/ (checkpoints.py, regions.py, constants.py) — add a new checkpoint family

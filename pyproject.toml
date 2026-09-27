@@ -60,7 +60,7 @@ copula_inter = "src/copula_inter"
 tabicl = "tabicl_upstream/src/tabicl"
 
 [tool.setuptools.package-data]
-conf = ["*.yaml", "data/*.yaml", "model/*.yaml"]
+conf = ["*.yaml", "data/*.yaml", "model/*.yaml", "experiment/*.yaml", "eval/*.yaml"]
 
 [tool.setuptools.packages.find]
 where = [".", "src", "tabicl_upstream/src"]

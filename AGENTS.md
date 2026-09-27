@@ -20,7 +20,10 @@ as `python -m copula_inter.<module>` with the checkout on `PYTHONPATH`
 - `backend_registry.py`: supported marginal and copula backbones and their
   capabilities. Add a backend here, then implement its adapter under
   `eval/spatial/` or `src/copula_inter/` and run the relevant backend tests.
-- `eval/runners/eval_checkpoint.py`: evaluation CLI (`run_evaluation`);
+- `eval/runners/`: one Hydra entry point per runner (`hydra_cli.hydra_entry`), each
+  with a typed dataclass config composed from `conf/eval/<runner>.yaml`; add a
+  setting as a dataclass field, not a flag. `eval_checkpoint.py`: evaluation
+  (`run_evaluation`, config `eval_args.EvalSpec`);
   `eval/baselines/classical.py`: baseline fits and their cache;
   `eval/baselines/prefit.py`: parallel prefit and CV best-baseline;
   `eval/runners/eval_tables.py`: printed tables; `eval/results.py`: summaries.

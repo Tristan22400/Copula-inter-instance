@@ -32,7 +32,7 @@ from glob import glob
 
 import torch
 import wandb
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
@@ -66,6 +66,12 @@ from copula_inter.pit import (
 )
 from copula_inter.training_core import (
     cosine_lr_lambda,
+)
+from eval.configs.checkpoints import resolve_checkpoint
+
+# ${path_stem:<path>} in the ERA5 fine-tuning preset's checkpoint directory.
+OmegaConf.register_new_resolver(
+    "path_stem", lambda path: os.path.splitext(os.path.basename(str(path)))[0], replace=True
 )
 
 # Peak dense FP16/BF16 tensor-core TFLOPS by device-name substring, for MFU.
@@ -188,6 +194,26 @@ def get_gpu_peak_flops(device: int = 0) -> float:
         "TFLOPS. MFU numbers will be approximate."
     )
     return _GPU_PEAK_FLOPS_DEFAULT
+
+
+def prepare_training_inputs(cfg: DictConfig) -> str | None:
+    """Resolve the resume checkpoint and validate ERA5 input paths before starting a run."""
+    t = cfg.training
+    resume_ckpt = t.get("resume_ckpt", None)
+    if bool(t.get("resume_required", False)) and not resume_ckpt:
+        raise ValueError("training.resume_ckpt is required: pass training.resume_ckpt=<ckpt>")
+    if resume_ckpt:
+        resolved = os.path.abspath(resolve_checkpoint(str(resume_ckpt)))
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"training.resume_ckpt not found: {resolved}")
+        t.resume_ckpt = resolved
+
+    if bool(t.get("live_generation", False)) and t.get("live_source", "gp") == "era5":
+        for key in ("corpus_dir", "val_corpus_dir"):
+            path = cfg.era5_live.get(key, None)
+            if path is not None and (not os.path.isdir(path) or not os.listdir(path)):
+                raise FileNotFoundError(f"era5_live.{key} is empty or missing: {path}")
+    return t.get("resume_ckpt", None)
 
 
 def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device: str) -> None:
@@ -514,7 +540,7 @@ def build_validation_probes(
     )
 
 
-def init_wandb_run(cfg: DictConfig, dataset_name: str, t: DictConfig) -> str | None:
+def init_wandb_run(cfg: DictConfig, dataset_name: str, t: DictConfig) -> None:
     """Name the run from its model/training settings and start wandb."""
     lora_cfg = cfg.get("lora", None)
     lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
@@ -570,7 +596,6 @@ def init_wandb_run(cfg: DictConfig, dataset_name: str, t: DictConfig) -> str | N
         name=run_name,
         config=config_dict(cfg),
     )
-    return resume_ckpt
 
 
 def build_data_loaders(

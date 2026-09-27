@@ -35,10 +35,11 @@ a different dataset. The training command is a full run; override
 Evaluate a trained checkpoint with:
 
 ```bash
-python eval/runners/eval_checkpoint.py --ckpt kernel-sweep-all-tabicl-retrain-15k
+python -m eval.runners.eval_checkpoint ckpt=kernel-sweep-all-tabicl-retrain-15k
 ```
 
-Use `--dump_episodes scores.json` during evaluation to save per-episode
+Eval runners take Hydra `key=value` overrides; add `--cfg job` to list every
+key. Use `output.dump_episodes=scores.json` during evaluation to save per-episode
 scores; `python -m eval.results scores.json` renders totals later without
 loading either model.
 

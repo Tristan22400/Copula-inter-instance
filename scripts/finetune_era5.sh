@@ -6,7 +6,8 @@
 #OAR -q p1
 #
 # Finetune an existing copula-model checkpoint on real, worldwide ARCO-ERA5
-# data (src/copula_inter/finetune_era5.py -> src/copula_inter/train.py training.live_source=era5).
+# data: copula_inter.train with the conf/experiment/finetune_era5.yaml preset.
+# Arguments are Hydra overrides for copula_inter.train.
 #
 # Prerequisite: a local ERA5 corpus (one-time, ~125MB/month; run on a
 # frontend or its own OAR job -- needs network, not GPU):
@@ -14,10 +15,10 @@
 #
 # Submit with:
 #     mkdir -p logs
-#     oarsub -S "./scripts/finetune_era5.sh --ckpt ./checkpoints/kernel-sweep-all-tabicl-retrain/step_0015000.pt"
+#     oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=kernel-sweep-all-tabicl-retrain-15k model.rank=32"
 #
-# Pass any finetune_era5.py flag through, e.g.:
-#     oarsub -S "./scripts/finetune_era5.sh --ckpt ./checkpoints/<run>/step_XXXXXXX.pt --steps 20000 --corpus-dir ./eval/data/cache/era5_global"
+# Pass any other override through, e.g.:
+#     oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=./checkpoints/<run>/step_XXXXXXX.pt training.steps=20000 era5_live.corpus_dir=./eval/data/cache/era5_global"
 
 set -euo pipefail
 
@@ -34,6 +35,6 @@ echo "[$(date +%H:%M:%S)] GPU: $(nvidia-smi --query-gpu=name --format=csv,nohead
 echo "[$(date +%H:%M:%S)] Finetuning on real ERA5 data..."
 echo "    args: $*"
 
-python -m copula_inter.finetune_era5 "$@"
+python -m copula_inter.train experiment=finetune_era5 "$@"
 
 echo "[$(date +%H:%M:%S)] Finetuning complete."
