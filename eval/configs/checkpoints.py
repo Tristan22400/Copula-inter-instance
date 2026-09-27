@@ -90,16 +90,39 @@ CHECKPOINT_FAMILIES = {
 }
 
 
+_REPO_ROOT = os.path.dirname(_CHECKPOINTS_ROOT)
+
+
+def _existing_path(name_or_path: str) -> str | None:
+    """`name_or_path` as a usable path, or None if it names no file on disk.
+
+    A relative path is tried against the REPO ROOT as well as the process's
+    cwd, because the configs spell their checkpoints "./checkpoints/..." --
+    which silently stops resolving the moment a run starts anywhere but the
+    repo root (a git worktree, an OAR script that cd's elsewhere), and the
+    failure is not "file not found" but a confusing 404 from the HF hub, which
+    is where load_tabicl sends anything that is not a path.
+    """
+    if os.path.exists(name_or_path):
+        return name_or_path
+    if not os.path.isabs(name_or_path):
+        rooted = os.path.join(_REPO_ROOT, name_or_path)
+        if os.path.exists(rooted):
+            return rooted
+    return None
+
+
 def resolve_checkpoint(name_or_path: str) -> str:
     """Resolve a `--ckpt`/`--checkpoints` token to a checkpoint file path.
 
     Accepts, in order:
-      - a raw path that exists on disk (returned unchanged)
+      - a path that exists, relative to the cwd or to the repo root
       - "family" -> CHECKPOINT_FAMILIES[family]'s dir + default_step
       - "family:step" -> CHECKPOINT_FAMILIES[family]'s dir + explicit step
     """
-    if os.path.exists(name_or_path):
-        return name_or_path
+    existing = _existing_path(name_or_path)
+    if existing is not None:
+        return existing
     family, _, step_str = name_or_path.partition(":")
     if family not in CHECKPOINT_FAMILIES:
         raise ValueError(
@@ -109,6 +132,19 @@ def resolve_checkpoint(name_or_path: str) -> str:
     entry = CHECKPOINT_FAMILIES[family]
     step = int(step_str) if step_str else entry["default_step"]
     return os.path.join(_CHECKPOINTS_ROOT, entry["dir"], f"step_{step:07d}.pt")
+
+
+# The copula checkpoint eval_checkpoint.py scores when --ckpt is not passed.
+# A name, not a path, so the file it points at is chosen in exactly one place
+# (the registry entry above) -- and so the printed run header says which
+# lineage is being scored, not just a step number.
+#
+# Two properties of this entry that are NOT true of the prod families, and
+# that a run against it has to state rather than bury: its copula head is rank
+# 512 (the others are 32), and rank enters baseline_fingerprint (it sizes
+# per_ep_transformer's low-rank factor), so this checkpoint CANNOT share a
+# --baseline_cache with them -- give it its own and expect a full fit pass.
+DEFAULT_CHECKPOINT_FAMILY = "copula-nano-finetune-marginal-float32"
 
 
 def all_family_names() -> list[str]:
@@ -179,7 +215,7 @@ def resolve_marginal_checkpoint(name_or_path: str) -> str:
     """Resolve a marginal-checkpoint token to something ``pit.load_tabicl`` takes.
 
     Accepts, in order:
-      - a raw path that exists on disk (returned unchanged)
+      - a path that exists, relative to the cwd or to the repo root
       - a MARGINAL_FAMILIES name with an ``hf_name`` -> that HF filename
       - "family" / "family:step" -> that family's dir + step under checkpoints/
       - anything else -> returned unchanged, so a bare HF filename still works
@@ -187,8 +223,9 @@ def resolve_marginal_checkpoint(name_or_path: str) -> str:
         HF filename anyway, and failing here would be a worse error than the
         one the HF hub gives).
     """
-    if os.path.exists(name_or_path):
-        return name_or_path
+    existing = _existing_path(name_or_path)
+    if existing is not None:
+        return existing
     family, _, step_str = name_or_path.partition(":")
     entry = MARGINAL_FAMILIES.get(family)
     if entry is None:

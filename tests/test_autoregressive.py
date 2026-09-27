@@ -30,6 +30,10 @@ Tests verify:
   7. "autoregressive" is in _TOTAL_NLL_ORDER but NOT in _METHOD_ORDER: it has
      no correlation matrix, so it must not reach the z-space table or the
      best-of-baselines ranking.
+  8. attach_autoregressive runs on any episode source: it batches only
+     episodes of matching (P, N) and leaves each episode's result in raw
+     nats, undoing a standardized episode's y_log_std so the row is
+     differenceable against that episode's one-shot log_pdf_test.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ from era5_live_dataset import _pit_group  # noqa: E402
 from eval.baselines.autoregressive import (  # noqa: E402
     _orderings,
     ar_parts_from_log_pdf,
+    attach_autoregressive,
     autoregressive_log_pdf,
 )
 from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: E402
@@ -214,3 +219,97 @@ def test_ar_note_warns_on_sampled_conditioning():
     assert "WARNING" in sampled and "max_context=64" in sampled
     assert _ar_note([{"autoregressive": _NAN_PARTS.copy()}], "random",
                     "teacher_forcing", None) is None
+
+
+class SmoothFakeTabICL(nn.Module):
+    """Fake marginal whose predictive is a SMOOTH function of the table: the
+    context mean as location, a fixed scale.
+
+    RowIndependentFakeTabICL hashes the table's float sum into an RNG seed, so
+    a 1e-7 difference in the input gives a completely different distribution —
+    fine for the equivalence tests it was written for, useless for checking a
+    numerical identity that only ever holds up to round-off.
+    """
+
+    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        n = X.shape[1] - y.shape[1]
+        loc = y.mean(dim=1, keepdim=True).expand(-1, n)
+        return torch.stack([loc, torch.zeros_like(loc), torch.zeros_like(loc)], dim=-1)
+
+    def quantile_dist(self, logits_flat: torch.Tensor):
+        return RowIndependentFakeTabICL.quantile_dist(self, logits_flat)
+
+
+def _episode_dicts(shapes, seed=0):
+    """One episode dict per (P, N, d_x) in `shapes`, carrying exactly the fields
+    attach_autoregressive is allowed to read — the fields every episode source
+    in this repo populates."""
+    eps = []
+    for i, (P, N, d_x) in enumerate(shapes):
+        x_tr, y_tr, x_te, y_te = _episodes(B=1, P=P, N=N, d_x=d_x, seed=seed + i)
+        eps.append({
+            "x_norm_train": x_tr[0], "y_train": y_tr[0],
+            "x_norm_test": x_te[0], "y_test": y_te[0],
+        })
+    return eps
+
+
+def test_attach_batches_matching_shapes_and_isolates_mismatched_ones():
+    tabicl = RecordingFakeTabICL()
+    # Two episodes of one geometry (batchable), then one differing in N and
+    # one differing only in d_x — live-generated synthetic episodes vary in
+    # both, and either alone makes the tables unstackable.
+    shapes = [(6, 5, 3), (6, 5, 3), (7, 4, 3), (6, 5, 2)]
+    eps = _episode_dicts(shapes)
+
+    n = attach_autoregressive(
+        list(enumerate(eps)), tabicl, order="natural", seed=0, batch_size=8,
+        verbose=False,
+    )
+
+    assert n == 4
+    for ep, (_, N, _) in zip(eps, shapes):
+        assert ep["ar_log_pdf"].shape == (N,)
+    # 5 chain steps for the batched pair, plus 4 and 5 for the two that could
+    # not join it — the pair shared its forwards rather than each paying its own.
+    assert len(tabicl.calls) == 5 + 4 + 5
+
+
+def test_attach_undoes_a_standardized_episodes_jacobian():
+    """An episode stored in standardized y (ERA5's --era5_standardize_y)
+    carries log(std) as y_log_std; the attached row must come back in the same
+    RAW nats as an episode stored raw, or it is not differenceable against
+    log_pdf_test."""
+    raw = _episode_dicts([(6, 5, 3)])[0]
+    mean, std = raw["y_train"].mean(), raw["y_train"].std()
+    scaled = dict(
+        raw,
+        y_train=(raw["y_train"] - mean) / std,
+        y_test=(raw["y_test"] - mean) / std,
+        y_log_std=float(std.log()),
+    )
+
+    tabicl = SmoothFakeTabICL()
+    attach_autoregressive([(0, raw)], tabicl, order="natural", seed=0, verbose=False)
+    attach_autoregressive([(0, scaled)], tabicl, order="natural", seed=0, verbose=False)
+
+    assert torch.allclose(raw["ar_log_pdf"], scaled["ar_log_pdf"], atol=1e-4)
+    # The correction is the Jacobian, not a no-op: without it the standardized
+    # episode's row would sit log(std) away from the raw one.
+    assert not torch.allclose(
+        raw["ar_log_pdf"], scaled["ar_log_pdf"] + float(std.log()), atol=1e-4
+    )
+
+
+def test_attach_keys_the_ordering_on_the_given_global_index():
+    """The (index, episode) pairs carry GLOBAL indices, so an episode gets the
+    same visit order whether it was scored in one long run or in a shard."""
+    tabicl = RowIndependentFakeTabICL()
+    a, b = _episode_dicts([(6, 5, 3)]), _episode_dicts([(6, 5, 3)])
+
+    attach_autoregressive([(7, a[0])], tabicl, seed=0, verbose=False)
+    alone = a[0]["ar_log_pdf"].clone()
+    # Same episode, same global index 7, but now batched behind another one.
+    attach_autoregressive([(0, b[0]), (7, a[0])], tabicl, seed=0, verbose=False)
+
+    assert torch.allclose(alone, a[0]["ar_log_pdf"], atol=1e-5)

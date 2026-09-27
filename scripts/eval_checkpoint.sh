@@ -7,12 +7,14 @@
 #
 # Evaluate an ICL checkpoint against classical baselines (eval/runners/eval_checkpoint.py).
 #
-# Submit with:
+# Submit with (--ckpt optional -- it defaults to
+# eval/configs/checkpoints.py's DEFAULT_CHECKPOINT_FAMILY):
 #     mkdir -p logs
-#     oarsub -S "./scripts/eval_checkpoint.sh --ckpt ./checkpoints/<run>/step_XXXXXXX.pt"
+#     oarsub -S ./scripts/eval_checkpoint.sh
 #
-# Pass any eval_checkpoint.py flag through, e.g.:
-#     oarsub -S "./scripts/eval_checkpoint.sh --ckpt ./checkpoints/test_temp/step_0005000.pt --live_generate --n_episodes 200"
+# Pass any eval_checkpoint.py flag through, including another checkpoint by
+# path or by registry name:
+#     oarsub -S "./scripts/eval_checkpoint.sh --ckpt kernel-sweep-all-tabicl-retrain-15k --n_episodes 200"
 
 set -euo pipefail
 

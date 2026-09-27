@@ -38,11 +38,13 @@
 #     python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 \
 #         --cache-dir ./eval/data/cache/era5_global_val
 #
-# Submit with:
+# Submit with (--ckpt optional -- it defaults to
+# eval/configs/checkpoints.py's DEFAULT_CHECKPOINT_FAMILY):
 #     mkdir -p logs
-#     oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt ./checkpoints/<run>/step_XXXXXXX.pt"
+#     oarsub -S ./scripts/eval_checkpoint_era5.sh
 #
-# Any eval_checkpoint.py flag passes through, e.g. a different geometry:
+# Any eval_checkpoint.py flag passes through, e.g. another checkpoint or a
+# different geometry:
 #     oarsub -S "./scripts/eval_checkpoint_era5.sh --ckpt <...> --era5_grid_size 16 --n_episodes 800"
 #
 # Disk: the baseline cache holds 16 N x N correlation matrices per episode, so
@@ -59,14 +61,13 @@
 # d_x=9), so do not size a reservation off eval_checkpoint.py's synthetic
 # 78.6 s/episode figure.
 #
-# On top of that, the autoregressive row (on by default under --era5, see
-# eval/baselines/autoregressive.py) adds a GPU pass during the episode build,
-# before the fit pass. Unlike everything else here it is GPU-bound, so its
-# cost tracks the card and not the core count: measured 1.5 s/episode on an
-# RTX PRO 6000 Blackwell and 3.6 s/episode on an RTX A5000, i.e. ~10 to ~24
-# min for 400. It is also the only part of the run that is neither cached nor
-# checkpoint-dependent, so a resumed run pays it again; --no-autoregressive
-# drops it.
+# On top of that, the autoregressive row (on by default whenever the marginal
+# is TabICL, see eval/baselines/autoregressive.py) adds a GPU pass before the
+# fit pass. Unlike everything else here it is GPU-bound, so its cost tracks
+# the card and not the core count: measured 1.5 s/episode on an RTX PRO 6000
+# Blackwell and 3.6 s/episode on an RTX A5000, i.e. ~10 to ~24 min for 400.
+# A resumed run skips it for every episode whose scored results the
+# --results_cache already holds; --no-autoregressive drops it entirely.
 #
 # Sharding across an OAR array: every episode is a pure function of
 # (--seed, its GLOBAL index), so --n_episodes 100 with --episode_offset
@@ -103,6 +104,11 @@ echo "    args: $*"
 # ~98% of the runtime and is checkpoint-independent, so a second --ckpt over
 # the same episodes reuses every fit and only redoes the cheap ICL forward
 # pass. --results_cache IS checkpoint-dependent; override it per checkpoint.
+# One exception to the sharing: the copula head's RANK is in the baseline
+# fingerprint (it sizes per_ep_transformer's low-rank factor), so checkpoints
+# of different rank cannot share one cache. The default checkpoint is rank
+# 512 and the prod families are 32 -- mixing them refits, correctly but from
+# scratch. Point --baseline_cache somewhere else when switching rank.
 # -u: unbuffered, so a run killed at its walltime still shows its progress.
 python -u eval/runners/eval_checkpoint.py \
     --era5 \

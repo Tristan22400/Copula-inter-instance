@@ -65,7 +65,7 @@ from __future__ import annotations
 import os
 import sys
 import zlib
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -80,6 +80,7 @@ from pit import tabicl_forward
 
 __all__ = [
     "autoregressive_log_pdf",
+    "attach_autoregressive",
     "ar_parts_from_log_pdf",
     "AR_ORDERS",
     "AR_CONDITIONINGS",
@@ -253,6 +254,89 @@ def autoregressive_log_pdf(
         "order": visit,
         "appended": appended * std + mean,
     }
+
+
+def _stack(
+    group: Sequence[tuple[int, dict]], key: str, device: Optional[torch.device],
+) -> torch.Tensor:
+    """One episode field of a whole group, stacked into a leading batch axis."""
+    batched = torch.stack([ep[key] for _, ep in group])
+    return batched if device is None else batched.to(device)
+
+
+def attach_autoregressive(
+    episodes: Sequence[tuple[int, dict]],
+    tabicl,
+    *,
+    order: str = "random",
+    conditioning: str = "teacher_forcing",
+    max_context: Optional[int] = None,
+    seed: int = 0,
+    batch_size: int = 8,
+    device: Optional[torch.device] = None,
+    verbose: bool = True,
+) -> int:
+    """Run the chain over already-built episodes and store each one's result
+    as ``ep["ar_log_pdf"]`` (N,), in RAW target nats. Returns how many
+    episodes got one.
+
+    Source-agnostic on purpose: it reads only the four fields every episode
+    dict in this repo carries (x_norm_train/y_train/x_norm_test/y_test), so
+    the same row appears for synthetic GP draws, a --dataset_dir, and real
+    ERA5 alike. `episodes` is a sequence of (global episode index, episode)
+    pairs — the index, not the position in the list, is what seeds the visit
+    ordering, so a sharded run and a single long one agree (see _orderings).
+
+    Episodes are batched only with others of the exact same (P, N, d_x):
+    autoregressive_log_pdf folds the batch into TabICL's own batch axis, so a
+    group must agree on every table dimension. ERA5's fixed geometry makes
+    that one big bucket (measured ~4x over B=1); synthetic episodes vary in
+    both N and d_x and mostly land in buckets of one, which is the plain B=1
+    chain and still correct.
+
+    Episodes left out by the caller simply carry no ar_log_pdf: the runner
+    reads ep.get("ar_log_pdf") and averages the row over the episodes that
+    have one, rather than poisoning the mean with nans.
+    """
+    todo = list(episodes)
+    if not todo:
+        return 0
+
+    buckets: dict[tuple[int, int, int], list[tuple[int, dict]]] = {}
+    for ep_i, ep in todo:
+        P, d_x = ep["x_norm_train"].shape
+        shape = (int(P), int(ep["x_norm_test"].shape[0]), int(d_x))
+        buckets.setdefault(shape, []).append((ep_i, ep))
+
+    done = 0
+    step = max(1, int(batch_size))
+    for (P, N, d_x), bucket in buckets.items():
+        for start in range(0, len(bucket), step):
+            group = bucket[start:start + step]
+            table = {
+                key: _stack(group, key, device)
+                for key in ("x_norm_train", "y_train", "x_norm_test", "y_test")
+            }
+            out = autoregressive_log_pdf(
+                tabicl, table["x_norm_train"], table["y_train"],
+                table["x_norm_test"], table["y_test"],
+                order=order, conditioning=conditioning, max_context=max_context,
+                seed=seed, episode_indices=[ep_i for ep_i, _ in group],
+            )
+            for b, (_, ep) in enumerate(group):
+                # log p_raw(y) = log p_scaled(y_scaled) - log(std). An episode
+                # whose targets were rescaled before being stored (ERA5's
+                # --era5_standardize_y) carries that log(std) as y_log_std;
+                # every other source leaves it 0.0 and this is a no-op. What
+                # comes out is in the same raw nats as the PIT's log_pdf_test,
+                # which ar_parts_from_log_pdf differences it against.
+                shift = float(ep.get("y_log_std", 0.0))
+                ep["ar_log_pdf"] = (out["log_pdf"][b] - shift).detach().float().cpu()
+            done += len(group)
+            if verbose:
+                print(f"  [ar] {done}/{len(todo)} episodes "
+                      f"(P={P}, N={N}, d_x={d_x})", flush=True)
+    return done
 
 
 def ar_parts_from_log_pdf(

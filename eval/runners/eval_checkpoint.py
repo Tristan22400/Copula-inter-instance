@@ -149,7 +149,9 @@ from data_gen import _parse_composite, generate_gp_batch  # noqa: E402
 from dataset import CopulaDataset  # noqa: E402
 
 from eval.configs.checkpoints import (  # noqa: E402
+    DEFAULT_CHECKPOINT_FAMILY,
     DEFAULT_MARGINAL_FAMILY,
+    resolve_checkpoint,
     resolve_marginal_checkpoint,
 )
 from eval.configs.constants import N_CONTEXT  # noqa: E402
@@ -174,6 +176,7 @@ from eval.baselines.autoregressive import (  # noqa: E402
     AR_CONDITIONINGS,
     AR_ORDERS,
     ar_parts_from_log_pdf,
+    attach_autoregressive,
 )
 from eval.baselines.classical import (  # noqa: E402
     EXPECTED_BASELINE_KEYS,
@@ -1401,7 +1404,15 @@ def main() -> None:
                              "independent of --ckpt's saved training cfg. "
                              "Keeping this fixed is what lets the baseline "
                              "cache survive switching checkpoints.")
-    parser.add_argument("--ckpt",         required=True)
+    parser.add_argument("--ckpt",         default=DEFAULT_CHECKPOINT_FAMILY,
+                        help="Copula checkpoint to score: a path, or a name from "
+                             "eval/configs/checkpoints.py's CHECKPOINT_FAMILIES "
+                             "(\"family\" for its default step, \"family:step\" for "
+                             f"another). Defaults to {DEFAULT_CHECKPOINT_FAMILY}. Its "
+                             "copula head is rank 512 where the prod families are 32, "
+                             "and rank enters the baseline fingerprint, so give this "
+                             "checkpoint its own --baseline_cache rather than one "
+                             "built for a prod checkpoint.")
     parser.add_argument("--dataset_dir",  default=None,
                         help="Episode directory to evaluate on (overrides "
                              "training.dataset_dir from --config). Passing "
@@ -1476,10 +1487,14 @@ def main() -> None:
                              "autoregressive.py). An exact factorization of a joint "
                              "density, so it is directly comparable to every other row, "
                              "and it is the copula-free reference the copula head has to "
-                             "beat. ERA5 episode source only (--era5); on by default "
-                             "there, where it costs a GPU-bound 1.5-3.6 s/episode "
-                             "depending on the card, against the CPU baseline fits' "
-                             "~8.4 s on 32 physical cores.")
+                             "beat. Runs on every episode source (synthetic, --dataset_dir "
+                             "and --era5 alike) and is on by default wherever it can run, "
+                             "i.e. --z_train_source=tabicl: the chain calls that marginal "
+                             "one query at a time, which oracle and the batched "
+                             "exaone/tabpfn/tabldm backends have no entry point for. Costs "
+                             "a GPU-bound 1.5-3.6 s/episode at the --era5 geometry "
+                             "depending on the card, against the CPU baseline fits' ~8.4 s "
+                             "on 32 physical cores.")
     parser.add_argument("--ar_order", default="random", choices=list(AR_ORDERS),
                         help="Order the chain reveals test points in. An in-context "
                              "learner is not a coherent joint, so the chain-rule total "
@@ -1503,6 +1518,13 @@ def main() -> None:
                              "own P are always kept; the oldest revealed points are "
                              "dropped first). None (default) keeps every revealed point, "
                              "which at the --era5 defaults grows the context 30 -> 576.")
+    parser.add_argument("--ar_batch", type=int, default=8,
+                        help="How many episodes the chain advances per forward pass. Only "
+                             "episodes sharing the same (P, N, d_x) are batched together, "
+                             "since the batch axis is folded into TabICL's own — so this is "
+                             "a real ~4x under --era5's fixed geometry (measured 13.4 ms "
+                             "per forward for one episode against 21.4 ms for 8) and mostly "
+                             "a no-op on synthetic episodes, whose N and d_x both vary.")
     parser.add_argument("--ar_n_episodes", type=int, default=None,
                         help="Run the chain on only the first N episodes (None = all). "
                              "The row then averages over those episodes and the rest "
@@ -1802,21 +1824,29 @@ def main() -> None:
                              "and can be merged by concatenating their 'entries' dicts.")
     args = parser.parse_args()
 
-    # --autoregressive defaults to ON under --era5 (a GPU-bound 1.5-3.6
-    # s/episode next to the baseline fits' ~8.4 s of CPU, and the chain-rule
-    # row is the copula-free reference the copula head is being judged
-    # against on real data) and is
-    # unavailable elsewhere -- it is computed inside build_era5_eval_episodes,
-    # which is where the marginal is still loaded. Resolved HERE, before the
-    # checkpoint is read off disk, so an unsatisfiable request fails in
-    # milliseconds instead of after a multi-GB load.
-    if args.autoregressive and not args.era5:
+    # A family name or a repo-root-relative path both become a real path here,
+    # once, so everything downstream (the load, the printed header, the
+    # results cache's "ckpt" field) sees the same resolved spelling.
+    args.ckpt = resolve_checkpoint(str(args.ckpt))
+
+    # The chain needs the TabICL marginal itself, called one query at a time
+    # with a growing context: --z_train_source=oracle has no marginal model at
+    # all, and the exaone/tabpfn/tabldm backends are reached only through
+    # _BATCHED_MARGINAL_BACKENDS' fit-then-predict-a-whole-block interface
+    # (src/marginal_backbones.py), which has no such entry point. So the row
+    # is on by default wherever it CAN run -- every episode source alike, real
+    # or synthetic -- and an explicit request elsewhere is an error rather
+    # than a silently dropped row. Resolved HERE, before the checkpoint is
+    # read off disk, so an unsatisfiable request fails in milliseconds instead
+    # of after a multi-GB load.
+    ar_available = args.z_train_source == "tabicl"
+    if args.autoregressive and not ar_available:
         raise ValueError(
-            "--autoregressive currently requires --era5: the chain runs inside "
-            "build_era5_eval_episodes, the one place the marginal is loaded and "
-            "batched over a whole group of episodes."
+            f"--autoregressive is implemented for the TabICL marginal only, not for "
+            f"--z_train_source={args.z_train_source}. Re-run with --no-autoregressive, "
+            f"or with the default --z_train_source=tabicl."
         )
-    args.autoregressive = bool(args.era5) if args.autoregressive is None else bool(args.autoregressive)
+    args.autoregressive = ar_available if args.autoregressive is None else bool(args.autoregressive)
 
     _set_seed(args.seed)
 
@@ -1989,19 +2019,8 @@ def main() -> None:
             pit_group_size=args.era5_pit_batch,
             marginal_backend=marginal_backend, marginal_regressor=marginal_regressor,
             marginal_probs_n=args.marginal_probs_n,
-            autoregressive=args.autoregressive, ar_order=args.ar_order,
-            ar_conditioning=args.ar_conditioning,
-            ar_max_context=args.ar_max_context, ar_n_episodes=args.ar_n_episodes,
             **era5_geometry,
         )
-        # The PIT is done: every episode carries its own marginal_pit, so the
-        # scoring loop never touches these again. Release them now rather than
-        # pinning VRAM through the multi-hour CPU baseline pass (a multi-GB
-        # backbone for the exaone/tabldm marginals).
-        tabicl_marginal = None
-        marginal_regressor = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     elif live_generate:
         # cfg (the fixed eval-generating config, not icl_cfg) drives live
         # generation — same source already used for prior_cfg above — so
@@ -2133,6 +2152,48 @@ def main() -> None:
         episode_plan.append(
             (local_i, ep_i, cache_key, ep, _baseline_fit_seed(args.seed, cache_key))
         )
+
+    # ---- Autoregressive chain-rule row (eval/baselines/autoregressive.py) ---
+    # The copula-free reference the copula head has to beat, computed here —
+    # once the episode plan exists and while the marginal is still loaded and
+    # on-device — so every episode source gets the row on the same terms.
+    # Episodes whose scored results are already cached are skipped: the row
+    # lives in those cached total_nlls (see _results_fingerprint), so a
+    # resumed run no longer pays the chain's GPU time for them again.
+    if args.autoregressive:
+        scored = results_entries if use_results_cache else {}
+        # --ar_n_episodes counts from the front of the PLAN, not of what is
+        # left to do, so "the first M episodes" names the same M whether or
+        # not this run resumed from a results cache.
+        planned = (
+            episode_plan if args.ar_n_episodes is None
+            else episode_plan[:args.ar_n_episodes]
+        )
+        ar_todo = [
+            (ep_i, ep) for local_i, ep_i, _, ep, _ in planned
+            if str(ep_i) not in scored or local_i == args.plot_episode
+        ]
+        print(f"\nAutoregressive chain over {len(ar_todo)} episode(s): "
+              f"order={args.ar_order}, conditioning={args.ar_conditioning}, "
+              f"max_context={args.ar_max_context}, batch={args.ar_batch}")
+        attach_autoregressive(
+            ar_todo, tabicl_marginal,
+            order=args.ar_order, conditioning=args.ar_conditioning,
+            max_context=args.ar_max_context, seed=args.seed,
+            batch_size=args.ar_batch, device=device,
+        )
+
+    if era5:
+        # The PIT (and the chain above) are done: every ERA5 episode carries
+        # its own marginal_pit, so the scoring loop never touches the marginal
+        # again. Release it now rather than pinning VRAM through the
+        # multi-hour CPU baseline pass (a multi-GB backbone for the
+        # exaone/tabldm marginals). Synthetic episodes are PIT'd inside the
+        # loop instead, so theirs has to stay.
+        tabicl_marginal = None
+        marginal_regressor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ---- Parallel pre-fit of the expensive, checkpoint-independent half ----
     # Everything the evaluation loop needs that does NOT depend on --ckpt is
