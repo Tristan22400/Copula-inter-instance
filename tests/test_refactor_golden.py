@@ -1,9 +1,8 @@
-"""This checkout reproduces pre-refactor main's numerics (tests/refactor_golden.py has the what and how).
+"""This checkout reproduces pre-refactor main's numerics (see tests/refactor_golden.py).
 
-The golden file was computed on main @ 42c0402 with the pre-refactor source tree; on the same
-machine the refactor reproduces it bit-for-bit. The tolerance only absorbs cross-machine BLAS /
-CPU-kernel differences -- a real behavioural change (different RNG consumption, a changed
-formula, a reordered parameter) moves these values by orders of magnitude more.
+PyTorch versions can change seeded parameter initialization, so each supported test runtime has a
+golden computed from main @ 42c0402 under that same version. Within a version, the tolerance only
+absorbs cross-machine BLAS / CPU-kernel differences.
 """
 
 from __future__ import annotations
@@ -15,12 +14,20 @@ import torch
 from refactor_golden import GOLDEN_REF, SMALL_MODEL_CFG, compute, load_modules
 
 REPO = Path(__file__).resolve().parents[1]
-GOLDEN = Path(__file__).resolve().parent / "data" / "refactor_golden.pt"
+_TORCH_MINOR = ".".join(torch.__version__.split("+", 1)[0].split(".")[:2])
+_GOLDEN_NAMES = {
+    "2.11": "refactor_golden_torch_2_11.pt",
+    "2.14": "refactor_golden.pt",
+}
+GOLDEN_NAME = _GOLDEN_NAMES.get(_TORCH_MINOR)
+GOLDEN = Path(__file__).resolve().parent / "data" / GOLDEN_NAME if GOLDEN_NAME is not None else None
 RTOL, ATOL = 1e-4, 1e-5
 
 
 @pytest.fixture(scope="module")
 def golden() -> dict:
+    if GOLDEN is None:
+        pytest.skip(f"no pre-refactor golden is recorded for PyTorch {_TORCH_MINOR}")
     return torch.load(GOLDEN, map_location="cpu", weights_only=False)
 
 
@@ -61,12 +68,12 @@ def test_seeded_model_init_matches_pre_refactor_main(golden: dict, current: tupl
     assert not bad, f"{len(bad)} parameter(s) drifted from main @ {GOLDEN_REF}:\n" + "\n".join(bad)
 
 
-def test_pre_refactor_state_dict_loads_strictly() -> None:
+def test_pre_refactor_state_dict_loads_strictly(golden: dict) -> None:
     """A state_dict written by pre-refactor code loads into today's model with no key/shape drift."""
     from omegaconf import OmegaConf
 
     from copula_inter.model import build_copula_transformer
 
-    state = torch.load(GOLDEN, map_location="cpu", weights_only=False)["init_state"]
+    state = golden["init_state"]
     model = build_copula_transformer(OmegaConf.create(SMALL_MODEL_CFG))
     model.load_state_dict(state, strict=True)
