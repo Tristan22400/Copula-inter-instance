@@ -18,13 +18,10 @@ from copula_inter.backend_registry import COPULA_BACKBONES
 from tabicl._model.tabicl import TabICL
 
 __all__ = [
-    "BACKBONE_NAMES",
     "load_raw_backbone",
     "strip_decoder",
     "moe_aux_loss",
 ]
-
-BACKBONE_NAMES: tuple[str, ...] = COPULA_BACKBONES
 
 
 def _load_pretrained_tabicl(ckpt_name: str, recompute: bool = False) -> TabICL:
@@ -122,7 +119,7 @@ def load_raw_backbone(name: str, cfg: DictConfig) -> nn.Module:
         return _build_tabicl_scratch(cfg)
     if name == "tabldm":
         return _load_tabldm(cfg)
-    raise ValueError(f"Unknown copula backbone {name!r}; expected one of {list(BACKBONE_NAMES)}.")
+    raise ValueError(f"Unknown copula backbone {name!r}; expected one of {list(COPULA_BACKBONES)}.")
 
 
 def strip_decoder(module: Any) -> int:

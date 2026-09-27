@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from omegaconf import MISSING
 
-from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES, get_backend
 from eval.baselines.autoregressive import AR_CONDITIONINGS, AR_ORDERS
 from eval.baselines.classical import GP_VAL_SELECT_MODES
 from eval.configs.checkpoints import resolve_checkpoint
@@ -190,7 +190,8 @@ def validate_eval_spec(spec: EvalSpec) -> None:
     if spec.min_icl_coverage and spec.marginal.z_train_source == "oracle":
         raise ValueError("min_icl_coverage requires a learned marginal")
     # The autoregressive chain needs the TabICL marginal.
-    if spec.autoregressive.enabled and spec.marginal.z_train_source != "tabicl":
+    z_src = spec.marginal.z_train_source
+    if spec.autoregressive.enabled and (z_src == "oracle" or not get_backend(z_src).autoregressive):
         raise ValueError(
             "autoregressive.enabled requires marginal.z_train_source=tabicl: the chain needs "
             "a marginal callable with a growing context. Re-run with "

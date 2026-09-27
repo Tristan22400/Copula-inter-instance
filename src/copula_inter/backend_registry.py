@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from functools import partial
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -46,19 +45,31 @@ def z_train_source(cfg: HasDataConfig) -> str:
     return str((data or {}).get("z_train_source", DEFAULT_Z_TRAIN_SOURCE))
 
 
-def require_capability(name: str, capability: str) -> Backend:
+def validate_z_train_source(value: str) -> None:
+    """Raise ValueError if data.z_train_source is not a recognized value."""
+    if value not in Z_TRAIN_SOURCES:
+        raise ValueError(
+            f"Unknown data.z_train_source {value!r}; expected {', '.join(repr(v) for v in Z_TRAIN_SOURCES)}."
+        )
+
+
+def get_backend(name: str) -> Backend:
     try:
-        spec = BACKENDS[name]
+        return BACKENDS[name]
     except KeyError as exc:
         raise ValueError(f"unknown backend {name!r}; choose from {tuple(BACKENDS)}") from exc
+
+
+def require_capability(name: str, capability: str) -> Backend:
+    spec = get_backend(name)
     if not getattr(spec, capability):
         raise ValueError(f"backend {name!r} does not support {capability}")
     return spec
 
 
-def batched_backend_factories() -> dict[str, Callable[[], Callable]]:
-    def factory(path: str) -> Callable[..., Any]:
-        module, symbol = path.split(":")
-        return getattr(importlib.import_module(module), symbol)
-
-    return {name: partial(factory, spec.batched_pit) for name, spec in BACKENDS.items() if spec.batched_pit}
+def batched_pit(name: str) -> Callable[..., Any]:
+    """Import and return ``name``'s batched PIT function (lazy: heavy optional dependencies)."""
+    path = require_capability(name, "batched_pit").batched_pit
+    assert path is not None
+    module, symbol = path.split(":")
+    return getattr(importlib.import_module(module), symbol)

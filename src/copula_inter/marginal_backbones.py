@@ -27,18 +27,14 @@ if TYPE_CHECKING:
     from tabicl._model.quantile_dist import QuantileToDistribution
 
 from copula_inter.artifacts import atomic_torch_save
-from copula_inter.backend_registry import BACKENDS
+from copula_inter.backend_registry import MARGINAL_BACKENDS, get_backend
 
 __all__ = [
-    "BACKBONE_NAMES",
     "TIER0_PATTERNS",
-    "MAX_TIER",
     "MarginalBackbone",
     "load_backbone",
     "resolve_tier",
 ]
-
-BACKBONE_NAMES: tuple[str, ...] = tuple(BACKENDS)
 
 # Tier-0 parameter patterns per backbone: the label path, output norms and the
 # quantile decoder (tests/test_marginal_backbones.py checks each matches).
@@ -71,15 +67,13 @@ TIER0_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Highest tier (stage LoRA) per backbone. All-layer LoRA is not limited by this.
-MAX_TIER: dict[str, int] = {name: spec.max_tier for name, spec in BACKENDS.items()}
-
 
 def resolve_tier(backbone_name: str, tier: int) -> int:
     """Return tier if backbone_name supports it, else raise ValueError."""
-    if backbone_name not in MAX_TIER:
-        raise ValueError(f"Unknown marginal backbone {backbone_name!r}; expected one of {list(BACKBONE_NAMES)}.")
-    top = MAX_TIER[backbone_name]
+    if backbone_name not in MARGINAL_BACKENDS:
+        raise ValueError(f"Unknown marginal backbone {backbone_name!r}; expected one of {list(MARGINAL_BACKENDS)}.")
+    # Highest tier (stage LoRA); all-layer LoRA is not limited by this.
+    top = get_backend(backbone_name).max_tier
     if tier > top:
         raise ValueError(
             f"marginal.tier={tier} is not available for backbone {backbone_name!r} "
@@ -108,25 +102,11 @@ class MarginalBackbone:
     def tier0_patterns(self) -> tuple[str, ...]:
         return TIER0_PATTERNS[self.name]
 
-    @property
-    def max_tier(self) -> int:
-        return MAX_TIER[self.name]
-
     def parameters(self, *args: Any, **kwargs: Any) -> Iterator[nn.Parameter]:
         return self.module.parameters(*args, **kwargs)
 
     def named_parameters(self, *args: Any, **kwargs: Any) -> Iterator[tuple[str, nn.Parameter]]:
         return self.module.named_parameters(*args, **kwargs)
-
-    def trainable_report(self) -> dict:
-        n_train = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
-        n_total = sum(p.numel() for p in self.module.parameters())
-        return {
-            "backbone": self.name,
-            "n_trainable_params": int(n_train),
-            "n_total_params": int(n_total),
-            "trainable_frac": float(n_train / max(n_total, 1)),
-        }
 
     @property
     def native_quantile_count(self) -> int:
@@ -399,8 +379,8 @@ _QUANTILE_FORWARDS: dict[str, Callable] = {
 
 def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda") -> MarginalBackbone:
     """Build a fine-tunable backbone via eval/spatial/marginal_backends.make_regressor, optionally loading a Phase-A checkpoint."""
-    if name not in BACKBONE_NAMES:
-        raise ValueError(f"Unknown marginal backbone {name!r}; expected one of {list(BACKBONE_NAMES)}.")
+    if name not in MARGINAL_BACKENDS:
+        raise ValueError(f"Unknown marginal backbone {name!r}; expected one of {list(MARGINAL_BACKENDS)}.")
 
     if name == "tabicl":
         from copula_inter.pit import PRETRAINED_TABICL_CKPT, load_tabicl
@@ -410,7 +390,7 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
 
     if name == "tabpfn":
         raise NotImplementedError(
-            "Phase-A fine-tuning for tabpfn is wired (TIER0_PATTERNS/MAX_TIER above) "
+            "Phase-A fine-tuning for tabpfn is wired (TIER0_PATTERNS above, max_tier in backend_registry) "
             "but has never been executed: PriorLabs gates the weights behind a licence "
             "and TABPFN_TOKEN, which this environment does not have, so its parameter "
             "names are taken from published layout rather than from a loaded model. "
@@ -420,13 +400,8 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
 
     from eval.spatial.marginal_backends import make_regressor
 
-    regressor = make_regressor(name, device=device)
+    regressor = make_regressor(name, device=device, ckpt=ckpt)
     module = _trainable_module(name, regressor)
-    if ckpt:
-        payload = torch.load(ckpt, map_location=device, weights_only=False)
-        if payload.get("backbone") not in (None, name):
-            raise ValueError(f"checkpoint {ckpt} was written for backbone {payload.get('backbone')!r}, not {name!r}.")
-        module.load_state_dict(payload["state_dict"], strict=True)
     return MarginalBackbone(name=name, module=module, handle=regressor, config={})
 
 

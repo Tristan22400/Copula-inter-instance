@@ -24,6 +24,7 @@ from omegaconf import DictConfig
 from torch import Tensor
 
 from copula_inter import copula_backbones
+from copula_inter.backend_registry import COPULA_BACKBONES
 from copula_inter.correlation_factory import (
     LowRankCorrelationFactor,
     cossim_correlation,
@@ -226,10 +227,8 @@ def build_copula_transformer(cfg: DictConfig) -> CopulaTabICL:
     cfg.lora.{enabled, rank, alpha, target, stages}.
     """
     backbone_name = str(cfg.model.get("backbone", "tabicl"))
-    if backbone_name not in copula_backbones.BACKBONE_NAMES:
-        raise ValueError(
-            f"Unknown cfg.model.backbone={backbone_name!r}; expected one of {list(copula_backbones.BACKBONE_NAMES)}."
-        )
+    if backbone_name not in COPULA_BACKBONES:
+        raise ValueError(f"Unknown cfg.model.backbone={backbone_name!r}; expected one of {list(COPULA_BACKBONES)}.")
     base = copula_backbones.load_raw_backbone(backbone_name, cfg)
 
     model = CopulaTabICL(

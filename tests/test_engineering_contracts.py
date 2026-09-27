@@ -39,7 +39,7 @@ from eval.runners.eval_args import (
 )
 from eval.runners.eval_checkpoint import _results_fingerprint
 from eval.runners.eval_inputs import _dataset_dir_for_eval, _load_full_config
-from eval.spatial.marginal_backends import BACKEND_NAMES, _exaone_capture_quantile_bank
+from eval.spatial.marginal_backends import _exaone_capture_quantile_bank
 
 
 def _episode(p: int = 3, n: int = 2, d: int = 4) -> dict:
@@ -267,7 +267,7 @@ def test_backend_registry_capabilities() -> None:
     assert set(COPULA_BACKBONES) == {"tabicl", "tabldm"}
     assert set(GENERIC_MARGINAL_BACKENDS) == {"exaone", "tabpfn", "tabldm"}
     assert all(name == backend.name for name, backend in BACKENDS.items())
-    assert set(BACKENDS) == set(BACKEND_NAMES) == set(TIER0_PATTERNS)
+    assert set(BACKENDS) == set(TIER0_PATTERNS)
     with pytest.raises(ValueError, match="does not support"):
         require_capability("exaone", "copula_backbone")
 

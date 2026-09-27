@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
+from copula_inter.backend_registry import MARGINAL_BACKENDS
 from eval.configs import constants  # noqa: E402
 from eval.configs.checkpoints import resolve_checkpoint  # noqa: E402
 from eval.metrics.joint_nll import compute_joint_nll  # noqa: E402
@@ -38,7 +39,7 @@ from eval.spatial.diagnostics import (  # noqa: E402
     bin_correlation_by_distance,
     build_synthetic_grid_task,
 )
-from eval.spatial.marginal_backends import BACKEND_NAMES, loo_pit, make_regressor, quantiles  # noqa: E402
+from eval.spatial.marginal_backends import loo_pit, make_regressor, quantiles  # noqa: E402
 from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias  # noqa: E402
 from inference.copula_inference import (
     load_copula_model,  # noqa: E402
@@ -161,7 +162,7 @@ def main() -> None:
         "--backends",
         type=str,
         default="tabicl,exaone",
-        help=f"Comma-separated subset of {BACKEND_NAMES}. 'tabpfn' needs TABPFN_TOKEN.",
+        help=f"Comma-separated subset of {list(MARGINAL_BACKENDS)}. 'tabpfn' needs TABPFN_TOKEN.",
     )
     parser.add_argument(
         "--profile", type=str, default="low_context_7config", choices=list(constants.SYNTHETIC_SWEEP_PROFILES)
@@ -175,8 +176,8 @@ def main() -> None:
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     for b in backends:
-        if b not in BACKEND_NAMES:
-            raise ValueError(f"Unknown backend '{b}', choose from {BACKEND_NAMES}.")
+        if b not in MARGINAL_BACKENDS:
+            raise ValueError(f"Unknown backend '{b}', choose from {list(MARGINAL_BACKENDS)}.")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = resolve_checkpoint(args.ckpt)

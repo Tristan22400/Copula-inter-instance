@@ -1,6 +1,6 @@
 """Tests for data.z_train_source validation and the "y_train" source.
 
-_validate_z_train_source rejects unknown values (e.g. "tabicl-split") at
+validate_z_train_source rejects unknown values (e.g. "tabicl-split") at
 every call site before other requirements are checked. "y_train" uses the
 z-scored target as z_train, leaves z_test/log_pdf_test analytic, and is
 rejected by the on-disk generator.
@@ -13,9 +13,8 @@ from typing import TYPE_CHECKING
 import pytest
 from omegaconf import OmegaConf
 
+from copula_inter.backend_registry import Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.live_dataset import (
-    _VALID_Z_TRAIN_SOURCES,
-    _validate_z_train_source,
     build_fixed_live_val_batches,
     build_live_train_loader,
 )
@@ -26,8 +25,8 @@ if TYPE_CHECKING:
 
 
 @pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train"])
-def test_validate_z_train_source_accepts_known_values(value: str) -> None:
-    _validate_z_train_source(value)  # must not raise
+def testvalidate_z_train_source_accepts_known_values(value: str) -> None:
+    validate_z_train_source(value)  # must not raise
 
 
 @pytest.mark.parametrize(
@@ -40,14 +39,14 @@ def test_validate_z_train_source_accepts_known_values(value: str) -> None:
         "tabicl_splitt",
     ],
 )
-def test_validate_z_train_source_rejects_unknown_values(value: str) -> None:
+def testvalidate_z_train_source_rejects_unknown_values(value: str) -> None:
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
-        _validate_z_train_source(value)
+        validate_z_train_source(value)
 
 
 def test_valid_z_train_sources_matches_documented_set() -> None:
-    # _VALID_Z_TRAIN_SOURCES matches the documented values.
-    assert set(_VALID_Z_TRAIN_SOURCES) == {
+    # Z_TRAIN_SOURCES matches the documented values.
+    assert set(Z_TRAIN_SOURCES) == {
         "analytic",
         "tabicl",
         "tabicl_split",

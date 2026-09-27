@@ -24,20 +24,18 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from copula_inter.backend_registry import BACKENDS, require_capability
+from copula_inter.backend_registry import MARGINAL_BACKENDS, get_backend
 
-__all__ = ["BACKEND_NAMES", "make_regressor", "quantiles", "loo_pit"]
+__all__ = ["make_regressor", "quantiles", "loo_pit"]
 
 # Silence EXAONE's NNLS member-weighting fallback warning on small context sizes
 logging.getLogger("exaonetabular.regressor").setLevel(logging.ERROR)
-
-BACKEND_NAMES = list(BACKENDS)
 
 
 # Regressor construction (one instance reused across folds and tasks).
 def make_regressor(name: str, device: "str | None" = None, ckpt: "str | None" = None) -> Any:
     """Build a backend regressor, optionally loading a Phase-A checkpoint (MarginalBackbone.save format) into its trainable module."""
-    require_capability(name, "name")
+    get_backend(name)
     regressor = _make_pretrained_regressor(name, device)
     if ckpt:
         _load_finetuned_weights(name, regressor, ckpt, device)
@@ -104,7 +102,7 @@ def _make_pretrained_regressor(name: str, device: "str | None" = None) -> Any:
         reg._load_model = _cached_load
         reg._load_model_cached = True
         return reg
-    raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
+    raise ValueError(f"Unknown marginal backend '{name}', choose from {list(MARGINAL_BACKENDS)}.")
 
 
 def _require_tabpfn_token() -> None:
@@ -140,7 +138,7 @@ def quantiles(
         return _exaone_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
     if name == "tabldm":
         return _tabldm_quantiles(regressor, X_context, y_context, X_query, probs, seed=seed)
-    raise ValueError(f"Unknown marginal backend '{name}', choose from {BACKEND_NAMES}.")
+    raise ValueError(f"Unknown marginal backend '{name}', choose from {list(MARGINAL_BACKENDS)}.")
 
 
 @contextlib.contextmanager

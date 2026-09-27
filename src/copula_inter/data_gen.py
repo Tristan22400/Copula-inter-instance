@@ -26,7 +26,7 @@ from gpytorch.utils.cholesky import psd_safe_cholesky
 from gpytorch.utils.errors import NanError, NotPSDError
 from torch import Tensor
 
-from copula_inter.backend_registry import batched_backend_factories
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, batched_pit
 from copula_inter.episode_contracts import assemble_episodes
 from copula_inter.feature_transforms import (
     apply_kernel_hidden_warp,
@@ -58,9 +58,6 @@ if TYPE_CHECKING:
 
 # Force exact Cholesky solves for every covariance up to this size (gpytorch uses CG above max_cholesky_size).
 _MAX_CHOLESKY = 8192
-
-# z_train_source values with a batched PIT module, as lazy importers (heavy optional dependencies).
-_BATCHED_MARGINAL_BACKENDS: Dict[str, Callable[[], Callable]] = batched_backend_factories()
 
 
 # Kernel construction: _sample_episode_kernel samples B episodes' kernels;
@@ -656,7 +653,7 @@ def _marginal_pit(
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         z_train = ((y_train - y_mean) / y_std).detach()
-    elif marginal_backend in _BATCHED_MARGINAL_BACKENDS:
+    elif marginal_backend in GENERIC_MARGINAL_BACKENDS:
         # Batched PIT for a non-TabICL backend: (k_folds + 1) fused forwards for the call.
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
@@ -665,7 +662,7 @@ def _marginal_pit(
         x_train_np = draw.x_norm_train.detach().cpu().numpy()
         x_test_np = draw.x_norm_test.detach().cpu().numpy()
         base_seed = int(getattr(cfg, "seed", None) or 0)
-        _run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
+        _run_batched = batched_pit(marginal_backend)
         out = _run_batched(
             marginal_regressor,
             x_train_np,

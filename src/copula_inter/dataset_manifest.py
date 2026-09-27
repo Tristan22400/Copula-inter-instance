@@ -11,6 +11,7 @@ import torch
 from omegaconf import OmegaConf
 
 from copula_inter.artifacts import artifact_identity, canonical_digest, file_digest, mkstemp_like_open
+from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dict
 
@@ -29,12 +30,21 @@ def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
         "seed": OmegaConf.select(cfg, "seed"),
         "data": data,
         "tabicl": (
-            OmegaConf.to_container(cfg.tabicl, resolve=True)
-            if z_train_source_of(cfg) in ("tabicl", "tabicl_split") and "tabicl" in cfg
-            else None
+            config_dict(cfg.tabicl) if z_train_source_of(cfg) in TABICL_Z_TRAIN_SOURCES and "tabicl" in cfg else None
         ),
         "marginal": artifact_identity(marginal_checkpoint),
     }
+
+
+def stat_identity(path: str | os.PathLike[str]) -> dict[str, int]:
+    """The stat fields a shard sidecar records; a same-path replacement changes ctime/inode."""
+    st = os.stat(path)
+    return {"size": st.st_size, "ctime_ns": st.st_ctime_ns, "mtime_ns": st.st_mtime_ns, "inode": st.st_ino}
+
+
+def _stat_token(path: Path) -> str:
+    st = stat_identity(path)
+    return f"stat:{st['size']}:{st['mtime_ns']}:{st['ctime_ns']}:{st['inode']}"
 
 
 def ensure_manifest(directory: str | os.PathLike[str], spec: dict) -> dict:
@@ -44,7 +54,7 @@ def ensure_manifest(directory: str | os.PathLike[str], spec: dict) -> dict:
     path = root / "manifest.json"
     candidate = {"schema": SCHEMA, "spec": spec, "digest": canonical_digest(spec)}
     if not path.exists():
-        if any(root.glob("shard_*.pt")) and not path.exists():
+        if any(root.glob("shard_*.pt")):
             raise ValueError(f"{root} has shards but no manifest; use a new dataset directory")
         fd, temporary = mkstemp_like_open(prefix=".manifest.", dir=root)
         try:
@@ -82,15 +92,8 @@ def verified_shard_digest(
         raise ValueError(f"cannot resume incomplete shard {path}: count sidecar missing")
     saved = json.loads(sidecar.read_text())
     count = saved["count"]
-    stat = path.stat()
     digest = saved.get("sha256")
-    if (
-        not digest
-        or saved.get("size") != stat.st_size
-        or saved.get("ctime_ns") != stat.st_ctime_ns
-        or saved.get("mtime_ns") != stat.st_mtime_ns
-        or saved.get("inode") != stat.st_ino
-    ):
+    if not digest or any(saved.get(key) != value for key, value in stat_identity(path).items()):
         actual = file_digest(path)
         if require_match and digest and actual != digest:
             raise ValueError(f"shard content differs from its sidecar: {path}")
@@ -129,12 +132,8 @@ def dataset_identity(directory: str | os.PathLike[str]) -> dict:
             # Pre-refactor shards have no digest sidecar. Hashing every one on every eval run is
             # prohibitive for large datasets, so identify them by the same stat fields the sidecar
             # check trusts (a same-path replacement changes ctime/inode even if mtime is reset).
-            st = path.stat()
-            shards.append((path.name, f"stat:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_ino}"))
-    legacy = [
-        (p.name, f"stat:{p.stat().st_size}:{p.stat().st_mtime_ns}:{p.stat().st_ctime_ns}:{p.stat().st_ino}")
-        for p in sorted(root.glob("task_*.pt"))
-    ]
+            shards.append((path.name, _stat_token(path)))
+    legacy = [(p.name, _stat_token(p)) for p in sorted(root.glob("task_*.pt"))]
     meta = root / "meta.pt"
     return {
         "manifest": manifest,

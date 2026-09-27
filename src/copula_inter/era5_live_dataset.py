@@ -78,11 +78,11 @@ def era5_collate_fn(samples: List[dict]) -> dict:
 
 def _resolve_marginal(cfg: DictConfig) -> Tuple[Optional[str], int]:
     """(marginal_backend, marginal_probs_n) from data.z_train_source; backend None means TabICL ("analytic" is treated as TabICL)."""
-    from copula_inter.live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
+    from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, validate_z_train_source
 
     z_train_source = z_train_source_of(cfg)
-    _validate_z_train_source(z_train_source)
-    backend = z_train_source if z_train_source in _GENERIC_MARGINAL_BACKENDS else None
+    validate_z_train_source(z_train_source)
+    backend = z_train_source if z_train_source in GENERIC_MARGINAL_BACKENDS else None
     probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99)) if "data" in cfg else 99
     return backend, probs_n
 
@@ -100,9 +100,9 @@ def _backend_pit_batched(
     seed: int,
 ) -> dict:
     """Batched PIT of a group of ERA5 episodes through a non-TabICL backend; returns tensors on x_train's device."""
-    from copula_inter.data_gen import _BATCHED_MARGINAL_BACKENDS
+    from copula_inter.backend_registry import batched_pit
 
-    run_batched = _BATCHED_MARGINAL_BACKENDS[backend]()
+    run_batched = batched_pit(backend)
     out = run_batched(
         regressor,
         x_train.detach().cpu().numpy(),

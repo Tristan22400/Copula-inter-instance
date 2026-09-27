@@ -36,7 +36,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
-from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dict
 from copula_inter.dataset import (
@@ -48,11 +48,9 @@ from copula_inter.dataset import (
 from copula_inter.era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
 from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
 from copula_inter.live_dataset import (
-    _GENERIC_MARGINAL_BACKENDS,
     _LIVE_TABICL_FLAT_HEADROOM_GB,
     _LIVE_TABICL_WORKER_FIXED_OVERHEAD_GB,
     _LIVE_TABICL_WORKER_PER_EPISODE_GB,
-    _validate_z_train_source,
     build_fixed_live_val_batches,
     build_live_train_loader,
     resolve_live_tabicl_num_workers,
@@ -224,10 +222,10 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
     instead of starving the workers. Must run before training allocations.
     """
     z_train_source = z_train_source_of(cfg)
-    _validate_z_train_source(z_train_source)
+    validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     batched_marginal_worker_enabled = (
-        mix_enabled or z_train_source in TABICL_Z_TRAIN_SOURCES or z_train_source in _GENERIC_MARGINAL_BACKENDS
+        mix_enabled or z_train_source in TABICL_Z_TRAIN_SOURCES or z_train_source in GENERIC_MARGINAL_BACKENDS
     )
     if not batched_marginal_worker_enabled or device != "cuda":
         return
@@ -442,7 +440,7 @@ def build_validation_probes(
         # (data.z_train_tabicl_k_folds) under a TabICL z_train source; otherwise
         # tabicl.pit_k_folds.
         val_pit_k_folds = pit_k_folds
-        if z_train_source_of(cfg) in ("tabicl", "tabicl_split"):
+        if z_train_source_of(cfg) in TABICL_Z_TRAIN_SOURCES:
             val_pit_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", pit_k_folds))
             if val_pit_k_folds != pit_k_folds:
                 print(

@@ -35,7 +35,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from copula_inter.artifacts import atomic_json_save, atomic_torch_save, file_digest
-from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
 from copula_inter.data_gen import generate_gp_batch
@@ -44,10 +44,10 @@ from copula_inter.dataset_manifest import (
     ensure_manifest,
     generation_spec,
     shard_count_path,
+    stat_identity,
     verified_shard_digest,
 )
 from copula_inter.episode_contracts import validate_episode
-from copula_inter.live_dataset import _GENERIC_MARGINAL_BACKENDS, _validate_z_train_source
 
 _MAX_CUSOLVER_RETRIES = 8
 
@@ -164,16 +164,8 @@ def _save_shard_atomic(episodes: list, out_path: str) -> None:
     for episode in episodes:
         validate_episode(episode)
     atomic_torch_save(episodes, out_path)
-    stat = os.stat(out_path)
     atomic_json_save(
-        {
-            "count": len(episodes),
-            "sha256": file_digest(out_path),
-            "size": stat.st_size,
-            "ctime_ns": stat.st_ctime_ns,
-            "mtime_ns": stat.st_mtime_ns,
-            "inode": stat.st_ino,
-        },
+        {"count": len(episodes), "sha256": file_digest(out_path), **stat_identity(out_path)},
         shard_count_path(out_path),
     )
 
@@ -230,10 +222,10 @@ def main(cfg: DictConfig) -> None:
 
     # Load the TabICL marginal once for tabicl / tabicl_split.
     z_train_source = z_train_source_of(cfg)
-    _validate_z_train_source(z_train_source)
+    validate_z_train_source(z_train_source)
     _reject_disk_unsupported_z_train_source(z_train_source)
     tabicl_model = None
-    marginal_backend = z_train_source if z_train_source in _GENERIC_MARGINAL_BACKENDS else None
+    marginal_backend = z_train_source if z_train_source in GENERIC_MARGINAL_BACKENDS else None
     marginal_regressor = None
     marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))

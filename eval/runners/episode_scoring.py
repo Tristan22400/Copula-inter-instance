@@ -205,9 +205,9 @@ def _marginal_pit(
     y_train_scaled, y_test_scaled, _, std = normalize_targets(y_train, y_test)
     if marginal_backend is not None:
         # Batched backend PIT with a singleton episode axis.
-        from copula_inter.data_gen import _BATCHED_MARGINAL_BACKENDS
+        from copula_inter.backend_registry import batched_pit
 
-        run_batched = _BATCHED_MARGINAL_BACKENDS[marginal_backend]()
+        run_batched = batched_pit(marginal_backend)
         out = run_batched(
             marginal_regressor,
             X_train.unsqueeze(0).cpu().numpy(),

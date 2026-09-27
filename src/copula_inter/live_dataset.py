@@ -17,7 +17,7 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, Z_TRAIN_SOURCES
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.data_gen import generate_gp_batch
 from copula_inter.dataset import collate_fn
@@ -40,21 +40,8 @@ def limited_main_process_threads(n: int = _MAIN_PROCESS_GEN_THREADS) -> Iterator
         torch.set_num_threads(prev)
 
 
-# Recognized data.z_train_source values. "y_train" uses the z-scored target as
-# z_train (no marginal model; live generation only).
-_VALID_Z_TRAIN_SOURCES = Z_TRAIN_SOURCES
-_GENERIC_MARGINAL_BACKENDS = GENERIC_MARGINAL_BACKENDS
-# z_train sources that need no marginal model.
+# z_train sources that need no marginal model ("y_train": the z-scored target, live generation only).
 _RAW_Y_SOURCES = ("y_train",)
-
-
-def _validate_z_train_source(z_train_source: str) -> None:
-    """Raise ValueError if data.z_train_source is not a recognized value."""
-    if z_train_source not in _VALID_Z_TRAIN_SOURCES:
-        raise ValueError(
-            f"Unknown data.z_train_source {z_train_source!r}; expected "
-            f"{', '.join(repr(v) for v in _VALID_Z_TRAIN_SOURCES)}."
-        )
 
 
 # Per-worker VRAM estimate for GPU generation workers:
@@ -157,7 +144,7 @@ class LiveGPDataset(IterableDataset):
 
         # Load the marginal once per worker, before the generation loop.
         z_train_source = z_train_source_of(cfg)
-        _validate_z_train_source(z_train_source)
+        validate_z_train_source(z_train_source)
         raw_y_override = z_train_source in _RAW_Y_SOURCES
         tabicl_model = None
         gen_device = "cpu"
@@ -254,11 +241,11 @@ def build_live_train_loader(
     batch_size = int(t.batch_size)
 
     z_train_source = z_train_source_of(cfg)
-    _validate_z_train_source(z_train_source)
+    validate_z_train_source(z_train_source)
     mix_enabled = bool(cfg.data.get("z_train_tabicl_mix_enabled", False))
     tabicl_live_enabled = mix_enabled or z_train_source in TABICL_Z_TRAIN_SOURCES
     # Batched non-TabICL backends use the same GPU-worker setup as TabICL.
-    generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS
+    generic_marginal_enabled = z_train_source in GENERIC_MARGINAL_BACKENDS
     batched_marginal_worker_enabled = tabicl_live_enabled or generic_marginal_enabled
 
     # Group-size multiplier for GPU workers (live_group_multiplier is for CPU workers).
@@ -359,9 +346,9 @@ def build_fixed_live_val_batches(
     n_batches = max(1, (n_val + batch_size - 1) // batch_size)
 
     z_train_source = z_train_source_of(cfg)
-    _validate_z_train_source(z_train_source)
+    validate_z_train_source(z_train_source)
     tabicl_live_enabled = z_train_source in TABICL_Z_TRAIN_SOURCES
-    generic_marginal_enabled = z_train_source in _GENERIC_MARGINAL_BACKENDS
+    generic_marginal_enabled = z_train_source in GENERIC_MARGINAL_BACKENDS
     raw_y_override = z_train_source in _RAW_Y_SOURCES
     if (tabicl_live_enabled or generic_marginal_enabled) and device != "cuda":
         raise ValueError(
