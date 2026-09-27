@@ -39,13 +39,9 @@ jobs:
         run: |
           uv run --no-sync python -m compileall -q src eval inference debug tests
           uv run --no-sync python -c "import copula_inter.data_gen, copula_inter.train, eval.runners.eval_checkpoint, inference.copula_inference"
-      - name: Fast CPU regression tests
+      - name: CPU test suite
+        # Everything except the slow / gpu / pretrained / external_data tiers;
+        # scripts/test_full.sh runs those on a Grid5000 GPU node.
         run: |
-          uv run --no-sync python -m pytest -q --disable-warnings --durations=15 \
-            tests/test_lowrank_nll.py tests/test_loss.py \
-            tests/test_correlation_factory.py tests/test_corr_kl.py \
-            tests/test_pit_batched.py tests/test_resume_checkpoint.py \
-            tests/test_train_oom_cleanup.py tests/test_eval_checkpoint.py \
-            tests/test_copula_inference.py tests/test_model_config_presets.py \
-            tests/test_z_train_source_validation.py tests/test_tabldm_shape_groups.py \
-            tests/test_calibration_math.py tests/test_engineering_contracts.py
+          uv run --no-sync python -m pytest -q --disable-warnings --durations=15 -n auto \
+            -m "not slow and not gpu and not pretrained and not external_data"

@@ -6,6 +6,7 @@ module.
 
 from __future__ import annotations
 
+import importlib.util
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
     from omegaconf import DictConfig
 
     from copula_inter.model import CopulaTabICL
+
+requires_tabldm = pytest.mark.skipif(importlib.util.find_spec("tabldm") is None, reason="Xiaomi-TabLDM not installed")
 
 
 def test_tabicl_strip_decoder(small_model_cfg: DictConfig) -> None:
@@ -70,6 +73,8 @@ def tabldm_model(tabldm_cfg: DictConfig) -> CopulaTabICL:
     return model
 
 
+@pytest.mark.pretrained
+@requires_tabldm
 def test_tabldm_strip_decoder(tabldm_cfg: DictConfig) -> None:
     base: Any = copula_backbones.load_raw_backbone("tabldm", tabldm_cfg)
     in_features = copula_backbones.strip_decoder(base)
@@ -83,6 +88,8 @@ def test_tabldm_pretrained_false_raises(tabldm_cfg: DictConfig) -> None:
         copula_backbones.load_raw_backbone("tabldm", cfg)
 
 
+@pytest.mark.pretrained
+@requires_tabldm
 def test_tabldm_recompute_escalation(tabldm_cfg: DictConfig) -> None:
     cfg_on = merge_configs(tabldm_cfg, {"tabicl": {"recompute": True}})
     base: Any = copula_backbones.load_raw_backbone("tabldm", cfg_on)
@@ -98,6 +105,8 @@ def test_tabldm_recompute_escalation(tabldm_cfg: DictConfig) -> None:
     )
 
 
+@pytest.mark.pretrained
+@requires_tabldm
 def test_build_copula_transformer_tabldm(tabldm_model: CopulaTabICL, tabldm_cfg: DictConfig) -> None:
     assert tabldm_model.backbone_name == "tabldm"
     assert tabldm_model.feature_dim == 512
@@ -110,6 +119,8 @@ def test_build_copula_transformer_tabldm(tabldm_model: CopulaTabICL, tabldm_cfg:
     assert torch.isfinite(out["s"]).all()
 
 
+@pytest.mark.pretrained
+@requires_tabldm
 def test_tabldm_moe_aux_loss_present_and_carries_grad(tabldm_model: CopulaTabICL) -> None:
     tabldm_model.train()
     batch = make_batch(B=2, P=4, N=2)
@@ -124,6 +135,8 @@ def test_tabldm_moe_aux_loss_present_and_carries_grad(tabldm_model: CopulaTabICL
     tabldm_model.zero_grad(set_to_none=True)
 
 
+@pytest.mark.pretrained
+@requires_tabldm
 def test_tabldm_unfreeze_backbone_false_freezes_trunk() -> None:
     cfg = OmegaConf.create(
         {
@@ -136,6 +149,8 @@ def test_tabldm_unfreeze_backbone_false_freezes_trunk() -> None:
     assert all(p.requires_grad for p in model.copula_head.parameters())
 
 
+@pytest.mark.pretrained
+@requires_tabldm
 def test_tabldm_lora_installs_adapters() -> None:
     cfg = OmegaConf.create(
         {
@@ -154,6 +169,8 @@ def test_tabldm_lora_installs_adapters() -> None:
     assert all(p.requires_grad for p in model.copula_head.parameters())
 
 
+@pytest.mark.pretrained
+@requires_tabldm
 def test_tabldm_forward_and_loss_backprops(tabldm_model: CopulaTabICL) -> None:
     """_forward_and_loss on a tabldm-backed model includes the MoE aux term and backpropagates."""
     from copula_inter.training_core import _forward_and_loss
