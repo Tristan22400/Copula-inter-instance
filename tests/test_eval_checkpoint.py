@@ -127,10 +127,9 @@ def test_parallel_prefit_accepts_nested_tensor_metadata(tiny_episode: dict[str, 
             "n_restarts_dkl": 1,
         },
         n_workers=1,
-        cache_path=str(tmp_path / "unused.pt"),
+        cache_path=None,
         fingerprint={},
         fitted=fitted,
-        use_cache=False,
     )
 
     assert "nested-metadata" in fitted

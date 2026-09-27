@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,7 +29,14 @@ from eval.results import (
     require_coverage,
     save_results_cache,
 )
-from eval.runners.eval_args import parse_eval_spec
+from eval.runners.eval_args import (
+    AutoregressiveSpec,
+    BaselineSpec,
+    EvalSpec,
+    MarginalSpec,
+    SelectionSpec,
+    compose_eval_spec,
+)
 from eval.runners.eval_checkpoint import _results_fingerprint
 from eval.runners.eval_inputs import _dataset_dir_for_eval, _load_full_config
 from eval.spatial.marginal_backends import BACKEND_NAMES, _exaone_capture_quantile_bank
@@ -172,23 +178,13 @@ def test_scored_fingerprint_tracks_checkpoint_and_resolved_marginal(tmp_path: Pa
     marginal = tmp_path / "marginal.pt"
     checkpoint.write_bytes(b"model A")
     marginal.write_bytes(b"marginal A")
-    args = Namespace(
-        **{
-            "ckpt": str(checkpoint),
-            "tabicl_ckpt": None,
-            "z_train_source": "tabicl",
-            "tabicl_amp": False,
-            "marginal_probs_n": 99,
-            "n_folds": 2,
-            "min_fold_size": 2,
-            "seed": 1,
-            "zeromean_gp": False,
-            "n_steps_zeromean_gp": 1,
-            "lr_zeromean_gp": 0.01,
-            "n_restarts_zeromean_gp": 1,
-            "autoregressive": False,
-        }
+    args = EvalSpec(ckpt=str(checkpoint), marginal=MarginalSpec(tabicl_ckpt=None, z_train_source="tabicl"))
+    args.selection = SelectionSpec(n_folds=2, min_fold_size=2)
+    args.seed = 1
+    args.baselines = BaselineSpec(
+        zeromean_gp=False, n_steps_zeromean_gp=1, lr_zeromean_gp=0.01, n_restarts_zeromean_gp=1
     )
+    args.autoregressive = AutoregressiveSpec(enabled=False)
     first = _results_fingerprint({}, args, 5, resolved_marginal=str(marginal))
     copied = tmp_path / "same-model.pt"
     copied.write_bytes(checkpoint.read_bytes())
@@ -230,9 +226,10 @@ def test_results_cache_reuses_only_matching_artifact_identity(tmp_path: Path) ->
 def test_eval_spec_parses_without_loading_models(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.touch()
-    spec = parse_eval_spec(["--ckpt", str(checkpoint), "--no-autoregressive", "--n_episodes", "2"])
+    spec = compose_eval_spec([f"ckpt={checkpoint}", "autoregressive.enabled=false", "n_episodes=2"])
     assert spec.ckpt == str(checkpoint)
     assert spec.n_episodes == 2
+    assert not spec.autoregressive.enabled
 
 
 def test_default_eval_config_resolves_outside_checkout(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -241,7 +238,7 @@ def test_default_eval_config_resolves_outside_checkout(tmp_path: Path, monkeypat
 
 
 def test_eval_uses_configured_dataset_directory_in_cache_key() -> None:
-    args = Namespace(dataset_dir=None)
+    args = EvalSpec(ckpt="unused.pt")
     cfg = OmegaConf.create({"training": {"dataset_dir": "./generated/pit"}})
     assert _dataset_dir_for_eval(args, cfg, False, False) == "./generated/pit"
     assert _dataset_dir_for_eval(args, cfg, True, False) is None

@@ -59,7 +59,7 @@ def _kernel_composition_label(ep: dict) -> str:
         )
         return f"ERA5 {where} grid={meta['grid_size']} P={meta['P']} N={meta['N']}"
     if "kernel" not in ep:
-        return "unavailable (pass --dataset_dir with pre-generated metadata, or use --live_generate)"
+        return "unavailable (set dataset_dir to pre-generated metadata, or use live_generate=true)"
 
     if "kernel_components" in ep:
         parts = [ep["kernel_components"][0]]
@@ -194,7 +194,7 @@ def _ar_note(
     )
     if conditioning != "teacher_forcing":
         note += (
-            "\n  *** WARNING: --ar_conditioning=sample. Each step appended a DRAW, "
+            "\n  *** WARNING: autoregressive.conditioning=sample. Each step appended a DRAW, "
             "not the true y, so this row is NOT a joint density of y_test and is "
             "NOT comparable to the other rows. Ancestral-sampling diagnostic only. ***"
         )

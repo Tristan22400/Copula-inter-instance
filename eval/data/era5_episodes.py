@@ -72,8 +72,8 @@ def _draw_episode(
     raise RuntimeError(
         f"No valid ERA5 episode after {max_redraws} redraws at grid_size={grid_size}, "
         f"box_deg_range={box_deg_range} — the box is too small to hold a "
-        f"{grid_size}x{grid_size} block of 0.25deg points; raise --era5_box_deg_min "
-        "or lower --era5_grid_size."
+        f"{grid_size}x{grid_size} block of 0.25deg points; raise era5.box_deg_min "
+        "or lower era5.grid_size."
     )
 
 
@@ -122,15 +122,15 @@ def build_era5_eval_episodes(
     if tabicl_model is None and marginal_backend is None:
         raise ValueError(
             "ERA5 episodes need a real marginal to PIT with: pass tabicl_model "
-            "(--z_train_source=tabicl) or a marginal_backend + marginal_regressor. "
+            "(marginal.z_train_source=tabicl) or a marginal_backend + marginal_regressor. "
             "There is no analytic/oracle PIT on real data."
         )
     if autoregressive and marginal_backend is not None:
         # The chain needs TabICL; other backends have no incremental entry point.
         raise NotImplementedError(
-            f"--autoregressive is implemented for the TabICL marginal only, not "
-            f"for backend {marginal_backend!r}. Re-run with --no-autoregressive, "
-            f"or with the default --z_train_source=tabicl."
+            f"autoregressive.enabled is implemented for the TabICL marginal only, not "
+            f"for backend {marginal_backend!r}. Re-run with autoregressive.enabled=false, "
+            f"or with the default marginal.z_train_source=tabicl."
         )
 
     if verbose:

@@ -94,7 +94,7 @@ def save_results_cache(path: str, fingerprint: dict, entries: dict[str, dict]) -
 
 
 def render_saved_totals(report: Mapping) -> str:
-    """Summarize a --dump_episodes file without constructing a model."""
+    """Summarize an output.dump_episodes file without constructing a model."""
     episodes = report["episodes"]
     methods = sorted({name for episode in episodes for name in episode.get("total_nlls", {})})
     lines = ["| Method | Mean total NLL | Std | Valid/All |", "|---|---:|---:|---:|"]
@@ -107,7 +107,7 @@ def render_saved_totals(report: Mapping) -> str:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Render saved evaluation totals without loading a model")
-    parser.add_argument("dump", help="JSON created by eval_checkpoint.py --dump_episodes")
+    parser.add_argument("dump", help="JSON created by eval_checkpoint output.dump_episodes")
     args = parser.parse_args()
     with open(args.dump, encoding="utf-8") as source:
         print(render_saved_totals(json.load(source)))

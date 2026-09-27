@@ -6,7 +6,6 @@ chain, the ICL model and the TOTAL-table rows.
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import os
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from eval.runners.eval_tables import (
 
 if TYPE_CHECKING:
     from copula_inter.model import CopulaTabICL
+    from eval.runners.eval_args import EvalSpec
 
 from copula_inter.loss import y_space_nll
 from copula_inter.model import low_rank_correlation
@@ -243,9 +243,9 @@ def _marginal_pit(
     }
 
 
-def _baseline_worker_count(args: argparse.Namespace, baseline_device: torch.device) -> int:
-    """--baseline_workers, defaulting to one per physical core (capped at 32); 1 on a GPU."""
-    n_workers = args.baseline_workers
+def _baseline_worker_count(spec: EvalSpec, baseline_device: torch.device) -> int:
+    """baselines.workers, defaulting to one per physical core (capped at 32); 1 on a GPU."""
+    n_workers = spec.baselines.workers
     try:
         _aff = os.sched_getaffinity(0)
     except AttributeError:  # pragma: no cover - non-Linux
@@ -262,8 +262,8 @@ def _baseline_worker_count(args: argparse.Namespace, baseline_device: torch.devi
         )
     if baseline_device.type != "cpu" and n_workers > 1:
         print(
-            f"  [prefit] --baseline_device={baseline_device.type}: forcing "
-            "--baseline_workers=1 (parallel processes would just contend for one GPU)"
+            f"  [prefit] baselines.device={baseline_device.type}: forcing "
+            "baselines.workers=1 (parallel processes would just contend for one GPU)"
         )
         n_workers = 1
     return n_workers
@@ -273,7 +273,7 @@ def _baseline_worker_count(args: argparse.Namespace, baseline_device: torch.devi
 class _EvalContext:
     """Settings, models and cache identities shared by every scored episode."""
 
-    args: argparse.Namespace
+    spec: EvalSpec
     device: torch.device
     baseline_device: torch.device
     icl_model: CopulaTabICL
@@ -284,16 +284,17 @@ class _EvalContext:
     oracle_mode: str
     prior_cfg: dict
     fit_kwargs: dict[str, Any]
-    use_cache: bool
+    # Baseline cache path, or None when caching is off.
+    baseline_cache: str | None
     fingerprint: dict
 
 
 def _prefit_baselines(ctx: _EvalContext, episode_plan: list[_PlannedEpisode], cache_entries: dict) -> dict[str, dict]:
     """Baselines available before scoring: valid cache entries, plus parallel fits of the rest."""
-    args = ctx.args
-    n_workers = _baseline_worker_count(args, ctx.baseline_device)
+    spec = ctx.spec
+    n_workers = _baseline_worker_count(spec, ctx.baseline_device)
     fitted: dict[str, dict] = {}
-    if ctx.use_cache and not args.refresh_baselines:
+    if ctx.baseline_cache is not None and not spec.baselines.refresh:
         for _, ep_i, cache_key, _, _ in episode_plan:
             entry = _valid_cached_entry(cache_entries, cache_key, ep_i)
             if entry is not None:
@@ -310,10 +311,9 @@ def _prefit_baselines(ctx: _EvalContext, episode_plan: list[_PlannedEpisode], ca
             pending,
             ctx.fit_kwargs,
             n_workers,
-            args.baseline_cache,
+            ctx.baseline_cache,
             ctx.fingerprint,
             fitted,
-            ctx.use_cache,
         )
     return fitted
 
@@ -339,9 +339,9 @@ def _episode_baselines(
             **ctx.fit_kwargs,
         )
     baseline_R = {k: v.to(device) for k, v in baseline_R.items()}
-    if ctx.use_cache:
+    if ctx.baseline_cache is not None:
         save_baseline_entry(
-            ctx.args.baseline_cache,
+            ctx.baseline_cache,
             ctx.fingerprint,
             cache_key,
             {
@@ -364,7 +364,7 @@ def _episode_marginal_pit(ctx: _EvalContext, ep: dict, ep_i: int) -> dict[str, T
             device=ctx.device,
             marginal_backend=ctx.marginal_backend,
             marginal_regressor=ctx.marginal_regressor,
-            marginal_probs_n=ctx.args.marginal_probs_n,
+            marginal_probs_n=ctx.spec.marginal.probs_n,
             seed=ep_i,
         )
         if marginal_pit is None:
@@ -374,10 +374,10 @@ def _episode_marginal_pit(ctx: _EvalContext, ep: dict, ep_i: int) -> dict[str, T
 
 def _add_autoregressive_log_pdf(ctx: _EvalContext, ep: dict, local_i: int, ep_i: int) -> None:
     """Store the teacher-forced autoregressive chain's log-densities in ep (ERA5 precomputes them)."""
-    args = ctx.args
-    if not args.autoregressive or "ar_log_pdf" in ep:
+    spec = ctx.spec
+    if not spec.autoregressive.enabled or "ar_log_pdf" in ep:
         return
-    if args.ar_n_episodes is not None and local_i >= args.ar_n_episodes:
+    if spec.autoregressive.n_episodes is not None and local_i >= spec.autoregressive.n_episodes:
         return
     if ctx.tabicl_marginal is None:
         raise RuntimeError("autoregressive scoring needs the loaded TabICL marginal")
@@ -389,10 +389,10 @@ def _add_autoregressive_log_pdf(ctx: _EvalContext, ep: dict, local_i: int, ep_i:
             ep["y_train"].to(device).unsqueeze(0),
             ep["x_norm_test"].to(device).unsqueeze(0),
             ep["y_test"].to(device).unsqueeze(0),
-            order=args.ar_order,
-            conditioning=args.ar_conditioning,
-            max_context=args.ar_max_context,
-            seed=args.seed,
+            order=spec.autoregressive.order,
+            conditioning=spec.autoregressive.conditioning,
+            max_context=spec.autoregressive.max_context,
+            seed=spec.seed,
             episode_indices=[ep_i],
         )["log_pdf"][0]
         .detach()
@@ -407,7 +407,7 @@ def _with_zero_mean_gp(
 
     Seeded from fit_seed with the RNG restored and one thread.
     """
-    args = ctx.args
+    spec = ctx.spec
     with _snapshot_rng_and_threads(
         seed=fit_seed + 1,
         cpu_threads=1 if ctx.baseline_device.type == "cpu" else None,
@@ -416,9 +416,9 @@ def _with_zero_mean_gp(
             ep=ep,
             marginal_pit=marginal_pit,
             device=ctx.baseline_device,
-            n_steps=args.n_steps_zeromean_gp,
-            lr=args.lr_zeromean_gp,
-            n_restarts=args.n_restarts_zeromean_gp,
+            n_steps=spec.baselines.n_steps_zeromean_gp,
+            lr=spec.baselines.lr_zeromean_gp,
+            n_restarts=spec.baselines.n_restarts_zeromean_gp,
             oracle_mode=ctx.oracle_mode,
             prior_cfg=ctx.prior_cfg,
         )
@@ -565,10 +565,10 @@ def _score_episode(
     baselines: _BaselineResults,
 ) -> _EpisodeScore:
     """Score one episode: the ICL model, the oracle and every baseline, then the nested-CV best baseline."""
-    args, device = ctx.args, ctx.device
+    spec, device = ctx.spec, ctx.device
     marginal_pit = _episode_marginal_pit(ctx, ep, ep_i)
     _add_autoregressive_log_pdf(ctx, ep, local_i, ep_i)
-    if args.zeromean_gp and marginal_pit is not None:
+    if spec.baselines.zeromean_gp and marginal_pit is not None:
         baselines = _with_zero_mean_gp(ctx, ep, marginal_pit, fit_seed, baselines)
     baseline_nlls, baseline_R, baseline_y_nlls = baselines
 
@@ -588,12 +588,12 @@ def _score_episode(
     R_dict = {**baseline_R, **icl_R}
 
     # Best fitted baseline per episode, selected by nested CV over the test points.
-    holdout_seed = (args.seed * 1_000_003 + ep_i) % (2**31 - 1)
+    holdout_seed = (spec.seed * 1_000_003 + ep_i) % (2**31 - 1)
     best_nll, mode_key, fold_details = _select_best_baseline_cv(
         baseline_R,
         ep["z_test"].to(device),
-        args.n_folds,
-        args.min_fold_size,
+        spec.selection.n_folds,
+        spec.selection.min_fold_size,
         holdout_seed,
     )
     _print_episode(ep, ep_i, nlls, total_nlls, best_nll, fold_details)

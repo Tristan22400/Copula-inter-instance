@@ -50,7 +50,7 @@ CHECKPOINT_FAMILIES: dict[str, dict[str, Any]] = {
     },
     # Nano backbone, rank 512, trained with P=32, N=256, d_features=10 and the
     # era5-run1 marginal. Its rank changes the baseline fingerprint, so it needs its
-    # own --baseline_cache.
+    # own baselines.cache.
     "copula-nano-finetune-marginal-float32": {
         "dir": "copula_nano/copula-finetune-marginal-float32",
         "default_step": 630000,
@@ -61,7 +61,7 @@ CHECKPOINT_FAMILIES: dict[str, dict[str, Any]] = {
 
 
 def resolve_checkpoint(name_or_path: str) -> str:
-    """Resolve a `--ckpt`/`--checkpoints` token to a checkpoint file path.
+    """Resolve a checkpoint token (a runner's ckpt / checkpoints setting) to a checkpoint file path.
 
     Accepts, in order:
       - a path (exists, or ends in .pt/.ckpt, or contains a separator) -> unchanged

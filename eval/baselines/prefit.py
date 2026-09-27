@@ -265,12 +265,11 @@ def _prefit_baselines_parallel(
     pending: list[tuple[str, int, dict]],
     fit_kwargs: dict,
     n_workers: int,
-    cache_path: str,
+    cache_path: str | None,
     fingerprint: dict,
     fitted: dict,
-    use_cache: bool,
 ) -> None:
-    """Fit the pending episodes across a process pool, storing each result in fitted (and on disk, if caching) as it completes."""
+    """Fit the pending episodes across a process pool, storing each result in fitted (and in cache_path unless None) as it completes."""
     total = len(pending)
     done = 0
     failures = 0
@@ -291,7 +290,7 @@ def _prefit_baselines_parallel(
                 # Convert NumPy results back to tensors for the cache.
                 result["R_dict"] = {k: torch.from_numpy(v) for k, v in result["R_dict"].items()}
                 fitted[cache_key] = result
-                if use_cache:
+                if cache_path is not None:
                     # Write this episode's shard now.
                     save_baseline_entry(cache_path, fingerprint, cache_key, result)
 
