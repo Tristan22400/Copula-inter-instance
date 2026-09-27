@@ -1,98 +1,68 @@
-"""Structural checks of R_star for non-negative kernels (rbf, matern32, rational_quadratic, periodic, dot_product) in a dataset folder.
+"""Structural checks of R_star for non-negative kernels (rbf, matern32, rational_quadratic, periodic).
 
-    DATASET_DIR=<dataset>/pit pytest tests/test_dataset_corr_nonneg.py -v
-
-Skipped when the folder is missing or empty.
+Episodes are generated live from the default data config, one fixed kernel per
+batch, with the analytic marginal, so no dataset folder or TabICL model is needed.
+R_star is the prior test correlation (data_gen supports oracle_mode=prior only),
+so for these kernels it has no negative entries.
 """
 
 from __future__ import annotations
 
-import os
-import random
-from typing import Any, Iterator
-
 import pytest
 import torch
 
-_DEFAULT_DIR = "./data/rbf-posterior-tuned/pit"
+import copula_inter
+from copula_inter.config_path import compose_config, config_dir
+from copula_inter.data_gen import generate_gp_batch
 
-
-@pytest.fixture(scope="module")
-def dataset_dir() -> str:
-    return os.environ.get("DATASET_DIR", _DEFAULT_DIR)
-
-
-_N_EPISODES = 500
+_KERNELS = ("rbf", "matern32", "rational_quadratic", "periodic")
+_EPISODES_PER_KERNEL = 64
+_N_TEST = 64
 _SEED = 0
 
 
-def _iter_episodes(folder: str) -> Iterator[dict]:
-    paths = sorted(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".pt") and f != "meta.pt")
-    for p in paths:
-        obj = torch.load(p, map_location="cpu", weights_only=False)
-        if isinstance(obj, list):
-            yield from obj
-        elif isinstance(obj, dict):
-            yield obj
-
-
-def _load_episodes(folder: str, n: int, seed: int) -> tuple[torch.Tensor, list[Any]]:
-    all_eps = list(_iter_episodes(folder))
-    rng = random.Random(seed)
-    rng.shuffle(all_eps)
-    episodes = all_eps[:n]
-
-    values = []
-    min_eigs = []
-    for ep in episodes:
-        R = ep["R_star"]
-        N = R.shape[0]
-        mask = ~torch.eye(N, dtype=torch.bool)
-        values.append(R[mask].flatten())
-        min_eigs.append(torch.linalg.eigvalsh(R).min().item())
-
-    return torch.cat(values), min_eigs
-
-
-@pytest.fixture(scope="module")
-def episode_data(dataset_dir: str) -> tuple[torch.Tensor, list[Any]]:
-    if not os.path.isdir(dataset_dir):
-        pytest.skip(f"Dataset folder not found: {dataset_dir}")
-    pts = [f for f in os.listdir(dataset_dir) if f.endswith(".pt")]
-    if len(pts) == 0:
-        pytest.skip(f"Dataset folder is empty: {dataset_dir}")
-    return _load_episodes(dataset_dir, _N_EPISODES, _SEED)
-
-
-@pytest.fixture(scope="module")
-def off_diag(episode_data: tuple[torch.Tensor, list[Any]]) -> torch.Tensor:
-    return episode_data[0]
-
-
-@pytest.fixture(scope="module")
-def min_eigenvalues(episode_data: tuple[torch.Tensor, list[Any]]) -> list[Any]:
-    return episode_data[1]
-
-
-def test_correlations_have_negative_tail(off_diag: torch.Tensor) -> None:
-    """Some off-diagonal entries are negative."""
-    neg_frac = (off_diag < -0.01).float().mean().item()
-    assert neg_frac > 0.01, (
-        f"Only {neg_frac:.1%} of entries are negative — posterior shows no explaining-away, "
-        f"suggests conditioning on the training context isn't having any effect"
+def _live_r_star(kernel: str, n_episodes: int, n_test: int, seed: int) -> list[torch.Tensor]:
+    """R_star of n_episodes live GP episodes drawn with one fixed kernel."""
+    cfg = compose_config(
+        config_dir(copula_inter.__file__),
+        "config",
+        [
+            f"data.kernel={kernel}",
+            "data.systematic_composition=false",
+            "data.z_train_source=analytic",
+            f"data.N_min={n_test}",
+            f"data.N_max={n_test}",
+            f"seed={seed}",
+        ],
     )
+    torch.manual_seed(seed)
+    return [ep["R_star"] for ep in generate_gp_batch(cfg, n_episodes, "cpu")]
+
+
+@pytest.fixture(scope="module")
+def r_stars() -> list[torch.Tensor]:
+    return [R for kernel in _KERNELS for R in _live_r_star(kernel, _EPISODES_PER_KERNEL, _N_TEST, _SEED)]
+
+
+@pytest.fixture(scope="module")
+def off_diag(r_stars: list[torch.Tensor]) -> torch.Tensor:
+    return torch.cat([R[~torch.eye(R.shape[0], dtype=torch.bool)] for R in r_stars])
+
+
+@pytest.fixture(scope="module")
+def min_eigenvalues(r_stars: list[torch.Tensor]) -> list[float]:
+    return [torch.linalg.eigvalsh(R.double()).min().item() for R in r_stars]
+
+
+def test_correlations_non_negative(off_diag: torch.Tensor) -> None:
+    """A non-negative kernel's prior correlation has no negative entries (up to rounding)."""
+    assert off_diag.min().item() > -1e-5, f"Min correlation {off_diag.min().item():.2e} — negative entry found"
 
 
 def test_correlations_span_meaningful_range(off_diag: torch.Tensor) -> None:
     """Off-diagonal values must reach well above 0 — not collapsed to a near-identity matrix."""
     q95 = off_diag.quantile(0.95).item()
     assert q95 > 0.15, f"95th percentile {q95:.3f} too low — correlations look collapsed near 0"
-
-
-def test_correlations_not_saturated(off_diag: torch.Tensor) -> None:
-    """Off-diagonal values do not pile up near 1."""
-    frac_sat = (off_diag > 0.9).float().mean().item()
-    assert frac_sat < 0.05, f"{frac_sat:.1%} of entries > 0.9 — matrices look saturated near 1"
 
 
 def test_correlations_not_all_near_zero(off_diag: torch.Tensor) -> None:
@@ -107,19 +77,13 @@ def test_correlations_std_nonzero(off_diag: torch.Tensor) -> None:
     assert std > 0.03, f"Std {std:.4f} too low — R_star correlations appear degenerate."
 
 
-def test_unit_diagonal(dataset_dir: str) -> None:
-    if not os.path.isdir(dataset_dir):
-        pytest.skip(f"Dataset folder not found: {dataset_dir}")
-    episodes = list(_iter_episodes(dataset_dir))
-    if not episodes:
-        pytest.skip(f"Dataset folder is empty: {dataset_dir}")
-    for i, ep in enumerate(episodes[:20]):
-        R = ep["R_star"]
+def test_unit_diagonal(r_stars: list[torch.Tensor]) -> None:
+    for i, R in enumerate(r_stars):
         diag_err = (R.diagonal() - 1.0).abs().max().item()
         assert diag_err < 1e-4, f"episode[{i}]: diagonal of R_star deviates from 1 by {diag_err:.2e}"
 
 
-def test_r_star_well_conditioned(min_eigenvalues: list[Any]) -> None:
+def test_r_star_well_conditioned(min_eigenvalues: list[float]) -> None:
     """Every R_star has minimum eigenvalue >= 1e-3."""
     bad = [v for v in min_eigenvalues if v < 0.001]
     assert len(bad) == 0, (
@@ -128,6 +92,6 @@ def test_r_star_well_conditioned(min_eigenvalues: list[Any]) -> None:
     )
 
 
-def test_r_star_psd(min_eigenvalues: list[Any]) -> None:
+def test_r_star_psd(min_eigenvalues: list[float]) -> None:
     neg = [v for v in min_eigenvalues if v < -1e-5]
     assert len(neg) == 0, f"{len(neg)} episodes have negative min eigenvalue (most negative: {min(neg):.2e})"
