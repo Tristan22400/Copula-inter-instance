@@ -197,6 +197,12 @@ training:
   # storage. Still a true per-epoch permutation, just chunked randomization.
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
+  # Build the fixed validation probes at startup (synthetic kernel families,
+  # posterior probe, TabICL/analytic PIT caches of the val set, the TabICL mix
+  # gap measurement, ERA5 probes). false skips all of them for a fast start:
+  # val/* is still logged, but kernel_fit/*, era5_fit/*, oracle_diag/* and the
+  # measured TabICL mix fractions are not.
+  startup_probes: true
   # Adaptive kernel-family sampling for live generation: bias
   # live_dataset.py's kernel-chain sampling (data_gen._sample_kernel_chain_
   # structure) toward the kernel families the model currently fits worst,

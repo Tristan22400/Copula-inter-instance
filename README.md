@@ -5,7 +5,8 @@ checked-in `tabicl_upstream` source is included in this project's install.
 
 ```bash
 uv sync --locked --extra dev --extra cpu
-uv run --no-sync python -m pytest -q tests/test_loss.py tests/test_data.py tests/test_eval_checkpoint.py
+uv run --no-sync pre-commit install      # ruff check + format on every commit
+uv run --no-sync python -m pytest -q -n auto -m "not slow and not gpu and not pretrained and not external_data"
 ```
 
 The checked-in `uv.lock` pins the tested environment. The `cpu` extra selects
@@ -41,9 +42,12 @@ Use `--dump_episodes scores.json` during evaluation to save per-episode
 scores; `python -m eval.results scores.json` renders totals later without
 loading either model.
 
-The CPU pull-request gate is `.github/workflows/ci.yml`. The full suite can
-require pretrained models, a GPU, or external ERA5 data; run those tests in
-the corresponding environment. Configuration lives in `conf/`; use
+The CPU pull-request gate is `.github/workflows/ci.yml`; it runs the test
+command above. Tests that need a GPU, pretrained weights or external ERA5 data
+carry the `gpu` / `pretrained` / `external_data` markers; run the full suite on
+a Grid5000 GPU node with `oarsub -S ./scripts/test_full.sh` before merging.
+Add `training.startup_probes=false` to a training command to skip the fixed
+validation probes built at startup (kernel_fit/*, era5_fit/*, oracle_diag/*). Configuration lives in `conf/`; use
 `python -m copula_inter.train --cfg job` to inspect the composed settings without
 starting training. See [AGENTS.md](AGENTS.md) for the code map and
 [CLAUDE.md](CLAUDE.md) for experiment-specific notes.

@@ -365,6 +365,21 @@ def build_validation_probes(
     val_loader: ValLoader,
 ) -> ValidationProbes:
     """Build the fixed validation probes (synthetic kernel families, posterior probes, ERA5) and their TabICL/analytic z_train."""
+    if not bool(t.startup_probes):
+        print(
+            "[train] training.startup_probes=false: skipping the validation probes "
+            "(no kernel_fit/*, era5_fit/*, oracle_diag/* or measured TabICL mix fractions)."
+        )
+        return ValidationProbes(
+            synth_kernel_batches={},
+            posterior_probe=None,
+            pit_ckpt=resolve_pit_ckpt(cfg),
+            tabicl_val_z={},
+            analytic_val_z={},
+            tabicl_kernel_fit_z={},
+            era5_val_batches={},
+            era5_viz_batch=None,
+        )
     baselines_on = bool(cfg.get("baselines", {}).get("enabled", True))
     synth_kernel_batches = _build_synthetic_kernel_batches(cfg, device) if baselines_on else {}
     # Fallback posterior probe when the val loader has no kernel metadata (disk or ERA5).
