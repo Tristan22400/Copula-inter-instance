@@ -174,7 +174,9 @@ def _losses(m: SimpleNamespace, out: dict[str, torch.Tensor]) -> None:
     W = torch.randn(B, N, r)
     s = torch.randn(B, N)
     W_tilde = torch.nn.functional.normalize(torch.randn(B, N, r + 1), dim=-1)
-    out["loss.copula_nll"] = L.copula_nll(W_tilde, z, mask)
+    # R = eps*I + W W^T is near-singular here (rank r+1 < N, eps=1e-4): in float32 the /eps after the
+    # Woodbury cancellation leaves ~0.1-0.2 nats of CPU-dependent rounding error, so score in float64.
+    out["loss.copula_nll"] = L.copula_nll(W_tilde.double(), z.double(), mask)
 
     for par in ("covnorm", "cossim", "tanhnorm", "sparse_covnorm"):
         lam = torch.tensor([0.1]) if par == "sparse_covnorm" else None
