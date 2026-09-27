@@ -34,7 +34,11 @@ def summarize(path: str, era5: bool | None = None, max_episodes: int | None = No
         # The era5 settings live under the fingerprint's "baseline" entry.
         era5 = bool((fp.get("baseline") or {}).get("era5"))
     z_src = fp.get("z_train_source") or "tabicl"
-    ckpt = fp.get("ckpt")
+    # New caches key the checkpoint by content (ckpt_identity); pre-refactor ones stored its path.
+    identity = fp.get("ckpt_identity") or {}
+    ckpt = fp.get("ckpt") or (
+        f"sha256:{identity['sha256'][:12]}" if "sha256" in identity else identity.get("reference")
+    )
 
     # Sort by episode index.
     keys = sorted(entries, key=lambda k: int(k))

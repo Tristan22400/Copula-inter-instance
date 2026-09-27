@@ -443,7 +443,7 @@ def copula_nll(
     """
     B, device = W_tilde.shape[0], W_tilde.device
     r1 = W_tilde.shape[-1]  # r+1
-    eye_r = torch.eye(r1, device=device)
+    eye_r = torch.eye(r1, dtype=W_tilde.dtype, device=device)
 
     losses = []
     for b in range(B):
