@@ -763,7 +763,7 @@ def _export_final(run: _PhaseARun, selector: _BestSelector, total_steps: int) ->
             "\nPhase A done. Use it as the copula run's marginal with:\n"
             f"    python -m copula_inter.train tabicl.pit_ckpt={os.path.abspath(final)}\n"
             "and measure it first with:\n"
-            f"    python eval/runners/marginal_calibration_eval.py --ckpt {os.path.abspath(final)}"
+            f"    python -m eval.runners.marginal_calibration_eval ckpt={os.path.abspath(final)}"
         )
 
 

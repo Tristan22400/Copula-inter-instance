@@ -16,7 +16,7 @@
 #         python eval/data/fetch_era5_global.py --start 2013-01 --n-months 120
 #     (already present as eval/data/cache/era5_global_train/ + era5_global_val/)
 #   * a baseline measurement to compare against, so the run has a before:
-#         python eval/runners/marginal_calibration_eval.py --ckpt pretrained
+#         python -m eval.runners.marginal_calibration_eval ckpt=pretrained
 #
 # Submit with:
 #     mkdir -p logs
@@ -82,6 +82,6 @@ python -m copula_inter.finetune_marginal "${EXTRA_OVERRIDES[@]}" "$@"
 
 echo "[$(date +%H:%M:%S)] Phase A complete."
 echo "Next:"
-echo "  1) re-measure:  python eval/runners/marginal_calibration_eval.py --ckpt <the _final.pt>"
-echo "  2) forgetting gate:  python eval/runners/run_benchmarks.py"
+echo "  1) re-measure:  python -m eval.runners.marginal_calibration_eval ckpt=<the _final.pt>"
+echo "  2) forgetting gate:  python -m eval.runners.run_benchmarks"
 echo "  3) Phase B:     python -m copula_inter.train tabicl.pit_ckpt=<the _final.pt>"

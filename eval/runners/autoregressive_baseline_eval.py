@@ -4,15 +4,15 @@ Both are scored in per-point raw nats; the chain uses teacher forcing in the
 episode's own test order. Sample plots use ancestral sampling.
 
 Usage:
-    python eval/runners/autoregressive_baseline_eval.py --ckpt <copula checkpoint> \
-        --tabicl_marginal_ckpt era5-33y --n_episodes 20 --n_plot_episodes 3
+    python -m eval.runners.autoregressive_baseline_eval ckpt=<copula checkpoint> \
+        tabicl_marginal_ckpt=era5-33y n_episodes=20 n_plot_episodes=3
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -39,6 +39,7 @@ from eval.data.era5_io import safe_cholesky  # noqa: E402
 from eval.runners.episode_scoring import _eval_icl_episode, _marginal_pit  # noqa: E402
 from eval.runners.eval_checkpoint import _set_seed  # noqa: E402
 from eval.runners.eval_inputs import _live_generate_alternating, _load_full_config  # noqa: E402
+from eval.runners.hydra_cli import hydra_entry  # noqa: E402
 from eval.viz.sample_comparison_plots import plot_sample_comparison  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
 
@@ -94,46 +95,28 @@ def _one_sample_pair(
     return y_copula_sample, ar_sample
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Compare the Copula Model against an autoregressive marginal-chain "
-        "baseline that uses only the same frozen marginal, no copula head."
-    )
-    parser.add_argument(
-        "--config",
-        default="conf/config.yaml",
-        help="Hydra config defining the eval-episode-generating distribution "
-        "(cfg.data), same convention as eval_checkpoint.py's --config.",
-    )
-    parser.add_argument("--ckpt", default=_DEFAULT_CKPT, help="Copula Model checkpoint.")
-    parser.add_argument(
-        "--tabicl_marginal_ckpt",
-        default="era5-33y",
-        help="Marginal checkpoint shared by BOTH methods -- a "
-        "MARGINAL_FAMILIES name (eval/configs/checkpoints.py) or a raw "
-        "path. Default 'era5-33y': TabICL v2 fine-tuned on ERA5.",
-    )
-    parser.add_argument(
-        "--n_episodes",
-        type=int,
-        default=20,
-        help="Fewer than eval_checkpoint.py's default (30) -- the "
-        "autoregressive chain does N forward passes per episode "
-        "instead of 1, so wall-clock is much higher.",
-    )
-    parser.add_argument(
-        "--n_plot_episodes",
-        type=int,
-        default=3,
-        help="How many of the evaluated episodes additionally get a sample-comparison PNG (see --out_dir).",
-    )
-    parser.add_argument("--tabicl_pit_k_folds", type=int, default=DEFAULT_K_FOLDS)
-    parser.add_argument("--tabicl_amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--out_dir", default=os.path.join(_REPO_ROOT, "eval", "results"))
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="auto")
-    args = parser.parse_args()
+@dataclass
+class AutoregressiveBaselineSpec:
+    """Compare the copula model against the autoregressive marginal chain on the same frozen marginal."""
 
+    # Hydra config defining the episode distribution (same convention as eval_checkpoint's config).
+    config: str = "conf/config.yaml"
+    # Copula model checkpoint.
+    ckpt: str = _DEFAULT_CKPT
+    # Marginal shared by both methods: a MARGINAL_FAMILIES name or a path (era5-33y: TabICL v2 fine-tuned on ERA5).
+    tabicl_marginal_ckpt: str = "era5-33y"
+    # The chain does N forward passes per episode, so fewer than eval_checkpoint's 30.
+    n_episodes: int = 20
+    # Evaluated episodes that also get a sample-comparison PNG in out_dir.
+    n_plot_episodes: int = 3
+    tabicl_pit_k_folds: int = DEFAULT_K_FOLDS
+    tabicl_amp: bool = True
+    out_dir: str = os.path.join(_REPO_ROOT, "eval", "results")
+    seed: int = 42
+    device: str = "auto"
+
+
+def run(args: AutoregressiveBaselineSpec) -> None:
     _set_seed(args.seed)
     device = torch.device(
         "cuda"
@@ -232,6 +215,8 @@ def main() -> None:
     print(f"{'Autoregressive marginal-chain':<45}{np.nanmean(ar_totals):>14.4f}{np.nanstd(ar_totals):>10.4f}")
     print(f"{'─' * 70}\n")
 
+
+main = hydra_entry("autoregressive_baseline_eval", AutoregressiveBaselineSpec, run)
 
 if __name__ == "__main__":
     main()

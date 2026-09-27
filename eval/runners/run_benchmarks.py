@@ -5,18 +5,17 @@ R = I), copula (TabICL marginals, the copula model's R) and standard_gp (an
 end-to-end sklearn GP on raw y).
 
 Usage:
-    python eval/runners/run_benchmarks.py \
-        --copula_ckpt <copula checkpoint> \
-        --tabicl_ckpt tabicl-regressor-v2-20260212.ckpt \
-        --device auto --num_episodes 50 --n_samples 1000
+    python -m eval.runners.run_benchmarks copula_ckpt=<copula checkpoint> \
+        tabicl_ckpt=tabicl-regressor-v2-20260212.ckpt num_episodes=50 n_samples=1000
+    python -m eval.runners.run_benchmarks benchmarks=[synthetic_bbo]
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import traceback
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -37,6 +36,7 @@ from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_j
 from eval.metrics.energy_score import compute_energy_score  # noqa: E402
 from eval.metrics.joint_nll import compute_joint_nll, compute_pit  # noqa: E402
 from eval.results import require_coverage  # noqa: E402
+from eval.runners.hydra_cli import check_choices, hydra_entry  # noqa: E402
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_loo_pit, tabicl_quantiles  # noqa: E402
 from eval.viz.correlation_plots import (  # noqa: E402
     collect_pair_distances_and_values,
@@ -141,26 +141,30 @@ def run_episode(
     return records, R_by_method, pair_series
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="TabICLv2 + Copula inter-instance benchmark suite")
-    parser.add_argument("--copula_ckpt", default="./checkpoints/systematic-composition-k5/step_0045000.pt")
-    parser.add_argument("--tabicl_ckpt", default=None)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--num_episodes", type=int, default=50)
-    parser.add_argument("--n_samples", type=int, default=1000)
-    parser.add_argument("--benchmarks", default=",".join(BENCHMARK_NAMES))
-    parser.add_argument("--out_dir", default=os.path.join(_REPO_ROOT, "eval", "results"))
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--max_failed_fraction",
-        type=float,
-        default=0.0,
-        help="Maximum failed-episode fraction before exiting nonzero (1.0 allows exploratory partial runs).",
-    )
-    args = parser.parse_args()
-    if not 0 <= args.max_failed_fraction <= 1:
-        parser.error("--max_failed_fraction must lie in [0, 1]")
+@dataclass
+class BenchmarkSpec:
+    """TabICL + copula inter-instance benchmark suite."""
 
+    copula_ckpt: str = "./checkpoints/systematic-composition-k5/step_0045000.pt"
+    # TabICL marginal checkpoint; null uses make_tabicl_regressor's default.
+    tabicl_ckpt: str | None = None
+    device: str = "auto"
+    num_episodes: int = 50
+    n_samples: int = 1000
+    benchmarks: list[str] = field(default_factory=lambda: list(BENCHMARK_NAMES))
+    out_dir: str = os.path.join(_REPO_ROOT, "eval", "results")
+    seed: int = 0
+    # Maximum failed-episode fraction before exiting nonzero (1.0 allows exploratory partial runs).
+    max_failed_fraction: float = 0.0
+
+
+def validate(args: BenchmarkSpec) -> None:
+    if not 0 <= args.max_failed_fraction <= 1:
+        raise ValueError("max_failed_fraction must lie in [0, 1]")
+    check_choices("benchmarks", args.benchmarks, BENCHMARK_NAMES)
+
+
+def run(args: BenchmarkSpec) -> None:
     device = (
         "cuda"
         if (args.device == "auto" and torch.cuda.is_available())
@@ -168,9 +172,7 @@ def main() -> None:
     )
     print(f"Device: {device}")
 
-    benchmark_names = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
-    unknown = set(benchmark_names) - set(BENCHMARK_NAMES)
-    assert not unknown, f"Unknown benchmark(s): {unknown}, must be a subset of {BENCHMARK_NAMES}"
+    benchmark_names = list(args.benchmarks)
 
     print(f"Loading TabICL marginal model (TabICLRegressor): {args.tabicl_ckpt}")
     tabicl_reg = make_tabicl_regressor(checkpoint=args.tabicl_ckpt, device=device)
@@ -249,6 +251,8 @@ def main() -> None:
     print(f"Episode completion: {attempted - failed_episodes}/{attempted}")
     require_coverage(attempted - failed_episodes, attempted, 1 - args.max_failed_fraction)
 
+
+main = hydra_entry("run_benchmarks", BenchmarkSpec, run, validate=validate)
 
 if __name__ == "__main__":
     main()

@@ -1,8 +1,8 @@
 """Marginal calibration of a TabICL checkpoint on GP episodes, against the analytic posterior.
 
-    python eval/runners/marginal_calibration_eval.py
-    python eval/runners/marginal_calibration_eval.py --ckpt <marginal checkpoint>
-    python eval/runners/marginal_calibration_eval.py --p-values 32 --n-episodes 256
+    python -m eval.runners.marginal_calibration_eval
+    python -m eval.runners.marginal_calibration_eval ckpt=<marginal checkpoint>
+    python -m eval.runners.marginal_calibration_eval p_values=[32] n_episodes=256
 
 Reported per kernel family and context size P:
     nll, nll_oracle and gap: marginal NLL vs the exact GP marginal posterior.
@@ -15,10 +15,10 @@ Reported per kernel family and context size P:
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -42,6 +42,7 @@ from copula_inter.pit import (  # noqa: E402
     run_pit_batched,
 )
 from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
+from eval.runners.hydra_cli import hydra_entry  # noqa: E402
 from eval.spatial.calibration import compute_quantile_ece  # noqa: E402
 
 if TYPE_CHECKING:
@@ -160,36 +161,31 @@ def _print_table(title: str, rows: list[tuple[str, int, dict]]) -> None:
         )
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Marginal calibration / analytic-headroom report for a TabICL marginal.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    ap.add_argument(
-        "--ckpt",
-        default=PRETRAINED_TABICL_CKPT,
-        help="HF filename in jingang/TabICL, a local .pt/.ckpt path, or a name "
-        "registered in eval/configs/checkpoints.py::MARGINAL_FAMILIES.",
-    )
-    ap.add_argument("--n-episodes", type=int, default=128, help="Episodes per context size P.")
-    ap.add_argument(
-        "--batch-size", type=int, default=8, help="Episodes per generate_gp_batch / PIT call (they share P and N)."
-    )
-    ap.add_argument(
-        "--p-values",
-        type=int,
-        nargs="+",
-        default=[8, 16, 32, 64, 128, 256],
-        help="Context sizes to sweep. The defect is expected to vary along this axis, and so is the fix.",
-    )
-    ap.add_argument("--n-test", type=int, default=128, help="Query rows per episode.")
-    ap.add_argument("--k-folds", type=int, default=DEFAULT_K_FOLDS, help="Must match deployment (tabicl.pit_k_folds).")
-    ap.add_argument("--eps", type=float, default=1.0e-6, help="Probit clamp epsilon.")
-    ap.add_argument("--device", default="auto")
-    ap.add_argument("--seed", type=int, default=20260902)
-    ap.add_argument("--out-json", default=None, help="Write the full per-group record (incl. rank histograms) here.")
-    args = ap.parse_args()
+@dataclass
+class MarginalCalibrationSpec:
+    """Marginal calibration / analytic-headroom report for a TabICL marginal."""
 
+    # HF filename in jingang/TabICL, a local .pt/.ckpt path, or an eval/configs/checkpoints.py::MARGINAL_FAMILIES name.
+    ckpt: str = PRETRAINED_TABICL_CKPT
+    # Episodes per context size P.
+    n_episodes: int = 128
+    # Episodes per generate_gp_batch / PIT call (they share P and N).
+    batch_size: int = 8
+    # Context sizes to sweep.
+    p_values: list[int] = field(default_factory=lambda: [8, 16, 32, 64, 128, 256])
+    # Query rows per episode.
+    n_test: int = 128
+    # Must match deployment (tabicl.pit_k_folds).
+    k_folds: int = DEFAULT_K_FOLDS
+    # Probit clamp epsilon.
+    eps: float = 1.0e-6
+    device: str = "auto"
+    seed: int = 20260902
+    # Write the full per-group record (incl. rank histograms) here.
+    out_json: str | None = None
+
+
+def run(args: MarginalCalibrationSpec) -> None:
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -199,8 +195,10 @@ def main() -> None:
     tabicl = load_tabicl(ckpt, device)
 
     from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
 
-    # Same prior as Phase A training.
+    # Same prior as Phase A training, composed in place of this runner's own config.
+    GlobalHydra.instance().clear()
     with initialize_config_dir(config_dir=config_dir(__file__), version_base=None):
         full = compose(config_name="finetune_marginal")
 
@@ -259,7 +257,7 @@ def main() -> None:
             json.dump(
                 {
                     "ckpt": ckpt,
-                    "args": vars(args),
+                    "args": asdict(args),
                     "overall": overall,
                     "by_p": {n: m for n, _c, m in by_p},
                     "by_kernel": {n: m for n, _c, m in by_k},
@@ -271,6 +269,8 @@ def main() -> None:
             )
         print(f"[out] {args.out_json}")
 
+
+main = hydra_entry("marginal_calibration_eval", MarginalCalibrationSpec, run)
 
 if __name__ == "__main__":
     main()

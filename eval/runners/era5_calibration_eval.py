@@ -4,18 +4,17 @@ For each timestamp, an episode has a dense target patch inside a lat/lon box
 and n_ctx context points from the rest of the grid.
 
 Usage:
-    python eval/runners/era5_calibration_eval.py \
-        --nc-path /path/to/era5_temperature.nc \
-        --target-lat-bounds 45 50 --target-lon-bounds 0 5
+    python -m eval.runners.era5_calibration_eval nc_path=/path/to/era5_temperature.nc \
+        target_lat_bounds=[45,50] target_lon_bounds=[0,5]
 
-Without --nc-path a small ERA5 sample (Western Europe, 10 days of Jan 2023) is
+Without nc_path a small ERA5 sample (Western Europe, 10 days of Jan 2023) is
 downloaded from the public ARCO-ERA5 archive and cached in eval/data/cache/.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
+from dataclasses import dataclass, field
 from typing import Optional, Sequence, Tuple
 
 import matplotlib
@@ -29,6 +28,7 @@ from scipy.stats import norm
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
+from eval.runners.hydra_cli import check_choice, hydra_entry  # noqa: E402
 from eval.spatial import calibration as cal  # noqa: E402
 from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles  # noqa: E402
 
@@ -324,54 +324,40 @@ def build_calibration_figure(
     print(f"Saved {output_path}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--nc-path",
-        type=str,
-        default=None,
-        help="Path to a real ERA5 temperature NetCDF file. If omitted, a small real "
-        f"sample is auto-downloaded and cached to {_DEFAULT_CACHE_NC}.",
-    )
-    parser.add_argument(
-        "--target-lat-bounds",
-        type=float,
-        nargs=2,
-        default=list(_DEFAULT_TARGET_LAT_BOUNDS),
-        metavar=("LAT_MIN", "LAT_MAX"),
-    )
-    parser.add_argument(
-        "--target-lon-bounds",
-        type=float,
-        nargs=2,
-        default=list(_DEFAULT_TARGET_LON_BOUNDS),
-        metavar=("LON_MIN", "LON_MAX"),
-    )
-    parser.add_argument(
-        "--tabicl-ckpt",
-        type=str,
-        default=None,
-        help="TabICLRegressor marginal checkpoint (required for the non-default estimator).",
-    )
-    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
-    parser.add_argument("--n-ctx", type=int, default=1000, help="Global context points sampled per timestamp.")
-    parser.add_argument(
-        "--n-timestamps", type=int, default=None, help="Number of timestamps to evaluate (default: all)."
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=os.path.join(_DEFAULT_FIGURES_DIR, "era5_multivariate_calibration.pdf"),
-    )
-    args = parser.parse_args()
+@dataclass
+class Era5CalibrationSpec:
+    """Real-ERA5 independence-copula calibration of TabICL's marginals."""
 
+    # Real ERA5 temperature NetCDF; null downloads and caches a small real sample.
+    nc_path: str | None = None
+    # [min, max] of the target patch.
+    target_lat_bounds: list[float] = field(default_factory=lambda: list(_DEFAULT_TARGET_LAT_BOUNDS))
+    target_lon_bounds: list[float] = field(default_factory=lambda: list(_DEFAULT_TARGET_LON_BOUNDS))
+    # TabICLRegressor marginal checkpoint (required for the non-default estimator).
+    tabicl_ckpt: str | None = None
+    device: str | None = None
+    # Global context points sampled per timestamp.
+    n_ctx: int = 1000
+    # Timestamps to evaluate; null evaluates all.
+    n_timestamps: int | None = None
+    seed: int = 0
+    output: str = os.path.join(_DEFAULT_FIGURES_DIR, "era5_multivariate_calibration.pdf")
+
+
+def validate(args: Era5CalibrationSpec) -> None:
+    check_choice("device", args.device, ("cpu", "cuda"))
+    for key, bounds in (("target_lat_bounds", args.target_lat_bounds), ("target_lon_bounds", args.target_lon_bounds)):
+        if len(bounds) != 2:
+            raise ValueError(f"{key} needs [min,max], got {bounds}")
+
+
+def run(args: Era5CalibrationSpec) -> None:
     nc_path = args.nc_path if args.nc_path is not None else _fetch_default_era5_subset()
 
     y_true, all_quantiles = run_era5_eval(
         nc_path,
-        tuple(args.target_lat_bounds),
-        tuple(args.target_lon_bounds),
+        (args.target_lat_bounds[0], args.target_lat_bounds[1]),
+        (args.target_lon_bounds[0], args.target_lon_bounds[1]),
         tabicl_ckpt=args.tabicl_ckpt,
         device=args.device,
         n_ctx=args.n_ctx,
@@ -381,6 +367,8 @@ def main() -> None:
     print(f"Evaluated {y_true.shape[0]} timestamps x {y_true.shape[1]} target grid cells.")
     build_calibration_figure(y_true, all_quantiles, ALPHA_GRID, args.output)
 
+
+main = hydra_entry("era5_calibration_eval", Era5CalibrationSpec, run, validate=validate)
 
 if __name__ == "__main__":
     main()
