@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import zlib
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -190,7 +191,9 @@ def main() -> None:
     results = []
     for config_name, kernel_name, grid_size in profile_configs:
         for draw in range(args.n_draws):
-            seed = args.seed * 10_000 + hash((config_name, draw)) % 10_000
+            seed = (
+                args.seed * 10_000 + zlib.crc32(f"{config_name}:{draw}".encode()) % 10_000
+            )  # hash() is PYTHONHASHSEED-salted
             r = run_task(
                 model,
                 cfg,

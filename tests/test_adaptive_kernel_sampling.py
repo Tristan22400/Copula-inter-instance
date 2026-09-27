@@ -184,3 +184,21 @@ def test_weights_for_pool_renormalizes_over_subset() -> None:
     weights[_COMPOSABLE_KERNELS.index("matern32")] = 1.0
     out = _weights_for_pool(["rbf", "matern32"], weights)
     assert out == [0.75, 0.25]
+
+
+def test_no_kernel_fit_signal_leaves_the_weights_alone() -> None:
+    """With startup_probes=false there are no kernel_fit/* metrics; the floor must not silently drag
+    the mixture to uniform while the logged weights still look like adaptation."""
+    from omegaconf import OmegaConf
+
+    from copula_inter.train import _update_kernel_sampling
+
+    n = len(_COMPOSABLE_KERNELS)
+    w = torch.zeros(n)
+    w[0] = 1.0
+    before = w.clone()
+    log: dict = {}
+    cfg = OmegaConf.create({"training": {"adaptive_kernel_floor": 0.05}, "data": {}})
+    _update_kernel_sampling(cfg, w, {"y_nll_total": 1.0}, log)
+    assert torch.equal(w, before)
+    assert log[f"val/kernel_sampling_weight/{_COMPOSABLE_KERNELS[0]}"] == 1.0

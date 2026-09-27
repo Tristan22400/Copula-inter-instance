@@ -258,7 +258,7 @@ class LiveERA5Dataset(IterableDataset):
         n_context_frac_range: Tuple[float, float],
         base_seed: int,
         group_size: int = 1,
-        tabicl_inference_amp: bool = True,
+        tabicl_inference_amp: bool = False,
         marginal_backend: Optional[str] = None,
         marginal_probs_n: int = 99,
     ) -> None:
@@ -414,7 +414,7 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         n_context_frac_range=ecfg["n_context_frac_range"],
         base_seed=base_seed,
         group_size=group_size,
-        tabicl_inference_amp=bool(t.get("tabicl_inference_amp", True)),
+        tabicl_inference_amp=bool(t.get("tabicl_inference_amp", False)),
         marginal_backend=marginal_backend,
         marginal_probs_n=marginal_probs_n,
     )

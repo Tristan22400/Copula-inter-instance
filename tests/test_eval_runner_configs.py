@@ -162,3 +162,11 @@ def test_no_doc_invokes_a_runner_with_argparse_flags() -> None:
     pattern = re.compile(r"eval/runners/\w+\.py\s+--|copula_inter\.finetune_era5")
     for path in [REPO / "CLAUDE.md", REPO / "README.md", *sorted((REPO / "scripts").glob("*.sh"))]:
         assert not pattern.search(path.read_text()), path
+
+
+def test_run_benchmarks_tolerates_failed_episodes_by_default() -> None:
+    """Pre-refactor run_benchmarks logged a failed episode and continued; one failure must not fail the run."""
+    from eval.results import require_coverage
+
+    spec = BenchmarkSpec()
+    require_coverage(99, 100, 1 - spec.max_failed_fraction)  # must not raise

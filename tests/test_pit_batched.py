@@ -40,7 +40,9 @@ class RowIndependentFakeTabICL(nn.Module):
         super().__init__()
         self.q = q
 
-    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, X: torch.Tensor, y: torch.Tensor, **_kwargs: object
+    ) -> torch.Tensor:  # accepts inference_config like TabICL
         batch, T, _ = X.shape
         P = y.shape[1]
         n = T - P
@@ -64,7 +66,9 @@ class FoldScaleProbe(nn.Module):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
 
-    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, X: torch.Tensor, y: torch.Tensor, **_kwargs: object
+    ) -> torch.Tensor:  # accepts inference_config like TabICL
         n_query = X.shape[1] - y.shape[1]
         loc = y.pow(3).mean(dim=1, keepdim=True) + self.anchor
         return loc[:, None, :].expand(-1, n_query, -1)
@@ -518,7 +522,9 @@ class GradProbeFakeTabICL(nn.Module):
         self.saw_grad_enabled: list[bool] = []
         self.saw_training: list[bool] = []
 
-    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, X: torch.Tensor, y: torch.Tensor, **_kwargs: object
+    ) -> torch.Tensor:  # accepts inference_config like TabICL
         self.saw_grad_enabled.append(torch.is_grad_enabled())
         self.saw_training.append(self.training)
         batch, T, _ = X.shape

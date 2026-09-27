@@ -48,11 +48,16 @@ from eval.data.era5_episodes import (
 from inference.copula_inference import load_copula_model
 
 
+def resolve_config_path(config_path: str) -> str:
+    """The default relative "conf/config.yaml" names the project config wherever the runner is launched from."""
+    if config_path == "conf/config.yaml" and not os.path.isfile(config_path):
+        return os.path.join(project_config_dir(__file__), "config.yaml")
+    return config_path
+
+
 def _load_full_config(config_path: str) -> DictConfig:
     """Compose the episode config through Hydra's defaults list (model and data groups), independent of any checkpoint."""
-    if config_path == "conf/config.yaml" and not os.path.isfile(config_path):
-        config_path = os.path.join(project_config_dir(__file__), "config.yaml")
-    config_path = os.path.abspath(config_path)
+    config_path = os.path.abspath(resolve_config_path(config_path))
     config_dir = os.path.dirname(config_path)
     config_name = os.path.splitext(os.path.basename(config_path))[0]
     if GlobalHydra.instance().is_initialized():

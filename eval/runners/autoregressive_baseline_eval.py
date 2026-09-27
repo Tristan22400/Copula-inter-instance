@@ -33,23 +33,21 @@ from copula_inter.pit import (  # noqa: E402
     normalize_targets,
     tabicl_forward,
 )
+from copula_inter.rng import seed_everything  # noqa: E402
 from eval.baselines.autoregressive import autoregressive_log_pdf  # noqa: E402
-from eval.configs.checkpoints import resolve_marginal_checkpoint  # noqa: E402
+from eval.configs.checkpoints import (
+    resolve_checkpoint,  # noqa: E402
+    resolve_marginal_checkpoint,  # noqa: E402
+)
 from eval.data.era5_io import safe_cholesky  # noqa: E402
 from eval.runners.episode_scoring import _eval_icl_episode, _marginal_pit  # noqa: E402
-from eval.runners.eval_checkpoint import _set_seed  # noqa: E402
 from eval.runners.eval_inputs import _live_generate_alternating, _load_full_config  # noqa: E402
 from eval.runners.hydra_cli import hydra_entry  # noqa: E402
 from eval.viz.sample_comparison_plots import plot_sample_comparison  # noqa: E402
 from inference.copula_inference import load_copula_model  # noqa: E402
 
-_DEFAULT_CKPT = os.path.join(
-    _REPO_ROOT,
-    "checkpoints",
-    "copula_nano",
-    "copula-finetune-marginal-float32",
-    "step_0630000.pt",
-)
+# A CHECKPOINT_FAMILIES name (eval/configs/checkpoints.py), or a path; resolved in run().
+_DEFAULT_CKPT = "copula-nano-finetune-marginal-float32"
 
 
 def _one_sample_pair(
@@ -63,6 +61,7 @@ def _one_sample_pair(
     mean: torch.Tensor,
     std: torch.Tensor,
     device: Device,
+    seed: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """One joint sample per method in raw y units: the copula model (one marginal pass plus chol(Sigma) noise) and the chain (ancestral sampling)."""
     N = X_test.shape[0]
@@ -90,6 +89,7 @@ def _one_sample_pair(
         torch.zeros_like(X_test[None, :, 0]),
         order="natural",
         conditioning="sample",
+        seed=seed,  # per-episode: the chain's per-step generators depend only on (seed, step)
     )
     ar_sample = ar["appended"][0].detach().cpu().numpy()
     return y_copula_sample, ar_sample
@@ -110,14 +110,14 @@ class AutoregressiveBaselineSpec:
     # Evaluated episodes that also get a sample-comparison PNG in out_dir.
     n_plot_episodes: int = 3
     tabicl_pit_k_folds: int = DEFAULT_K_FOLDS
-    tabicl_amp: bool = True
+    tabicl_amp: bool = False
     out_dir: str = os.path.join(_REPO_ROOT, "eval", "results")
     seed: int = 42
     device: str = "auto"
 
 
 def run(args: AutoregressiveBaselineSpec) -> None:
-    _set_seed(args.seed)
+    seed_everything(args.seed)
     device = torch.device(
         "cuda"
         if (args.device == "auto" and torch.cuda.is_available())
@@ -127,8 +127,9 @@ def run(args: AutoregressiveBaselineSpec) -> None:
 
     cfg = _load_full_config(args.config)
 
-    print(f"\nLoading Copula Model checkpoint: {args.ckpt}")
-    icl_model, icl_cfg = load_copula_model(args.ckpt, config_path=args.config, device=str(device))
+    ckpt = resolve_checkpoint(args.ckpt)
+    print(f"\nLoading Copula Model checkpoint: {ckpt}")
+    icl_model, icl_cfg = load_copula_model(ckpt, config_path=args.config, device=str(device))
     print(
         f"Copula Model parameters: {sum(p.numel() for p in icl_model.parameters()):,}  rank={int(icl_cfg.model.rank)}"
     )
@@ -189,6 +190,7 @@ def run(args: AutoregressiveBaselineSpec) -> None:
                 mean,
                 std,
                 device,
+                seed=args.seed + i,
             )
             out_path = os.path.join(args.out_dir, f"sample_comparison_ep{i}.png")
             plot_sample_comparison(

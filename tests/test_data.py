@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import warnings
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -1576,7 +1577,7 @@ def test_mean_fn_diversifies_mu_star(small_cfg: DictConfig, family_probs: list[f
     cfg.data.mean_fn_family_probs = family_probs
     cfg.data.mean_fn_anomaly_frac = 0.5  # generous, so the sparse-anomaly family fires reliably at small N
 
-    torch.manual_seed(abs(hash(("mean_fn_mu_star", tuple(family_probs)))) % (2**31))
+    torch.manual_seed(zlib.crc32(f"mean_fn_mu_star:{tuple(family_probs)}".encode()))
     any_nonzero = False
     for _ in range(20):
         task = generate_gp_task(cfg)
@@ -1597,7 +1598,7 @@ def test_mean_fn_goldilocks_and_psd(small_cfg: DictConfig, family_probs: list[fl
     cfg.data.mean_fn_prob = 1.0
     cfg.data.mean_fn_family_probs = family_probs
 
-    torch.manual_seed(abs(hash(("mean_fn_psd", tuple(family_probs)))) % (2**31))
+    torch.manual_seed(zlib.crc32(f"mean_fn_psd:{tuple(family_probs)}".encode()))
     off_diag_abs = []
     for _ in range(20):
         task = generate_gp_task(cfg)
@@ -1636,7 +1637,7 @@ def test_mean_fn_z_train_stays_calibrated(small_cfg: DictConfig, family_probs: l
     cfg.data.mean_fn_weight_std = 1.0
     cfg.data.mean_fn_bias_std = 1.0
 
-    torch.manual_seed(abs(hash(("mean_fn_z_train", tuple(family_probs)))) % (2**31))
+    torch.manual_seed(zlib.crc32(f"mean_fn_z_train:{tuple(family_probs)}".encode()))
     episodes = generate_gp_batch(cfg, B=300, device="cpu")
     z_train = torch.cat([ep["z_train"] for ep in episodes])
 
@@ -1675,7 +1676,7 @@ def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg: DictConfig,
     cfg.data.mean_fn_family_probs = family_probs
     cfg.data.mean_fn_anomaly_frac = 0.5
 
-    torch.manual_seed(abs(hash(("mean_fn_pit_reconstruct", tuple(family_probs)))) % (2**31))
+    torch.manual_seed(zlib.crc32(f"mean_fn_pit_reconstruct:{tuple(family_probs)}".encode()))
     for _ in range(10):
         task = generate_gp_task(cfg)
         cached = gp_analytical_pit(task)

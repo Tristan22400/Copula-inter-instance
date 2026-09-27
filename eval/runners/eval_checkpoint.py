@@ -16,7 +16,6 @@ baselines.workers processes, one per physical core by default.
 from __future__ import annotations
 
 import os
-import random
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -31,6 +30,7 @@ from eval.runners.eval_inputs import (
     _load_models,
     _plan_episodes,
     _resolve_episode_source,
+    resolve_config_path,
 )
 from eval.runners.eval_tables import (
     _METHOD_LABELS,
@@ -44,15 +44,16 @@ from eval.runners.eval_tables import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from omegaconf import DictConfig
 
 from copula_inter.artifacts import artifact_identity, atomic_json_save
 from copula_inter.config_path import config_dict
-from copula_inter.config_path import config_dir as project_config_dir
+from copula_inter.rng import seed_everything
 from eval.baselines.classical import (
     baseline_fingerprint,
     load_baseline_cache,
 )
+from eval.configs.checkpoints import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
 from eval.data.era5_episodes import (
     era5_episode_fingerprint,
 )
@@ -74,14 +75,6 @@ from eval.results import (
 from eval.runners.eval_args import EvalSpec, prepare_eval_spec, validate_eval_spec
 from eval.runners.hydra_cli import hydra_entry
 from eval.viz.correlation_plots import plot_corr_grid
-
-
-def _set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def _results_fingerprint(
@@ -117,6 +110,64 @@ def _results_fingerprint(
         "ar_max_context": spec.autoregressive.max_context if spec.autoregressive.enabled else None,
         "ar_n_episodes": spec.autoregressive.n_episodes if spec.autoregressive.enabled else None,
     }
+
+
+def _baseline_cache_fingerprint(
+    spec: EvalSpec,
+    cfg: DictConfig,
+    *,
+    live_generate: bool,
+    dataset_dir: str | None,
+    icl_rank: int,
+    oracle_mode: str,
+    era5_geometry: dict | None,
+    tabicl_pit_k_folds: int,
+    tabicl_ckpt: str | None,
+) -> dict:
+    """Baseline-cache fingerprint: everything besides the episode index that the cached fits depend on.
+
+    Settings are recorded only when they differ from what 42c0402 did implicitly, so caches written
+    before the refactor stay valid exactly when they are still correct.
+    """
+    fingerprint = baseline_fingerprint(
+        cfg,
+        live_generate,
+        dataset_dir,
+        spec.seed,
+        icl_rank,
+        oracle_mode,
+        spec.baselines.n_steps_mle,
+        spec.baselines.lr_mle,
+        spec.baselines.n_restarts_mle,
+        spec.baselines.n_steps_dkl,
+        spec.baselines.lr_dkl,
+        spec.baselines.n_steps_per_ep,
+        spec.baselines.patience_per_ep,
+        gp_val_select=spec.baselines.gp_val_select,
+        n_restarts_dkl=spec.baselines.n_restarts_dkl,
+    )
+    if live_generate and not spec.alternate_noncomposite:
+        # Changes which kernel every even-index live episode draws (pre-refactor always alternated).
+        fingerprint["alternate_noncomposite"] = False
+    if era5_geometry is not None:
+        # ERA5 fingerprint also includes the corpus, geometry and marginal.
+        fingerprint["era5"] = era5_episode_fingerprint(
+            spec.era5.corpus_dir,
+            k_folds=tabicl_pit_k_folds,
+            marginal=spec.marginal.z_train_source,
+            **era5_geometry,
+        )
+        # The cached z-space baseline NLLs are scored against this marginal's PIT z_test, so which
+        # TabICL checkpoint (and precision) produced it is part of the identity. Pre-refactor caches
+        # were all written with the default marginal under AMP; that case keeps the old key set.
+        if spec.marginal.z_train_source == "tabicl" and tabicl_ckpt is not None:
+            legacy = tabicl_ckpt == resolve_marginal_checkpoint(DEFAULT_MARGINAL_FAMILY) and spec.marginal.tabicl_amp
+            if not legacy:
+                fingerprint["era5"]["pit_marginal_identity"] = {
+                    "ckpt": artifact_identity(tabicl_ckpt),
+                    "amp": bool(spec.marginal.tabicl_amp),
+                }
+    return fingerprint
 
 
 def _report_results(
@@ -224,9 +275,8 @@ def _report_results(
 def run_evaluation(spec: EvalSpec) -> None:
     """Score one validated evaluation specification."""
     validate_eval_spec(spec)
-    if spec.config == "conf/config.yaml" and not os.path.isfile(spec.config):
-        spec.config = os.path.join(project_config_dir(__file__), "config.yaml")
-    _set_seed(spec.seed)
+    spec.config = resolve_config_path(spec.config)
+    seed_everything(spec.seed)
 
     device = torch.device(
         "cuda"
@@ -295,32 +345,17 @@ def run_evaluation(spec: EvalSpec) -> None:
 
     # Baseline cache.
     baseline_cache = spec.baselines.cache
-    fingerprint = baseline_fingerprint(
+    fingerprint = _baseline_cache_fingerprint(
+        spec,
         cfg,
-        live_generate,
-        dataset_dir,
-        spec.seed,
-        icl_rank,
-        oracle_mode,
-        spec.baselines.n_steps_mle,
-        spec.baselines.lr_mle,
-        spec.baselines.n_restarts_mle,
-        spec.baselines.n_steps_dkl,
-        spec.baselines.lr_dkl,
-        spec.baselines.n_steps_per_ep,
-        spec.baselines.patience_per_ep,
-        gp_val_select=spec.baselines.gp_val_select,
-        n_restarts_dkl=spec.baselines.n_restarts_dkl,
+        live_generate=live_generate,
+        dataset_dir=dataset_dir,
+        icl_rank=icl_rank,
+        oracle_mode=oracle_mode,
+        era5_geometry=era5_geometry if era5 else None,
+        tabicl_pit_k_folds=tabicl_pit_k_folds,
+        tabicl_ckpt=tabicl_ckpt,
     )
-    if era5:
-        assert era5_geometry is not None
-        # ERA5 fingerprint also includes the corpus, geometry and marginal.
-        fingerprint["era5"] = era5_episode_fingerprint(
-            spec.era5.corpus_dir,
-            k_folds=tabicl_pit_k_folds,
-            marginal=spec.marginal.z_train_source,
-            **era5_geometry,
-        )
     cache_entries = load_baseline_cache(baseline_cache, fingerprint) if baseline_cache is not None else {}
 
     # ---- Scored-results cache: the checkpoint-DEPENDENT half of a resume ----

@@ -189,3 +189,14 @@ def test_kernel_hidden_warp_oracle_diag_marginal_gap_vanishes(
     assert m["oracle_diag/marginal_gap"] == pytest.approx(0.0, abs=1e-3)
     assert m["oracle_diag/copula_gap"] == pytest.approx(m["oracle_diag/gap_nll"], abs=1e-4)
     assert m["oracle_diag/copula_headroom"] > 0.0
+
+
+def test_copula_nll_std_without_episode_meta(small_cfg: DictConfig, small_model_cfg: DictConfig) -> None:
+    """On-disk and ERA5-live training have no val_episodes_meta; with the default startup_probes the
+    per-task copula NLL dispersion is still computed (it needs only Sigma and z_test), as before 62b5205."""
+    cfg = _cfg(small_cfg, small_model_cfg)
+    eps = _reprior_standardize(_episodes(cfg, b=4, seed=8))
+    batches = [collate_fn(eps)]
+    model = build_copula_transformer(cfg)
+    metrics = validate(model, batches, cfg, "cpu", step=0, do_plot=False, val_episodes_meta=None)[0]
+    assert math.isfinite(metrics["oracle_diag/copula_nll_std"])

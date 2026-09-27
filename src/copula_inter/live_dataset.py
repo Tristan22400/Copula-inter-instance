@@ -150,7 +150,7 @@ class LiveGPDataset(IterableDataset):
         info = get_worker_info()
         worker_id = info.id if info is not None else 0
         cfg = copy.deepcopy(self._cfg)
-        configure_tabicl_inference_amp(bool(cfg.training.get("tabicl_inference_amp", True)))
+        configure_tabicl_inference_amp(bool(cfg.training.get("tabicl_inference_amp", False)))
         call_idx = 0
         # Silence per-call degenerate-episode warnings.
         warnings.filterwarnings("ignore", category=RuntimeWarning)

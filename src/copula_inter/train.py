@@ -252,20 +252,32 @@ def _fmt_metric(metrics: dict[str, float], key: str, spec: str) -> str:
     return format(value, spec) if math.isfinite(value) else "n/a"
 
 
+_warned_no_kernel_signal = False
+
+
 def _update_kernel_sampling(
     cfg: DictConfig, adaptive_kernel_weights: torch.Tensor, metrics: dict[str, float], log_dict: dict[str, Any]
 ) -> None:
     """Move the adaptive kernel-family sampling weights toward the families validation scores worst."""
     t = cfg.training
     excluded_kernels = set(getattr(cfg.data, "composite_exclude_kernels", None) or [])
-    new_kernel_weights = _update_adaptive_kernel_weights(
-        adaptive_kernel_weights,
-        metrics,
-        float(t.get("adaptive_kernel_lr", 1.0)),
-        float(t.get("adaptive_kernel_floor", 0.05)),
-        exclude=excluded_kernels,
-        signal=str(t.get("adaptive_kernel_signal", "tabicl")),
-    )
+    if not any(k.startswith(("oracle_diag/kernel_fit/", "kernel_fit/")) for k in metrics):
+        # No per-family signal (training.startup_probes=false skips the kernel_fit probes): every
+        # gap would read 0 and the floor would drag the mixture toward uniform. Hold the weights.
+        global _warned_no_kernel_signal
+        if not _warned_no_kernel_signal:
+            print("[train] adaptive kernel sampling: no kernel_fit/* metrics at validation; weights held")
+            _warned_no_kernel_signal = True
+        new_kernel_weights = adaptive_kernel_weights.clone()
+    else:
+        new_kernel_weights = _update_adaptive_kernel_weights(
+            adaptive_kernel_weights,
+            metrics,
+            float(t.get("adaptive_kernel_lr", 1.0)),
+            float(t.get("adaptive_kernel_floor", 0.05)),
+            exclude=excluded_kernels,
+            signal=str(t.get("adaptive_kernel_signal", "tabicl")),
+        )
     # In-place update of the shared-memory tensor the workers read.
     adaptive_kernel_weights.copy_(new_kernel_weights)
     # Excluded families are never sampled; don't log their weights.
@@ -355,7 +367,7 @@ def main(cfg: DictConfig) -> None:
     device, gpu_peak_flops = resolve_train_device(cfg)
 
     t = cfg.training
-    tabicl_amp = bool(t.get("tabicl_inference_amp", True))
+    tabicl_amp = bool(t.get("tabicl_inference_amp", False))
     configure_tabicl_inference_amp(tabicl_amp)
     print(f"[train] frozen TabICL marginal inference AMP={'on' if tabicl_amp else 'off (float32)'}")
     live_generation = bool(t.get("live_generation", False))

@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 from omegaconf import OmegaConf
 
-from copula_inter.artifacts import artifact_identity, canonical_digest, file_digest
+from copula_inter.artifacts import artifact_identity, canonical_digest, file_digest, mkstemp_like_open
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dict
 
@@ -47,7 +46,7 @@ def ensure_manifest(directory: str | os.PathLike[str], spec: dict) -> dict:
     if not path.exists():
         if any(root.glob("shard_*.pt")) and not path.exists():
             raise ValueError(f"{root} has shards but no manifest; use a new dataset directory")
-        fd, temporary = tempfile.mkstemp(prefix=".manifest.", dir=root)
+        fd, temporary = mkstemp_like_open(prefix=".manifest.", dir=root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as out:
                 json.dump(candidate, out, sort_keys=True)
@@ -124,12 +123,18 @@ def dataset_identity(directory: str | os.PathLike[str]) -> dict:
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else None
     shards = []
     for path in sorted(root.glob("shard_*.pt")):
-        sidecar = shard_count_path(path)
-        digest = verified_shard_digest(path)[1] if sidecar.is_file() else None
-        # Replacing bytes at the same pathname changes ctime even if mtime is
-        # reset. Legacy or modified shards are hashed directly.
-        shards.append((path.name, digest or file_digest(path)))
-    legacy = [(p.name, file_digest(p)) for p in sorted(root.glob("task_*.pt"))]
+        if shard_count_path(path).is_file():
+            shards.append((path.name, verified_shard_digest(path)[1]))
+        else:
+            # Pre-refactor shards have no digest sidecar. Hashing every one on every eval run is
+            # prohibitive for large datasets, so identify them by the same stat fields the sidecar
+            # check trusts (a same-path replacement changes ctime/inode even if mtime is reset).
+            st = path.stat()
+            shards.append((path.name, f"stat:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_ino}"))
+    legacy = [
+        (p.name, f"stat:{p.stat().st_size}:{p.stat().st_mtime_ns}:{p.stat().st_ctime_ns}:{p.stat().st_ino}")
+        for p in sorted(root.glob("task_*.pt"))
+    ]
     meta = root / "meta.pt"
     return {
         "manifest": manifest,

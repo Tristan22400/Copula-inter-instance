@@ -15,15 +15,20 @@ __all__ = ["make_tabicl_regressor", "tabicl_quantiles", "tabicl_loo_pit"]
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def make_tabicl_regressor(checkpoint: str | None = None, device: str | None = None) -> TabICLRegressor:
+def make_tabicl_regressor(
+    checkpoint: str | None = None, device: str | None = None, use_amp: bool = False
+) -> TabICLRegressor:
     """Build one TabICLRegressor to reuse across .fit() calls.
 
     checkpoint is a local .ckpt/.pt file (model_path) or a jingang/TabICL HF
-    filename (checkpoint_version).
+    filename (checkpoint_version). use_amp defaults to float32 like every eval
+    runner's frozen marginal (TabICL's own "auto" turns AMP on under CUDA).
     """
     from tabicl import TabICLRegressor
 
-    kwargs: dict[str, Any] = {"device": device} if device is not None else {}
+    kwargs: dict[str, Any] = {"use_amp": use_amp}
+    if device is not None:
+        kwargs["device"] = device
     if checkpoint is not None:
         checkpoint_path = Path(checkpoint)
         if checkpoint_path.is_absolute() or "/" in checkpoint or checkpoint_path.suffix == ".pt":

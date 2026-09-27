@@ -149,7 +149,8 @@ def autoregressive_log_pdf(
             g = torch.Generator()
             g.manual_seed(zlib.crc32(f"ar-sample:{seed}:{i}".encode()) & 0x7FFFFFFF)
             u = torch.rand(B, generator=g, dtype=torch.float32).to(device)
-            y_next = dist.icdf(u).to(ctx_y.dtype)
+            # TabICL's icdf reads the trailing axis as quantile levels: one level per row.
+            y_next = dist.icdf(u.unsqueeze(-1)).squeeze(-1).to(ctx_y.dtype)
 
         ctx_x[:, P + i] = x_rem[:, 0, :]
         ctx_y[:, P + i] = y_next

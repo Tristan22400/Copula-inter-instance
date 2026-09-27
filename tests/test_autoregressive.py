@@ -33,7 +33,9 @@ class RecordingFakeTabICL(RowIndependentFakeTabICL):
         super().__init__(q)
         self.calls: list[tuple[int, int]] = []  # (n_context, n_query)
 
-    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, X: torch.Tensor, y: torch.Tensor, **_kwargs: object
+    ) -> torch.Tensor:  # accepts inference_config like TabICL
         self.calls.append((y.shape[1], X.shape[1] - y.shape[1]))
         return super().forward(X, y)
 
@@ -93,7 +95,7 @@ def test_teacher_forcing_appends_the_truth_in_visit_order() -> None:
 
 
 def test_sample_conditioning_departs_from_the_truth_but_is_reproducible() -> None:
-    tabicl = RowIndependentFakeTabICL()
+    tabicl = QuantileFakeTabICL()  # defined below: real TabICL icdf semantics
     x_tr, y_tr, x_te, y_te = _episodes(seed=2)
 
     kw: dict[str, Any] = dict(order="natural", conditioning="sample", seed=11)
@@ -199,3 +201,31 @@ def test_ar_note_warns_on_sampled_conditioning() -> None:
     assert sampled is not None
     assert "WARNING" in sampled and "max_context=64" in sampled
     assert _ar_note([{"autoregressive": _NAN_PARTS.copy()}], "random", "teacher_forcing", None) is None
+
+
+class QuantileFakeTabICL(RowIndependentFakeTabICL):
+    """Row-independent fake whose quantile_dist is TabICL's real QuantileDistribution, so icdf has
+    TabICL's semantics: the trailing axis is the quantile *levels* (a (B,) input is B shared levels)."""
+
+    def __init__(self, q: int = 31) -> None:
+        super().__init__(q)
+        from tabicl._model.quantile_dist import QuantileToDistribution
+
+        self.to_dist = QuantileToDistribution(num_quantiles=q)
+
+    def forward(self, X: torch.Tensor, y: torch.Tensor, **_kwargs: object) -> torch.Tensor:
+        loc = super().forward(X, y)[..., :1]  # (B, n, 1)
+        return loc + torch.linspace(-2.0, 2.0, self.q)  # sorted quantile bank per row
+
+    def quantile_dist(self, logits_flat: torch.Tensor) -> Any:  # noqa: ANN401 -- tabicl's QuantileDistribution
+        return self.to_dist(logits_flat)
+
+
+def test_sample_conditioning_runs_batched_with_tabicl_quantile_semantics() -> None:
+    """era5.pit_batch=8 runs the chain on several episodes at once; icdf must get one level per row."""
+    x_tr, y_tr, x_te, y_te = _episodes(B=4, seed=5)
+    out = autoregressive_log_pdf(
+        QuantileFakeTabICL(), x_tr, y_tr, x_te, y_te, order="natural", conditioning="sample", seed=3
+    )
+    assert out["appended"].shape == y_te.shape
+    assert torch.isfinite(out["log_pdf"]).all()

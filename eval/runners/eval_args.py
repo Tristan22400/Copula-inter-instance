@@ -201,6 +201,12 @@ def validate_eval_spec(spec: EvalSpec) -> None:
 def prepare_eval_spec(spec: EvalSpec) -> EvalSpec:
     """Resolve the checkpoint name and validate; returns the same object."""
     spec.ckpt = resolve_checkpoint(spec.ckpt)
+    if os.path.isdir(spec.ckpt):
+        # Pin a run directory to the step file it loads *now*, so the results cache is keyed on
+        # that file's bytes (a later step in the same directory must not reuse cached scores).
+        from inference.copula_inference import _resolve_copula_checkpoint
+
+        spec.ckpt = _resolve_copula_checkpoint(spec.ckpt)
     validate_eval_spec(spec)
     return spec
 

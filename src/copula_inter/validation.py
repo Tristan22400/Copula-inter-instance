@@ -152,6 +152,7 @@ def _score_val_batch(
     z_cache_b: dict | None,
     eps_b: list[dict] | None,
     score_oracle: bool,
+    score_copula_dispersion: bool = True,
 ) -> None:
     """Accumulate one validation batch's analytic-z, TabICL-marginal and ceiling scores."""
     out = model(batch)
@@ -175,7 +176,7 @@ def _score_val_batch(
         acc.oracle_total.append(parts_o["total"].item())
         acc.oracle_copula.append(parts_o["copula"].item())
 
-    _sigma_diagnostics(acc, out, Sigma, z_test_an, batch["test_mask"], include_oracle_copula=score_oracle)
+    _sigma_diagnostics(acc, out, Sigma, z_test_an, batch["test_mask"], include_oracle_copula=score_copula_dispersion)
 
     for b in range(Sigma.shape[0]):
         n = int(batch["test_mask"][b].sum())
@@ -444,6 +445,8 @@ def validate(
             z_cache_b=tabicl_val_z.get(batch_idx) if tabicl_val_z else None,
             eps_b=val_episodes_meta.get(batch_idx) if val_episodes_meta is not None else None,
             score_oracle=include_oracle_diagnostics and val_episodes_meta is not None,
+            # Needs only Sigma and z_test, not the episode meta (on-disk / ERA5-live have none).
+            score_copula_dispersion=include_oracle_diagnostics,
         )
 
     z_label = "analytic_z" if include_oracle_diagnostics else "val_z"

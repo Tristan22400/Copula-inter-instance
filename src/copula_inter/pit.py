@@ -51,18 +51,25 @@ class TabICLLike(Protocol):
 # Pretrained TabICL regressor in the jingang/TabICL HF repo.
 PRETRAINED_TABICL_CKPT = "tabicl-regressor-v2-20260212.ckpt"
 
-# None keeps TabICL's default (AMP on CUDA); set once by the entrypoint and inherited by workers.
-_TABICL_INFERENCE_CONFIG: Optional[InferenceConfig] = None
 
-
-def configure_tabicl_inference_amp(use_amp: bool) -> None:
-    """Set the process-global inference precision for every PIT TabICL forward (None = TabICL default)."""
-    global _TABICL_INFERENCE_CONFIG
-    _TABICL_INFERENCE_CONFIG = InferenceConfig(
+def _inference_config(use_amp: bool) -> InferenceConfig:
+    return InferenceConfig(
         COL_CONFIG=MgrConfig(use_amp=bool(use_amp)),
         ROW_CONFIG=MgrConfig(use_amp=bool(use_amp)),
         ICL_CONFIG=MgrConfig(use_amp=bool(use_amp)),
     )
+
+
+# Frozen-marginal precision for every PIT TabICL forward. Float32 unless an entrypoint opts into AMP
+# (TabICL's own default is AMP on CUDA, which silently applied to every runner that never set it).
+# Set once by the entrypoint and inherited by workers.
+_TABICL_INFERENCE_CONFIG: Optional[InferenceConfig] = _inference_config(False)
+
+
+def configure_tabicl_inference_amp(use_amp: bool) -> None:
+    """Set the process-global inference precision for every PIT TabICL forward (default float32)."""
+    global _TABICL_INFERENCE_CONFIG
+    _TABICL_INFERENCE_CONFIG = _inference_config(use_amp)
 
 
 def tabicl_forward(tabicl: TabICLLike, X: torch.Tensor, y_train: torch.Tensor, **kwargs: Any) -> torch.Tensor:

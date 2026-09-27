@@ -900,15 +900,12 @@ def baseline_fingerprint(
     icl_rank, oracle_mode and the fitting settings.
     """
     data_cfg = OmegaConf.select(gen_cfg, "data", default=None)
-    return {
+    fp = {
         "algo_version": _BASELINE_ALGO_VERSION,
         "data_cfg": OmegaConf.to_container(data_cfg) if data_cfg is not None else {},
         "icl_rank": icl_rank,
         "live_generate": live_generate,
         "dataset_dir": os.path.abspath(dataset_dir) if (dataset_dir and not live_generate) else None,
-        "dataset_identity": (
-            dataset_identity(dataset_dir) if dataset_dir and not live_generate and os.path.isdir(dataset_dir) else None
-        ),
         "seed": seed,
         "oracle_mode": oracle_mode,
         "n_steps_mle": n_steps_mle,
@@ -921,6 +918,11 @@ def baseline_fingerprint(
         "patience_per_ep": patience_per_ep,
         "gp_val_select": gp_val_select,
     }
+    # Only on-disk datasets get a content identity (same-path replacement). Live / ERA5 runs keep
+    # 42c0402's exact key set, so baseline caches written before the refactor stay valid.
+    if dataset_dir and not live_generate and os.path.isdir(dataset_dir):
+        fp["dataset_identity"] = dataset_identity(dataset_dir)
+    return fp
 
 
 def episode_cache_key(

@@ -37,11 +37,26 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def default_file_mode() -> int:
+    """The mode a plain open() would create: 0666 minus the process umask."""
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
+def mkstemp_like_open(*, prefix: str, dir: str | Path, suffix: str = "") -> tuple[int, str]:
+    """tempfile.mkstemp, but with open()'s permissions (mkstemp forces 0600, which
+    os.replace/os.link then publish -- unreadable to group jobs on shared storage)."""
+    fd, temporary = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=dir)
+    os.chmod(temporary, default_file_mode())
+    return fd, temporary
+
+
 def atomic_write(path: str | os.PathLike[str], writer: Callable[[str], None]) -> None:
     """Publish a complete file on the destination filesystem or leave it absent."""
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
+    fd, temporary = mkstemp_like_open(prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
     os.close(fd)
     try:
         writer(temporary)

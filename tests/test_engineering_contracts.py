@@ -15,7 +15,7 @@ import torch
 from omegaconf import OmegaConf
 from pytest import MonkeyPatch
 
-from copula_inter.artifacts import atomic_torch_save
+from copula_inter.artifacts import atomic_json_save, atomic_torch_save
 from copula_inter.backend_registry import BACKENDS, COPULA_BACKBONES, GENERIC_MARGINAL_BACKENDS, require_capability
 from copula_inter.dataset import CopulaDataset, collate_fn
 from copula_inter.dataset_manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
@@ -173,6 +173,24 @@ def test_atomic_save_keeps_old_file_on_failure(tmp_path: Path, monkeypatch: Monk
     assert sorted(item.name for item in tmp_path.iterdir()) == ["checkpoint.pt"]
 
 
+@pytest.mark.parametrize("umask", [0o022, 0o002, 0o077])
+def test_published_files_get_umask_permissions_like_open(tmp_path: Path, umask: int) -> None:
+    """mkstemp creates 0600; published artifacts must be readable like a plain open() on shared storage."""
+    old = os.umask(umask)
+    try:
+        with open(tmp_path / "plain.txt", "w") as out:
+            out.write("x")
+        atomic_torch_save({"step": 1}, tmp_path / "checkpoint.pt")
+        atomic_json_save({"a": 1}, tmp_path / "results.json")
+        ensure_manifest(tmp_path / "ds", {"k": 1})
+    finally:
+        os.umask(old)
+    want = (tmp_path / "plain.txt").stat().st_mode & 0o777
+    assert want == 0o666 & ~umask
+    for name in ("checkpoint.pt", "results.json", "ds/manifest.json"):
+        assert (tmp_path / name).stat().st_mode & 0o777 == want, name
+
+
 def test_scored_fingerprint_tracks_checkpoint_and_resolved_marginal(tmp_path: Path) -> None:
     checkpoint = tmp_path / "copula.pt"
     marginal = tmp_path / "marginal.pt"
@@ -283,3 +301,31 @@ def test_exaone_adapter_overrides_only_one_instance() -> None:
         torch.testing.assert_close(second._collapse_members(output, 1), original)
     assert "_collapse_members" not in first.__dict__
     torch.testing.assert_close(first._collapse_members(output, 1), original)
+
+
+def test_legacy_shards_are_identified_without_rehashing(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """Pre-refactor shards have no digest sidecar; identity must not sha256 every shard on every eval."""
+    import copula_inter.dataset_manifest as dm
+
+    shard = tmp_path / "shard_000000.pt"
+    torch.save([_episode()], shard)  # legacy: no .count.json sidecar
+
+    def no_hashing(path: object) -> str:
+        raise AssertionError(f"re-hashed legacy shard {path}")
+
+    monkeypatch.setattr(dm, "file_digest", no_hashing)
+    first = dataset_identity(tmp_path)
+    assert dataset_identity(tmp_path) == first
+    os.utime(shard, ns=(1, 1))  # a rewritten / replaced shard changes its stat
+    assert dataset_identity(tmp_path) != first
+
+
+def test_diverged_episodes_count_against_a_method_like_pre_refactor_main() -> None:
+    """Only NaN (not scored) is excluded; +inf (diverged) stays in the mean and ranks last, as np.nanmean did."""
+    from eval.results import numeric_summary
+
+    mean, _std, count = numeric_summary([1.0, float("inf"), float("nan")])
+    assert mean == float("inf") and count == 2
+    assert numeric_summary([1.0, 3.0, float("nan")])[:1] == (2.0,)
+    ranks = competition_ranks([{"a": float("inf"), "b": 5.0, "c": float("nan")}], ["a", "b", "c"])
+    assert ranks == {"a": [2], "b": [1], "c": []}

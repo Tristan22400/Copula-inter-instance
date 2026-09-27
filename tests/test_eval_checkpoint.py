@@ -30,6 +30,7 @@ from eval.baselines.prefit import (  # noqa: E402
     _prefit_baselines_parallel,
 )
 from eval.runners.episode_scoring import _eval_icl_episode  # noqa: E402
+from eval.runners.eval_args import EvalSpec
 
 _TINY_DATA_CFG = {
     "d_features": 1,
@@ -418,3 +419,131 @@ def test_failed_baseline_fit_still_yields_nan_parts_dict(
         assert {"total", "marginal", "copula"} <= parts.keys(), label
     for label in dkl_labels:
         assert all(math.isnan(v) for v in y_space_nlls[label].values()), label
+
+
+# The exact key set 42c0402's baseline_fingerprint produced. Live / ERA5 runs must keep it so the
+# baseline caches written before the refactor (hours of fitting) stay valid.
+_PRE_REFACTOR_FINGERPRINT_KEYS = {
+    "algo_version",
+    "data_cfg",
+    "icl_rank",
+    "live_generate",
+    "dataset_dir",
+    "seed",
+    "oracle_mode",
+    "n_steps_mle",
+    "lr_mle",
+    "n_restarts_mle",
+    "n_steps_dkl",
+    "lr_dkl",
+    "n_restarts_dkl",
+    "n_steps_per_ep",
+    "patience_per_ep",
+    "gp_val_select",
+}
+
+
+def _fingerprint(live_generate: bool, dataset_dir: str | None) -> dict:
+    return baseline_fingerprint(
+        OmegaConf.create({"data": dict(_TINY_DATA_CFG)}),
+        live_generate=live_generate,
+        dataset_dir=dataset_dir,
+        seed=0,
+        icl_rank=2,
+        oracle_mode="prior",
+        n_steps_mle=3,
+        lr_mle=0.1,
+        n_restarts_mle=1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
+    )
+
+
+def test_live_baseline_fingerprint_matches_pre_refactor_caches() -> None:
+    fp = _fingerprint(live_generate=True, dataset_dir=None)
+    assert set(fp) == _PRE_REFACTOR_FINGERPRINT_KEYS
+    assert fp["algo_version"] == 4
+
+
+def test_on_disk_baseline_fingerprint_tracks_dataset_content(tmp_path: Path) -> None:
+    fp = _fingerprint(live_generate=False, dataset_dir=str(tmp_path))
+    assert set(fp) == _PRE_REFACTOR_FINGERPRINT_KEYS | {"dataset_identity"}
+
+
+def _eval_spec(tmp_path: Path, *overrides: str) -> EvalSpec:
+    from eval.runners.eval_args import compose_eval_spec
+
+    ckpt = tmp_path / "model.pt"
+    ckpt.write_bytes(b"not loaded")
+    return compose_eval_spec([f"ckpt={ckpt}", *overrides])
+
+
+def test_ckpt_directory_is_pinned_to_its_latest_step(tmp_path: Path) -> None:
+    """A run-directory ckpt must key caches on the step file it loads, not on the directory name."""
+    from eval.runners.eval_args import compose_eval_spec
+
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "step_0000010.pt").write_bytes(b"a")
+    assert compose_eval_spec([f"ckpt={run}"]).ckpt == str(run / "step_0000010.pt")
+    (run / "step_0000020.pt").write_bytes(b"b")
+    assert compose_eval_spec([f"ckpt={run}"]).ckpt == str(run / "step_0000020.pt")
+
+
+def _cache_fp(
+    spec: EvalSpec,
+    *,
+    live_generate: bool = True,
+    era5_geometry: dict | None = None,
+    tabicl_ckpt: str | None = None,
+) -> dict:
+    from eval.runners.eval_checkpoint import _baseline_cache_fingerprint
+
+    return _baseline_cache_fingerprint(
+        spec,
+        OmegaConf.create({"data": dict(_TINY_DATA_CFG)}),
+        live_generate=live_generate,
+        dataset_dir=None,
+        icl_rank=2,
+        oracle_mode="prior",
+        era5_geometry=era5_geometry,
+        tabicl_pit_k_folds=5,
+        tabicl_ckpt=tabicl_ckpt,
+    )
+
+
+def test_alternate_noncomposite_is_part_of_the_live_cache_identity(tmp_path: Path) -> None:
+    default = _cache_fp(_eval_spec(tmp_path))
+    assert set(default) == _PRE_REFACTOR_FINGERPRINT_KEYS  # old caches still match by default
+    assert _cache_fp(_eval_spec(tmp_path, "alternate_noncomposite=false")) != default
+
+
+_ERA5_GEOMETRY = {
+    "grid_size": 24,
+    "n_context": 30,
+    "box_deg_range": (5.0, 25.0),
+    "vary_geometry": False,
+    "grid_size_range": (8, 28),
+    "n_context_frac_range": (0.05, 0.4),
+    "max_months": None,
+    "standardize_y": True,
+}
+
+
+def test_era5_cache_identity_records_the_pit_marginal(tmp_path: Path) -> None:
+    from eval.configs.checkpoints import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
+
+    default_ckpt = resolve_marginal_checkpoint(DEFAULT_MARGINAL_FAMILY)
+    other = tmp_path / "other_marginal.pt"
+    other.write_bytes(b"other")
+
+    def era5_fp(ckpt: str, amp: bool) -> dict:
+        spec = _eval_spec(tmp_path, "era5.enabled=true", f"marginal.tabicl_amp={str(amp).lower()}")
+        return _cache_fp(spec, live_generate=False, era5_geometry=_ERA5_GEOMETRY, tabicl_ckpt=ckpt)["era5"]
+
+    # The implicit pre-refactor setup (default marginal, AMP on) keeps the old key set.
+    assert "pit_marginal_identity" not in era5_fp(default_ckpt, amp=True)
+    assert era5_fp(default_ckpt, amp=False)["pit_marginal_identity"]["amp"] is False
+    assert era5_fp(str(other), amp=True) != era5_fp(default_ckpt, amp=True)

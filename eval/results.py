@@ -18,10 +18,13 @@ NAN_PARTS: dict[str, float] = {"total": float("nan"), "marginal": float("nan"), 
 
 
 def numeric_summary(values: Sequence[float]) -> tuple[float, float, int]:
-    finite = np.asarray([v for v in values if math.isfinite(float(v))], dtype=float)
-    if not len(finite):
+    """Mean, std and count over scored values. Only NaN (not scored) is dropped: a diverged +inf
+    episode keeps the mean at inf, as pre-refactor np.nanmean did, so an unstable method can't look
+    better than a stable one."""
+    scored = np.asarray([v for v in values if not math.isnan(float(v))], dtype=float)
+    if not len(scored):
         return float("nan"), float("nan"), 0
-    return float(finite.mean()), float(finite.std()), len(finite)
+    return float(scored.mean()), float(scored.std()), len(scored)
 
 
 def score_summary(episodes: Sequence[Mapping[str, float]], key: str) -> tuple[float, float, int]:
@@ -37,7 +40,7 @@ def competition_ranks(
     for episode in episodes:
         scores = [(key, float(episode.get(key, float("nan")))) for key in keys]
         valid = sorted(
-            ((key, value) for key, value in scores if math.isfinite(value)),
+            ((key, value) for key, value in scores if not math.isnan(value)),  # +inf ranks last
             key=lambda pair: pair[1],
         )
         prior_value = None

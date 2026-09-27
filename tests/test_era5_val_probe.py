@@ -49,7 +49,9 @@ class FakeTabICL(nn.Module):
         super().__init__()
         self.q = q
 
-    def forward(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, X: torch.Tensor, y: torch.Tensor, **_kwargs: object
+    ) -> torch.Tensor:  # accepts inference_config like TabICL
         d, T, _ = X.shape
         P = y.shape[1]
         n = T - P

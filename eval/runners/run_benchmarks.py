@@ -31,6 +31,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
 from eval.baselines import independent, standard_gp  # noqa: E402
+from eval.configs.checkpoints import resolve_checkpoint  # noqa: E402
 from eval.datasets import sensor_imputation, spatial_housing, synthetic_bbo  # noqa: E402
 from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_json  # noqa: E402
 from eval.metrics.energy_score import compute_energy_score  # noqa: E402
@@ -154,8 +155,9 @@ class BenchmarkSpec:
     benchmarks: list[str] = field(default_factory=lambda: list(BENCHMARK_NAMES))
     out_dir: str = os.path.join(_REPO_ROOT, "eval", "results")
     seed: int = 0
-    # Maximum failed-episode fraction before exiting nonzero (1.0 allows exploratory partial runs).
-    max_failed_fraction: float = 0.0
+    # Maximum failed-episode fraction before exiting nonzero. 1.0 (default) keeps pre-refactor
+    # behaviour: failures are logged and the run still succeeds; set e.g. 0.0 to gate on coverage.
+    max_failed_fraction: float = 1.0
 
 
 def validate(args: BenchmarkSpec) -> None:
@@ -177,8 +179,9 @@ def run(args: BenchmarkSpec) -> None:
     print(f"Loading TabICL marginal model (TabICLRegressor): {args.tabicl_ckpt}")
     tabicl_reg = make_tabicl_regressor(checkpoint=args.tabicl_ckpt, device=device)
 
-    print(f"Loading copula model: {args.copula_ckpt}")
-    copula_model, cfg = load_copula_model(args.copula_ckpt, device=device)
+    copula_ckpt = resolve_checkpoint(args.copula_ckpt)  # a path, or a CHECKPOINT_FAMILIES name
+    print(f"Loading copula model: {copula_ckpt}")
+    copula_model, cfg = load_copula_model(copula_ckpt, device=device)
 
     # synthetic_bbo samples its kernels with this checkpoint's cfg.
     exclude_kernels = OmegaConf.select(cfg, "data.composite_exclude_kernels", default=None)
