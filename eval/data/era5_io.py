@@ -20,10 +20,7 @@ def haversine_distance_km(coords: np.ndarray) -> np.ndarray:
     lon_rad, lat_rad = np.radians(coords[:, 0]), np.radians(coords[:, 1])
     dlat = lat_rad[:, None] - lat_rad[None, :]
     dlon = lon_rad[:, None] - lon_rad[None, :]
-    a = (
-        np.sin(dlat / 2) ** 2
-        + np.cos(lat_rad[:, None]) * np.cos(lat_rad[None, :]) * np.sin(dlon / 2) ** 2
-    )
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat_rad[:, None]) * np.cos(lat_rad[None, :]) * np.sin(dlon / 2) ** 2
     return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
@@ -51,7 +48,7 @@ def safe_cholesky(C: np.ndarray, jitter: float = 1e-6, max_tries: int = 6) -> np
     """Cholesky factor of C, adding diagonal jitter if it's not quite PSD.
 
     A real checkpoint's predicted correlation matrix is PSD by construction
-    (low-rank-plus-diagonal, see src/model.py:low_rank_correlation) but
+    (low-rank-plus-diagonal, see src/copula_inter/model.py:low_rank_correlation) but
     float32 round-trip can leave it *just* outside PSD, which
     np.linalg.cholesky rejects outright.
     """

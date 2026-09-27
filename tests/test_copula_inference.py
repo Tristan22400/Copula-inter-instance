@@ -1,17 +1,11 @@
-"""
-test_copula_inference.py — unit tests for inference/copula_inference.py.
-
-No live checkpoints or network access required: the PIT/interpolation math is
-exercised via ``tabicl_upstream``'s own ``QuantileDistribution`` fed a
-hand-built exact quantile grid (not a real TabICL forward pass), and
-``get_test_correlation``'s post-processing is exercised via a tiny fake
-copula model rather than a real ``CopulaTabICL``.
-"""
+"""Tests for inference/copula_inference.py with hand-built quantile grids and a fake copula model."""
 
 from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -19,27 +13,37 @@ import torch
 from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_TESTS)
-_SRC = os.path.join(_REPO_ROOT, "src")
-_TABICL_SRC = os.path.join(_REPO_ROOT, "tabicl_upstream", "src")
-for _p in (_REPO_ROOT, _SRC, _TABICL_SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from tabicl._model.quantile_dist import QuantileDistribution  # noqa: E402
-
-from inference.copula_inference import get_test_correlation, normalize_features, sample_trajectories  # noqa: E402
-from model import low_rank_correlation  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# PIT / interpolation sanity check (hand-built quantile grid, no live model)
-# ---------------------------------------------------------------------------
+from copula_inter.model import low_rank_correlation
+from inference.copula_inference import (
+    _resolve_copula_checkpoint,
+    get_test_correlation,
+    normalize_features,
+    sample_trajectories,
+)
+from tabicl._model.quantile_dist import QuantileDistribution
 
 
-def test_pit_recovers_standard_normal_from_exact_quantile_grid():
-    """QuantileDistribution.cdf + probit on an EXACT Gaussian quantile grid
-    should recover ~N(0,1) Z-values — this is exactly the math loo_pit /
-    get_marginal_quantiles rely on internally."""
+def test_resolve_copula_checkpoint_directory_uses_highest_step(tmp_path: Path) -> None:
+    """A checkpoint directory selects the last numerical training snapshot."""
+    (tmp_path / "step_0000010.pt").touch()
+    (tmp_path / "step_0000020.pt").touch()
+    final = tmp_path / "step_0000020_final.pt"
+    final.touch()
+    (tmp_path / "notes.pt").touch()
+
+    assert _resolve_copula_checkpoint(str(tmp_path)) == str(final)
+
+
+def test_resolve_copula_checkpoint_file_is_unchanged(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "arbitrary-name.pt"
+    checkpoint.touch()
+
+    assert _resolve_copula_checkpoint(str(checkpoint)) == str(checkpoint)
+
+
+def test_pit_recovers_standard_normal_from_exact_quantile_grid() -> None:
+    """cdf + probit on an exact Gaussian quantile grid recovers ~N(0, 1)."""
     rng = np.random.default_rng(0)
     probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
     mu, sigma = 2.0, 1.5
@@ -60,9 +64,8 @@ def test_pit_recovers_standard_normal_from_exact_quantile_grid():
     assert abs(z.std() - 1.0) < 0.1
 
 
-def test_pit_recovers_standard_normal_from_skewnorm_grid():
-    """Same check with a skew-normal marginal, to make sure the recovery
-    isn't an artifact of the Gaussian case being trivial."""
+def test_pit_recovers_standard_normal_from_skewnorm_grid() -> None:
+    """Same with a skew-normal marginal."""
     from scipy.stats import skewnorm
 
     rng = np.random.default_rng(1)
@@ -85,16 +88,11 @@ def test_pit_recovers_standard_normal_from_skewnorm_grid():
     assert abs(z.std() - 1.0) < 0.15
 
 
-# ---------------------------------------------------------------------------
-# sample_trajectories
-# ---------------------------------------------------------------------------
-
-
 def _standard_normal_grid(n_test: int, probs: np.ndarray) -> np.ndarray:
     return np.tile(norm.ppf(probs), (n_test, 1))
 
 
-def test_sample_trajectories_recovers_known_correlation():
+def test_sample_trajectories_recovers_known_correlation() -> None:
     n_test = 4
     probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
     quantile_grid = _standard_normal_grid(n_test, probs)
@@ -103,12 +101,8 @@ def test_sample_trajectories_recovers_known_correlation():
     idx = np.arange(n_test)
     R = rho ** np.abs(idx[:, None] - idx[None, :])
 
-    samples_small, _ = sample_trajectories(
-        quantile_grid, probs, R, n_samples=300, rng=np.random.default_rng(10)
-    )
-    samples_large, _ = sample_trajectories(
-        quantile_grid, probs, R, n_samples=30000, rng=np.random.default_rng(11)
-    )
+    samples_small, _ = sample_trajectories(quantile_grid, probs, R, n_samples=300, rng=np.random.default_rng(10))
+    samples_large, _ = sample_trajectories(quantile_grid, probs, R, n_samples=30000, rng=np.random.default_rng(11))
 
     err_small = np.linalg.norm(np.corrcoef(samples_small, rowvar=False) - R)
     err_large = np.linalg.norm(np.corrcoef(samples_large, rowvar=False) - R)
@@ -116,27 +110,24 @@ def test_sample_trajectories_recovers_known_correlation():
     assert err_large < err_small
 
 
-def test_sample_trajectories_identity_gives_near_zero_cross_correlation():
+def test_sample_trajectories_identity_gives_near_zero_cross_correlation() -> None:
     n_test = 5
     probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
     quantile_grid = _standard_normal_grid(n_test, probs)
     R = np.eye(n_test)
 
-    samples, _ = sample_trajectories(
-        quantile_grid, probs, R, n_samples=20000, rng=np.random.default_rng(20)
-    )
+    samples, _ = sample_trajectories(quantile_grid, probs, R, n_samples=20000, rng=np.random.default_rng(20))
     corr = np.corrcoef(samples, rowvar=False)
     off_diag = corr[~np.eye(n_test, dtype=bool)]
 
     assert np.abs(off_diag).max() < 0.1
 
 
-def test_sample_trajectories_clip_diagnostic_flags_narrow_grid():
+def test_sample_trajectories_clip_diagnostic_flags_narrow_grid() -> None:
     n_test = 3
     R = np.eye(n_test)
 
-    # Narrow grid: most standard-normal draws map to probabilities outside
-    # the grid's support and must be clipped.
+    # Narrow grid: most probabilities are clipped.
     probs_narrow = np.linspace(0.3, 0.7, 50)
     grid_narrow = np.tile(np.linspace(-0.5, 0.5, 50), (n_test, 1))
     _, n_clipped_narrow = sample_trajectories(
@@ -146,25 +137,16 @@ def test_sample_trajectories_clip_diagnostic_flags_narrow_grid():
     # Wide grid: essentially the whole standard-normal mass is covered.
     probs_wide = np.linspace(1e-6, 1 - 1e-6, 999)
     grid_wide = np.tile(norm.ppf(probs_wide), (n_test, 1))
-    _, n_clipped_wide = sample_trajectories(
-        grid_wide, probs_wide, R, n_samples=2000, rng=np.random.default_rng(31)
-    )
+    _, n_clipped_wide = sample_trajectories(grid_wide, probs_wide, R, n_samples=2000, rng=np.random.default_rng(31))
 
     assert n_clipped_narrow > 0
     assert n_clipped_wide < n_clipped_narrow
 
 
-# ---------------------------------------------------------------------------
-# get_test_correlation post-processing (symmetrize + unit diagonal)
-# ---------------------------------------------------------------------------
-
-
 class _FakeCopulaModel(torch.nn.Module):
-    """Stands in for CopulaTabICL: forward(batch) -> {"W": ..., "s": ...},
-    ignoring the batch contents entirely, so we can test get_test_correlation's
-    post-processing (symmetrize + force unit diagonal) without a real model."""
+    """Stands in for CopulaTabICL: forward(batch) -> {"W", "s"}, ignoring the batch."""
 
-    def __init__(self, W: torch.Tensor, s: torch.Tensor):
+    def __init__(self, W: torch.Tensor, s: torch.Tensor) -> None:
         super().__init__()
         self.W = W
         self.s = s
@@ -174,12 +156,12 @@ class _FakeCopulaModel(torch.nn.Module):
         return {"W": self.W, "s": self.s}
 
 
-def test_get_test_correlation_is_symmetric_and_unit_diagonal():
+def test_get_test_correlation_is_symmetric_and_unit_diagonal() -> None:
     torch.manual_seed(0)
     n_test, rank = 6, 2
     W = torch.randn(1, n_test, rank) * 0.3
     s = torch.randn(1, n_test)
-    model = _FakeCopulaModel(W, s)
+    model: Any = _FakeCopulaModel(W, s)
 
     X_train = np.random.randn(4, 1)
     Z_train = np.random.randn(4)
@@ -193,15 +175,13 @@ def test_get_test_correlation_is_symmetric_and_unit_diagonal():
     assert eigvals.min() > -1e-6
 
 
-def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing():
-    """Sanity-check that get_test_correlation is really just
-    low_rank_correlation + symmetrize + force-unit-diagonal, not some other
-    computation."""
+def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing() -> None:
+    """get_test_correlation is low_rank_correlation plus symmetrization and a unit diagonal."""
     torch.manual_seed(1)
     n_test, rank = 5, 3
     W = torch.randn(1, n_test, rank) * 0.5
     s = torch.randn(1, n_test)
-    model = _FakeCopulaModel(W, s)
+    model: Any = _FakeCopulaModel(W, s)
 
     X_train = np.random.randn(3, 1)
     Z_train = np.random.randn(3)
@@ -216,7 +196,7 @@ def test_get_test_correlation_matches_low_rank_correlation_up_to_postprocessing(
     assert np.allclose(R, Sigma_expected, atol=1e-6)
 
 
-def test_normalize_features_gives_zero_mean_unit_std_jointly_over_train_and_test():
+def test_normalize_features_gives_zero_mean_unit_std_jointly_over_train_and_test() -> None:
     rng = np.random.default_rng(0)
     X_train = rng.uniform(10.0, 20.0, size=(7, 2))  # arbitrary raw scale/offset
     X_test = rng.uniform(10.0, 20.0, size=(13, 2))
@@ -230,12 +210,8 @@ def test_normalize_features_gives_zero_mean_unit_std_jointly_over_train_and_test
     assert X_test_norm.shape == X_test.shape
 
 
-def test_normalize_features_uses_joint_not_train_only_statistics():
-    """A train subset with a narrower range than the full test grid must be
-    standardized using the COMBINED train+test mean/std (matching
-    data_gen.py's convention), not train-only statistics — otherwise train
-    and test wouldn't share a common scale the way they do at training
-    time."""
+def test_normalize_features_uses_joint_not_train_only_statistics() -> None:
+    """normalize_features uses the joint train+test mean and std."""
     X_test = np.linspace(0.0, 1.0, 50).reshape(-1, 1)
     X_train = X_test[:5]  # narrow, non-representative subset
 

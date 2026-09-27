@@ -8,6 +8,7 @@ from copy import deepcopy
 from typing import List, Optional
 
 import numpy as np
+from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.impute import SimpleImputer
@@ -100,28 +101,56 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
         cat_tfm = OrdinalEncoder(
             dtype=np.int64, handle_unknown="use_encoded_value", unknown_value=-1, encoded_missing_value=-1
         )
-        num_tfm = SimpleImputer()
+        num_tfm = SimpleImputer(keep_empty_features=True)
 
         if not hasattr(X, "columns"):  # proxy way to check whether X is a dataframe without importing pandas
-            # no dataframe
-            # check if dtype is bool, object, byte sting, or unicode string
-            is_categorical = np.asarray(X).dtype.kind in {"b", "O", "S", "U"}
-            self.tfm_ = cat_tfm if is_categorical else num_tfm
-            self.tfm_.fit(X)
-            return self
+            # no dataframe, so we can't do column-wise transformations. Instead, we check if it's already numeric and if not, raise an error.
+            
+            # For compatibility with sklearn's tests
+            if issparse(X):
+                raise TypeError(
+                    "Sparse input is not supported by TabICL. "
+                    "Convert X to a dense array, e.g. with X.toarray()."
+                )
+            X_arr = np.asarray(X)
+            try:
+                X_arr.astype(np.float64)
+            except (ValueError, TypeError) as e:
+                # Preserve the original exception type so that, e.g., object arrays
+                # holding non-string/non-number elements still raise a TypeError.
+                raise type(e)(
+                    "NumPy arrays passed to TabICL must be castable to a numeric dtype, "
+                    f"but casting to float64 failed with: {e}. "
+                    "If your data contains categorical or string columns, pass it as a pandas "
+                    "DataFrame instead, so each column can be typed and preprocessed accordingly."
+                ) from None
+            self.tfm_ = num_tfm
 
-        cat_cols = make_column_selector(dtype_include=["string", "object", "category", "boolean"])(X)
-        cat_pos = [X.columns.get_loc(col) for col in cat_cols]
+        else:
 
-        numeric_cols = make_column_selector(dtype_include="number")(X)
-        numeric_pos = [X.columns.get_loc(col) for col in numeric_cols]
+            cat_cols = make_column_selector(dtype_include=["string", "object", "category", "boolean"])(X)
+            cat_pos = [X.columns.get_loc(col) for col in cat_cols]
 
-        self.tfm_ = ColumnTransformer(
-            transformers=[("categorical", cat_tfm, cat_pos), ("continuous", num_tfm, numeric_pos)]
-        )
+            high_cardinality_cols = [col for col in cat_cols if X[col].nunique() > 40]
+            if high_cardinality_cols:
+                import warnings
+
+                warnings.warn(
+                    f"The following categorical columns have a cardinality above 40: {high_cardinality_cols}. "
+                    "High-cardinality columns might benefit from a better encoding than ordinal encoding, "
+                    "e.g. Skrub's TableVectorizer for strings."
+                )
+
+            numeric_cols = make_column_selector(dtype_include="number")(X)
+            numeric_pos = [X.columns.get_loc(col) for col in numeric_cols]
+
+            self.tfm_ = ColumnTransformer(
+                transformers=[("categorical", cat_tfm, cat_pos), ("continuous", num_tfm, numeric_pos)]
+            )
+
         self.tfm_.fit(X)
 
-        if self.verbose:
+        if self.verbose and hasattr(self.tfm_, "transformers_"):
             selected_cols = []
             for name, tfm, pos in self.tfm_.transformers_:
                 if tfm != "drop":
@@ -179,6 +208,8 @@ class UniqueFeatureFilter(TransformerMixin, BaseEstimator):
 
        - With few samples, it's difficult to reliably assess feature variability.
        - A feature might appear constant in few samples but vary in the complete dataset.
+    3. If every feature would be removed, the first one is kept so that the output
+       always has at least one column.
     """
 
     def __init__(self, threshold: int = 1):
@@ -210,6 +241,13 @@ class UniqueFeatureFilter(TransformerMixin, BaseEstimator):
             self.features_to_keep_ = np.array(
                 [len(np.unique(X[:, i])) > self.threshold for i in range(self.n_features_in_)]
             )
+
+            # Every feature is constant. Dropping all of them leaves a zero-column
+            # matrix that downstream steps cannot handle, so keep the first one: the
+            # model then sees a single uninformative feature and falls back to the
+            # marginal distribution of the target.
+            if not self.features_to_keep_.any():
+                self.features_to_keep_[0] = True
 
         self.n_features_out_ = np.sum(self.features_to_keep_)
 
@@ -669,6 +707,8 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
             Returns self.
         """
         X = validate_data(self, X)
+        if hasattr(X, "dtype") and X.dtype == np.float16:
+            X = X.astype(np.float32)
 
         # 1. Apply standard scaling
         self.standard_scaler_ = CustomStandardScaler()
@@ -723,6 +763,8 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
         """
         check_is_fitted(self)
         X = validate_data(self, X, reset=False, copy=True)
+        if hasattr(X, "dtype") and X.dtype == np.float16:
+            X = X.astype(np.float32)
         # Standard scaling
         X = self.standard_scaler_.transform(X)
         # Normalization
@@ -1098,7 +1140,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
 
         return ensemble_configs, X_shuffle_dict, y_pattern_dict
 
-    def transform(self, X=None, mode="both", feature_mask=None):
+    def transform(self, X=None, mode="both"):
         """Create ensemble data variants for in-context learning.
 
         Parameters
@@ -1120,14 +1162,6 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
               Returns ``OrderedDict`` mapping normalization methods to
               ``(X_test_ensemble[n_variants, n_test, n_features],)``.
 
-        feature_mask : ndarray of shape (n_original_features,) or None, default=None
-            Boolean mask where ``True`` indicates masked (all-NaN) columns in
-            the *original* feature space (before ``UniqueFeatureFilter``).  When
-            provided, masked columns are dropped from both preprocessed training
-            and test data, and feature shuffles are remapped to the reduced
-            ``[0, K)`` space.  A transient ``masked_feature_shuffles_``
-            attribute is stored for the caller to retrieve the remapped shuffles.
-
         Returns
         -------
         OrderedDict
@@ -1137,39 +1171,14 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         check_is_fitted(self, ["ensemble_configs_"])
         assert mode in ("both", "train", "test"), f"Invalid mode: {mode}"
 
-        # Remap feature shuffles if a feature mask is provided to drop masked columns
-        if feature_mask is not None:
-            # Map mask from original feature space to filtered space
-            filtered_mask = feature_mask[self.unique_filter_.features_to_keep_]
-            kept_cols = ~filtered_mask
-            # Build old-index -> new-index mapping for shuffle remapping
-            idx_map = {}
-            new_idx = 0
-            for old_idx in range(len(filtered_mask)):
-                if kept_cols[old_idx]:
-                    idx_map[old_idx] = new_idx
-                    new_idx += 1
-
-            # Pre-compute remapped feature shuffles per norm method
-            self.masked_feature_shuffles_ = OrderedDict()
-            for norm_method, shuffle_configs in self.ensemble_configs_.items():
-                remapped = []
-                for feat_shuffle, _ in shuffle_configs:
-                    remapped.append([idx_map[i] for i in feat_shuffle if i in idx_map])
-                self.masked_feature_shuffles_[norm_method] = remapped
-
         if mode == "train":
             y = self.y_
             data = OrderedDict()
             for norm_method, shuffle_configs in self.ensemble_configs_.items():
                 X_preprocessed = self.preprocessors_[norm_method].X_transformed_
-                if feature_mask is not None:
-                    X_preprocessed = X_preprocessed[:, kept_cols]
                 X_ensemble = []
                 y_ensemble = []
-                for i, (feat_shuffle, y_pattern) in enumerate(shuffle_configs):
-                    if feature_mask is not None:
-                        feat_shuffle = self.masked_feature_shuffles_[norm_method][i]
+                for feat_shuffle, y_pattern in shuffle_configs:
                     X_ensemble.append(X_preprocessed[:, feat_shuffle])
                     if self.classification:
                         y_ensemble.append(np.array(y_pattern)[y.astype(int)])
@@ -1182,21 +1191,12 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         assert X is not None, "X is required when mode is 'test' or 'both'"
         X = self.unique_filter_.transform(X)
 
-        # Fill masked columns with 0.0 so sklearn transformers don't choke on NaN
-        if feature_mask is not None:
-            X = np.array(X, dtype=np.float64)
-            X[:, filtered_mask] = 0.0
-
         if mode == "test":
             data = OrderedDict()
             for norm_method, shuffle_configs in self.ensemble_configs_.items():
                 X_test_preprocessed = self.preprocessors_[norm_method].transform(X)
-                if feature_mask is not None:
-                    X_test_preprocessed = X_test_preprocessed[:, kept_cols]
                 X_ensemble = []
-                for i, (feat_shuffle, _) in enumerate(shuffle_configs):
-                    if feature_mask is not None:
-                        feat_shuffle = self.masked_feature_shuffles_[norm_method][i]
+                for feat_shuffle, _ in shuffle_configs:
                     X_ensemble.append(X_test_preprocessed[:, feat_shuffle])
                 data[norm_method] = (np.stack(X_ensemble, axis=0),)
             return data
@@ -1208,15 +1208,10 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
             preprocessor = self.preprocessors_[norm_method]
             X_train_pp = preprocessor.X_transformed_
             X_test_pp = preprocessor.transform(X)
-            if feature_mask is not None:
-                X_train_pp = X_train_pp[:, kept_cols]
-                X_test_pp = X_test_pp[:, kept_cols]
             X_variant = np.concatenate([X_train_pp, X_test_pp], axis=0)
             X_ensemble = []
             y_ensemble = []
-            for i, (feat_shuffle, y_pattern) in enumerate(shuffle_configs):
-                if feature_mask is not None:
-                    feat_shuffle = self.masked_feature_shuffles_[norm_method][i]
+            for feat_shuffle, y_pattern in shuffle_configs:
                 X_ensemble.append(X_variant[:, feat_shuffle])
 
                 if self.classification:

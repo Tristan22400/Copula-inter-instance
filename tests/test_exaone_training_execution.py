@@ -1,6 +1,10 @@
 """Execution optimizations must preserve LoRA gradients across optimizer steps."""
+
+from __future__ import annotations
+
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -8,31 +12,35 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils import parametrize
 
-from lora import LoRAParametrization
-from marginal_backbones import MarginalBackbone, _exaone_grad_forward
+from copula_inter.lora import LoRAParametrization
+from copula_inter.marginal_backbones import MarginalBackbone, _exaone_grad_forward
 
 
 class RepeatedWeightModel(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.randn(3, 3))
         parametrize.register_parametrization(self, "weight", LoRAParametrization(self.weight, 2, 4))
-        self.parametrizations.weight.original.requires_grad_(False)
+        cast(Any, self.parametrizations).weight.original.requires_grad_(False)
 
-    def forward(self, support, label, query, **kwargs):
+    def forward(self, support: torch.Tensor, label: torch.Tensor, query: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         hidden = F.linear(query + support.mean(1, keepdim=True), self.weight).tanh()
         return F.linear(hidden, self.weight) + label.mean(1)[:, None, None]
 
 
 @pytest.mark.parametrize("checkpointing", [True, False])
 @pytest.mark.parametrize("chunk_size", [1, 2, 8])
-def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_size):
+def test_cached_chunked_forward_matches_uncached_updates(checkpointing: bool, chunk_size: int) -> None:
     torch.manual_seed(42)
     reference = RepeatedWeightModel()
     actual = deepcopy(reference)
-    bb = MarginalBackbone("exaone", actual, SimpleNamespace(model=actual),
-                          exaone_chunk_size=chunk_size,
-                          exaone_activation_checkpointing=checkpointing)
+    bb = MarginalBackbone(
+        "exaone",
+        actual,
+        SimpleNamespace(model=actual),
+        exaone_chunk_size=chunk_size,
+        exaone_activation_checkpointing=checkpointing,
+    )
     opts = [torch.optim.SGD(m.parameters(), lr=0.01) for m in (reference, actual)]
     for _ in range(2):
         support, label, query = torch.randn(5, 7, 3), torch.randn(5, 7), torch.randn(5, 4, 3)
@@ -51,11 +59,12 @@ def test_cached_chunked_forward_matches_uncached_updates(checkpointing, chunk_si
             opt.step()
             opt.zero_grad(set_to_none=True)
         with torch.no_grad():
-            torch.testing.assert_close(_exaone_grad_forward(bb, support, label, query),
-                                       reference(support, label, query))
+            torch.testing.assert_close(
+                _exaone_grad_forward(bb, support, label, query), reference(support, label, query)
+            )
 
 
-def test_invalid_chunk_size():
+def test_invalid_chunk_size() -> None:
     model = RepeatedWeightModel()
     bb = MarginalBackbone("exaone", model, SimpleNamespace(model=model), exaone_chunk_size=0)
     with pytest.raises(ValueError, match="positive"):

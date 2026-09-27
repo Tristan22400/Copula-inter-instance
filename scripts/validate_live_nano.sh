@@ -7,7 +7,7 @@
 #
 # Smoke-test training.live_generation=true against the nano model preset
 # (conf/model/copula_nano.yaml) across every model.correlation_parametrization
-# option in src/correlation_factory.py (covnorm, cossim, tanhnorm,
+# option in src/copula_inter/correlation_factory.py (covnorm, cossim, tanhnorm,
 # sparse_covnorm). Each variant runs a handful of steps with a small episode
 # size, so this validates that on-the-fly generation + training + the
 # live-mode validation batch (build_fixed_live_val_batches) all run end to
@@ -23,21 +23,8 @@
 
 set -uo pipefail
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/.."
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
-# ----- Env (mirrors scripts/train.sh) -----
-CONDA_BASE="$HOME/thoth_storage/miniconda3"
-CONDA_ENV="$CONDA_BASE/envs/multivariate-icl"
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-else
-    source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
-fi
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 # Keep the smoke test out of the real wandb project history.
 export WANDB_MODE="${WANDB_MODE:-offline}"
@@ -62,7 +49,7 @@ for p in "${PARAMETRIZATIONS[@]}"; do
     out="logs/validate_live_nano_${JOB_TAG}_${p}.out"
     err="logs/validate_live_nano_${JOB_TAG}_${p}.err"
     echo "[$(date +%H:%M:%S)] --- ${p}: starting (log: $out) ---"
-    if python src/train.py model=copula_nano \
+    if python -m copula_inter.train model=copula_nano \
         training.live_generation=true \
         model.correlation_parametrization="$p" \
         data.P_min=8 data.P_max=64 data.N_min=4 data.N_max=32 \

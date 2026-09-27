@@ -13,14 +13,12 @@ from __future__ import annotations
 
 import torch
 
-from loss import _safe_cholesky, copula_nll, oracle_copula_nll
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from copula_inter.loss import _safe_cholesky, copula_nll, oracle_copula_nll
 
 
-def make_w_and_z(B: int = 4, N: int = 10, rank: int = 2, seed: int = 0):
+def make_w_and_z(
+    B: int = 4, N: int = 10, rank: int = 2, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     W = torch.randn(B, N, rank + 1)
     W = W / W.norm(dim=-1, keepdim=True)  # unit rows
@@ -29,30 +27,25 @@ def make_w_and_z(B: int = 4, N: int = 10, rank: int = 2, seed: int = 0):
     return W, z, mask
 
 
-def make_identity_w(B: int, N: int, rank: int):
+def make_identity_w(B: int, N: int, rank: int) -> torch.Tensor:
     """W_tilde with eps=1 and W=0 gives R_eps = I + 0 = I (independence)."""
     return torch.zeros(B, N, rank + 1)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-def test_copula_nll_is_finite():
+def test_copula_nll_is_finite() -> None:
     """copula_nll should return a finite scalar for valid inputs."""
     W, z, mask = make_w_and_z(B=4, N=10, rank=2)
     loss = copula_nll(W, z, mask)
     assert torch.isfinite(loss), f"copula_nll returned non-finite: {loss}"
 
 
-def test_copula_nll_is_scalar():
+def test_copula_nll_is_scalar() -> None:
     W, z, mask = make_w_and_z(B=4, N=10, rank=2)
     loss = copula_nll(W, z, mask)
     assert loss.shape == (), f"Expected scalar, got shape {loss.shape}"
 
 
-def test_copula_nll_gradients_flow():
+def test_copula_nll_gradients_flow() -> None:
     """Gradients must flow from loss to W_tilde."""
     W, z, mask = make_w_and_z(B=4, N=10, rank=2)
     W = W.requires_grad_(True)
@@ -62,7 +55,7 @@ def test_copula_nll_gradients_flow():
     assert torch.isfinite(W.grad).all(), "Non-finite gradients"
 
 
-def test_copula_nll_zero_mask():
+def test_copula_nll_zero_mask() -> None:
     """copula_nll with all-False mask should return zero (no valid tasks)."""
     B, N, rank = 2, 5, 2
     W = torch.randn(B, N, rank + 1)
@@ -73,7 +66,7 @@ def test_copula_nll_zero_mask():
     assert loss.item() == 0.0
 
 
-def test_oracle_copula_nll_is_finite():
+def test_oracle_copula_nll_is_finite() -> None:
     """oracle_copula_nll should be finite for valid inputs."""
     B, N = 4, 8
     torch.manual_seed(5)
@@ -90,7 +83,7 @@ def test_oracle_copula_nll_is_finite():
     assert torch.isfinite(loss), f"oracle_copula_nll not finite: {loss}"
 
 
-def test_oracle_le_independence_on_average():
+def test_oracle_le_independence_on_average() -> None:
     """Oracle (R=R_star) should beat independence (R=I) on average over many tasks."""
     torch.manual_seed(42)
     B, N, rank = 8, 20, 4
@@ -123,16 +116,13 @@ def test_oracle_le_independence_on_average():
 
     mean_oracle = sum(oracle_losses) / len(oracle_losses)
     mean_indep = sum(pred_losses) / len(pred_losses)
-    # Oracle should generally be lower (oracle < independence when R ≠ I)
-    # This is not guaranteed for every single case, only in expectation
-    # (when R is actually correlated, oracle does better)
+    # Oracle beats independence in expectation, not in every case.
     assert mean_oracle < mean_indep + 1.0, (
-        f"Oracle ({mean_oracle:.4f}) should be better than or comparable to "
-        f"independence ({mean_indep:.4f}) on average"
+        f"Oracle ({mean_oracle:.4f}) should be better than or comparable to independence ({mean_indep:.4f}) on average"
     )
 
 
-def test_copula_nll_smaller_for_better_w():
+def test_copula_nll_smaller_for_better_w() -> None:
     """copula_nll should be smaller when W_tilde encodes the true correlation."""
     torch.manual_seed(99)
     N, rank = 10, 3
@@ -167,17 +157,11 @@ def test_copula_nll_smaller_for_better_w():
 
     mean_true = sum(nll_true_list) / len(nll_true_list)
     mean_rand = sum(nll_rand_list) / len(nll_rand_list)
-    assert mean_true < mean_rand, (
-        f"True W NLL ({mean_true:.4f}) should be lower than random W NLL ({mean_rand:.4f})"
-    )
+    assert mean_true < mean_rand, f"True W NLL ({mean_true:.4f}) should be lower than random W NLL ({mean_rand:.4f})"
 
 
-def test_woodbury_matches_direct_cholesky():
-    """copula_nll via Woodbury should match oracle_copula_nll when R=W_tilde@W_tilde^T+eps*I.
-
-    Use eps=0.5 to keep the matrix well-conditioned and avoid numerical drift
-    from the large ratio (1/eps) in the capacitance matrix.
-    """
+def test_woodbury_matches_direct_cholesky() -> None:
+    """copula_nll (Woodbury) matches oracle_copula_nll for R = W W^T + eps I (eps=0.5 keeps it well-conditioned)."""
     torch.manual_seed(7)
     B, N, rank = 1, 8, 3
     # Use a moderate eps so R_eps is well-conditioned (min eigenvalue = eps, max ≈ eps+r+1)
@@ -196,10 +180,5 @@ def test_woodbury_matches_direct_cholesky():
     nll_direct = oracle_copula_nll(R_eps, z, mask)
 
     # Relative tolerance: both formulas should agree to ~0.1%
-    rel_err = abs(nll_woodbury.item() - nll_direct.item()) / (
-        abs(nll_direct.item()) + 1e-8
-    )
-    assert rel_err < 1e-3, (
-        f"Woodbury ({nll_woodbury:.6f}) != direct ({nll_direct:.6f}), "
-        f"rel_err={rel_err:.2e}"
-    )
+    rel_err = abs(nll_woodbury.item() - nll_direct.item()) / (abs(nll_direct.item()) + 1e-8)
+    assert rel_err < 1e-3, f"Woodbury ({nll_woodbury:.6f}) != direct ({nll_direct:.6f}), rel_err={rel_err:.2e}"

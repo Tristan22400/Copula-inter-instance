@@ -1,4 +1,4 @@
-"""test_correlation_factory.py — verify src/correlation_factory.py.
+"""test_correlation_factory.py — verify src/copula_inter/correlation_factory.py.
 
 Checks, per parametrization (CovNorm / CosSim / TanhNorm / SparseCovNorm):
   1. Unit diagonal, symmetry, strict positive-definiteness of R = dense().
@@ -8,13 +8,15 @@ Checks, per parametrization (CovNorm / CosSim / TanhNorm / SparseCovNorm):
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
-from correlation_factory import (
+from copula_inter.correlation_factory import (
     LowRankCorrelationFactor,
-    covnorm_correlation,
     cossim_correlation,
+    covnorm_correlation,
     sparse_covnorm_correlation,
     tanhnorm_correlation,
 )
@@ -25,8 +27,8 @@ D = 12  # ambient dimension
 R = 3  # rank
 
 
-def _random_inputs(batch: int, requires_grad: bool = False):
-    def mk(*shape):
+def _random_inputs(batch: int, requires_grad: bool = False) -> dict[str, torch.Tensor]:
+    def mk(*shape: Any) -> torch.Tensor:
         t = torch.randn(*shape, dtype=torch.float64) * 1.5
         if requires_grad:
             t.requires_grad_(True)
@@ -59,7 +61,7 @@ BATCH_SIZES = [1, 4]
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_unit_diagonal(name, batch):
+def test_unit_diagonal(name: str, batch: int) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -69,7 +71,7 @@ def test_unit_diagonal(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_symmetry(name, batch):
+def test_symmetry(name: str, batch: int) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -78,7 +80,7 @@ def test_symmetry(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_strictly_positive_definite(name, batch):
+def test_strictly_positive_definite(name: str, batch: int) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -89,7 +91,7 @@ def test_strictly_positive_definite(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_log_det_matches_dense(name, batch):
+def test_log_det_matches_dense(name: str, batch: int) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -100,7 +102,7 @@ def test_log_det_matches_dense(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_inverse_matches_dense(name, batch):
+def test_inverse_matches_dense(name: str, batch: int) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -113,7 +115,7 @@ def test_inverse_matches_dense(name, batch):
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_solve_matches_dense(name, batch):
+def test_solve_matches_dense(name: str, batch: int) -> None:
     inputs = _random_inputs(batch)
     factor = _build(name, inputs)
     Rd = factor.dense()
@@ -128,7 +130,7 @@ def test_solve_matches_dense(name, batch):
 
 
 @pytest.mark.parametrize("name", PARAMETRIZATIONS)
-def test_gradients_are_finite(name):
+def test_gradients_are_finite(name: str) -> None:
     inputs = _random_inputs(batch=4, requires_grad=True)
     factor = _build(name, inputs)
     loss = factor.dense().sum() + factor.log_det().sum()

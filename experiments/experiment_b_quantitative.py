@@ -1,40 +1,15 @@
-"""
-experiment_b_quantitative.py — Experiment B: quantitative joint comparison.
+"""Experiment B: TabICL marginals + copula R vs PFN4BO (own marginals, R = I) on synthetic 1-D GP draws.
 
-Across many synthetic 1D GP draws (varied kernel, lengthscale, train-set size
-/ placement), compares "your model" (TabICL marginals + copula R_test)
-against PFN4BO (own marginals, R=I — the independence assumption baked into
-PFN4BO's use in this comparison) on:
-
-  1. Joint NLPD — see the "NLPD proxy" note below for exactly what's computed.
-  2. Correlation recovery — ||R_test - R_true||_F / N, where R_true follows
-     whatever ``oracle_mode`` (prior vs. posterior) the loaded copula
-     checkpoint was actually trained under (read from its own saved cfg).
-  3. Locality-vs-distance aggregate — binned predicted correlation vs. true
-     kernel correlation, by |x_i - x_j|.
-
-All non-trivial inference logic (marginal quantiles, PIT, correlation query)
-is imported from inference/copula_inference.py.
-
-NLPD proxy note: a true joint density under quantile-grid (non-Gaussian)
-marginals has no closed form. Both models' marginal PIT (Z-values and
-log-densities) are computed by interpolating their OWN returned
-``(quantile_grid, probs)`` pair (linear interpolation for Z, local
-finite-difference slope of the quantile function for log-density — the same
-"f(z) = 1/Q'(F(z))" identity TabICL's own ``QuantileDistribution.log_prob``
-uses, just via finite differences on the grid instead of the exact
-spline/tail machinery) — this keeps the two models' marginal-density
-treatment symmetric/fair rather than giving one an exact method and the other
-an approximation. The joint density is then the Gaussian-copula-in-Z-space
-proxy (``loss.y_space_nll``): copula term + marginal term, exactly 0 copula
-term for the PFN4BO (R=I) baseline.
+Reports the joint NLPD (Gaussian-copula proxy via loss.y_space_nll, marginal
+densities from each model's quantile grid), ||R_test - R_true||_F / N with
+R_true following the checkpoint's oracle_mode, and binned predicted vs true
+correlation by distance.
 
 Usage:
-    python experiments/experiment_b_quantitative.py \\
-        [--copula-ckpt ./checkpoints/systematic-composition/step_0180000.pt] \\
-        [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \\
-        [--n-functions 60] [--n-test 40] [--n-train-min 5] [--n-train-max 15] \\
-        [--out-csv ./results/quantitative_comparison.csv] \\
+    python experiments/experiment_b_quantitative.py \
+        [--copula-ckpt <checkpoint>] [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \
+        [--n-functions 60] [--n-test 40] [--n-train-min 5] [--n-train-max 15] \
+        [--out-csv ./results/quantitative_comparison.csv] \
         [--out-dir ./results/figures] [--device auto] [--seed 0]
 """
 
@@ -43,26 +18,18 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import sys
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 from scipy.stats import norm
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from data_gen import gp_posterior, sigma_to_correlation  # noqa: E402
-from loss import y_space_nll  # noqa: E402
-from pit import normalize_targets, run_pit  # noqa: E402
-
-from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
-from inference.copula_inference import (  # noqa: E402
+from copula_inter.data_gen import gp_posterior, sigma_to_correlation
+from copula_inter.loss import y_space_nll
+from copula_inter.pit import normalize_targets, run_pit
+from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function
+from inference.copula_inference import (
     get_marginal_quantiles_pfn4bo,
     get_test_correlation,
     load_copula_model,
@@ -71,6 +38,10 @@ from inference.copula_inference import (  # noqa: E402
     normalize_features,
 )
 
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from tabicl._model.tabicl import TabICL
+
 KERNELS = ["rbf", "matern32"]
 LENGTHSCALE_LOG_RANGE = (np.log(0.05), np.log(1.2))
 
@@ -78,12 +49,7 @@ LENGTHSCALE_LOG_RANGE = (np.log(0.05), np.log(1.2))
 def _quantile_grid_pit(
     quantile_grid: np.ndarray, probs: np.ndarray, y_true: np.ndarray, eps: float = 1e-6
 ) -> tuple[np.ndarray, np.ndarray]:
-    """PIT (Z-values) and log-density for true targets from an ALREADY-BUILT
-    (quantile_grid, probs) pair (whichever backend produced it), via linear
-    interpolation for u = F(y) and a local finite-difference slope of the
-    quantile function for the density (f(z) = 1/Q'(F(z))). Applied
-    identically to TabICL's and PFN4BO's own quantile grids for a fair
-    marginal-density comparison (see module docstring)."""
+    """PIT z-values and log-densities of y_true from a (quantile_grid, probs) pair (linear interpolation, finite-difference density)."""
     n = quantile_grid.shape[0]
     u = np.empty(n)
     log_pdf = np.empty(n)
@@ -101,7 +67,16 @@ def _quantile_grid_pit(
 
 def _sample_one_function(
     rng_np: np.random.Generator, rng_torch: torch.Generator, n_test: int, n_train_range: tuple, kernels: list[str]
-):
+) -> tuple[
+    str,
+    float,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+]:
     kernel_name = rng_np.choice(kernels)
     lengthscale = float(np.exp(rng_np.uniform(*LENGTHSCALE_LOG_RANGE)))
     n_train = int(rng_np.integers(n_train_range[0], n_train_range[1] + 1))
@@ -116,7 +91,13 @@ def _sample_one_function(
     return kernel_name, lengthscale, n_train, X_train_t, y_train_t, X_test_t, y_test_t, kernel_fn
 
 
-def _compute_r_true(oracle_mode: str, X_train_t, y_train_t, X_test_t, kernel_fn) -> np.ndarray:
+def _compute_r_true(
+    oracle_mode: str,
+    X_train_t: torch.Tensor,
+    y_train_t: torch.Tensor,
+    X_test_t: torch.Tensor,
+    kernel_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> np.ndarray:
     if oracle_mode == "posterior":
         _, Sigma_star = gp_posterior(X_train_t, y_train_t, X_test_t, kernel_fn, noise=OBS_NOISE_STD**2, latent=False)
     else:  # "prior": raw kernel structure among test points, ignoring train conditioning
@@ -127,7 +108,12 @@ def _compute_r_true(oracle_mode: str, X_train_t, y_train_t, X_test_t, kernel_fn)
 
 @torch.no_grad()
 def run_one_function(
-    seed: int, tabicl_model, copula_model, pfn4bo_model, oracle_mode: str, args
+    seed: int,
+    tabicl_model: TabICL,
+    copula_model: CopulaTabICL,
+    pfn4bo_model: Any,
+    oracle_mode: str,
+    args: argparse.Namespace,
 ) -> tuple[dict, tuple]:
     rng_np = np.random.default_rng(seed)
     rng_torch = torch.Generator().manual_seed(seed)
@@ -139,52 +125,30 @@ def run_one_function(
     X_test, y_test = X_test_t.numpy(), y_test_t.numpy()
     n_test = X_test.shape[0]
 
-    # R_true and the locality distances below use the RAW [0, 1] grid — the
-    # true kernel correlation depends on real distance in that domain, not
-    # the standardized one below. Only the features fed to the models get
-    # normalized (see normalize_features's docstring: data_gen.py z-scores
-    # x jointly over train+test before ever calling TabICL/CopulaTabICL;
-    # neither model normalizes internally).
+    # R_true and distances use the raw [0, 1] grid; only model inputs are standardized.
     R_true = _compute_r_true(oracle_mode, X_train_t, y_train_t, X_test_t, kernel_fn)
 
     X_train_norm, X_test_norm = normalize_features(X_train, X_test)
     X_train_norm_t = torch.as_tensor(X_train_norm, dtype=X_train_t.dtype)
     X_test_norm_t = torch.as_tensor(X_test_norm, dtype=X_test_t.dtype)
 
-    # Use TabICL's own exact PIT (pit.run_pit — QuantileDistribution.cdf/log_prob,
-    # not the coarser quantile-grid-interpolation approximation) for "ours",
-    # since this is the exact convention Z_train/Z_test were computed with when
-    # this copula checkpoint was trained — anything cruder would make R_test's
-    # evaluation unfair to the model. PFN4BO has no such training-time coupling,
-    # so its simpler self-consistent approximation (_quantile_grid_pit) is fine.
-    #
-    # y is z-scored via pit.normalize_targets before reaching the raw TabICL
-    # module -- the same helper every other run_pit/raw-TabICL call site in
-    # the repo uses (inference/copula_inference.py::loo_pit,
-    # eval_checkpoint.py::_tabicl_z_train, train.py::_build_tabicl_val_z) --
-    # or this GP draw's random outputscale saturates the pretrained quantile
-    # head's CDF into its extreme tail, collapsing Z_train/z_ours' spread
-    # instead of reflecting the true per-point rank. y_test is scaled with
-    # y_train's own mean/std (never its own), matching a real deployment
-    # where test targets are unknown at normalization time.
+    # "Ours" uses TabICL's exact PIT (pit.run_pit) on normalized targets; PFN4BO uses _quantile_grid_pit.
     tabicl_device = next(tabicl_model.parameters()).device
     y_train_scaled, y_test_scaled, y_mean, y_std = normalize_targets(
         y_train_t.to(tabicl_device), y_test_t.to(tabicl_device)
     )
     pit_out = run_pit(
         tabicl_model,
-        X_train_norm_t.to(tabicl_device), y_train_scaled.unsqueeze(-1),
-        X_test_norm_t.to(tabicl_device), y_test_scaled.unsqueeze(-1),
+        X_train_norm_t.to(tabicl_device),
+        y_train_scaled.unsqueeze(-1),
+        X_test_norm_t.to(tabicl_device),
+        y_test_scaled.unsqueeze(-1),
         k_folds=min(10, len(X_train)),
         Y_train_raw=y_train_t.to(tabicl_device).unsqueeze(-1),
     )
     Z_train = pit_out["z_train"].squeeze(-1).cpu().numpy()
     z_ours = pit_out["z_test"].squeeze(-1).cpu().numpy()
-    # log_pdf_test is the density of the SCALED y_test under the scaled call;
-    # convert back to raw y-units via the standardization's Jacobian
-    # (log p_raw(y) = log p_scaled(y_scaled) - log(std)) to match
-    # loss.y_space_nll's "raw y-unit marginal log-density" contract -- the
-    # same convention data_gen.py's analytic GP-LOO log_pdf_test uses.
+    # Back to raw-y nats: log p_raw = log p_scaled - log(std).
     log_pdf_ours = (pit_out["log_pdf_test"].squeeze(-1) - y_std.log()).cpu().numpy()
 
     R_test = get_test_correlation(copula_model, X_train_norm, Z_train, X_test_norm)
@@ -242,19 +206,29 @@ def run_one_function(
 
 def _print_summary(results: list[dict]) -> None:
     keys = [
-        "corr_frob_norm", "nlpd_ours_total", "nlpd_ours_copula", "nlpd_ours_marginal",
-        "nlpd_pfn4bo_total", "nlpd_pfn4bo_marginal",
+        "corr_frob_norm",
+        "nlpd_ours_total",
+        "nlpd_ours_copula",
+        "nlpd_ours_marginal",
+        "nlpd_pfn4bo_total",
+        "nlpd_pfn4bo_marginal",
     ]
-    print(f"\n{'-'*70}")
+    print(f"\n{'-' * 70}")
     print(f"Summary over {len(results)} synthetic functions (mean +/- std)")
-    print(f"{'-'*70}")
+    print(f"{'-' * 70}")
     for k in keys:
         vals = np.array([r[k] for r in results], dtype=float)
         print(f"  {k:<22} {np.nanmean(vals):>10.4f} +/- {np.nanstd(vals):>8.4f}  (n_valid={np.isfinite(vals).sum()})")
-    print(f"{'-'*70}\n")
+    print(f"{'-' * 70}\n")
 
 
-def _plot_locality_aggregate(all_dists, all_r_test, all_r_true, out_path: str, n_bins: int = 15) -> None:
+def _plot_locality_aggregate(
+    all_dists: np.ndarray,
+    all_r_test: np.ndarray,
+    all_r_true: np.ndarray,
+    out_path: str,
+    n_bins: int = 15,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -304,8 +278,10 @@ def main() -> None:
     args.kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
     assert all(k in KERNELS for k in args.kernels), f"Unknown kernel(s) in {args.kernels}, must be subset of {KERNELS}"
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
+    device = (
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
 
@@ -354,7 +330,9 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     _plot_locality_aggregate(
-        np.concatenate(all_dists), np.concatenate(all_r_test), np.concatenate(all_r_true),
+        np.concatenate(all_dists),
+        np.concatenate(all_r_test),
+        np.concatenate(all_r_true),
         os.path.join(args.out_dir, "experiment_b_locality_aggregate.png"),
     )
 

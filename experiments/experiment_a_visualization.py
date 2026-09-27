@@ -1,25 +1,12 @@
-"""
-experiment_a_visualization.py — Experiment A: qualitative 1D sample plots.
+"""Experiment A: sampled 1-D trajectories for a few synthetic GP functions.
 
-For a handful of 1D synthetic GP test functions (RBF at a few lengthscales,
-one Matern-3/2), draws sparse training points, queries TabICL's marginal
-quantiles at a dense test grid, runs loo_pit + the copula model to get
-R_test, and samples trajectories under three/four conditions:
-
-  1. "your model"        — TabICL quantiles + copula R_test
-  2. "PFN4BO (R=I)"       — same TabICL quantiles, independence assumption
-  3. "PFN4BO (own marg.)" — PFN4BO's own marginal quantiles, R=I
-  4. "reference GP"       — exact GP posterior (known kernel), if available
-
-All non-trivial inference logic (PIT, correlation query, sampling) is
-imported from inference/copula_inference.py — this script is thin CLI +
-plotting only.
+Conditions: TabICL quantiles + copula R, TabICL quantiles with R = I, PFN4BO's
+own quantiles with R = I, and the exact GP posterior when available.
 
 Usage:
-    python experiments/experiment_a_visualization.py \\
-        [--copula-ckpt ./checkpoints/systematic-composition/step_0180000.pt] \\
-        [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \\
-        [--out-dir ./results/figures] [--device auto] [--seed 0] \\
+    python experiments/experiment_a_visualization.py \
+        [--copula-ckpt <checkpoint>] [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \
+        [--out-dir ./results/figures] [--device auto] [--seed 0] \
         [--n-samples 8] [--n-train 7] [--n-test 60]
 """
 
@@ -27,22 +14,15 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from data_gen import _safe_cholesky, gp_posterior  # noqa: E402
-
-from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function  # noqa: E402
-from inference.copula_inference import (  # noqa: E402
+from copula_inter.data_gen import gp_posterior
+from copula_inter.loss import _safe_cholesky
+from experiments._synthetic import OBS_NOISE_STD, pick_train_indices, sample_gp_function
+from inference.copula_inference import (
     get_marginal_quantiles,
     get_marginal_quantiles_pfn4bo,
     get_test_correlation,
@@ -54,9 +34,9 @@ from inference.copula_inference import (  # noqa: E402
     sample_trajectories,
 )
 
-# ---------------------------------------------------------------------------
-# Synthetic test functions
-# ---------------------------------------------------------------------------
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from tabicl._model.tabicl import TabICL
 
 TEST_FUNCTIONS = [
     ("rbf", 0.5, "RBF (l=0.5)"),
@@ -65,13 +45,14 @@ TEST_FUNCTIONS = [
     ("matern32", 0.3, "Matern-3/2 (l=0.3)"),
 ]
 
+
 def _locality_check(R_test: np.ndarray, X_test: np.ndarray, label: str) -> None:
     n = R_test.shape[0]
     i = n // 2
     r_adjacent = R_test[i, i + 1]
     dx = abs(X_test[i + 1, 0] - X_test[i, 0])
     flag = "" if r_adjacent > 0.7 else "  <-- FLAG: low adjacent correlation, local smoothness not learned?"
-    print(f"  [{label}] R_test[{i},{i+1}] (dx={dx:.4f}) = {r_adjacent:.4f}{flag}")
+    print(f"  [{label}] R_test[{i},{i + 1}] (dx={dx:.4f}) = {r_adjacent:.4f}{flag}")
 
 
 @torch.no_grad()
@@ -79,10 +60,10 @@ def run_one_function(
     kernel_name: str,
     lengthscale: float,
     label: str,
-    tabicl_model,
-    copula_model,
-    pfn4bo_model,
-    args,
+    tabicl_model: TabICL,
+    copula_model: CopulaTabICL,
+    pfn4bo_model: Any,
+    args: argparse.Namespace,
     seed: int,
 ) -> None:
     import matplotlib
@@ -105,15 +86,11 @@ def run_one_function(
     X_test = X_test_t.numpy()
     true_f_np = true_f.numpy()
 
-    # Models expect zero-mean/unit-std features (data_gen.py's x_norm
-    # convention, computed jointly over train+test) — the raw [0, 1] grid
-    # used for the reference GP / plotting below is NOT on that scale.
+    # Standardize model inputs; the raw grid is kept for the reference GP and plots.
     X_train_norm, X_test_norm = normalize_features(X_train, X_test)
 
     # --- Reference exact GP posterior (known kernel) ---
-    mu_star, Sigma_star = gp_posterior(
-        X_train_t, y_train_t, X_test_t, kernel_fn, noise=OBS_NOISE_STD**2, latent=False
-    )
+    mu_star, Sigma_star = gp_posterior(X_train_t, y_train_t, X_test_t, kernel_fn, noise=OBS_NOISE_STD**2, latent=False)
     mu_star_np = mu_star.numpy()
     sigma_star_np = Sigma_star.diagonal().clamp(min=1e-12).sqrt().numpy()
     L_star = _safe_cholesky(Sigma_star)
@@ -145,9 +122,7 @@ def run_one_function(
 
     # --- PFN4BO's own marginals + R=I ---
     try:
-        quantile_grid_pfn, probs_pfn = get_marginal_quantiles_pfn4bo(
-            pfn4bo_model, X_train_norm, y_train, X_test_norm
-        )
+        quantile_grid_pfn, probs_pfn = get_marginal_quantiles_pfn4bo(pfn4bo_model, X_train_norm, y_train, X_test_norm)
         samples_pfn_own, n_clipped_pfn_own = sample_trajectories(
             quantile_grid_pfn, probs_pfn, R_I, args.n_samples, rng=np.random.default_rng(seed + 3)
         )
@@ -202,8 +177,10 @@ def main() -> None:
     parser.add_argument("--n-test", type=int, default=60)
     args = parser.parse_args()
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
+    device = (
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
 
@@ -223,8 +200,13 @@ def main() -> None:
     for i, (kernel_name, lengthscale, label) in enumerate(TEST_FUNCTIONS):
         print(f"\n=== {label} ===")
         run_one_function(
-            kernel_name, lengthscale, label,
-            tabicl_model, copula_model, pfn4bo_model, args,
+            kernel_name,
+            lengthscale,
+            label,
+            tabicl_model,
+            copula_model,
+            pfn4bo_model,
+            args,
             seed=args.seed + i,
         )
 

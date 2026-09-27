@@ -1,0 +1,27 @@
+# @package _global_
+# Fine-tune a copula checkpoint on real ARCO-ERA5 data: live ERA5 episodes, a
+# short fresh warmup/cosine schedule and a finetune-scale LR. Needs a local
+# corpus (python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24).
+#
+#   python -m copula_inter.train experiment=finetune_era5 training.resume_ckpt=<ckpt>
+#
+# resume_ckpt takes a path or a CHECKPOINT_FAMILIES name[:step]. Common extras:
+#   training.resume_reset_schedule=false   continue the source run's schedule
+#   data.z_train_source=tabldm             another marginal for the ERA5 PIT
+#   era5_live.val_corpus_dir=<dir>         held-out-year validation corpus
+#   era5_live.grid_size_min/max, era5_live.box_deg_min/max
+training:
+  resume_required: true
+  resume_reset_schedule: true
+  live_generation: true
+  live_source: era5
+  steps: 10000
+  warmup_steps: 200
+  muon_lr: 4.0e-5
+  batch_size: 16
+  # Real ERA5 has no oracle R_star.
+  aux_mae_weight: 0.0
+  ckpt_dir: checkpoints/era5-finetune-${path_stem:${training.resume_ckpt}}-${now:%Y%m%d-%H%M%S}
+
+era5_live:
+  corpus_dir: ./eval/data/cache/era5_global

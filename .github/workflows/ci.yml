@@ -1,0 +1,47 @@
+name: CPU checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: cpu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      WANDB_MODE: disabled
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Install project
+        run: uv sync --locked --extra dev --extra cpu
+      - name: Lint and format
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+      - name: Type check
+        run: uv run --no-sync mypy
+      - name: Syntax and import smoke
+        run: |
+          uv run --no-sync python -m compileall -q src eval inference debug tests
+          uv run --no-sync python -c "import copula_inter.data_gen, copula_inter.train, eval.runners.eval_checkpoint, inference.copula_inference"
+      - name: CPU test suite
+        # Everything except the slow / gpu / pretrained / external_data tiers;
+        # scripts/test_full.sh runs those on a Grid5000 GPU node.
+        run: |
+          uv run --no-sync python -m pytest -q --disable-warnings --durations=15 -n auto \
+            -m "not slow and not gpu and not pretrained and not external_data"

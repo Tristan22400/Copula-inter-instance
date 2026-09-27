@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import os
 from collections import defaultdict
 
 import numpy as np
 from scipy.stats import norm
+
+from copula_inter.artifacts import atomic_json_save
 
 __all__ = ["gp_to_quantile_and_R", "save_results_json", "print_markdown_summary"]
 
@@ -40,15 +40,15 @@ def gp_to_quantile_and_R(
 
 
 def save_results_json(results: list[dict], path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(results, f, indent=2)
+    atomic_json_save(results, path)
 
 
 def print_markdown_summary(results: list[dict]) -> None:
     """Print a markdown table of mean +/- std per (benchmark, method, metric)."""
     groups: dict[tuple[str, str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for r in results:
+        if r.get("status") == "failed":
+            continue
         key = (r["benchmark"], r["method"])
         for col in _METRIC_COLUMNS:
             val = r.get(col)

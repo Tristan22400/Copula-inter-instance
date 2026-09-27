@@ -1,93 +1,50 @@
-"""s3_pit_floor.py — attainable copula floor once TabICL's own PIT is the marginal.
+"""Debug stage S3: attainable copula floor when TabICL's PIT is the marginal.
 
-Per episode: fix the context (x_train, y_train), draw M y_test ~ N(mu_post,
-Sigma_post) (the exact GP posterior, pit.py::gp_analytical_posterior), and
-PIT each draw through the SAME frozen TabICL forward pass -- the quantile
-distribution at each of the N test locations depends only on (x_train,
-y_train, x_test), so it is built ONCE per episode and .cdf()'d M times
-(tabicl_upstream's QuantileToDistribution broadcasts over trailing dims,
-see cdf()'s own docstring), not M forward passes.
-
-Reports:
-  - R_z: empirical correlation of the M PIT'd z-vectors, vs R_post
-  - floor: copula NLL of R_z scored on held-out draws (the best ANY
-    correlation model could do once TabICL's marginal has already
-    distorted z-space -- an attainable floor, not the oracle's -0.32)
-  - copula NLL of R_post scored on the PIT z (a perfect correlation
-    predictor using R_post, still handicapped by the same PIT distortion)
-  - S1's rank-32 ceiling (debug.stages.s1_rank_ceiling.fit_rank_ceiling,
-    reused not reimplemented) recomputed on R_z instead of R_post
-
-These separate two effects: "floor" measures OUT-OF-SAMPLE generalization
-of the full (Ledoit-Wolf-shrunk) R_z on fresh held-out draws -- the real
-achievable performance given finite, PIT-distorted data. "rank_ceiling_on_Rz"
-is S1's exact population-level fit (no sampling, no held-out split) treating
-R_z itself AS the population target -- an upper bound on how well a rank-r
-model could describe R_z's own structure, not a generalization estimate.
-Because of that protocol difference, rank_ceiling_on_Rz CAN legitimately
-look better than floor: a rank-r projection acts as extra denoising on top
-of Ledoit-Wolf shrinkage, and floor pays a real generalization penalty
-rank_ceiling_on_Rz never sees. Read them as two separate diagnostics, not
-as endpoints of one difference: floor - oracle_posterior_copula_nll (S0's
-number) isolates PIT distortion loss; a LARGE gap between floor and
-rank_ceiling_on_Rz signals that R_z itself is too noisy (check
-Rz_shrinkage_coefficient, raise --m-samples) rather than that rank is
-binding.
-
-R_z estimation note: with N=256 test points and M draws split fit/eval,
-the RAW sample correlation of m_fit < N draws is rank-deficient by
-construction (m_fit-1 nonzero eigenvalues at most) and its inverse
-explodes on held-out scoring. R_z is therefore estimated via Ledoit-Wolf
-linear shrinkage toward the identity (sklearn.covariance.LedoitWolf) rather
-than the raw sample correlation -- the standard fix for exactly this
-small-sample/high-dimension regime. The fitted shrinkage coefficient is
-reported per episode: values near 1 mean m_fit draws barely constrain R_z
-at all (raise --m-samples), values near 0 mean the raw sample estimate was
-already well-conditioned.
+Per episode, draw M y_test from the exact GP posterior, PIT each through one
+TabICL forward, and report: R_z (Ledoit-Wolf-shrunk correlation of the PIT z)
+vs R_post; floor, the held-out copula NLL of R_z; the copula NLL of R_post on
+the PIT z; and the rank-r ceiling fitted to R_z (population fit, so it can
+look better than floor).
 
 Usage:
     python debug/run_debug.py s3
     python debug/stages/s3_pit_floor.py --n-episodes 20 --m-samples 2048
 """
+
 from __future__ import annotations
 
 import argparse
-import os
-import sys
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
+from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
-import common
-from config import DebugConfig, add_common_args, build_config
-from stages.s1_rank_ceiling import fit_rank_ceiling
+if TYPE_CHECKING:
+    from tabicl._model.quantile_dist import QuantileDistribution
+    from tabicl._model.tabicl import TabICL
 
 
-def _build_quantile_dist(tabicl_model, x_train: torch.Tensor, y_train_scaled: torch.Tensor, x_test: torch.Tensor):
-    """One forward pass -> a quantile distribution object with batch_shape
-    (N,) -- one per test location. Mirrors pit.py::run_pit's single-target-
-    dim test-instance step (d=1 here, since a GP episode has one target)."""
+def _build_quantile_dist(
+    tabicl_model: TabICL, x_train: torch.Tensor, y_train_scaled: torch.Tensor, x_test: torch.Tensor
+) -> QuantileDistribution:
+    """One TabICL forward -> quantile distribution with batch_shape (N,)."""
     X_concat = torch.cat([x_train, x_test], dim=0).unsqueeze(0)  # (1, P+N, d_x)
-    y_train_batch = y_train_scaled.unsqueeze(0)                   # (1, P)
+    y_train_batch = y_train_scaled.unsqueeze(0)  # (1, P)
     with torch.no_grad():
-        logits = tabicl_model(X_concat, y_train_batch)            # (1, N, Q)
+        logits = tabicl_model(X_concat, y_train_batch)  # (1, N, Q)
     logits = logits.to(x_test.device)
     N, Q = logits.shape[1], logits.shape[-1]
     return tabicl_model.quantile_dist(logits.reshape(N, Q))
 
 
-def sample_and_pit(tabicl_model, episode: dict, post: dict, M: int, device: str) -> torch.Tensor:
-    """Returns z_samples (N, M): M independent PIT'd z-vectors at this
-    episode's N test points, from M draws of the true GP posterior."""
-    from loss import _safe_cholesky
-    from pit import _probit
+def sample_and_pit(tabicl_model: TabICL, episode: dict, post: dict, M: int, device: str) -> torch.Tensor:
+    """z_samples (N, M): M posterior draws at the episode's test points, PIT'd through TabICL."""
+    from copula_inter.loss import _safe_cholesky
+    from copula_inter.pit import _probit
 
     x_train = episode["x_norm_train"].to(device)
     y_train = episode["y_train"].to(device)
@@ -103,18 +60,16 @@ def sample_and_pit(tabicl_model, episode: dict, post: dict, M: int, device: str)
     N = mu_post.shape[0]
     L = _safe_cholesky(Sigma_post.unsqueeze(0)).squeeze(0)
     eps = torch.randn(N, M, device=device)
-    y_samples = mu_post.unsqueeze(-1) + L @ eps            # (N, M), raw y-space
+    y_samples = mu_post.unsqueeze(-1) + L @ eps  # (N, M), raw y-space
 
     y_samples_scaled = (y_samples - y_mean) / y_std
     with torch.no_grad():
-        u = dist.cdf(y_samples_scaled)                      # (N, M)
-    return _probit(u)                                        # (N, M)
+        u = dist.cdf(y_samples_scaled)  # (N, M)
+    return _probit(u)  # (N, M)
 
 
 def _shrunk_correlation(z_fit: torch.Tensor) -> tuple[torch.Tensor, float]:
-    """Ledoit-Wolf-shrunk correlation of z_fit (N, m_fit) -- see the module
-    docstring's "R_z estimation note". Returns (R_z (N,N) on z_fit's
-    device, shrinkage coefficient in [0,1])."""
+    """Ledoit-Wolf-shrunk correlation of z_fit (N, m_fit); returns (R_z, shrinkage coefficient)."""
     from sklearn.covariance import LedoitWolf
 
     z_np = z_fit.detach().cpu().numpy().T  # (m_fit, N) -- sklearn's (n_samples, n_features)
@@ -125,8 +80,8 @@ def _shrunk_correlation(z_fit: torch.Tensor) -> tuple[torch.Tensor, float]:
     return torch.from_numpy(R).to(z_fit.device, dtype=z_fit.dtype), float(lw.shrinkage_)
 
 
-def run(dcfg: DebugConfig, M: int = 2048, m_fit: int = None, rank: int = 32) -> dict:
-    from loss import oracle_copula_nll
+def run(dcfg: DebugConfig, M: int = 2048, m_fit: int | None = None, rank: int = 32) -> dict:
+    from copula_inter.loss import oracle_copula_nll
 
     m_fit = m_fit or M // 2
     tabicl_model = common.load_frozen_tabicl(dcfg)
@@ -157,21 +112,26 @@ def run(dcfg: DebugConfig, M: int = 2048, m_fit: int = None, rank: int = 32) -> 
 
         ceiling_per_ep, _ = fit_rank_ceiling(R_z.unsqueeze(0), min(rank, N - 1), jitter=jitter, device=dcfg.device)
 
-        per_episode.append({
-            "n_test": N,
-            "floor_copula_nll_on_Rz": float(floor_nll.item()),
-            "copula_nll_of_Rpost_on_pit_z": float(r_post_on_pit_nll.item()),
-            "rank_ceiling_on_Rz": float(ceiling_per_ep.item()),
-            "Rz_shrinkage_coefficient": shrinkage,
-            "Rz_vs_Rpost_pearson": pearson,
-            "Rz_vs_Rpost_mae": float(np.abs(off_z - off_post).mean()),
-        })
+        per_episode.append(
+            {
+                "n_test": N,
+                "floor_copula_nll_on_Rz": float(floor_nll.item()),
+                "copula_nll_of_Rpost_on_pit_z": float(r_post_on_pit_nll.item()),
+                "rank_ceiling_on_Rz": float(ceiling_per_ep.item()),
+                "Rz_shrinkage_coefficient": shrinkage,
+                "Rz_vs_Rpost_pearson": pearson,
+                "Rz_vs_Rpost_mae": float(np.abs(off_z - off_post).mean()),
+            }
+        )
 
-    def _mean(key):
+    def _mean(key: str) -> float:
         return float(np.mean([e[key] for e in per_episode]))
 
     return {
-        "M": M, "m_fit": m_fit, "rank": rank, "n_episodes_scored": len(per_episode),
+        "M": M,
+        "m_fit": m_fit,
+        "rank": rank,
+        "n_episodes_scored": len(per_episode),
         "summary": {
             "floor_copula_nll_on_Rz_mean": _mean("floor_copula_nll_on_Rz"),
             "copula_nll_of_Rpost_on_pit_z_mean": _mean("copula_nll_of_Rpost_on_pit_z"),
@@ -192,8 +152,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     result = run(dcfg, M=args.m_samples, rank=args.rank)
     if "error" in result:

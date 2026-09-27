@@ -1,14 +1,4 @@
-"""era5_global_corpus.py — in-memory reader over the monthly global caches
-written by fetch_era5_global.py, with a `sample_episode` that crops a random
-worldwide region at a random grid resolution out of the full native-0.25deg
-grid.
-
-This is what makes "different resolutions, different geographic space" a
-per-training-episode draw instead of a fixed handful of pre-fetched regions:
-once the global grid is on disk, every crop is pure in-memory numpy slicing
-(no GCS round-trip), so src/era5_live_dataset.py can afford to draw a fresh
-region/resolution/day every single training episode.
-"""
+"""In-memory reader over the monthly global ERA5 caches (fetch_era5_global.py), cropping random regions at random resolutions."""
 
 from __future__ import annotations
 
@@ -38,20 +28,19 @@ def _load_month(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str
 
 
 class GlobalERA5Corpus:
-    """Loads every era5_global_t2m_*.nc file under `cache_dir` into RAM once
-    (native grid is the same lat/lon for every file — only checked, not
-    re-derived, per file) and exposes `sample_episode` for random-region,
-    random-resolution episode draws.
+    """Global ERA5 2 m temperature corpus with random-region, random-resolution episode sampling.
 
-    Two construction paths:
-      - `GlobalERA5Corpus(cache_dir)`: reads from disk into a private copy.
-        Fine for a single-process use (e.g. build_era5_fixed_val_batches).
-      - `GlobalERA5Corpus.from_shared(shared)`: attaches to arrays another
-        process already loaded via `load_shared_corpus_arrays` and put in
-        shared memory -- what src/era5_live_dataset.py's DataLoader workers
-        use, so `live_tabicl_num_workers` copies of this corpus don't each
-        cost their own ~15GB of system RAM.
+    GlobalERA5Corpus(cache_dir) reads a private copy; from_shared(shared)
+    attaches to arrays already placed in shared memory by
+    load_shared_corpus_arrays (used by DataLoader workers).
     """
+
+    lat: np.ndarray
+    lon: np.ndarray
+    static: dict[str, np.ndarray]
+    # None when months are memory-mapped from _paths on demand.
+    _t2m_by_month: list[np.ndarray] | None
+    _paths: list[str] | None
 
     def __init__(
         self,
@@ -60,28 +49,19 @@ class GlobalERA5Corpus:
         max_months: int | None = None,
         lazy: bool | None = None,
         _shared: dict | None = None,
-    ):
-        """`max_months` caps how many monthly files are read (the most recent
-        ones, since paths are sorted by YYYYMM). When lazy is None (the default),
-        corpora with >60 months automatically use lazy on-demand memory-mapped
-        reading in `_day_slice`, keeping resident RAM under 100MB even for the
-        full 33-year (396 months, ~56GB) archive. None for max_months reads
-        everything."""
+    ) -> None:
+        """max_months keeps only the most recent monthly files (None = all). lazy=None memory-maps on demand when there are more than 60 months."""
         if _shared is not None:
-            # See from_shared()/load_shared_corpus_arrays() below -- attach
-            # to already-loaded, already-shared torch storage instead of
-            # touching disk. .numpy() on a share_memory_()'d CPU tensor is a
-            # zero-copy view over that shared storage, so every downstream
-            # numpy op in sample_episode/sample_episode_fixed_shape below
-            # works unmodified against the SAME physical memory every other
-            # attached worker reads.
+            # Attach to shared storage (zero-copy numpy views).
             self.lat = _shared["lat"].numpy()
             self.lon = _shared["lon"].numpy()
             self._t2m_by_month = [t.numpy() for t in _shared["t2m_by_month"]]
             self.static = {k: v.numpy() for k, v in _shared["static"].items()}
-            self._paths: list[str] | None = None
+            self._paths = None
             day_counts = [a.shape[0] for a in self._t2m_by_month]
         else:
+            if cache_dir is None:
+                raise ValueError("GlobalERA5Corpus needs cache_dir unless attaching to shared arrays")
             paths = sorted(glob.glob(os.path.join(cache_dir, "era5_global_t2m_*.nc")))
             if not paths:
                 raise FileNotFoundError(
@@ -90,15 +70,15 @@ class GlobalERA5Corpus:
                     "worldwide finetuning corpus."
                 )
             if max_months is not None and max_months > 0:
-                paths = paths[-int(max_months):]
+                paths = paths[-int(max_months) :]
             self._paths = paths
 
             if lazy is None:
                 lazy = len(paths) > 60
 
-            self.lat: np.ndarray | None = None
-            self.lon: np.ndarray | None = None
-            self.static: dict[str, np.ndarray] = {}
+            lat_arr: np.ndarray | None = None
+            lon_arr: np.ndarray | None = None
+            static_arrs: dict[str, np.ndarray] = {}
 
             if lazy:
                 self._t2m_by_month = None
@@ -106,15 +86,12 @@ class GlobalERA5Corpus:
                 import re
 
                 f0 = netcdf_file(paths[0], "r", mmap=True)
-                self.lat = f0.variables["latitude"][:].astype(np.float64).copy()
-                self.lon = f0.variables["longitude"][:].astype(np.float64).copy()
+                lat_arr = f0.variables["latitude"][:].astype(np.float64).copy()
+                lon_arr = f0.variables["longitude"][:].astype(np.float64).copy()
                 for v in STATIC_VARS:
                     if v in f0.variables:
-                        self.static[v] = f0.variables[v][:].astype(np.float32).copy()
+                        static_arrs[v] = f0.variables[v][:].astype(np.float32).copy()
                 f0.close()
-                if not self.static:
-                    st = load_static()
-                    self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
 
                 day_counts = []
                 for p in paths:
@@ -126,29 +103,28 @@ class GlobalERA5Corpus:
                         day_counts.append(f.variables["t2m"].shape[0])
                         f.close()
             else:
-                self._t2m_by_month: list[np.ndarray] = []
+                months: list[np.ndarray] = []
                 for p in paths:
                     t2m, lat, lon, static = _load_month(p)
-                    if self.lat is None:
-                        self.lat, self.lon = lat, lon
+                    if lat_arr is None:
+                        lat_arr, lon_arr = lat, lon
                         if static:
-                            self.static = static
-                    self._t2m_by_month.append(t2m)
-                if not self.static:
-                    st = load_static()
-                    self.static = {k: st[k].astype(np.float32) for k in STATIC_VARS}
-                day_counts = [a.shape[0] for a in self._t2m_by_month]
+                            static_arrs = static
+                    months.append(t2m)
+                self._t2m_by_month = months
+                day_counts = [a.shape[0] for a in months]
+            if not static_arrs:
+                st = load_static()
+                static_arrs = {k: st[k].astype(np.float32) for k in STATIC_VARS}
+            assert lat_arr is not None and lon_arr is not None
+            self.lat, self.lon, self.static = lat_arr, lon_arr, static_arrs
 
         self.n_days_total = int(sum(day_counts))
         self._cum_days = np.cumsum([0] + day_counts)
 
     @classmethod
     def from_shared(cls, shared: dict) -> "GlobalERA5Corpus":
-        """Attach to a corpus already loaded (once) by load_shared_corpus_arrays
-        in the main process, instead of re-reading every era5_global_t2m_*.nc
-        file from disk into a private copy. Meant to be called inside each
-        DataLoader worker's __iter__ (see LiveERA5Dataset) -- cheap (no I/O,
-        just wrapping already-shared torch storage as numpy views)."""
+        """Wrap arrays loaded by load_shared_corpus_arrays (no I/O)."""
         return cls(_shared=shared)
 
     def _day_slice(self, day_global_idx: int) -> np.ndarray:
@@ -156,6 +132,7 @@ class GlobalERA5Corpus:
         d = day_global_idx - int(self._cum_days[m])
         if self._t2m_by_month is not None:
             return self._t2m_by_month[m][d]
+        assert self._paths is not None
         f = netcdf_file(self._paths[m], "r", mmap=True)
         slice_2d = f.variables["t2m"][d].astype(np.float32).copy()
         f.close()
@@ -170,37 +147,22 @@ class GlobalERA5Corpus:
     ) -> dict | None:
         """Draw one (region, resolution, day, context/test split) episode.
 
-        Region: box center sampled uniformly on the sphere (arcsin-of-uniform
-        latitude, uniform longitude — area-uniform, not lat/lon-uniform, so
-        the corpus doesn't over-represent high latitudes), box half-width
-        drawn from `box_deg_range` degrees. Resolution: grid_size drawn from
-        `grid_size_range`, subsampled from whatever native 0.25deg points
-        fall inside the box via evenly-spaced index decimation (simpler than
-        fetch_era5.py's block-mean coarsen(), and uniform regardless of
-        whether the box wraps the antimeridian).
-
-        No cap on the test set: every point not drawn into context becomes a
-        test point, so N grows with grid_size (up to grid_size_range's own
-        max squared) rather than being clipped to a fixed ceiling -- the
-        model predicts on everything the sampled resolution actually offers.
-
-        Returns None on a degenerate draw (box too small/near a pole edge to
-        contain >=2 native points per axis, or too few points left over for
-        a disjoint test set) — caller should just draw again.
+        The box centre is area-uniform on the sphere with half-width from
+        box_deg_range; grid_size from grid_size_range, subsampled by evenly spaced
+        index decimation. Every non-context point is a test point. Returns None on a
+        degenerate draw.
         """
         from inference.copula_inference import normalize_features
 
         grid_size = int(rng.integers(grid_size_range[0], grid_size_range[1] + 1))
         box_deg = float(rng.uniform(*box_deg_range))
         half = box_deg / 2.0
-        # Keep the box fully within [-90, 90] and away from the exact pole so
-        # a plain symmetric lat window never degenerates to zero rows.
+        # Keep the box within [-90, 90] and away from the poles.
         lat_c = float(rng.uniform(-90.0 + half, 90.0 - half))
         lon_c = float(rng.uniform(0.0, 360.0))
 
         lat_mask = np.abs(self.lat - lat_c) <= half
-        # Signed shortest angular distance handles antimeridian wraparound
-        # (lon_c near 0/360) without special-casing.
+        # Signed shortest angular distance handles the antimeridian.
         dlon = ((self.lon - lon_c + 180.0) % 360.0) - 180.0
         lon_mask = np.abs(dlon) <= half
         row_idx = np.nonzero(lat_mask)[0]
@@ -249,19 +211,7 @@ class GlobalERA5Corpus:
         box_deg_range: tuple[float, float],
         n_context: int,
     ) -> dict | None:
-        """Like `sample_episode`, but `grid_size`/`n_context` are exact
-        integers instead of ranges, and this returns None (redraw) rather
-        than silently clipping to fewer native points whenever the drawn box
-        doesn't contain a full `grid_size` x `grid_size` grid along either
-        axis. That makes every successful draw's P (`n_context`) and N
-        (`grid_size**2 - n_context`) identical, letting a caller collect a
-        whole *group* of episodes (region/day/box_deg still vary per draw)
-        that share P/N -- required for src/pit.py::run_pit_batched, which
-        can only PIT a batch of episodes in one TabICL call when they all
-        share P/N. Mirrors src/live_dataset.py::LiveGPDataset's group_size
-        mechanism (see its docstring: group_size=1 measured ~1.2s/episode of
-        TabICL PIT overhead vs ~0.03s/episode grouped).
-        """
+        """Like sample_episode with exact grid_size and n_context; returns None unless the box holds a full grid_size x grid_size grid, so all episodes share P and N."""
         box_deg = float(rng.uniform(*box_deg_range))
         half = box_deg / 2.0
         lat_c = float(rng.uniform(-90.0 + half, 90.0 - half))
@@ -302,10 +252,7 @@ class GlobalERA5Corpus:
             "x_norm_test": x_test_norm.astype(np.float32),
             "y_train": values[context_idx].astype(np.float32),
             "y_test": values[test_idx].astype(np.float32),
-            # Same reporting keys sample_episode returns. The training path
-            # (LiveERA5Dataset) reads only the four arrays above and ignores
-            # these; eval/data/era5_episodes.py uses them to label which
-            # region each evaluated episode actually came from.
+            # Reporting keys (used by eval/data/era5_episodes.py).
             "lat_bounds": (lat_c - half, lat_c + half),
             "lon_bounds": (lon_c - half, lon_c + half),
             "grid_size": grid_size,
@@ -313,27 +260,10 @@ class GlobalERA5Corpus:
 
 
 def load_shared_corpus_arrays(cache_dir: str) -> dict:
-    """Load `cache_dir`'s corpus from disk ONCE and move its arrays into
-    shared CPU memory (torch.Tensor.share_memory_()), so a DataLoader's
-    spawned workers can each attach to the SAME physical memory via
-    GlobalERA5Corpus.from_shared instead of every worker loading (and
-    holding, for the life of the run) its own private ~15GB copy.
-
-    Must be called in the MAIN process before the DataLoader's workers spawn
-    -- share_memory_() tensors created ahead of spawn are what let
-    torch.multiprocessing's spawn-safe pickling hand out a shared-memory
-    handle to each worker instead of serializing (copying) the full array,
-    exactly the pattern src/live_dataset.py::build_live_train_loader already
-    uses for kernel_weights/tabicl_mix_weights (see LiveGPDataset's
-    docstring) -- applied here to O(10GB) corpus data instead of a
-    handful-of-floats tensor. Removes the RAM-per-worker constraint that
-    used to force live_tabicl_num_workers down to 1 regardless of GPU
-    headroom: with one shared copy total regardless of worker count,
-    src/era5_live_dataset.py::build_era5_train_loader now sizes
-    live_tabicl_num_workers via live_dataset.py's plain GPU-only-bound
-    resolve_live_tabicl_num_workers, same as the synthetic-GP path.
-    """
-    corpus = GlobalERA5Corpus(cache_dir)
+    """Load the corpus once in the main process and move its arrays to shared memory, for workers to attach to via GlobalERA5Corpus.from_shared."""
+    # Shared memory needs the months in RAM: never the memory-mapped (lazy) layout.
+    corpus = GlobalERA5Corpus(cache_dir, lazy=False)
+    assert corpus._t2m_by_month is not None
     return {
         "lat": torch.from_numpy(corpus.lat).share_memory_(),
         "lon": torch.from_numpy(corpus.lon).share_memory_(),

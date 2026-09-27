@@ -1,43 +1,24 @@
-"""era5_calibration_eval.py — real-ERA5 driver for the independence-copula
-multivariate spatial calibration diagnostics in eval/spatial/calibration.py
-(calc_kendall_pit, calc_mahalanobis_distances, calc_exceedance_probs,
-calc_spatial_coverage and their plot_* counterparts). Promoted from
-plots/run_era5_eval.py.
+"""Real-ERA5 independence-copula calibration of TabICL's marginals (eval/spatial/calibration.py).
 
-All four calibration metrics are, by their own docstrings, testing whether
-TabICL's MARGINALS ALONE (ignoring spatial correlation — the independence
-copula) are calibrated: they only need real per-cell marginal quantile
-predictions, not the correlation/copula model. So the promotion from
-plots/run_era5_eval.py's placeholder `MockTabICLv2` to a real model is a
-contained swap of the quantile source — via eval/tabicl_utils.py's
-make_tabicl_regressor + tabicl_quantiles (the same helpers
-eval/runners/run_benchmarks.py already uses) — not new inference logic.
-
-For each timestamp, an in-context-learning episode is built with
-`sample_icl_task_from_era5`: a dense target patch inside a lat/lon box, and
-a global context of `n_ctx` points from the rest of the grid at that same
-timestamp.
+For each timestamp, an episode has a dense target patch inside a lat/lon box
+and n_ctx context points from the rest of the grid.
 
 Usage:
-    python eval/runners/era5_calibration_eval.py \\
-        --nc-path /path/to/era5_temperature.nc \\
-        --target-lat-bounds 45 50 --target-lon-bounds 0 5
+    python -m eval.runners.era5_calibration_eval nc_path=/path/to/era5_temperature.nc \
+        target_lat_bounds=[45,50] target_lon_bounds=[0,5]
 
-If --nc-path is omitted, a small real ERA5 sample (Western Europe, 10 daily
-snapshots from Jan 2023) is auto-downloaded from the public no-auth
-ARCO-ERA5 Zarr archive on GCS and cached under eval/data/cache/, so the
-script produces real results out of the box with no arguments.
+Without nc_path a small ERA5 sample (Western Europe, 10 days of Jan 2023) is
+downloaded from the public ARCO-ERA5 archive and cached in eval/data/cache/.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-import sys
+from dataclasses import dataclass, field
 from typing import Optional, Sequence, Tuple
 
-import numpy as np
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -46,24 +27,24 @@ from scipy.stats import norm
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from eval.spatial import calibration as cal  # noqa: E402
-from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles  # noqa: E402
+from eval.runners.hydra_cli import check_choice, hydra_entry
+from eval.spatial import calibration as cal
+from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
 
 _G = 9.80665  # m/s^2, for geopotential (m^2/s^2) -> elevation (m)
 _TEMP_VAR_CANDIDATES = ("t2m", "2m_temperature", "temperature", "temp")
 _ELEV_VAR_CANDIDATES = (
-    "z", "geopotential", "geopotential_at_surface", "surface_geopotential",
-    "orography", "elevation", "altitude",
+    "z",
+    "geopotential",
+    "geopotential_at_surface",
+    "surface_geopotential",
+    "orography",
+    "elevation",
+    "altitude",
 )
 
-# Public, no-auth ARCO-ERA5 archive used to auto-fetch a default real-data
-# sample when --nc-path is omitted (see reference memory: no CDS API key
-# needed).
+# Public ARCO-ERA5 archive (no credentials needed).
 _ARCO_ERA5_URL = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
 _CACHE_DIR = os.path.join(_REPO_ROOT, "eval", "data", "cache")
 _DEFAULT_CACHE_NC = os.path.join(_CACHE_DIR, "era5_calibration_default.nc")
@@ -74,25 +55,12 @@ _DEFAULT_FETCH_LON_BOUNDS = (0.0, 40.0)  # kept in [0, 360) to match ARCO-ERA5's
 _DEFAULT_FETCH_TIME_RANGE = ("2023-01-01", "2023-01-10")  # 10 daily (00:00 UTC) snapshots
 _DEFAULT_FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")
 
-# Quantile levels TabICL is queried at for every ICL episode. Dense enough
-# to (a) fit a Gaussian mean/std per target cell via least squares, (b)
-# invert the quantile function at an arbitrary threshold by linear
-# interpolation, and (c) read off arbitrary alpha/2, 1-alpha/2 central-
-# interval bounds for the coverage curve.
+# Quantile levels TabICL is queried at.
 ALPHA_GRID = np.round(np.linspace(0.01, 0.99, 99), 2)
 
 
 def _fetch_default_era5_subset(cache_path: str = _DEFAULT_CACHE_NC) -> str:
-    """Download a small real ERA5 sample (2m temperature + surface
-    geopotential, Europe box, 10 daily snapshots from Jan 2023) from the
-    public no-auth ARCO-ERA5 Zarr archive and cache it as a local NetCDF
-    file, so this only runs once. Returns `cache_path`.
-
-    A separate fetch routine from eval/data/fetch_era5.py: this needs a
-    real datetime64 'time' coordinate and elevation, which that
-    diagnostics-focused fetcher's minimal (t2m/lat/lon/integer-day-index)
-    NetCDF3-classic schema deliberately doesn't carry.
-    """
+    """Download and cache a small ERA5 sample (2 m temperature and surface geopotential, Europe, 10 days of Jan 2023) as NetCDF; return its path."""
     if os.path.exists(cache_path):
         return cache_path
     os.makedirs(_CACHE_DIR, exist_ok=True)
@@ -112,9 +80,6 @@ def _fetch_default_era5_subset(cache_path: str = _DEFAULT_CACHE_NC) -> str:
     return cache_path
 
 
-# ---------------------------------------------------------------------------
-# ERA5 -> ICL episode
-# ---------------------------------------------------------------------------
 def _find_var(ds: xr.Dataset, candidates: Sequence[str]) -> Optional[str]:
     for name in candidates:
         if name in ds.variables:
@@ -158,7 +123,7 @@ def sample_icl_task_from_era5(
     target_lon_bounds: Tuple[float, float],
     n_ctx: int = 1000,
     rng: Optional[np.random.Generator] = None,
-):
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Build one in-context-learning episode from `ds` at a single timestamp:
     a dense target patch inside the given lat/lon box (the D-dimensional
@@ -201,20 +166,23 @@ def sample_icl_task_from_era5(
     elev_field = _elevation_field(ds, time_idx, temp_field.shape)
     cos_day, sin_day, cos_hour, sin_hour = _time_features(ds, time_idx)
 
-    def _features(mask):
+    def _features(mask: np.ndarray) -> np.ndarray:
         n = int(mask.sum())
         return np.column_stack(
             [
-                lat_grid[mask], lon_grid[mask], elev_field[mask],
-                np.full(n, cos_day), np.full(n, sin_day), np.full(n, cos_hour), np.full(n, sin_hour),
+                lat_grid[mask],
+                lon_grid[mask],
+                elev_field[mask],
+                np.full(n, cos_day),
+                np.full(n, sin_day),
+                np.full(n, cos_hour),
+                np.full(n, sin_hour),
             ]
         )
 
     lat_lo, lat_hi = target_lat_bounds
     lon_lo, lon_hi = target_lon_bounds
-    target_mask = (
-        (lat_grid >= lat_lo) & (lat_grid <= lat_hi) & (lon_grid >= lon_lo) & (lon_grid <= lon_hi)
-    )
+    target_mask = (lat_grid >= lat_lo) & (lat_grid <= lat_hi) & (lon_grid >= lon_lo) & (lon_grid <= lon_hi)
     if not target_mask.any():
         raise ValueError("target_lat_bounds/target_lon_bounds select zero grid points.")
 
@@ -234,9 +202,6 @@ def sample_icl_task_from_era5(
     return X_ctx, Y_ctx, X_target, Y_target
 
 
-# ---------------------------------------------------------------------------
-# Quantile-grid adapters (shared by all 4 calibration metrics)
-# ---------------------------------------------------------------------------
 def _invert_quantile_cdf(y_values: np.ndarray, quantile_values: np.ndarray, alpha_grid: np.ndarray) -> np.ndarray:
     """Per-row inverse of a piecewise-linear quantile function: row i's
     (quantile_values[i], alpha_grid) pairs are the model's declared
@@ -258,7 +223,7 @@ def _quantile_at_alpha(alpha: float, quantile_values: np.ndarray, alpha_grid: np
     return q0 + w * (q1 - q0)
 
 
-def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray):
+def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-row Gaussian (mu, sigma^2) fit by least squares against the
     standard-normal z-scores of alpha_grid: q_i(alpha) ~= mu_i + sigma_i * z(alpha)."""
     z = norm.ppf(alpha_grid)
@@ -269,9 +234,6 @@ def _gaussian_mean_variance(quantile_values: np.ndarray, alpha_grid: np.ndarray)
     return means, sigmas**2
 
 
-# ---------------------------------------------------------------------------
-# Evaluation loop + figure
-# ---------------------------------------------------------------------------
 def run_era5_eval(
     nc_path: str,
     target_lat_bounds: Tuple[float, float],
@@ -281,7 +243,7 @@ def run_era5_eval(
     n_ctx: int = 1000,
     n_timestamps: Optional[int] = None,
     seed: int = 0,
-):
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Loop over the first `n_timestamps` (default: all) timestamps in
     `nc_path`, running one ICL episode + real TabICL marginal inference per
@@ -321,7 +283,7 @@ def build_calibration_figure(
     output_path: str,
     exceedance_thresholds: Optional[np.ndarray] = None,
     nominal_coverages: Optional[np.ndarray] = None,
-):
+) -> None:
     """Build and save the 2x2 multivariate spatial calibration figure."""
     N, D, K = all_quantiles.shape
     flat_q = all_quantiles.reshape(N * D, K)
@@ -334,14 +296,14 @@ def build_calibration_figure(
 
     distances = cal.calc_mahalanobis_distances(y_true, means, variances)
 
-    def cdf_func(tau):
+    def cdf_func(tau: float) -> np.ndarray:
         return _invert_quantile_cdf(np.full(N * D, tau), flat_q, alpha_grid).reshape(N, D)
 
     if exceedance_thresholds is None:
         exceedance_thresholds = np.quantile(y_true, [0.5, 0.75, 0.9, 0.95, 0.99])
     predicted_probs, true_events = cal.calc_exceedance_probs(y_true, cdf_func, exceedance_thresholds)
 
-    def quantile_func(alpha):
+    def quantile_func(alpha: float) -> tuple[np.ndarray, np.ndarray]:
         lo = _quantile_at_alpha(alpha / 2, flat_q, alpha_grid).reshape(N, D)
         hi = _quantile_at_alpha(1 - alpha / 2, flat_q, alpha_grid).reshape(N, D)
         return lo, hi
@@ -362,44 +324,51 @@ def build_calibration_figure(
     print(f"Saved {output_path}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--nc-path", type=str, default=None,
-        help="Path to a real ERA5 temperature NetCDF file. If omitted, a small real "
-        f"sample is auto-downloaded and cached to {_DEFAULT_CACHE_NC}.",
-    )
-    parser.add_argument(
-        "--target-lat-bounds", type=float, nargs=2, default=list(_DEFAULT_TARGET_LAT_BOUNDS),
-        metavar=("LAT_MIN", "LAT_MAX"),
-    )
-    parser.add_argument(
-        "--target-lon-bounds", type=float, nargs=2, default=list(_DEFAULT_TARGET_LON_BOUNDS),
-        metavar=("LON_MIN", "LON_MAX"),
-    )
-    parser.add_argument(
-        "--tabicl-ckpt", type=str, default=None,
-        help="TabICLRegressor marginal checkpoint (required for the non-default estimator).",
-    )
-    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
-    parser.add_argument("--n-ctx", type=int, default=1000, help="Global context points sampled per timestamp.")
-    parser.add_argument("--n-timestamps", type=int, default=None, help="Number of timestamps to evaluate (default: all).")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--output", type=str, default=os.path.join(_DEFAULT_FIGURES_DIR, "era5_multivariate_calibration.pdf"),
-    )
-    args = parser.parse_args()
+@dataclass
+class Era5CalibrationSpec:
+    """Real-ERA5 independence-copula calibration of TabICL's marginals."""
 
+    # Real ERA5 temperature NetCDF; null downloads and caches a small real sample.
+    nc_path: str | None = None
+    # [min, max] of the target patch.
+    target_lat_bounds: list[float] = field(default_factory=lambda: list(_DEFAULT_TARGET_LAT_BOUNDS))
+    target_lon_bounds: list[float] = field(default_factory=lambda: list(_DEFAULT_TARGET_LON_BOUNDS))
+    # TabICLRegressor marginal checkpoint (required for the non-default estimator).
+    tabicl_ckpt: str | None = None
+    device: str | None = None
+    # Global context points sampled per timestamp.
+    n_ctx: int = 1000
+    # Timestamps to evaluate; null evaluates all.
+    n_timestamps: int | None = None
+    seed: int = 0
+    output: str = os.path.join(_DEFAULT_FIGURES_DIR, "era5_multivariate_calibration.pdf")
+
+
+def validate(args: Era5CalibrationSpec) -> None:
+    check_choice("device", args.device, ("cpu", "cuda"))
+    for key, bounds in (("target_lat_bounds", args.target_lat_bounds), ("target_lon_bounds", args.target_lon_bounds)):
+        if len(bounds) != 2:
+            raise ValueError(f"{key} needs [min,max], got {bounds}")
+
+
+def run(args: Era5CalibrationSpec) -> None:
     nc_path = args.nc_path if args.nc_path is not None else _fetch_default_era5_subset()
 
     y_true, all_quantiles = run_era5_eval(
-        nc_path, tuple(args.target_lat_bounds), tuple(args.target_lon_bounds),
-        tabicl_ckpt=args.tabicl_ckpt, device=args.device,
-        n_ctx=args.n_ctx, n_timestamps=args.n_timestamps, seed=args.seed,
+        nc_path,
+        (args.target_lat_bounds[0], args.target_lat_bounds[1]),
+        (args.target_lon_bounds[0], args.target_lon_bounds[1]),
+        tabicl_ckpt=args.tabicl_ckpt,
+        device=args.device,
+        n_ctx=args.n_ctx,
+        n_timestamps=args.n_timestamps,
+        seed=args.seed,
     )
     print(f"Evaluated {y_true.shape[0]} timestamps x {y_true.shape[1]} target grid cells.")
     build_calibration_figure(y_true, all_quantiles, ALPHA_GRID, args.output)
 
+
+main = hydra_entry("era5_calibration_eval", Era5CalibrationSpec, run, validate=validate)
 
 if __name__ == "__main__":
     main()

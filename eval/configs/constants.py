@@ -1,67 +1,50 @@
-"""constants.py — numeric constants and law/kernel name lists shared across
-the spatial-correlation diagnostic/sweep/baseline/report tooling, single-
-sourced here instead of duplicated across plots/*.py."""
+"""Constants and name lists for the spatial-correlation tooling."""
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
-N_CONTEXT = 30              # in-context sample size for --profile sweeps (see regions.SWEEP_PROFILES)
-N_BINS = 15                 # distance bins for correlation-vs-distance binning
+# eval_checkpoint choice lists, kept here so the config schema imports no model code.
+AR_ORDERS = ("random", "natural")
+AR_CONDITIONINGS = ("teacher_forcing", "sample")
+GP_VAL_SELECT_MODES = ("ard", "always", "never")
+# Held-out ERA5 year, disjoint from the training corpus.
+ERA5_DEFAULT_CORPUS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cache", "era5_global_val"
+)
+
+N_CONTEXT = 30  # in-context sample size for --profile sweeps (see regions.SWEEP_PROFILES)
+N_BINS = 15  # distance bins for correlation-vs-distance binning
 SEED = 42
-N_DAYS = 60                 # daily ERA5 snapshots fetched per (region, grid_size)
+N_DAYS = 60  # daily ERA5 snapshots fetched per (region, grid_size)
 MAX_DIST_PERCENTILE = 90.0  # cap the binned distance range at this percentile (excludes the
-                             # corner-only, high-variance tail of a bounded lat/lon rectangle)
-PIT_K_FOLDS = 10            # K-fold leave-one-out PIT folds for real-context z_train estimation
-N_SYNTHETIC_DRAWS = 20      # independent GP draws averaged per synthetic-mode config
+# corner-only, high-variance tail of a bounded lat/lon rectangle)
+PIT_K_FOLDS = 10  # K-fold leave-one-out PIT folds for real-context z_train estimation
+N_SYNTHETIC_DRAWS = 20  # independent GP draws averaged per synthetic-mode config
 EARTH_RADIUS_KM = 6371.0
 
-# Real-ERA5 y-space empirical correlation curve (sweep_core.py::
-# run_real_config's rho_model_yspace / model_r2 / shape_corr): per probe
-# day, draw this many joint y-space samples from the checkpoint's OWN
-# implied Sklar model (R_context's copula + its own marginal, via
-# eval.spatial.diagnostics.sample_copula_residual_fields) and pool across
-# days into one (N_DAYS_PROBE * N_YSPACE_MC_SAMPLES, D) observation matrix
-# before computing np.corrcoef -- the same "outer(z,z) is single-draw-noisy,
-# pool across many draws" logic as run_benchmarks.py's empirical_ground_truth
-# proxy, just pooling MC samples per day here instead of pooling episodes.
-# Mirrors N_SYNTHETIC_DRAWS above; kept separate since the two serve
-# different modes (real vs. synthetic) and could legitimately diverge.
+# Joint y-space samples per probe day for the real-ERA5 model correlation curve (pooled across days).
 N_YSPACE_MC_SAMPLES = 20
 
-# Total (marginal+copula) joint-NLL diagnostic (eval/metrics/joint_nll.py::
-# compute_joint_nll), shared by debug/stages/s7_backbone.py and
-# sweep_core.py::run_real_config -- neither the per-episode NLL tables in
-# eval_checkpoint.py/run_benchmarks.py nor spatial_model_r2 (a binned
-# correlation-curve-shape diagnostic, not a proper scoring rule) cover this
-# real-ERA5 / cross-backend setting.
-N_NLL_TEST = 30             # held-out (never-in-context) points scored per task/day
+# Held-out points for the real-ERA5 joint-NLL diagnostic.
+N_NLL_TEST = 30  # held-out (never-in-context) points scored per task/day
 NLL_PROBS = np.linspace(0.02, 0.98, 49)  # quantile-grid probability levels for compute_joint_nll
 
-# Classical-GP-MLE baseline Y-space NLL on the same real-ERA5 held-out split
-# as N_NLL_TEST/nll_total above (eval/spatial/sweep_core.py::
-# _fit_gp_baseline_nll, via eval/baselines/classical.py::fit_and_eval_gpytorch
-# + src/loss.py::gp_oracle_y_nll) -- the real-ERA5 counterpart to the
-# synthetic-episode classical-GP baselines in eval_checkpoint.py. Defaults
-# match eval_checkpoint.py's own --n_steps_mle/--lr_mle/--n_restarts_mle.
+# GP-MLE baseline settings for the real-ERA5 held-out NLL (eval_checkpoint's defaults).
 GP_BASELINE_KERNELS = ["rbf", "matern12", "matern32", "matern52", "rational_quadratic"]
 GP_N_STEPS_MLE = 1000
 GP_LR_MLE = 0.05
 GP_N_RESTARTS_MLE = 5
 
-# Direct-curve-fit law names (eval.spatial.diagnostics.fit_theoretical_law's
-# THEORY_LAWS keys, as fit by the `baseline` subcommand) -- a DIFFERENT
-# concept from SYNTHETIC_SWEEP_KERNELS below (data_gen.py *generating*
-# kernel names, not fit shapes).
+# Theoretical-law names for the `baseline` curve fits.
 CURVE_FIT_LAWS = ["gaussian", "matern", "rational_quadratic"]
 
-# Kernel families sampled as synthetic-mode ground truth in `sweep --mode
-# synthetic` / `diagnose --mode synthetic` (src/data_gen.py's registry).
+# data_gen kernel families used as synthetic ground truth.
 SYNTHETIC_SWEEP_KERNELS = ["rbf", "matern12", "matern32", "periodic", "rational_quadratic"]
 
-# Synthetic-mode analogue of regions.SWEEP_PROFILES["low_context_7config"]:
-# 3 grid resolutions (kernel fixed = rbf) + 4 kernel families (grid fixed =
-# 24) -- the profile plots/run_synthetic_checkpoint_comparison.py hardcoded.
+# Synthetic sweep profile: 3 grid sizes (rbf) and 4 kernel families (grid 24).
 SYNTHETIC_SWEEP_PROFILES = {
     "low_context_7config": [
         ("grid_08x08_rbf", "rbf", 8),

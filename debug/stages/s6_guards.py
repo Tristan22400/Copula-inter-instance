@@ -1,72 +1,42 @@
-"""s6_guards.py — saturation-guard audit: covnorm escape ratio + Cholesky
-jitter escalation / non-finite-input fallback counts.
+"""Debug stage S6: saturation guards.
 
-Narrowed from the original debug list's broader "audit saturation guards":
-the jitter ceiling (1/(1+sigma_jitter) ~= 0.9999 at the default 1e-4) and
-rank's lack of a pairwise correlation ceiling are both closed-form facts,
-not worth instrumenting (see debug/README.md). What's left to actually
-MEASURE on a real model:
-
-  - covnorm escape ratio ||W_i||^2 / softplus(s_i) per test point -- this
-    ratio, not rank, sets how close a pair's correlation can get to +-1
-    (Sigma_ij bounded by sqrt((1-D_i/C_i)(1-D_j/C_j)) before the jitter
-    floor, model.py::low_rank_correlation's "covnorm" branch). At init
-    (s=0, W~N(0,0.02^2)) this ratio starts near 0 -- reports how far a
-    trained checkpoint has moved off that init.
-  - loss.py::_safe_cholesky's two failure paths, counted via monkey-patching
-    torch.linalg.cholesky and loss._safe_cholesky for the duration of one
-    y_space_nll call (no src/ edits): (a) how many (episode, retry) pairs
-    needed jitter escalation beyond the base 1e-6, (b) how many Sigma slices
-    had non-finite entries and were silently replaced with identity before
-    factorization. train/sigma_nonfinite_count already tracks (b) in
-    production (reads 0 in every run inspected) -- this stage exists to
-    confirm that at a chosen checkpoint/config rather than take it on faith,
-    and to add (a), which nothing in the repo counts today.
+Reports the covnorm escape ratio ||W_i||^2 / softplus(s_i) per test point and,
+for one y_space_nll call, how many Cholesky factorizations needed jitter
+escalation and how many Sigma slices were non-finite.
 
 Usage:
     python debug/run_debug.py s6 --ckpt <name>
-    python debug/stages/s6_guards.py --n-episodes 50   # fresh (untrained) model
+    python debug/stages/s6_guards.py --n-episodes 50
 """
+
 from __future__ import annotations
 
 import argparse
 import contextlib
-import os
-import sys
+from typing import Any, Iterator
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-import common
-from config import DebugConfig, add_common_args, build_config
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
 
 @contextlib.contextmanager
-def _cholesky_instrumentation():
-    """Monkey-patches torch.linalg.cholesky (counts calls per _safe_cholesky
-    invocation -> jitter-escalation count) and loss._safe_cholesky (counts
-    non-finite-input slices before it replaces them with identity) for the
-    duration of the `with` block. Restores both on exit regardless of
-    exceptions. No src/ files are edited."""
-    import loss as loss_mod
+def _cholesky_instrumentation() -> Iterator[dict[str, int]]:
+    """Context manager counting jitter retries and non-finite slices in loss._safe_cholesky (monkey-patched, restored on exit)."""
+    from copula_inter import loss as loss_mod
 
     counters = {"cholesky_calls": 0, "safe_cholesky_calls": 0, "escalated_calls": 0, "nonfinite_slices": 0}
     orig_cholesky = torch.linalg.cholesky
     orig_safe_cholesky = loss_mod._safe_cholesky
 
-    def counting_cholesky(K, *a, **kw):
+    def counting_cholesky(K: torch.Tensor, *a: Any, **kw: Any) -> torch.Tensor:
         counters["cholesky_calls"] += 1
         return orig_cholesky(K, *a, **kw)
 
-    def counting_safe_cholesky(K, *a, **kw):
+    def counting_safe_cholesky(K: torch.Tensor, *a: Any, **kw: Any) -> torch.Tensor:
         counters["safe_cholesky_calls"] += 1
         calls_before = counters["cholesky_calls"]
         finite = torch.isfinite(K).flatten(-2).all(-1)
@@ -86,9 +56,9 @@ def _cholesky_instrumentation():
 
 
 def run(dcfg: DebugConfig) -> dict:
-    from dataset import collate_fn
-    from loss import y_space_nll
-    from model import low_rank_correlation
+    from copula_inter.dataset import collate_fn
+    from copula_inter.loss import y_space_nll
+    from copula_inter.model import low_rank_correlation
 
     model = common.load_model(dcfg)
     episodes = common.generate_episodes(dcfg, dcfg.n_episodes, tabicl_model=None)
@@ -98,15 +68,18 @@ def run(dcfg: DebugConfig) -> dict:
 
     with torch.no_grad():
         out = model(batch)
-        W = out["W"].float()                          # (B, N_max, r)
+        W = out["W"].float()  # (B, N_max, r)
         s = out.get("s")
         Sigma = low_rank_correlation(
-            W, s.float() if s is not None else None, batch["test_mask"],
-            jitter=jitter, parametrization=parametrization,
+            W,
+            s.float() if s is not None else None,
+            batch["test_mask"],
+            jitter=jitter,
+            parametrization=parametrization,
         )
 
     mask = batch["test_mask"]
-    W_norm = W.norm(dim=-1)[mask].cpu().numpy()          # ||W_i|| per valid test point
+    W_norm = W.norm(dim=-1)[mask].cpu().numpy()  # ||W_i|| per valid test point
     escape_ratio = None
     if parametrization == "covnorm" and s is not None:
         D = F.softplus(s.float())
@@ -128,11 +101,20 @@ def run(dcfg: DebugConfig) -> dict:
         "sigma_jitter": jitter,
         "W_norm": {"mean": float(W_norm.mean()), "std": float(W_norm.std()), "max": float(W_norm.max())},
         "escape_ratio": (
-            {"mean": float(escape_ratio.mean()), "std": float(escape_ratio.std()),
-             "max": float(escape_ratio.max()), "frac_gt_1": float((escape_ratio > 1).mean())}
-            if escape_ratio is not None else None
+            {
+                "mean": float(escape_ratio.mean()),
+                "std": float(escape_ratio.std()),
+                "max": float(escape_ratio.max()),
+                "frac_gt_1": float((escape_ratio > 1).mean()),
+            }
+            if escape_ratio is not None
+            else None
         ),
-        "sigma_offdiag": {"mean": float(offdiag.mean()), "abs_mean": float(np.abs(offdiag).mean()), "std": float(offdiag.std())},
+        "sigma_offdiag": {
+            "mean": float(offdiag.mean()),
+            "abs_mean": float(np.abs(offdiag).mean()),
+            "std": float(offdiag.std()),
+        },
         "cholesky_calls_total": counters["cholesky_calls"],
         "safe_cholesky_calls_total": counters["safe_cholesky_calls"],
         "safe_cholesky_calls_escalated": counters["escalated_calls"],
@@ -146,8 +128,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     result = run(dcfg)
 
@@ -156,11 +143,17 @@ def main() -> None:
     print(f"  ||W_i||: mean={w['mean']:.4f} std={w['std']:.4f} max={w['max']:.4f}")
     if result["escape_ratio"] is not None:
         e = result["escape_ratio"]
-        print(f"  escape ratio ||W||^2/softplus(s): mean={e['mean']:.4f} std={e['std']:.4f} max={e['max']:.4f} frac>1={e['frac_gt_1']:.4f}")
-        print("    (near 0 = still near init-independence; >1 = the model has actively pushed toward strong correlations)")
+        print(
+            f"  escape ratio ||W||^2/softplus(s): mean={e['mean']:.4f} std={e['std']:.4f} max={e['max']:.4f} frac>1={e['frac_gt_1']:.4f}"
+        )
+        print(
+            "    (near 0 = still near init-independence; >1 = the model has actively pushed toward strong correlations)"
+        )
     sd = result["sigma_offdiag"]
     print(f"  Sigma offdiag: mean={sd['mean']:+.4f} abs_mean={sd['abs_mean']:.4f} std={sd['std']:.4f}")
-    print(f"\n  Cholesky calls (y_space_nll pass): {result['cholesky_calls_total']} over {result['safe_cholesky_calls_total']} _safe_cholesky invocation(s)")
+    print(
+        f"\n  Cholesky calls (y_space_nll pass): {result['cholesky_calls_total']} over {result['safe_cholesky_calls_total']} _safe_cholesky invocation(s)"
+    )
     print(f"  Escalated (needed jitter > 1e-6): {result['safe_cholesky_calls_escalated']}")
     print(f"  Non-finite input slices (identity fallback fired): {result['nonfinite_input_slices']}")
 

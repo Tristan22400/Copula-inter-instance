@@ -5,28 +5,30 @@ from __future__ import annotations
 import gc
 import traceback
 import weakref
+from typing import Any, Callable
 
 import pytest
 import torch
 from omegaconf import OmegaConf
+from pytest import MonkeyPatch
 from torch import nn
 
-import train
+from copula_inter import train, train_setup
 
 
 class _TinyModel(nn.Module):
-    def __init__(self, n_test: int):
+    def __init__(self, n_test: int) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.randn(1, n_test, 2))
 
-    def forward(self, batch):
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
             "W": self.weight.expand(batch["x_train"].shape[0], -1, -1),
             "s": self.weight[..., :1],
         }
 
 
-def test_oom_unwinds_train_step_graph(monkeypatch):
+def test_oom_unwinds_train_step_graph(monkeypatch: MonkeyPatch) -> None:
     """A failed optimizer step must not keep the step graph alive."""
     n_test = 3
     model = _TinyModel(n_test)
@@ -40,18 +42,20 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
     }
     graph_ref = {}
 
-    def fake_correlation(W, _s, jitter, **_kwargs):
+    def fake_correlation(W: torch.Tensor, _s: Any, jitter: float, **_kwargs: Any) -> Any:
         graph_ref["tensor"] = weakref.ref(W)
         return W[..., :1] @ W[..., :1].transpose(-1, -2)
 
-    def fake_nll(Sigma, *_args):
+    def fake_nll(Sigma: Any, *_args: Any) -> dict[str, Any]:
         total = Sigma.square().mean()
         return {"total": total, "copula": total, "marginal": total}
 
-    monkeypatch.setattr(train, "low_rank_correlation_factor", fake_correlation)
-    monkeypatch.setattr(train, "y_space_nll", fake_nll)
+    from copula_inter import training_core
 
-    def fail_step(*_args, **_kwargs):
+    monkeypatch.setattr(training_core, "low_rank_correlation_factor", fake_correlation)
+    monkeypatch.setattr(training_core, "y_space_nll", fake_nll)
+
+    def fail_step(*_args: Any, **_kwargs: Any) -> None:
         raise torch.cuda.OutOfMemoryError("synthetic OOM")
 
     monkeypatch.setattr(optimizer, "step", fail_step)
@@ -89,44 +93,44 @@ def test_oom_unwinds_train_step_graph(monkeypatch):
     assert graph_ref["tensor"]() is None
 
 
-def _fake_device_properties(total_gb: float):
+def _fake_device_properties(total_gb: float) -> Callable[[Any], Any]:
     class _Props:
         total_memory = total_gb * 1e9
 
     return lambda _device: _Props()
 
 
-def test_reserve_headroom_noop_when_tabicl_not_live(monkeypatch):
+def test_reserve_headroom_noop_when_tabicl_not_live(monkeypatch: MonkeyPatch) -> None:
     """No live-generation TabICL workers -> nothing should cap this process."""
     calls = []
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
     cfg = OmegaConf.create({"data": {"z_train_source": "analytic", "z_train_tabicl_mix_enabled": False}})
     t = OmegaConf.create({"live_tabicl_num_workers": 2})
-    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    train_setup._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert calls == []
 
 
-def test_reserve_headroom_noop_on_cpu(monkeypatch):
+def test_reserve_headroom_noop_on_cpu(monkeypatch: MonkeyPatch) -> None:
     """TabICL mix enabled but device=cpu (no GPU workers to protect) -> no-op."""
     calls = []
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
     cfg = OmegaConf.create({"data": {"z_train_tabicl_mix_enabled": True}})
     t = OmegaConf.create({"live_tabicl_num_workers": 2})
-    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cpu")
+    train_setup._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cpu")
     assert calls == []
 
 
-def test_reserve_headroom_noop_when_zero_workers(monkeypatch):
+def test_reserve_headroom_noop_when_zero_workers(monkeypatch: MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda *a: calls.append(a))
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
     cfg = OmegaConf.create({"data": {"z_train_source": "tabicl"}})
     t = OmegaConf.create({"live_tabicl_num_workers": 0})
-    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    train_setup._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert calls == []
 
 
-def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
+def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch: MonkeyPatch) -> None:
     """2 workers * 2.5GB + 1.0GB flat = 6GB headroom on a 24GB card -> 75%.
 
     The 2.5GB/worker is 0.5 fixed + 0.02 * group_size, where group_size is
@@ -135,28 +139,30 @@ def test_reserve_headroom_caps_fraction_for_tabicl_workers(monkeypatch):
     returns, _reserve_gpu_headroom_for_live_tabicl reads t.batch_size
     unconditionally.
     """
-    captured = {}
+    captured: dict[str, Any] = {}
     monkeypatch.setattr(
-        torch.cuda, "set_per_process_memory_fraction",
+        torch.cuda,
+        "set_per_process_memory_fraction",
         lambda frac, dev: captured.update(fraction=frac, device=dev),
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
     cfg = OmegaConf.create({"data": {"z_train_tabicl_mix_enabled": True}})
     t = OmegaConf.create({"live_tabicl_num_workers": 2, "batch_size": 50})
-    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    train_setup._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert captured["device"] == 0
     assert captured["fraction"] == pytest.approx(0.75)
 
 
-def test_reserve_headroom_clamps_fraction_floor(monkeypatch):
+def test_reserve_headroom_clamps_fraction_floor(monkeypatch: MonkeyPatch) -> None:
     """A huge worker count shouldn't starve this process itself below 50%."""
-    captured = {}
+    captured: dict[str, Any] = {}
     monkeypatch.setattr(
-        torch.cuda, "set_per_process_memory_fraction",
+        torch.cuda,
+        "set_per_process_memory_fraction",
         lambda frac, dev: captured.update(fraction=frac, device=dev),
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", _fake_device_properties(24.0))
     cfg = OmegaConf.create({"data": {"z_train_source": "tabicl_split"}})
     t = OmegaConf.create({"live_tabicl_num_workers": 50, "batch_size": 50})
-    train._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
+    train_setup._reserve_gpu_headroom_for_live_tabicl(cfg, t, "cuda")
     assert captured["fraction"] == pytest.approx(0.5)

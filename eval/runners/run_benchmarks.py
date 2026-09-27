@@ -1,72 +1,64 @@
-"""run_benchmarks.py — CLI entry point for the TabICLv2 + Copula inter-instance
-joint-distribution validation suite.
+"""Joint-distribution benchmarks: spatial interpolation, sensor in-painting and synthetic BBO.
 
-For each of three benchmarks (spatial interpolation, sensor in-painting,
-synthetic BBO surrogates), compares three methods that all produce a
-(quantile_grid, probs, R) predictive representation:
-
-  independent  — TabICL marginals, R = I
-  copula       — TabICL marginals, R = CopulaTabICL's predicted correlation
-  standard_gp  — a fully independent end-to-end GaussianProcessRegressor fit
-                 in raw y-space (own mean/covariance, not tied to TabICL)
-
-All non-trivial inference logic (marginal quantiles, PIT, correlation query,
-trajectory sampling) is imported from inference/copula_inference.py; the
-joint-NLL/energy-score math is imported from src/loss.py via eval/metrics/.
-This script is orchestration only.
+Methods (all give (quantile_grid, probs, R)): independent (TabICL marginals,
+R = I), copula (TabICL marginals, the copula model's R) and standard_gp (an
+end-to-end sklearn GP on raw y).
 
 Usage:
-    python eval/runners/run_benchmarks.py \\
-        --copula_ckpt ./checkpoints/systematic-composition-k5/step_0045000.pt \\
-        --tabicl_ckpt tabicl-regressor-v2-20260212.ckpt \\
-        --device auto --num_episodes 50 --n_samples 1000
+    python -m eval.runners.run_benchmarks copula_ckpt=<copula checkpoint> \
+        tabicl_ckpt=tabicl-regressor-v2-20260212.ckpt num_episodes=50 n_samples=1000
+    python -m eval.runners.run_benchmarks benchmarks=[synthetic_bbo]
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-import sys
 import traceback
 from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
 from omegaconf import OmegaConf
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from inference.copula_inference import (  # noqa: E402
+from copula_inter.rng import resolve_device
+from eval.baselines import independent, standard_gp
+from eval.configs.checkpoints import resolve_checkpoint
+from eval.datasets import sensor_imputation, spatial_housing, synthetic_bbo
+from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_json
+from eval.metrics.energy_score import compute_energy_score
+from eval.metrics.joint_nll import compute_joint_nll, compute_pit
+from eval.results import require_coverage
+from eval.runners.hydra_cli import check_choices, hydra_entry
+from eval.tabicl_utils import make_tabicl_regressor, tabicl_loo_pit, tabicl_quantiles
+from eval.viz.correlation_plots import (
+    collect_pair_distances_and_values,
+    plot_correlation_heatmaps,
+    plot_correlation_vs_distance,
+)
+from inference.copula_inference import (
     get_test_correlation,
     load_copula_model,
     normalize_features,
     sample_trajectories,
 )
 
-from eval.baselines import independent, standard_gp  # noqa: E402
-from eval.datasets import sensor_imputation, spatial_housing, synthetic_bbo  # noqa: E402
-from eval.metrics.energy_score import compute_energy_score  # noqa: E402
-from eval.metrics.joint_nll import compute_joint_nll, compute_pit  # noqa: E402
-from eval.tabicl_utils import make_tabicl_regressor, tabicl_loo_pit, tabicl_quantiles  # noqa: E402
-from eval.viz.correlation_plots import (  # noqa: E402
-    collect_pair_distances_and_values,
-    plot_correlation_heatmaps,
-    plot_correlation_vs_distance,
-)
-from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_json  # noqa: E402
-
 BENCHMARK_NAMES = ["spatial_housing", "sensor_imputation", "synthetic_bbo"]
-# TabICL's own native quantile-grid density (p_j = j/1001), used as the
-# probability levels queried from TabICLRegressor.
+# TabICL's native quantile levels (p_j = j/1001).
 DEFAULT_PROBS = np.arange(1, 1000) / 1001
 
 
-def _load_episode(benchmark_name: str, seed: int, synthetic_bbo_cfg=None):
+def _load_episode(
+    benchmark_name: str, seed: int, synthetic_bbo_cfg: DictConfig | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Returns (X_train, y_train, X_test, y_test, R_true_or_None)."""
     if benchmark_name == "spatial_housing":
         X_train, y_train, X_test, y_test = spatial_housing.load_split(n_ctx=64, n_test=32, seed=seed)
@@ -82,24 +74,18 @@ def _load_episode(benchmark_name: str, seed: int, synthetic_bbo_cfg=None):
 def run_episode(
     benchmark_name: str,
     seed: int,
-    tabicl_reg,
-    copula_model,
+    tabicl_reg: Any,
+    copula_model: CopulaTabICL,
     n_samples: int,
     rng: np.random.Generator,
-    synthetic_bbo_cfg=None,
+    synthetic_bbo_cfg: DictConfig | None = None,
 ) -> tuple[list[dict], dict[str, np.ndarray], dict[str, tuple[np.ndarray, np.ndarray]]]:
     X_train, y_train, X_test, y_test, R_true = _load_episode(benchmark_name, seed, synthetic_bbo_cfg)
     n_test = X_test.shape[0]
 
     X_train_n, X_test_n = normalize_features(X_train, X_test)
 
-    # Marginals and PIT come from the public tabicl.TabICLRegressor, not the
-    # low-level TabICL model class inference/copula_inference.py wraps.
-    # TabICLRegressor.fit() standardizes y internally (its own StandardScaler)
-    # and predict() inverse-transforms back — this is the documented,
-    # canonical way TabICL expects to be used (see
-    # tabicl_upstream/.../regressor.py), so y_train is passed in RAW, no
-    # manual normalization on our end.
+    # TabICLRegressor standardizes y itself, so y_train is passed raw.
     probs = DEFAULT_PROBS
     quantile_grid = tabicl_quantiles(tabicl_reg, X_train_n, y_train, X_test_n, probs)
     Z_train = tabicl_loo_pit(tabicl_reg, X_train_n, y_train, probs, k_folds=10, seed=seed)
@@ -116,17 +102,9 @@ def run_episode(
         "standard_gp": (qgrid_gp, probs_gp, R_gp),
     }
 
-    # Ground truth: for synthetic_bbo the analytical posterior correlation is
-    # known exactly. For real datasets (spatial_housing, sensor_imputation)
-    # there is no known generative kernel, so we fall back to an EMPIRICAL
-    # proxy built from the PIT z-residuals of the true y_test under TabICL's
-    # own marginals: z_i * z_j is an unbiased (but single-episode-noisy)
-    # estimator of Corr(z_i, z_j), since PIT z-values are ~N(0,1) marginally
-    # by construction. This single-episode outer(z, z) is rank-1 and noisy —
-    # not a real correlation matrix — so it is not scored (no corr_frob for
-    # real datasets), only shown for visual reference; the statistically
-    # meaningful signal is the binned correlation-vs-distance plot pooled
-    # across all episodes (see plot_correlation_vs_distance in main()).
+    # Ground truth: exact for synthetic_bbo; for real datasets a single-episode
+    # outer(z, z) proxy, shown but not scored (the pooled correlation-vs-distance
+    # plot is the real signal).
     if R_true is not None:
         gt_name, R_gt = "ground_truth", R_true
     else:
@@ -164,42 +142,49 @@ def run_episode(
     return records, R_by_method, pair_series
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="TabICLv2 + Copula inter-instance benchmark suite")
-    parser.add_argument("--copula_ckpt", default="./checkpoints/systematic-composition-k5/step_0045000.pt")
-    parser.add_argument("--tabicl_ckpt", default=None)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--num_episodes", type=int, default=50)
-    parser.add_argument("--n_samples", type=int, default=1000)
-    parser.add_argument("--benchmarks", default=",".join(BENCHMARK_NAMES))
-    parser.add_argument("--out_dir", default=os.path.join(_REPO_ROOT, "eval", "results"))
-    parser.add_argument("--seed", type=int, default=0)
-    args = parser.parse_args()
+@dataclass
+class BenchmarkSpec:
+    """TabICL + copula inter-instance benchmark suite."""
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
-    )
+    copula_ckpt: str = "./checkpoints/systematic-composition-k5/step_0045000.pt"
+    # TabICL marginal checkpoint; null uses make_tabicl_regressor's default.
+    tabicl_ckpt: str | None = None
+    device: str = "auto"
+    num_episodes: int = 50
+    n_samples: int = 1000
+    benchmarks: list[str] = field(default_factory=lambda: list(BENCHMARK_NAMES))
+    out_dir: str = os.path.join(_REPO_ROOT, "eval", "results")
+    seed: int = 0
+    # Maximum failed-episode fraction before exiting nonzero. 1.0 (default) keeps pre-refactor
+    # behaviour: failures are logged and the run still succeeds; set e.g. 0.0 to gate on coverage.
+    max_failed_fraction: float = 1.0
+
+
+def validate(args: BenchmarkSpec) -> None:
+    if not 0 <= args.max_failed_fraction <= 1:
+        raise ValueError("max_failed_fraction must lie in [0, 1]")
+    check_choices("benchmarks", args.benchmarks, BENCHMARK_NAMES)
+
+
+def run(args: BenchmarkSpec) -> None:
+    device = resolve_device(args.device)
     print(f"Device: {device}")
 
-    benchmark_names = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
-    unknown = set(benchmark_names) - set(BENCHMARK_NAMES)
-    assert not unknown, f"Unknown benchmark(s): {unknown}, must be a subset of {BENCHMARK_NAMES}"
+    benchmark_names = list(args.benchmarks)
 
     print(f"Loading TabICL marginal model (TabICLRegressor): {args.tabicl_ckpt}")
     tabicl_reg = make_tabicl_regressor(checkpoint=args.tabicl_ckpt, device=device)
 
-    print(f"Loading copula model: {args.copula_ckpt}")
-    copula_model, cfg = load_copula_model(args.copula_ckpt, device=device)
+    copula_ckpt = resolve_checkpoint(args.copula_ckpt)  # a path, or a CHECKPOINT_FAMILIES name
+    print(f"Loading copula model: {copula_ckpt}")
+    copula_model, cfg = load_copula_model(copula_ckpt, device=device)
 
-    # synthetic_bbo's ground-truth kernel is sampled with this SAME cfg (see
-    # synthetic_bbo.load_split/_sample_episode_kernel_fn), so its
-    # kernel family, chain length, and lengthscale/noise priors always match
-    # whatever this checkpoint actually trained on, instead of a hardcoded
-    # guess that silently drifts if a different checkpoint's cfg differs.
+    # synthetic_bbo samples its kernels with this checkpoint's cfg.
     exclude_kernels = OmegaConf.select(cfg, "data.composite_exclude_kernels", default=None)
     print(f"synthetic_bbo composite_exclude_kernels (from checkpoint cfg): {exclude_kernels}")
 
     all_records: list[dict] = []
+    failed_episodes = 0
     heatmap_saved: set[str] = set()
     results_path = os.path.join(args.out_dir, "benchmark_results.json")
 
@@ -211,19 +196,32 @@ def main() -> None:
             rng = np.random.default_rng(episode_seed)
             try:
                 records, R_by_method, pair_series = run_episode(
-                    benchmark_name, episode_seed, tabicl_reg, copula_model, args.n_samples, rng,
+                    benchmark_name,
+                    episode_seed,
+                    tabicl_reg,
+                    copula_model,
+                    args.n_samples,
+                    rng,
                     cfg,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 print(f"  [episode {ep}] FAILED:", flush=True)
                 traceback.print_exc()
+                failed_episodes += 1
+                all_records.append(
+                    {
+                        "benchmark": benchmark_name,
+                        "seed": episode_seed,
+                        "method": "__episode__",
+                        "status": "failed",
+                        "error": repr(exc),
+                    }
+                )
+                save_results_json(all_records, results_path)
                 continue
 
             all_records.extend(records)
-            # Saved after every episode (not just at the end) so a run in
-            # progress can be inspected on disk — this is a slow run (TabICL
-            # is fit ~11x per episode for K-fold PIT + marginals), and the
-            # JSON write is negligible next to that cost.
+            # Save results after every episode.
             save_results_json(all_records, results_path)
             for name, dv in pair_series.items():
                 pooled_series[name].append(dv)
@@ -248,7 +246,12 @@ def main() -> None:
 
     print()
     print_markdown_summary(all_records)
+    attempted = len(benchmark_names) * args.num_episodes
+    print(f"Episode completion: {attempted - failed_episodes}/{attempted}")
+    require_coverage(attempted - failed_episodes, attempted, 1 - args.max_failed_fraction)
 
+
+main = hydra_entry("run_benchmarks", BenchmarkSpec, run, validate=validate)
 
 if __name__ == "__main__":
     main()

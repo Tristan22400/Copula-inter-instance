@@ -17,24 +17,23 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
+from typing import TYPE_CHECKING
 
 import torch
 from hydra import compose, initialize_config_dir
 
+if TYPE_CHECKING:
+    from copula_inter.marginal_backbones import MarginalBackbone
+    from tabicl._model.tabicl import TabICL
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-for _path in (_ROOT, os.path.join(_ROOT, "src"), os.path.join(_ROOT, "tabicl_upstream", "src")):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
 
-from finetune_marginal import _generate_phase_a_gp_batch, _gp_cfg  # noqa: E402
-from marginal_finetune import (  # noqa: E402
-    MarginalLossWeights,
-    apply_tier,
-    phase_a_batch_loss,
-)
-from pit import load_tabicl  # noqa: E402
+from copula_inter.finetune_marginal import phase_a_batch_loss
+from copula_inter.marginal_data import _generate_phase_a_gp_batch, _gp_cfg
+from copula_inter.marginal_objective import MarginalLossWeights
+from copula_inter.marginal_tiers import apply_tier
+from copula_inter.pit import load_tabicl
 
 
 def _args() -> argparse.Namespace:
@@ -49,10 +48,14 @@ def _args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _metrics(model, episode, weights, device: str) -> dict:
+def _metrics(model: TabICL | MarginalBackbone, episode: dict, weights: MarginalLossWeights, device: str) -> dict:
     with torch.no_grad():
         result = phase_a_batch_loss(
-            model, [episode], weights, k_folds=2, folds_per_step=None,
+            model,
+            [episode],
+            weights,
+            k_folds=2,
+            folds_per_step=None,
             device=device,
         )
     return {
@@ -69,10 +72,17 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     overrides = [
-        "data.P_min=12", "data.P_max=12", "data.N_min=8", "data.N_max=8",
-        "data.d_features=2", "data.systematic_composition=false", "data.kernel=rbf",
-        "data.structural_warp_enabled=false", "data.mlp_mixing_enabled=false",
-        "data.mean_fn_enabled=false", "marginal.era5.mix_frac=0",
+        "data.P_min=12",
+        "data.P_max=12",
+        "data.N_min=8",
+        "data.N_max=8",
+        "data.d_features=2",
+        "data.systematic_composition=false",
+        "data.kernel=rbf",
+        "data.structural_warp_enabled=false",
+        "data.mlp_mixing_enabled=false",
+        "data.mean_fn_enabled=false",
+        "marginal.era5.mix_frac=0",
     ]
     with initialize_config_dir(config_dir=os.path.join(_ROOT, "conf"), version_base=None):
         cfg = compose(config_name="finetune_marginal", overrides=overrides)
@@ -82,23 +92,23 @@ def main() -> None:
     episode = _generate_phase_a_gp_batch(gp_cfg, 1, args.device)[0]
     # The episode is fixed supervision. This is defensive for hand-built
     # episodes too, whose temporary gpytorch kernel can otherwise retain a graph.
-    episode = {
-        key: value.detach() if torch.is_tensor(value) else value
-        for key, value in episode.items()
-    }
+    episode = {key: value.detach() if torch.is_tensor(value) else value for key, value in episode.items()}
 
-    model, _ = load_tabicl(
-        str(cfg.marginal.ckpt), args.device, trainable=True, return_config=True
-    )
+    model, _ = load_tabicl(str(cfg.marginal.ckpt), args.device, trainable=True, return_config=True)
     report = apply_tier(
-        model, args.tier, lora_rank=int(cfg.marginal.lora_rank),
+        model,
+        args.tier,
+        lora_rank=int(cfg.marginal.lora_rank),
         lora_alpha=float(cfg.marginal.lora_alpha),
         lora_target=str(cfg.marginal.lora_target),
     )
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     weights = MarginalLossWeights(
-        distill=1.0, nll=0.0, crps=0.0, pinball=0.0,
+        distill=1.0,
+        nll=0.0,
+        crps=0.0,
+        pinball=0.0,
         tail_power=float(cfg.marginal.loss.tail_power),
     )
 
@@ -107,7 +117,11 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
         result = phase_a_batch_loss(
-            model, [episode], weights, k_folds=2, folds_per_step=None,
+            model,
+            [episode],
+            weights,
+            k_folds=2,
+            folds_per_step=None,
             device=args.device,
         )
         result["loss"].backward()

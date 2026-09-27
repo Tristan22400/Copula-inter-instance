@@ -1,53 +1,40 @@
-"""s5_kfold.py — impact of K-fold noise on z_train, frozen checkpoint.
+"""Debug stage S5: effect of the K-fold count on z_train for a frozen checkpoint.
 
-K-folding only affects z_train (the model's INPUT context) -- z_test/
-log_pdf_test always come from one non-folded forward regardless of K (see
-pit.py::run_pit_batched's own docstring: "Test-set PIT stays a single
-forward pass"). So this is a frozen-checkpoint probe, not a training
-ablation: for a fixed batch of episodes (fixed context+test points, fixed
-z_test), re-run TabICL's K-fold PIT at several K to get several z_train
-variants, feed each through the SAME trained --ckpt, and score copula NLL /
-correlation-vs-R_post.
-
-Also scores an "oracle input" upper bound: the episode's own exact GP-LOO
-z_train (data_gen.py's analytic z_train field, Rasmussen & Williams Eq.
-5.12 -- computed for every episode regardless of z_train_source) paired
-with the SAME TabICL-PIT z_test used above. This isolates how much of the
-model's gap-to-oracle comes from z_train's K-fold noise specifically, vs.
-everything else (rank, PIT distortion in z_test, optimization).
+For fixed episodes, recompute TabICL's K-fold PIT z_train at several K (z_test
+does not depend on K), feed each to --ckpt, and score the copula NLL and the
+correlation against R_post; also with the exact GP LOO z_train as an upper
+bound.
 
 Usage:
     python debug/run_debug.py s5 --ckpt <name>
     python debug/stages/s5_kfold.py --ckpt kernel-sweep-all-tabicl-retrain-15k --n-episodes 50
 """
+
 from __future__ import annotations
 
 import argparse
-import os
-import sys
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
-import common
-from config import DebugConfig, add_common_args, build_config
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
+    from copula_inter.pit import TabICLLike
 
 K_SWEEP_DEFAULT = [2, 5, 10]  # "P" (true K-fold LOO through TabICL) is appended in run()
 
 
-def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
-    """run_pit_batched at a given K over one shared-P/N batch of episodes,
-    replicating data_gen.py's own y-scaling convention exactly (per-episode
-    y_train mean/std, y_test/log_pdf_test corrected the same way) so a
-    frozen checkpoint sees the same input distribution it was trained on."""
-    from pit import run_pit_batched
+def _pit_at_k(
+    tabicl_model: TabICLLike, episodes: list[dict], k_folds: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """run_pit_batched at K over a shared-P/N batch, with data_gen's per-episode y scaling."""
+    from copula_inter.pit import run_pit_batched
 
     x_train = torch.stack([ep["x_norm_train"] for ep in episodes]).to(device)
     x_test = torch.stack([ep["x_norm_test"] for ep in episodes]).to(device)
@@ -60,16 +47,27 @@ def _pit_at_k(tabicl_model, episodes: list[dict], k_folds: int, device: str):
     y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)
 
     out = run_pit_batched(tabicl_model, x_train, y_train_scaled, x_test, y_test_scaled, k_folds=k_folds)
-    z_train = out["z_train"].squeeze(-1)                              # (B, P)
-    z_test = out["z_test"].squeeze(-1)                                # (B, N)
-    log_pdf_test = out["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast, matches data_gen.py's own convention
+    z_train = out["z_train"].squeeze(-1)  # (B, P)
+    z_test = out["z_test"].squeeze(-1)  # (B, N)
+    log_pdf_test = (
+        out["log_pdf_test"].squeeze(-1) - y_std.log()
+    )  # (B, N) - (B, 1) broadcast, matches data_gen.py's own convention
     return z_train, z_test, log_pdf_test
 
 
-def _score_variant(model, episodes: list[dict], z_train, z_test, log_pdf_test, posts, cfg, device):
-    from dataset import collate_fn
-    from loss import y_space_nll
-    from model import build_sigma
+def _score_variant(
+    model: CopulaTabICL,
+    episodes: list[dict],
+    z_train: torch.Tensor,
+    z_test: torch.Tensor,
+    log_pdf_test: torch.Tensor,
+    posts: list[dict | None],
+    cfg: DictConfig,
+    device: str,
+) -> dict:
+    from copula_inter.dataset import collate_fn
+    from copula_inter.loss import y_space_nll
+    from copula_inter.model import build_sigma
 
     variant_eps = []
     for i, ep in enumerate(episodes):
@@ -81,7 +79,6 @@ def _score_variant(model, episodes: list[dict], z_train, z_test, log_pdf_test, p
 
     batch = {k: v.to(device) for k, v in collate_fn(variant_eps).items()}
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
-    parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     with torch.no_grad():
         out = model(batch)
         Sigma = build_sigma(out, cfg, jitter=jitter, test_mask=batch["test_mask"])
@@ -109,7 +106,7 @@ def _score_variant(model, episodes: list[dict], z_train, z_test, log_pdf_test, p
     }
 
 
-def run(dcfg: DebugConfig, k_sweep=None) -> dict:
+def run(dcfg: DebugConfig, k_sweep: Sequence[int] | None = None) -> dict:
     if dcfg.ckpt is None:
         return {"error": "S5 needs a trained --ckpt (frozen-checkpoint probe, no retraining here)."}
 
@@ -128,9 +125,7 @@ def run(dcfg: DebugConfig, k_sweep=None) -> dict:
         label = "P (true LOO)" if K == P else str(K)
         results[label] = _score_variant(model, episodes, z_train, z_test, log_pdf_test, posts, dcfg.cfg, dcfg.device)
 
-    # Oracle-input upper bound: exact analytic GP-LOO z_train (data_gen.py's
-    # own field, untouched) + the SAME TabICL-PIT z_test/log_pdf_test from
-    # the last K-fold call above (z_test is K-invariant, see module docstring).
+    # Upper bound: exact GP LOO z_train with the same TabICL z_test.
     z_train_oracle = torch.stack([ep["z_train"] for ep in episodes]).to(dcfg.device)
     results["oracle_z_train"] = _score_variant(
         model, episodes, z_train_oracle, z_test, log_pdf_test, posts, dcfg.cfg, dcfg.device
@@ -146,8 +141,13 @@ def main() -> None:
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     result = run(dcfg, k_sweep=[int(x) for x in args.k_sweep.split(",")])
     if "error" in result:

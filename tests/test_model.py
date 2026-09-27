@@ -11,30 +11,23 @@ Tests verify:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 import torch
 from conftest import make_batch
 
-from model import build_copula_transformer, low_rank_correlation
+from copula_inter.model import build_copula_transformer, low_rank_correlation
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from copula_inter.model import CopulaTabICL
 
 
 @pytest.fixture(scope="module")
-def model_and_cfg(small_model_cfg):
-    """A scratch CopulaTabICL, warm-started with one optimizer step.
-
-    TabICL's attention/FF output projections are zero-initialized (a
-    ReZero-style stability trick, see tabicl_upstream _model/layers.py
-    MultiheadAttentionBlock.init_weights), so a freshly-constructed model is
-    an exact identity map: every attention block collapses to its residual
-    input, and row/test representations come out identical regardless of
-    per-row content. One dummy gradient step moves the projections off of
-    that degenerate fixed point so the structural properties below actually
-    probe the architecture instead of a constant function.
-    """
+def model_and_cfg(small_model_cfg: DictConfig) -> tuple[CopulaTabICL, DictConfig]:
+    """Scratch CopulaTabICL after one optimizer step (a fresh model is an identity map: TabICL zero-initializes its output projections)."""
     torch.manual_seed(0)
     model = build_copula_transformer(small_model_cfg)
     model.train()  # eval() would route through TabICL's inference manager,
@@ -50,11 +43,6 @@ def model_and_cfg(small_model_cfg):
     opt.zero_grad()
 
     return model, small_model_cfg
-
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
 
 
 def permute_test(batch: dict, perm: list) -> dict:
@@ -75,41 +63,29 @@ def permute_train(batch: dict, perm: list) -> dict:
     return b
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-def test_output_shape(model_and_cfg):
+def test_output_shape(model_and_cfg: tuple[CopulaTabICL, DictConfig]) -> None:
     model, cfg = model_and_cfg
     B, P, N = 2, 10, 5
     batch = make_batch(B=B, P=P, N=N)
     with torch.no_grad():
         out = model(batch)
     rank = cfg.model.rank
-    assert out["W"].shape == (B, N, rank), (
-        f"Expected W {(B, N, rank)}, got {out['W'].shape}"
-    )
-    assert out["s"].shape == (B, N), (
-        f"Expected s {(B, N)}, got {out['s'].shape}"
-    )
+    assert out["W"].shape == (B, N, rank), f"Expected W {(B, N, rank)}, got {out['W'].shape}"
+    assert out["s"].shape == (B, N), f"Expected s {(B, N)}, got {out['s'].shape}"
 
 
-def test_correlation_unit_diagonal(model_and_cfg):
-    """low_rank_correlation(W, s) must have Sigma_ii == 1 exactly (jitter is
-    renormalized back out -- see model._renormalize_to_unit_diagonal)."""
+def test_correlation_unit_diagonal(model_and_cfg: tuple[CopulaTabICL, DictConfig]) -> None:
+    """low_rank_correlation(W, s) has an exactly unit diagonal."""
     model, _ = model_and_cfg
     batch = make_batch(B=2, P=10, N=5)
     with torch.no_grad():
         out = model(batch)
         Sigma = low_rank_correlation(out["W"], out["s"], batch["test_mask"])
     diag = Sigma.diagonal(dim1=-2, dim2=-1)
-    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-6), (
-        f"Diagonal not 1: {diag}"
-    )
+    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-6), f"Diagonal not 1: {diag}"
 
 
-def test_correlation_is_psd(model_and_cfg):
+def test_correlation_is_psd(model_and_cfg: tuple[CopulaTabICL, DictConfig]) -> None:
     """low_rank_correlation(W, s) must be PSD (all eigenvalues >= 0)."""
     model, _ = model_and_cfg
     batch = make_batch(B=2, P=10, N=5)
@@ -118,12 +94,10 @@ def test_correlation_is_psd(model_and_cfg):
         Sigma = low_rank_correlation(out["W"], out["s"], batch["test_mask"])
     for b in range(Sigma.shape[0]):
         eigvals = torch.linalg.eigvalsh(Sigma[b])
-        assert (eigvals >= -1e-4).all(), (
-            f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
-        )
+        assert (eigvals >= -1e-4).all(), f"Batch {b}: negative eigenvalues: {eigvals[eigvals < 0]}"
 
 
-def test_permutation_equivariance_test_instances(model_and_cfg):
+def test_permutation_equivariance_test_instances(model_and_cfg: tuple[CopulaTabICL, DictConfig]) -> None:
     """Permuting test instances should permute (W, s) rows by the same permutation."""
     model, _ = model_and_cfg
     torch.manual_seed(42)
@@ -142,7 +116,7 @@ def test_permutation_equivariance_test_instances(model_and_cfg):
     )
 
 
-def test_permutation_invariance_train_instances(model_and_cfg):
+def test_permutation_invariance_train_instances(model_and_cfg: tuple[CopulaTabICL, DictConfig]) -> None:
     """Permuting train instances should not change the output (W, s)."""
     model, _ = model_and_cfg
     torch.manual_seed(42)
@@ -161,7 +135,7 @@ def test_permutation_invariance_train_instances(model_and_cfg):
     )
 
 
-def test_test_instances_are_independent(model_and_cfg):
+def test_test_instances_are_independent(model_and_cfg: tuple[CopulaTabICL, DictConfig]) -> None:
     """Perturbing one test instance's input must not change any other test
     instance's output — the ICL stage must not let test rows attend to
     each other."""
@@ -177,7 +151,7 @@ def test_test_instances_are_independent(model_and_cfg):
         out2 = model(batch_perturbed)
 
     w_diff = (out1["W"] - out2["W"]).abs().sum(dim=-1)  # (B, N)
-    s_diff = (out1["s"] - out2["s"]).abs()               # (B, N)
+    s_diff = (out1["s"] - out2["s"]).abs()  # (B, N)
 
     # The perturbed instance (index 0) is expected to change.
     assert (w_diff[:, 0] > 1e-6).all() or (s_diff[:, 0] > 1e-6).all(), (
@@ -192,7 +166,7 @@ def test_test_instances_are_independent(model_and_cfg):
     )
 
 
-def test_forward_with_padding(model_and_cfg):
+def test_forward_with_padding(model_and_cfg: tuple[CopulaTabICL, DictConfig]) -> None:
     """Model should handle batches with different P and N per sample (via padding)."""
     model, _ = model_and_cfg
     torch.manual_seed(3)
@@ -222,10 +196,14 @@ def test_forward_with_padding(model_and_cfg):
     test_mask[1, :3] = True
 
     batch = {
-        "x_train": x_train, "z_train": z_train,
-        "x_test": x_test, "z_test": z_test,
-        "train_mask": train_mask, "test_mask": test_mask,
-        "n_train": torch.tensor([8, 6]), "n_test": torch.tensor([4, 3]),
+        "x_train": x_train,
+        "z_train": z_train,
+        "x_test": x_test,
+        "z_test": z_test,
+        "train_mask": train_mask,
+        "test_mask": test_mask,
+        "n_train": torch.tensor([8, 6]),
+        "n_test": torch.tensor([4, 3]),
     }
 
     with torch.no_grad():

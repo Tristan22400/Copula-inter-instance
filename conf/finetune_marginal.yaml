@@ -2,15 +2,15 @@
 # Phase A — fine-tune a standalone TabICL so its marginal posterior predictive
 # is CORRECT for the GP prior the copula is trained on.
 #
-#   python src/finetune_marginal.py                       # tier 3, defaults
-#   python src/finetune_marginal.py marginal.tier=1 training.lr=2e-5
+#   python -m copula_inter.finetune_marginal                       # tier 3, defaults
+#   python -m copula_inter.finetune_marginal marginal.tier=1 training.lr=2e-5
 #
 # Output: a checkpoint in TabICL's own {"config", "state_dict"} schema, so it is
 # a drop-in for the copula run's marginal:
 #
-#   python src/train.py tabicl.pit_ckpt=<that path>
+#   python -m copula_inter.train tabicl.pit_ckpt=<that path>
 #
-# This trains NOTHING jointly with the copula. src/model.py is untouched and
+# This trains NOTHING jointly with the copula. src/copula_inter/model.py is untouched and
 # conf/config.yaml is untouched; the two phases meet only at that file path.
 # ---------------------------------------------------------------------------
 
@@ -35,7 +35,7 @@ wandb:
 
 marginal:
   # Which tabular foundation model's marginal to fine-tune. See
-  # src/marginal_backbones.py for what each supports and why they differ:
+  # src/copula_inter/marginal_backbones.py for what each supports and why they differ:
   # tabicl/tabldm reach tiers 0-3, exaone tier 0 only (its attention holds raw
   # Parameters, so there is nothing for LoRA to swap), tabpfn is wired but
   # licence-gated and never executed here.
@@ -89,7 +89,7 @@ marginal:
   tier: 3
 
   # LoRA on EVERY 2-D weight matrix in the backbone, at one shared rank, for
-  # every architecture (src/lora.py::apply_lora_all_layers). This is the
+  # every architecture (src/copula_inter/lora.py::apply_lora_all_layers). This is the
   # default because the stage ladder above adapts only swappable attention
   # MODULES, which covers ~91% of TabLDM's parameters but ~2% of EXAONE's --
   # its attention and feed-forward weights are raw nn.Parameters inside
@@ -189,7 +189,7 @@ training:
   steps: 200000
   # Full-backbone attention LoRA is more expressive than Tier 0 and needs a
   # conservative step size. AdamW rather than Muon deliberately —
-  # src/muon.py:64-65 warns it "may not work well for finetuning pretrained
+  # src/copula_inter/muon.py:64-65 warns it "may not work well for finetuning pretrained
   # models", and Phase A is exactly that.
   lr: 1.0e-5
   warmup_steps: 200

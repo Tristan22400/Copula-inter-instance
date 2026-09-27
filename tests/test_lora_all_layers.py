@@ -1,55 +1,32 @@
-"""test_lora_all_layers.py — universal LoRA: one shared rank on every 2-D
-weight matrix, in every marginal backbone.
-
-The stage/tier ladder adapts swappable attention MODULES, which covers ~91%
-of TabLDM's parameters but ~2% of EXAONE's (its attention and feed-forward
-weights are raw nn.Parameters inside custom modules with no submodule to
-replace). ``apply_lora_all_layers`` uses torch parametrization instead, so
-coverage no longer depends on which library used nn.Module children.
-
-Each test here guards a failure that is silent rather than loud:
-  - adapters that perturb a pretrained model at step 0,
-  - the frozen base weight being unfrozen by a tier-0 pattern that still
-    matches its post-rename name (i.e. quiet full fine-tuning),
-  - rank drifting between architectures,
-  - a checkpoint written with the wrong merger, which only fails at the next
-    run's load_state_dict -- long after the training spend.
-"""
+"""Tests for all-layer LoRA (apply_lora_all_layers) on every marginal backbone: identity at init, frozen base weights, shared rank, and checkpoint merging to stock names."""
 
 from __future__ import annotations
 
-import os
-import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "src"),
-           os.path.join(_REPO_ROOT, "tabicl_upstream", "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if TYPE_CHECKING:
+    from copula_inter.marginal_backbones import MarginalBackbone
 
 RANK = 8
 BACKENDS = ["tabldm", "exaone"]
 
 
-def _load(name):
-    pytest.importorskip(
-        {"tabldm": "tabldm", "exaone": "exaonetabular"}[name], reason=f"{name} not installed"
-    )
-    from marginal_backbones import load_backbone
+def _load(name: str) -> MarginalBackbone:
+    pytest.importorskip({"tabldm": "tabldm", "exaone": "exaonetabular"}[name], reason=f"{name} not installed")
+    from copula_inter.marginal_backbones import load_backbone
 
     return load_backbone(name, device="cpu")
 
 
-def test_adapters_are_identity_at_initialisation():
-    """B is zero-initialised, so installing adapters must not move a single
-    weight -- otherwise every run starts from a perturbed pretrained model."""
-    from lora import apply_lora_all_layers
+def test_adapters_are_identity_at_initialisation() -> None:
+    """Installing adapters leaves every weight unchanged (B = 0)."""
+    from copula_inter.lora import apply_lora_all_layers
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 8), nn.ReLU(), nn.Linear(8, 4))
@@ -60,12 +37,9 @@ def test_adapters_are_identity_at_initialisation():
     torch.testing.assert_close(model(x), before, rtol=0, atol=0)
 
 
-def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern():
-    """register_parametrization renames `0.weight` to
-    `0.parametrizations.weight.original`, which still matches a prefix-style
-    tier-0 pattern. Without the guard that silently full-fine-tunes the layer
-    LoRA was just installed on."""
-    from lora import apply_lora_all_layers
+def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern() -> None:
+    """A tier-0 pattern matching "...parametrizations.weight.original" does not unfreeze it."""
+    from copula_inter.lora import apply_lora_all_layers
 
     model = nn.Sequential(nn.Linear(6, 8))
     apply_lora_all_layers(model, rank=RANK, alpha=16.0, also_trainable=(r"^0\.",))
@@ -77,8 +51,8 @@ def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern():
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name):
-    from lora import apply_lora_all_layers
+def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name: str) -> None:
+    from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
     n_matrices = sum(1 for _, p in bb.module.named_parameters() if p.dim() == 2)
@@ -91,14 +65,13 @@ def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name):
             ranks.add(plist[0].A.shape[0])
             ranks.add(plist[0].B.shape[1])
     assert ranks == {RANK}, f"{name} has mixed LoRA ranks: {sorted(ranks)}"
-    # Essentially total coverage: every 2-D matrix that existed before is now
-    # behind an adapter (the count shifts because `.original` replaces it).
+    # Every former 2-D matrix is now behind an adapter.
     assert n_adapted == n_matrices, f"{name}: adapted {n_adapted} of {n_matrices} matrices"
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_only_adapters_train_and_gradients_reach_them(name):
-    from lora import apply_lora_all_layers
+def test_only_adapters_train_and_gradients_reach_them(name: str) -> None:
+    from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
     apply_lora_all_layers(bb.module, rank=RANK, alpha=16.0)
@@ -114,37 +87,31 @@ def test_only_adapters_train_and_gradients_reach_them(name):
     assert torch.isfinite(q).all()
     q.pow(2).mean().backward()
 
-    def _live(suffix):
-        return [n for n, p in bb.module.named_parameters()
-                if n.endswith(suffix) and p.grad is not None and p.grad.abs().sum() > 0]
+    def _live(suffix: str) -> list[str]:
+        return [
+            n
+            for n, p in bb.module.named_parameters()
+            if n.endswith(suffix) and p.grad is not None and p.grad.abs().sum() > 0
+        ]
 
-    # At initialisation B == 0, so d(loss)/dA = B^T @ grad is exactly zero:
-    # only the B factors move on the first step. This is standard LoRA
-    # behaviour, not a broken graph -- asserting "all adapters get gradient"
-    # here would be asserting something false.
+    # At init B == 0, so only the B factors get gradients.
     n_b = sum(1 for n, _ in bb.module.named_parameters() if n.endswith(".B"))
-    assert len(_live(".B")) > 0.9 * n_b, (
-        f"{name}: only {len(_live('.B'))}/{n_b} B factors received gradient"
-    )
+    assert len(_live(".B")) > 0.9 * n_b, f"{name}: only {len(_live('.B'))}/{n_b} B factors received gradient"
     assert not _live(".A"), "A should have zero gradient while B is still zero"
 
-    # After one step B is nonzero, so A becomes trainable too -- this is what
-    # proves the whole factorisation is live, not just half of it.
+    # After one step A gets gradients too.
     opt = torch.optim.SGD([p for p in bb.module.parameters() if p.requires_grad], lr=1e-2)
     opt.step()
     bb.module.zero_grad(set_to_none=True)
     q2 = bb.quantile_forward([X[:12]], [y[:12]], [X[12:]], probs)
     q2.pow(2).mean().backward()
-    assert len(_live(".A")) > 0.5 * n_b, (
-        f"{name}: A factors still dead after a step ({len(_live('.A'))}/{n_b})"
-    )
+    assert len(_live(".A")) > 0.5 * n_b, f"{name}: A factors still dead after a step ({len(_live('.A'))}/{n_b})"
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name, tmp_path):
-    """The written file must carry the ORIGINAL names with deltas baked in,
-    or the next run's strict load_state_dict fails."""
-    from lora import apply_lora_all_layers
+def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name: str, tmp_path: Path) -> None:
+    """The checkpoint uses the original parameter names with deltas merged."""
+    from copula_inter.lora import apply_lora_all_layers
 
     bb = _load(name)
     stock_keys = set(bb.module.state_dict().keys())
@@ -165,10 +132,9 @@ def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name, tmp_path
     )
     assert not any(".parametrizations." in k for k in sd)
 
-    from marginal_backbones import load_backbone
+    from copula_inter.marginal_backbones import load_backbone
 
     fresh = load_backbone(name, device="cpu")
     base = fresh.module.state_dict()
-    moved = [k for k in stock_keys
-             if base[k].dim() == 2 and not torch.allclose(base[k].float(), sd[k].float())]
+    moved = [k for k in stock_keys if base[k].dim() == 2 and not torch.allclose(base[k].float(), sd[k].float())]
     assert moved, "no adapted weight changed; the delta was not merged in"

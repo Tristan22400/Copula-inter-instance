@@ -1,19 +1,10 @@
-"""
-plot_covariance_comparison.py — visualize predicted vs. oracle correlation matrices.
-
-For a handful of synthetic GP draws (same sampling logic as
-``experiment_b_quantitative.py``), plots side-by-side heatmaps of the copula
-model's predicted test-test correlation matrix (``R_test``) against the true
-kernel correlation (``R_true``), plus their difference — to see *where*
-(which distances / which functions) the model over- or under-estimates
-correlation, rather than just the aggregate Frobenius-norm summary.
+"""Heatmaps of the copula model's predicted test correlation, the true kernel correlation and their difference, for a few synthetic GP draws.
 
 Usage:
-    python experiments/plot_covariance_comparison.py \\
-        [--copula-ckpt ./checkpoints/systematic-composition/step_0180000.pt] \\
-        [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \\
-        [--kernels rbf,matern32] [--seeds 0,1,2,3] \\
-        [--n-test 40] [--n-train-min 5] [--n-train-max 15] \\
+    python experiments/plot_covariance_comparison.py \
+        [--copula-ckpt <checkpoint>] [--tabicl-ckpt tabicl-regressor-v2-20260212.ckpt] \
+        [--kernels rbf,matern32] [--seeds 0,1,2,3] \
+        [--n-test 40] [--n-train-min 5] [--n-train-max 15] \
         [--out-dir ./results/figures] [--device auto]
 """
 
@@ -21,32 +12,35 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_SRC = os.path.join(_REPO_ROOT, "src")
-for _p in (_REPO_ROOT, _SRC):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from pit import normalize_targets, run_pit  # noqa: E402
-
-from experiments.experiment_b_quantitative import _compute_r_true, _sample_one_function  # noqa: E402
-from inference.copula_inference import (  # noqa: E402
+from copula_inter.pit import normalize_targets, run_pit
+from experiments.experiment_b_quantitative import _compute_r_true, _sample_one_function
+from inference.copula_inference import (
     get_test_correlation,
     load_copula_model,
     load_tabicl_marginal,
     normalize_features,
 )
 
+if TYPE_CHECKING:
+    from copula_inter.model import CopulaTabICL
+    from tabicl._model.tabicl import TabICL
+
 
 @torch.no_grad()
-def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_dir: str) -> None:
+def plot_one(
+    seed: int,
+    tabicl_model: TabICL,
+    copula_model: CopulaTabICL,
+    oracle_mode: str,
+    args: argparse.Namespace,
+    out_dir: str,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -57,7 +51,7 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
     kernel_name, lengthscale, n_train, X_train_t, y_train_t, X_test_t, y_test_t, kernel_fn = _sample_one_function(
         rng_np, rng_torch, args.n_test, (args.n_train_min, args.n_train_max), args.kernels
     )
-    X_train, y_train = X_train_t.numpy(), y_train_t.numpy()
+    X_train = X_train_t.numpy()
     X_test = X_test_t.numpy()
     n_test = X_test.shape[0]
 
@@ -67,20 +61,16 @@ def plot_one(seed: int, tabicl_model, copula_model, oracle_mode: str, args, out_
     X_train_norm_t = torch.as_tensor(X_train_norm, dtype=X_train_t.dtype)
     X_test_norm_t = torch.as_tensor(X_test_norm, dtype=X_test_t.dtype)
 
-    # y is z-scored via pit.normalize_targets before reaching the raw TabICL
-    # module -- the same helper every other run_pit/raw-TabICL call site in
-    # the repo uses -- or this GP draw's random outputscale saturates the
-    # pretrained quantile head's CDF into its extreme tail, collapsing
-    # Z_train's spread instead of reflecting the true per-point rank.
+    # Normalize targets before TabICL.
     tabicl_device = next(tabicl_model.parameters()).device
     with torch.no_grad():
-        y_train_scaled, y_test_scaled, _, _ = normalize_targets(
-            y_train_t.to(tabicl_device), y_test_t.to(tabicl_device)
-        )
+        y_train_scaled, y_test_scaled, _, _ = normalize_targets(y_train_t.to(tabicl_device), y_test_t.to(tabicl_device))
         pit_out = run_pit(
             tabicl_model,
-            X_train_norm_t.to(tabicl_device), y_train_scaled.unsqueeze(-1),
-            X_test_norm_t.to(tabicl_device), y_test_scaled.unsqueeze(-1),
+            X_train_norm_t.to(tabicl_device),
+            y_train_scaled.unsqueeze(-1),
+            X_test_norm_t.to(tabicl_device),
+            y_test_scaled.unsqueeze(-1),
             k_folds=min(10, len(X_train)),
             Y_train_raw=y_train_t.to(tabicl_device).unsqueeze(-1),
         )
@@ -135,8 +125,10 @@ def main() -> None:
     args.kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
 
-    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
-        args.device if args.device != "auto" else "cpu"
+    device = (
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else (args.device if args.device != "auto" else "cpu")
     )
     print(f"Device: {device}")
 

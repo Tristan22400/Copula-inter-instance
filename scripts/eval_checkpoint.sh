@@ -1,30 +1,24 @@
 #!/bin/bash
 #OAR -n CopulaEval
-#OAR -l gpu=1,walltime=24:00:00
+#OAR -l gpu=1,walltime=48:00:00
 #OAR -O logs/eval_%jobid%.out
 #OAR -E logs/eval_%jobid%.err
 #OAR -q p1
 #
 # Evaluate an ICL checkpoint against classical baselines (eval/runners/eval_checkpoint.py).
+# Arguments are Hydra overrides on eval/runners/eval_args.py::EvalSpec.
 #
 # Submit with:
 #     mkdir -p logs
-#     oarsub -S "./scripts/eval_checkpoint.sh --ckpt ./checkpoints/<run>/step_XXXXXXX.pt"
+#     oarsub -S "./scripts/eval_checkpoint.sh ckpt=./checkpoints/<run>/step_XXXXXXX.pt"
 #
-# Pass any eval_checkpoint.py flag through, e.g.:
-#     oarsub -S "./scripts/eval_checkpoint.sh --ckpt ./checkpoints/test_temp/step_0005000.pt --live_generate --n_episodes 200"
+# Pass any eval_checkpoint override through, e.g.:
+#     oarsub -S "./scripts/eval_checkpoint.sh ckpt=./checkpoints/test_temp/step_0005000.pt live_generate=true n_episodes=200"
 
 set -euo pipefail
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/.."
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
-# ----- Env -----
-source ~/thoth_storage/miniconda3/etc/profile.d/conda.sh
-conda activate multivariate-icl
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "[$(date +%H:%M:%S)] OAR job ${OAR_JOB_ID:-local} — host: $(hostname)"
 echo "[$(date +%H:%M:%S)] GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
@@ -36,6 +30,6 @@ echo "    args: $*"
 # this an OAR job's .out held nothing but the bash echoes above until the
 # process exited — and a run killed at its walltime therefore showed no
 # progress at all for the whole reservation.
-python -u eval/runners/eval_checkpoint.py "$@"
+python -u -m eval.runners.eval_checkpoint "$@"
 
 echo "[$(date +%H:%M:%S)] Evaluation complete."

@@ -9,7 +9,7 @@ defaults:
   # 2026-08-24 before this reorder (copula_nano.yaml's
   # live_tabicl_main_process_reserve_gb/live_tabicl_group_multiplier
   # overrides were composed then clobbered straight back to this file's
-  # defaults). CLI overrides (python src/train.py training.foo=bar) always
+  # defaults). CLI overrides (python -m copula_inter.train training.foo=bar) always
   # win regardless of this order -- Hydra applies those last, after the
   # whole defaults list.
   #
@@ -20,10 +20,12 @@ defaults:
   - _self_
   - model: copula_prod
   - data: gp_tasks
+  # Optional preset over everything above, e.g. experiment=finetune_era5.
+  - experiment: null
 
 seed: 42
 
-# Multi-process parallel dataset generation only (src/generate_pit_dataset.py,
+# Multi-process parallel dataset generation only (src/copula_inter/generate_pit_dataset.py,
 # launched via scripts/generate_dataset.sh's GEN_WORKERS) -- ignored by
 # train.py. worker_id/num_workers default to 0/1 (single process, original
 # behaviour); N cooperating processes pointed at the same data.dataset_dir
@@ -58,8 +60,11 @@ training:
   # `warmup_steps`/`steps`/`muon_lr` etc. still come from this run's config,
   # not the one baked into the checkpoint, so an extended `steps` budget
   # smoothly stretches the remaining decay instead of starting over.
-  # Usage: python src/train.py training.resume_ckpt=./checkpoints/copula_transformer/step_0029999.pt
+  # Usage: python -m copula_inter.train training.resume_ckpt=<checkpoint.pt>
   resume_ckpt: null
+  # true refuses to start without resume_ckpt (set by fine-tuning presets
+  # such as conf/experiment/finetune_era5.yaml).
+  resume_required: false
   # Set true to opt back into the old behavior: restart at step 0 with a
   # fresh warmup/cosine schedule instead of continuing the checkpoint's.
   # Intended for deliberately warm-starting a new, unrelated experiment
@@ -103,7 +108,7 @@ training:
   # resolvable TabICL checkpoint (tabicl.ckpt/tabicl.pit_ckpt) -- there is no
   # oracle-PIT option for real data, so training.aux_mae_weight is forced to
   # 0.0 automatically under this source (no R_star exists to regress
-  # against). See src/finetune_era5.py for a ready-made CLI wrapper.
+  # against). Use experiment=finetune_era5 for the ready-made preset.
   live_source: gp
   # CPU-bound generation is heavier than a shard read; size to keep the GPU
   # fed. 16 (not 8) because generate_gp_batch's fixed per-call overhead means
@@ -197,6 +202,12 @@ training:
   # storage. Still a true per-epoch permutation, just chunked randomization.
   shard_block_shards: 16
   plot_val_every: 1000  # generate val plots every N steps (0 = never)
+  # Build the fixed validation probes at startup (synthetic kernel families,
+  # posterior probe, TabICL/analytic PIT caches of the val set, the TabICL mix
+  # gap measurement, ERA5 probes). false skips all of them for a fast start:
+  # val/* is still logged, but kernel_fit/*, era5_fit/*, oracle_diag/* and the
+  # measured TabICL mix fractions are not.
+  startup_probes: true
   # Adaptive kernel-family sampling for live generation: bias
   # live_dataset.py's kernel-chain sampling (data_gen._sample_kernel_chain_
   # structure) toward the kernel families the model currently fits worst,
@@ -258,7 +269,7 @@ training:
   # Weight on the copula BACKBONE's own auxiliary loss, when it has one --
   # currently only model.backbone=tabldm (MoE router z-loss + load-balance,
   # already internally scaled by the checkpoint's own coefficients -- see
-  # src/copula_backbones.py::moe_aux_loss). A no-op (nothing to add) for
+  # src/copula_inter/copula_backbones.py::moe_aux_loss). A no-op (nothing to add) for
   # model.backbone=tabicl. 1.0 is the standard "just add it" MoE-training
   # convention; this is not a term to tune down casually -- dropping it
   # while training a MoE end-to-end risks expert imbalance/collapse.
@@ -353,7 +364,7 @@ baselines:
   era5_viz_gp: true
   era5_viz_gp_kernel: matern32    # any eval/baselines/classical.py kernel name
 
-# training.live_source=era5's data knobs (src/era5_live_dataset.py). Ignored
+# training.live_source=era5's data knobs (src/copula_inter/era5_live_dataset.py). Ignored
 # unless training.live_generation=true AND training.live_source=era5.
 era5_live:
   # Local cache directory populated by `python eval/data/fetch_era5_global.py`

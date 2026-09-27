@@ -1,6 +1,6 @@
 """energy_score.py — Energy Score for sample-based joint predictive evaluation.
 
-Direct numpy port of ``src/loss.py::energy_score``'s scoring formula (its
+Direct numpy port of ``src/copula_inter/loss.py::energy_score``'s scoring formula (its
 ``term1``/``term2`` computation, lines ~478-485). That torch function can't be
 called as-is here: it *draws* its own Monte-Carlo samples internally from a
 ``mu + D^{1/2} eps_diag + V @ eps_low`` low-rank Gaussian, a parameterization

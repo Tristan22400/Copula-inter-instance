@@ -6,7 +6,8 @@
 #OAR -q p1
 #
 # Finetune an existing copula-model checkpoint on real, worldwide ARCO-ERA5
-# data (src/finetune_era5.py -> src/train.py training.live_source=era5).
+# data: copula_inter.train with the conf/experiment/finetune_era5.yaml preset.
+# Arguments are Hydra overrides for copula_inter.train.
 #
 # Prerequisite: a local ERA5 corpus (one-time, ~125MB/month; run on a
 # frontend or its own OAR job -- needs network, not GPU):
@@ -14,28 +15,15 @@
 #
 # Submit with:
 #     mkdir -p logs
-#     oarsub -S "./scripts/finetune_era5.sh --ckpt ./checkpoints/kernel-sweep-all-tabicl-retrain/step_0015000.pt"
+#     oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=kernel-sweep-all-tabicl-retrain-15k model.rank=32"
 #
-# Pass any finetune_era5.py flag through, e.g.:
-#     oarsub -S "./scripts/finetune_era5.sh --ckpt ./checkpoints/<run>/step_XXXXXXX.pt --steps 20000 --corpus-dir ./eval/data/cache/era5_global"
+# Pass any other override through, e.g.:
+#     oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=./checkpoints/<run>/step_XXXXXXX.pt training.steps=20000 era5_live.corpus_dir=./eval/data/cache/era5_global"
 
 set -euo pipefail
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/.."
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
-# ----- Env (mirrors scripts/train.sh) -----
-CONDA_BASE="$HOME/thoth_storage/miniconda3"
-CONDA_ENV="$CONDA_BASE/envs/multivariate-icl"
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-else
-    source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
-fi
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # See scripts/train.sh's comment: the frozen-TabICL-marginal load does a slow
 # HF Hub HEAD check even when fully cached locally. Skip it once cached.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
@@ -47,6 +35,6 @@ echo "[$(date +%H:%M:%S)] GPU: $(nvidia-smi --query-gpu=name --format=csv,nohead
 echo "[$(date +%H:%M:%S)] Finetuning on real ERA5 data..."
 echo "    args: $*"
 
-python src/finetune_era5.py "$@"
+python -m copula_inter.train experiment=finetune_era5 "$@"
 
 echo "[$(date +%H:%M:%S)] Finetuning complete."
