@@ -1,28 +1,33 @@
 """Spatial-correlation diagnostics CLI.
 
-Subcommands:
+Subcommands, chosen with command=<name> (settings are command.<key>=<value>):
     diagnose: correlation-vs-distance, heatmaps and field panels for one
-        real-ERA5 or synthetic config, for one or more --ckpt.
+        real-ERA5 or synthetic config, for one or more checkpoints.
     sweep: scalar and curve metrics for every (checkpoint, config) in a
-        profile, written to eval/results/*.json (--checkpoints all by default).
+        profile, written to eval/results/*.json (every family by default).
     baseline: theoretical-law fits to the ground truth for the same profiles.
     report: figures in eval/reports/figures/ from eval/results/*.json.
-    all: sweep, baseline and report, real and synthetic.
+    all (default): sweep, baseline and report, real and synthetic.
 
 Usage:
-    python eval/runners/spatial_correlation_eval.py all
-    python eval/runners/spatial_correlation_eval.py diagnose --ckpt kernel-sweep-all-tabicl-retrain-15k
-    python eval/runners/spatial_correlation_eval.py sweep --mode synthetic --checkpoints all
+    python -m eval.runners.spatial_correlation_eval
+    python -m eval.runners.spatial_correlation_eval command=diagnose command.ckpt=kernel-sweep-all-tabicl-retrain-15k
+    python -m eval.runners.spatial_correlation_eval command=sweep command.mode=synthetic
+    python -m eval.runners.spatial_correlation_eval command=diagnose --cfg job   # every diagnose key
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
+import sys
+from dataclasses import dataclass, field, fields
+from typing import Any, Callable
 
 import numpy as np
 import torch
+from hydra.core.config_store import ConfigStore
+from omegaconf import MISSING
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -34,6 +39,7 @@ from eval.configs import (
 from eval.configs.checkpoints import CHECKPOINT_FAMILIES, all_family_names, resolve_checkpoint  # noqa: E402
 from eval.data.era5_io import haversine_distance_km, load_era5_data, safe_cholesky  # noqa: E402
 from eval.data.fetch_era5 import fetch as fetch_era5  # noqa: E402
+from eval.runners.hydra_cli import check_choice, check_choices, hydra_entry  # noqa: E402
 from eval.spatial.diagnostics import (  # noqa: E402
     bin_correlation_by_distance,
     empirical_spatial_correlation,
@@ -298,20 +304,20 @@ def _diagnose(
             _diagnose_synthetic(token, kernel, grid_size, n_context, n_draws, device, seed, out_dir)
 
 
-def cmd_diagnose(args: argparse.Namespace) -> None:
-    tokens = [t.strip() for t in args.ckpt.split(",") if t.strip()]
+def cmd_diagnose(spec: DiagnoseSpec) -> None:
+    tokens = _checkpoint_tokens(spec.ckpt)
     _diagnose(
-        args.mode,
+        spec.mode,
         tokens,
-        args.region,
-        args.grid_size,
-        args.kernel,
-        args.n_days,
-        args.n_context,
-        args.n_draws,
-        args.device,
-        args.seed,
-        args.out_dir,
+        spec.region,
+        spec.grid_size,
+        spec.kernel,
+        spec.n_days,
+        spec.n_context,
+        spec.n_draws,
+        spec.device,
+        spec.seed,
+        spec.out_dir,
     )
 
 
@@ -381,22 +387,22 @@ def _sweep(
     return out_path
 
 
-def cmd_sweep(args: argparse.Namespace) -> None:
+def cmd_sweep(spec: SweepSpec) -> None:
     _sweep(
-        args.mode,
-        args.profile,
-        args.checkpoints,
-        args.n_context,
-        args.n_days,
-        args.n_draws,
-        args.device,
-        args.seed,
-        args.out,
-        compute_gp_baseline=not args.no_gp_baseline,
-        gp_kernels=args.gp_kernels,
-        gp_n_steps_mle=args.gp_n_steps_mle,
-        gp_lr_mle=args.gp_lr_mle,
-        gp_n_restarts_mle=args.gp_n_restarts_mle,
+        spec.mode,
+        spec.profile,
+        ",".join(_checkpoint_tokens(spec.checkpoints)),
+        spec.n_context,
+        spec.n_days,
+        spec.n_draws,
+        spec.device,
+        spec.seed,
+        spec.out,
+        compute_gp_baseline=spec.gp_baseline,
+        gp_kernels=spec.gp_kernels,
+        gp_n_steps_mle=spec.gp_n_steps_mle,
+        gp_lr_mle=spec.gp_lr_mle,
+        gp_n_restarts_mle=spec.gp_n_restarts_mle,
     )
 
 
@@ -473,8 +479,8 @@ def _baseline(
     return out_path
 
 
-def cmd_baseline(args: argparse.Namespace) -> None:
-    _baseline(args.mode, args.profile, args.laws, args.n_days, args.ckpt, args.device, args.seed, args.out)
+def cmd_baseline(spec: LawBaselineSpec) -> None:
+    _baseline(spec.mode, spec.profile, spec.laws, spec.n_days, spec.ckpt, spec.device, spec.seed, spec.out)
 
 
 def _family_style(family_token: str) -> tuple:
@@ -627,7 +633,7 @@ def _report(
     else:
         print(
             f"No real sweep results at {real_path}; skipping real-mode report figures "
-            f"(run `sweep --mode real` first, or `all`)."
+            f"(run command=sweep command.mode=real first, or command=all)."
         )
 
     if os.path.exists(synth_path):
@@ -636,20 +642,18 @@ def _report(
     else:
         print(
             f"No synthetic sweep results at {synth_path}; skipping synthetic-mode report figures "
-            f"(run `sweep --mode synthetic` first, or `all`)."
+            f"(run command=sweep command.mode=synthetic first, or command=all)."
         )
 
 
-def cmd_report(args: argparse.Namespace) -> None:
-    _report(args.out_dir, args.real_results, args.synthetic_results, args.baseline_real, args.baseline_synthetic)
+def cmd_report(spec: ReportSpec) -> None:
+    _report(spec.out_dir, spec.real_results, spec.synthetic_results, spec.baseline_real, spec.baseline_synthetic)
 
 
-def cmd_all(args: argparse.Namespace) -> None:
-    checkpoints = args.checkpoints or "all"
-    baseline_synthetic_ckpt = (
-        [t.strip() for t in checkpoints.split(",") if t.strip()][-1] if checkpoints != "all" else all_family_names()[-1]
-    )
-    print("=== [all] 1/5: sweep --mode real ===")
+def cmd_all(spec: AllSpec) -> None:
+    checkpoints = "all" if spec.checkpoints is None else ",".join(_checkpoint_tokens(spec.checkpoints))
+    baseline_synthetic_ckpt = checkpoints.split(",")[-1] if checkpoints != "all" else all_family_names()[-1]
+    print("=== [all] 1/5: sweep mode=real ===")
     _sweep(
         "real",
         "low_context_7config",
@@ -657,11 +661,11 @@ def cmd_all(args: argparse.Namespace) -> None:
         constants.N_CONTEXT,
         constants.N_DAYS,
         constants.N_SYNTHETIC_DRAWS,
-        args.device,
+        spec.device,
         constants.SEED,
-        compute_gp_baseline=not args.no_gp_baseline,
+        compute_gp_baseline=spec.gp_baseline,
     )
-    print("=== [all] 2/5: sweep --mode synthetic ===")
+    print("=== [all] 2/5: sweep mode=synthetic ===")
     _sweep(
         "synthetic",
         "low_context_7config",
@@ -669,21 +673,21 @@ def cmd_all(args: argparse.Namespace) -> None:
         constants.N_CONTEXT,
         constants.N_DAYS,
         constants.N_SYNTHETIC_DRAWS,
-        args.device,
+        spec.device,
         constants.SEED,
     )
-    print("=== [all] 3/5: baseline --mode real ===")
+    print("=== [all] 3/5: baseline mode=real ===")
     _baseline(
-        "real", "low_context_7config", constants.CURVE_FIT_LAWS, constants.N_DAYS, None, args.device, constants.SEED
+        "real", "low_context_7config", constants.CURVE_FIT_LAWS, constants.N_DAYS, None, spec.device, constants.SEED
     )
-    print("=== [all] 4/5: baseline --mode synthetic ===")
+    print("=== [all] 4/5: baseline mode=synthetic ===")
     _baseline(
         "synthetic",
         "low_context_7config",
         constants.CURVE_FIT_LAWS,
         constants.N_DAYS,
         baseline_synthetic_ckpt,
-        args.device,
+        spec.device,
         constants.SEED,
     )
     print("=== [all] 5/5: report ===")
@@ -691,129 +695,154 @@ def cmd_all(args: argparse.Namespace) -> None:
     print(f"=== [all] done. Figures in {_FIGURES_DIR} ===")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command", required=True)
+@dataclass
+class DiagnoseSpec:
+    """Correlation-vs-distance, heatmaps and field panels for one config."""
 
-    p_diag = sub.add_parser("diagnose", help="Single/multi-checkpoint deep-dive plots for one config.")
-    p_diag.add_argument(
-        "--ckpt",
-        type=str,
-        required=True,
-        help="Comma-separated list of checkpoint family names (see eval/configs/checkpoints.py), "
-        "'family:step', or raw .pt paths — looped over in-process, sharing the model cache.",
-    )
-    p_diag.add_argument("--mode", choices=["real", "synthetic"], default="real")
-    p_diag.add_argument(
-        "--region",
-        choices=list(regions.REGIONS),
-        default="western_europe",
-        help="[--mode real] Named region (eval/configs/regions.py).",
-    )
-    p_diag.add_argument("--grid-size", type=int, default=24)
-    p_diag.add_argument(
-        "--kernel",
-        choices=constants.SYNTHETIC_SWEEP_KERNELS,
-        default=None,
-        help="[--mode synthetic] Ground-truth kernel; random if omitted.",
-    )
-    p_diag.add_argument("--n-days", type=int, default=constants.N_DAYS, help="[--mode real]")
-    p_diag.add_argument("--n-context", type=int, default=constants.N_CONTEXT)
-    p_diag.add_argument("--n-draws", type=int, default=constants.N_SYNTHETIC_DRAWS, help="[--mode synthetic]")
-    p_diag.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
-    p_diag.add_argument("--seed", type=int, default=constants.SEED)
-    p_diag.add_argument("--out-dir", type=str, default=_DIAGNOSE_DIR)
-    p_diag.set_defaults(func=cmd_diagnose)
+    # Checkpoint family name, family:step or .pt path, or a list of them ([a,b]) sharing one model cache.
+    ckpt: Any = MISSING
+    mode: str = "real"
+    # [mode=real] Named region (eval/configs/regions.py).
+    region: str = "western_europe"
+    grid_size: int = 24
+    # [mode=synthetic] Ground-truth kernel; random when null.
+    kernel: str | None = None
+    # [mode=real] Daily snapshots.
+    n_days: int = constants.N_DAYS
+    n_context: int = constants.N_CONTEXT
+    # [mode=synthetic] GP draws averaged per config.
+    n_draws: int = constants.N_SYNTHETIC_DRAWS
+    device: str | None = None
+    seed: int = constants.SEED
+    out_dir: str = _DIAGNOSE_DIR
 
-    p_sweep = sub.add_parser("sweep", help="Batch scalar+curve metrics over a named config profile.")
-    p_sweep.add_argument("--mode", choices=["real", "synthetic"], default="real")
-    p_sweep.add_argument(
-        "--profile",
-        type=str,
-        default="low_context_7config",
-        help="Named config list — see eval/configs/regions.py:SWEEP_PROFILES "
-        "(--mode real) / eval/configs/constants.py:SYNTHETIC_SWEEP_PROFILES (--mode synthetic).",
-    )
-    p_sweep.add_argument(
-        "--checkpoints",
-        type=str,
-        default="all",
-        help="'all' (default, auto-discovers every eval/configs/checkpoints.py family), or a "
-        "comma-separated list of family names / 'family:step' / raw .pt paths.",
-    )
-    p_sweep.add_argument("--n-context", type=int, default=constants.N_CONTEXT)
-    p_sweep.add_argument("--n-days", type=int, default=constants.N_DAYS, help="[--mode real]")
-    p_sweep.add_argument("--n-draws", type=int, default=constants.N_SYNTHETIC_DRAWS, help="[--mode synthetic]")
-    p_sweep.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
-    p_sweep.add_argument("--seed", type=int, default=constants.SEED)
-    p_sweep.add_argument("--out", type=str, default=None, help="Default: eval/results/sweep_<mode>_<profile>.json")
-    p_sweep.add_argument(
-        "--gp-kernels",
-        type=str,
-        nargs="+",
-        default=constants.GP_BASELINE_KERNELS,
-        choices=constants.GP_BASELINE_KERNELS,
-        help="[--mode real] Classical-GP-MLE kernels to fit as a real-ERA5 nll_total "
-        "baseline (eval/spatial/sweep_core.py::_fit_gp_baseline_nll).",
-    )
-    p_sweep.add_argument("--gp-n-steps-mle", type=int, default=constants.GP_N_STEPS_MLE)
-    p_sweep.add_argument("--gp-lr-mle", type=float, default=constants.GP_LR_MLE)
-    p_sweep.add_argument("--gp-n-restarts-mle", type=int, default=constants.GP_N_RESTARTS_MLE)
-    p_sweep.add_argument(
-        "--no-gp-baseline", action="store_true", help="[--mode real] Skip the classical-GP-MLE baseline nll_total fit."
-    )
-    p_sweep.set_defaults(func=cmd_sweep)
 
-    p_base = sub.add_parser("baseline", help="Direct (non-learned) theoretical-law curve fits against ground truth.")
-    p_base.add_argument("--mode", choices=["real", "synthetic"], default="real")
-    p_base.add_argument("--profile", type=str, default="low_context_7config")
-    p_base.add_argument(
-        "--laws", type=str, nargs="+", default=constants.CURVE_FIT_LAWS, choices=list(constants.CURVE_FIT_LAWS)
-    )
-    p_base.add_argument("--n-days", type=int, default=constants.N_DAYS, help="[--mode real]")
-    p_base.add_argument(
-        "--ckpt",
-        type=str,
-        default=None,
-        help="[--mode synthetic] Checkpoint to source data_gen.py kernel-prior cfg from "
-        "(no model forward pass) — default: the last registered family.",
-    )
-    p_base.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
-    p_base.add_argument("--seed", type=int, default=constants.SEED)
-    p_base.add_argument("--out", type=str, default=None, help="Default: eval/results/baseline_<mode>.json")
-    p_base.set_defaults(func=cmd_baseline)
+@dataclass
+class SweepSpec:
+    """Scalar and curve metrics for every (checkpoint, config) in a profile."""
 
-    p_report = sub.add_parser("report", help="Build bar-chart + curve-overlay figures from eval/results/*.json.")
-    p_report.add_argument("--out-dir", type=str, default=None, help="Default: eval/reports/figures/")
-    p_report.add_argument("--real-results", type=str, default=None)
-    p_report.add_argument("--synthetic-results", type=str, default=None)
-    p_report.add_argument("--baseline-real", type=str, default=None)
-    p_report.add_argument("--baseline-synthetic", type=str, default=None)
-    p_report.set_defaults(func=cmd_report)
+    mode: str = "real"
+    # regions.SWEEP_PROFILES (mode=real) or constants.SYNTHETIC_SWEEP_PROFILES (mode=synthetic).
+    profile: str = "low_context_7config"
+    # "all" (every eval/configs/checkpoints.py family), or one or a list ([a,b]) of names / family:step / .pt paths.
+    checkpoints: Any = "all"
+    n_context: int = constants.N_CONTEXT
+    n_days: int = constants.N_DAYS
+    n_draws: int = constants.N_SYNTHETIC_DRAWS
+    device: str | None = None
+    seed: int = constants.SEED
+    # Default: eval/results/sweep_<mode>_<profile>.json.
+    out: str | None = None
+    # [mode=real] Fit the classical GP-MLE nll_total baseline with these kernels.
+    gp_baseline: bool = True
+    gp_kernels: list[str] = field(default_factory=lambda: list(constants.GP_BASELINE_KERNELS))
+    gp_n_steps_mle: int = constants.GP_N_STEPS_MLE
+    gp_lr_mle: float = constants.GP_LR_MLE
+    gp_n_restarts_mle: int = constants.GP_N_RESTARTS_MLE
 
-    p_all = sub.add_parser("all", help="sweep -> baseline -> report, real+synthetic, zero required flags.")
-    p_all.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
-    p_all.add_argument(
-        "--checkpoints",
-        type=str,
-        default=None,
-        help="'all' (default, every registered family) or a comma-separated list of "
-        "family names / 'family:step' / raw .pt paths, same as `sweep --checkpoints`.",
-    )
-    p_all.add_argument(
-        "--no-gp-baseline",
-        action="store_true",
-        help="Skip the real-ERA5 classical-GP-MLE baseline nll_total fit (same as `sweep --no-gp-baseline`).",
-    )
-    p_all.set_defaults(func=cmd_all)
 
-    return parser
+@dataclass
+class LawBaselineSpec:
+    """Theoretical-law curve fits to the ground truth, no learned model."""
+
+    mode: str = "real"
+    profile: str = "low_context_7config"
+    laws: list[str] = field(default_factory=lambda: list(constants.CURVE_FIT_LAWS))
+    n_days: int = constants.N_DAYS
+    # [mode=synthetic] Checkpoint whose saved config supplies the kernel prior; default: the last family.
+    ckpt: str | None = None
+    device: str | None = None
+    seed: int = constants.SEED
+    # Default: eval/results/baseline_<mode>.json.
+    out: str | None = None
+
+
+@dataclass
+class ReportSpec:
+    """Figures from eval/results/*.json; each null path falls back to the default file name."""
+
+    # Default: eval/reports/figures/.
+    out_dir: str | None = None
+    real_results: str | None = None
+    synthetic_results: str | None = None
+    baseline_real: str | None = None
+    baseline_synthetic: str | None = None
+
+
+@dataclass
+class AllSpec:
+    """sweep, baseline and report, real and synthetic, at the default profile."""
+
+    device: str | None = None
+    # "all" when null, else what sweep's checkpoints takes.
+    checkpoints: Any = None
+    # Fit the real-ERA5 classical GP-MLE nll_total baseline.
+    gp_baseline: bool = True
+
+
+@dataclass
+class SpatialSpec:
+    """One subcommand, chosen with command=<name>; its settings are command.<key>."""
+
+    command: Any = MISSING
+
+
+_COMMANDS: dict[str, tuple[type, Callable[[Any], None]]] = {
+    "diagnose": (DiagnoseSpec, cmd_diagnose),
+    "sweep": (SweepSpec, cmd_sweep),
+    "baseline": (LawBaselineSpec, cmd_baseline),
+    "report": (ReportSpec, cmd_report),
+    "all": (AllSpec, cmd_all),
+}
+for _name, (_schema, _) in _COMMANDS.items():
+    ConfigStore.instance().store(group="command", name=_name, node=_schema)
+
+
+def _checkpoint_tokens(value: Any) -> list[str]:
+    """A checkpoint setting (one token, a comma-separated string, or a list) as a list of tokens."""
+    items = value.split(",") if isinstance(value, str) else [str(v) for v in value]
+    return [t.strip() for t in items if t.strip()]
+
+
+def validate_spatial_spec(spec: SpatialSpec) -> None:
+    """Raise ValueError for a setting outside its allowed values."""
+    cmd = spec.command
+    device = getattr(cmd, "device", None)
+    check_choice("command.device", device, ("cpu", "cuda"))
+    if isinstance(cmd, (DiagnoseSpec, SweepSpec, LawBaselineSpec)):
+        check_choice("command.mode", cmd.mode, ("real", "synthetic"))
+    if isinstance(cmd, DiagnoseSpec):
+        check_choice("command.region", cmd.region, regions.REGIONS)
+        check_choice("command.kernel", cmd.kernel, constants.SYNTHETIC_SWEEP_KERNELS)
+    if isinstance(cmd, SweepSpec):
+        check_choices("command.gp_kernels", cmd.gp_kernels, constants.GP_BASELINE_KERNELS)
+    if isinstance(cmd, LawBaselineSpec):
+        check_choices("command.laws", cmd.laws, constants.CURVE_FIT_LAWS)
+
+
+def run(spec: SpatialSpec) -> None:
+    for schema, cmd in _COMMANDS.values():
+        if isinstance(spec.command, schema):
+            cmd(spec.command)
+            return
+    raise TypeError(f"unknown command config {type(spec.command).__name__}")
+
+
+# Every retired argparse flag maps to the same name under command.
+_FLAG_ALIASES = {f.name: f"command.{f.name}" for schema, _ in _COMMANDS.values() for f in fields(schema)} | {
+    "no_gp_baseline": "command.gp_baseline=false"
+}
+
+_hydra_main = hydra_entry("spatial_correlation_eval", SpatialSpec, run, _FLAG_ALIASES, validate=validate_spatial_spec)
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    args.func(args)
+    if len(sys.argv) > 1 and sys.argv[1] in _COMMANDS:
+        raise SystemExit(
+            f"spatial_correlation_eval: subcommands are now an override: command={sys.argv[1]} "
+            "(its settings are command.<key>=<value>)"
+        )
+    _hydra_main()
 
 
 if __name__ == "__main__":

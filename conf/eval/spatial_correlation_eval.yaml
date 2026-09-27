@@ -1,0 +1,7 @@
+# Keys and defaults: the dataclasses in eval/runners/spatial_correlation_eval.py.
+# Pick a subcommand with command=<diagnose|sweep|baseline|report|all>.
+defaults:
+  - spatial_correlation_eval_schema
+  - command: all
+  - _runner
+  - _self_
