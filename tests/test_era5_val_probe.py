@@ -94,6 +94,7 @@ def test_weighted_corr_nan_with_too_few_valid_points() -> None:
     assert np.isnan(weighted_corr(a, b, w))
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_build_era5_probe_shapes_and_finite(tabicl_fake: FakeTabICL) -> None:
     probe = build_era5_probe(
         _TINY_REGION,
@@ -124,6 +125,7 @@ def test_build_era5_probe_shapes_and_finite(tabicl_fake: FakeTabICL) -> None:
     assert np.isfinite(probe["rho_emp"][0])
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_build_era5_probe_deterministic(tabicl_fake: FakeTabICL) -> None:
     """build_era5_probe gives the same probe for the same seed."""
     p1 = build_era5_probe(
@@ -153,6 +155,7 @@ def test_build_era5_probe_deterministic(tabicl_fake: FakeTabICL) -> None:
     np.testing.assert_array_equal(p1["x_train_norm"], p2["x_train_norm"])
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_build_era5_probe_none_marginal_uses_naive_standardization() -> None:
     probe = build_era5_probe(
         _TINY_REGION,
@@ -191,6 +194,7 @@ def _tiny_era5_cfg(seed: int = 555) -> DictConfig:
     )
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_build_era5_val_batches_shapes(tabicl_fake: FakeTabICL) -> None:
     batches = _build_era5_val_batches(_tiny_era5_cfg(), tabicl_fake, "cpu")
     assert set(batches.keys()) == {_TINY_REGION}
@@ -219,6 +223,7 @@ def test_build_era5_val_batches_shapes(tabicl_fake: FakeTabICL) -> None:
     assert torch.isfinite(probe["nll_test_log_pdf"]).all()
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_build_era5_val_batches_none_marginal_skips_nll() -> None:
     """Without a marginal the probe has no nll_test_* keys."""
     batches = _build_era5_val_batches(_tiny_era5_cfg(), None, "cpu")
@@ -228,6 +233,7 @@ def test_build_era5_val_batches_none_marginal_skips_nll() -> None:
     assert "nll_test_idx" not in probe
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_build_era5_val_batches_gp_baseline(tabicl_fake: FakeTabICL) -> None:
     """era5_gp_baseline=True adds a GP-MLE baseline NLL per kernel to each probe (tiny settings)."""
     cfg = _tiny_era5_cfg()
@@ -248,6 +254,7 @@ def test_build_era5_val_batches_gp_baseline(tabicl_fake: FakeTabICL) -> None:
     assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_build_era5_val_batches_gp_baseline_disabled_by_default_cfg(tabicl_fake: FakeTabICL) -> None:
     """era5_gp_baseline defaults to True when the key is absent."""
     cfg = OmegaConf.create(
@@ -280,6 +287,7 @@ def test_build_era5_val_batches_skips_unregistered_region(tabicl_fake: FakeTabIC
     assert _build_era5_val_batches(cfg, tabicl_fake, "cpu") == {}
 
 
+@pytest.mark.external_data  # fetches ERA5 from ARCO on a cache miss
 def test_era5_fit_scoring_with_tiny_model(small_model_cfg: DictConfig, tabicl_fake: FakeTabICL) -> None:
     torch.manual_seed(0)
     model = build_copula_transformer(small_model_cfg)
