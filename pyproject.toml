@@ -64,7 +64,7 @@ conf = ["*.yaml", "data/*.yaml", "model/*.yaml", "experiment/*.yaml", "eval/*.ya
 
 [tool.setuptools.packages.find]
 where = [".", "src", "tabicl_upstream/src"]
-include = ["copula_inter*", "conf*", "eval*", "inference*", "debug*", "experiments*", "tabicl*"]
+include = ["copula_inter*", "conf*", "eval*", "inference*", "debug*", "tabicl*"]
 namespaces = false
 
 [tool.pytest.ini_options]
@@ -87,10 +87,10 @@ extend-exclude = ["tabicl_upstream", "*_upstream", ".claude/worktrees", ".codex"
 select = ["E9", "F", "I", "TC004"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["copula_inter", "eval", "inference", "conf", "debug", "experiments", "scripts", "tabicl"]
+known-first-party = ["copula_inter", "eval", "inference", "conf", "debug", "scripts", "tabicl"]
 
 [tool.mypy]
-files = ["src/copula_inter", "eval", "inference", "conf", "debug", "experiments", "scripts", "tests"]
+files = ["src/copula_inter", "eval", "inference", "conf", "debug", "scripts", "tests"]
 mypy_path = ["src", ".", "tabicl_upstream/src"]
 python_version = "3.12"
 explicit_package_bases = true
@@ -105,5 +105,5 @@ exclude = ["tabicl_upstream/", "_upstream/"]
 
 [[tool.mypy.overrides]]
 # Vendored upstream code: analysed for the types our code uses, never reported.
-module = ["tabicl.*", "pfns4bo.*"]
+module = ["tabicl.*"]
 ignore_errors = true

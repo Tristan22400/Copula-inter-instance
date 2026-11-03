@@ -3,26 +3,20 @@
 Features must be standardized first with normalize_features (jointly over
 train and test). Targets are z-scored internally before reaching TabICL.
 
-Marginal backends, both returning (quantile_grid (n_query, Q), probs):
-    get_marginal_quantiles: TabICL (999-level grid, or icdf at given probs).
-    get_marginal_quantiles_pfn4bo: PFN4BO bar distribution (x mapped to
-        [0, 1] with the Gaussian CDF, y Yeo-Johnson transformed).
+get_marginal_quantiles returns TabICL's (quantile_grid (n_query, Q), probs):
+the 999-level grid, or the icdf at given probs.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 from scipy.stats import norm
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
-_PFNS4BO_ROOT = os.path.join(_REPO_ROOT, "pfns4bo_upstream")
 
 from copula_inter.model import CopulaTabICL, build_copula_transformer, low_rank_correlation
 from copula_inter.pit import load_tabicl, normalize_targets, run_pit
@@ -37,8 +31,6 @@ __all__ = [
     "loo_pit",
     "load_copula_model",
     "get_test_correlation",
-    "load_pfn4bo",
-    "get_marginal_quantiles_pfn4bo",
     "sample_trajectories",
 ]
 
@@ -245,135 +237,6 @@ def get_test_correlation(
     R = 0.5 * (R + R.T)
     np.fill_diagonal(R, 1.0)
     return R
-
-
-def _patch_pfns4bo_torch_compat() -> None:
-    """Re-export typing.Optional from torch.nn.modules.transformer, which pfns4bo imports from there."""
-    import typing
-
-    import torch.nn.modules.transformer as _t
-
-    if not hasattr(_t, "Optional"):
-        setattr(_t, "Optional", typing.Optional)
-
-
-def load_pfn4bo(model_name: str = "hebo_plus_model", device: str = "cpu") -> torch.nn.Module:
-    """Load a pretrained PFN4BO model from pfns4bo_upstream by attribute name (downloads on first use)."""
-    _patch_pfns4bo_torch_compat()
-    import pfns4bo
-
-    model_path = getattr(pfns4bo, model_name)
-    model = torch.load(model_path, map_location=device, weights_only=False)
-    model.to(device)
-    model.eval()
-    return model
-
-
-def _vectorized_bar_icdf(criterion: Any, logits: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-    """BarDistribution.icdf at many probability levels at once.
-
-    Args:
-        criterion: BarDistribution (uses .borders and .num_bars).
-        logits: (..., num_bars).
-        probs: (Q,).
-
-    Returns:
-        (..., Q) quantiles.
-    """
-    p = torch.softmax(logits, dim=-1)  # (..., B)
-    cumprobs = torch.cumsum(p, dim=-1)  # (..., B)
-    prefix_shape = cumprobs.shape[:-1]
-
-    probs_b = probs.view(*([1] * len(prefix_shape)), -1).expand(*prefix_shape, -1).contiguous()
-    idx = torch.searchsorted(cumprobs.contiguous(), probs_b).clamp(0, criterion.num_bars - 1)
-
-    zeros = torch.zeros(*prefix_shape, 1, device=logits.device, dtype=logits.dtype)
-    cumprobs_padded = torch.cat([zeros, cumprobs], dim=-1)
-    left_cum = cumprobs_padded.gather(-1, idx)
-    rest_prob = probs_b - left_cum
-
-    left_border = criterion.borders[idx]
-    right_border = criterion.borders[idx + 1]
-    bucket_p = p.gather(-1, idx).clamp(min=1e-12)
-
-    return left_border + (right_border - left_border) * rest_prob / bucket_p
-
-
-def _yeo_johnson_valid_domain(lam: float) -> tuple[float, float]:
-    """Interval of transformed values that the inverse Yeo-Johnson transform at lam accepts."""
-    t_min = -1.0 / (lam - 2.0) if lam > 2.0 else -np.inf
-    t_max = -1.0 / lam if lam < 0.0 else np.inf
-    return t_min, t_max
-
-
-@torch.no_grad()
-def get_marginal_quantiles_pfn4bo(
-    pfn4bo_model: torch.nn.Module,
-    X_context: np.ndarray,
-    y_context: np.ndarray,
-    X_query: np.ndarray,
-    probs: Optional[np.ndarray] = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """PFN4BO's predictive quantiles at X_query.
-
-    x is mapped to [0, 1]^d with the Gaussian CDF; y is Yeo-Johnson transformed
-    (fit on y_context) and the quantiles are transformed back, clipped to the
-    invertible domain and to a multiple of the context range.
-
-    Args:
-        pfn4bo_model: loaded PFN4BO model.
-        X_context: (n_ctx, d).
-        y_context: (n_ctx,).
-        X_query: (n_q, d).
-        probs: optional (Q,) levels (default: the 999-level grid).
-
-    Returns:
-        quantile_grid (n_q, Q) in original y units and the probs used.
-    """
-    from sklearn.preprocessing import PowerTransformer
-
-    if probs is None:
-        probs = np.linspace(0.0, 1.0, 999 + 2)[1:-1]
-    probs = np.asarray(probs)
-
-    device = next(pfn4bo_model.parameters()).device
-
-    y_ctx = np.asarray(y_context, dtype=np.float64).reshape(-1, 1)
-    pt = PowerTransformer(method="yeo-johnson", standardize=False)
-    y_ctx_transformed = pt.fit_transform(y_ctx).reshape(-1)
-
-    X_ctx = np.asarray(X_context, dtype=np.float64)
-    X_qry = np.asarray(X_query, dtype=np.float64)
-    x_ctx_t = torch.special.ndtr(torch.as_tensor(X_ctx, dtype=torch.float32))
-    x_qry_t = torch.special.ndtr(torch.as_tensor(X_qry, dtype=torch.float32))
-
-    n_ctx = x_ctx_t.shape[0]
-    x_full = torch.cat([x_ctx_t, x_qry_t], dim=0).to(device).unsqueeze(1)  # (T, 1, d_x)
-    y_full = torch.as_tensor(y_ctx_transformed, dtype=torch.float32, device=device).unsqueeze(1)  # (P, 1)
-
-    # The output covers only the query positions: (n_q, 1, num_bars).
-    logits = pfn4bo_model((None, x_full, y_full), single_eval_pos=n_ctx)  # (n_q, 1, num_bars)
-    logits_query = logits[:, 0, :]  # (n_q, num_bars)
-
-    criterion = pfn4bo_model.criterion
-    probs_t = torch.as_tensor(probs, dtype=logits_query.dtype, device=device)
-    quantile_grid_transformed = _vectorized_bar_icdf(criterion, logits_query, probs_t)  # (n_q, Q)
-
-    # Clip to the inverse transform's domain (outside it sklearn returns NaN).
-    t_min, t_max = _yeo_johnson_valid_domain(float(pt.lambdas_[0]))
-    margin = 1e-6
-    flat = quantile_grid_transformed.cpu().numpy().reshape(-1, 1).astype(np.float64)
-    flat = np.clip(flat, t_min + margin, t_max - margin)
-
-    n_q = quantile_grid_transformed.shape[0]
-    quantile_grid = pt.inverse_transform(flat).reshape(n_q, -1)
-
-    # Clip to a multiple of the context range.
-    y_ctx_min, y_ctx_max = float(y_ctx.min()), float(y_ctx.max())
-    y_range = max(y_ctx_max - y_ctx_min, 1e-6)
-    quantile_grid = np.clip(quantile_grid, y_ctx_min - 10 * y_range, y_ctx_max + 10 * y_range)
-
-    return quantile_grid, probs
 
 
 def sample_trajectories(
