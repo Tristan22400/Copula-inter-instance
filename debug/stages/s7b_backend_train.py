@@ -23,7 +23,7 @@ from debug.config import DebugConfig, add_common_args, build_config
 from debug.stages.s5_kfold import _pit_at_k
 
 if TYPE_CHECKING:
-    from copula_inter.pit import TabICLLike
+    from copula_inter.marginal.pit import TabICLLike
 
 DEFAULT_PROBS_N = 99  # coarser than TabICL's 999 -- TabPFN's per-fold .fit()+.predict() dominates wall-clock
 
@@ -31,9 +31,9 @@ DEFAULT_PROBS_N = 99  # coarser than TabICL's 999 -- TabPFN's per-fold .fit()+.p
 def _generic_pit_episode(
     backend: str, regressor: Any, ep: dict, k_folds: int, probs_n: int, seed: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-episode PIT through a non-TabICL backend (marginal_backends loo_pit/quantiles and joint_nll.compute_pit)."""
-    from eval.metrics.joint_nll import compute_pit
-    from eval.spatial.marginal_backends import loo_pit, quantiles
+    """Per-episode PIT through a non-TabICL backend (marginal.backends loo_pit/quantiles and joint_nll.compute_pit)."""
+    from copula_inter.marginal.backends import loo_pit, quantiles
+    from copula_inter.marginal.kfold import compute_pit
 
     x_train = ep["x_norm_train"].numpy()
     x_test = ep["x_norm_test"].numpy()
@@ -46,7 +46,7 @@ def _generic_pit_episode(
     z_train = loo_pit(backend, regressor, x_train, y_train_s, probs, k_folds=k_folds, seed=seed)
     q_test = quantiles(backend, regressor, x_train, y_train_s, x_test, probs, seed=seed)
     z_test, log_pdf = compute_pit(q_test, probs, y_test_s)
-    log_pdf = log_pdf - np.log(y_std)  # Jacobian back to raw-y nats, same convention as data_gen.py
+    log_pdf = log_pdf - np.log(y_std)  # Jacobian back to raw-y nats, same convention as gp_episodes.py
     return torch.from_numpy(z_train).float(), torch.from_numpy(z_test).float(), torch.from_numpy(log_pdf).float()
 
 
@@ -60,7 +60,7 @@ def _build_batch_for_backend(
     k_folds: int = 5,
     probs_n: int = DEFAULT_PROBS_N,
 ) -> dict:
-    from copula_inter.dataset import collate_fn
+    from copula_inter.data.dataset import collate_fn
 
     episodes = common.generate_episodes(dcfg, n, tabicl_model=None, seed_offset=seed_offset)
     if backend == "tabicl":
@@ -87,8 +87,8 @@ def _train_one_backend(
     k_folds: int,
     probs_n: int,
 ) -> list[dict[str, float]]:
-    from copula_inter.loss import y_space_nll
-    from copula_inter.model import build_copula_transformer, build_sigma
+    from copula_inter.copula.loss import y_space_nll
+    from copula_inter.copula.model import build_copula_transformer, build_sigma
 
     torch.manual_seed(dcfg.seed)  # same init across backends for a fair comparison
     model = build_copula_transformer(dcfg.cfg).to(dcfg.device)
@@ -98,7 +98,7 @@ def _train_one_backend(
     tabicl_model = common.load_frozen_tabicl(dcfg) if backend == "tabicl" else None
     regressor = None
     if backend != "tabicl":
-        from eval.spatial.marginal_backends import make_regressor
+        from copula_inter.marginal.backends import make_regressor
 
         # One regressor reused across folds, episodes and steps.
         regressor = make_regressor(backend, device=dcfg.device)

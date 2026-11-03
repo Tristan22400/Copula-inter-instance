@@ -11,9 +11,17 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from copula_inter.loss import gp_oracle_y_nll
-from copula_inter.pit import resolve_pit_ckpt
-from eval.baselines.classical import fit_and_eval_gpytorch
+from copula_inter.baselines.gp_mle import fit_gp_baseline_nll
+from copula_inter.era5.fetch import fetch as fetch_era5
+from copula_inter.era5.io import haversine_distance_km, load_era5_data
+from copula_inter.era5.regions import REGIONS
+from copula_inter.era5.spatial_stats import (
+    bin_correlation_by_distance,
+    empirical_spatial_correlation,
+    pair_counts_by_distance,
+)
+from copula_inter.marginal.pit import normalize_features, resolve_pit_ckpt
+from copula_inter.marginal.tabicl_regressor import make_tabicl_regressor, tabicl_quantiles
 from eval.configs.constants import (
     GP_BASELINE_KERNELS,
     GP_LR_MLE,
@@ -29,31 +37,22 @@ from eval.configs.constants import (
     PIT_K_FOLDS,
     SEED,
 )
-from eval.configs.regions import REGIONS
-from eval.data.era5_io import haversine_distance_km, load_era5_data
-from eval.data.fetch_era5 import fetch as fetch_era5
 from eval.metrics.joint_nll import compute_joint_nll
 from eval.spatial.diagnostics import (
-    bin_correlation_by_distance,
     build_synthetic_grid_task,
-    compute_context_z_train,
-    empirical_spatial_correlation,
     extract_model_context_correlation,
     extract_model_dummy_context_correlation,
     fit_theoretical_law,
     load_marginal_tabicl,
-    pair_counts_by_distance,
     pool_yspace_samples_and_correlate,
     sample_copula_residual_fields,
 )
-from eval.tabicl_utils import make_tabicl_regressor, tabicl_quantiles
-from inference.copula_inference import load_copula_model, normalize_features
+from inference.copula_inference import load_copula_model
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from copula_inter.model import CopulaTabICL
-    from copula_inter.pit import TabICLLike
+    from copula_inter.copula.model import CopulaTabICL
     from tabicl import TabICLRegressor
     from tabicl._model.tabicl import TabICL
 
@@ -61,7 +60,6 @@ __all__ = [
     "get_model",
     "run_real_config",
     "run_synthetic_config",
-    "build_era5_probe",
     "weighted_corr",
     "weighted_rmse_bias",
     "weighted_r2",
@@ -69,8 +67,6 @@ __all__ = [
 
 _MODEL_CACHE: dict = {}
 
-# GP baseline NLL cache (fits do not depend on the checkpoint).
-_GP_BASELINE_CACHE: dict = {}
 # Sklearn TabICLRegressor for one-shot quantile grids at held-out points.
 _TABICL_REGRESSOR_CACHE: dict = {}
 
@@ -136,68 +132,6 @@ def weighted_r2(pred: np.ndarray, target: np.ndarray, n: np.ndarray) -> float:
     weighted_ss_res = float(np.sum((resid / sigma) ** 2))
     weighted_ss_tot = float(np.sum(((target - t_bar) / sigma) ** 2))
     return 1.0 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot > 0 else float("nan")
-
-
-def _fit_gp_baseline_nll(
-    cache_key: tuple,
-    x_train_norm: np.ndarray,
-    context_values: np.ndarray,
-    x_test_norm: np.ndarray,
-    y_test: np.ndarray,
-    kernel_names: list,
-    n_steps: int,
-    lr: float,
-    n_restarts: int,
-    device: str,
-) -> dict:
-    """Classical GP-MLE baseline Y-space NLL (total, marginal, copula) per kernel on the held-out points.
-
-    Fitted on standardized context values (posterior mode) and rescaled to
-    Kelvin before scoring with gp_oracle_y_nll; cached per cache_key.
-    """
-    key = cache_key + (tuple(kernel_names), n_steps, lr, n_restarts)
-    if key in _GP_BASELINE_CACHE:
-        return _GP_BASELINE_CACHE[key]
-
-    X_train = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
-    X_test = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device)
-    y_test_t = torch.as_tensor(y_test, dtype=torch.float32, device=device)
-
-    mu_y = float(context_values.mean())
-    sigma_y = max(float(context_values.std(ddof=1)), 1e-6) if len(context_values) > 1 else 1.0
-    y_train_std = torch.as_tensor((context_values - mu_y) / sigma_y, dtype=torch.float32, device=device)
-
-    n = X_test.shape[0]
-    mask = torch.ones(1, n, dtype=torch.bool, device=device)
-
-    out = {}
-    for kname in kernel_names:
-        try:
-            fit = fit_and_eval_gpytorch(
-                X_train,
-                y_train_std,
-                X_test,
-                kname,
-                n_steps=n_steps,
-                lr=lr,
-                oracle_mode="posterior",
-                n_restarts=n_restarts,
-            )
-            mean_real = fit["mean"] * sigma_y + mu_y
-            Sigma_real = fit["Sigma"] * (sigma_y**2)
-            parts = gp_oracle_y_nll(
-                Sigma_real.unsqueeze(0),
-                mean_real.unsqueeze(0),
-                y_test_t.unsqueeze(0),
-                mask,
-            )
-            out[kname] = {k: float(v) for k, v in parts.items()}
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [gp_baseline:{kname}] failed: {exc}")
-            out[kname] = {"total": float("nan"), "marginal": float("nan"), "copula": float("nan")}
-
-    _GP_BASELINE_CACHE[key] = out
-    return out
 
 
 def run_real_config(
@@ -299,7 +233,7 @@ def run_real_config(
             print(f"  [day {d}] joint-NLL scoring failed: {exc}")
 
         if compute_gp_baseline:
-            gp_day = _fit_gp_baseline_nll(
+            gp_day = fit_gp_baseline_nll(
                 cache_key=(config_name, d, seed, n_context_eff),
                 x_train_norm=x_train_norm,
                 context_values=context_values,
@@ -384,7 +318,7 @@ def run_synthetic_config(
     device: "str | None" = None,
     n_bins: int = N_BINS,
 ) -> dict:
-    """Synthetic config: sample a known covariance from one data_gen kernel and score how well the checkpoint recovers it."""
+    """Synthetic config: sample a known covariance from one gp_episodes kernel and score how well the checkpoint recovers it."""
     model, cfg, resolved_device, marginal = get_model(ckpt, device)
 
     task = build_synthetic_grid_task(cfg, kernel_name, grid_size, n_context, n_bins, seed, min_context=1)
@@ -441,106 +375,3 @@ def run_synthetic_config(
         f"model_r2={model_r2:.3f} bias={bias:+.3f}"
     )
     return result
-
-
-def build_era5_probe(
-    region_name: str,
-    grid_size: int,
-    n_days_fetch: int,
-    n_days_probe: int,
-    n_context: int,
-    n_bins: int,
-    tabicl_marginal: TabICLLike | None,
-    device: str,
-    seed: int = SEED,
-) -> dict:
-    """Frozen real-ERA5 probe for region_name, computed once for the training loop.
-
-    Holds the empirical correlogram (rho_emp), a fixed context sample with its
-    PIT z_train (when tabicl_marginal is given), and held-out points
-    (nll_test_idx) with their values on the same days, for validate()'s
-    Y-space NLL.
-    """
-    from inference.copula_inference import normalize_features
-
-    rng = np.random.default_rng(seed)
-    lat_bounds, lon_bounds = REGIONS[region_name]
-    nc_path = fetch_era5(region_name, lat_bounds, lon_bounds, grid_size, n_days_fetch)
-    data = load_era5_data(nc_path)
-    lat, lon = data["latitude"], data["longitude"]
-    lon_grid, lat_grid = np.meshgrid(lon, lat)
-    coords = np.column_stack([lon_grid.ravel(), lat_grid.ravel()])
-    D = coords.shape[0]
-
-    static_cols = []
-    for v in (
-        "geopotential_at_surface",
-        "land_sea_mask",
-        "standard_deviation_of_orography",
-        "slope_of_sub_gridscale_orography",
-    ):
-        if v in data:
-            static_cols.append(data[v].ravel())
-    if static_cols:
-        features = np.column_stack([lon_grid.ravel(), lat_grid.ravel()] + static_cols)
-    else:
-        features = coords
-
-    R_emp = empirical_spatial_correlation(data, target="raw")
-    dist = haversine_distance_km(coords)
-    dist_iu = dist[np.triu_indices_from(dist, k=1)]
-    max_dist = np.percentile(dist_iu, MAX_DIST_PERCENTILE)
-    bin_edges = np.linspace(0.0, max_dist, n_bins + 1)
-    dist_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    pair_counts = pair_counts_by_distance(dist, bin_edges).astype(float)
-    rho_emp = bin_correlation_by_distance(R_emp, dist, bin_edges)
-
-    n_time = data["t2m"].shape[0]
-    n_pick = min(n_days_probe, n_time)
-    days = sorted(set(np.linspace(0, n_time - 1, n_pick).round().astype(int).tolist()))
-
-    n_context_eff = max(1, min(n_context, D - 1))
-    context_idx = rng.choice(D, size=n_context_eff, replace=False)
-    context_features = features[context_idx]
-
-    x_train_norm, x_test_norm = normalize_features(context_features, features)
-
-    # Held-out points for the Y-space NLL (same construction as run_real_config).
-    remaining_idx = np.setdiff1d(np.arange(D), context_idx)
-    nll_test_idx = rng.choice(remaining_idx, size=min(N_NLL_TEST, len(remaining_idx)), replace=False)
-    x_nll_test_norm = x_test_norm[nll_test_idx]
-
-    z_train_per_day = []
-    context_values_per_day = []
-    nll_test_values_per_day = []
-    for d in days:
-        day_values = data["t2m"][d].ravel()
-        context_values = day_values[context_idx]
-        z_train = compute_context_z_train(
-            x_train_norm,
-            context_values,
-            tabicl_marginal,
-            device,
-            k_folds=PIT_K_FOLDS,
-        )
-        z_train_per_day.append(z_train)
-        context_values_per_day.append(context_values)
-        nll_test_values_per_day.append(day_values[nll_test_idx])
-
-    return {
-        "region": region_name,
-        "x_train_norm": x_train_norm,  # (P, 2)
-        "x_test_norm": x_test_norm,  # (D, 2)
-        "z_train_per_day": np.stack(z_train_per_day, axis=0),  # (n_days_probe, P)
-        "x_nll_test_norm": x_nll_test_norm,  # (n_nll_test, 2)
-        "nll_test_idx": nll_test_idx,  # (n_nll_test,) indices into x_test_norm/coords
-        "context_values_per_day": np.stack(context_values_per_day, axis=0),  # (n_days_probe, P) raw t2m
-        "nll_test_values_per_day": np.stack(nll_test_values_per_day, axis=0),  # (n_days_probe, n_nll_test) raw t2m
-        "dist": dist,  # (D, D)
-        "bin_edges": bin_edges,
-        "dist_centers": dist_centers,
-        "pair_counts": pair_counts,
-        "rho_emp": rho_emp,
-        "D": int(D),
-        "n_context": int(n_context_eff),
-    }

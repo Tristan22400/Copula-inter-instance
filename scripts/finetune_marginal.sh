@@ -13,7 +13,7 @@
 # Prerequisites:
 #   * the ERA5 mixture corpus (one-time, needs network not GPU -- run on a
 #     frontend). Phase A reads the TRAIN half; the 2023 val half stays held out:
-#         python eval/data/fetch_era5_global.py --start 2013-01 --n-months 120
+#         python -m copula_inter.era5.fetch_global --start 2013-01 --n-months 120
 #     (already present as eval/data/cache/era5_global_train/ + era5_global_val/)
 #   * a baseline measurement to compare against, so the run has a before:
 #         python -m eval.runners.marginal_calibration_eval ckpt=pretrained

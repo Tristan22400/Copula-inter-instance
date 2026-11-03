@@ -1,11 +1,11 @@
-"""Tests for data_gen.corrupt_z_train: off by default, a no-op at prob 0, and corr(z_train, z) ~ sqrt(rho)."""
+"""Tests for gp_episodes.corrupt_z_train: off by default, a no-op at prob 0, and corr(z_train, z) ~ sqrt(rho)."""
 
 from __future__ import annotations
 
 import torch
 from omegaconf import OmegaConf
 
-from copula_inter.data_gen import corrupt_z_train
+from copula_inter.data.gp_episodes import corrupt_z_train
 
 
 def make_z_train(B: int = 200, P: int = 40, seed: int = 0) -> torch.Tensor:

@@ -11,7 +11,7 @@
 #
 # Prerequisite: a local ERA5 corpus (one-time, ~125MB/month; run on a
 # frontend or its own OAR job -- needs network, not GPU):
-#     python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24
+#     python -m copula_inter.era5.fetch_global --start 2022-01 --n-months 24
 #
 # Submit with:
 #     mkdir -p logs

@@ -26,7 +26,7 @@ def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path: str, 
     tabldm_sym = getattr(importlib.import_module(f"tabldm.{module_path}"), symbol)
     assert inspect.getsource(tabicl_sym) == inspect.getsource(tabldm_sym), (
         f"tabldm.{module_path}.{symbol} has diverged from tabicl's. "
-        "src/copula_inter/lora.py::_get_mha_class assumes they are identical -- either "
+        "src/copula_inter/marginal/lora.py::_get_mha_class assumes they are identical -- either "
         "port the difference into LoRAMultiheadAttention or drop TabLDM from "
         "that tuple."
     )
@@ -35,7 +35,7 @@ def test_tabldm_attention_stack_is_source_identical_to_tabicl(module_path: str, 
 def test_get_mha_class_includes_both() -> None:
     from tabldm._model.layers import MultiheadAttention as TabLDMMHA
 
-    from copula_inter.lora import _get_mha_class
+    from copula_inter.marginal.lora import _get_mha_class
     from tabicl._model.layers import MultiheadAttention as TabICLMHA
 
     classes = _get_mha_class()
@@ -49,7 +49,7 @@ def test_apply_lora_installs_adapters_on_a_tabldm_backbone() -> None:
     import numpy as np
     from tabldm import TabLDMRegressor
 
-    from copula_inter.lora import apply_lora
+    from copula_inter.marginal.lora import apply_lora
 
     rng = np.random.default_rng(0)
     X = rng.normal(size=(20, 3)).astype(np.float32)

@@ -1,7 +1,7 @@
 # @package _global_
 # Fine-tune a copula checkpoint on real ARCO-ERA5 data: live ERA5 episodes, a
 # short fresh warmup/cosine schedule and a finetune-scale LR. Needs a local
-# corpus (python eval/data/fetch_era5_global.py --start 2022-01 --n-months 24).
+# corpus (python -m copula_inter.era5.fetch_global --start 2022-01 --n-months 24).
 #
 #   python -m copula_inter.train experiment=finetune_era5 training.resume_ckpt=<ckpt>
 #

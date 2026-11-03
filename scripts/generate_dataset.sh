@@ -15,7 +15,7 @@
 #     oarsub -S "./scripts/generate_dataset.sh data.n_tasks=5000 data.kernel=cosine"
 #
 # GEN_WORKERS: how many generate_pit_dataset.py processes to run concurrently
-# against the single allocated GPU (data.py's src/copula_inter/data_gen.py::generate_gp_batch
+# against the single allocated GPU (data.py's src/copula_inter/data/gp_episodes.py::generate_gp_batch
 # spends much of its time on host-side Python/kernel-construction work between
 # GPU calls, so one process alone leaves the GPU idle a large fraction of the
 # time -- measured 0-45% utilization, <2GB of 24GB VRAM used, from a single

@@ -19,14 +19,19 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from copula_inter.model import CopulaTabICL
-    from copula_inter.pit import TabICLLike
+    from copula_inter.copula.model import CopulaTabICL
+    from copula_inter.marginal.pit import TabICLLike
     from copula_inter.type_aliases import Device
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-from copula_inter.pit import (
+from copula_inter.checkpoint_registry import (
+    resolve_checkpoint,
+    resolve_marginal_checkpoint,
+)
+from copula_inter.era5.io import safe_cholesky
+from copula_inter.marginal.pit import (
     DEFAULT_K_FOLDS,
     configure_tabicl_inference_amp,
     load_tabicl,
@@ -35,18 +40,13 @@ from copula_inter.pit import (
 )
 from copula_inter.rng import resolve_device, seed_everything
 from eval.baselines.autoregressive import autoregressive_log_pdf
-from eval.configs.checkpoints import (
-    resolve_checkpoint,
-    resolve_marginal_checkpoint,
-)
-from eval.data.era5_io import safe_cholesky
 from eval.runners.episode_scoring import _eval_icl_episode, _marginal_pit
 from eval.runners.eval_inputs import _live_generate_alternating, _load_full_config
 from eval.runners.hydra_cli import hydra_entry
 from eval.viz.sample_comparison_plots import plot_sample_comparison
 from inference.copula_inference import load_copula_model
 
-# A CHECKPOINT_FAMILIES name (eval/configs/checkpoints.py), or a path; resolved in run().
+# A CHECKPOINT_FAMILIES name (src/copula_inter/checkpoint_registry.py), or a path; resolved in run().
 _DEFAULT_CKPT = "copula-nano-finetune-marginal-float32"
 
 

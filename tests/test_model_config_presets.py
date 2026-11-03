@@ -15,8 +15,8 @@ import pytest
 import torch
 from conftest import make_batch
 
-from copula_inter.model import build_copula_transformer, build_sigma, low_rank_correlation
-from copula_inter.pit import resolve_pit_ckpt as _resolve_pit_ckpt
+from copula_inter.copula.model import build_copula_transformer, build_sigma, low_rank_correlation
+from copula_inter.marginal.pit import resolve_pit_ckpt as _resolve_pit_ckpt
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig

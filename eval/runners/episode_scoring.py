@@ -32,12 +32,12 @@ from eval.runners.eval_tables import (
 )
 
 if TYPE_CHECKING:
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
     from eval.runners.eval_args import EvalSpec
 
-from copula_inter.loss import y_space_nll
-from copula_inter.model import low_rank_correlation
-from copula_inter.pit import (
+from copula_inter.copula.loss import y_space_nll
+from copula_inter.copula.model import low_rank_correlation
+from copula_inter.marginal.pit import (
     TabICLLike,
     gp_analytical_posterior,
     normalize_targets,

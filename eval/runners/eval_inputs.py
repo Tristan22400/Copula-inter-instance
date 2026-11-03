@@ -18,17 +18,21 @@ from eval.baselines.prefit import (
 )
 
 if TYPE_CHECKING:
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
     from copula_inter.type_aliases import Device
     from eval.runners.eval_args import EvalSpec
 
 from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS
+from copula_inter.checkpoint_registry import (
+    DEFAULT_MARGINAL_FAMILY,
+    resolve_marginal_checkpoint,
+)
 from copula_inter.config_path import compose_config
 from copula_inter.config_path import config_dir as project_config_dir
-from copula_inter.data_gen import generate_gp_batch
-from copula_inter.dataset import CopulaDataset
-from copula_inter.gp_kernels import _parse_composite
-from copula_inter.pit import (
+from copula_inter.data.dataset import CopulaDataset
+from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.data.gp_kernels import _parse_composite
+from copula_inter.marginal.pit import (
     DEFAULT_K_FOLDS,
     TabICLLike,
     configure_tabicl_inference_amp,
@@ -36,10 +40,6 @@ from copula_inter.pit import (
 )
 from eval.baselines.classical import (
     episode_cache_key,
-)
-from eval.configs.checkpoints import (
-    DEFAULT_MARGINAL_FAMILY,
-    resolve_marginal_checkpoint,
 )
 from eval.data.era5_episodes import (
     build_era5_eval_episodes,
@@ -238,7 +238,7 @@ def _load_models(
         OmegaConf.select(cfg, "tabicl.pit_k_folds", default=DEFAULT_K_FOLDS)
     )
     if marginal_backend is not None:
-        from eval.spatial.marginal_backends import make_regressor
+        from copula_inter.marginal.backends import make_regressor
 
         tabicl_pit_k_folds = configured_k_folds
         print(

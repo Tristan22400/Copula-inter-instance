@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING
 import torch
 from omegaconf import OmegaConf
 
-from copula_inter.data_gen import _generate_gp_batch_raw
-from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
-from copula_inter.kernel_sampling import _tabicl_mix_prob_for_kernel
+from copula_inter.data.gp_episodes import _generate_gp_batch_raw
+from copula_inter.data.gp_kernels import _COMPOSABLE_KERNELS
+from copula_inter.data.kernel_sampling import _tabicl_mix_prob_for_kernel
 from tests.test_pit_batched import RowIndependentFakeTabICL
 
 if TYPE_CHECKING:
@@ -197,7 +197,7 @@ def test_corruption_skipped_on_mix_hit_but_not_on_miss_or_legacy(small_cfg: Dict
 
 
 def _import_train() -> types.ModuleType:
-    from copula_inter import adaptive_sampling as train
+    from copula_inter.training import adaptive_sampling as train
 
     return train
 

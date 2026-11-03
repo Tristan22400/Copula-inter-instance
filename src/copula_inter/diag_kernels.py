@@ -20,8 +20,8 @@ from typing import List
 
 import torch
 
-from copula_inter.data_gen import generate_gp_task
-from copula_inter.gp_kernels import ALL_KERNELS
+from copula_inter.data.gp_episodes import generate_gp_task
+from copula_inter.data.gp_kernels import ALL_KERNELS
 
 # Minimal config (mirrors gp_tasks.yaml defaults).
 

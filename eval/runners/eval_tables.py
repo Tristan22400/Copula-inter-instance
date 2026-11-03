@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from copula_inter.gp_kernels import _parse_composite
+from copula_inter.data.gp_kernels import _parse_composite
 from eval.results import (
     NAN_PARTS as _NAN_PARTS,
 )

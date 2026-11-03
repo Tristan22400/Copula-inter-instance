@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from copula_inter.loss import _safe_cholesky, copula_nll, oracle_copula_nll
+from copula_inter.copula.loss import _safe_cholesky, copula_nll, oracle_copula_nll
 
 
 def make_w_and_z(

@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 import torch
 
-from copula_inter.era5_live_dataset import _pit_group
+from copula_inter.data.era5_live_dataset import _pit_group
 from eval.baselines.autoregressive import (
     _orderings,
     ar_parts_from_log_pdf,

@@ -17,12 +17,12 @@ import pytest
 import torch
 from conftest import make_batch
 
-from copula_inter.model import build_copula_transformer, low_rank_correlation
+from copula_inter.copula.model import build_copula_transformer, low_rank_correlation
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
 
 
 @pytest.fixture(scope="module")

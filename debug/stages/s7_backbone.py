@@ -24,27 +24,21 @@ import torch
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
 from copula_inter.backend_registry import MARGINAL_BACKENDS
+from copula_inter.checkpoint_registry import resolve_checkpoint
+from copula_inter.era5.spatial_stats import bin_correlation_by_distance
+from copula_inter.marginal.backends import loo_pit, make_regressor, quantiles
+from copula_inter.marginal.pit import normalize_features
 from eval.configs import constants
-from eval.configs.checkpoints import resolve_checkpoint
 from eval.metrics.joint_nll import compute_joint_nll
-from eval.spatial.diagnostics import (
-    _exact_gp_loo_z_train,
-    _forward_correlation,
-    bin_correlation_by_distance,
-    build_synthetic_grid_task,
-)
-from eval.spatial.marginal_backends import loo_pit, make_regressor, quantiles
+from eval.spatial.diagnostics import _exact_gp_loo_z_train, _forward_correlation, build_synthetic_grid_task
 from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias
-from inference.copula_inference import (
-    load_copula_model,
-    normalize_features,
-)
+from inference.copula_inference import load_copula_model
 
 _RESULTS_DIR = os.path.join(_REPO_ROOT, "eval", "results")
 _FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")

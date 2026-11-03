@@ -14,7 +14,7 @@ import torch
 from pytest import FixtureRequest
 
 if TYPE_CHECKING:
-    from copula_inter.marginal_backbones import MarginalBackbone
+    from copula_inter.marginal.finetune_adapters import MarginalBackbone
 
 BACKENDS = ["tabldm", "exaone"]
 
@@ -25,7 +25,7 @@ def backbone(request: FixtureRequest) -> MarginalBackbone:
         {"tabldm": "tabldm", "exaone": "exaonetabular"}[request.param],
         reason=f"{request.param} not installed",
     )
-    from copula_inter.marginal_backbones import load_backbone
+    from copula_inter.marginal.finetune_adapters import load_backbone
 
     return load_backbone(request.param, device="cpu")
 
@@ -40,7 +40,7 @@ def _episode(
 
 def test_tier0_patterns_match_real_parameters(backbone: MarginalBackbone) -> None:
     """Every tier-0 pattern matches at least one parameter."""
-    from copula_inter.marginal_backbones import assert_patterns_match
+    from copula_inter.marginal.finetune_adapters import assert_patterns_match
 
     counts = assert_patterns_match(backbone.module, backbone.tier0_patterns)
     assert all(v > 0 for v in counts.values())
@@ -121,7 +121,7 @@ def test_quantile_forward_is_monotone_in_probs(backbone: MarginalBackbone) -> No
 
 
 def test_checkpoint_round_trips(backbone: MarginalBackbone, tmp_path: Path) -> None:
-    from copula_inter.marginal_backbones import load_backbone
+    from copula_inter.marginal.finetune_adapters import load_backbone
 
     path = str(tmp_path / f"{backbone.name}_phase_a.pt")
     backbone.save(path, step=123)
@@ -140,7 +140,7 @@ def test_checkpoint_round_trips(backbone: MarginalBackbone, tmp_path: Path) -> N
 
 def test_checkpoint_rejects_a_different_architecture(backbone: MarginalBackbone, tmp_path: Path) -> None:
     """Loading a checkpoint into a different architecture raises."""
-    from copula_inter.marginal_backbones import load_backbone
+    from copula_inter.marginal.finetune_adapters import load_backbone
 
     path = str(tmp_path / "mislabelled.pt")
     backbone.save(path, step=1)
@@ -164,7 +164,7 @@ def test_checkpoint_rejects_a_different_architecture(backbone: MarginalBackbone,
 )
 def test_resolve_tier_gates_the_ladder(name: str, tier: int, ok: bool) -> None:
     """Tier >= 1 raises where attention is not swappable."""
-    from copula_inter.marginal_backbones import resolve_tier
+    from copula_inter.marginal.finetune_adapters import resolve_tier
 
     if ok:
         assert resolve_tier(name, tier) == tier

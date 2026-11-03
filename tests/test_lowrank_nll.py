@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from copula_inter.loss import y_space_nll
-from copula_inter.model import low_rank_correlation, low_rank_correlation_factor
+from copula_inter.copula.loss import y_space_nll
+from copula_inter.copula.model import low_rank_correlation, low_rank_correlation_factor
 
 PARAMS = ["covnorm", "cossim", "tanhnorm", "sparse_covnorm"]
 

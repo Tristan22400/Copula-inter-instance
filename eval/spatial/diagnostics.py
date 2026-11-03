@@ -10,81 +10,34 @@ from scipy.optimize import curve_fit
 from scipy.special import gamma as gamma_fn
 from scipy.special import kv as bessel_k
 
-from eval.data.era5_io import safe_cholesky
+from copula_inter.era5.io import safe_cholesky
+from copula_inter.era5.spatial_stats import pair_counts_by_distance
+from copula_inter.marginal.pit import compute_context_z_train
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from copula_inter.model import CopulaTabICL
-    from copula_inter.pit import TabICLLike
+    from copula_inter.copula.model import CopulaTabICL
+    from copula_inter.marginal.pit import TabICLLike
     from copula_inter.type_aliases import Device, HasDataConfig
     from tabicl._model.tabicl import TabICL
 
 __all__ = [
-    "compute_persistence_residuals",
-    "compute_raw_temperature_observations",
-    "get_ground_truth_observations",
-    "empirical_spatial_correlation",
-    "morans_i",
     "predict_copula_residual_field",
     "sample_copula_residual_fields",
     "pool_yspace_samples_and_correlate",
     "load_marginal_tabicl",
     "extract_model_dummy_context_correlation",
-    "compute_context_z_train",
     "extract_model_context_correlation",
     "extract_model_true_z_train_correlation",
     "sample_simple_kernel_covariance",
     "build_synthetic_grid_task",
-    "bin_correlation_by_distance",
-    "pair_counts_by_distance",
     "seriate_by_correlation",
     "THEORY_LAWS",
     "THEORY_STYLE",
     "LITERATURE_L",
     "fit_theoretical_law",
 ]
-
-
-def compute_persistence_residuals(field_all: np.ndarray) -> np.ndarray:
-    """24 h persistence residuals E_t = Z_t - Z_{t-1} for daily snapshots field_all (n, H, W); returns (n - 1, H*W)."""
-    n = field_all.shape[0]
-    if n < 2:
-        raise ValueError(f"Need >= 2 time snapshots to form 24h persistence residuals, got {n}.")
-    flat = field_all.reshape(n, -1)
-    return flat[1:] - flat[:-1]
-
-
-def compute_raw_temperature_observations(field_all: np.ndarray) -> np.ndarray:
-    """Daily temperatures (n, H*W), no differencing."""
-    n = field_all.shape[0]
-    return field_all.reshape(n, -1)
-
-
-def get_ground_truth_observations(field_all: np.ndarray, target: str) -> np.ndarray:
-    """Observation matrix (n, H*W) for target "raw" or "persistence"."""
-    if target == "raw":
-        return compute_raw_temperature_observations(field_all)
-    if target == "residual":
-        return compute_persistence_residuals(field_all)
-    raise ValueError(f"Unknown target '{target}', choose from 'raw' or 'residual'.")
-
-
-def empirical_spatial_correlation(data: dict, target: str = "raw") -> np.ndarray:
-    """Pearson correlation matrix (D, D) of the target observations."""
-    observations = get_ground_truth_observations(data["t2m"], target)
-    return np.corrcoef(observations.T)
-
-
-def morans_i(field: np.ndarray) -> float:
-    """Global Moran's I with rook adjacency on an (H, W) grid (+1 smooth, 0 random, negative checkerboard)."""
-    x = field - field.mean()
-    cross_h = x[:, :-1] * x[:, 1:]
-    cross_v = x[:-1, :] * x[1:, :]
-    n_edges = cross_h.size + cross_v.size
-    numerator = cross_h.sum() + cross_v.sum()
-    denominator = (x**2).sum()
-    return float(field.size * numerator / (n_edges * denominator))
 
 
 def sample_copula_residual_fields(
@@ -115,8 +68,7 @@ def sample_copula_residual_fields(
 
     import torch
 
-    from copula_inter.pit import normalize_targets
-    from inference.copula_inference import normalize_features
+    from copula_inter.marginal.pit import normalize_features, normalize_targets
 
     x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
 
@@ -162,7 +114,7 @@ def predict_copula_residual_field(
 
 def load_marginal_tabicl(cfg: DictConfig, device: str) -> TabICL | None:
     """Load the frozen TabICL marginal named by pit.resolve_pit_ckpt(cfg), or None (with a warning) if none or loading fails."""
-    from copula_inter.pit import load_tabicl, resolve_pit_ckpt
+    from copula_inter.marginal.pit import load_tabicl, resolve_pit_ckpt
 
     source = resolve_pit_ckpt(cfg)
     if source is None:
@@ -189,7 +141,7 @@ def _forward_correlation(
     """Model forward (x_train, z_train, x_test) -> dense Sigma."""
     import torch
 
-    from copula_inter.model import low_rank_correlation
+    from copula_inter.copula.model import low_rank_correlation
 
     x_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device).unsqueeze(0)
     x_test_t = torch.as_tensor(x_test_norm, dtype=torch.float32, device=device).unsqueeze(0)
@@ -214,39 +166,6 @@ def extract_model_dummy_context_correlation(model: CopulaTabICL, device: Device,
     return _forward_correlation(model, device, x_train_norm, z_train, x_test_norm)
 
 
-def compute_context_z_train(
-    x_train_norm: np.ndarray,
-    context_values: np.ndarray,
-    tabicl_marginal: TabICLLike | None,
-    device: Device,
-    k_folds: int = 10,
-) -> np.ndarray:
-    """K-fold PIT z_train of a real context sample under tabicl_marginal (standardized values when it is None)."""
-    if tabicl_marginal is None:
-        y_mean = context_values.mean()
-        y_std = max(context_values.std(), 1e-8)
-        return (context_values - y_mean) / y_std
-
-    import torch
-
-    from copula_inter.pit import normalize_targets, run_pit
-
-    X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
-    context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)
-    context_values_scaled_t, _, _, _ = normalize_targets(context_values_t)
-    Y_train_t = context_values_scaled_t.unsqueeze(-1)  # (P, 1)
-    pit_out = run_pit(
-        tabicl_marginal,
-        X_train_t,
-        Y_train_t,
-        X_train_t[:1],
-        Y_train_t[:1],
-        k_folds=k_folds,
-        Y_train_raw=context_values_t.unsqueeze(-1),
-    )
-    return pit_out["z_train"].squeeze(-1).cpu().numpy()  # (P,)
-
-
 def extract_model_context_correlation(
     model: CopulaTabICL,
     device: Device,
@@ -257,7 +176,7 @@ def extract_model_context_correlation(
     k_folds: int = 10,
 ) -> np.ndarray:
     """Model correlation at coords_test given a real context sample (z_train from compute_context_z_train)."""
-    from inference.copula_inference import normalize_features
+    from copula_inter.marginal.pit import normalize_features
 
     x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
     z_train = compute_context_z_train(x_train_norm, context_values, tabicl_marginal, device, k_folds)
@@ -284,7 +203,7 @@ def extract_model_true_z_train_correlation(
     coords_test: np.ndarray,
 ) -> np.ndarray:
     """Model correlation conditioned on the exact GP LOO z_train (synthetic mode only)."""
-    from inference.copula_inference import normalize_features
+    from copula_inter.marginal.pit import normalize_features
 
     x_train_norm, x_test_norm = normalize_features(context_coords, coords_test)
     z_train_true = _exact_gp_loo_z_train(K_ff_context, context_values)
@@ -297,7 +216,7 @@ def sample_simple_kernel_covariance(
     kernel_name: "str | None" = None,
     seed: "int | None" = None,
 ) -> "tuple[np.ndarray, str]":
-    """Covariance of one elementary data_gen kernel (random or given) at standardized coordinates, with hyperparameters from the training priors.
+    """Covariance of one elementary gp_episodes kernel (random or given) at standardized coordinates, with hyperparameters from the training priors.
 
     Returns (Sigma, kernel_name).
     """
@@ -306,7 +225,7 @@ def sample_simple_kernel_covariance(
     import torch
     from omegaconf import OmegaConf
 
-    from copula_inter.gp_kernels import _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS, _build_kernel_component
+    from copula_inter.data.gp_kernels import _COMPOSABLE_KERNELS, _SCALAR_ONLY_KERNELS, _build_kernel_component
 
     if seed is not None:
         _random.seed(seed)
@@ -353,7 +272,7 @@ def build_synthetic_grid_task(
     """
     import torch
 
-    from copula_inter.data_gen import sigma_to_correlation
+    from copula_inter.data.gp_episodes import sigma_to_correlation
 
     rng = np.random.default_rng(seed)
     axis = np.linspace(-1000.0, 1000.0, grid_size)
@@ -387,38 +306,6 @@ def build_synthetic_grid_task(
         "n_context_eff": n_context_eff,
         "L": safe_cholesky(true_cov),
     }
-
-
-def _bin_indices(d: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
-    """Bin index per distance, -1 outside [bin_edges[0], bin_edges[-1]]."""
-    n_bins = len(bin_edges) - 1
-    bin_idx = np.digitize(d, bin_edges) - 1
-    bin_idx[(d < bin_edges[0]) | (d > bin_edges[-1])] = -1
-    bin_idx[bin_idx == n_bins] = n_bins - 1  # d == bin_edges[-1] exactly
-    return bin_idx
-
-
-def bin_correlation_by_distance(R: np.ndarray, dist: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
-    """Mean upper-triangle correlation per distance bin."""
-    iu = np.triu_indices_from(R, k=1)
-    corr, d = R[iu], dist[iu]
-    n_bins = len(bin_edges) - 1
-    bin_idx = _bin_indices(d, bin_edges)
-    means = np.full(n_bins, np.nan)
-    for b in range(n_bins):
-        mask = bin_idx == b
-        if mask.any():
-            means[b] = corr[mask].mean()
-    return means
-
-
-def pair_counts_by_distance(dist: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
-    """Number of upper-triangle pairs per distance bin."""
-    iu_dist = dist[np.triu_indices_from(dist, k=1)]
-    n_bins = len(bin_edges) - 1
-    bin_idx = _bin_indices(iu_dist, bin_edges)
-    counts = np.bincount(bin_idx[bin_idx >= 0], minlength=n_bins)
-    return counts[:n_bins]
 
 
 def seriate_by_correlation(R: np.ndarray) -> np.ndarray:

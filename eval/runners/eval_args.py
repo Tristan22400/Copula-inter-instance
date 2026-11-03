@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from omegaconf import MISSING
 
 from copula_inter.backend_registry import EVAL_Z_TRAIN_SOURCES, get_backend
-from eval.configs.checkpoints import resolve_checkpoint
+from copula_inter.checkpoint_registry import resolve_checkpoint
 from eval.configs.constants import (
     AR_CONDITIONINGS,
     AR_ORDERS,
@@ -31,7 +31,7 @@ class Era5Spec:
 
     # Evaluate on real ERA5 instead of synthetic GP draws; excludes dataset_dir and live_generate.
     enabled: bool = False
-    # Cached monthly NetCDF corpus (eval/data/fetch_era5_global.py); defaults to the held-out val years.
+    # Cached monthly NetCDF corpus (src/copula_inter/era5/fetch_global.py); defaults to the held-out val years.
     corpus_dir: str = ERA5_DEFAULT_CORPUS_DIR
     # Points per side of each region (D = grid_size^2).
     grid_size: int = 24

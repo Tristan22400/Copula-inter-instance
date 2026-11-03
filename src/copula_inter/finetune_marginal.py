@@ -28,15 +28,12 @@ from omegaconf import DictConfig, OmegaConf
 
 from copula_inter.artifacts import atomic_torch_save
 from copula_inter.config_path import config_dict, config_dir
-from copula_inter.lora import (
-    merged_base_state_dict_any,
-)
-from copula_inter.marginal_backbones import (
+from copula_inter.marginal.finetune_adapters import (
     MarginalBackbone,
     kfold_quantiles_grad,
     load_backbone,
 )
-from copula_inter.marginal_data import (
+from copula_inter.marginal.finetune_data import (
     ERA5EpisodeSampler,
     _build_gp_val_batches,
     _generate_phase_a_gp_batch,
@@ -44,7 +41,10 @@ from copula_inter.marginal_data import (
     build_era5_marginal_val_batches,
     stack_episodes,
 )
-from copula_inter.marginal_objective import (
+from copula_inter.marginal.lora import (
+    merged_base_state_dict_any,
+)
+from copula_inter.marginal.objective import (
     AnchorPenalty,
     MarginalLossWeights,
     analytic_marginal_targets,
@@ -53,16 +53,16 @@ from copula_inter.marginal_objective import (
     marginal_objective,
     oracle_marginal_nll,
 )
-from copula_inter.marginal_tiers import apply_tier
-from copula_inter.pit import (
+from copula_inter.marginal.pit import (
     DEFAULT_K_FOLDS,
     _kernel_fn_from_task,
     load_tabicl,
     normalize_targets,
     run_pit_batched_grad,
 )
+from copula_inter.marginal.tiers import apply_tier
 from copula_inter.rng import resolve_device, seed_everything
-from copula_inter.training_core import cosine_lr_lambda
+from copula_inter.training.step import cosine_lr_lambda
 
 if TYPE_CHECKING:
     from tabicl._model.tabicl import TabICL
@@ -92,7 +92,7 @@ def phase_a_batch_loss(
     training folds against their K-1-fold context (default all K). Episodes
     whose kernel cannot be rebuilt get no distillation target but still
     contribute sample-score terms. tabicl is a TabICL module or a
-    MarginalBackbone (marginal_backbones.kfold_quantiles_grad, same fold geometry).
+    MarginalBackbone (finetune_adapters.kfold_quantiles_grad, same fold geometry).
     """
 
     def _mark(name: str, started: float) -> float:
@@ -507,7 +507,7 @@ def _check_mixture(mix_frac: float, weights: MarginalLossWeights, era5_weights: 
 def _make_era5_sampler(cfg: DictConfig, mix_frac: float) -> ERA5EpisodeSampler | None:
     if mix_frac <= 0:
         return None
-    from eval.data.era5_global_corpus import GlobalERA5Corpus
+    from copula_inter.era5.corpus import GlobalERA5Corpus
 
     corpus = GlobalERA5Corpus(
         str(cfg.marginal.era5.corpus_dir),

@@ -14,11 +14,11 @@ import pytest
 from omegaconf import OmegaConf
 
 from copula_inter.backend_registry import Z_TRAIN_SOURCES, validate_z_train_source
-from copula_inter.live_dataset import (
+from copula_inter.data.live_dataset import (
     build_fixed_live_val_batches,
     build_live_train_loader,
 )
-from copula_inter.train_setup import _reserve_gpu_headroom_for_live_tabicl
+from copula_inter.training.setup import _reserve_gpu_headroom_for_live_tabicl
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -92,7 +92,7 @@ def test_raw_y_override_z_train_matches_scaled_y_train(small_cfg: DictConfig) ->
     import torch
     from omegaconf import OmegaConf as OC
 
-    from copula_inter.data_gen import generate_gp_batch
+    from copula_inter.data.gp_episodes import generate_gp_batch
 
     cfg = OC.create(OC.to_container(small_cfg, resolve=True))
     cfg.data.P_min = cfg.data.P_max = 8
@@ -110,7 +110,7 @@ def test_raw_y_override_leaves_z_test_at_analytic_oracle(small_cfg: DictConfig) 
     import torch
     from omegaconf import OmegaConf as OC
 
-    from copula_inter.data_gen import generate_gp_batch
+    from copula_inter.data.gp_episodes import generate_gp_batch
 
     cfg = OC.create(OC.to_container(small_cfg, resolve=True))
     cfg.data.P_min = cfg.data.P_max = 8

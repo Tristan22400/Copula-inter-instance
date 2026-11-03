@@ -22,15 +22,15 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def regressor() -> Any:
-    from eval.spatial.marginal_backends import make_regressor
+    from copula_inter.marginal.backends import make_regressor
 
     return make_regressor("exaone", device="cuda")
 
 
 def test_exaone_batched_matches_per_episode(regressor: Any) -> None:
-    from eval.metrics.joint_nll import compute_pit
-    from eval.spatial.exaone_batched import exaone_run_pit_batched
-    from eval.spatial.marginal_backends import loo_pit, quantiles
+    from copula_inter.marginal.backends import loo_pit, quantiles
+    from copula_inter.marginal.exaone_batched import exaone_run_pit_batched
+    from copula_inter.marginal.kfold import compute_pit
 
     rng = np.random.default_rng(0)
     B, P, N, p_x, K, probs_n = 3, 14, 6, 3, 4, 33

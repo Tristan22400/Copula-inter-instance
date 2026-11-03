@@ -10,7 +10,7 @@
 #
 #   python -m copula_inter.train tabicl.pit_ckpt=<that path>
 #
-# This trains NOTHING jointly with the copula. src/copula_inter/model.py is untouched and
+# This trains NOTHING jointly with the copula. src/copula_inter/copula/model.py is untouched and
 # conf/config.yaml is untouched; the two phases meet only at that file path.
 # ---------------------------------------------------------------------------
 
@@ -35,7 +35,7 @@ wandb:
 
 marginal:
   # Which tabular foundation model's marginal to fine-tune. See
-  # src/copula_inter/marginal_backbones.py for what each supports and why they differ:
+  # src/copula_inter/marginal/finetune_adapters.py for what each supports and why they differ:
   # tabicl/tabldm reach tiers 0-3, exaone tier 0 only (its attention holds raw
   # Parameters, so there is nothing for LoRA to swap), tabpfn is wired but
   # licence-gated and never executed here.
@@ -89,7 +89,7 @@ marginal:
   tier: 3
 
   # LoRA on EVERY 2-D weight matrix in the backbone, at one shared rank, for
-  # every architecture (src/copula_inter/lora.py::apply_lora_all_layers). This is the
+  # every architecture (src/copula_inter/marginal/lora.py::apply_lora_all_layers). This is the
   # default because the stage ladder above adapts only swappable attention
   # MODULES, which covers ~91% of TabLDM's parameters but ~2% of EXAONE's --
   # its attention and feed-forward weights are raw nn.Parameters inside
@@ -98,7 +98,7 @@ marginal:
   # library happened to use nn.Module children.
   #
   # Set false to fall back to the stage/tier ladder (a capacity ablation; only
-  # tabicl and tabldm can climb it -- see marginal_backbones.MAX_TIER).
+  # tabicl and tabldm can climb it -- see finetune_adapters.MAX_TIER).
   lora_all_layers: true
 
   # The shared low rank. One value, applied identically to every adapted
@@ -189,7 +189,7 @@ training:
   steps: 200000
   # Full-backbone attention LoRA is more expressive than Tier 0 and needs a
   # conservative step size. AdamW rather than Muon deliberately —
-  # src/copula_inter/muon.py:64-65 warns it "may not work well for finetuning pretrained
+  # src/copula_inter/training/muon.py:64-65 warns it "may not work well for finetuning pretrained
   # models", and Phase A is exactly that.
   lr: 1.0e-5
   warmup_steps: 200
@@ -216,7 +216,7 @@ training:
 validation:
   # The copula run's own ERA5 validation geometry, reused verbatim
   # (conf/config.yaml's baselines.era5_* block) so Phase-A numbers land on the
-  # same points. These probes come from eval/data/fetch_era5.py, whose
+  # same points. These probes come from src/copula_inter/era5/fetch.py, whose
   # start_date defaults to 2023-01-01 — the held-out year, disjoint from the
   # 2013-2022 training months above.
   era5_regions:

@@ -38,8 +38,8 @@ def fit_rank_ceiling(
 
     Returns (loss per episode (B,), Sigma_hat).
     """
-    from copula_inter.loss import _safe_cholesky
-    from copula_inter.model import low_rank_correlation
+    from copula_inter.copula.loss import _safe_cholesky
+    from copula_inter.copula.model import low_rank_correlation
 
     B, N, _ = R_post.shape
     R_post = R_post.to(device)

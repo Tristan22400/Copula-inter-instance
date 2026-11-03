@@ -32,34 +32,30 @@ from omegaconf import MISSING
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-from eval.configs import (
-    constants,
-    regions,
-)
-from eval.configs.checkpoints import CHECKPOINT_FAMILIES, all_family_names, resolve_checkpoint
-from eval.data.era5_io import haversine_distance_km, load_era5_data, safe_cholesky
-from eval.data.fetch_era5 import fetch as fetch_era5
-from eval.runners.hydra_cli import check_choice, check_choices, hydra_entry
-from eval.spatial.diagnostics import (
+from copula_inter.checkpoint_registry import CHECKPOINT_FAMILIES, all_family_names, resolve_checkpoint
+from copula_inter.era5 import regions
+from copula_inter.era5.fetch import fetch as fetch_era5
+from copula_inter.era5.io import haversine_distance_km, load_era5_data, safe_cholesky
+from copula_inter.era5.spatial_stats import (
     bin_correlation_by_distance,
     empirical_spatial_correlation,
+    pair_counts_by_distance,
+)
+from copula_inter.viz.field_grids import plot_residual_grid, plot_synthetic_residual_grid
+from eval.configs import constants
+from eval.runners.hydra_cli import check_choice, check_choices, hydra_entry
+from eval.spatial.diagnostics import (
     extract_model_context_correlation,
     extract_model_dummy_context_correlation,
     extract_model_true_z_train_correlation,
     fit_theoretical_law,
-    pair_counts_by_distance,
     pool_yspace_samples_and_correlate,
     predict_copula_residual_field,
     sample_copula_residual_fields,
     sample_simple_kernel_covariance,
 )
 from eval.spatial.sweep_core import get_model, run_real_config, run_synthetic_config
-from eval.viz.correlation_plots import (
-    plot_correlation_heatmaps,
-    plot_correlation_vs_distance,
-    plot_residual_grid,
-    plot_synthetic_residual_grid,
-)
+from eval.viz.correlation_plots import plot_correlation_heatmaps, plot_correlation_vs_distance
 
 _RESULTS_DIR = os.path.join(_REPO_ROOT, "eval", "results")
 _FIGURES_DIR = os.path.join(_REPO_ROOT, "eval", "reports", "figures")
@@ -185,7 +181,7 @@ def _diagnose_synthetic(
     seed: int,
     out_dir: str,
 ) -> None:
-    from copula_inter.data_gen import sigma_to_correlation
+    from copula_inter.data.gp_episodes import sigma_to_correlation
 
     ckpt = resolve_checkpoint(ckpt_token)
     model, cfg, resolved_device, marginal = get_model(ckpt, device)
@@ -444,7 +440,7 @@ def _baseline(
                 print(f"[{config_name}] {law}: r2={fits[law]}")
             out[config_name] = fits
     else:
-        from copula_inter.data_gen import sigma_to_correlation
+        from copula_inter.data.gp_episodes import sigma_to_correlation
 
         ckpt = resolve_checkpoint(ckpt_token or all_family_names()[-1])
         _, cfg, _, _ = get_model(ckpt, device)
@@ -702,7 +698,7 @@ class DiagnoseSpec:
     # Checkpoint family name, family:step or .pt path, or a list of them ([a,b]) sharing one model cache.
     ckpt: Any = MISSING
     mode: str = "real"
-    # [mode=real] Named region (eval/configs/regions.py).
+    # [mode=real] Named region (src/copula_inter/era5/regions.py).
     region: str = "western_europe"
     grid_size: int = 24
     # [mode=synthetic] Ground-truth kernel; random when null.
@@ -724,7 +720,7 @@ class SweepSpec:
     mode: str = "real"
     # regions.SWEEP_PROFILES (mode=real) or constants.SYNTHETIC_SWEEP_PROFILES (mode=synthetic).
     profile: str = "low_context_7config"
-    # "all" (every eval/configs/checkpoints.py family), or one or a list ([a,b]) of names / family:step / .pt paths.
+    # "all" (every src/copula_inter/checkpoint_registry.py family), or one or a list ([a,b]) of names / family:step / .pt paths.
     checkpoints: Any = "all"
     n_context: int = constants.N_CONTEXT
     n_days: int = constants.N_DAYS

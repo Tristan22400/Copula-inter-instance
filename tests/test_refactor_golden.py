@@ -72,7 +72,7 @@ def test_pre_refactor_state_dict_loads_strictly(golden: dict) -> None:
     """A state_dict written by pre-refactor code loads into today's model with no key/shape drift."""
     from omegaconf import OmegaConf
 
-    from copula_inter.model import build_copula_transformer
+    from copula_inter.copula.model import build_copula_transformer
 
     state = golden["init_state"]
     model = build_copula_transformer(OmegaConf.create(SMALL_MODEL_CFG))

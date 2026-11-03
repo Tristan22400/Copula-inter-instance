@@ -1,4 +1,1 @@
-"""eval/spatial — the core spatial-correlation diagnostic engine: checkpoint
-loading + context-conditioned correlation extraction (diagnostics.py), the
-batch config runner sweep/report tools call (sweep_core.py), and the
-independence-copula calibration metrics (calibration.py)."""
+"""Spatial-correlation diagnostics: model correlation extraction and decay-law fits (diagnostics), the sweep driver (sweep_core), and calibration plots (calibration)."""

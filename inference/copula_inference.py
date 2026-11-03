@@ -18,8 +18,8 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from scipy.stats import norm
 
-from copula_inter.model import CopulaTabICL, build_copula_transformer, low_rank_correlation
-from copula_inter.pit import load_tabicl, normalize_targets, run_pit
+from copula_inter.copula.model import CopulaTabICL, build_copula_transformer, low_rank_correlation
+from copula_inter.marginal.pit import load_tabicl, normalize_features, normalize_targets, run_pit
 
 if TYPE_CHECKING:
     from tabicl._model.tabicl import TabICL
@@ -33,28 +33,6 @@ __all__ = [
     "get_test_correlation",
     "sample_trajectories",
 ]
-
-
-def normalize_features(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Z-score features with the joint train+test mean and std per column (the training convention).
-
-    Args:
-        X_train: (P, d) raw features.
-        X_test: (N, d) raw features.
-
-    Returns:
-        (X_train_norm, X_test_norm).
-    """
-    X_train = np.asarray(X_train, dtype=np.float64)
-    X_test = np.asarray(X_test, dtype=np.float64)
-    X_all = np.concatenate([X_train, X_test], axis=0)
-    mean = X_all.mean(axis=0, keepdims=True)
-    std_raw = X_all.std(axis=0, ddof=1, keepdims=True)
-    is_constant = std_raw < 1e-6
-    std = np.where(is_constant, 1.0, std_raw)
-    norm_tr = np.where(is_constant, 0.0, (X_train - mean) / std)
-    norm_te = np.where(is_constant, 0.0, (X_test - mean) / std)
-    return norm_tr, norm_te
 
 
 def load_tabicl_marginal(ckpt_name: str, device: str) -> TabICL:

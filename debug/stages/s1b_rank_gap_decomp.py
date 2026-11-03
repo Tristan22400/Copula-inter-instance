@@ -63,7 +63,7 @@ def fit_decomposition(
     device: str = "cpu",
 ) -> tuple[torch.Tensor, int]:
     """Fit the inducing-point basis to R_post by the expected copula NLL. X: (B, N, d) test inputs."""
-    from copula_inter.loss import _safe_cholesky
+    from copula_inter.copula.loss import _safe_cholesky
 
     B, N, _ = R_post.shape
     d = X.shape[-1]

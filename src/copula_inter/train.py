@@ -18,15 +18,15 @@ import os
 import traceback
 from typing import TYPE_CHECKING, Any
 
-from copula_inter.adaptive_sampling import (
+from copula_inter.training.adaptive_sampling import (
     _refresh_tabicl_mix_weights,
     _update_adaptive_kernel_weights,
 )
-from copula_inter.checkpointing import save_checkpoint
-from copula_inter.probe_batches import (
+from copula_inter.training.checkpointing import save_checkpoint
+from copula_inter.training.probe_batches import (
     _sigma_stats,
 )
-from copula_inter.train_setup import (
+from copula_inter.training.setup import (
     ModelBundle,
     TrainData,
     ValidationProbes,
@@ -38,10 +38,10 @@ from copula_inter.train_setup import (
     prepare_training_inputs,
     resolve_train_device,
 )
-from copula_inter.validation import validate
+from copula_inter.training.validation import validate
 
 if TYPE_CHECKING:
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
 
 # Batch shapes vary with P and N; expandable segments reduce allocator
 # fragmentation. Must be set before torch initializes CUDA.
@@ -55,15 +55,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-import wandb
 from omegaconf import DictConfig
 
+import wandb
 from copula_inter.config_path import config_dir
-from copula_inter.gp_kernels import _COMPOSABLE_KERNELS
-from copula_inter.pit import (
+from copula_inter.data.gp_kernels import _COMPOSABLE_KERNELS
+from copula_inter.marginal.pit import (
     configure_tabicl_inference_amp,
 )
-from copula_inter.training_core import (
+from copula_inter.training.step import (
     _measure_step_flops,
     _run_train_step,
 )

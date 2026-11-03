@@ -104,7 +104,7 @@ training:
   # era5_live_dataset.py (see era5_live: below for its knobs) -- for
   # finetuning a checkpoint on real spatial data across many geographic
   # regions and grid resolutions instead of synthetic kernels. Requires a
-  # local corpus from `python eval/data/fetch_era5_global.py` first, and a
+  # local corpus from `python -m copula_inter.era5.fetch_global` first, and a
   # resolvable TabICL checkpoint (tabicl.ckpt/tabicl.pit_ckpt) -- there is no
   # oracle-PIT option for real data, so training.aux_mae_weight is forced to
   # 0.0 automatically under this source (no R_star exists to regress
@@ -186,7 +186,7 @@ training:
   # live_tabicl_num_workers/live_tabicl_group_multiplier (above) are SHARED
   # with data.z_train_source=exaone/tabpfn too, not just tabicl/tabicl_split
   # -- both now batch their own forward across the whole group_size call
-  # (eval/spatial/exaone_batched.py / tabpfn_batched.py), the same batched-
+  # (src/copula_inter/marginal/exaone_batched.py / tabpfn_batched.py), the same batched-
   # GPU-worker shape as tabicl (see live_dataset.py::build_live_train_loader's
   # batched_marginal_worker_enabled). The auto-sizing formula's constants are
   # still calibrated against TabICL's own per-worker VRAM specifically (no
@@ -209,7 +209,7 @@ training:
   # measured TabICL mix fractions are not.
   startup_probes: true
   # Adaptive kernel-family sampling for live generation: bias
-  # live_dataset.py's kernel-chain sampling (data_gen._sample_kernel_chain_
+  # live_dataset.py's kernel-chain sampling (gp_episodes._sample_kernel_chain_
   # structure) toward the kernel families the model currently fits worst,
   # instead of sampling _COMPOSABLE_KERNELS uniformly. Only takes effect when
   # live_generation=true AND cfg.data.systematic_composition=true (the active
@@ -269,7 +269,7 @@ training:
   # Weight on the copula BACKBONE's own auxiliary loss, when it has one --
   # currently only model.backbone=tabldm (MoE router z-loss + load-balance,
   # already internally scaled by the checkpoint's own coefficients -- see
-  # src/copula_inter/copula_backbones.py::moe_aux_loss). A no-op (nothing to add) for
+  # src/copula_inter/copula/backbones.py::moe_aux_loss). A no-op (nothing to add) for
   # model.backbone=tabicl. 1.0 is the standard "just add it" MoE-training
   # convention; this is not a term to tune down casually -- dropping it
   # while training a MoE end-to-end risks expert imbalance/collapse.
@@ -282,7 +282,7 @@ training:
 # Model-fit-to-classical-kernel diagnostic, evaluated each validation loop:
 #   val/kernel_fit/<kernel>/{copula_nll,corr_mse,corr_mae,corr_pearson}
 # For each kernel family below, a fixed batch of synthetic episodes is
-# generated once (at startup) via data_gen.generate_gp_batch — the same
+# generated once (at startup) via gp_episodes.generate_gp_batch — the same
 # (x_train, z_train, x_test, R_star, ...) construction as real training data,
 # but with the generative kernel forced to that single family instead of this
 # run's usual composite/systematic mixture. Every validation call then runs
@@ -291,7 +291,7 @@ training:
 baselines:
   enabled: true
   # polynomial added (2026-08-13) alongside adaptive_kernel_sampling above: it
-  # was in data_gen._COMPOSABLE_KERNELS (the live-sampling pool) but had no
+  # was in gp_episodes._COMPOSABLE_KERNELS (the live-sampling pool) but had no
   # probe here, so it had no kernel_fit signal and adaptive_kernel_sampling
   # couldn't see it. periodic is kept for the kernel_fit/periodic/* diagnostic
   # (useful on its own even off the sampling curriculum), even though
@@ -320,7 +320,7 @@ baselines:
   probe_N_max: 1024
 
   # era5_fit/<region>/* validation metrics (see train.py::_build_era5_val_batches):
-  # real ARCO-ERA5 spatial-correlation probes, one per eval/configs/regions.py
+  # real ARCO-ERA5 spatial-correlation probes, one per src/copula_inter/era5/regions.py
   # entry, scored against empirical Pearson correlation (no GP oracle exists for
   # real data, unlike kernel_fit/<family> above). Fetched/PIT'd once before
   # training starts and cached -- only the model forward pass re-runs every
@@ -328,7 +328,7 @@ baselines:
   # adds real forward passes to EVERY validation call, not a one-off sweep.
   era5_enabled: true
   era5_regions: [western_europe, north_atlantic_ocean, sahara_desert, himalaya_tibetan_plateau, amazon_basin]
-  era5_grid_size: 24        # matches eval/configs/regions.py's low_context_7config/grid_resolution convention (grid=24, n_context=30 -> ~5% context fraction)
+  era5_grid_size: 24        # matches src/copula_inter/era5/regions.py's low_context_7config/grid_resolution convention (grid=24, n_context=30 -> ~5% context fraction)
   era5_n_days_fetch: 60     # days fetched/cached per region (eval.configs.constants.N_DAYS)
   era5_n_days_probe: 3      # of those, how many are used as context-conditioning draws per validate() call
   era5_n_context: 30        # in-context sample size (eval.configs.constants.N_CONTEXT)
@@ -364,10 +364,10 @@ baselines:
   era5_viz_gp: true
   era5_viz_gp_kernel: matern32    # any eval/baselines/classical.py kernel name
 
-# training.live_source=era5's data knobs (src/copula_inter/era5_live_dataset.py). Ignored
+# training.live_source=era5's data knobs (src/copula_inter/data/era5_live_dataset.py). Ignored
 # unless training.live_generation=true AND training.live_source=era5.
 era5_live:
-  # Local cache directory populated by `python eval/data/fetch_era5_global.py`
+  # Local cache directory populated by `python -m copula_inter.era5.fetch_global`
   # (full-globe monthly grids) -- every training/val episode is a random
   # in-memory crop of whatever's cached here, no GCS traffic during training.
   corpus_dir: ./eval/data/cache/era5_global
@@ -380,13 +380,13 @@ era5_live:
   val_corpus_dir: null
   # Grid resolution range (points per side of the sampled region's crop, D =
   # grid_size^2 total points) -- drawn per episode, matching the spread
-  # eval/configs/regions.py's grid_resolution sweep profile already probes
+  # src/copula_inter/era5/regions.py's grid_resolution sweep profile already probes
   # (8..28) so finetuning covers the same resolution range validation does.
   grid_size_min: 8
   grid_size_max: 28
   # Region box size (degrees lat/lon half-width doubled), drawn per episode.
   # Box center is sampled area-uniformly over the whole globe (arcsin-of-
-  # uniform latitude, uniform longitude -- see era5_global_corpus.py), so
+  # uniform latitude, uniform longitude -- see era5/corpus.py), so
   # "different geographic space" is a continuous draw, not a fixed region list.
   box_deg_min: 5.0
   box_deg_max: 25.0

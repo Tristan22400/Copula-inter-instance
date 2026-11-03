@@ -10,8 +10,8 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from copula_inter.model import CopulaTabICL
-    from copula_inter.pit import TabICLLike
+    from copula_inter.copula.model import CopulaTabICL
+    from copula_inter.marginal.pit import TabICLLike
     from tabicl._model.tabicl import TabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,17 +24,17 @@ from debug.config import DebugConfig
 
 
 def resolve_ckpt_path(ckpt: Optional[str]) -> Optional[str]:
-    """Resolve a --ckpt token via eval.configs.checkpoints.resolve_checkpoint (None stays None)."""
+    """Resolve a --ckpt token via copula_inter.checkpoint_registry.resolve_checkpoint (None stays None)."""
     if ckpt is None:
         return None
-    from eval.configs.checkpoints import resolve_checkpoint
+    from copula_inter.checkpoint_registry import resolve_checkpoint
 
     return resolve_checkpoint(ckpt)
 
 
 def load_model(dcfg: DebugConfig) -> CopulaTabICL:
     """Build CopulaTabICL from dcfg.cfg and load dcfg.ckpt's weights if set (non-strict on key mismatch)."""
-    from copula_inter.model import build_copula_transformer
+    from copula_inter.copula.model import build_copula_transformer
 
     model = build_copula_transformer(dcfg.cfg).to(dcfg.device)
     ckpt_path = resolve_ckpt_path(dcfg.ckpt)
@@ -54,7 +54,7 @@ _TABICL_CACHE: dict[str, TabICL] = {}
 
 def load_frozen_tabicl(dcfg: DebugConfig) -> TabICL:
     """Frozen TabICL marginal, cached per (ckpt, device)."""
-    from copula_inter.pit import load_tabicl, resolve_pit_ckpt
+    from copula_inter.marginal.pit import load_tabicl, resolve_pit_ckpt
 
     ckpt = resolve_pit_ckpt(dcfg.cfg)
     if ckpt is None:
@@ -78,7 +78,7 @@ def generate_episodes(
     P_override: Optional[int] = None,
 ) -> list[dict]:
     """generate_gp_batch with the debug seed; P_override temporarily sets cfg.data.P_min/P_max."""
-    from copula_inter.data_gen import generate_gp_batch
+    from copula_inter.data.gp_episodes import generate_gp_batch
 
     cfg = dcfg.cfg
     if P_override is not None:
@@ -107,7 +107,7 @@ def generate_paired_episodes(dcfg: DebugConfig, n: int, *, seed_offset: int = 0)
 
 def posterior_oracle(episode: dict) -> dict | None:
     """gp_analytical_posterior(episode), or None for unsupported kernels."""
-    from copula_inter.pit import gp_analytical_posterior
+    from copula_inter.marginal.pit import gp_analytical_posterior
 
     try:
         return gp_analytical_posterior(episode)

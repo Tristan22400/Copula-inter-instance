@@ -11,7 +11,7 @@ import torch
 
 import copula_inter
 from copula_inter.config_path import compose_config, config_dir
-from copula_inter.data_gen import generate_gp_batch
+from copula_inter.data.gp_episodes import generate_gp_batch
 
 _KERNEL = "cosine"
 _N_EPISODES = 256

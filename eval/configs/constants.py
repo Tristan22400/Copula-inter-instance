@@ -1,47 +1,48 @@
-"""Constants and name lists for the spatial-correlation tooling."""
+"""Constants and name lists for the evaluation runners and the spatial-correlation tooling.
+
+Values that library code also needs live with their owner in copula_inter and
+are re-exported here, so each number has a single definition.
+"""
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
+
+from copula_inter.baselines.gp_mle import GP_LR_MLE as GP_LR_MLE
+from copula_inter.era5.io import EARTH_RADIUS_KM as EARTH_RADIUS_KM
+from copula_inter.era5.probe import MAX_DIST_PERCENTILE as MAX_DIST_PERCENTILE
+from copula_inter.era5.probe import N_NLL_TEST as N_NLL_TEST
+from copula_inter.era5.probe import PIT_K_FOLDS as PIT_K_FOLDS
+from copula_inter.paths import ERA5_GLOBAL_VAL_CACHE_DIR
 
 # eval_checkpoint choice lists, kept here so the config schema imports no model code.
 AR_ORDERS = ("random", "natural")
 AR_CONDITIONINGS = ("teacher_forcing", "sample")
 GP_VAL_SELECT_MODES = ("ard", "always", "never")
 # Held-out ERA5 year, disjoint from the training corpus.
-ERA5_DEFAULT_CORPUS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cache", "era5_global_val"
-)
+ERA5_DEFAULT_CORPUS_DIR = str(ERA5_GLOBAL_VAL_CACHE_DIR)
 
 N_CONTEXT = 30  # in-context sample size for --profile sweeps (see regions.SWEEP_PROFILES)
 N_BINS = 15  # distance bins for correlation-vs-distance binning
 SEED = 42
 N_DAYS = 60  # daily ERA5 snapshots fetched per (region, grid_size)
-MAX_DIST_PERCENTILE = 90.0  # cap the binned distance range at this percentile (excludes the
-# corner-only, high-variance tail of a bounded lat/lon rectangle)
-PIT_K_FOLDS = 10  # K-fold leave-one-out PIT folds for real-context z_train estimation
 N_SYNTHETIC_DRAWS = 20  # independent GP draws averaged per synthetic-mode config
-EARTH_RADIUS_KM = 6371.0
 
 # Joint y-space samples per probe day for the real-ERA5 model correlation curve (pooled across days).
 N_YSPACE_MC_SAMPLES = 20
 
 # Held-out points for the real-ERA5 joint-NLL diagnostic.
-N_NLL_TEST = 30  # held-out (never-in-context) points scored per task/day
 NLL_PROBS = np.linspace(0.02, 0.98, 49)  # quantile-grid probability levels for compute_joint_nll
 
 # GP-MLE baseline settings for the real-ERA5 held-out NLL (eval_checkpoint's defaults).
 GP_BASELINE_KERNELS = ["rbf", "matern12", "matern32", "matern52", "rational_quadratic"]
 GP_N_STEPS_MLE = 1000
-GP_LR_MLE = 0.05
 GP_N_RESTARTS_MLE = 5
 
 # Theoretical-law names for the `baseline` curve fits.
 CURVE_FIT_LAWS = ["gaussian", "matern", "rational_quadratic"]
 
-# data_gen kernel families used as synthetic ground truth.
+# gp_episodes kernel families used as synthetic ground truth.
 SYNTHETIC_SWEEP_KERNELS = ["rbf", "matern12", "matern32", "periodic", "rational_quadratic"]
 
 # Synthetic sweep profile: 3 grid sizes (rbf) and 4 kernel families (grid 24).

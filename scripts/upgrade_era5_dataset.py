@@ -17,7 +17,7 @@ import numpy as np
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from eval.data.fetch_era5_static import STATIC_VARS, fetch_static, load_static
+from copula_inter.era5.fetch_static import STATIC_VARS, fetch_static, load_static
 
 
 def upgrade_global_file(path: str, static_dict: dict[str, np.ndarray]) -> bool:

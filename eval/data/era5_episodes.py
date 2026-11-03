@@ -21,13 +21,13 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from copula_inter.pit import TabICLLike
+    from copula_inter.marginal.pit import TabICLLike
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-from copula_inter.pit import normalize_targets
+from copula_inter.era5.corpus import GlobalERA5Corpus
+from copula_inter.marginal.pit import normalize_targets
 from eval.configs.constants import ERA5_DEFAULT_CORPUS_DIR
-from eval.data.era5_global_corpus import GlobalERA5Corpus
 
 __all__ = ["build_era5_eval_episodes", "era5_episode_fingerprint", "DEFAULT_CORPUS_DIR"]
 
@@ -116,7 +116,7 @@ def build_era5_eval_episodes(
     (raw nats) for the first ar_n_episodes episodes. The PIT and the chain run on
     raw y.
     """
-    from copula_inter.era5_live_dataset import _pit_group
+    from copula_inter.data.era5_live_dataset import _pit_group
     from eval.baselines.autoregressive import autoregressive_log_pdf
 
     if tabicl_model is None and marginal_backend is None:

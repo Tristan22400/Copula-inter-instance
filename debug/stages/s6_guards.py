@@ -26,7 +26,7 @@ from debug.config import DebugConfig, add_common_args, build_config
 @contextlib.contextmanager
 def _cholesky_instrumentation() -> Iterator[dict[str, int]]:
     """Context manager counting jitter retries and non-finite slices in loss._safe_cholesky (monkey-patched, restored on exit)."""
-    from copula_inter import loss as loss_mod
+    from copula_inter.copula import loss as loss_mod
 
     counters = {"cholesky_calls": 0, "safe_cholesky_calls": 0, "escalated_calls": 0, "nonfinite_slices": 0}
     orig_cholesky = torch.linalg.cholesky
@@ -56,9 +56,9 @@ def _cholesky_instrumentation() -> Iterator[dict[str, int]]:
 
 
 def run(dcfg: DebugConfig) -> dict:
-    from copula_inter.dataset import collate_fn
-    from copula_inter.loss import y_space_nll
-    from copula_inter.model import low_rank_correlation
+    from copula_inter.copula.loss import y_space_nll
+    from copula_inter.copula.model import low_rank_correlation
+    from copula_inter.data.dataset import collate_fn
 
     model = common.load_model(dcfg)
     episodes = common.generate_episodes(dcfg, dcfg.n_episodes, tabicl_model=None)

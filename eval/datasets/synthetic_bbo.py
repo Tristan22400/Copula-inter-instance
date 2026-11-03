@@ -1,6 +1,6 @@
 """Synthetic d-dimensional GP benchmark with a known prior correlation at the test points.
 
-Kernels are sampled with data_gen's own chain, lengthscale and nugget priors
+Kernels are sampled with gp_episodes's own chain, lengthscale and nugget priors
 from the given cfg; pass the checkpoint's own cfg so the ground truth matches
 its training distribution.
 """
@@ -14,10 +14,10 @@ import torch
 from omegaconf import OmegaConf
 from scipy.stats import qmc
 
-from copula_inter.data_gen import gp_posterior, sigma_to_correlation
-from copula_inter.gp_kernels import _build_likelihood, _kernel_needs_scalar_input
-from copula_inter.kernel_sampling import _build_kernel_chain, _sample_kernel_chain_structure
-from copula_inter.loss import _safe_cholesky
+from copula_inter.copula.loss import _safe_cholesky
+from copula_inter.data.gp_episodes import gp_posterior, sigma_to_correlation
+from copula_inter.data.gp_kernels import _build_likelihood, _kernel_needs_scalar_input
+from copula_inter.data.kernel_sampling import _build_kernel_chain, _sample_kernel_chain_structure
 from copula_inter.rng import seed_everything
 
 if TYPE_CHECKING:
@@ -28,7 +28,7 @@ __all__ = ["load_split"]
 _PERTURB_STD = 0.05
 _N_OPTIMA_SEEDS = 3
 
-# Defaults for data_gen's keys when no checkpoint cfg is given (periodic and cosine excluded).
+# Defaults for gp_episodes's keys when no checkpoint cfg is given (periodic and cosine excluded).
 _DEFAULT_CFG = OmegaConf.create(
     {
         "data": {

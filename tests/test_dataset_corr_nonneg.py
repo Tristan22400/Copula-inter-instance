@@ -2,7 +2,7 @@
 
 Episodes are generated live from the default data config, one fixed kernel per
 batch, with the analytic marginal, so no dataset folder or TabICL model is needed.
-R_star is the prior test correlation (data_gen supports oracle_mode=prior only),
+R_star is the prior test correlation (gp_episodes supports oracle_mode=prior only),
 so for these kernels it has no negative entries.
 """
 
@@ -13,7 +13,7 @@ import torch
 
 import copula_inter
 from copula_inter.config_path import compose_config, config_dir
-from copula_inter.data_gen import generate_gp_batch
+from copula_inter.data.gp_episodes import generate_gp_batch
 
 _KERNELS = ("rbf", "matern32", "rational_quadratic", "periodic")
 _EPISODES_PER_KERNEL = 64

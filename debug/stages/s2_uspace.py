@@ -24,7 +24,7 @@ from debug.config import DebugConfig, add_common_args, build_config
 
 U_HARD_CLAMP = 1e-6  # pit.py::_probit's clamp -- exactly |z| = 4.7534 beyond this
 U_SPLINE_KNOT = 1e-3  # TabICL's outermost quantile knot (num_quantiles=999 -> alpha in [.001,.999])
-Z_STD_DEGEN_LO, Z_STD_DEGEN_HI = 0.1, 3.0  # data_gen.py's own post-hoc degeneracy filter bounds
+Z_STD_DEGEN_LO, Z_STD_DEGEN_HI = 0.1, 3.0  # gp_episodes.py's own post-hoc degeneracy filter bounds
 
 
 def u_from_z(z: torch.Tensor) -> np.ndarray:
@@ -38,7 +38,7 @@ def _pit_ece(u: np.ndarray, n_levels: int = 19) -> tuple[float, np.ndarray, np.n
 
     Returns (ece, alpha_grid, empirical_coverage).
     """
-    from eval.spatial.calibration import compute_quantile_ece
+    from copula_inter.marginal.calibration import compute_quantile_ece
 
     alpha_grid = np.linspace(1.0 / (n_levels + 1), n_levels / (n_levels + 1), n_levels)
     y_pred_quantiles = np.tile(alpha_grid, (len(u), 1))

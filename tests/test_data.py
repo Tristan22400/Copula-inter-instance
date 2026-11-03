@@ -14,18 +14,22 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from pytest import MonkeyPatch
 
-from copula_inter.data_gen import (
+from copula_inter.data.dataset import CopulaDataset, _add_derived_fields, collate_fn
+from copula_inter.data.feature_transforms import (
+    apply_kernel_hidden_warp,
+    apply_mlp_feature_mixing,
+    tabiclv2_warp_features,
+)
+from copula_inter.data.gp_episodes import (
     _generate_gp_batch_raw,
     generate_gp_batch,
     generate_gp_task,
     gp_posterior,
     sigma_to_correlation,
 )
-from copula_inter.dataset import CopulaDataset, _add_derived_fields, collate_fn
-from copula_inter.feature_transforms import apply_kernel_hidden_warp, apply_mlp_feature_mixing, tabiclv2_warp_features
-from copula_inter.gp_kernels import ALL_KERNELS, _kernel_needs_scalar_input
-from copula_inter.kernel_sampling import _sample_mean_module
-from copula_inter.structural_warps import (
+from copula_inter.data.gp_kernels import ALL_KERNELS, _kernel_needs_scalar_input
+from copula_inter.data.kernel_sampling import _sample_mean_module
+from copula_inter.data.structural_warps import (
     _CATEGORY_OPS,
     _DEFAULT_CATEGORY_WEIGHTS,
     _STRUCTURAL_CATEGORIES,
@@ -345,7 +349,7 @@ _ARD_ELIGIBLE_KERNELS = ["rbf", "matern32", "rational_quadratic", "periodic"]
 @pytest.mark.parametrize("kernel_name", _ARD_ELIGIBLE_KERNELS)
 def test_ard_samples_per_dimension_lengthscale(small_cfg: DictConfig, kernel_name: str) -> None:
     """cfg.data.ard gives a (k,) lengthscale that round-trips through gp_analytical_pit."""
-    from copula_inter.pit import gp_analytical_pit
+    from copula_inter.marginal.pit import gp_analytical_pit
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -505,7 +509,7 @@ def test_polynomial_power_varies_across_batches(small_cfg: DictConfig) -> None:
 
 def test_topup_round_reuses_first_round_d_features(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """generate_gp_batch's top-up rounds reuse the first round's d_features."""
-    from copula_inter import data_gen as dg
+    from copula_inter.data import gp_episodes as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -534,8 +538,8 @@ def test_topup_round_reuses_first_round_d_features(small_cfg: DictConfig, monkey
 
 def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """_generate_shard_with_oom_retry's retry chunks reuse the first chunk's d_features."""
-    from copula_inter import data_gen as dg
     from copula_inter import generate_pit_dataset as gpd
+    from copula_inter.data import gp_episodes as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     assert isinstance(cfg, DictConfig)
@@ -570,7 +574,7 @@ def test_oom_retry_chunk_reuses_first_chunk_d_features(small_cfg: DictConfig, mo
 
 def test_generate_gp_batch_raw_discards_batch_on_linalg_error(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """A LinAlgError from kernel evaluation discards the batch (and generate_gp_batch tops up) instead of raising."""
-    from copula_inter import data_gen as dg
+    from copula_inter.data import gp_episodes as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -608,7 +612,7 @@ def test_is_transient_cusolver_error_covers_tabicl_contention_errors() -> None:
 
 def test_degenerate_loo_z_is_discarded_not_leaked(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """An episode with non-finite z_train is discarded, not returned."""
-    from copula_inter import data_gen as dg
+    from copula_inter.data import gp_episodes as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -642,7 +646,7 @@ def test_degenerate_active_kernel_column_is_discarded_not_leaked(
     small_cfg: DictConfig, kernel_name: str, monkeypatch: MonkeyPatch
 ) -> None:
     """A k=1 (periodic/cosine) episode whose active column is constant is discarded."""
-    from copula_inter import data_gen as dg
+    from copula_inter.data import gp_episodes as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -677,7 +681,7 @@ def test_degenerate_active_kernel_column_is_discarded_not_leaked(
 
 def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """An episode whose every active column (3 of 4) is constant is discarded."""
-    from copula_inter import data_gen as dg
+    from copula_inter.data import gp_episodes as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -715,7 +719,7 @@ def test_multi_dim_active_kernel_fully_collapsed_is_discarded(small_cfg: DictCon
 
 def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg: DictConfig, monkeypatch: MonkeyPatch) -> None:
     """An episode with only one of several active columns constant is kept."""
-    from copula_inter import data_gen as dg
+    from copula_inter.data import gp_episodes as dg
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = "rbf"
@@ -753,7 +757,7 @@ def test_multi_dim_active_kernel_partial_collapse_is_kept(small_cfg: DictConfig,
 @pytest.mark.parametrize("kernel_name", ["polynomial", "dot_product+polynomial", "rbf+polynomial"])
 def test_polynomial_reconstruction_round_trip(small_cfg: DictConfig, kernel_name: str) -> None:
     """Polynomial offset/alpha2/power round-trip through gp_analytical_pit to the generated z_train/z_test."""
-    from copula_inter.pit import gp_analytical_pit
+    from copula_inter.marginal.pit import gp_analytical_pit
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.kernel = kernel_name
@@ -851,7 +855,7 @@ def test_feature_normalisation_holds_with_mlp_mixing(small_cfg: DictConfig) -> N
     cfg.data.mlp_num_layers_min = 1
     cfg.data.mlp_num_layers_max = 1
 
-    # Seed torch and random (data_gen also uses random); these seeds avoid the rare column collapse.
+    # Seed torch and random (gp_episodes also uses random); these seeds avoid the rare column collapse.
     torch.manual_seed(0)
     random.seed(0)
     for _ in range(10):
@@ -1666,7 +1670,7 @@ def test_oracle_mode_posterior_unsupported(small_cfg: DictConfig) -> None:
 @pytest.mark.parametrize("family_probs", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 def test_mean_fn_gp_analytical_pit_reconstruction_matches(small_cfg: DictConfig, family_probs: list[float]) -> None:
     """gp_analytical_pit without cached factors matches the cached z_train for every mean family."""
-    from copula_inter.pit import gp_analytical_pit
+    from copula_inter.marginal.pit import gp_analytical_pit
 
     cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
     cfg.data.d_features = 4
@@ -1702,7 +1706,7 @@ def test_mean_fn_linear_prob_zero_forces_constant_only(small_cfg: DictConfig) ->
 
 def test_gp_posterior_helper() -> None:
     """gp_posterior should return correct shapes and PSD Sigma_star."""
-    from copula_inter.gp_kernels import build_kernel_fn
+    from copula_inter.data.gp_kernels import build_kernel_fn
 
     P, N, d = 20, 8, 1
     x_train = torch.randn(P, d)

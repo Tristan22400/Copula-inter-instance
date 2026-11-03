@@ -1,4 +1,4 @@
-"""test_correlation_factory.py — verify src/copula_inter/correlation_factory.py.
+"""test_correlation_factory.py — verify src/copula_inter/copula/correlation.py.
 
 Checks, per parametrization (CovNorm / CosSim / TanhNorm / SparseCovNorm):
   1. Unit diagonal, symmetry, strict positive-definiteness of R = dense().
@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 import torch
 
-from copula_inter.correlation_factory import (
+from copula_inter.copula.correlation import (
     LowRankCorrelationFactor,
     cossim_correlation,
     covnorm_correlation,

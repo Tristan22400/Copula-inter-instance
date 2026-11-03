@@ -23,9 +23,11 @@ BACKENDS = {
     spec.name: spec
     for spec in (
         Backend("tabicl", 3, copula_backbone=True, autoregressive=True),
-        Backend("exaone", 0, batched_pit="eval.spatial.exaone_batched:exaone_run_pit_batched"),
-        Backend("tabpfn", 0, batched_pit="eval.spatial.tabpfn_batched:tabpfn_run_pit_batched"),
-        Backend("tabldm", 3, copula_backbone=True, batched_pit="eval.spatial.tabldm_batched:tabldm_run_pit_batched"),
+        Backend("exaone", 0, batched_pit="copula_inter.marginal.exaone_batched:exaone_run_pit_batched"),
+        Backend("tabpfn", 0, batched_pit="copula_inter.marginal.tabpfn_batched:tabpfn_run_pit_batched"),
+        Backend(
+            "tabldm", 3, copula_backbone=True, batched_pit="copula_inter.marginal.tabldm_batched:tabldm_run_pit_batched"
+        ),
     )
 }
 

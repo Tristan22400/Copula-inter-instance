@@ -1,6 +1,6 @@
 """Tests that the analytic PIT standardizes z_test by the GP posterior (not the prior).
 
-Per-episode moments of z_test, agreement between data_gen, gp_analytical_pit
+Per-episode moments of z_test, agreement between gp_episodes, gp_analytical_pit
 and gp_analytical_posterior, and the consequence that the copula optimum is
 R_post.
 """
@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from copula_inter.data_gen import generate_gp_batch
-from copula_inter.pit import gp_analytical_pit, gp_analytical_posterior
+from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.marginal.pit import gp_analytical_pit, gp_analytical_posterior
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -37,7 +37,7 @@ def test_z_test_has_unit_variance_conditional_on_the_context(small_cfg: DictConf
     assert 0.85 < per_ep.mean() < 1.15, (
         f"mean per-episode Var(z_test | context) = {per_ep.mean():.4f}; "
         "expected ~1. A value near 0.3 means z_test is standardized by the "
-        "PRIOR sigma (data_gen's oracle_mode='prior' mu_star/sigma_star) "
+        "PRIOR sigma (gp_episodes's oracle_mode='prior' mu_star/sigma_star) "
         "instead of the posterior marginals."
     )
 
@@ -65,7 +65,7 @@ def test_analytic_pit_matches_gp_analytical_posterior_marginals(small_cfg: DictC
 
 
 def test_batched_generator_matches_single_episode_pit(small_cfg: DictConfig) -> None:
-    """data_gen's batched path and gp_analytical_pit give the same z_test/log_pdf_test."""
+    """gp_episodes's batched path and gp_analytical_pit give the same z_test/log_pdf_test."""
     for ep in _episodes(small_cfg, b=12):
         rec = gp_analytical_pit(ep)
         assert torch.allclose(rec["z_test"], ep["z_test"], atol=1e-3)

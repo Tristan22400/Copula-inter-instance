@@ -14,15 +14,15 @@ import pytest
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from copula_inter.data_gen import generate_gp_batch
-from copula_inter.dataset import collate_fn
-from copula_inter.model import build_copula_transformer
-from copula_inter.pit import gp_analytical_pit
-from copula_inter.probe_batches import _build_analytic_val_z
-from copula_inter.validation import validate
+from copula_inter.copula.model import build_copula_transformer
+from copula_inter.data.dataset import collate_fn
+from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.marginal.pit import gp_analytical_pit
+from copula_inter.training.probe_batches import _build_analytic_val_z
+from copula_inter.training.validation import validate
 
 if TYPE_CHECKING:
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
 
 
 def _cfg(small_cfg: DictConfig, small_model_cfg: DictConfig) -> DictConfig:
@@ -43,7 +43,7 @@ def _episodes(cfg: DictConfig, b: int = 4, seed: int = 0) -> list[dict[str, torc
 
 
 def _reprior_standardize(episodes: list[dict]) -> list[dict]:
-    """Replace each episode's PIT with one under the GP prior (in place), like data_gen's TabICL branch."""
+    """Replace each episode's PIT with one under the GP prior (in place), like gp_episodes's TabICL branch."""
     for ep in episodes:
         sig = ep["sigma_star"].double().clamp_min(1e-8)
         z = (ep["y_test"].double() - ep["mu_star"].double()) / sig

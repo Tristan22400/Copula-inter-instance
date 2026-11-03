@@ -24,7 +24,7 @@ import warnings
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from copula_inter.pit import TabICLLike
+    from copula_inter.marginal.pit import TabICLLike
 
 # Set before torch initializes CUDA (reduces allocator fragmentation).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -38,8 +38,9 @@ from copula_inter.artifacts import atomic_json_save, atomic_torch_save, file_dig
 from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
-from copula_inter.data_gen import generate_gp_batch
-from copula_inter.dataset_manifest import (
+from copula_inter.data.contracts import validate_episode
+from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.data.manifest import (
     contiguous_shard_counts,
     ensure_manifest,
     generation_spec,
@@ -47,7 +48,6 @@ from copula_inter.dataset_manifest import (
     stat_identity,
     verified_shard_digest,
 )
-from copula_inter.episode_contracts import validate_episode
 
 _MAX_CUSOLVER_RETRIES = 8
 
@@ -227,7 +227,7 @@ def _reject_disk_unsupported_z_train_source(z_train_source: str) -> None:
     if z_train_source == "y_train":
         raise ValueError(
             "data.z_train_source=y_train is only supported under "
-            "training.live_generation=true (src/copula_inter/live_dataset.py) -- no "
+            "training.live_generation=true (src/copula_inter/data/live_dataset.py) -- no "
             "on-disk generate_pit_dataset.py implementation exists."
         )
 
@@ -263,7 +263,7 @@ def main(cfg: DictConfig) -> None:
     )
     ckpt = None
     if z_train_source in TABICL_Z_TRAIN_SOURCES:
-        from copula_inter.pit import load_tabicl, resolve_pit_ckpt
+        from copula_inter.marginal.pit import load_tabicl, resolve_pit_ckpt
 
         ckpt = resolve_pit_ckpt(cfg)
         if ckpt is None:
@@ -276,7 +276,7 @@ def main(cfg: DictConfig) -> None:
         tabicl_model = load_tabicl(ckpt, device)
     elif marginal_backend is not None:
         # Build one backend regressor for all shards (CPU is allowed here, only slower).
-        from eval.spatial.marginal_backends import make_regressor
+        from copula_inter.marginal.backends import make_regressor
 
         print(f"Building {z_train_source} marginal for data.z_train_source={z_train_source} on {device}")
         marginal_regressor = make_regressor(marginal_backend, device=device)

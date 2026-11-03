@@ -47,13 +47,13 @@ if TYPE_CHECKING:
     from omegaconf import DictConfig
 
 from copula_inter.artifacts import artifact_identity, atomic_json_save
+from copula_inter.checkpoint_registry import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
 from copula_inter.config_path import config_dict
 from copula_inter.rng import resolve_device, seed_everything
 from eval.baselines.classical import (
     baseline_fingerprint,
     load_baseline_cache,
 )
-from eval.configs.checkpoints import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
 from eval.data.era5_episodes import (
     era5_episode_fingerprint,
 )

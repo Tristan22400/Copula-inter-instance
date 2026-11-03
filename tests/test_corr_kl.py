@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from copula_inter.pit import gaussian_corr_kl
+from copula_inter.marginal.pit import gaussian_corr_kl
 
 
 def _random_correlation(n: int, seed: int, rank: int | None = None) -> torch.Tensor:

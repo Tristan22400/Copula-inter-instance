@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from copula_inter.loss import y_space_nll
+from copula_inter.copula.loss import y_space_nll
 from eval.baselines.classical import (
     EXPECTED_BASELINE_KEYS,
     corr_nll_single,

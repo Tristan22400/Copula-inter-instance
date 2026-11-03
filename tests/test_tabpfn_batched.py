@@ -1,12 +1,12 @@
 """test_tabpfn_batched.py — Regression test for
-eval/spatial/tabpfn_batched.py::tabpfn_run_pit_batched.
+src/copula_inter/marginal/tabpfn_batched.py::tabpfn_run_pit_batched.
 
 Checks the batched multi-episode path (TabPFNRegressor.predict_batched)
-against marginal_backends.py's existing per-episode loo_pit/quantiles path
+against marginal/backends.py's existing per-episode loo_pit/quantiles path
 on real, non-mocked episodes.
 
 Skipped without TABPFN_TOKEN (PriorLabs' own license gate, see
-eval/spatial/marginal_backends.py::_require_tabpfn_token) -- this was the
+src/copula_inter/marginal/backends.py::_require_tabpfn_token) -- this was the
 case in the environment tabpfn_batched.py was written in, so unlike
 test_exaone_batched.py this test has NEVER actually run end-to-end here.
 Set TABPFN_TOKEN and run this before relying on data.z_train_source=tabpfn's
@@ -32,15 +32,15 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def regressor() -> Any:
-    from eval.spatial.marginal_backends import make_regressor
+    from copula_inter.marginal.backends import make_regressor
 
     return make_regressor("tabpfn", device="cpu")
 
 
 def test_tabpfn_batched_matches_per_episode(regressor: Any) -> None:
-    from eval.metrics.joint_nll import compute_pit
-    from eval.spatial.marginal_backends import loo_pit, quantiles
-    from eval.spatial.tabpfn_batched import tabpfn_run_pit_batched
+    from copula_inter.marginal.backends import loo_pit, quantiles
+    from copula_inter.marginal.kfold import compute_pit
+    from copula_inter.marginal.tabpfn_batched import tabpfn_run_pit_batched
 
     rng = np.random.default_rng(0)
     B, P, N, p_x, K, probs_n = 3, 14, 6, 3, 4, 33

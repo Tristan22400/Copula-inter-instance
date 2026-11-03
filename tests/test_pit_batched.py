@@ -1,4 +1,4 @@
-"""Tests for pit.run_pit_batched / run_pit_calib_split_batched / run_pit_batched_grad and their use in data_gen.
+"""Tests for pit.run_pit_batched / run_pit_calib_split_batched / run_pit_batched_grad and their use in gp_episodes.
 
 1. run_pit_batched with B=1 matches run_pit.
 2. B > 1 matches run_pit per episode.
@@ -18,8 +18,8 @@ import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
-from copula_inter.data_gen import _generate_gp_batch_raw
-from copula_inter.pit import (
+from copula_inter.data.gp_episodes import _generate_gp_batch_raw
+from copula_inter.marginal.pit import (
     _run_pit_batched_impl,
     normalize_targets,
     run_pit,
@@ -583,7 +583,7 @@ def test_return_quantiles_is_additive_and_self_consistent() -> None:
     assert extra["q_train"].shape == (B, P, 1, 7)
     assert extra["q_test"].shape == (B, N, 1, 7)
     # probit(u_test) equals the returned z_test.
-    from copula_inter.pit import _probit
+    from copula_inter.marginal.pit import _probit
 
     assert torch.allclose(_probit(extra["u_test"], 1e-6), extra["z_test"], atol=0)
     assert torch.allclose(_probit(extra["u_train"], 1e-6), extra["z_train"], atol=0)

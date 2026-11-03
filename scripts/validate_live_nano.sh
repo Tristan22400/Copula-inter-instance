@@ -7,7 +7,7 @@
 #
 # Smoke-test training.live_generation=true against the nano model preset
 # (conf/model/copula_nano.yaml) across every model.correlation_parametrization
-# option in src/copula_inter/correlation_factory.py (covnorm, cossim, tanhnorm,
+# option in src/copula_inter/copula/correlation.py (covnorm, cossim, tanhnorm,
 # sparse_covnorm). Each variant runs a handful of steps with a small episode
 # size, so this validates that on-the-fly generation + training + the
 # live-mode validation batch (build_fixed_live_val_batches) all run end to

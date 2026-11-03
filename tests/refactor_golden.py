@@ -71,23 +71,28 @@ def load_modules(layout: str, root: Path) -> SimpleNamespace:
     if layout == "main":
         for p in (root / "tabicl_upstream" / "src", root, root / "src"):
             sys.path.insert(0, str(p))
-        pkg = ""
-        kernels = importlib.import_module("data_gen")
-        train_core = importlib.import_module("train")
+        names = {
+            "kernels": "data_gen",
+            "data_gen": "data_gen",
+            "loss": "loss",
+            "model": "model",
+            "muon": "muon",
+            "train_core": "train",
+        }
     elif layout == "branch":
-        pkg = "copula_inter."
-        kernels = importlib.import_module("copula_inter.gp_kernels")
-        train_core = importlib.import_module("copula_inter.training_core")
+        names = {
+            "kernels": "copula_inter.data.gp_kernels",
+            "data_gen": "copula_inter.data.gp_episodes",
+            "loss": "copula_inter.copula.loss",
+            "model": "copula_inter.copula.model",
+            "muon": "copula_inter.training.muon",
+            "train_core": "copula_inter.training.step",
+        }
     else:
         raise ValueError(f"unknown layout {layout!r}")
     return SimpleNamespace(
         root=root,
-        kernels=kernels,
-        data_gen=importlib.import_module(pkg + "data_gen"),
-        loss=importlib.import_module(pkg + "loss"),
-        model=importlib.import_module(pkg + "model"),
-        muon=importlib.import_module(pkg + "muon"),
-        train_core=train_core,
+        **{key: importlib.import_module(name) for key, name in names.items()},
         classical=importlib.import_module("eval.baselines.classical"),
     )
 

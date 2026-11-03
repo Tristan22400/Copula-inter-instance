@@ -24,15 +24,17 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from copula_inter.checkpoint_registry import resolve_marginal_checkpoint
 from copula_inter.config_path import compose_config, config_dict, config_dir
-from copula_inter.data_gen import generate_gp_batch
-from copula_inter.marginal_objective import (
+from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.marginal.calibration import compute_quantile_ece
+from copula_inter.marginal.objective import (
     analytic_marginal_targets,
     ks_uniform,
     oracle_marginal_nll,
     rank_histogram,
 )
-from copula_inter.pit import (
+from copula_inter.marginal.pit import (
     DEFAULT_K_FOLDS,
     PRETRAINED_TABICL_CKPT,
     _kernel_fn_from_task,
@@ -42,12 +44,10 @@ from copula_inter.pit import (
     run_pit_batched,
 )
 from copula_inter.rng import resolve_device
-from eval.configs.checkpoints import resolve_marginal_checkpoint
 from eval.runners.hydra_cli import hydra_entry
-from eval.spatial.calibration import compute_quantile_ece
 
 if TYPE_CHECKING:
-    from copula_inter.pit import TabICLLike
+    from copula_inter.marginal.pit import TabICLLike
 
 # |log f| bound implied by QuantileDistribution's slope clamp [1e-6, 1e6].
 _LOG_F_CEILING = math.log(1e6)
@@ -166,7 +166,7 @@ def _print_table(title: str, rows: list[tuple[str, int, dict]]) -> None:
 class MarginalCalibrationSpec:
     """Marginal calibration / analytic-headroom report for a TabICL marginal."""
 
-    # HF filename in jingang/TabICL, a local .pt/.ckpt path, or an eval/configs/checkpoints.py::MARGINAL_FAMILIES name.
+    # HF filename in jingang/TabICL, a local .pt/.ckpt path, or an src/copula_inter/checkpoint_registry.py::MARGINAL_FAMILIES name.
     ckpt: str = PRETRAINED_TABICL_CKPT
     # Episodes per context size P.
     n_episodes: int = 128

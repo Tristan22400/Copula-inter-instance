@@ -14,8 +14,8 @@ from pytest import MonkeyPatch
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
-from copula_inter.data_gen import generate_gp_batch
-from copula_inter.pit import gp_analytical_posterior
+from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.marginal.pit import gp_analytical_posterior
 from eval.baselines.classical import (
     baseline_fingerprint,
     episode_cache_key,
@@ -533,7 +533,7 @@ _ERA5_GEOMETRY = {
 
 
 def test_era5_cache_identity_records_the_pit_marginal(tmp_path: Path) -> None:
-    from eval.configs.checkpoints import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
+    from copula_inter.checkpoint_registry import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
 
     default_ckpt = resolve_marginal_checkpoint(DEFAULT_MARGINAL_FAMILY)
     other = tmp_path / "other_marginal.pt"

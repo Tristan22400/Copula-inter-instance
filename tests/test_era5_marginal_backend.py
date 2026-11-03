@@ -19,7 +19,7 @@ from omegaconf import OmegaConf
     ],
 )
 def test_resolve_marginal_maps_z_train_source(source: str, expected: str | None) -> None:
-    from copula_inter.era5_live_dataset import _resolve_marginal
+    from copula_inter.data.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": source}})
     backend, probs_n = _resolve_marginal(cfg)
@@ -28,7 +28,7 @@ def test_resolve_marginal_maps_z_train_source(source: str, expected: str | None)
 
 
 def test_resolve_marginal_reads_probs_n() -> None:
-    from copula_inter.era5_live_dataset import _resolve_marginal
+    from copula_inter.data.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": "tabldm", "z_train_marginal_probs_n": 33}})
     assert _resolve_marginal(cfg) == ("tabldm", 33)
@@ -36,7 +36,7 @@ def test_resolve_marginal_reads_probs_n() -> None:
 
 def test_resolve_marginal_rejects_typo() -> None:
     """_resolve_marginal rejects unknown z_train_source values."""
-    from copula_inter.era5_live_dataset import _resolve_marginal
+    from copula_inter.data.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": "tabicl-split"}})
     with pytest.raises(ValueError, match="Unknown data.z_train_source"):
@@ -47,8 +47,8 @@ def test_resolve_marginal_rejects_typo() -> None:
 def test_pit_group_and_episode_agree_under_backend(backend: str) -> None:
     """A backend reaches the PIT, and the grouped and single-episode paths agree."""
     pytest.importorskip(backend, reason=f"{backend} not installed")
-    from copula_inter.era5_live_dataset import _pit_episode, _pit_group
-    from eval.spatial.marginal_backends import make_regressor
+    from copula_inter.data.era5_live_dataset import _pit_episode, _pit_group
+    from copula_inter.marginal.backends import make_regressor
 
     regressor = make_regressor(backend, device="cpu")
     torch.manual_seed(0)

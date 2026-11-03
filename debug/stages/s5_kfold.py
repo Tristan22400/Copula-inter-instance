@@ -24,8 +24,8 @@ from debug.config import DebugConfig, add_common_args, build_config
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from copula_inter.model import CopulaTabICL
-    from copula_inter.pit import TabICLLike
+    from copula_inter.copula.model import CopulaTabICL
+    from copula_inter.marginal.pit import TabICLLike
 
 K_SWEEP_DEFAULT = [2, 5, 10]  # "P" (true K-fold LOO through TabICL) is appended in run()
 
@@ -33,8 +33,8 @@ K_SWEEP_DEFAULT = [2, 5, 10]  # "P" (true K-fold LOO through TabICL) is appended
 def _pit_at_k(
     tabicl_model: TabICLLike, episodes: list[dict], k_folds: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """run_pit_batched at K over a shared-P/N batch, with data_gen's per-episode y scaling."""
-    from copula_inter.pit import run_pit_batched
+    """run_pit_batched at K over a shared-P/N batch, with gp_episodes's per-episode y scaling."""
+    from copula_inter.marginal.pit import run_pit_batched
 
     x_train = torch.stack([ep["x_norm_train"] for ep in episodes]).to(device)
     x_test = torch.stack([ep["x_norm_test"] for ep in episodes]).to(device)
@@ -51,7 +51,7 @@ def _pit_at_k(
     z_test = out["z_test"].squeeze(-1)  # (B, N)
     log_pdf_test = (
         out["log_pdf_test"].squeeze(-1) - y_std.log()
-    )  # (B, N) - (B, 1) broadcast, matches data_gen.py's own convention
+    )  # (B, N) - (B, 1) broadcast, matches gp_episodes.py's own convention
     return z_train, z_test, log_pdf_test
 
 
@@ -65,9 +65,9 @@ def _score_variant(
     cfg: DictConfig,
     device: str,
 ) -> dict:
-    from copula_inter.dataset import collate_fn
-    from copula_inter.loss import y_space_nll
-    from copula_inter.model import build_sigma
+    from copula_inter.copula.loss import y_space_nll
+    from copula_inter.copula.model import build_sigma
+    from copula_inter.data.dataset import collate_fn
 
     variant_eps = []
     for i, ep in enumerate(episodes):

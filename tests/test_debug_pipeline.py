@@ -13,7 +13,7 @@ _TESTS = os.path.dirname(os.path.abspath(__file__))
 
 def test_rank_ceiling_recovers_exact_low_rank_target() -> None:
     """Fitting rank r to a rank-r covnorm matrix drives the ceiling loss to ~0."""
-    from copula_inter.model import low_rank_correlation
+    from copula_inter.copula.model import low_rank_correlation
     from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
     torch.manual_seed(0)
@@ -30,7 +30,7 @@ def test_rank_ceiling_recovers_exact_low_rank_target() -> None:
 
 def test_rank_ceiling_monotone_in_rank() -> None:
     """The rank-8 ceiling loss is <= the rank-2 one on the same target."""
-    from copula_inter.model import low_rank_correlation
+    from copula_inter.copula.model import low_rank_correlation
     from debug.stages.s1_rank_ceiling import fit_rank_ceiling
 
     torch.manual_seed(1)
@@ -67,7 +67,7 @@ def test_clamping_census_none_saturated() -> None:
 
 def test_u_from_z_roundtrips_probit() -> None:
     """u_from_z inverts pit._probit (clamped values come back at the clamp)."""
-    from copula_inter.pit import _probit
+    from copula_inter.marginal.pit import _probit
     from debug.stages.s2_uspace import U_HARD_CLAMP, u_from_z
 
     u = torch.tensor([0.5, 0.1, 0.9, 1e-9, 1.0 - 1e-9])

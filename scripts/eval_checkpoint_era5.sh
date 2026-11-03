@@ -36,7 +36,7 @@
 # regardless. marginal.z_train_source=oracle is rejected.
 #
 # Requires the global ERA5 corpus to be cached first (once):
-#     python eval/data/fetch_era5_global.py --start 2023-01 --n-months 12 \
+#     python -m copula_inter.era5.fetch_global --start 2023-01 --n-months 12 \
 #         --cache-dir ./eval/data/cache/era5_global_val
 #
 # Submit with:

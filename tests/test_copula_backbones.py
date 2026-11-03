@@ -14,14 +14,14 @@ import torch
 from conftest import make_batch
 from omegaconf import OmegaConf
 
-from copula_inter import copula_backbones
 from copula_inter.config_path import merge_configs
-from copula_inter.model import build_copula_transformer
+from copula_inter.copula import backbones as copula_backbones
+from copula_inter.copula.model import build_copula_transformer
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
 
 requires_tabldm = pytest.mark.skipif(importlib.util.find_spec("tabldm") is None, reason="Xiaomi-TabLDM not installed")
 
@@ -173,7 +173,7 @@ def test_tabldm_lora_installs_adapters() -> None:
 @requires_tabldm
 def test_tabldm_forward_and_loss_backprops(tabldm_model: CopulaTabICL) -> None:
     """_forward_and_loss on a tabldm-backed model includes the MoE aux term and backpropagates."""
-    from copula_inter.training_core import _forward_and_loss
+    from copula_inter.training.step import _forward_and_loss
 
     tabldm_model.train()
     batch = make_batch(B=2, P=4, N=2)

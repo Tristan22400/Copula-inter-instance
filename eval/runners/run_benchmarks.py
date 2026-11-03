@@ -24,32 +24,29 @@ from omegaconf import OmegaConf
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from copula_inter.model import CopulaTabICL
+    from copula_inter.copula.model import CopulaTabICL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
+from copula_inter.checkpoint_registry import resolve_checkpoint
+from copula_inter.marginal.kfold import compute_pit
+from copula_inter.marginal.pit import normalize_features
+from copula_inter.marginal.tabicl_regressor import make_tabicl_regressor, tabicl_loo_pit, tabicl_quantiles
 from copula_inter.rng import resolve_device
 from eval.baselines import independent, standard_gp
-from eval.configs.checkpoints import resolve_checkpoint
 from eval.datasets import sensor_imputation, spatial_housing, synthetic_bbo
 from eval.io import gp_to_quantile_and_R, print_markdown_summary, save_results_json
 from eval.metrics.energy_score import compute_energy_score
-from eval.metrics.joint_nll import compute_joint_nll, compute_pit
+from eval.metrics.joint_nll import compute_joint_nll
 from eval.results import require_coverage
 from eval.runners.hydra_cli import check_choices, hydra_entry
-from eval.tabicl_utils import make_tabicl_regressor, tabicl_loo_pit, tabicl_quantiles
 from eval.viz.correlation_plots import (
     collect_pair_distances_and_values,
     plot_correlation_heatmaps,
     plot_correlation_vs_distance,
 )
-from inference.copula_inference import (
-    get_test_correlation,
-    load_copula_model,
-    normalize_features,
-    sample_trajectories,
-)
+from inference.copula_inference import get_test_correlation, load_copula_model, sample_trajectories
 
 BENCHMARK_NAMES = ["spatial_housing", "sensor_imputation", "synthetic_bbo"]
 # TabICL's native quantile levels (p_j = j/1001).

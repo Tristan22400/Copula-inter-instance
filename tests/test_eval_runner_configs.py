@@ -12,7 +12,7 @@ import pytest
 from hydra.core.global_hydra import GlobalHydra
 
 from copula_inter.config_path import config_dir
-from copula_inter.train_setup import prepare_training_inputs
+from copula_inter.training.setup import prepare_training_inputs
 from eval.runners.autoregressive_baseline_eval import AutoregressiveBaselineSpec
 from eval.runners.era5_calibration_eval import Era5CalibrationSpec
 from eval.runners.eval_args import EvalSpec
@@ -122,10 +122,18 @@ def test_finetune_inputs_are_checked_before_startup(tmp_path: Path) -> None:
     assert "era5-finetune-source-" in cfg.training.ckpt_dir
 
 
+def _doc_files() -> list[Path]:
+    """The Markdown docs and job scripts whose commands must keep working."""
+    top = [REPO / name for name in ("README.md", "CONTRIBUTING.md", "CLAUDE.md", "AGENTS.md")]
+    return (
+        [p for p in top if p.is_file()] + sorted((REPO / "docs").glob("*.md")) + sorted((REPO / "scripts").glob("*.sh"))
+    )
+
+
 def _documented_commands() -> list[str]:
     """Every `python -m <module> ...` line in the docs and job scripts, continuation lines joined."""
     commands = []
-    for path in [REPO / "CLAUDE.md", REPO / "README.md", REPO / "AGENTS.md", *sorted((REPO / "scripts").glob("*.sh"))]:
+    for path in _doc_files():
         text = re.sub(r"\\\n\s*", " ", path.read_text())
         for line in text.splitlines():
             line = line.strip().lstrip("#").strip()
@@ -160,7 +168,7 @@ def test_documented_commands_compose() -> None:
 
 def test_no_doc_invokes_a_runner_with_argparse_flags() -> None:
     pattern = re.compile(r"eval/runners/\w+\.py\s+--|copula_inter\.finetune_era5")
-    for path in [REPO / "CLAUDE.md", REPO / "README.md", *sorted((REPO / "scripts").glob("*.sh"))]:
+    for path in _doc_files():
         assert not pattern.search(path.read_text()), path
 
 

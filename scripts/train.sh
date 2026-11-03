@@ -1,6 +1,6 @@
 #!/bin/bash
 #OAR -n TabICL_Train
-#OAR -l gpu=1,walltime=36:00:00
+#OAR -l gpu=1,walltime=96:00:00
 #OAR -p gpu_model != 'TITAN RTX' AND gpu_model != 'TitanRTX' AND gpu_model != 'Quadro RTX 8000' AND gpu_model != 'L4' AND gpu_model != 'NVIDIA L4'
 #OAR -O logs/train_%jobid%.out
 #OAR -E logs/train_%jobid%.err

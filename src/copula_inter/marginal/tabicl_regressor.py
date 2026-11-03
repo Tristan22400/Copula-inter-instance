@@ -1,0 +1,88 @@
+"""Helpers around the public tabicl.TabICLRegressor (which scales y itself)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+from copula_inter.paths import REPO_ROOT
+
+if TYPE_CHECKING:
+    from tabicl import TabICLRegressor
+
+__all__ = ["make_tabicl_regressor", "tabicl_quantiles", "tabicl_loo_pit"]
+
+
+def make_tabicl_regressor(
+    checkpoint: str | None = None, device: str | None = None, use_amp: bool = False
+) -> TabICLRegressor:
+    """Build one TabICLRegressor to reuse across .fit() calls.
+
+    checkpoint is a local .ckpt/.pt file (model_path) or a jingang/TabICL HF
+    filename (checkpoint_version). use_amp defaults to float32 like every eval
+    runner's frozen marginal (TabICL's own "auto" turns AMP on under CUDA).
+    """
+    from tabicl import TabICLRegressor
+
+    kwargs: dict[str, Any] = {"use_amp": use_amp}
+    if device is not None:
+        kwargs["device"] = device
+    if checkpoint is not None:
+        checkpoint_path = Path(checkpoint)
+        if checkpoint_path.is_absolute() or "/" in checkpoint or checkpoint_path.suffix == ".pt":
+            if not checkpoint_path.is_absolute():
+                checkpoint_path = REPO_ROOT / checkpoint_path
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(f"Marginal checkpoint not found: {checkpoint_path}")
+            kwargs.update(model_path=str(checkpoint_path), allow_auto_download=False)
+        else:
+            kwargs["checkpoint_version"] = checkpoint
+    return TabICLRegressor(**kwargs)
+
+
+def tabicl_quantiles(
+    regressor: Any, X_context: np.ndarray, y_context: np.ndarray, X_query: np.ndarray, probs: np.ndarray
+) -> np.ndarray:
+    """Fit TabICLRegressor on the context and return its quantiles at X_query.
+
+    Args:
+        regressor: TabICLRegressor.
+        X_context: (n_ctx, d).
+        y_context: (n_ctx,) raw targets.
+        X_query: (n_q, d).
+        probs: (Q,) levels.
+
+    Returns:
+        (n_q, Q) quantile grid in raw y units.
+    """
+    regressor.fit(X_context, y_context)
+    return regressor.predict(X_query, output_type="quantiles", alphas=list(probs))
+
+
+def tabicl_loo_pit(
+    regressor: Any,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    probs: np.ndarray,
+    k_folds: int = 10,
+    eps: float = 1e-6,
+    seed: int = 0,
+) -> np.ndarray:
+    """K-fold PIT of the training set through TabICLRegressor (eval/metrics/joint_nll.kfold_loo_pit).
+
+    Returns:
+        (n_train,) Gaussianized residuals.
+    """
+    from copula_inter.marginal.kfold import kfold_loo_pit
+
+    return kfold_loo_pit(
+        lambda Xc, yc, Xq, _fold: tabicl_quantiles(regressor, Xc, yc, Xq, probs),
+        X_train,
+        y_train,
+        probs,
+        k_folds=k_folds,
+        eps=eps,
+        seed=seed,
+    )

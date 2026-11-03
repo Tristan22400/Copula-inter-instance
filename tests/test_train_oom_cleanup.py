@@ -13,7 +13,8 @@ from omegaconf import OmegaConf
 from pytest import MonkeyPatch
 from torch import nn
 
-from copula_inter import train, train_setup
+from copula_inter import train
+from copula_inter.training import setup as train_setup
 
 
 class _TinyModel(nn.Module):
@@ -50,7 +51,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch: MonkeyPatch) -> None:
         total = Sigma.square().mean()
         return {"total": total, "copula": total, "marginal": total}
 
-    from copula_inter import training_core
+    from copula_inter.training import step as training_core
 
     monkeypatch.setattr(training_core, "low_rank_correlation_factor", fake_correlation)
     monkeypatch.setattr(training_core, "y_space_nll", fake_nll)

@@ -12,6 +12,7 @@ from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
+from copula_inter.marginal.calibration import compute_quantile_ece
 from eval.spatial import calibration as gp
 
 
@@ -25,7 +26,7 @@ def test_compute_quantile_ece_perfect_calibration() -> None:
     quantile_values = norm.ppf(quantiles, loc=mu, scale=sigma)
     y_pred_quantiles = np.broadcast_to(quantile_values, (n, len(quantiles))).copy()
 
-    ece, empirical_coverage = gp.compute_quantile_ece(y_true, y_pred_quantiles, quantiles)
+    ece, empirical_coverage = compute_quantile_ece(y_true, y_pred_quantiles, quantiles)
     assert ece < 0.02
     assert np.all(np.diff(empirical_coverage) > 0)
 
@@ -41,7 +42,7 @@ def test_compute_quantile_ece_detects_miscalibration() -> None:
     quantile_values = norm.ppf(skewed_quantiles, loc=mu, scale=sigma)
     y_pred_quantiles = np.broadcast_to(quantile_values, (n, len(quantiles))).copy()
 
-    ece, _ = gp.compute_quantile_ece(y_true, y_pred_quantiles, quantiles)
+    ece, _ = compute_quantile_ece(y_true, y_pred_quantiles, quantiles)
     assert ece > 0.02
 
 
@@ -50,7 +51,7 @@ def test_compute_quantile_ece_shape_validation() -> None:
     y_true = np.zeros(10)
     bad_pred = np.zeros((9, len(quantiles)))  # wrong n_samples vs. y_true
     with pytest.raises(ValueError):
-        gp.compute_quantile_ece(y_true, bad_pred, quantiles)
+        compute_quantile_ece(y_true, bad_pred, quantiles)
 
 
 class _FakeTabICLRegressor:

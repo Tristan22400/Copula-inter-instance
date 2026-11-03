@@ -18,7 +18,7 @@
 # this width+depth cut.
 #
 # NOTE: previously held a dead d_model/n_heads/n_layers_s1/s2/s3/n_inducing/
-# n_cls/p_max/d_max schema that build_copula_transformer (src/copula_inter/model.py) never
+# n_cls/p_max/d_max schema that build_copula_transformer (src/copula_inter/copula/model.py) never
 # read — orphaned since the repo's initial commit.
 #
 # Usage:
@@ -29,7 +29,7 @@ model:
   rank: 128                  # same head rank as copula_prod; backbone is smaller
   sigma_jitter: 1.0e-4
   unfreeze_backbone: true
-  # Which src/copula_inter/correlation_factory.py builder turns the copula head's raw
+  # Which src/copula_inter/copula/correlation.py builder turns the copula head's raw
   # output into a valid low-rank correlation matrix: covnorm (default,
   # matches the original hard-coded implementation) | cossim | tanhnorm |
   # sparse_covnorm. Override from CLI, e.g. model.correlation_parametrization=cossim.

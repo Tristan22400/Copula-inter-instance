@@ -23,16 +23,12 @@ if TYPE_CHECKING:
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
 from copula_inter.config_path import merge_configs
-from copula_inter.era5_probes import _build_era5_val_batches
-from copula_inter.loss import y_space_nll
-from copula_inter.model import build_copula_transformer, build_sigma
-from eval.spatial.diagnostics import bin_correlation_by_distance
-from eval.spatial.sweep_core import (
-    build_era5_probe,
-    weighted_corr,
-    weighted_r2,
-    weighted_rmse_bias,
-)
+from copula_inter.copula.loss import y_space_nll
+from copula_inter.copula.model import build_copula_transformer, build_sigma
+from copula_inter.era5.probe import build_era5_probe
+from copula_inter.era5.spatial_stats import bin_correlation_by_distance
+from copula_inter.training.era5_probes import _build_era5_val_batches
+from eval.spatial.sweep_core import weighted_corr, weighted_r2, weighted_rmse_bias
 
 _TINY_REGION = "western_europe"
 _TINY_GRID = 4

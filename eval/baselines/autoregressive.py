@@ -22,11 +22,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from copula_inter.pit import tabicl_forward
+from copula_inter.marginal.pit import tabicl_forward
 from eval.configs.constants import AR_CONDITIONINGS, AR_ORDERS
 
 if TYPE_CHECKING:
-    from copula_inter.pit import TabICLLike
+    from copula_inter.marginal.pit import TabICLLike
 
 __all__ = [
     "autoregressive_log_pdf",

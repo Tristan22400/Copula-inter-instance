@@ -17,11 +17,12 @@ from pytest import MonkeyPatch
 
 from copula_inter.artifacts import atomic_json_save, atomic_torch_save
 from copula_inter.backend_registry import BACKENDS, COPULA_BACKBONES, GENERIC_MARGINAL_BACKENDS, require_capability
-from copula_inter.dataset import CopulaDataset, collate_fn
-from copula_inter.dataset_manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
-from copula_inter.episode_contracts import assemble_episodes, validate_episode
+from copula_inter.data.contracts import assemble_episodes, validate_episode
+from copula_inter.data.dataset import CopulaDataset, collate_fn
+from copula_inter.data.manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
 from copula_inter.generate_pit_dataset import _refresh_meta, _save_shard_atomic, _shard_is_resumable
-from copula_inter.marginal_backbones import TIER0_PATTERNS
+from copula_inter.marginal.backends import _exaone_capture_quantile_bank
+from copula_inter.marginal.finetune_adapters import TIER0_PATTERNS
 from eval.results import (
     competition_ranks,
     load_results_cache,
@@ -39,7 +40,6 @@ from eval.runners.eval_args import (
 )
 from eval.runners.eval_checkpoint import _results_fingerprint
 from eval.runners.eval_inputs import _dataset_dir_for_eval, _load_full_config
-from eval.spatial.marginal_backends import _exaone_capture_quantile_bank
 
 
 def _episode(p: int = 3, n: int = 2, d: int = 4) -> dict:
@@ -292,13 +292,45 @@ def test_training_core_import_does_not_load_reporting_or_era5() -> None:
         [
             sys.executable,
             "-c",
-            "import sys, copula_inter.training_core; "
-            "assert not any(name == 'wandb' or name.startswith(('matplotlib', 'eval.data.era5')) "
+            "import sys, copula_inter.training.step; "
+            "assert not any(name == 'wandb' or name.startswith(('matplotlib', 'copula_inter.era5')) "
             "for name in sys.modules)",
         ],
         check=True,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
     )
+
+
+# Each top-level package may import only the ones listed (besides itself and
+# third-party code): the library never depends on the harnesses built on it.
+_ALLOWED_IMPORTS = {
+    "copula_inter": {"tabicl"},
+    "inference": {"copula_inter", "tabicl"},
+    "eval": {"copula_inter", "inference", "tabicl"},
+}
+_FIRST_PARTY = {"copula_inter", "inference", "eval", "debug", "scripts", "tabicl"}
+
+
+def test_package_layering() -> None:
+    import ast
+
+    repo = Path(__file__).resolve().parents[1]
+    roots = {"copula_inter": repo / "src" / "copula_inter", "inference": repo / "inference", "eval": repo / "eval"}
+    violations = []
+    for package, root in roots.items():
+        for path in root.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    names = [node.module]
+                elif isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                else:
+                    continue
+                for name in names:
+                    top = name.split(".")[0]
+                    if top in _FIRST_PARTY and top != package and top not in _ALLOWED_IMPORTS[package]:
+                        violations.append(f"{path.relative_to(repo)}:{node.lineno} imports {name}")
+    assert not violations, "\n".join(violations)
 
 
 def test_exaone_adapter_overrides_only_one_instance() -> None:
@@ -320,7 +352,7 @@ def test_exaone_adapter_overrides_only_one_instance() -> None:
 
 def test_legacy_shards_are_identified_without_rehashing(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Pre-refactor shards have no digest sidecar; identity must not sha256 every shard on every eval."""
-    import copula_inter.dataset_manifest as dm
+    import copula_inter.data.manifest as dm
 
     shard = tmp_path / "shard_000000.pt"
     torch.save([_episode()], shard)  # legacy: no .count.json sidecar

@@ -14,13 +14,9 @@ from scipy.stats import norm
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
-from copula_inter.model import low_rank_correlation
-from inference.copula_inference import (
-    _resolve_copula_checkpoint,
-    get_test_correlation,
-    normalize_features,
-    sample_trajectories,
-)
+from copula_inter.copula.model import low_rank_correlation
+from copula_inter.marginal.pit import normalize_features
+from inference.copula_inference import _resolve_copula_checkpoint, get_test_correlation, sample_trajectories
 from tabicl._model.quantile_dist import QuantileDistribution
 
 

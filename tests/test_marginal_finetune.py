@@ -13,12 +13,12 @@ import pytest
 import torch
 from pytest import MonkeyPatch
 
-from copula_inter.data_gen import gp_posterior
+from copula_inter.data.gp_episodes import gp_posterior
+from copula_inter.data.gp_kernels import build_kernel_fn
 from copula_inter.finetune_marginal import phase_a_batch_loss
-from copula_inter.gp_kernels import build_kernel_fn
-from copula_inter.lora import merged_base_state_dict
-from copula_inter.marginal_data import _generate_phase_a_gp_batch
-from copula_inter.marginal_objective import (
+from copula_inter.marginal.finetune_data import _generate_phase_a_gp_batch
+from copula_inter.marginal.lora import merged_base_state_dict
+from copula_inter.marginal.objective import (
     AnchorPenalty,
     MarginalLossWeights,
     analytic_marginal_targets,
@@ -29,8 +29,8 @@ from copula_inter.marginal_objective import (
     quantile_level_weights,
     rank_histogram,
 )
-from copula_inter.marginal_tiers import TIER0_PATTERNS, apply_tier
-from copula_inter.pit import _probit, run_pit_batched, run_pit_batched_grad
+from copula_inter.marginal.pit import _probit, run_pit_batched, run_pit_batched_grad
+from copula_inter.marginal.tiers import TIER0_PATTERNS, apply_tier
 
 if TYPE_CHECKING:
     from tabicl._model.tabicl import TabICL
@@ -41,7 +41,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def test_phase_a_generator_pins_shape_after_mixed_topup(monkeypatch: MonkeyPatch) -> None:
     from omegaconf import OmegaConf
 
-    from copula_inter import marginal_data as entrypoint
+    from copula_inter.marginal import finetune_data as entrypoint
 
     calls = []
 
@@ -334,7 +334,7 @@ def test_fold_subset_rows_match_a_full_pit_pass() -> None:
     part = run_pit_batched(tab, Xtr, Ytr, Xte, Yte, k_folds=K, return_quantiles=True)
     assert torch.allclose(full["z_train"], part["z_train"])
 
-    from copula_inter.pit import _run_pit_batched_impl
+    from copula_inter.marginal.pit import _run_pit_batched_impl
 
     sub = _run_pit_batched_impl(tab, Xtr, Ytr, Xte, Yte, K, 1e-6, return_quantiles=True, fold_subset=[1, 3])
     rows = sub["train_query_idx"]
@@ -344,7 +344,7 @@ def test_fold_subset_rows_match_a_full_pit_pass() -> None:
 
 
 def test_fold_subset_empty_returns_test_only() -> None:
-    from copula_inter.pit import _run_pit_batched_impl
+    from copula_inter.marginal.pit import _run_pit_batched_impl
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
     torch.manual_seed(0)
@@ -359,7 +359,7 @@ def test_fold_subset_empty_returns_test_only() -> None:
 
 
 def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output() -> None:
-    from copula_inter.pit import _run_pit_batched_impl
+    from copula_inter.marginal.pit import _run_pit_batched_impl
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
     torch.manual_seed(0)
@@ -396,7 +396,7 @@ def test_quantiles_only_fast_path_skips_pit_but_preserves_decoder_output() -> No
 
 
 def test_fused_fold_forward_matches_separate_forwards() -> None:
-    from copula_inter.pit import _run_pit_batched_impl
+    from copula_inter.marginal.pit import _run_pit_batched_impl
     from tests.test_pit_batched import RowIndependentFakeTabICL  # noqa: PLC0415
 
     torch.manual_seed(0)

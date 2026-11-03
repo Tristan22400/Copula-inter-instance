@@ -10,7 +10,7 @@ dragging down the mixed-kernel average.
 Thin wrapper over scripts/train_fast.py: forces
 data.systematic_composition=false data.kernel=<KERNEL>
 training.adaptive_kernel_sampling=false (that flag silently goes inert on
-the fixed-kernel branch anyway, see data_gen.py::_resolve_kernel_name --
+the fixed-kernel branch anyway, see gp_episodes.py::_resolve_kernel_name --
 disabling it here just makes the run's intent explicit in its config/logs)
 and forwards everything else verbatim, so this is not a separate
 implementation of the debug loop, just a documented invocation of the

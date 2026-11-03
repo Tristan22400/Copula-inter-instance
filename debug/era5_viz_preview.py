@@ -26,7 +26,7 @@ matplotlib.use("Agg")
 import torch
 from omegaconf import OmegaConf
 
-from eval.spatial.diagnostics import morans_i
+from copula_inter.era5.spatial_stats import morans_i
 from eval.spatial.sweep_core import get_model
 
 
@@ -44,13 +44,13 @@ def main() -> None:
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
-    from copula_inter.era5_probes import (
+    from copula_inter.copula.model import build_sigma
+    from copula_inter.training.era5_probes import (
         _build_era5_viz_batch,
         _era5_viz_field,
         _era5_viz_fig,
         _era5_viz_gp_field,
     )
-    from copula_inter.model import build_sigma
 
     model, cfg, device, marginal = get_model(args.ckpt, args.device)
     OmegaConf.set_struct(cfg, False)

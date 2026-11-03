@@ -38,7 +38,7 @@ jobs:
       - name: Syntax and import smoke
         run: |
           uv run --no-sync python -m compileall -q src eval inference debug tests
-          uv run --no-sync python -c "import copula_inter.data_gen, copula_inter.train, eval.runners.eval_checkpoint, inference.copula_inference"
+          uv run --no-sync python -c "import copula_inter.data.gp_episodes, copula_inter.train, eval.runners.eval_checkpoint, inference.copula_inference"
       - name: CPU test suite
         # Everything except the slow / gpu / pretrained / external_data tiers;
         # scripts/test_full.sh runs those on a Grid5000 GPU node.

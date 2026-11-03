@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    from copula_inter.marginal_backbones import MarginalBackbone
+    from copula_inter.marginal.finetune_adapters import MarginalBackbone
 
 RANK = 8
 BACKENDS = ["tabldm", "exaone"]
@@ -19,14 +19,14 @@ BACKENDS = ["tabldm", "exaone"]
 
 def _load(name: str) -> MarginalBackbone:
     pytest.importorskip({"tabldm": "tabldm", "exaone": "exaonetabular"}[name], reason=f"{name} not installed")
-    from copula_inter.marginal_backbones import load_backbone
+    from copula_inter.marginal.finetune_adapters import load_backbone
 
     return load_backbone(name, device="cpu")
 
 
 def test_adapters_are_identity_at_initialisation() -> None:
     """Installing adapters leaves every weight unchanged (B = 0)."""
-    from copula_inter.lora import apply_lora_all_layers
+    from copula_inter.marginal.lora import apply_lora_all_layers
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 8), nn.ReLU(), nn.Linear(8, 4))
@@ -39,7 +39,7 @@ def test_adapters_are_identity_at_initialisation() -> None:
 
 def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern() -> None:
     """A tier-0 pattern matching "...parametrizations.weight.original" does not unfreeze it."""
-    from copula_inter.lora import apply_lora_all_layers
+    from copula_inter.marginal.lora import apply_lora_all_layers
 
     model = nn.Sequential(nn.Linear(6, 8))
     apply_lora_all_layers(model, rank=RANK, alpha=16.0, also_trainable=(r"^0\.",))
@@ -52,7 +52,7 @@ def test_frozen_base_is_never_unfrozen_by_an_allowlist_pattern() -> None:
 
 @pytest.mark.parametrize("name", BACKENDS)
 def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name: str) -> None:
-    from copula_inter.lora import apply_lora_all_layers
+    from copula_inter.marginal.lora import apply_lora_all_layers
 
     bb = _load(name)
     n_matrices = sum(1 for _, p in bb.module.named_parameters() if p.dim() == 2)
@@ -71,7 +71,7 @@ def test_every_backbone_gets_the_same_rank_on_every_weight_matrix(name: str) -> 
 
 @pytest.mark.parametrize("name", BACKENDS)
 def test_only_adapters_train_and_gradients_reach_them(name: str) -> None:
-    from copula_inter.lora import apply_lora_all_layers
+    from copula_inter.marginal.lora import apply_lora_all_layers
 
     bb = _load(name)
     apply_lora_all_layers(bb.module, rank=RANK, alpha=16.0)
@@ -111,7 +111,7 @@ def test_only_adapters_train_and_gradients_reach_them(name: str) -> None:
 @pytest.mark.parametrize("name", BACKENDS)
 def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name: str, tmp_path: Path) -> None:
     """The checkpoint uses the original parameter names with deltas merged."""
-    from copula_inter.lora import apply_lora_all_layers
+    from copula_inter.marginal.lora import apply_lora_all_layers
 
     bb = _load(name)
     stock_keys = set(bb.module.state_dict().keys())
@@ -132,7 +132,7 @@ def test_checkpoint_merges_adapters_back_to_stock_parameter_names(name: str, tmp
     )
     assert not any(".parametrizations." in k for k in sd)
 
-    from copula_inter.marginal_backbones import load_backbone
+    from copula_inter.marginal.finetune_adapters import load_backbone
 
     fresh = load_backbone(name, device="cpu")
     base = fresh.module.state_dict()

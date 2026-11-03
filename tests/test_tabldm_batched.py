@@ -1,9 +1,9 @@
 """test_tabldm_batched.py — Regression test for
-eval/spatial/tabldm_batched.py::tabldm_run_pit_batched.
+src/copula_inter/marginal/tabldm_batched.py::tabldm_run_pit_batched.
 
 Checks the batched multi-episode path (episodes stacked along TabLDM's own
 documented "number of tables" axis, see that module's docstring) against
-marginal_backends.py's existing per-episode loo_pit/quantiles path on real,
+marginal/backends.py's existing per-episode loo_pit/quantiles path on real,
 non-mocked episodes. This is the check that makes tabldm_batched.py's safety
 argument empirical rather than just a reading of TabLDM's source -- the same
 standard test_exaone_batched.py holds exaone_batched.py to.
@@ -27,16 +27,16 @@ pytest.importorskip("tabldm", reason="Xiaomi-TabLDM not installed")
 
 @pytest.fixture(scope="module")
 def regressor() -> Any:
-    from eval.spatial.marginal_backends import make_regressor
+    from copula_inter.marginal.backends import make_regressor
 
     return make_regressor("tabldm", device="cpu")
 
 
 @pytest.mark.parametrize("constant_column", [False, True])
 def test_tabldm_batched_matches_per_episode(regressor: Any, constant_column: bool) -> None:
-    from eval.metrics.joint_nll import compute_pit
-    from eval.spatial.marginal_backends import loo_pit, quantiles
-    from eval.spatial.tabldm_batched import tabldm_run_pit_batched
+    from copula_inter.marginal.backends import loo_pit, quantiles
+    from copula_inter.marginal.kfold import compute_pit
+    from copula_inter.marginal.tabldm_batched import tabldm_run_pit_batched
 
     rng = np.random.default_rng(0)
     B, P, N, p_x, K, probs_n = 2, 12, 4, 3, 3, 21
@@ -80,7 +80,7 @@ def test_tabldm_batched_matches_per_episode(regressor: Any, constant_column: boo
 def test_tabldm_batched_rejects_unsupported_regressor_modes(regressor: Any) -> None:
     """The two predict() branches this module deliberately does not mirror
     must fail loudly rather than silently fusing the wrong thing."""
-    from eval.spatial.tabldm_batched import _episode_member_batch
+    from copula_inter.marginal.tabldm_batched import _episode_member_batch
 
     rng = np.random.default_rng(1)
     X = rng.normal(size=(10, 3)).astype(np.float32)

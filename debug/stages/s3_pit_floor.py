@@ -43,8 +43,8 @@ def _build_quantile_dist(
 
 def sample_and_pit(tabicl_model: TabICL, episode: dict, post: dict, M: int, device: str) -> torch.Tensor:
     """z_samples (N, M): M posterior draws at the episode's test points, PIT'd through TabICL."""
-    from copula_inter.loss import _safe_cholesky
-    from copula_inter.pit import _probit
+    from copula_inter.copula.loss import _safe_cholesky
+    from copula_inter.marginal.pit import _probit
 
     x_train = episode["x_norm_train"].to(device)
     y_train = episode["y_train"].to(device)
@@ -81,7 +81,7 @@ def _shrunk_correlation(z_fit: torch.Tensor) -> tuple[torch.Tensor, float]:
 
 
 def run(dcfg: DebugConfig, M: int = 2048, m_fit: int | None = None, rank: int = 32) -> dict:
-    from copula_inter.loss import oracle_copula_nll
+    from copula_inter.copula.loss import oracle_copula_nll
 
     m_fit = m_fit or M // 2
     tabicl_model = common.load_frozen_tabicl(dcfg)
