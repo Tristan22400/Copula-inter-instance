@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -13,9 +15,7 @@ from omegaconf import OmegaConf
         ("analytic", None),  # no generating GP on real data -> stay on TabICL
         ("tabicl", None),
         ("tabicl_split", None),
-        ("exaone", "exaone"),
         ("tabpfn", "tabpfn"),
-        ("tabldm", "tabldm"),
     ],
 )
 def test_resolve_marginal_maps_z_train_source(source: str, expected: str | None) -> None:
@@ -30,8 +30,8 @@ def test_resolve_marginal_maps_z_train_source(source: str, expected: str | None)
 def test_resolve_marginal_reads_probs_n() -> None:
     from copula_inter.data.era5_live_dataset import _resolve_marginal
 
-    cfg = OmegaConf.create({"data": {"z_train_source": "tabldm", "z_train_marginal_probs_n": 33}})
-    assert _resolve_marginal(cfg) == ("tabldm", 33)
+    cfg = OmegaConf.create({"data": {"z_train_source": "tabpfn", "z_train_marginal_probs_n": 33}})
+    assert _resolve_marginal(cfg) == ("tabpfn", 33)
 
 
 def test_resolve_marginal_rejects_typo() -> None:
@@ -43,10 +43,13 @@ def test_resolve_marginal_rejects_typo() -> None:
         _resolve_marginal(cfg)
 
 
-@pytest.mark.parametrize("backend", ["tabldm"])
+@pytest.mark.pretrained
+@pytest.mark.parametrize("backend", ["tabpfn"])
 def test_pit_group_and_episode_agree_under_backend(backend: str) -> None:
     """A backend reaches the PIT, and the grouped and single-episode paths agree."""
     pytest.importorskip(backend, reason=f"{backend} not installed")
+    if not os.environ.get("TABPFN_TOKEN"):
+        pytest.skip("TABPFN_TOKEN not set")
     from copula_inter.data.era5_live_dataset import _pit_episode, _pit_group
     from copula_inter.marginal.backends import make_regressor
 

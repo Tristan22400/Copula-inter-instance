@@ -36,12 +36,11 @@ uv sync --locked --extra dev --extra gpu
 
 The `.venv` lives in the checkout, so every OAR job on that storage reuses it.
 
-**Optional marginal backends.** `uv.lock` doesn't cover TabPFN (`tabpfn`),
-EXAONE (`exaonetabular`) or Xiaomi TabLDM (`tabldm`). Without them, those
-backends' tests are skipped and selecting them raises an ImportError. Install
-the ones you need into the venv with `uv pip install <package or path>`. The
-old conda env shows where each came from:
-`~/thoth_storage/miniconda3/bin/conda run -n multivariate-icl pip show tabpfn exaonetabular tabldm`.
+**TabPFN (optional).** The TabPFN marginal backend is the `tabpfn` extra:
+add `--extra tabpfn` to the `uv sync` command, and keep it on every later
+`uv sync`, which otherwise uninstalls it. It also needs a PriorLabs API key in
+`TABPFN_TOKEN` (see [architecture](architecture.md)). Without the extra, the
+TabPFN tests are skipped and selecting it raises an ImportError.
 If your laptop mounts the same storage (sshfs), don't run `uv sync` through the
 mount. That would overwrite the cluster's GPU venv with a CPU one linked to the
 laptop's Python. Keep a laptop venv elsewhere:
@@ -59,8 +58,8 @@ oarsub -S "./scripts/generate_dataset.sh data.n_tasks=5000"        # on Grid5000
 
 `data.z_train_source` selects the marginal that produces the PIT: `analytic`
 (the exact-GP oracle, no model weights needed), `tabicl` (default),
-`tabicl_split`, `exaone`, `tabpfn` or `tabldm`. Non-TabICL backends need no GPU
-at generation time; they are just slower.
+`tabicl_split` or `tabpfn`. TabPFN needs no GPU at generation time; it is
+just slower.
 
 Generation writes a manifest. It refuses to resume into a directory created with
 different settings or different marginal checkpoint bytes, so use a fresh
@@ -113,8 +112,8 @@ table compares correlations on a shared `z_test`.
 `marginal.z_train_source` decides where the context PIT comes from:
 - `tabicl` (default): K-fold TabICL, as in deployment;
 - `oracle`: the exact-GP LOO, an idealized upper bound;
-- `exaone` / `tabpfn` / `tabldm`: score against the marginal a run was trained
-  with. Also pass `autoregressive.enabled=false`.
+- `tabpfn`: score against the marginal a run was trained with. Also pass
+  `autoregressive.enabled=false`.
 
 `output.dump_episodes=scores.json` saves per-episode scores, and
 `python -m eval.results scores.json` re-renders the totals later without loading
@@ -201,7 +200,6 @@ standalone marginal; the two phases meet only at a checkpoint path.
 
    ```bash
    python -m copula_inter.finetune_marginal
-   python -m copula_inter.finetune_marginal marginal.backbone=tabldm     # or exaone
    oarsub -S ./scripts/finetune_marginal.sh
    ```
 
@@ -211,13 +209,11 @@ standalone marginal; the two phases meet only at a checkpoint path.
    | Backbone | Matrices | Trainable parameters |
    |---|---|---|
    | tabicl | 153 | 854K (2.91 %) |
-   | tabldm | 295 | 2.00M (2.73 %) |
-   | exaone | 360 | 1.43M (6.33 %) |
 
    The tier ladder is an ablation: `marginal.lora_all_layers=false marginal.tier=1`.
-   Only tabicl and tabldm can climb it, because EXAONE's attention has no
-   swappable module (`marginal/finetune_adapters.py::MAX_TIER`). TabPFN is wired
-   but licence-gated and has never been run here.
+   Only tabicl can climb it (`backend_registry.Backend.max_tier`). TabPFN is
+   wired for tier 0 but `load_backbone` refuses it until its parameter names
+   are checked against a loaded model.
 
    Each model is scored on its native 999-level decoder grid
    (`marginal.probs_n=null`), so the objective is comparable across backbones.

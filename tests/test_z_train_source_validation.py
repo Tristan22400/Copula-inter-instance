@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from omegaconf import DictConfig
 
 
-@pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "exaone", "tabpfn", "tabldm", "y_train"])
+@pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "tabpfn", "y_train"])
 def testvalidate_z_train_source_accepts_known_values(value: str) -> None:
     validate_z_train_source(value)  # must not raise
 
@@ -50,9 +50,7 @@ def test_valid_z_train_sources_matches_documented_set() -> None:
         "analytic",
         "tabicl",
         "tabicl_split",
-        "exaone",
         "tabpfn",
-        "tabldm",
         "y_train",
     }
 

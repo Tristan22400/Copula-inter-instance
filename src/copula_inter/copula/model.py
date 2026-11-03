@@ -1,6 +1,6 @@
 """CopulaTabICL: a tabular ICL backbone used as a feature extractor, plus a copula head.
 
-The backbone (cfg.model.backbone: "tabicl" or "tabldm") is built by
+The backbone (cfg.model.backbone: "tabicl") is built by
 copula/backbones.py with its quantile decoder replaced by nn.Identity, so it
 emits per-test-row features of size feature_dim. copula_head maps each row to
 (w_i in R^r, s_i), and the default "covnorm" parametrization builds
@@ -192,8 +192,7 @@ class CopulaTabICL(nn.Module):
         """Forward over a padded batch from dataset.collate_fn.
 
         Returns a dict with W: (B, N_max, r), plus s: (B, N_max) unless the
-        parametrization is "tanhnorm", plus lam: (1,) for "sparse_covnorm", plus
-        moe_aux_loss when the backbone emits one.
+        parametrization is "tanhnorm", plus lam: (1,) for "sparse_covnorm".
         """
         x_train = batch["x_train"]  # (B, P_max, d_x)
         x_test = batch["x_test"]  # (B, N_max, d_x)
@@ -211,11 +210,6 @@ class CopulaTabICL(nn.Module):
             out["s"] = head_out[..., self.rank]  # (B, N_max)
         if self.correlation_parametrization == "sparse_covnorm":
             out["lam"] = self.sparse_lambda_raw
-
-        # Backbone auxiliary loss (TabLDM MoE only).
-        aux = copula_backbones.moe_aux_loss(self.backbone_name, self.feature_extractor)
-        if aux is not None:
-            out["moe_aux_loss"] = aux
         return out
 
 

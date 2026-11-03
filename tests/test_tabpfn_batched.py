@@ -6,12 +6,8 @@ against marginal/backends.py's existing per-episode loo_pit/quantiles path
 on real, non-mocked episodes.
 
 Skipped without TABPFN_TOKEN (PriorLabs' own license gate, see
-src/copula_inter/marginal/backends.py::_require_tabpfn_token) -- this was the
-case in the environment tabpfn_batched.py was written in, so unlike
-test_exaone_batched.py this test has NEVER actually run end-to-end here.
-Set TABPFN_TOKEN and run this before relying on data.z_train_source=tabpfn's
-batched path for a real training run -- see tabpfn_batched.py's module
-docstring for the same caveat.
+src/copula_inter/marginal/backends.py::_require_tabpfn_token) or without the
+`tabpfn` uv extra. Passes with tabpfn 8.5.0.
 """
 
 from __future__ import annotations

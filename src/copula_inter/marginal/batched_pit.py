@@ -1,4 +1,4 @@
-"""K-fold PIT driver shared by the batched marginal backends (exaone, tabpfn, tabldm).
+"""K-fold PIT driver for the batched marginal backends (tabpfn).
 
 The backend supplies bank_fn:
 

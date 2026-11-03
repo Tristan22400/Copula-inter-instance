@@ -37,7 +37,6 @@ def _forward_and_loss(
     jitter: float,
     triu_cache: dict[int, torch.Tensor],
     parametrization: str = "covnorm",
-    moe_aux_weight: float = 1.0,
     phase_start: Callable[[], Any] = lambda: None,
     phase_end: Callable[[str, Any], None] = lambda name, start: None,
 ) -> tuple[dict[str, torch.Tensor], LowRankCorrelationFactor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
@@ -85,11 +84,6 @@ def _forward_and_loss(
             oracle_off = batch["R_star"].float()[:, ri, ci][valid_off]
             aux_mae = (pred_off - oracle_off).abs().mean()
         loss = loss + aux_mae_weight * aux_mae
-
-    # Backbone auxiliary loss (TabLDM MoE only).
-    moe_aux = out.get("moe_aux_loss")
-    if moe_aux is not None:
-        loss = loss + moe_aux_weight * moe_aux
     phase_end("loss", ev_loss0)
     return out, Sigma, parts, loss, aux_mae
 
@@ -106,7 +100,6 @@ def _measure_step_flops(
     jitter: float,
     triu_cache: dict[int, torch.Tensor],
     parametrization: str = "covnorm",
-    moe_aux_weight: float = 1.0,
 ) -> float:
     """FLOPs of one forward+backward under FlopCounterMode, without an optimizer step (for MFU)."""
     with FlopCounterMode(display=False) as flop_ctr:
@@ -121,7 +114,6 @@ def _measure_step_flops(
             jitter=jitter,
             triu_cache=triu_cache,
             parametrization=parametrization,
-            moe_aux_weight=moe_aux_weight,
         )
         loss.backward()
     model.zero_grad(set_to_none=True)
@@ -147,7 +139,6 @@ def _run_train_step(
     phase_start: Callable[[], Any],
     phase_end: Callable[[str, Any], None],
     parametrization: str = "covnorm",
-    moe_aux_weight: float = 1.0,
 ) -> tuple[
     dict[str, torch.Tensor],
     LowRankCorrelationFactor,
@@ -170,7 +161,6 @@ def _run_train_step(
         phase_start=phase_start,
         phase_end=phase_end,
         parametrization=parametrization,
-        moe_aux_weight=moe_aux_weight,
     )
 
     ev_bwd0 = phase_start()

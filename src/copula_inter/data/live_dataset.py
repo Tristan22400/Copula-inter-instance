@@ -261,8 +261,7 @@ def build_live_train_loader(
             f"training.live_generation with {reason} requires device='cuda' "
             f"(got {device!r}) -- CPU-only inference for this backend was "
             "benchmarked and rejected as too slow to keep the GPU fed (see "
-            "this function's docstring, and src/copula_inter/marginal/exaone_batched.py's "
-            "for the exaone-specific ~120x CPU-vs-CUDA gap). Use "
+            "this function's docstring). Use "
             "data.z_train_source=analytic and "
             "data.z_train_tabicl_mix_enabled=false for CPU-only runs."
         )
@@ -355,7 +354,7 @@ def build_fixed_live_val_batches(
             f"training.live_generation with data.z_train_source={z_train_source} "
             f"requires device='cuda' (got {device!r}) -- see build_live_train_loader's "
             "batched_marginal_worker_enabled docstring for why CPU is rejected "
-            "rather than silently slow for exaone/tabpfn too."
+            "rather than silently slow for tabpfn too."
         )
     tabicl_model = None
     gen_device = "cpu"

@@ -412,11 +412,6 @@ def _load_phase_a_model(cfg: DictConfig, device: str) -> _PhaseAModel:
         trainable_module = tabicl
     else:
         backbone_obj = load_backbone(backbone_name, ckpt=cfg.marginal.get("resume_ckpt", None), device=device)
-        if backbone_name == "exaone":
-            backbone_obj.exaone_chunk_size = int(cfg.marginal.exaone.chunk_size)
-            if backbone_obj.exaone_chunk_size < 1:
-                raise ValueError("marginal.exaone.chunk_size must be positive")
-            backbone_obj.exaone_activation_checkpointing = bool(cfg.marginal.exaone.activation_checkpointing)
         tabicl, tabicl_config = backbone_obj, {}
         trainable_module = backbone_obj.module
         for p_ in trainable_module.parameters():
