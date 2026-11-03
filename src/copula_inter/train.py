@@ -55,9 +55,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+import wandb
 from omegaconf import DictConfig
 
-import wandb
 from copula_inter.config_path import config_dir
 from copula_inter.data.gp_kernels import _COMPOSABLE_KERNELS
 from copula_inter.marginal.pit import (

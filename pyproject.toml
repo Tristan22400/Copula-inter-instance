@@ -88,6 +88,8 @@ select = ["E9", "F", "I", "TC004"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["copula_inter", "eval", "inference", "conf", "debug", "scripts", "tabicl"]
+# A local wandb/ run directory would otherwise make ruff treat wandb as first-party.
+known-third-party = ["wandb"]
 
 [tool.mypy]
 files = ["src/copula_inter", "eval", "inference", "conf", "debug", "scripts", "tests"]

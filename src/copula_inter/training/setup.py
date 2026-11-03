@@ -32,11 +32,11 @@ if TYPE_CHECKING:
 from glob import glob
 
 import torch
+import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
-import wandb
 from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.checkpoint_registry import resolve_checkpoint
