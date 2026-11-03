@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as summarize_results_cache_schema.
+defaults:
+  - summarize_results_cache_schema
+  - _runner
+  - _self_

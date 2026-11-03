@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
-"""run_debug.py — single entry point for the z_train_source=tabicl plateau
-debug pipeline (see debug/README.md for what each stage answers).
+"""Dispatcher for the debug stages (debug/README.md).
 
-Each stage is a standalone script under debug/stages/ with its own CLI
-(run it directly for full control over its flags); this dispatcher just
-forwards everything after the stage name to that script's own main(), so
-`--help` on either path shows the same flags. Its only added value is
-`all`, which runs every stage that needs no stage-specific flag (S0-S3
-unconditionally; S5/S6 too if --ckpt is given) under ONE shared --run-id,
-so their JSON output lands in the same debug/results/<run_id>/ directory
-and report.py can aggregate it in one pass.
-
-S4 (overfit, needs --kernel/--target), S7a (backbone diagnostic, needs
---ckpt and per-backend setup), S7b (backend training comparison, needs
---backends and is itself a short training run), and S8 (single-kernel
-train_fast.py launch, needs --kernel and is a training run, not a
-diagnostic) are deliberately NOT part of `all` -- invoke them directly.
+Forwards arguments to debug/stages/<stage>.py's main(). `all` runs S0-S3
+(plus S5/S6 with --ckpt) under one shared --run-id; S4, S7a, S7b and S8 run
+only directly.
 
 Usage:
     python debug/run_debug.py all --n-episodes 200
@@ -26,6 +14,7 @@ Usage:
     python debug/run_debug.py s8 --kernel matern52
     python debug/run_debug.py report --run-id <run_id>
 """
+
 from __future__ import annotations
 
 import argparse
@@ -56,7 +45,7 @@ ALL_STAGES_NEEDS_CKPT = ["s5", "s6"]
 
 
 def _git_sha() -> str:
-    from config import _git_sha as gs
+    from debug.config import _git_sha as gs
 
     return gs(os.path.dirname(_HERE))
 
@@ -74,7 +63,7 @@ def main() -> None:
     args, extra = p.parse_known_args()
 
     if args.stage == "report":
-        from report import main as report_main
+        from debug.report import main as report_main
 
         sys.argv = ["report.py", *extra]
         report_main()
@@ -83,12 +72,7 @@ def main() -> None:
     if args.stage != "all":
         raise SystemExit(_run_stage(args.stage, extra))
 
-    # "all": one shared run_id across every stage so their JSON lands in
-    # the same debug/results/<run_id>/ directory. Handles both the
-    # one-token (--run-id=foo) and two-token (--run-id foo) argparse forms
-    # -- getting this wrong would silently re-append a second, different
-    # --run-id and let each stage's own argparse pick whichever wins by
-    # last-occurrence, defeating the whole point of a SHARED id.
+    # all: one shared run id (handles both --run-id=x and --run-id x).
     has_ckpt = any(a.startswith("--ckpt") for a in extra)
     run_id = None
     for i, a in enumerate(extra):
@@ -118,7 +102,7 @@ def main() -> None:
 
     print(f"\n{'=' * 70}\nrun_id={run_id}  stages_run={stages}  failures={failures or 'none'}\n{'=' * 70}")
     if not failures:
-        from report import build_report
+        from debug.report import build_report
 
         out_path = build_report(run_id)
         print(f"Report written -> {out_path}")
@@ -127,5 +111,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, _HERE)
     main()

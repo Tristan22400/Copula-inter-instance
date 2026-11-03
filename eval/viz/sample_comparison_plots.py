@@ -1,6 +1,6 @@
 """sample_comparison_plots.py — one-dimensional sample-comparison plot for
 the Copula Model vs. the autoregressive marginal-chain baseline
-(src/autoregressive_baseline.py). Kept separate from correlation_plots.py,
+(eval/baselines/autoregressive.py). Kept separate from correlation_plots.py,
 which draws ERA5 lat/lon field grids (pcolormesh) — a different shape of
 plot from this generic per-point line/scatter chart over an arbitrary GP
 episode's covariates."""
@@ -55,10 +55,26 @@ def plot_sample_comparison(
         x0_train = np.asarray(x_train)[:, 0]
         ax.scatter(x0_train, y_train, s=18, color="gray", alpha=0.7, label="context (train)")
     ax.plot(x0_test[order], np.asarray(y_test_true)[order], "k.-", linewidth=1, markersize=4, label="true (test)")
-    ax.plot(x0_test[order], np.asarray(y_copula_sample)[order], "o-", color="#4c72b0",
-            linewidth=1, markersize=3, alpha=0.85, label="Copula Model sample")
-    ax.plot(x0_test[order], np.asarray(y_ar_chain_sample)[order], "s-", color="#c44e52",
-            linewidth=1, markersize=3, alpha=0.85, label="Autoregressive marginal-chain sample")
+    ax.plot(
+        x0_test[order],
+        np.asarray(y_copula_sample)[order],
+        "o-",
+        color="#4c72b0",
+        linewidth=1,
+        markersize=3,
+        alpha=0.85,
+        label="Copula Model sample",
+    )
+    ax.plot(
+        x0_test[order],
+        np.asarray(y_ar_chain_sample)[order],
+        "s-",
+        color="#c44e52",
+        linewidth=1,
+        markersize=3,
+        alpha=0.85,
+        label="Autoregressive marginal-chain sample",
+    )
     ax.set_xlabel("x (first covariate)")
     ax.set_ylabel("y")
     ax.set_title(title or "Sample comparison: Copula Model vs. autoregressive marginal-chain")

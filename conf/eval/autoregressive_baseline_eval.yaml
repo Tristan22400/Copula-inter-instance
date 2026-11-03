@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as autoregressive_baseline_eval_schema.
+defaults:
+  - autoregressive_baseline_eval_schema
+  - _runner
+  - _self_

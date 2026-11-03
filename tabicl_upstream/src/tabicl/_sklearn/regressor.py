@@ -77,8 +77,9 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
 
         The cache retains whatever dtype the model produced during ``fit()``
         (float16 when AMP is active, float32 otherwise). If the cache is later
-        loaded on CPU or on CUDA without AMP, the tensors are automatically
-        upcast to float32 to avoid dtype-mismatch errors.
+        loaded on a device without AMP, the tensors are automatically upcast to
+        float32 to avoid dtype-mismatch errors. With AMP enabled, reduced-precision
+        caches are kept on CPU, CUDA, XPU, and MPS.
 
     model_path : Optional[str or Path], default=None
         Path to the pre-trained model checkpoint file.
@@ -101,10 +102,10 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
         Checkpoints are downloaded from https://huggingface.co/jingang/TabICL.
 
     device : Optional[str or torch.device], default=None
-        Device to use for inference. If None, automatically selects CUDA if
-        available, otherwise CPU. Can be specified as a string (``'cuda'``,
-        ``'cpu'``, ``'mps'``) or a ``torch.device`` object. MPS (Apple Silicon
-        GPU) is supported but must be explicitly requested.
+        Device to use for inference. If None, automatically selects CUDA when
+        available, otherwise XPU, then MPS (Apple Silicon), and falls back to
+        CPU. Can be specified as a string (``'cuda'``, ``'xpu'``, ``'cpu'``,
+        ``'mps'``) or a ``torch.device`` object.
 
     use_amp : bool or "auto", default="auto"
         Controls automatic mixed precision (AMP) for inference.
@@ -121,6 +122,11 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
             | Large  (n >= 10240)                  |  on   |  on   |
             +--------------------------------------+-------+-------+
 
+            The AMP columns apply on CUDA / XPU / MPS. On CPU, ``use_amp="auto"``
+            stays off (explicit ``use_amp=True`` still enables bfloat16 autocast,
+            but local benchmarks found it much slower than fp32). The FA3 column
+            applies on CUDA only (``use_fa3="auto"`` is always off on CPU / MPS / XPU).
+
             The above heuristic is based on the observation that AMP can introduce overhead that outweighs
             its benefits for small inputs. In addition, it assumes that the training set is large relative to
             the test set and does not account for KV-cache scenarios. If it is suboptimal for your workload,
@@ -128,9 +134,9 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
 
     use_fa3 : bool or "auto", default="auto"
         Whether to use Flash Attention 3 that can speed up inference for large datasets on NVIDIA Hopper
-        GPUs like H100. Only effective when FA3 is installed.
+        GPUs like H100. Only effective on CUDA when FA3 is installed; a no-op on CPU / MPS / XPU.
         - True / False: force on / off.
-        - "auto": Automatically enable FA3 based on input data size using a simple heuristic (see above).
+        - "auto": Enable FA3 from the size heuristic above on CUDA only; always off on other devices.
 
     offload_mode : str or bool, default='auto'
         Controls where column-wise embedding outputs are stored during inference.
@@ -690,45 +696,22 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
                         f"TabICL got n_jobs={self.n_jobs} but there are only {n_logical_cores} logical cores available."
                         f" Only {n_logical_cores} threads will be used."
                     )
-                n_threads = max(n_logical_cores, self.n_jobs)
+                n_threads = min(n_logical_cores, self.n_jobs)
             else:
-                n_threads = max(1, mp.cpu_count() + 1 + self.n_jobs)
+                n_threads = max(1, n_logical_cores + 1 + self.n_jobs)
 
             torch.set_num_threads(n_threads)
 
         # Preserve DataFrame structure to retain column names and types for correct feature transformation
         X = validate_data(self, X, reset=False, dtype=None, skip_check_array=True)
 
-        # Detect all-NaN columns (used by SHAP's feature masking approach)
-        if hasattr(X, "columns"):  # check for dataframe without importing pandas
-            feature_mask = X.isna().all(axis=0).to_numpy()
-        else:
-            arr = np.asarray(X)
-            if np.issubdtype(arr.dtype, np.number):
-                feature_mask = np.isnan(arr).all(axis=0)
-            else:
-                # object dtype: v != v is True only for NaN in IEEE 754, safe for strings too
-                feature_mask = np.array([all(v != v for v in arr[:, i]) for i in range(arr.shape[1])])
-
-        if feature_mask is not None and not np.any(feature_mask):
-            feature_mask = None
-
-        # Fill masked columns so that transformers don't choke on NaN
-        if feature_mask is not None:
-            if hasattr(X, "columns"):  # Proxy way to check whether X is a dataframe
-                X.iloc[:, feature_mask] = 0.0
-            else:
-                X[:, feature_mask] = 0.0
-
         X = self.X_encoder_.transform(X)
 
         output_type = [output_type] if isinstance(output_type, str) else list(output_type)
 
-        # Skip KV cache when features are masked
         has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
-        use_cache = has_kv_cache and feature_mask is None
 
-        if use_cache:
+        if has_kv_cache:
             # Cache exists: forward only test data and use the pre-computed cache for training data
             test_data = self.ensemble_generator_.transform(X, mode="test")
             results = {key: [] for key in output_type}
@@ -741,8 +724,7 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
                 else:
                     results[output_type[0]].append(batch_out)
         else:
-            # No cache or masked features: forward both training and test data
-            data = self.ensemble_generator_.transform(X, mode="both", feature_mask=feature_mask)
+            data = self.ensemble_generator_.transform(X, mode="both")
             results = {key: [] for key in output_type}
             for Xs, ys in data.values():
                 batch_out = self._batch_forward(Xs, ys, output_type=output_type, alphas=alphas)

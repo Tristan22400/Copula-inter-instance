@@ -8,7 +8,7 @@ d_features: 10          # total feature columns; fallback used only when
 # Total feature count d ~ round(LogNormal(d_features_lognormal_loc,
 # d_features_lognormal_scale)), clipped to a minimum of 2, sampled once per
 # shard (every episode within one shard shares the same d — see
-# data_gen.py::_sample_d_features). Defaults below (loc=log(10), scale=0.4)
+# gp_episodes.py::_sample_d_features). Defaults below (loc=log(10), scale=0.4)
 # give d mostly in [5, 19], median 10 (matches the old fixed default).
 # Comment out both keys to fall back to the fixed d_features above.
 #
@@ -22,7 +22,7 @@ d_features_lognormal_loc: 2.302585    # log(10)
 d_features_lognormal_scale: 0.4
 
 # Kernel active-column selection (random per task, via gpytorch's own
-# active_dims kernel kwarg — see data_gen.py::_sample_active_dims).
+# active_dims kernel kwarg — see gp_episodes.py::_sample_active_dims).
 # A fraction ~ Uniform[inactive_frac_min, inactive_frac_max] of the
 # d_features columns is left inactive (irrelevant noise the model must
 # learn to ignore); the rest are the kernel's active_dims. Defaults below
@@ -47,7 +47,7 @@ n_tasks: 20000000
 # active kernel dims. Without the k-dependent shift, the k-dims-summed
 # squared distance grows ~linearly in k for standardized iid inputs, so a
 # fixed-in-k lengthscale collapses R_star toward the identity as k grows
-# (see data_gen.py::_kernel_prior_spec). Re-tune against
+# (see gp_episodes.py::_kernel_prior_spec). Re-tune against
 # tests/test_dataset_corr_uniform.py's abs(mean)<0.30 bound if
 # composite_exclude_kernels or the nugget prior change.
 #
@@ -69,9 +69,9 @@ alpha2_gamma_rate: 3.0
 # ARD: sample one independent lengthscale per active kernel dimension
 # (ard_num_dims=k) instead of one isotropic scalar shared across all k dims.
 # Applies to rbf/matern32/periodic/rational_quadratic ("cosine"/"dot_product"
-# can't be — see data_gen.py's module docstring). Default false preserves
+# can't be — see gp_episodes.py's module docstring). Default false preserves
 # prior behaviour. "periodic" is always capped to k=1 active dims regardless
-# (see data_gen.py).
+# (see gp_episodes.py).
 ard: true
 
 # Even when a kernel is ARD (via `ard: true` above), each episode
@@ -80,14 +80,14 @@ ard: true
 # across active dims instead of one independent value per dim — i.e. an
 # isotropic kernel in effect, mixed in among the ARD episodes. Default 0.0
 # (no isotropic override) preserves prior behaviour. See
-# data_gen.py::_build_scaled_kernel / _collapse_isotropic.
+# gp_episodes.py::_build_scaled_kernel / _collapse_isotropic.
 isotropic_ratio: 0.3
 
 # MLP feature mixing: optionally entangle the d_features input columns
 # through a small stack of random dense affine + nonlinearity layers,
 # applied to the GP's INPUT coordinates x (never to sampled outputs y)
 # before the existing per-episode z-normalisation -- preserves the EXACT
-# analytic oracle. See data_gen.py::apply_mlp_feature_mixing.
+# analytic oracle. See gp_episodes.py::apply_mlp_feature_mixing.
 # Default off: byte-for-byte no-op for every existing config/dataset.
 mlp_mixing_enabled: true
 # Fraction of episodes per generate_gp_batch call that get mixed at all
@@ -111,7 +111,7 @@ mlp_mix_weight_std: 1.0
 # mlp_mixing above (which the model DOES see, since it runs before
 # x_norm_train/x_norm_test are cut), this exists purely to stop the model
 # from solving "predict R_star" by recognising the kernel family straight off
-# its own input. See data_gen.py::apply_kernel_hidden_warp for why the
+# its own input. See gp_episodes.py::apply_kernel_hidden_warp for why the
 # down-projection bottleneck (not just extra depth) is what actually
 # prevents this. Default off: byte-for-byte no-op for every existing
 # config/dataset -- unvalidated at scale, same convention as
@@ -148,7 +148,7 @@ kernel_hidden_weight_std: 1.0
 # integral), discrete (quantize/censor). Runs on x alongside
 # tabiclv2_warp_features/mlp_mixing (never on sampled y), so the same
 # deterministic-feature-map argument keeps R_star/Sigma_star exact. See
-# data_gen.py::apply_structural_feature_warp / _STRUCTURAL_CATEGORIES.
+# gp_episodes.py::apply_structural_feature_warp / _STRUCTURAL_CATEGORIES.
 # Default off: byte-for-byte no-op for every existing config/dataset. Unlike
 # mlp_mixing/mean_fn above, NOT turned on here yet -- validate against
 # tests/test_dataset_corr_uniform.py on a pilot dataset before enabling by
@@ -163,7 +163,7 @@ structural_warp_num_ops_min: 2
 structural_warp_num_ops_max: 6
 # Category weights, exactly TempoPFN's own defaults. One op is drawn per
 # chosen category (uniform, except discrete: quantize 0.6 / censor 0.4, also
-# matching TempoPFN) -- see data_gen.py::_CATEGORY_OPS/_CATEGORY_SUB_OP_WEIGHTS.
+# matching TempoPFN) -- see gp_episodes.py::_CATEGORY_OPS/_CATEGORY_SUB_OP_WEIGHTS.
 structural_warp_category_weights:
   invariances: 0.6
   structure: 0.6
@@ -174,7 +174,7 @@ structural_warp_category_weights:
 # Pseudo-time axis for order-dependent ops (regime_change, shock_recovery,
 # amplitude_modulation, differential, resample_artifact, time_flip): value-
 # rank by default (decoupled from the train/test split, since the split is a
-# plain row-index slice -- see data_gen.py::_structural_warp_column). Setting
+# plain row-index slice -- see gp_episodes.py::_structural_warp_column). Setting
 # structural_warp_index_axis_enabled: true lets a structural_warp_index_axis_ratio
 # fraction of gated columns instead use the raw row-index axis (a more
 # faithful port of TempoPFN's real time axis), which *can* introduce a fixed
@@ -195,7 +195,7 @@ structural_warp_index_axis_ratio: 0.5
 # depends on the mean function (only mu_star does), so this diversifies
 # mu_star/z_train/z_test realism without perturbing R_star/Sigma_star at
 # all. Covers all four of CauKer's own mean families -- Zero, Linear,
-# Exponential, Sparse Anomalies. See data_gen.py::_sample_mean_module /
+# Exponential, Sparse Anomalies. See gp_episodes.py::_sample_mean_module /
 # _MeanFunctionBank / _GeneratorGP.
 # Default off (byte-for-byte no-op, same convention as mlp_mixing_enabled)
 # at the code level; turned on here.
@@ -204,7 +204,7 @@ mean_fn_enabled: true
 # ZeroMean).
 mean_fn_prob: 0.5
 # Conditional on non-zero (above), categorical weights over which family
-# fires: [linear, exponential, anomaly] (data_gen.py::_MeanFunctionBank).
+# fires: [linear, exponential, anomaly] (gp_episodes.py::_MeanFunctionBank).
 mean_fn_family_probs: [0.5, 0.25, 0.25]
 # Within the linear family, probability it also carries a linear trend (a
 # random direction across the full d-dimensional feature space) rather than
@@ -252,16 +252,16 @@ oracle_mode: prior
 #   kernels: [rbf, matern12, matern32, matern52, cosine, periodic, rational_quadratic, dot_product, polynomial]
 #
 # Available kernels: rbf, matern12, matern32, matern52, cosine, periodic, rational_quadratic, dot_product, polynomial
-# (plus "A+B"/"A*B" composites of all 9 of those — see data_gen.COMPOSITE_KERNELS / data_gen._COMPOSABLE_KERNELS)
+# (plus "A+B"/"A*B" composites of all 9 of those — see gp_episodes.COMPOSITE_KERNELS / gp_episodes._COMPOSABLE_KERNELS)
 kernel: rbf
 
 # Systematic composition (CauKer-style, github.com/ShifengXIE/CauKer): if
 # true, ignores kernel/kernels above entirely and instead samples a random
 # chain length M ~ round(LogNormal(composite_num_kernels_lognormal_loc,
 # _scale)), clipped to [composite_num_kernels_min, composite_num_kernels_max],
-# draws M elementary kernels with replacement from data_gen._COMPOSABLE_KERNELS
+# draws M elementary kernels with replacement from gp_episodes._COMPOSABLE_KERNELS
 # (minus composite_exclude_kernels below), and combines them left-to-right
-# with independently-sampled +/* operators — see data_gen.py::
+# with independently-sampled +/* operators — see gp_episodes.py::
 # _sample_kernel_chain_structure / _build_kernel_chain. Produces chain names
 # like "rbf+cosine*periodic" that are NOT in ALL_KERNELS/KERNEL_REGISTRY
 # (unbounded cardinality) and are not reconstructible via build_kernel_fn.
@@ -275,7 +275,7 @@ kernel: rbf
 # preserving the old chain-length-1/2/3 relative 60:25:15 shape) and a
 # decaying tail out to composite_num_kernels_max. Validated (many
 # independent small-B generate_gp_batch calls — see the batch-sampling
-# gotcha in data_gen.py's module docstring) against
+# gotcha in gp_episodes.py's module docstring) against
 # tests/test_dataset_corr_uniform.py: mean +0.166->+0.264 (still inside the
 # abs(mean)<0.30 bound), frac(R>0.7) 0.093->0.179. Does not address the
 # negative-correlation side (frac(R<-0.7) stays ~0.004-0.005) — that needs
@@ -287,10 +287,10 @@ composite_num_kernels_max: 8
 composite_num_kernels_lognormal_loc: 0.55
 composite_num_kernels_lognormal_scale: 1.05
 # Optional: drop elementary kernels from the systematic_composition sampling
-# pool (data_gen._COMPOSABLE_KERNELS) without affecting the static
+# pool (gp_episodes._COMPOSABLE_KERNELS) without affecting the static
 # COMPOSITE_KERNELS pool used by the non-systematic path. e.g. [periodic] to
 # exclude periodic chains entirely. Empty = sample from all of
-# data_gen._COMPOSABLE_KERNELS (rbf, matern12, matern32, matern52, cosine,
+# gp_episodes._COMPOSABLE_KERNELS (rbf, matern12, matern32, matern52, cosine,
 # periodic, rational_quadratic, dot_product, polynomial).
 composite_exclude_kernels: [cosine,periodic,dot_product,polynomial]
 
@@ -300,7 +300,7 @@ period_lognormal_scale: 0.4
 rq_alpha_gamma_concentration: 2.0    # rational_quadratic kernel's `rq_alpha`
 rq_alpha_gamma_rate: 1.0
 poly_power_min: 2     # polynomial kernel's integer degree d, sampled once per
-poly_power_max: 5     # generate_gp_batch call (shared by the whole batch — see data_gen.py)
+poly_power_max: 5     # generate_gp_batch call (shared by the whole batch — see gp_episodes.py)
 poly_offset_gamma_concentration: 2.0    # polynomial kernel's offset c
 poly_offset_gamma_rate: 1.0
 
@@ -308,7 +308,7 @@ poly_offset_gamma_rate: 1.0
 # s(x1) * s(x2), s(x) = tanh(a*(w.x+b)), a random hyperplane split of the
 # kernel's own active-column subspace, PSD via the Schur product theorem
 # (rank-1 PSD s s^T times PSD K stays PSD, for ANY real-valued s — see
-# data_gen.py::SignModulatedKernel) — see data_gen.py::SignModulatedKernel.
+# gp_episodes.py::SignModulatedKernel) — see gp_episodes.py::SignModulatedKernel.
 # w ~ N(0, I_k)/sqrt(k), b ~ N(0, 1), a ~ LogNormal(sharpness_lognormal_loc/
 # _scale), one independent draw per episode. Injects negative pairwise
 # correlation into R_star without touching oracle_mode or gp_posterior.
@@ -326,7 +326,7 @@ sign_modulation_sharpness_lognormal_scale: 0.5
 # coin flip (same granularity as mlp_mixing_prob — if it fires, EVERY episode
 # in that generate_gp_batch call gets its own independent (w, b) draw):
 #   sign_modulation_component_prob: applied per elementary kernel component,
-#     inside data_gen.py::_build_kernel_component -- covers bare kernels,
+#     inside gp_episodes.py::_build_kernel_component -- covers bare kernels,
 #     both sides of a static "A+B"/"A*B" composite, and every link of a
 #     systematic_composition chain, independently per component.
 #   sign_modulation_outer_prob: applied once more to the fully composed
@@ -363,7 +363,7 @@ pit_eps: 1.0e-6
 # always use the analytic oracle, unlike z_train_corruption below which
 # applies everywhere):
 #   analytic: exact closed-form GP-LOO whitened residual (R&W Eq. 5.12) --
-#             see data_gen.py::_generate_gp_batch_raw.
+#             see gp_episodes.py::_generate_gp_batch_raw.
 #   tabicl:   real K-fold PIT through the frozen TabICL marginal quantile
 #             head (pit.py::run_pit_batched), the same approximate estimator
 #             real (non-GP) deployment data would produce -- see
@@ -409,7 +409,7 @@ pit_eps: 1.0e-6
 #             z_train_split_calib_frac too -- a fully valid, self-consistent
 #             episode either way, just not byte-identical to a
 #             z_train_split_calib_frac=0 run at the same seed. See
-#             data_gen.py::_generate_gp_batch_raw's tabicl_split_calib_frac
+#             gp_episodes.py::_generate_gp_batch_raw's tabicl_split_calib_frac
 #             docstring for why a second renormalization pass after dropping
 #             the calibration block would be worse (decouples the saved
 #             coordinates from the already-computed oracle).
@@ -424,9 +424,9 @@ pit_eps: 1.0e-6
 # z_test/log_pdf_test with a real (non-oracle) tabular foundation model's own
 # K-fold PIT -- genuinely BATCHED across every episode in a shard-generation
 # call, same shape of speedup as "tabicl"'s pit.py::run_pit_batched, via
-# eval/spatial/{exaone,tabpfn,tabldm}_batched.py (registered in data_gen.py::
+# src/copula_inter/marginal/{exaone,tabpfn,tabldm}_batched.py (registered in gp_episodes.py::
 # _BATCHED_MARGINAL_BACKENDS; see _generate_gp_batch_raw's marginal_backend
-# arg). All three share one K-fold PIT driver, eval/spatial/_batched_pit.py
+# arg). All three share one K-fold PIT driver, src/copula_inter/marginal/batched_pit.py
 # -- only the per-backend quantile-bank call differs. "exaone" recovers LG AI
 # Research EXAONE-Tabular's real native 999-level quantile head, fused into
 # ONE forward per k-fold across the whole batch by concatenating every
@@ -435,7 +435,7 @@ pit_eps: 1.0e-6
 # verified bit-identical to the unbatched per-episode path on CPU,
 # tests/test_exaone_batched.py); "tabpfn" is PriorLabs TabPFN v3 (needs a
 # one-time license acceptance + `TABPFN_TOKEN` env var, see
-# _require_tabpfn_token in marginal_backends.py) and uses its own PUBLIC
+# _require_tabpfn_token in marginal/backends.py) and uses its own PUBLIC
 # TabPFNRegressor.predict_batched method for the same fusion, lower-risk
 # than exaone's approach since it needs no internal-API reverse-engineering
 # -- NOT execution-verified in this repo's environment (no TABPFN_TOKEN set
@@ -456,14 +456,14 @@ pit_eps: 1.0e-6
 # ~6ms/episode -- about 6x faster than the old per-episode loop at that
 # scale, but not TabICL-parity), and requires device='cuda' for
 # live-generation (CPU EXAONE is ~120x slower per call, see
-# eval/spatial/marginal_backends.py::make_regressor's "exaone" branch) --
+# src/copula_inter/marginal/backends.py::make_regressor's "exaone" branch) --
 # training.live_generation with z_train_source=exaone/tabpfn/tabldm raises
 # if device isn't 'cuda' (live_dataset.py::build_live_train_loader). TabLDM
 # on CPU measured ~4.9s per fit+predict call at P=32 -- far cheaper than
 # EXAONE's CPU path, still nowhere near usable for live generation. Any
-# backend eval/spatial/marginal_backends.py registers with no dedicated
+# backend src/copula_inter/marginal/backends.py registers with no dedicated
 # _batched module falls back to the slow per-episode Python loop instead
-# (see data_gen.py's marginal_backend branch); every registered backend
+# (see gp_episodes.py's marginal_backend branch); every registered backend
 # currently has one. Shares training.live_tabicl_num_workers/
 # live_tabicl_group_multiplier with "tabicl" (see conf/config.yaml) -- pilot
 # with a small batch_size/z_train_tabicl_k_folds/z_train_marginal_probs_n
@@ -476,7 +476,7 @@ pit_eps: 1.0e-6
 # exact analytic oracle (only "tabicl_split"'s sibling behavior -- every
 # other override above replaces those too), so this isolates exactly one
 # variable: does the ICL conditioning input need PIT preprocessing at all.
-# See data_gen.py::_generate_gp_batch_raw's raw_y_override and
+# See gp_episodes.py::_generate_gp_batch_raw's raw_y_override and
 # live_dataset.py's _RAW_Y_SOURCES. training.live_generation=true only -- no
 # on-disk generate_pit_dataset.py implementation exists (raises if selected
 # there).
@@ -558,7 +558,7 @@ z_train_split_calib_frac: 1.0
 # monitoring). Families with a larger measured gap (harder for TabICL to
 # approximate) get a higher mixing fraction, linearly interpolated between
 # the floor and max fractions below over the observed [min_gap, max_gap]
-# range across data_gen._COMPOSABLE_KERNELS.
+# range across gp_episodes._COMPOSABLE_KERNELS.
 #
 # Requires training.live_generation=true and a resolvable TabICL checkpoint
 # (same tabicl.ckpt/tabicl.pit_ckpt resolution as z_train_source=tabicl) and
@@ -586,12 +586,12 @@ z_train_tabicl_mix_max_frac: 0.35
 # called from the same block as save_checkpoint) -- reuses training.save_every
 # rather than a separate cadence knob, since it's already 10x rarer than
 # training.val_every by default and each re-measurement reloads the frozen
-# TabICL marginal, regenerates data_gen._COMPOSABLE_KERNELS-worth of probe
+# TabICL marginal, regenerates gp_episodes._COMPOSABLE_KERNELS-worth of probe
 # episodes, and frees it again (~1k+ extra episodes and a TabICL reload per
 # refresh -- not free, hence tied to the rarer cadence and opt-in).
 z_train_tabicl_mix_adaptive: false
 
-# z_train corruption (see data_gen.py::corrupt_z_train's docstring): trains
+# z_train corruption (see gp_episodes.py::corrupt_z_train's docstring): trains
 # the model to be robust to z_train NOT being the exact closed-form GP-LOO
 # whitened residual, since real (non-GP) deployment data can only ever
 # produce an approximate PIT (measured to recover only a fraction of the

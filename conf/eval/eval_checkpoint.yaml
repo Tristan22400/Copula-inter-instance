@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as eval_checkpoint_schema.
+defaults:
+  - eval_checkpoint_schema
+  - _runner
+  - _self_

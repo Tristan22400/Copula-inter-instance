@@ -4,7 +4,7 @@ Investigates why training with `data.z_train_source=tabicl` plateaus far from
 the oracle. Built as composable stages, each answering one question and
 writing `results/<run_id>/<stage>.json`, so the same measurements re-run
 after a change to the data prior (`conf/data/gp_tasks.yaml`) or the
-architecture (`src/model.py`, rank, parametrization) — pass `--baseline
+architecture (`src/copula_inter/copula/model.py`, rank, parametrization) — pass `--baseline
 <old_run_id>` to `report.py` to see what moved.
 
 ## Quick start
@@ -34,7 +34,7 @@ positional args on every stage, same syntax as `train.py`/`train_fast.py`.
 `oracle_diag/gap_nll` (the number you watch in wandb) is
 `total − oracle_posterior_total`, which bundles a copula term the model can
 improve with a marginal term it can't (the marginal comes from a *separate
-frozen* TabICL, `data_gen.py`'s `z_train_source=tabicl` override). `src/
+frozen* TabICL, `gp_episodes.py`'s `z_train_source=tabicl` override). `src/
 train.py::validate()` now also logs `oracle_diag/copula_gap` and
 `oracle_diag/marginal_gap` so the split is visible without re-deriving it
 (plus `oracle_diag/copula_headroom`, the Bayes-optimal copula reward the gap
@@ -93,14 +93,14 @@ undertraining. That's why S1 (rank ceiling) is the stage to run first.
 
 ## Reused, not reimplemented
 
-`src/pit.py::gp_analytical_posterior`, `src/loss.py::{y_space_nll,
-oracle_copula_nll, _safe_cholesky}`, `src/model.py::{low_rank_correlation,
-build_sigma}`, `src/data_gen.py::generate_gp_batch`,
-`src/dataset.py::collate_fn`, `src/pit.py::{load_tabicl, resolve_pit_ckpt,
+`src/copula_inter/marginal/pit.py::gp_analytical_posterior`, `src/copula_inter/copula/loss.py::{y_space_nll,
+oracle_copula_nll, _safe_cholesky}`, `src/copula_inter/copula/model.py::{low_rank_correlation,
+build_sigma}`, `src/copula_inter/data/gp_episodes.py::generate_gp_batch`,
+`src/copula_inter/data/dataset.py::collate_fn`, `src/copula_inter/marginal/pit.py::{load_tabicl, resolve_pit_ckpt,
 run_pit_batched, _probit}`, `eval/spatial/calibration.py::
-compute_quantile_ece`, `eval/spatial/marginal_backends.py`,
+compute_quantile_ece`, `src/copula_inter/marginal/backends.py`,
 `eval/metrics/joint_nll.py::{compute_pit, kfold_loo_pit}`,
-`eval/configs/checkpoints.py::resolve_checkpoint`.
+`src/copula_inter/checkpoint_registry.py::resolve_checkpoint`.
 
 ## Tests
 

@@ -1,0 +1,16 @@
+# Install once per clone: `uv run pre-commit install` (or `pipx run pre-commit install`).
+# Keep the ruff rev in step with the ruff pin in pyproject.toml's dev extra.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=5000]
+      - id: check-merge-conflict
+      - id: check-yaml

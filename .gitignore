@@ -22,4 +22,8 @@ eval/data/beijing_pm25/
 .agent/
 .env
 .env.*
+.venv/
+build/
+*.egg-info/
 *.token
+

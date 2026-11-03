@@ -1,0 +1,10 @@
+# @package _global_
+# Shared by every conf/eval/<runner>.yaml: no output directory, no chdir,
+# log to stdout only.
+defaults:
+  - override /hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

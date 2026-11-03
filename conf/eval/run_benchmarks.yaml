@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as run_benchmarks_schema.
+defaults:
+  - run_benchmarks_schema
+  - _runner
+  - _self_

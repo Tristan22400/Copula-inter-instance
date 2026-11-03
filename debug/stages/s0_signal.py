@@ -15,23 +15,17 @@ Usage:
     python debug/run_debug.py s0
     python debug/stages/s0_signal.py --n-episodes 100 data.P_min=32 data.P_max=32
 """
+
 from __future__ import annotations
 
 import argparse
-import os
-import sys
+from typing import Sequence
 
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "debug")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-import common
-from config import DebugConfig, add_common_args, build_config
+from debug import common
+from debug.config import DebugConfig, add_common_args, build_config
 
 P_SWEEP_DEFAULT = [16, 32, 64, 128, 256]
 
@@ -71,11 +65,14 @@ def run_one_P(dcfg: DebugConfig, P: int, n_episodes: int) -> dict:
         "n_episodes_scored": len(pairs),
         "n_episodes_requested": n_episodes,
         "copula_nll_per_point": {
-            "mean": float(np.mean(copula_per_pt)), "std": float(np.std(copula_per_pt)),
-            "min": float(np.min(copula_per_pt)), "max": float(np.max(copula_per_pt)),
+            "mean": float(np.mean(copula_per_pt)),
+            "std": float(np.std(copula_per_pt)),
+            "min": float(np.min(copula_per_pt)),
+            "max": float(np.max(copula_per_pt)),
         },
         "marginal_nll_per_point": {
-            "mean": float(np.mean(marginal_per_pt)), "std": float(np.std(marginal_per_pt)),
+            "mean": float(np.mean(marginal_per_pt)),
+            "std": float(np.std(marginal_per_pt)),
         },
         "offdiag_R_post": {
             "mean": float(offdiag.mean()) if offdiag.size else None,
@@ -91,7 +88,7 @@ def run_one_P(dcfg: DebugConfig, P: int, n_episodes: int) -> dict:
     }
 
 
-def run(dcfg: DebugConfig, P_sweep=None) -> dict:
+def run(dcfg: DebugConfig, P_sweep: Sequence[int] | None = None) -> dict:
     P_sweep = P_sweep or P_SWEEP_DEFAULT
     per_P = [run_one_P(dcfg, P, dcfg.n_episodes) for P in P_sweep]
     return {"P_sweep": P_sweep, "per_P": per_P}
@@ -100,13 +97,21 @@ def run(dcfg: DebugConfig, P_sweep=None) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(p)
-    p.add_argument("--P-sweep", default=",".join(str(x) for x in P_SWEEP_DEFAULT),
-                   help="Comma-separated P values to sweep (default: 16,32,64,128,256)")
+    p.add_argument(
+        "--P-sweep",
+        default=",".join(str(x) for x in P_SWEEP_DEFAULT),
+        help="Comma-separated P values to sweep (default: 16,32,64,128,256)",
+    )
     args = p.parse_args()
 
     dcfg = build_config(
-        overrides=args.override, model_preset=args.model, n_episodes=args.n_episodes,
-        ckpt=args.ckpt, device=args.device, seed=args.seed, run_id=args.run_id,
+        overrides=args.override,
+        model_preset=args.model,
+        n_episodes=args.n_episodes,
+        ckpt=args.ckpt,
+        device=args.device,
+        seed=args.seed,
+        run_id=args.run_id,
     )
     P_sweep = [int(x) for x in args.P_sweep.split(",")]
     result = run(dcfg, P_sweep=P_sweep)

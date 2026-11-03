@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------
 # gp_tasks_marginal — the GP prior as Phase-A marginal fine-tuning
-# (src/finetune_marginal.py) draws it. Inherits conf/data/gp_tasks.yaml
+# (src/copula_inter/finetune_marginal.py) draws it. Inherits conf/data/gp_tasks.yaml
 # wholesale and changes exactly two things.
 #
 # Why a separate group file rather than a `data:` block in

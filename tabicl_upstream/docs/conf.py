@@ -3,16 +3,6 @@
 # For the full list of built-in configuration values, see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
-import warnings
-
-# Suppress known gluonts warning on Python >= 3.14 during docs builds.
-warnings.filterwarnings(
-    "ignore",
-    message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.",
-    category=UserWarning,
-    module="gluonts\\.pydantic",
-)
-
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
@@ -52,6 +42,7 @@ autodoc_default_options = {
     "inherited-members": False,
 }
 autodoc_typehints = "none"
+autodoc_mock_imports = ["shap", "shapiq"]
 # Keep default arguments as their source-code names (e.g. `DEFAULT_FIXED_HP`)
 # instead of evaluating them into the full dict/list repr, which bloats
 # signatures like `PriorDataset(..., scm_fixed_hp={<huge dict>}, ...)`.
@@ -62,6 +53,7 @@ intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
     "sklearn": ("https://scikit-learn.org/stable/", None),
+    "skrub": ("https://skrub-data.org/stable/", None),
     "torch": ("https://pytorch.org/docs/stable/", None),
 }
 

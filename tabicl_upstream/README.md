@@ -2,19 +2,19 @@
 [![PyPI version](https://badge.fury.io/py/tabicl.svg)](https://badge.fury.io/py/tabicl)
 [![Downloads](https://img.shields.io/pypi/dm/tabicl)](https://pypistats.org/packages/tabicl)
 
-# TabICLv2: A state-of-the-art tabular foundation model
+# TabICLv2: An open tabular foundation model
 
 This repository is the official implementation of **TabICLv2** ([ICML 2026](https://arxiv.org/abs/2602.11139)) 
 and **TabICL** ([ICML 2025](https://arxiv.org/abs/2502.05564)).
 
-**State-of-the-art accuracy even without hyperparameter tuning:** 
-TabICLv2 is the new state-of-the-art model for tabular classification and regression 
+**Strong performance without hyperparameter tuning:** 
+TabICLv2 is a competitive model for tabular classification and regression 
 on the [TabArena](https://tabarena.ai) and [TALENT](https://arxiv.org/abs/2407.00956) benchmarks. 
 It does not require hyperparameter tuning 
-and still outperforms heavily tuned XGBoost, CatBoost, or LightGBM on TabArena on ~80% of datasets.
+and outperforms heavily tuned XGBoost, CatBoost, or LightGBM on TabArena on ~80% of datasets.
 
 **Easy to use:** TabICL is pip-installable and scikit-learn compliant. 
-It is also **open source** (including [pre-training](#pre-training) for v1), 
+It is also **open source** (including [pre-training](#pre-training)), 
 with a permissive license.
 
 **Speed:** TabICL performs `fit` and `predict` jointly via a single 
@@ -111,7 +111,7 @@ clf = TabICLClassifier(
     model_path=None,  # path to checkpoint, None downloads from Hugging Face
     allow_auto_download=True,  # auto-download checkpoint if not found locally
     checkpoint_version="tabicl-classifier-v2-20260212.ckpt",  # pretrained checkpoint version
-    device=None,  # inference device, None auto-selects CUDA or CPU; specify "mps" for Apple Silicon
+    device=None,  # inference device: None auto-selects CUDA → XPU → MPS → CPU
     use_amp="auto",  # automatic mixed precision for faster inference
     use_fa3="auto",  # Flash Attention 3 for Hopper GPUs (e.g. H100)
     offload_mode="auto",  # automatically decide when to use cpu/disk offloading
@@ -134,7 +134,7 @@ clf = TabICLClassifier(
 | **TabICLv1.1** (May 2025, no paper) | `tabicl-classifier-v1.1-20250506.ckpt` | — |
 | **TabICLv1** ([ICML 2025](https://arxiv.org/abs/2502.05564)) | `tabicl-classifier-v1-20250208.ckpt` | — |
 
-- **TabICLv2**: Our state-of-the-art model, supporting both classification and regression.
+- **TabICLv2**: Our latest model, supporting both classification and regression.
   Strongly improved accuracy over v1 through better synthetic pre-training data,
   architectural improvements, and better pre-training, with comparable runtime.
 - **TabICLv1.1**: TabICLv1 post-trained on an early version of the v2 prior. Classification only.
@@ -287,10 +287,50 @@ plot_shap(shap_values)
 
 ## Pre-training
 
-Pre-training code (including synthetic data generation) is currently available for the v1 model. 
-The scripts folder provides the commands for [stage 1](./scripts/train_stage1.sh), [stage 2](./scripts/train_stage2.sh), 
-and [stage 3](./scripts/train_stage3.sh) of curriculum learning.
-Pre-training code for v2 will be released upon publication.
+Pre-training code (including synthetic data generation) is available for **both TabICLv1 and TabICLv2**.
+
+> **Note:** The original pre-training likely used AMP with float16, but this can lead to instabilities 
+> (https://github.com/soda-inria/tabicl/pull/151#discussion_r3869087460), 
+> so we're leaving float32 as the default value in the scripts.
+> While the code has been vibe-migrated from the original
+> (private) pre-training codebase, users have been able to achieve good performance with it.
+> On systems with fewer CPU cores, it might speed up the training to reduce n_jobs 
+> (e.g., to 12 on a 64-core system). 
+> On 4xH100, it should be possible to reach 0.7-0.8s/step 
+> for stage 1 with float16 and 1s/step with float32.
+
+The easiest way to pre-train is to run the stage scripts in the `scripts` folder, which contain
+the full recipes (they launch `python -m tabicl.train` under `torchrun` with all arguments set).
+Adjust the placeholder checkpoint paths, `NUM_GPUS`, and `--n_jobs` at the top of each script for
+your hardware, then run the three stages in order, e.g. for the TabICLv2 classifier:
+
+```bash
+bash scripts/train_v2_clf_stage1.sh
+bash scripts/train_v2_clf_stage2.sh   # loads the stage-1 checkpoint
+bash scripts/train_v2_clf_stage3.sh   # loads the stage-2 checkpoint
+```
+
+Available recipes:
+- **TabICLv2** ([arXiv](https://arxiv.org/abs/2602.11139), §4.1): classifier [stage 1](./scripts/train_v2_clf_stage1.sh), [stage 2](./scripts/train_v2_clf_stage2.sh),
+  [stage 3](./scripts/train_v2_clf_stage3.sh); regressor [stage 1](./scripts/train_v2_reg_stage1.sh),
+  [stage 2](./scripts/train_v2_reg_stage2.sh), [stage 3](./scripts/train_v2_reg_stage3.sh).
+- **TabICLv1**: [stage 1](./scripts/train_stage1.sh), [stage 2](./scripts/train_stage2.sh),
+  [stage 3](./scripts/train_stage3.sh).
+
+By default, `tabicl.train` generates synthetic prior datasets **on the fly** in the DataLoader
+workers while training — this is how the TabICLv2 checkpoints were trained (and what the v2
+scripts do). Alternatively, datasets can be **pre-generated to disk** with
+`python -m tabicl.prior --save_dir /my/prior/dir --num_batches 100000 ...` and loaded during
+training via `--prior_dir`, which is how TabICLv1 was trained (the v1 scripts show both variants).
+
+Training supports classification (cross-entropy) and quantile regression (pinball loss, via
+`--regression_method quantile`), and both the **AdamW** (default) and **Muon** (`--muon True`)
+optimizers. See `python -m tabicl.train --help` for the full set of options.
+
+A note on the v2 training: the paper reports using cautious weight decay, which is
+available via `--use_cautious_wd`, but the released checkpoints were trained with it left `False`
+(it was not wired into Muon during the reference runs), so the v2 scripts keep it `False` to
+reproduce that behavior.
 
 ## Nanotabicl: a minimal architecture implementation
 
@@ -326,8 +366,7 @@ We have not tested if TabICL generalizes to datasets smaller than 300 samples.
 <img src="./docs/figures/tabiclv2_perf_vs_n_samples.png" width="70%" alt="Average rank vs. number of samples" style="display: block; margin: auto;">
 
 **What about the number of columns?**
-TabICLv2 is pre-trained on datasets between 2 and 100 columns. 
-We see good generalization to more columns and don't know where the limit is.
+TabICLv2 is pre-trained on datasets between 2 and 100 columns. It can degrade when going much beyond 100 features.
 
 <img src="./docs/figures/tabiclv2_perf_vs_n_features.png" width="70%" alt="Average rank vs. number of features" style="display: block; margin: auto;">
 
@@ -407,4 +446,4 @@ please cite our papers for **[TabICL](https://arxiv.org/abs/2502.05564)** and **
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=soda-inria/tabicl&type=date&legend=top-left)](https://www.star-history.com/#soda-inria/tabicl&type=date&legend=top-left)
+[![Star History Chart](https://star-history.dera.page/svg?repos=soda-inria/tabicl&type=date&legend=top-left)](https://star-history.dera.page/#soda-inria/tabicl&type=date&legend=top-left)

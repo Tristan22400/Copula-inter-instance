@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import WhiteKernel, Matern
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 
 __all__ = ["fit_predict"]
 

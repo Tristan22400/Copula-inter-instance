@@ -10,7 +10,7 @@ dragging down the mixed-kernel average.
 Thin wrapper over scripts/train_fast.py: forces
 data.systematic_composition=false data.kernel=<KERNEL>
 training.adaptive_kernel_sampling=false (that flag silently goes inert on
-the fixed-kernel branch anyway, see data_gen.py::_resolve_kernel_name --
+the fixed-kernel branch anyway, see gp_episodes.py::_resolve_kernel_name --
 disabling it here just makes the run's intent explicit in its config/logs)
 and forwards everything else verbatim, so this is not a separate
 implementation of the debug loop, just a documented invocation of the
@@ -20,6 +20,7 @@ Usage:
     python debug/run_debug.py s8 --kernel rbf
     python debug/stages/s8_single_kernel.py --kernel matern52 -- training.steps=2000 data.P_min=32 data.P_max=32
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,8 +32,15 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
 AVAILABLE_KERNELS = [
-    "rbf", "matern12", "matern32", "matern52", "cosine", "periodic",
-    "rational_quadratic", "dot_product", "polynomial",
+    "rbf",
+    "matern12",
+    "matern32",
+    "matern52",
+    "cosine",
+    "periodic",
+    "rational_quadratic",
+    "dot_product",
+    "polynomial",
 ]
 
 
@@ -50,7 +58,11 @@ def build_overrides(kernel: str, extra: "list[str]") -> "list[str]":
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kernel", default="rbf", choices=AVAILABLE_KERNELS)
-    p.add_argument("extra", nargs=argparse.REMAINDER, help="Extra Hydra overrides forwarded to train_fast.py verbatim (put a lone -- before them if any start with --)")
+    p.add_argument(
+        "extra",
+        nargs=argparse.REMAINDER,
+        help="Extra Hydra overrides forwarded to train_fast.py verbatim (put a lone -- before them if any start with --)",
+    )
     args = p.parse_args()
 
     extra = [a for a in args.extra if a != "--"]

@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as marginal_calibration_eval_schema.
+defaults:
+  - marginal_calibration_eval_schema
+  - _runner
+  - _self_

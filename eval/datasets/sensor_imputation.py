@@ -90,11 +90,7 @@ def _build_instance_table() -> pd.DataFrame:
     frames = []
     for path in csv_paths:
         df = pd.read_csv(path)
-        daily = (
-            df.groupby(["station", "year", "month", "day"])[["PM2.5", "TEMP", "PRES", "DEWP"]]
-            .mean()
-            .reset_index()
-        )
+        daily = df.groupby(["station", "year", "month", "day"])[["PM2.5", "TEMP", "PRES", "DEWP"]].mean().reset_index()
         frames.append(daily)
     all_daily = pd.concat(frames, ignore_index=True)
     all_daily = all_daily.dropna(subset=["PM2.5", "TEMP", "PRES", "DEWP"])

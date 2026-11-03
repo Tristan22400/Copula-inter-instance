@@ -34,18 +34,8 @@ set -uo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR/.."
 
-# ----- Env (mirrors scripts/train.sh / scripts/finetune_era5.sh) -----
-CONDA_BASE="$HOME/thoth_storage/miniconda3"
-CONDA_ENV="$CONDA_BASE/envs/multivariate-icl"
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-else
-    source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
-fi
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# ----- Env: the shared job setup (uv venv, PYTHONPATH) -----
+source scripts/_env.sh
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 TABPFN_TOKEN_FILE="${TABPFN_TOKEN_FILE:-$HOME/.config/tabpfn_token}"
