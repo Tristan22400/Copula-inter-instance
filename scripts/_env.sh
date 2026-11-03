@@ -1,16 +1,25 @@
-# Shared job setup: cd to this checkout's root, activate the conda env, and put
-# this checkout's packages first on PYTHONPATH. Source it from scripts/*.sh.
+# Shared job setup: cd to this checkout's root, activate its uv virtualenv, and
+# put this checkout's packages first on PYTHONPATH. Source it from scripts/*.sh.
+#
+# The venv is created once per machine, from the checkout root:
+#     uv sync --locked --extra dev --extra gpu      # --extra cpu on a machine without CUDA
+# A git worktree without its own .venv uses the main checkout's; COPULA_VENV
+# overrides both.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-CONDA_BASE="${CONDA_BASE:-$HOME/thoth_storage/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-multivariate-icl}"
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-else
-    source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
+if [[ -z "${COPULA_VENV:-}" ]]; then
+    COPULA_VENV="$REPO_ROOT/.venv"
+    if [[ ! -d "$COPULA_VENV" ]]; then
+        git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+        [[ -n "$git_common_dir" ]] && COPULA_VENV="$(dirname "$git_common_dir")/.venv"
+    fi
 fi
+if [[ ! -f "$COPULA_VENV/bin/activate" ]]; then
+    echo "_env.sh: no virtualenv at $COPULA_VENV; run 'uv sync --locked --extra dev --extra gpu' in $REPO_ROOT" >&2
+    exit 1
+fi
+source "$COPULA_VENV/bin/activate"
 
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:$REPO_ROOT/tabicl_upstream/src${PYTHONPATH:+:$PYTHONPATH}"

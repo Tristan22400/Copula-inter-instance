@@ -13,10 +13,12 @@ case "$f" in
   "$root"/tabicl_upstream/* | "$root"/*_upstream/*) exit 0 ;;
 esac
 
-env_bin=${COPULA_ENV_BIN:-/srv/storage/thoth1@storage4.grenoble.grid5000.fr/trmartin/miniconda3/envs/multivariate-icl/bin}
+# The checkout's uv venv, else COPULA_ENV_BIN (e.g. a venv kept off a slow mount), else PATH.
+env_bin=${COPULA_ENV_BIN:-}
 tool() {
   if [[ -x "$root/.venv/bin/$1" ]]; then echo "$root/.venv/bin/$1"; return; fi
-  command -v "$1" 2>/dev/null || { [[ -x "$env_bin/$1" ]] && echo "$env_bin/$1"; }
+  if [[ -n "$env_bin" && -x "$env_bin/$1" ]]; then echo "$env_bin/$1"; return; fi
+  command -v "$1" 2>/dev/null
 }
 ruff=$(tool ruff)
 mypy=$(tool mypy)
