@@ -394,8 +394,6 @@ def main(cfg: DictConfig) -> None:
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
     aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
-    # Weight of the backbone's MoE auxiliary loss (TabLDM only).
-    moe_aux_weight = float(t.get("moe_aux_weight", 1.0))
     adaptive_mix = bool(cfg.data.get("z_train_tabicl_mix_adaptive", False))
 
     model.train()
@@ -453,7 +451,6 @@ def main(cfg: DictConfig) -> None:
                 phase_start=timer.start,
                 phase_end=timer.end,
                 parametrization=parametrization,
-                moe_aux_weight=moe_aux_weight,
             )
             # At log steps, count this step's FLOPs with FlopCounterMode in a separate
             # throwaway forward+backward (grads discarded) for MFU.
@@ -470,7 +467,6 @@ def main(cfg: DictConfig) -> None:
                         jitter=jitter,
                         triu_cache=triu_cache,
                         parametrization=parametrization,
-                        moe_aux_weight=moe_aux_weight,
                     )
                 except torch.cuda.OutOfMemoryError:
                     # OOM during the FLOP measurement only: skip the count, keep the step.

@@ -1,13 +1,13 @@
 """Debug stage S7a: compare marginal backends' z_train through the same trained copula model.
 
 For each synthetic task (constants.SYNTHETIC_SWEEP_PROFILES) and backend
-(tabicl, tabpfn, exaone): the gap of the backend's K-fold PIT z_train to the
+(tabicl, tabpfn): the gap of the backend's K-fold PIT z_train to the
 exact GP LOO z_train; the correlation recovery (shape_corr, rmse, bias,
 model_r2) when that z_train is fed to --ckpt; and the Y-space joint NLL on
 held-out points. tabpfn needs TABPFN_TOKEN.
 
 Usage:
-    python debug/stages/s7_backbone.py --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn,exaone
+    python debug/stages/s7_backbone.py --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn
 """
 
 from __future__ import annotations
@@ -155,7 +155,7 @@ def main() -> None:
     parser.add_argument(
         "--backends",
         type=str,
-        default="tabicl,exaone",
+        default="tabicl",
         help=f"Comma-separated subset of {list(MARGINAL_BACKENDS)}. 'tabpfn' needs TABPFN_TOKEN.",
     )
     parser.add_argument(

@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,7 +20,6 @@ from copula_inter.data.contracts import assemble_episodes, validate_episode
 from copula_inter.data.dataset import CopulaDataset, collate_fn
 from copula_inter.data.manifest import dataset_identity, ensure_manifest, generation_spec, verified_shard_digest
 from copula_inter.generate_pit_dataset import _refresh_meta, _save_shard_atomic, _shard_is_resumable
-from copula_inter.marginal.backends import _exaone_capture_quantile_bank
 from copula_inter.marginal.finetune_adapters import TIER0_PATTERNS
 from eval.results import (
     competition_ranks,
@@ -279,12 +277,12 @@ def test_eval_uses_configured_dataset_directory_in_cache_key() -> None:
 
 
 def test_backend_registry_capabilities() -> None:
-    assert set(COPULA_BACKBONES) == {"tabicl", "tabldm"}
-    assert set(GENERIC_MARGINAL_BACKENDS) == {"exaone", "tabpfn", "tabldm"}
+    assert set(COPULA_BACKBONES) == {"tabicl"}
+    assert set(GENERIC_MARGINAL_BACKENDS) == {"tabpfn"}
     assert all(name == backend.name for name, backend in BACKENDS.items())
     assert set(BACKENDS) == set(TIER0_PATTERNS)
     with pytest.raises(ValueError, match="does not support"):
-        require_capability("exaone", "copula_backbone")
+        require_capability("tabpfn", "copula_backbone")
 
 
 def test_training_core_import_does_not_load_reporting_or_era5() -> None:
@@ -331,23 +329,6 @@ def test_package_layering() -> None:
                     if top in _FIRST_PARTY and top != package and top not in _ALLOWED_IMPORTS[package]:
                         violations.append(f"{path.relative_to(repo)}:{node.lineno} imports {name}")
     assert not violations, "\n".join(violations)
-
-
-def test_exaone_adapter_overrides_only_one_instance() -> None:
-    class FakeRegressor:
-        manifest = SimpleNamespace(runtime=SimpleNamespace(ensemble_count=1), output_width=3)
-
-        def _collapse_members(self, output: Any, query_count: int) -> Any:
-            return output.sum(dim=-1)
-
-    first, second = FakeRegressor(), FakeRegressor()
-    output = torch.tensor([[[3.0, 1.0, 2.0]]])
-    original = second._collapse_members(output, 1)
-    with _exaone_capture_quantile_bank(first):
-        torch.testing.assert_close(first._collapse_members(output, 1), torch.tensor([[[1.0, 2.0, 3.0]]]))
-        torch.testing.assert_close(second._collapse_members(output, 1), original)
-    assert "_collapse_members" not in first.__dict__
-    torch.testing.assert_close(first._collapse_members(output, 1), original)
 
 
 def test_legacy_shards_are_identified_without_rehashing(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

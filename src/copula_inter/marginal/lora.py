@@ -22,18 +22,10 @@ if TYPE_CHECKING:
 
 
 def _get_mha_class() -> tuple[type[nn.Module], ...]:
-    """Tuple of MultiheadAttention classes LoRAMultiheadAttention can replace (TabICL's, plus TabLDM's if installed)."""
+    """Tuple of MultiheadAttention classes LoRAMultiheadAttention can replace (TabICL's)."""
     from tabicl._model.layers import MultiheadAttention
 
-    classes: list[type[nn.Module]] = [MultiheadAttention]
-    try:
-        from tabldm._model.layers import MultiheadAttention as TabLDMMHA
-    except Exception:
-        pass
-    else:
-        if TabLDMMHA is not MultiheadAttention:
-            classes.append(TabLDMMHA)
-    return tuple(classes)
+    return (MultiheadAttention,)
 
 
 def _get_mha_forward() -> Callable[..., Any]:
@@ -214,7 +206,6 @@ def _replace_mha_in_module(
             # Only replace if the full name contains one of the requested stage keywords
             stage_match = any(_STAGE_KEYWORDS[s] in full_name for s in stages if s in _STAGE_KEYWORDS)
             if stage_match:
-                # TabLDM's class is a byte-identical fork of TabICL's.
                 mha = cast("MultiheadAttention", child)
                 lora_mha = LoRAMultiheadAttention(mha, rank=rank, alpha=alpha, target=target)
                 setattr(parent, child_name, lora_mha)
@@ -376,7 +367,7 @@ def merged_base_state_dict(backbone: nn.Module) -> dict:
 
 
 # All-layer LoRA via torch.nn.utils.parametrize: adapts parameters rather than
-# modules, so it covers architectures without swappable attention (EXAONE).
+# modules, so it covers architectures without swappable attention.
 class LoRAParametrization(nn.Module):
     """Parametrization W -> W + (B @ A) * alpha / rank.
 

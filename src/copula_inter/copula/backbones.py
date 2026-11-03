@@ -1,18 +1,17 @@
-"""Copula backbones: build the trunk, strip its quantile decoder, and expose any auxiliary loss.
+"""Copula backbone: build the TabICL trunk and strip its quantile decoder.
 
-cfg.model.backbone selects "tabicl" or "tabldm" (both have a strippable
-icl_predictor.decoder). This is independent of the marginal used for the PIT.
+cfg.model.backbone selects the trunk ("tabicl" is the only one). This is
+independent of the marginal used for the PIT.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
-from torch import Tensor
 
 from copula_inter.backend_registry import COPULA_BACKBONES
 from tabicl._model.tabicl import TabICL
@@ -20,7 +19,6 @@ from tabicl._model.tabicl import TabICL
 __all__ = [
     "load_raw_backbone",
     "strip_decoder",
-    "moe_aux_loss",
 ]
 
 
@@ -74,41 +72,6 @@ def _build_tabicl_scratch(cfg: DictConfig) -> TabICL:
     )
 
 
-# Xiaomi-TabLDM, loaded through copula_inter.marginal.backends.
-def _load_tabldm(cfg: DictConfig) -> nn.Module:
-    """Load the pretrained Xiaomi-TabLDM trunk (no from-scratch option).
-
-    cfg.tabicl.recompute=true enables gradient checkpointing on every stage;
-    false keeps the checkpoint's own settings.
-    """
-    if not bool(cfg.tabicl.get("pretrained", True)):
-        raise ValueError(
-            "model.backbone='tabldm' has no from-scratch architecture — "
-            "cfg.tabicl.pretrained=false is not supported for this backbone. "
-            "Use model.backbone='tabicl' for a from-scratch run, or leave "
-            "tabicl.pretrained at its default (true) here."
-        )
-
-    from copula_inter.marginal.backends import make_regressor
-
-    regressor = make_regressor("tabldm", device="cpu")
-    regressor._load_model()
-    module = regressor.model_
-
-    if bool(cfg.tabicl.get("recompute", False)):
-        n_flipped = 0
-        for sub in module.modules():
-            if hasattr(sub, "recompute"):
-                sub.recompute = True
-                n_flipped += 1
-        print(
-            f"[copula_backbones] tabldm: forced recompute=True on {n_flipped} "
-            "submodules (gradient checkpointing escalated for OOM headroom)."
-        )
-
-    return module
-
-
 def load_raw_backbone(name: str, cfg: DictConfig) -> nn.Module:
     """Build the named backbone before decoder stripping, from cfg.tabicl.*."""
     if name == "tabicl":
@@ -117,8 +80,6 @@ def load_raw_backbone(name: str, cfg: DictConfig) -> nn.Module:
         if pretrained:
             return _load_pretrained_tabicl(cfg.tabicl.ckpt, recompute=recompute)
         return _build_tabicl_scratch(cfg)
-    if name == "tabldm":
-        return _load_tabldm(cfg)
     raise ValueError(f"Unknown copula backbone {name!r}; expected one of {list(COPULA_BACKBONES)}.")
 
 
@@ -129,10 +90,3 @@ def strip_decoder(module: Any) -> int:
     in_features = first_linear.in_features
     module.icl_predictor.decoder = nn.Identity()
     return in_features
-
-
-def moe_aux_loss(name: str, module: Any) -> Optional[Tensor]:
-    """The backbone's auxiliary loss: TabLDM's MoE z-loss + load-balance term, None for TabICL."""
-    if name == "tabldm":
-        return module.icl_predictor.moe_aux_loss()
-    return None

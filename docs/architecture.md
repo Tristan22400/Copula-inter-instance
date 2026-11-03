@@ -95,8 +95,8 @@ Subpackages:
 - **`marginal/`** turns targets into *z*.
   - `pit.py`: PIT through TabICL, batched and differentiable variants, and the exact-GP equivalent.
   - `kfold.py`: backend-agnostic PIT from any quantile grid.
-  - `backends.py`: the K-fold PIT for every marginal backend (TabICL, TabPFN, EXAONE, TabLDM).
-  - `batched_pit.py`, `*_batched.py`: fast batched paths for the non-TabICL backends.
+  - `backends.py`: the K-fold PIT for every marginal backend (TabICL, TabPFN).
+  - `batched_pit.py`, `tabpfn_batched.py`: fast batched path for TabPFN.
   - `tabicl_regressor.py`: helpers around the sklearn-style `TabICLRegressor`.
   - `calibration.py`: quantile ECE.
   - Phase A: `finetune_adapters.py` (per-architecture parameter selection and checkpoint format), `tiers.py`, `lora.py`, `objective.py`, `finetune_data.py`.

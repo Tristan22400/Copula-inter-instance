@@ -14,9 +14,9 @@ already revealed ones. Its total NLL is an exact factorization of a joint
 density, so it is the copula-free reference the copula head has to beat.
 
 **Backend / backbone.** A *marginal backend* is a tabular foundation model used
-for the PIT: `tabicl`, `tabpfn`, `exaone` or `tabldm`, listed in
+for the PIT: `tabicl` or `tabpfn`, listed in
 `backend_registry.py`. A *copula backbone* is the ICL trunk the copula head sits
-on (`model.backbone`: `tabicl` or `tabldm`). The two choices are independent.
+on (`model.backbone`: only `tabicl`). The two choices are independent.
 
 **Copula NLL / marginal NLL / total (Y-space) NLL.** The two terms of Sklar's
 decomposition and their sum, in nats per query point. The total is a proper
@@ -67,4 +67,4 @@ NLL scores.
 
 **`z_train_source`.** Which marginal produces the PIT for generated episodes:
 `analytic`, `tabicl`, `tabicl_split` (query scored against a disjoint
-calibration split), `exaone`, `tabpfn` or `tabldm`.
+calibration split) or `tabpfn`.

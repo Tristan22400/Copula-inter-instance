@@ -390,8 +390,7 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         raise ValueError(
             "training.live_source=era5 requires a resolvable TabICL checkpoint — "
             "set tabicl.ckpt (with tabicl.pretrained=true) or tabicl.pit_ckpt, "
-            "or select a non-TabICL marginal with data.z_train_source="
-            "exaone/tabpfn/tabldm."
+            "or select the TabPFN marginal with data.z_train_source=tabpfn."
         )
     ecfg = _resolve_era5_cfg(cfg)
     k_folds = int(cfg.tabicl.get("pit_k_folds", 10))
@@ -448,8 +447,7 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
         raise ValueError(
             "training.live_source=era5 requires a resolvable TabICL checkpoint — "
             "set tabicl.ckpt (with tabicl.pretrained=true) or tabicl.pit_ckpt, "
-            "or select a non-TabICL marginal with data.z_train_source="
-            "exaone/tabpfn/tabldm."
+            "or select the TabPFN marginal with data.z_train_source=tabpfn."
         )
     k_folds = int(cfg.tabicl.get("pit_k_folds", 10))
     tabicl_model = None

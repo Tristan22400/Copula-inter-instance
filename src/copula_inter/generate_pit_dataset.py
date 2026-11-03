@@ -11,7 +11,7 @@ Usage:
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000000 data.shard_size=512
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl_split
-    python -m copula_inter.generate_pit_dataset data.n_tasks=500 data.z_train_source=tabldm
+    python -m copula_inter.generate_pit_dataset data.n_tasks=500 data.z_train_source=tabpfn
 """
 
 from __future__ import annotations

@@ -13,14 +13,10 @@
 # Uses `_global_` packaging so this one file (selected via `model=...`) sets
 # both `model.*` (the copula head) and `tabicl.*` (the backbone) — the whole
 # experiment in one edit. See conf/model/copula_nano.yaml for the
-# from-scratch fast dev-loop counterpart, and
-# conf/model/copula_prod_tabldm.yaml for the Xiaomi-TabLDM backbone variant
-# of this same preset.
+# from-scratch fast dev-loop counterpart.
 # ---------------------------------------------------------------------------
 model:
-  backbone: tabicl           # which src/copula_inter/copula/backbones.py backbone to use:
-                              # tabicl (default) | tabldm. See
-                              # conf/model/copula_prod_tabldm.yaml.
+  backbone: tabicl           # src/copula_inter/copula/backbones.py backbone (tabicl only)
   rank: 128                  # low-rank dimension r in W ∈ R^{N×r}
   sigma_jitter: 1.0e-4     # added to diag(Σ) for Cholesky stability
   unfreeze_backbone: true  # train the backbone end-to-end alongside the head

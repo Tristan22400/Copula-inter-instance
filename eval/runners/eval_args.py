@@ -105,10 +105,10 @@ class MarginalSpec:
     """The marginal whose PIT gives the copula model its z_train."""
 
     # "tabicl": K-fold PIT from the frozen TabICL marginal (the deployment setting);
-    # "oracle": exact GP-LOO PIT (synthetic only, no total-NLL row); exaone/tabpfn/tabldm:
-    # another foundation model through the same batched PIT.
+    # "oracle": exact GP-LOO PIT (synthetic only, no total-NLL row); "tabpfn":
+    # TabPFN through the same batched PIT.
     z_train_source: str = "tabicl"
-    # Quantile-grid size for exaone/tabpfn/tabldm.
+    # Quantile-grid size for tabpfn.
     probs_n: int = 99
     # TabICL checkpoint (path or MARGINAL_FAMILIES name); default: the episode config's tabicl.ckpt.
     tabicl_ckpt: str | None = None
@@ -197,7 +197,7 @@ def validate_eval_spec(spec: EvalSpec) -> None:
             raise ValueError(
                 "era5.enabled has no oracle marginal: real ERA5 has no generating GP to take "
                 "an exact LOO-PIT residual from. Use marginal.z_train_source=tabicl (default) "
-                "or one of exaone/tabpfn/tabldm."
+                "or tabpfn."
             )
     if not 0 <= spec.min_icl_coverage <= 1:
         raise ValueError("min_icl_coverage must lie in [0, 1]")
