@@ -20,6 +20,7 @@ from eval.runners.hydra_cli import compose_spec, reject_argparse_flags
 from eval.runners.marginal_calibration_eval import MarginalCalibrationSpec
 from eval.runners.paired_compare import PairedCompareSpec
 from eval.runners.run_benchmarks import BenchmarkSpec
+from eval.runners.sdwpf_audit import SdwpfAuditSpec
 from eval.runners.spatial_correlation_eval import (
     AllSpec,
     DiagnoseSpec,
@@ -41,6 +42,7 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "autoregressive_baseline_eval": (AutoregressiveBaselineSpec, []),
     "summarize_results_cache": (SummarizeSpec, ["caches=[a.json]"]),
     "paired_compare": (PairedCompareSpec, ["a=a.json"]),
+    "sdwpf_audit": (SdwpfAuditSpec, []),
 }
 
 

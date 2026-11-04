@@ -468,3 +468,69 @@ def test_paired_compare_matches_episodes_and_rejects_different_ones(tmp_path: Pa
     c = _dump(tmp_path / "c.json", [_ep(i, 1.5, 2.5, m) for i, m in enumerate(bad)])
     with pytest.raises(ValueError, match="different episodes"):
         paired_deltas(PairedCompareSpec(a=a, b=c))
+
+
+# ---------------------------------------------------------------------------
+# Audit: per-fold direction checks and the cross-fitted decision
+# ---------------------------------------------------------------------------
+
+
+def _wake_table(seed: int = 0) -> SdwpfTable:
+    """245 days x 12 turbines in partial load; Patv falls with the downwind coordinate of the true direction."""
+    rng = np.random.default_rng(seed)
+    n_steps = _FULL_DAYS * STEPS_PER_DAY
+    gx, gy = np.meshgrid(np.arange(4) * 500.0, np.arange(3) * 500.0)
+    x, y = gx.ravel(), gy.ravel()
+    phi = rng.uniform(0.0, 360.0, n_steps)
+    u, _ = wind_aligned_axes(x[None, :], y[None, :], phi[:, None])
+    patv = rng.uniform(500.0, 900.0, n_steps)[:, None] - 0.2 * u + rng.normal(0, 5, (n_steps, 12))
+    wdir = rng.uniform(-5, 5, (n_steps, 12))
+    ndir = phi[:, None] - wdir
+    return SdwpfTable(
+        turb_ids=np.arange(1, 13),
+        x=x,
+        y=y,
+        patv=patv.astype(np.float32),
+        wspd=np.full((n_steps, 12), 8.0, dtype=np.float32),
+        wdir=wdir.astype(np.float32),
+        ndir=ndir.astype(np.float32),
+        n_raw=n_steps * 12,
+        dropped={"missing": 0, "unknown": 0, "abnormal": 0},
+        flagged={"missing": 0, "unknown": 0, "abnormal": 0},
+        n_clipped=0,
+        identity={"test": "wake"},
+    )
+
+
+def test_audit_finds_the_wake_convention_per_fold() -> None:
+    from eval.runners.sdwpf_audit import audit
+
+    result, farm_phi = audit(_wake_table(), n_query=4, n_context=[4], n_boot=100, distance_bins=4)
+    assert farm_phi.shape == (_FULL_DAYS * STEPS_PER_DAY // 6,)
+    dr = result["direction"]
+    for k in range(5):
+        offs = dr["frame_alignment"]["partial_pooled"][f"fold{k}"]["offsets"]
+        assert offs["+0"]["ci95"][1] < -0.5
+        assert offs["+180"]["mean"] == pytest.approx(-offs["+0"]["mean"])
+        dec = dr["cross_fitted_decisions"][f"fold{k}"]
+        assert dec["chosen_offset_deg"] == 0 and dec["f1b_admissible"]
+        assert f"fold{k}" not in dec["training_folds"]
+    assert dr["spread"]["fold0"]["circular_std_deg"]["p95"] < 10.0
+    assert result["eligibility"]["fold0"]["P4_N4"]["all"] == 49 * 24
+
+
+def test_cross_fitted_decision_for_fold_k_never_reads_fold_k() -> None:
+    from eval.runners.sdwpf_audit import audit
+
+    base, _ = audit(_wake_table(), n_query=4, n_context=[4], n_boot=100, distance_bins=4)
+    scrambled = _wake_table()
+    lo, hi = FOLD_DAYS[2]
+    rows = slice((lo - 1) * STEPS_PER_DAY, hi * STEPS_PER_DAY)
+    # Fold 2's directions point the other way: its own statistics flip, its decision must not move.
+    scrambled.ndir[rows] += 180.0
+    other, _ = audit(scrambled, n_query=4, n_context=[4], n_boot=100, distance_bins=4)
+    d0, d1 = base["direction"]["cross_fitted_decisions"], other["direction"]["cross_fitted_decisions"]
+    assert d1["fold2"] == d0["fold2"]
+    assert d1["fold0"]["offsets"] != d0["fold0"]["offsets"]
+    f2 = other["direction"]["frame_alignment"]["partial_pooled"]["fold2"]["offsets"]
+    assert f2["+180"]["mean"] < 0 < f2["+0"]["mean"]

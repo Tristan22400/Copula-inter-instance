@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as sdwpf_audit_schema.
+defaults:
+  - sdwpf_audit_schema
+  - _runner
+  - _self_

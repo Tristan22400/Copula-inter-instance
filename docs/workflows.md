@@ -167,6 +167,7 @@ folds, CI cluster = day (`eval/data/real/sdwpf.py` documents the episode
 contract, the cleaning and the partial-load rule).
 
 ```bash
+python -m eval.runners.sdwpf_audit output_dir=results/sdwpf_audit    # model-free, per fold
 python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
     real.dataset=sdwpf real.sdwpf.features=f0 real.sdwpf.mask=random n_episodes=400 \
     output.dump_episodes=results/sdwpf/f0_random.json
