@@ -121,13 +121,34 @@ def _load_episodes(
     n_ep: int,
     tabicl_marginal: TabICLLike | None,
     tabicl_pit_k_folds: int,
-) -> tuple[CopulaDataset | None, dict[str, Any] | None, list[dict] | None, Any, int | None, TabICLLike | None]:
-    """Load the evaluation episodes: fixed-geometry ERA5, live-generated GP, or an on-disk dataset."""
+) -> tuple[
+    CopulaDataset | None,
+    dict[str, Any] | None,
+    list[dict] | None,
+    Any,
+    int | None,
+    TabICLLike | None,
+    dict[str, Any] | None,
+]:
+    """Load the evaluation episodes: a real dataset, fixed-geometry ERA5, live-generated GP, or an on-disk dataset.
+
+    The last element is the real-data fingerprint (None for every other source).
+    """
     dataset = None
     era5_geometry: dict[str, Any] | None = None
     live_episodes = None
     n_available = None
-    if era5:
+    real_fp: dict[str, Any] | None = None
+    if spec.real.dataset is not None:
+        live_episodes, real_fp = _build_real_episodes(
+            spec, device, marginal_backend, marginal_regressor, n_ep, tabicl_marginal, tabicl_pit_k_folds
+        )
+        # Free the marginal after the PIT.
+        tabicl_marginal = None
+        marginal_regressor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif era5:
         print(
             f"\nBuilding {n_ep} REAL ARCO-ERA5 episodes, seed={spec.seed}, "
             f"global indices {spec.episode_offset}..{spec.episode_offset + n_ep - 1}"
@@ -213,7 +234,58 @@ def _load_episodes(
         n_available = len(dataset)
         print(f"\nEvaluating {n_ep} episodes from {dataset_dir} (start={spec.episode_idx})")
         print(f"  Dataset size: {n_available} episodes")
-    return dataset, era5_geometry, live_episodes, marginal_regressor, n_available, tabicl_marginal
+    return dataset, era5_geometry, live_episodes, marginal_regressor, n_available, tabicl_marginal, real_fp
+
+
+def _build_real_episodes(
+    spec: EvalSpec,
+    device: torch.device,
+    marginal_backend: str | None,
+    marginal_regressor: Any,
+    n_ep: int,
+    tabicl_marginal: TabICLLike | None,
+    tabicl_pit_k_folds: int,
+) -> tuple[list[dict], dict[str, Any]]:
+    """real.dataset episodes (eval/data/real) and their fingerprint, PIT'd with the run's marginal."""
+    from eval.data.episode_packaging import PitSettings
+    from eval.data.real import build_real_eval_episodes, dataset_module, real_episode_fingerprint
+    from eval.runners.eval_args import real_dataset_spec
+
+    name = spec.real.dataset
+    assert name is not None
+    sub = real_dataset_spec(spec)
+    print(
+        f"\nBuilding {n_ep} REAL {name} episodes, seed={spec.seed}, "
+        f"global indices {spec.episode_offset}..{spec.episode_offset + n_ep - 1}"
+    )
+    print(f"  real.{name}: {sub}")
+    data = dataset_module(name).load(sub)
+    settings = PitSettings(
+        tabicl_model=tabicl_marginal,
+        k_folds=tabicl_pit_k_folds,
+        device=device,
+        marginal_backend=marginal_backend,
+        marginal_regressor=marginal_regressor,
+        marginal_probs_n=spec.marginal.probs_n,
+        standardize_y=spec.real.standardize_y,
+        autoregressive=spec.autoregressive.enabled,
+        ar_order=spec.autoregressive.order,
+        ar_conditioning=spec.autoregressive.conditioning,
+        ar_max_context=spec.autoregressive.max_context,
+        ar_n_episodes=spec.autoregressive.n_episodes,
+    )
+    episodes = build_real_eval_episodes(
+        name, sub, data, n_ep, settings, seed=spec.seed, offset=spec.episode_offset, pit_batch=spec.real.pit_batch
+    )
+    fp = real_episode_fingerprint(
+        name,
+        sub,
+        data,
+        k_folds=tabicl_pit_k_folds,
+        marginal=spec.marginal.z_train_source,
+        standardize_y=spec.real.standardize_y,
+    )
+    return episodes, fp
 
 
 def _load_models(
@@ -269,7 +341,9 @@ def _load_models(
 
 
 def _resolve_episode_source(spec: EvalSpec, cfg: DictConfig) -> tuple[bool, bool, str | None]:
-    """(era5, live_generate, dataset_dir) from era5.enabled, dataset_dir and live_generate."""
+    """(era5, live_generate, dataset_dir) from era5.enabled, dataset_dir and live_generate; all off for real.dataset."""
+    if spec.real.dataset is not None:
+        return False, False, None
     era5 = bool(spec.era5.enabled)
     if era5:
         live_generate = False
@@ -299,8 +373,16 @@ def _plan_episodes(
 ) -> list[_PlannedEpisode]:
     """Every episode to evaluate, with its cache key; skips out-of-range or too-small dataset episodes."""
     episode_plan: list[_PlannedEpisode] = []
+    real = spec.real.dataset
     for local_i in range(spec.n_episodes):
-        if era5:
+        if real is not None:
+            assert live_episodes is not None
+            # Skipped draws leave gaps; use each episode's own global index.
+            if local_i >= len(live_episodes):
+                continue
+            ep = live_episodes[local_i]
+            ep_i = int(ep["real_meta"]["ep_i"])
+        elif era5:
             assert live_episodes is not None
             # ERA5 may return fewer episodes; use each episode's own global index.
             if local_i >= len(live_episodes):
@@ -332,7 +414,7 @@ def _plan_episodes(
             dataset_dir,
             spec.seed,
             ep_i,
-            source="era5" if era5 else None,
+            source=f"real-{real}" if real is not None else ("era5" if era5 else None),
         )
         episode_plan.append(_PlannedEpisode(local_i, ep_i, cache_key, ep, _baseline_fit_seed(spec.seed, cache_key)))
     return episode_plan

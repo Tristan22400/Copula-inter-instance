@@ -126,6 +126,9 @@ Subpackages:
 | `runners/eval_checkpoint.py` | The main comparison: model vs. classical baselines, synthetic or real-ERA5 episodes |
 | `baselines/` | Baseline tables (`classical.py`, with its per-episode cache), CV best-of-baselines (`prefit.py`), the autoregressive row |
 | `data/era5_episodes.py` | Real-ERA5 evaluation episodes |
+| `data/episode_packaging.py` | The PIT / autoregressive chain / `standardize_y` packaging shared by ERA5 and every real dataset |
+| `data/real/` | Real-data benchmark episodes for `eval_checkpoint real.dataset=<name>`: one module per dataset (`load`, `draw`, `fingerprint`; contract in `base.py`), raw files under `REAL_DATA_DIR/<name>/` |
+| `runners/paired_compare.py` | Paired per-episode NLL deltas between two `output.dump_episodes` files, with cluster-bootstrap CIs |
 | `datasets/` | Real-world benchmark datasets (`run_benchmarks`) |
 | `metrics/` | Joint NLL from a quantile grid, energy score |
 | `spatial/` | Spatial-correlation diagnostics, sweeps, calibration plots |

@@ -47,6 +47,11 @@ _METHOD_LABELS = dict(_METHOD_ORDER) | {"oracle_posterior": "Oracle (posterior)"
 
 def _kernel_composition_label(ep: dict) -> str:
     """Kernel-composition string for one episode (e.g. "rbf(ARD)+periodic, mlp-mixing") from its kernel metadata."""
+    real_meta = ep.get("real_meta")
+    if real_meta is not None:
+        from eval.data.real import dataset_module
+
+        return str(dataset_module(real_meta["dataset"]).label(real_meta))
     meta = ep.get("era5_meta")
     if meta is not None:
         # Real ERA5: report the episode's geography instead of a kernel.
@@ -94,7 +99,11 @@ def _kernel_composition_label(ep: dict) -> str:
 
 
 def _print_table(
-    all_nlls: list[dict[str, float]], z_train_source: str = "tabicl", era5: bool = False, attempted: int | None = None
+    all_nlls: list[dict[str, float]],
+    z_train_source: str = "tabicl",
+    era5: bool = False,
+    attempted: int | None = None,
+    real_label: str | None = None,
 ) -> None:
     summaries = {k: score_summary(all_nlls, k) for k, _ in _METHOD_ORDER}
     attempted = len(all_nlls) if attempted is None else attempted
@@ -110,6 +119,13 @@ def _print_table(
             "marginal (none exists on real data) — rows still differ only in their "
             "correlation matrix R, so the ranking is valid, but 'Oracle (prior)' is "
             "structurally unavailable and prints nan.".format(s=z_train_source)
+        )
+    if real_label is not None:
+        print(
+            f"Episodes: REAL data, {real_label}. The shared z_test is the frozen-{z_train_source} "
+            "K-fold PIT, not a ground-truth marginal, so this table ranks correlation matrices "
+            "against an estimated marginal and must NOT be read across methods as the result; "
+            "read the total Y-space NLL table. 'Oracle (prior)' prints nan."
         )
     print(
         f"ICL z_train source: {z_train_source}"
@@ -207,6 +223,7 @@ def _print_total_nll_table(
     era5: bool = False,
     ar_note: str | None = None,
     attempted: int | None = None,
+    real_label: str | None = None,
 ) -> None:
     """Print the per-point total Y-space NLL table: each method's own marginal plus copula.
 
@@ -242,6 +259,12 @@ def _print_total_nll_table(
             "density and is scored at the same real y_test, which is a proper "
             "scoring rule regardless of whose marginal is whose. The two Oracle "
             "rows are nan by construction (no generating kernel behind ERA5)."
+        )
+    if real_label is not None:
+        print(
+            f"Episodes: REAL data, {real_label}, in raw target units. THIS is the table to read: "
+            "every method supplies its own full predictive density and is scored at the same "
+            "real y_test (a proper scoring rule). The two Oracle rows are nan by construction."
         )
     print(
         f"ICL z_train source: {z_train_source}"

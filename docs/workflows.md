@@ -148,6 +148,39 @@ checkpoint. To compare a second checkpoint on the same episodes, share
 `baselines.cache` and give each checkpoint its own `output.results_cache`; only
 the ICL forward pass is redone.
 
+### Real-data benchmarks
+
+`real.dataset=<name>` swaps the episode source for one of `eval/data/real/`,
+with the same baselines, tables and caches as ERA5 (no oracle rows, the
+shared `z_test` is the marginal's PIT, read the total Y-space table). Raw
+files live under `REAL_DATA_DIR/<name>/` (default `eval/data/cache/`; from a
+git worktree, point `REAL_DATA_DIR` at the main checkout's cache). Episode
+`ep_i` is drawn from `default_rng([seed, ep_i])`, so `episode_offset` shards
+reproduce the unsharded stream; smoke runs use `seed=43` so none of their
+episodes is a reported one. Pair every copula checkpoint with the marginal it
+was trained with (`tabicl.pit_ckpt` in its config) via `marginal.tabicl_ckpt`.
+
+#### SDWPF wind farm
+
+One timestamp per episode, rows = turbines, target `Patv` (kW); five 49-day
+folds, CI cluster = day (`eval/data/real/sdwpf.py` documents the episode
+contract, the cleaning and the partial-load rule).
+
+```bash
+python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
+    real.dataset=sdwpf real.sdwpf.features=f0 real.sdwpf.mask=random n_episodes=400 \
+    output.dump_episodes=results/sdwpf/f0_random.json
+python -m eval.runners.paired_compare a=results/sdwpf/f0_random.json \
+    b=results/sdwpf/f1b_random.json
+python -m eval.runners.paired_compare a=results/sdwpf/f0_random.json
+```
+
+The second command is F1b minus F0 on identical episodes (it fails if the
+episode meta differs); the third gives the copula's within-run contrasts
+against independence, the autoregressive row and best_baseline. Every delta
+carries a 95 % cluster-bootstrap CI (2,000 replicates) and a win rate;
+`folds=[...]` restricts both runs to the listed folds for cross-fitting.
+
 ### The autoregressive row
 
 This row is on by default for the TabICL marginal. It uses the same marginal

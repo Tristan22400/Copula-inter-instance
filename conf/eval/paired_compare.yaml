@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as paired_compare_schema.
+defaults:
+  - paired_compare_schema
+  - _runner
+  - _self_

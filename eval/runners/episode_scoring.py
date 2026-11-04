@@ -584,6 +584,11 @@ def _score_episode(
         "n_test": ep["z_test"].shape[0],
         "kernel": _kernel_composition_label(ep),
     }
+    if "real_meta" in ep:
+        # Identifies the episode (rows, split, group) for paired comparisons and cluster bootstraps.
+        meta["episode"] = ep["real_meta"]
+        # The marginal-calibration gate reads these.
+        meta["z_test"] = [float(z) for z in ep["z_test"].tolist()]
     nlls = {**baseline_nlls, **icl_nlls}
     R_dict = {**baseline_R, **icl_R}
 

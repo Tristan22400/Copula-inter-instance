@@ -53,6 +53,43 @@ class Era5Spec:
 
 
 @dataclass
+class SdwpfSpec:
+    """SDWPF wind farm (eval/data/real/sdwpf.py): one timestamp per episode, rows = turbines, target Patv (kW)."""
+
+    # Directory with the SCADA and location CSVs; default copula_inter.paths.SDWPF_DATA_DIR.
+    data_dir: str | None = None
+    n_context: int = 32
+    n_query: int = 64
+    # "random" or "block" (the n_query turbines nearest a random anchor are the queries).
+    mask: str = "random"
+    # "f0" = (x, y); "f1b" = (x, y, u, v) rotated by the context turbines' mean wind direction.
+    features: str = "f0"
+    # "partial_load": keep a timestamp only if every selected turbine is in (0, atom_hi_frac * rated);
+    # "all": no filter (NLL unreliable: Patv has atoms at 0 and rated).
+    regime: str = "partial_load"
+    # Added to (Ndir + Wdir) before the mod 360 (F1b only): one of 0, 90, 180, -90, cross-fitted by the audit.
+    direction_offset_deg: int = 0
+    atom_hi_frac: float = 0.99
+    # Rated power = this quantile of cleaned Patv over all days.
+    rated_quantile: float = 0.999
+    # Candidate timestamps each episode owns; it takes the first that passes the regime.
+    timestamp_tries: int = 8
+
+
+@dataclass
+class RealSpec:
+    """Real-data benchmark episodes (eval/data/real): same baselines and tables, no oracle rows."""
+
+    # Dataset name (eval.data.real.REAL_DATASETS); null = off. Excludes era5.enabled, dataset_dir, live_generate.
+    dataset: str | None = None
+    # Episodes per batched PIT call (fixed-shape datasets only).
+    pit_batch: int = 8
+    # Z-score each episode's target before fitting the baselines and add log(std) back (as era5.standardize_y).
+    standardize_y: bool = True
+    sdwpf: SdwpfSpec = field(default_factory=SdwpfSpec)
+
+
+@dataclass
 class AutoregressiveSpec:
     """The chain-rule row: the same marginal revealing test points one at a time (eval/baselines/autoregressive.py)."""
 
@@ -173,11 +210,67 @@ class EvalSpec:
     # Fail after scoring unless this fraction of attempted episodes has a finite ICL total NLL.
     min_icl_coverage: float = 0.0
     era5: Era5Spec = field(default_factory=Era5Spec)
+    real: RealSpec = field(default_factory=RealSpec)
     autoregressive: AutoregressiveSpec = field(default_factory=AutoregressiveSpec)
     baselines: BaselineSpec = field(default_factory=BaselineSpec)
     marginal: MarginalSpec = field(default_factory=MarginalSpec)
     selection: SelectionSpec = field(default_factory=SelectionSpec)
     output: OutputSpec = field(default_factory=OutputSpec)
+
+
+def real_dataset_spec(spec: EvalSpec) -> SdwpfSpec:
+    """The real.<name> sub-config of the selected real.dataset."""
+    assert spec.real.dataset is not None
+    sub: SdwpfSpec = getattr(spec.real, spec.real.dataset)
+    return sub
+
+
+def _validate_real(spec: EvalSpec) -> None:
+    """real.dataset: exclusive source, learned marginal, enough queries, and every choice field in range."""
+    from eval.data.real import REAL_DATASETS
+    from eval.data.real import sdwpf as sdwpf_mod
+
+    check_choice("real.dataset", spec.real.dataset, REAL_DATASETS)
+    if spec.era5.enabled:
+        raise ValueError("real.dataset and era5.enabled are mutually exclusive episode sources.")
+    if spec.dataset_dir is not None:
+        raise ValueError("real.dataset and dataset_dir are mutually exclusive episode sources.")
+    if spec.live_generate:
+        raise ValueError("real.dataset and live_generate are mutually exclusive episode sources.")
+    if spec.marginal.z_train_source == "oracle":
+        raise ValueError(
+            "real.dataset has no oracle marginal: real data has no generating GP to take an exact "
+            "LOO-PIT residual from. Use marginal.z_train_source=tabicl (default) or tabpfn."
+        )
+    sub = real_dataset_spec(spec)
+    min_test = (
+        spec.selection.min_test_points
+        if spec.selection.min_test_points is not None
+        else 2 * spec.selection.min_fold_size
+    )
+    if sub.n_query < min_test:
+        raise ValueError(
+            f"real.{spec.real.dataset}.n_query={sub.n_query} is below selection.min_test_points={min_test}: "
+            "best_baseline needs at least two nested-CV folds of test points."
+        )
+    if sub.n_context < 2:
+        raise ValueError(f"real.{spec.real.dataset}.n_context must be at least 2 for the K-fold PIT")
+    if spec.real.dataset == "sdwpf":
+        s = spec.real.sdwpf
+        check_choice("real.sdwpf.mask", s.mask, sdwpf_mod.MASKS)
+        check_choice("real.sdwpf.features", s.features, sdwpf_mod.FEATURE_SETS)
+        check_choice("real.sdwpf.regime", s.regime, sdwpf_mod.REGIMES)
+        check_choice(
+            "real.sdwpf.direction_offset_deg",
+            str(s.direction_offset_deg),
+            tuple(str(o) for o in sdwpf_mod.DIRECTION_OFFSETS),
+        )
+        if not 0.0 < s.atom_hi_frac <= 1.0:
+            raise ValueError("real.sdwpf.atom_hi_frac must lie in (0, 1]")
+        if not 0.5 < s.rated_quantile <= 1.0:
+            raise ValueError("real.sdwpf.rated_quantile must lie in (0.5, 1]")
+        if s.timestamp_tries < 1:
+            raise ValueError("real.sdwpf.timestamp_tries must be at least 1")
 
 
 def validate_eval_spec(spec: EvalSpec) -> None:
@@ -199,6 +292,8 @@ def validate_eval_spec(spec: EvalSpec) -> None:
                 "an exact LOO-PIT residual from. Use marginal.z_train_source=tabicl (default) "
                 "or tabpfn."
             )
+    if spec.real.dataset is not None:
+        _validate_real(spec)
     if not 0 <= spec.min_icl_coverage <= 1:
         raise ValueError("min_icl_coverage must lie in [0, 1]")
     if spec.min_icl_coverage and spec.marginal.z_train_source == "oracle":
