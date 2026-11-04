@@ -166,6 +166,14 @@ One timestamp per episode, rows = turbines, target `Patv` (kW); five 49-day
 folds, CI cluster = day (`eval/data/real/sdwpf.py` documents the episode
 contract, the cleaning and the partial-load rule).
 
+Feature set: **F0 = (x, y) only.** F1b (positions rotated by the farm wind
+direction) is dropped: the audit (`sdwpf_audit`, 2026-11-04) found the
+per-timestamp circular std of $\phi_i = (\mathrm{Ndir}_i + \mathrm{Wdir}_i) \bmod 360$
+across turbines at about 73° in every fold (68 of 134 turbines biased more than
+30° from the farm mean), far above the pre-declared 30° limit, so all five
+cross-fitted decisions rejected it. The code path stays, for the audit and
+its tests, but no reported run uses it.
+
 ```bash
 python -m eval.runners.sdwpf_audit output_dir=results/sdwpf_audit    # model-free, per fold
 python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
