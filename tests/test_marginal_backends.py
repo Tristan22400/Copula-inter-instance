@@ -264,9 +264,14 @@ def test_tabpfn_feature_count_can_change() -> None:
 
 
 def _mixed_column_episodes() -> tuple[torch.Tensor, ...]:
-    """Four episodes; episode 2 has one feature constant over its context, so it keeps other columns than the rest."""
+    """Four episodes; episodes 2 and 3 each have a different feature constant over their context.
+
+    They keep two columns each (but not the same two), so they share a forward
+    after their kept columns are gathered; episodes 0 and 1 keep all three.
+    """
     X_train, Y_train, X_test, _ = _episodes(4, 25, 7, 3, seed=5)
     X_train[2, :, 1] = 0.3
+    X_train[3, :, 0] = -0.8
     X_test[0] *= 30.0  # queries far outside the context: exercises the soft clipping
     return torch.as_tensor(X_train), torch.as_tensor(Y_train), torch.as_tensor(X_test)
 

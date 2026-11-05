@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from scipy.special import ndtri
 
-__all__ = ["backend_pit_fn", "group_by_varying_columns", "run_kfold_pit_batched"]
+__all__ = ["backend_pit_fn", "group_by_kept_columns", "run_kfold_pit_batched", "take_columns"]
 
 PitFn = Callable[[list, list, list, list], tuple[np.ndarray, np.ndarray]]
 
@@ -54,24 +54,39 @@ def backend_pit_fn(name: str, regressor: Any) -> PitFn:
     return pit_fn
 
 
-def group_by_varying_columns(X_context: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Group a batch of contexts (B, n, C) by which feature columns vary over their rows.
+def group_by_kept_columns(X_context: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Group a batch of contexts (B, n, C) by how many feature columns vary over their rows.
 
     Both libraries drop the columns that are constant over the context (a NaN
-    column counts as constant) before the network, so members with different
-    kept columns cannot share a forward. Returns [(member indices, kept column
-    indices)], one entry per distinct pattern; with a single context row every
-    column is kept (sdm.processing.DropConstantColumns).
+    column counts as constant) and keep the others in their order, so the
+    network only sees the kept columns, compacted. Members that keep the same
+    number of columns can therefore share a forward once each one's kept
+    columns are gathered (take_columns), whichever columns those are; grouping
+    by the exact pattern instead split batches with discrete features into
+    hundreds of forwards. With a single context row every column is kept
+    (sdm.processing.DropConstantColumns).
+
+    Returns:
+        [(member indices (G,), kept column indices (G, C'), ascending per row)],
+        one entry per distinct kept-column count C'.
     """
     B, n, C = X_context.shape
     if n <= 1:
         keep = torch.ones(B, C, dtype=torch.bool, device=X_context.device)
     else:
         keep = (X_context != X_context[:, :1]).any(dim=1) & ~X_context.isnan().all(dim=1)
-    patterns, inverse = torch.unique(keep, dim=0, return_inverse=True)
-    return [
-        (torch.nonzero(inverse == g).squeeze(1), torch.nonzero(patterns[g]).squeeze(1)) for g in range(len(patterns))
-    ]
+    counts = keep.sum(dim=1)
+    groups = []
+    for count in torch.unique(counts).tolist():
+        members = torch.nonzero(counts == count).squeeze(1)
+        cols = torch.nonzero(keep[members])[:, 1].reshape(len(members), count)  # row-major: ascending per member
+        groups.append((members, cols))
+    return groups
+
+
+def take_columns(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    """x (G, rows, C) restricted to each member's columns cols (G, C'): (G, rows, C')."""
+    return x.gather(-1, cols.unsqueeze(1).expand(-1, x.shape[1], -1))
 
 
 def _probit(u: np.ndarray, eps: float) -> np.ndarray:

@@ -112,24 +112,24 @@ def kumo_native_quantiles(
     Recipe/TableTensor machinery (whose Python overhead dominated small
     episodes): the recipe's statistics are fitted per member along the row axis
     in one tensor op, the members run through the regression network in one
-    forward, and the target transform is inverted. Members that drop different
-    constant columns run in separate forwards. tests/test_marginal_backends.py
+    forward, and the target transform is inverted. Members that keep different
+    numbers of columns run in separate forwards. tests/test_marginal_backends.py
     checks it against the library call.
 
     Args:
         x_context: (B, n, C); y_context: (B, n); x_query: (B, m, C), float32 on the model's device.
     """
-    from copula_inter.marginal.batched_pit import group_by_varying_columns
+    from copula_inter.marginal.batched_pit import group_by_kept_columns, take_columns
 
     if not (torch.isfinite(x_context).all() and torch.isfinite(x_query).all() and torch.isfinite(y_context).all()):
         return _library_quantiles(model, x_context, y_context, x_query)
-    groups = group_by_varying_columns(x_context.detach())
-    if len(groups) == 1 and groups[0][1].numel() == x_context.shape[-1]:
+    groups = group_by_kept_columns(x_context.detach())
+    if len(groups) == 1 and groups[0][1].shape[1] == x_context.shape[-1]:
         return _kumo_forward(model, x_context, y_context, x_query)
     out = x_query.new_empty((*x_query.shape[:2], len(KUMO_NATIVE_PROBS)))
     for members, cols in groups:
-        q = _kumo_forward(model, x_context[members][..., cols], y_context[members], x_query[members][..., cols])
-        out = out.index_copy(0, members, q)
+        xc, xq = take_columns(x_context[members], cols), take_columns(x_query[members], cols)
+        out = out.index_copy(0, members, _kumo_forward(model, xc, y_context[members], xq))
     return out
 
 

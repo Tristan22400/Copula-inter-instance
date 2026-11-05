@@ -13,7 +13,7 @@ import torch
 from scipy.special import ndtri
 from scipy.stats import norm
 
-from copula_inter.marginal.batched_pit import group_by_varying_columns, run_kfold_pit_batched
+from copula_inter.marginal.batched_pit import group_by_kept_columns, run_kfold_pit_batched, take_columns
 
 
 def _gaussian_pit(X_ctx: list, y_ctx: list, X_qry: list, y_qry: list) -> tuple[np.ndarray, np.ndarray]:
@@ -84,11 +84,17 @@ def test_max_cells_splits_calls_without_changing_the_result() -> None:
         np.testing.assert_array_equal(split[key], whole[key])
 
 
-def test_group_by_varying_columns() -> None:
-    x = torch.randn(4, 6, 3)
+def test_group_by_kept_columns_groups_by_count_and_keeps_column_order() -> None:
+    x = torch.randn(5, 6, 3)
     x[1, :, 0] = 2.0  # constant column
-    x[3, :, 2] = float("nan")  # all-NaN column counts as constant
-    groups = {tuple(m.tolist()): c.tolist() for m, c in group_by_varying_columns(x)}
-    assert groups == {(0, 2): [0, 1, 2], (1,): [1, 2], (3,): [0, 1]}
-    single_row = group_by_varying_columns(torch.zeros(2, 1, 3))
-    assert [(m.tolist(), c.tolist()) for m, c in single_row] == [([0, 1], [0, 1, 2])]
+    x[3, :, 2] = float("nan")  # an all-NaN column counts as constant
+    x[4, :, 1] = -1.0
+    groups = {tuple(m.tolist()): c.tolist() for m, c in group_by_kept_columns(x)}
+    # Members 1, 3 and 4 drop different columns but keep two each: one group.
+    assert groups == {(0, 2): [[0, 1, 2], [0, 1, 2]], (1, 3, 4): [[1, 2], [0, 1], [0, 2]]}
+    members, cols = next((m, c) for m, c in group_by_kept_columns(x) if c.shape[1] == 2)
+    gathered = take_columns(x[members], cols)
+    for i, b in enumerate(members.tolist()):
+        torch.testing.assert_close(gathered[i], x[b][:, cols[i]], equal_nan=True)
+    single_row = group_by_kept_columns(torch.zeros(2, 1, 3))
+    assert [(m.tolist(), c.tolist()) for m, c in single_row] == [([0, 1], [[0, 1, 2], [0, 1, 2]])]

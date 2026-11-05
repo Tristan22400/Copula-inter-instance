@@ -102,10 +102,10 @@ class TabPFNMarginal:
         std) is applied per member along the row axis, its GPU pipeline
         (fingerprint feature, column shuffle, soft outlier clip), which accepts a
         batch axis, runs once, and so does the network. Members that keep
-        different columns run in separate forwards. tests/test_marginal_backends.py
+        different numbers of columns run in separate forwards. tests/test_marginal_backends.py
         checks it against the per-episode path. Differentiable in the weights.
         """
-        from copula_inter.marginal.batched_pit import group_by_varying_columns
+        from copula_inter.marginal.batched_pit import group_by_kept_columns, take_columns
 
         B, m = X_query.shape[:2]
         y = y_context.float()
@@ -114,11 +114,16 @@ class TabPFNMarginal:
         if bool((y_std <= 1e-12).any()):
             raise ValueError("TabPFN refuses a constant target (std ~ 0) on the differentiable-input path.")
         y_z = (y - y_mean[:, None]) / y_std[:, None]
-        groups = group_by_varying_columns(X_context.detach())
-        if not groups[0][1].numel():
+        groups = group_by_kept_columns(X_context.detach())
+        if groups[0][1].shape[1] == 0:
             raise ValueError("All features are constant over a context; TabPFN cannot predict from it.")
         parts = [
-            (members, self._forward_kept(X_context[members][..., cols], y_z[members], X_query[members][..., cols]))
+            (
+                members,
+                self._forward_kept(
+                    take_columns(X_context[members], cols), y_z[members], take_columns(X_query[members], cols)
+                ),
+            )
             for members, cols in groups
         ]
         if len(parts) == 1:
