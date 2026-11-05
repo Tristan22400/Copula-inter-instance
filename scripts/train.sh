@@ -26,5 +26,6 @@ if [[ "${TRAIN_SH_DRY_RUN:-0}" == "1" ]]; then
     echo "[train.sh] Dry run; command would be: python -m copula_inter.train $*"
     exit 0
 fi
+start_cuda_mps train.sh
 python -m copula_inter.train "$@"
 echo "Training complete."

@@ -13,7 +13,7 @@ pins the tested environment.
 
 ```bash
 uv sync --locked --extra dev --extra cpu    # laptop / CI (CPU PyTorch wheel)
-uv sync --locked --extra dev --extra gpu    # CUDA machine, e.g. a Grid5000 node
+uv sync --locked --extra dev --extra gpu --extra tabpfn --extra kumo --extra era5    # CUDA machine, e.g. a Grid5000 node
 uv run --no-sync pre-commit install         # ruff check + format on every commit
 ```
 
@@ -31,16 +31,17 @@ storage:
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh      # installs uv into ~/.local/bin
 cd ~/thoth_storage/copula-inter
-uv sync --locked --extra dev --extra gpu
+uv sync --locked --extra dev --extra gpu --extra tabpfn --extra kumo --extra era5
 ```
 
 The `.venv` lives in the checkout, so every OAR job on that storage reuses it.
 
 **TabPFN-3.5 and Kumo (optional).** The two extra marginal backends are uv
 extras: `--extra tabpfn` (`tabpfn35_fast`, PriorLabs TabPFN-3.5 Fast) and
-`--extra kumo` (`kumo_small`, NVIDIA Kumo Tabular small). Add them to the
-`uv sync` command and keep them on every later `uv sync`, which otherwise
-uninstalls them. TabPFN also needs a PriorLabs API key in `TABPFN_TOKEN` whose
+`--extra kumo` (`kumo_small`, NVIDIA Kumo Tabular small); `--extra era5` is the
+real-data loader. The Grid5000 command above includes all of them: keep every
+extra on every later `uv sync` (including repairs with `--reinstall-package`),
+which otherwise uninstalls the ones left out. TabPFN also needs a PriorLabs API key in `TABPFN_TOKEN` whose
 account accepted the TabPFN-3.5 licence (see [architecture](architecture.md)).
 Without an extra, its tests are skipped and selecting it raises an ImportError.
 If your laptop mounts the same storage (sshfs), don't run `uv sync` through the
@@ -81,6 +82,10 @@ DataLoader workers. Useful overrides:
 - `training.startup_probes=false` to skip building the fixed validation probes
   (`kernel_fit/*`, `era5_fit/*`, `oracle_diag/*`);
 - `WANDB_MODE=disabled` to run offline.
+
+`scripts/train.sh` starts a private CUDA MPS daemon for the job (`start_cuda_mps`
+in `scripts/_env.sh`) so the workers' kernels share the GPU concurrently instead
+of time-slicing; `CUDA_MPS=0` turns it off.
 
 ### Fine-tune on real ERA5
 
