@@ -140,26 +140,33 @@ def test_missing_z_train_source_defaults_to_tabicl() -> None:
     assert z_train_source(OmegaConf.create({"data": {"z_train_source": "analytic"}})) == "analytic"
 
 
-@pytest.mark.parametrize("source", ["tabicl", "tabpfn35_fast", "kumo_small"])
-def test_fixed_live_val_episodes_are_drawn_on_one_device_for_every_source(
-    source: str, small_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("source", "pit_device"),
+    [("analytic", "cpu"), ("tabicl", "cuda"), ("tabpfn35_fast", "cuda"), ("kumo_small", "cuda")],
+)
+def test_fixed_live_val_episodes_are_synthesized_on_cpu_for_every_source(
+    source: str, pit_device: str, small_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every marginal synthesises the val GP episodes on `device`, so one seed gives the same episodes for all sources.
+    """Every z_train source draws its val episodes through generate_fixed_gp_batch; only the marginal PIT runs on the GPU.
 
-    CPU and CUDA draw different streams from one seed: a source synthesising on
-    CPU would be validated on other episodes, and its val/* totals would not be
-    comparable with TabICL's.
+    CUDA draws a different stream than CPU from one seed and its float32
+    Cholesky differs between GPU models, so synthesizing the episodes on the
+    training device would give each run, marginal or GPU its own validation set.
     """
     import copula_inter.data.live_dataset as live
     import copula_inter.marginal.backends as backends
 
-    devices: list[str] = []
+    pit_devices: list[str] = []
 
-    def fake_generate(cfg: DictConfig, batch_size: int, device: str = "cpu", **_: object) -> list[dict]:
-        devices.append(str(device))
+    def fake_fixed(cfg: DictConfig, batch_size: int, *, pit_device: str = "cpu", **_: object) -> list[dict]:
+        pit_devices.append(str(pit_device))
         return []
 
-    monkeypatch.setattr(live, "generate_gp_batch", fake_generate)
+    def forbidden(*_: object, **__: object) -> list[dict]:
+        raise AssertionError("validation episodes must come from generate_fixed_gp_batch")
+
+    monkeypatch.setattr(live, "generate_fixed_gp_batch", fake_fixed)
+    monkeypatch.setattr(live, "generate_gp_batch", forbidden)
     monkeypatch.setattr(live, "collate_fn", lambda episodes: {})
     monkeypatch.setattr(live, "load_tabicl", lambda ckpt, device: object())
     monkeypatch.setattr(backends, "make_regressor", lambda *a, **k: object())
@@ -169,4 +176,4 @@ def test_fixed_live_val_episodes_are_drawn_on_one_device_for_every_source(
     cfg.tabicl = {"pit_ckpt": "fake.ckpt", "pretrained": True}
     t = OmegaConf.create({"val_episodes": 8, "batch_size": 4})
     build_fixed_live_val_batches(cfg, t, device="cuda")
-    assert devices == ["cuda", "cuda"]
+    assert pit_devices == [pit_device, pit_device]

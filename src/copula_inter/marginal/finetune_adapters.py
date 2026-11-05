@@ -232,6 +232,67 @@ def backend_quantiles(
     return out
 
 
+def backend_pit(
+    name: str,
+    regressor: Any,
+    X_context: Sequence[np.ndarray],
+    y_context: Sequence[np.ndarray],
+    X_query: Sequence[np.ndarray],
+    y_query: Sequence[np.ndarray],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(u, log_pdf), each (B, n_query): the predictive CDF and log-density of y_query under the backend's full distribution.
+
+    In y_context's units, evaluated directly at y_query -- no quantile grid:
+    tabpfn35_fast reads its bar distribution (5000 bins, half-normal tails),
+    kumo_small its 999 quantiles through TabICL's QuantileToDistribution (the
+    spline-with-exponential-tails density TabICL's own PIT uses), so all three
+    marginals score a proper density with tails.
+
+    Episodes whose context features are all constant get the feature-free
+    Gaussian predictive, as in backend_quantiles.
+    """
+    if name == "tabpfn35_fast":
+        from copula_inter.marginal.tabpfn_marginal import tabpfn_pit
+
+        model_pit: Callable[..., tuple[torch.Tensor, torch.Tensor]] = tabpfn_pit
+    elif name == "kumo_small":
+        from copula_inter.marginal.kumo_marginal import kumo_pit
+
+        model_pit = kumo_pit
+    else:
+        raise ValueError(f"No generic PIT function for backbone {name!r}.")
+    informative = [b for b, xc in enumerate(X_context) if _has_varying_feature(xc)]
+    if len(informative) == len(X_context):
+        return model_pit(regressor, X_context, y_context, X_query, y_query)
+    device = next(_trainable_module(name, regressor).parameters()).device
+    pairs = [_feature_free_pit(y_context[b], y_query[b], device) for b in range(len(X_context))]
+    u = torch.stack([p[0] for p in pairs])
+    log_pdf = torch.stack([p[1] for p in pairs])
+    if informative:
+        u_inf, lp_inf = model_pit(
+            regressor,
+            [X_context[b] for b in informative],
+            [y_context[b] for b in informative],
+            [X_query[b] for b in informative],
+            [y_query[b] for b in informative],
+        )
+        index = torch.as_tensor(informative, device=device)
+        u = u.to(u_inf.dtype).index_copy(0, index, u_inf.to(device))
+        log_pdf = log_pdf.to(lp_inf.dtype).index_copy(0, index, lp_inf.to(device))
+    return u, log_pdf
+
+
+def _feature_free_pit(
+    y_context: np.ndarray, y_query: np.ndarray, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(u, log_pdf) of y_query under N(mean, std) of the context targets."""
+    y = np.asarray(y_context, dtype=np.float64)
+    std = max(float(y.std(ddof=1)) if y.size > 1 else 0.0, 1e-8)
+    normal = torch.distributions.Normal(float(y.mean()), std)
+    yq = torch.as_tensor(np.asarray(y_query, dtype=np.float64))
+    return normal.cdf(yq).float().to(device), normal.log_prob(yq).float().to(device)
+
+
 def _has_varying_feature(X_context: np.ndarray) -> bool:
     """Whether a feature column varies over the context rows (TabPFN's and Kumo's constant-column test)."""
     X = np.asarray(X_context)

@@ -224,9 +224,11 @@ standalone marginal; the two phases meet only at a checkpoint path.
    and Kumo's native decoder levels, TabPFN's bar distribution read at the same
    levels. The objective is therefore comparable across backbones. Set
    `probs_n=<int>` only to resample onto a coarser grid. The generic backbones'
-   Phase-A forward is the function their PIT reads
-   (`finetune_adapters.backend_quantiles`), so a fine-tuned model is scored as
-   it was trained.
+   PIT (`finetune_adapters.backend_pit`) reads the same model forward as their
+   Phase-A quantiles (`backend_quantiles`), as a full predictive distribution:
+   TabPFN's bar distribution with its half-normal tails, Kumo's 999 quantiles
+   through TabICL's `QuantileToDistribution`. So a fine-tuned model is scored
+   as it was trained, with a proper density like TabICL's.
 
 3. **Re-measure and gate on real data.** The point of a TabICL marginal is
    non-Gaussian tabular transfer, which GP-only training can destroy, so real

@@ -95,7 +95,6 @@ def build_era5_eval_episodes(
     pit_group_size: int = 8,
     marginal_backend: Optional[str] = None,
     marginal_regressor: Any = None,
-    marginal_probs_n: int = 99,
     max_months: Optional[int] = None,
     lazy: Optional[bool] = None,
     standardize_y: bool = True,
@@ -186,7 +185,6 @@ def build_era5_eval_episodes(
             k_folds,
             marginal_backend=marginal_backend,
             marginal_regressor=marginal_regressor,
-            marginal_probs_n=marginal_probs_n,
             seed=chunk[0]["ep_i"],
         )
         pits = [

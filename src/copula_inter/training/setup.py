@@ -404,7 +404,6 @@ def _generic_marginal_probes(
         marginal = BackendMarginal(
             name,
             make_regressor(name, device=device, ckpt=z_train_marginal_ckpt(cfg)),
-            probs_n=int(cfg.data.get("z_train_marginal_probs_n", 99)),
         )
         era5_val_batches = _build_era5_val_batches(cfg, marginal, device)
         del marginal

@@ -35,7 +35,6 @@ class BackendMarginal:
 
     name: str
     regressor: Any
-    probs_n: int = 99
 
     def pit(
         self,
@@ -54,7 +53,6 @@ class BackendMarginal:
             x_test[None],
             y_test_scaled[None],
             k_folds=k_folds,
-            probs_n=self.probs_n,
             seed=seed,
         )
         return {key: value[0] for key, value in out.items()}

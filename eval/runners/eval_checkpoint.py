@@ -95,7 +95,8 @@ def _results_fingerprint(
         ),
         "tabicl_pit_k_folds": tabicl_pit_k_folds,
         "tabicl_amp": spec.marginal.tabicl_amp,
-        "marginal_probs_n": spec.marginal.probs_n,
+        # tabpfn35_fast / kumo_small PIT estimator; invalidates results cached with the old 99-quantile grid.
+        "generic_marginal_pit": "full_distribution",
         "n_folds": spec.selection.n_folds,
         "min_fold_size": spec.selection.min_fold_size,
         "seed": spec.seed,
@@ -493,7 +494,6 @@ _FLAG_ALIASES = {
     "refresh_baselines": "baselines.refresh",
     "no_baseline_cache": "baselines.cache=null",
     "no_results_cache": "output.results_cache=null",
-    "marginal_probs_n": "marginal.probs_n",
 }
 
 main = hydra_entry("eval_checkpoint", EvalSpec, run_evaluation, _FLAG_ALIASES, validate=prepare_eval_spec)

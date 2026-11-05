@@ -1,6 +1,7 @@
 """The generic marginal backends (tabpfn35_fast, kumo_small) on their pretrained weights.
 
-For each backend: the batched K-fold PIT equals the per-episode one, Phase A's
+For each backend: the batched K-fold PIT equals the per-episode one and reads a
+proper density with tails (the model's full predictive distribution), Phase A's
 tier-0 patterns name real parameters and gradients reach them through the same
 quantile function the PIT reads, and a Phase-A checkpoint round-trips through
 make_regressor. TabPFN also checks bar_icdf against the bar distribution's own
@@ -44,30 +45,97 @@ def _episodes(B: int, P: int, N: int, p_x: int, seed: int = 0) -> tuple[np.ndarr
 
 @pytest.mark.parametrize("backend,module", BACKENDS)
 def test_batched_pit_matches_per_episode(backend: str, module: str) -> None:
+    """The batched K-fold PIT of B episodes equals the same driver run on each episode alone."""
     from copula_inter.backend_registry import batched_pit
-    from copula_inter.marginal.backends import loo_pit, make_regressor, quantiles
-    from copula_inter.marginal.kfold import compute_pit
+    from copula_inter.marginal.backends import make_regressor
 
     _require(backend, module)
     regressor = make_regressor(backend, device="cpu")
-    B, P, N, p_x, K, probs_n = 3, 20, 6, 2, 4, 33
+    B, P, N, p_x, K = 3, 20, 6, 2, 4
     X_train, Y_train, X_test, Y_test = _episodes(B, P, N, p_x)
-    probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
     seed = 12345
+    run = batched_pit(backend)
 
-    out = batched_pit(backend)(regressor, X_train, Y_train, X_test, Y_test, k_folds=K, probs_n=probs_n, seed=seed)
+    out = run(regressor, X_train, Y_train, X_test, Y_test, k_folds=K, seed=seed)
     for b in range(B):
-        z_train = loo_pit(backend, regressor, X_train[b], Y_train[b], probs, k_folds=K, seed=seed + b)
-        z_test, log_pdf = compute_pit(
-            quantiles(backend, regressor, X_train[b], Y_train[b], X_test[b], probs), probs, Y_test[b]
+        one = run(
+            regressor,
+            X_train[b : b + 1],
+            Y_train[b : b + 1],
+            X_test[b : b + 1],
+            Y_test[b : b + 1],
+            k_folds=K,
+            seed=seed + b,
         )
-        np.testing.assert_allclose(out["z_train"][b], z_train, atol=1e-3)
-        np.testing.assert_allclose(out["z_test"][b], z_test, atol=1e-3)
-        np.testing.assert_allclose(out["log_pdf_test"][b], log_pdf, atol=1e-2)
+        np.testing.assert_allclose(out["z_train"][b], one["z_train"][0], atol=1e-3)
+        np.testing.assert_allclose(out["z_test"][b], one["z_test"][0], atol=1e-3)
+        np.testing.assert_allclose(out["log_pdf_test"][b], one["log_pdf_test"][0], atol=1e-2)
     assert all(np.isfinite(v).all() for v in out.values())
     # Deterministic: a second pass gives the same residuals.
-    again = batched_pit(backend)(regressor, X_train, Y_train, X_test, Y_test, k_folds=K, probs_n=probs_n, seed=seed)
+    again = run(regressor, X_train, Y_train, X_test, Y_test, k_folds=K, seed=seed)
     np.testing.assert_array_equal(again["z_test"], out["z_test"])
+
+
+def _pit_on_grid(backend: str, regressor: Any, y_grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(u, log_pdf) on y_grid for the first query row of one episode."""
+    from copula_inter.marginal.finetune_adapters import backend_pit
+
+    X_train, Y_train, X_test, _ = _episodes(1, 24, 1, 2, seed=5)
+    u_parts, lp_parts = [], []
+    for y in np.array_split(y_grid.astype(np.float32), max(1, len(y_grid) // 10_000)):
+        xq = np.repeat(X_test[0], len(y), axis=0)
+        with torch.no_grad():
+            u, log_pdf = backend_pit(backend, regressor, [X_train[0]], [Y_train[0]], [xq], [y])
+        u_parts.append(u[0].double().numpy())
+        lp_parts.append(log_pdf[0].double().numpy())
+    return np.concatenate(u_parts), np.concatenate(lp_parts)
+
+
+@pytest.mark.parametrize("backend,module", BACKENDS)
+def test_pit_density_is_proper_with_tails(backend: str, module: str) -> None:
+    """The PIT reads a proper density: it integrates to 1, is the derivative of u, and u reaches the tails.
+
+    The old 99-quantile estimator failed all three: u was clamped to [0.01, 0.99]
+    (|z| <= 2.33) and the density stayed constant beyond the outer quantiles.
+    """
+    from copula_inter.marginal.backends import make_regressor
+
+    _require(backend, module)
+    regressor = make_regressor(backend, device="cpu")
+    y = np.linspace(-30.0, 30.0, 24001)
+    u, log_pdf = _pit_on_grid(backend, regressor, y)
+    pdf = np.exp(log_pdf)
+    assert np.isfinite(log_pdf).all()
+    assert abs(np.trapezoid(pdf, y) - 1.0) < 2e-2, np.trapezoid(pdf, y)
+    assert np.all(np.diff(u) >= -1e-6), "CDF not monotone"
+    assert u[0] < 1e-4 and u[-1] > 1 - 1e-4, (u[0], u[-1])
+    # F(y) - F(y_0) = integral of f: u and log_pdf describe one distribution. Checked on a
+    # fine grid over the central 98%: these piecewise densities have steps (bar borders,
+    # spline knots) and Kumo's narrowest quantile spacings are ~1e-5 wide.
+    from scipy.integrate import cumulative_trapezoid
+
+    lo, hi = y[np.searchsorted(u, 0.01)], y[np.searchsorted(u, 0.99)]
+    y_fine = np.linspace(lo, hi, 200_001)
+    u_fine, log_pdf_fine = _pit_on_grid(backend, regressor, y_fine)
+    integral = u_fine[0] + cumulative_trapezoid(np.exp(log_pdf_fine), y_fine, initial=0.0)
+    np.testing.assert_allclose(integral, u_fine, atol=5e-3)
+
+
+@pytest.mark.parametrize("backend,module", BACKENDS)
+def test_pit_inverts_the_quantile_function(backend: str, module: str) -> None:
+    """u(q_p) = p: the PIT's CDF and the quantiles Phase A trains are the same distribution."""
+    from copula_inter.marginal.backends import make_regressor
+    from copula_inter.marginal.finetune_adapters import backend_pit, backend_quantiles
+
+    _require(backend, module)
+    regressor = make_regressor(backend, device="cpu")
+    X_train, Y_train, X_test, _ = _episodes(1, 24, 4, 2, seed=8)
+    probs = np.array([0.002, 0.05, 0.3, 0.5, 0.7, 0.95, 0.998])
+    with torch.no_grad():
+        q = backend_quantiles(backend, regressor, [X_train[0]], [Y_train[0]], [X_test[0]], probs)[0].numpy()
+        for j, p in enumerate(probs):
+            u, _ = backend_pit(backend, regressor, [X_train[0]], [Y_train[0]], [X_test[0]], [q[:, j]])
+            np.testing.assert_allclose(u[0].numpy(), p, atol=2e-3)
 
 
 @pytest.mark.parametrize("backend,module", BACKENDS)
@@ -192,6 +260,15 @@ def test_constant_context_gets_the_feature_free_predictive(backend: str, module:
     np.testing.assert_allclose(q[1], np.broadcast_to(expected, (5, 3)), rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(q[0], alone[0], atol=1e-4)
     assert np.isfinite(q).all()
+
+    from copula_inter.marginal.finetune_adapters import backend_pit
+
+    y_query = np.resize(expected, 5).astype(np.float32)  # the 0.1/0.5/0.9 quantiles, then repeats
+    with torch.no_grad():
+        u, log_pdf = backend_pit(backend, regressor, list(X_train), list(Y_train), list(X_test), [y_query] * 3)
+    gauss = norm(Y_train[1].mean(), Y_train[1].std(ddof=1))
+    np.testing.assert_allclose(u[1, :3].numpy(), probs, atol=1e-5)
+    np.testing.assert_allclose(log_pdf[1].numpy(), gauss.logpdf(y_query), atol=1e-4)
 
 
 def test_tabpfn_bar_icdf_gradient_is_finite_on_bin_edges() -> None:

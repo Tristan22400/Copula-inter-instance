@@ -187,7 +187,6 @@ def _marginal_pit(
     device: torch.device,
     marginal_backend: str | None = None,
     marginal_regressor: Any = None,
-    marginal_probs_n: int = 99,
     seed: int = 0,
 ) -> dict[str, Tensor] | None:
     """K-fold PIT of one episode through a real marginal (TabICL or a batched backend).
@@ -215,7 +214,6 @@ def _marginal_pit(
             X_test.unsqueeze(0).cpu().numpy(),
             y_test_scaled.unsqueeze(0).cpu().numpy(),
             k_folds=k_folds,
-            probs_n=marginal_probs_n,
             seed=seed,
         )
         as_t = lambda a: torch.as_tensor(a[0], dtype=torch.float32, device=device)  # noqa: E731
@@ -364,7 +362,6 @@ def _episode_marginal_pit(ctx: _EvalContext, ep: dict, ep_i: int) -> dict[str, T
             device=ctx.device,
             marginal_backend=ctx.marginal_backend,
             marginal_regressor=ctx.marginal_regressor,
-            marginal_probs_n=ctx.spec.marginal.probs_n,
             seed=ep_i,
         )
         if marginal_pit is None:

@@ -9,7 +9,8 @@ recipe members (each preprocessed on its own context, all run in one model
 call), and Phase A trains the same function the PIT reads: KumoTabular.forward
 keeps gradients when the module is in train mode.
 
-Kumo's regression head emits 999 quantiles q001..q999, i.e. levels i/1000.
+Kumo's regression head emits 999 quantiles q001..q999, i.e. levels i/1000; the
+PIT (kumo_pit) turns them into a full distribution with tails.
 Needs the `kumo` uv extra (structured-data-models); weights download from the
 nvidia/Kumo-Tabular HF repo (OpenMDW licence).
 """
@@ -25,7 +26,14 @@ if TYPE_CHECKING:
     import sdm.processing
     from sdm.models import KumoTabular
 
-__all__ = ["KUMO_NATIVE_PROBS", "kumo_recipe", "make_kumo_regressor", "kumo_quantiles", "kumo_run_pit_batched"]
+__all__ = [
+    "KUMO_NATIVE_PROBS",
+    "kumo_recipe",
+    "make_kumo_regressor",
+    "kumo_quantiles",
+    "kumo_pit",
+    "kumo_run_pit_batched",
+]
 
 KUMO_SIZE = "small"
 KUMO_NATIVE_PROBS = np.arange(1, 1000) / 1000.0
@@ -104,6 +112,32 @@ def _interp_levels(q: torch.Tensor, levels: np.ndarray, probs: np.ndarray) -> to
     return q.index_select(-1, lo_t) * (1 - w) + q.index_select(-1, hi_t) * w
 
 
+def kumo_pit(
+    model: KumoTabular,
+    X_context: Sequence[np.ndarray],
+    y_context: Sequence[np.ndarray],
+    X_query: Sequence[np.ndarray],
+    y_query: Sequence[np.ndarray],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(u, log_pdf), each (B, n_query): Kumo's 999 native quantiles as a full distribution, evaluated at y_query.
+
+    The distribution is TabICL's QuantileToDistribution on the same levels
+    i/1000 (monotone spline inside [q001, q999], exponential tails outside), the
+    construction TabICL's own PIT uses, so the density is proper with tails.
+    """
+    q = kumo_quantiles(model, X_context, y_context, X_query, None)  # (B, n_query, 999)
+    B, n_query, Q = q.shape
+    dist = _quantile_distribution(q.device)(q.reshape(B * n_query, Q).float())
+    y = torch.as_tensor(np.stack(y_query), dtype=torch.float32, device=q.device).reshape(B * n_query)
+    return dist.cdf(y).reshape(B, n_query), dist.log_prob(y).reshape(B, n_query)
+
+
+def _quantile_distribution(device: torch.device) -> torch.nn.Module:
+    from tabicl._model.quantile_dist import QuantileToDistribution
+
+    return QuantileToDistribution(num_quantiles=len(KUMO_NATIVE_PROBS)).to(device)
+
+
 def kumo_run_pit_batched(
     regressor: KumoTabular,
     X_train: np.ndarray,
@@ -111,18 +145,12 @@ def kumo_run_pit_batched(
     X_test: np.ndarray,
     Y_test: np.ndarray,
     k_folds: int = 10,
-    probs_n: int = 99,
     eps: float = 1e-6,
     seed: int = 0,
 ) -> dict:
-    """run_pit_batched for Kumo, via the shared K-fold driver (one batched forward per fold)."""
-    from copula_inter.marginal.batched_pit import run_kfold_pit_batched
-    from copula_inter.marginal.finetune_adapters import backend_quantiles
-
-    def bank(X_ctx: list, y_ctx: list, X_qry: list, probs: np.ndarray) -> np.ndarray:
-        with torch.no_grad():
-            return backend_quantiles("kumo_small", regressor, X_ctx, y_ctx, X_qry, probs).float().cpu().numpy()
+    """run_pit_batched for Kumo, via the shared K-fold driver (one batched forward per fold) and its full distribution."""
+    from copula_inter.marginal.batched_pit import backend_pit_fn, run_kfold_pit_batched
 
     return run_kfold_pit_batched(
-        bank, X_train, Y_train, X_test, Y_test, k_folds=k_folds, probs_n=probs_n, eps=eps, seed=seed
+        backend_pit_fn("kumo_small", regressor), X_train, Y_train, X_test, Y_test, k_folds=k_folds, eps=eps, seed=seed
     )

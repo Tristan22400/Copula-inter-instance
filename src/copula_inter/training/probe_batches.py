@@ -13,7 +13,7 @@ from copula_inter.baselines.classical_kernels import DEFAULT_FAMILIES
 from copula_inter.data.dataset import (
     collate_fn,
 )
-from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.data.gp_episodes import generate_fixed_gp_batch
 from copula_inter.data.gp_kernels import KERNEL_REGISTRY
 from copula_inter.marginal.backends import BackendMarginal
 from copula_inter.marginal.pit import (
@@ -107,7 +107,7 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
                 }
             ),
         )
-        episodes = generate_gp_batch(synth_cfg, n_episodes, device=device, return_kernel_metadata=True)
+        episodes = generate_fixed_gp_batch(synth_cfg, n_episodes, return_kernel_metadata=True)
         batch = collate_fn(episodes)
         batches[family] = {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
     return batches
@@ -127,7 +127,7 @@ def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
     n_episodes = int(bcfg.get("posterior_probe_n_episodes", 64))
     base_seed = int(bcfg.get("synth_seed", 20260718)) + 2  # +1 is _compute_tabicl_z_train_gap's
     probe_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": base_seed}))
-    episodes = generate_gp_batch(probe_cfg, n_episodes, device=device, return_kernel_metadata=True)
+    episodes = generate_fixed_gp_batch(probe_cfg, n_episodes, return_kernel_metadata=True)
     batch = collate_fn(episodes)
     return {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
 

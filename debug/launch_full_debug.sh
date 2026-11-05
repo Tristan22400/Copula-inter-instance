@@ -106,7 +106,7 @@ echo "=========================================================="
 echo "[4/5] S7b -- real training comparison across backends=$BACKENDS"
 echo "=========================================================="
 python debug/stages/s7b_backend_train.py --backends "$BACKENDS" --steps "$S7B_STEPS" --batch-size 4 \
-    --eval-every 10 --n-eval 8 --k-folds 5 --probs-n 49 --n-episodes "$N_EPISODES" --device cuda --run-id "$RUN_ID"
+    --eval-every 10 --n-eval 8 --k-folds 5 --n-episodes "$N_EPISODES" --device cuda --run-id "$RUN_ID"
 echo "[$(date +%H:%M:%S)] stage 4 exit=$?"
 
 echo "=========================================================="

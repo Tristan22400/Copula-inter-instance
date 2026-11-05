@@ -108,8 +108,6 @@ class MarginalSpec:
     # "oracle": exact GP-LOO PIT (synthetic only, no total-NLL row);
     # "tabpfn35_fast" / "kumo_small": that backend through the same batched PIT.
     z_train_source: str = "tabicl"
-    # Quantile-grid size for tabpfn35_fast / kumo_small.
-    probs_n: int = 99
     # Phase-A weights for tabpfn35_fast / kumo_small; default: the copula
     # checkpoint's own data.z_train_marginal_ckpt (the marginal it was trained on).
     backend_ckpt: str | None = None

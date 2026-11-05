@@ -435,7 +435,8 @@ pit_eps: 1.0e-6
 # (live_dataset.py::build_live_train_loader). Shares
 # training.live_tabicl_num_workers/live_tabicl_group_multiplier with "tabicl"
 # (see conf/config.yaml) -- pilot with a small batch_size/
-# z_train_tabicl_k_folds/z_train_marginal_probs_n before scaling up.
+# z_train_tabicl_k_folds before scaling up. Their PIT reads each model's full
+# predictive distribution (marginal/batched_pit.py), no quantile grid.
 #
 # "y_train": no-PIT control/ablation arm -- z_train becomes the raw
 # per-episode z-scored target ((y_train - mean) / std), no marginal model
@@ -449,13 +450,6 @@ pit_eps: 1.0e-6
 # on-disk generate_pit_dataset.py implementation exists (raises if selected
 # there).
 z_train_source: tabicl
-# Quantile grid size for z_train_source=tabpfn35_fast/kumo_small's PIT
-# (ignored for every other z_train_source -- TabICL's grid is always
-# 999-level). Default 99 matches
-# debug/stages/s7b_backend_train.py's DEFAULT_PROBS_N; raise for closer
-# density estimates at the cost of one interp/finite-difference pass per
-# extra probs point.
-z_train_marginal_probs_n: 99
 # Phase-A checkpoint (python -m copula_inter.finetune_marginal
 # marginal.backbone=<name>, a *_final.pt) loaded into z_train_source=
 # tabpfn35_fast/kumo_small's weights; null = the pretrained weights. A

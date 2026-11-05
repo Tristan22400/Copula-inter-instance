@@ -9,9 +9,10 @@ through. It differs from TabPFNRegressor.fit/predict, whose numpy feature
 preprocessing is not differentiable.
 
 TabPFN predicts a bar distribution (5000 bins with half-normal tails) over the
-z-normalized target. quantiles come from bar_icdf, a vectorized, differentiable
-copy of FullSupportBarDistribution.icdf (tests/test_marginal_backends.py checks
-it against the original).
+z-normalized target. The PIT (tabpfn_pit) reads that distribution directly:
+its CDF and log-density at y, tails included. Phase A's quantiles come from
+bar_icdf, a vectorized, differentiable copy of FullSupportBarDistribution.icdf
+(tests/test_marginal_backends.py checks it against the original).
 
 Needs the `tabpfn` uv extra and TABPFN_TOKEN, with the TabPFN-3.5 licence
 accepted at https://ux.priorlabs.ai (never commit the key).
@@ -29,7 +30,14 @@ import torch
 if TYPE_CHECKING:
     from tabpfn import TabPFNRegressor
 
-__all__ = ["TabPFNMarginal", "make_tabpfn_regressor", "bar_icdf", "tabpfn_quantiles", "tabpfn_run_pit_batched"]
+__all__ = [
+    "TabPFNMarginal",
+    "make_tabpfn_regressor",
+    "bar_icdf",
+    "tabpfn_quantiles",
+    "tabpfn_pit",
+    "tabpfn_run_pit_batched",
+]
 
 TABPFN_NATIVE_QUANTILES = 999
 # Keeps the half-normal tail inverse finite (and its gradient defined) at the bin edges.
@@ -80,6 +88,27 @@ class TabPFNMarginal:
         reg = self.regressor
         q_z = bar_icdf(reg.znorm_space_bardist_, self.logits(X_query), probs)
         return q_z * reg.y_train_std_ + reg.y_train_mean_
+
+    def pit(
+        self, X_context: torch.Tensor, y_context: torch.Tensor, X_query: torch.Tensor, y_query: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(u, log_pdf), each (n_query,): CDF and log-density of y_query under the full bar distribution, in y_context's units.
+
+        FullSupportBarDistribution.cdf and its negative log-density (forward)
+        include the half-normal tails, so the density is proper on all of R.
+        The z-normalization is undone by u(y) = F_z(y_z) and
+        log f(y) = log f_z(y_z) - log s, with y_z = (y - m) / s.
+        """
+        self.fit(X_context, y_context)
+        reg = self.regressor
+        bardist = reg.znorm_space_bardist_
+        logits = self.logits(X_query).float().to(bardist.borders.device)
+        mean = torch.as_tensor(reg.y_train_mean_, dtype=torch.float32, device=logits.device)
+        std = torch.as_tensor(reg.y_train_std_, dtype=torch.float32, device=logits.device)
+        y_z = (y_query.to(logits.device, torch.float32) - mean) / std
+        u = bardist.cdf(logits, y_z.unsqueeze(-1)).squeeze(-1)
+        log_pdf = -bardist(logits, y_z) - std.log()
+        return u, log_pdf
 
 
 def make_tabpfn_regressor(device: str | None = None) -> TabPFNMarginal:
@@ -172,6 +201,26 @@ def tabpfn_quantiles(
     )
 
 
+def tabpfn_pit(
+    marginal: TabPFNMarginal,
+    X_context: Sequence[np.ndarray],
+    y_context: Sequence[np.ndarray],
+    X_query: Sequence[np.ndarray],
+    y_query: Sequence[np.ndarray],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(u, log_pdf), each (B, n_query), from the full bar distribution; one fit per episode."""
+    device = marginal.device
+
+    def tensor(a: np.ndarray) -> torch.Tensor:
+        return torch.as_tensor(a, dtype=torch.float32, device=device)
+
+    pairs = [
+        marginal.pit(tensor(xc), tensor(yc), tensor(xq), tensor(yq))
+        for xc, yc, xq, yq in zip(X_context, y_context, X_query, y_query, strict=True)
+    ]
+    return torch.stack([p[0] for p in pairs]), torch.stack([p[1] for p in pairs])
+
+
 def tabpfn_run_pit_batched(
     regressor: TabPFNMarginal,
     X_train: np.ndarray,
@@ -179,18 +228,19 @@ def tabpfn_run_pit_batched(
     X_test: np.ndarray,
     Y_test: np.ndarray,
     k_folds: int = 10,
-    probs_n: int = 99,
     eps: float = 1e-6,
     seed: int = 0,
 ) -> dict:
-    """run_pit_batched for TabPFN, via the shared K-fold driver."""
-    from copula_inter.marginal.batched_pit import run_kfold_pit_batched
-    from copula_inter.marginal.finetune_adapters import backend_quantiles
-
-    def bank(X_ctx: list, y_ctx: list, X_qry: list, probs: np.ndarray) -> np.ndarray:
-        with torch.no_grad():
-            return backend_quantiles("tabpfn35_fast", regressor, X_ctx, y_ctx, X_qry, probs).float().cpu().numpy()
+    """run_pit_batched for TabPFN, via the shared K-fold driver and the full bar distribution."""
+    from copula_inter.marginal.batched_pit import backend_pit_fn, run_kfold_pit_batched
 
     return run_kfold_pit_batched(
-        bank, X_train, Y_train, X_test, Y_test, k_folds=k_folds, probs_n=probs_n, eps=eps, seed=seed
+        backend_pit_fn("tabpfn35_fast", regressor),
+        X_train,
+        Y_train,
+        X_test,
+        Y_test,
+        k_folds=k_folds,
+        eps=eps,
+        seed=seed,
     )

@@ -23,16 +23,7 @@ def test_resolve_marginal_maps_z_train_source(source: str, expected: str | None)
     from copula_inter.data.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": source}})
-    backend, probs_n = _resolve_marginal(cfg)
-    assert backend == expected
-    assert probs_n == 99
-
-
-def test_resolve_marginal_reads_probs_n() -> None:
-    from copula_inter.data.era5_live_dataset import _resolve_marginal
-
-    cfg = OmegaConf.create({"data": {"z_train_source": "kumo_small", "z_train_marginal_probs_n": 33}})
-    assert _resolve_marginal(cfg) == ("kumo_small", 33)
+    assert _resolve_marginal(cfg) == expected
 
 
 def test_resolve_marginal_rejects_typo() -> None:
@@ -63,7 +54,6 @@ def test_pit_group_and_episode_agree_under_backend(backend: str, module: str) ->
     kw = dict(
         marginal_backend=backend,
         marginal_regressor=regressor,
-        marginal_probs_n=9,
         seed=7,
     )
     grouped = _pit_group(x_train, y_train, x_test, y_test, None, 2, **kw)

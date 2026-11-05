@@ -87,7 +87,6 @@ def _generate_shard_with_oom_retry(
     tabicl_split_calib_frac: float = 0.0,
     marginal_backend: str | None = None,
     marginal_regressor: Any = None,
-    marginal_probs_n: int = 99,
 ) -> list:
     """Generate n_this episodes for one shard, halving the chunk size on CUDA OOM.
 
@@ -117,7 +116,6 @@ def _generate_shard_with_oom_retry(
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
-                marginal_probs_n=marginal_probs_n,
             )
             if d_fixed is None and new_episodes:
                 d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
@@ -261,7 +259,6 @@ def main(cfg: DictConfig) -> None:
     tabicl_model = None
     marginal_backend = z_train_source if z_train_source in GENERIC_MARGINAL_BACKENDS else None
     marginal_regressor = None
-    marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
     tabicl_split_calib_frac = (
         float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
@@ -338,7 +335,6 @@ def main(cfg: DictConfig) -> None:
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
-                marginal_probs_n=marginal_probs_n,
             )
             # Don't store R_prior and Sigma_star (reconstructed at load).
             for ep in episodes:

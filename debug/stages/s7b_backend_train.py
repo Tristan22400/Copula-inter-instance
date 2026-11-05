@@ -25,29 +25,30 @@ from debug.stages.s5_kfold import _pit_at_k
 if TYPE_CHECKING:
     from copula_inter.marginal.pit import TabICLLike
 
-DEFAULT_PROBS_N = 99  # coarser than TabICL's 999 -- TabPFN's per-fold .fit()+.predict() dominates wall-clock
-
 
 def _generic_pit_episode(
-    backend: str, regressor: Any, ep: dict, k_folds: int, probs_n: int, seed: int
+    backend: str, regressor: Any, ep: dict, k_folds: int, seed: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-episode PIT through a non-TabICL backend (marginal.backends loo_pit/quantiles and joint_nll.compute_pit)."""
-    from copula_inter.marginal.backends import loo_pit, quantiles
-    from copula_inter.marginal.kfold import compute_pit
+    """Per-episode PIT through a non-TabICL backend: the batched PIT training uses (full predictive distribution), B=1."""
+    from copula_inter.marginal.backends import BackendMarginal
 
-    x_train = ep["x_norm_train"].numpy()
-    x_test = ep["x_norm_test"].numpy()
     y_train = ep["y_train"].numpy()
     y_test = ep["y_test"].numpy()
     y_mean, y_std = y_train.mean(), max(y_train.std(), 1e-8)
-    y_train_s, y_test_s = (y_train - y_mean) / y_std, (y_test - y_mean) / y_std
-
-    probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
-    z_train = loo_pit(backend, regressor, x_train, y_train_s, probs, k_folds=k_folds, seed=seed)
-    q_test = quantiles(backend, regressor, x_train, y_train_s, x_test, probs, seed=seed)
-    z_test, log_pdf = compute_pit(q_test, probs, y_test_s)
-    log_pdf = log_pdf - np.log(y_std)  # Jacobian back to raw-y nats, same convention as gp_episodes.py
-    return torch.from_numpy(z_train).float(), torch.from_numpy(z_test).float(), torch.from_numpy(log_pdf).float()
+    out = BackendMarginal(backend, regressor).pit(
+        ep["x_norm_train"].numpy(),
+        (y_train - y_mean) / y_std,
+        ep["x_norm_test"].numpy(),
+        (y_test - y_mean) / y_std,
+        k_folds=k_folds,
+        seed=seed,
+    )
+    log_pdf = out["log_pdf_test"] - np.log(y_std)  # Jacobian back to raw-y nats, same convention as gp_episodes.py
+    return (
+        torch.from_numpy(out["z_train"]).float(),
+        torch.from_numpy(out["z_test"]).float(),
+        torch.from_numpy(log_pdf).float(),
+    )
 
 
 def _build_batch_for_backend(
@@ -58,7 +59,6 @@ def _build_batch_for_backend(
     tabicl_model: TabICLLike | None = None,
     regressor: Any = None,
     k_folds: int = 5,
-    probs_n: int = DEFAULT_PROBS_N,
 ) -> dict:
     from copula_inter.data.dataset import collate_fn
 
@@ -71,7 +71,7 @@ def _build_batch_for_backend(
     else:
         # Other backends: per-episode PIT.
         for i, ep in enumerate(episodes):
-            zt, zte, lp = _generic_pit_episode(backend, regressor, ep, k_folds, probs_n, seed=seed_offset + i)
+            zt, zte, lp = _generic_pit_episode(backend, regressor, ep, k_folds, seed=seed_offset + i)
             ep["z_train"], ep["z_test"], ep["log_pdf_test"] = zt, zte, lp
     return {k: v.to(dcfg.device) for k, v in collate_fn(episodes).items()}
 
@@ -85,7 +85,6 @@ def _train_one_backend(
     eval_every: int,
     n_eval: int,
     k_folds: int,
-    probs_n: int,
 ) -> list[dict[str, float]]:
     from copula_inter.copula.loss import y_space_nll
     from copula_inter.copula.model import build_copula_transformer, build_sigma
@@ -112,7 +111,6 @@ def _train_one_backend(
         tabicl_model=tabicl_model,
         regressor=regressor,
         k_folds=k_folds,
-        probs_n=probs_n,
     )
 
     history = []
@@ -126,7 +124,6 @@ def _train_one_backend(
             tabicl_model=tabicl_model,
             regressor=regressor,
             k_folds=k_folds,
-            probs_n=probs_n,
         )
         out = model(batch)
         Sigma = build_sigma(out, dcfg.cfg, jitter=jitter, test_mask=batch["test_mask"])
@@ -177,7 +174,6 @@ def run(
     eval_every: int,
     n_eval: int,
     k_folds: int,
-    probs_n: int,
 ) -> dict:
     result = {}
     for backend in backends:
@@ -191,7 +187,6 @@ def run(
             eval_every=eval_every,
             n_eval=n_eval,
             k_folds=k_folds,
-            probs_n=probs_n,
         )
     return {"backends": backends, "steps": steps, "batch_size": batch_size, "history": result}
 
@@ -206,12 +201,6 @@ def main() -> None:
     p.add_argument("--eval-every", type=int, default=20)
     p.add_argument("--n-eval", type=int, default=8, help="Fixed eval-set episode count")
     p.add_argument("--k-folds", type=int, default=5)
-    p.add_argument(
-        "--probs-n",
-        type=int,
-        default=DEFAULT_PROBS_N,
-        help="Quantile grid size for tabpfn35_fast/kumo_small (default 99; TabICL always uses its own 999)",
-    )
     args = p.parse_args()
 
     dcfg = build_config(
@@ -233,7 +222,6 @@ def main() -> None:
         eval_every=args.eval_every,
         n_eval=args.n_eval,
         k_folds=args.k_folds,
-        probs_n=args.probs_n,
     )
 
     print("\n=== final eval_copula by backend ===")

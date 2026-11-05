@@ -170,7 +170,6 @@ def _load_episodes(
             pit_group_size=spec.era5.pit_batch,
             marginal_backend=marginal_backend,
             marginal_regressor=marginal_regressor,
-            marginal_probs_n=spec.marginal.probs_n,
             autoregressive=spec.autoregressive.enabled,
             ar_order=spec.autoregressive.order,
             ar_conditioning=spec.autoregressive.conditioning,
@@ -246,7 +245,7 @@ def _load_models(
         tabicl_ckpt = spec.marginal.backend_ckpt or z_train_marginal_ckpt(icl_cfg)
         print(
             f"\nBuilding {marginal_backend} marginal for marginal.z_train_source={marginal_backend} "
-            f"(k_folds={tabicl_pit_k_folds}, probs_n={spec.marginal.probs_n}, "
+            f"(k_folds={tabicl_pit_k_folds}, full predictive distribution, "
             f"weights={tabicl_ckpt or 'pretrained'})"
         )
         marginal_regressor = make_regressor(marginal_backend, device=str(device), ckpt=tabicl_ckpt)
