@@ -24,6 +24,7 @@ from tabicl._model.inference_config import InferenceConfig, MgrConfig
 from tabicl._model.tabicl import TabICL
 
 if TYPE_CHECKING:
+    from copula_inter.marginal.backends import BackendMarginal
     from copula_inter.type_aliases import Device
 
 DEFAULT_K_FOLDS = 10
@@ -962,15 +963,25 @@ def gaussian_corr_kl(R_model: torch.Tensor, R_post: torch.Tensor) -> float:
 def compute_context_z_train(
     x_train_norm: np.ndarray,
     context_values: np.ndarray,
-    tabicl_marginal: TabICLLike | None,
+    tabicl_marginal: TabICLLike | BackendMarginal | None,
     device: Device,
     k_folds: int = 10,
 ) -> np.ndarray:
-    """K-fold PIT z_train of a real context sample under tabicl_marginal (standardized values when it is None)."""
+    """K-fold PIT z_train of a real context sample under tabicl_marginal (standardized values when it is None).
+
+    tabicl_marginal may also be a marginal.backends.BackendMarginal.
+    """
     if tabicl_marginal is None:
         y_mean = context_values.mean()
         y_std = max(context_values.std(), 1e-8)
         return (context_values - y_mean) / y_std
+    from copula_inter.marginal.backends import BackendMarginal
+
+    if isinstance(tabicl_marginal, BackendMarginal):
+        scaled = (context_values - context_values.mean()) / max(float(context_values.std(ddof=1)), 1e-8)
+        x = np.asarray(x_train_norm, dtype=np.float32)
+        y = np.asarray(scaled, dtype=np.float32)
+        return tabicl_marginal.pit(x, y, x[:1], y[:1], k_folds=k_folds)["z_train"]
 
     X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
     context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)

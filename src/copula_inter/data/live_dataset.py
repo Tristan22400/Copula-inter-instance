@@ -17,7 +17,12 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
+from copula_inter.backend_registry import (
+    GENERIC_MARGINAL_BACKENDS,
+    TABICL_Z_TRAIN_SOURCES,
+    validate_z_train_source,
+    z_train_marginal_ckpt,
+)
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.data.dataset import collate_fn
 from copula_inter.data.gp_episodes import generate_gp_batch
@@ -181,11 +186,13 @@ class LiveGPDataset(IterableDataset):
         if self.marginal_backend is not None:
             from copula_inter.marginal.backends import make_regressor
 
+            marginal_ckpt = z_train_marginal_ckpt(cfg)
             print(
                 f"[live_dataset] worker {worker_id}: loading {self.marginal_backend} marginal "
                 f"for data.z_train_source={self.marginal_backend} on {self.marginal_device}"
+                + (f" from {marginal_ckpt}" if marginal_ckpt else "")
             )
-            marginal_regressor = make_regressor(self.marginal_backend, device=self.marginal_device)
+            marginal_regressor = make_regressor(self.marginal_backend, device=self.marginal_device, ckpt=marginal_ckpt)
 
         while True:
             cfg.seed = worker_seed(self._base_seed, worker_id, call_idx)
@@ -354,7 +361,7 @@ def build_fixed_live_val_batches(
             f"training.live_generation with data.z_train_source={z_train_source} "
             f"requires device='cuda' (got {device!r}) -- see build_live_train_loader's "
             "batched_marginal_worker_enabled docstring for why CPU is rejected "
-            "rather than silently slow for tabpfn too."
+            "rather than silently slow for tabpfn35_fast/kumo_small too."
         )
     tabicl_model = None
     gen_device = "cpu"
@@ -381,7 +388,7 @@ def build_fixed_live_val_batches(
         from copula_inter.marginal.backends import make_regressor
 
         print(f"[live_dataset] Loading {z_train_source} marginal for fixed val batches on {device}")
-        marginal_regressor = make_regressor(z_train_source, device=device)
+        marginal_regressor = make_regressor(z_train_source, device=device, ckpt=z_train_marginal_ckpt(cfg))
 
     batches = []
     episodes_by_batch: List[List[dict]] = []

@@ -19,16 +19,7 @@ configure_cuda_devices train.sh
 # HF_HUB_OFFLINE=0 before calling this script if a checkpoint isn't cached yet.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
-# data.z_train_source=tabpfn needs a one-time PriorLabs license acceptance +
-# API key (https://ux.priorlabs.ai) -- never pass it as a CLI arg (oarstat/ps
-# show job command lines to other users on this shared cluster) or commit it.
-# Same convention as debug/launch_full_debug.sh: read from a private,
-# untracked file outside the repo if TABPFN_TOKEN isn't already set.
-TABPFN_TOKEN_FILE="${TABPFN_TOKEN_FILE:-$HOME/.config/tabpfn_token}"
-if [[ -z "${TABPFN_TOKEN:-}" && -f "$TABPFN_TOKEN_FILE" ]]; then
-    export TABPFN_TOKEN
-    TABPFN_TOKEN="$(cat "$TABPFN_TOKEN_FILE")"
-fi
+# data.z_train_source=tabpfn35_fast reads TABPFN_TOKEN, which _env.sh loads.
 
 echo "Starting Training... (Job ID: ${OAR_JOB_ID:-local})"
 if [[ "${TRAIN_SH_DRY_RUN:-0}" == "1" ]]; then

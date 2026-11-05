@@ -10,7 +10,7 @@ Usage:
     python debug/run_debug.py all --ckpt kernel-sweep-all-tabicl-retrain-15k
     python debug/run_debug.py s1 --n-episodes 64 --ranks 8,16,32,64
     python debug/run_debug.py s4 --kernel rbf --target posterior
-    python debug/run_debug.py s7b --backends tabicl,tabpfn --steps 200
+    python debug/run_debug.py s7b --backends tabicl,kumo_small --steps 200
     python debug/run_debug.py s8 --kernel matern52
     python debug/run_debug.py report --run-id <run_id>
 """

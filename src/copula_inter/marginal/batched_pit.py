@@ -1,4 +1,4 @@
-"""K-fold PIT driver for the batched marginal backends (tabpfn).
+"""K-fold PIT driver for the batched marginal backends (tabpfn35_fast, kumo_small).
 
 The backend supplies bank_fn:
 

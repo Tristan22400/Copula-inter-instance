@@ -420,16 +420,21 @@ pit_eps: 1.0e-6
 # forward pass, but over a larger context) -- pilot on a small n_tasks before
 # scaling a production run up.
 #
-# "tabpfn": same idea as "tabicl" -- override z_train AND z_test/log_pdf_test
-# with PriorLabs TabPFN v3's own K-fold PIT, batched across every episode in
-# a shard-generation call through its public TabPFNRegressor.predict_batched
-# (src/copula_inter/marginal/tabpfn_batched.py, on the shared K-fold driver
-# src/copula_inter/marginal/batched_pit.py). Needs a one-time license
-# acceptance + `TABPFN_TOKEN` env var (see _require_tabpfn_token in
-# marginal/backends.py). training.live_generation with z_train_source=tabpfn
-# raises if device isn't 'cuda' (live_dataset.py::build_live_train_loader).
-# Shares training.live_tabicl_num_workers/live_tabicl_group_multiplier with
-# "tabicl" (see conf/config.yaml) -- pilot with a small batch_size/
+# "tabpfn35_fast" / "kumo_small": same idea as "tabicl" -- override z_train
+# AND z_test/log_pdf_test with another tabular foundation model's K-fold PIT
+# (shared K-fold driver src/copula_inter/marginal/batched_pit.py):
+#   tabpfn35_fast  PriorLabs TabPFN-3.5, Fast checkpoint
+#                  (src/copula_inter/marginal/tabpfn_marginal.py; one fit per
+#                  episode). Needs `TABPFN_TOKEN` with the TabPFN-3.5 licence
+#                  accepted (scripts/train.sh reads ~/.config/tabpfn_token).
+#   kumo_small     NVIDIA Kumo Tabular, small
+#                  (src/copula_inter/marginal/kumo_marginal.py; episodes batched).
+# Each reads z_train_marginal_ckpt (below) for Phase-A weights. Both need the
+# matching uv extra (`--extra tabpfn` / `--extra kumo`). training.live_generation
+# with either raises if device isn't 'cuda'
+# (live_dataset.py::build_live_train_loader). Shares
+# training.live_tabicl_num_workers/live_tabicl_group_multiplier with "tabicl"
+# (see conf/config.yaml) -- pilot with a small batch_size/
 # z_train_tabicl_k_folds/z_train_marginal_probs_n before scaling up.
 #
 # "y_train": no-PIT control/ablation arm -- z_train becomes the raw
@@ -444,13 +449,19 @@ pit_eps: 1.0e-6
 # on-disk generate_pit_dataset.py implementation exists (raises if selected
 # there).
 z_train_source: tabicl
-# Quantile grid size for z_train_source=tabpfn's PIT (ignored for
-# every other z_train_source, which use their own native grid -- TabICL's is
-# always 999-level). Default 99 matches
+# Quantile grid size for z_train_source=tabpfn35_fast/kumo_small's PIT
+# (ignored for every other z_train_source -- TabICL's grid is always
+# 999-level). Default 99 matches
 # debug/stages/s7b_backend_train.py's DEFAULT_PROBS_N; raise for closer
 # density estimates at the cost of one interp/finite-difference pass per
 # extra probs point.
 z_train_marginal_probs_n: 99
+# Phase-A checkpoint (python -m copula_inter.finetune_marginal
+# marginal.backbone=<name>, a *_final.pt) loaded into z_train_source=
+# tabpfn35_fast/kumo_small's weights; null = the pretrained weights. A
+# checkpoint written for another backbone is refused. For tabicl use
+# tabicl.pit_ckpt instead.
+z_train_marginal_ckpt: null
 # K-fold count for z_train_source=tabicl's run_pit_batched call (same
 # semantics/default as pit.py::DEFAULT_K_FOLDS). Ignored unless
 # z_train_source=tabicl. Clamped into [2, P] by run_pit_batched regardless

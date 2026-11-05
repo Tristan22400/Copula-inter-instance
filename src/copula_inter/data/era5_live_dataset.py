@@ -14,6 +14,7 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
+from copula_inter.backend_registry import z_train_marginal_ckpt
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.data.live_dataset import _limit_worker_threads, resolve_live_tabicl_num_workers, worker_seed
 from copula_inter.era5.corpus import GlobalERA5Corpus, load_shared_corpus_arrays
@@ -261,6 +262,7 @@ class LiveERA5Dataset(IterableDataset):
         tabicl_inference_amp: bool = False,
         marginal_backend: Optional[str] = None,
         marginal_probs_n: int = 99,
+        marginal_ckpt: Optional[str] = None,
     ) -> None:
         self.shared_corpus = shared_corpus
         self.tabicl_ckpt = tabicl_ckpt
@@ -275,6 +277,7 @@ class LiveERA5Dataset(IterableDataset):
         # None: TabICL run_pit; otherwise a generic backend built per worker.
         self.marginal_backend = marginal_backend
         self.marginal_probs_n = int(marginal_probs_n)
+        self.marginal_ckpt = marginal_ckpt
 
     def __iter__(self) -> Iterator:
         import numpy as np
@@ -297,7 +300,9 @@ class LiveERA5Dataset(IterableDataset):
                 f"[era5_live_dataset] worker {worker_id}: building {self.marginal_backend} marginal "
                 f"on {self.tabicl_device}"
             )
-            marginal_regressor = make_regressor(self.marginal_backend, device=self.tabicl_device)
+            marginal_regressor = make_regressor(
+                self.marginal_backend, device=self.tabicl_device, ckpt=self.marginal_ckpt
+            )
 
         call_idx = 0
         while True:
@@ -390,7 +395,7 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         raise ValueError(
             "training.live_source=era5 requires a resolvable TabICL checkpoint — "
             "set tabicl.ckpt (with tabicl.pretrained=true) or tabicl.pit_ckpt, "
-            "or select the TabPFN marginal with data.z_train_source=tabpfn."
+            "or select another marginal with data.z_train_source=tabpfn35_fast or kumo_small."
         )
     ecfg = _resolve_era5_cfg(cfg)
     k_folds = int(cfg.tabicl.get("pit_k_folds", 10))
@@ -416,6 +421,7 @@ def build_era5_train_loader(cfg: DictConfig, t: DictConfig, device: str) -> Data
         tabicl_inference_amp=bool(t.get("tabicl_inference_amp", False)),
         marginal_backend=marginal_backend,
         marginal_probs_n=marginal_probs_n,
+        marginal_ckpt=z_train_marginal_ckpt(cfg),
     )
     # Worker count bound by GPU headroom (the corpus is shared).
     num_workers = resolve_live_tabicl_num_workers(t, device)
@@ -447,7 +453,7 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
         raise ValueError(
             "training.live_source=era5 requires a resolvable TabICL checkpoint — "
             "set tabicl.ckpt (with tabicl.pretrained=true) or tabicl.pit_ckpt, "
-            "or select the TabPFN marginal with data.z_train_source=tabpfn."
+            "or select another marginal with data.z_train_source=tabpfn35_fast or kumo_small."
         )
     k_folds = int(cfg.tabicl.get("pit_k_folds", 10))
     tabicl_model = None
@@ -460,7 +466,7 @@ def build_era5_fixed_val_batches(cfg: DictConfig, t: DictConfig, device: str = "
         from copula_inter.marginal.backends import make_regressor
 
         print(f"[era5_live_dataset] Building {marginal_backend} marginal for fixed val batches on {device}")
-        marginal_regressor = make_regressor(marginal_backend, device=device)
+        marginal_regressor = make_regressor(marginal_backend, device=device, ckpt=z_train_marginal_ckpt(cfg))
     val_corpus_dir = ecfg["val_corpus_dir"] or ecfg["corpus_dir"]
     print(f"[era5_live_dataset] Building fixed val batches from corpus: {val_corpus_dir}")
     corpus = GlobalERA5Corpus(val_corpus_dir)

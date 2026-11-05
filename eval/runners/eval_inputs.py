@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from copula_inter.type_aliases import Device
     from eval.runners.eval_args import EvalSpec
 
-from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, z_train_marginal_ckpt
 from copula_inter.checkpoint_registry import (
     DEFAULT_MARGINAL_FAMILY,
     resolve_marginal_checkpoint,
@@ -241,11 +241,15 @@ def _load_models(
         from copula_inter.marginal.backends import make_regressor
 
         tabicl_pit_k_folds = configured_k_folds
+        # The returned "tabicl_ckpt" slot carries the marginal's own weights file
+        # (None = pretrained) so the results caches key on it.
+        tabicl_ckpt = spec.marginal.backend_ckpt or z_train_marginal_ckpt(icl_cfg)
         print(
             f"\nBuilding {marginal_backend} marginal for marginal.z_train_source={marginal_backend} "
-            f"(k_folds={tabicl_pit_k_folds}, probs_n={spec.marginal.probs_n})"
+            f"(k_folds={tabicl_pit_k_folds}, probs_n={spec.marginal.probs_n}, "
+            f"weights={tabicl_ckpt or 'pretrained'})"
         )
-        marginal_regressor = make_regressor(marginal_backend, device=str(device))
+        marginal_regressor = make_regressor(marginal_backend, device=str(device), ckpt=tabicl_ckpt)
     elif spec.marginal.z_train_source == "tabicl":
         # marginal.tabicl_ckpt, then cfg.tabicl.ckpt, then DEFAULT_MARGINAL_FAMILY.
         tabicl_ckpt = (

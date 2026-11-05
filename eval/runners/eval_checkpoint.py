@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from omegaconf import DictConfig
 
 from copula_inter.artifacts import artifact_identity, atomic_json_save
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS
 from copula_inter.checkpoint_registry import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
 from copula_inter.config_path import config_dict
 from copula_inter.rng import resolve_device, seed_everything
@@ -160,7 +161,9 @@ def _baseline_cache_fingerprint(
         # The cached z-space baseline NLLs are scored against this marginal's PIT z_test, so which
         # TabICL checkpoint (and precision) produced it is part of the identity. Pre-refactor caches
         # were all written with the default marginal under AMP; that case keeps the old key set.
-        if spec.marginal.z_train_source == "tabicl" and tabicl_ckpt is not None:
+        if spec.marginal.z_train_source in GENERIC_MARGINAL_BACKENDS and tabicl_ckpt is not None:
+            fingerprint["era5"]["pit_marginal_identity"] = {"ckpt": artifact_identity(tabicl_ckpt)}
+        elif spec.marginal.z_train_source == "tabicl" and tabicl_ckpt is not None:
             legacy = tabicl_ckpt == resolve_marginal_checkpoint(DEFAULT_MARGINAL_FAMILY) and spec.marginal.tabicl_amp
             if not legacy:
                 fingerprint["era5"]["pit_marginal_identity"] = {
@@ -362,7 +365,7 @@ def run_evaluation(spec: EvalSpec) -> None:
             fingerprint,
             spec,
             tabicl_pit_k_folds,
-            resolved_marginal=tabicl_ckpt if spec.marginal.z_train_source == "tabicl" else None,
+            resolved_marginal=tabicl_ckpt if spec.marginal.z_train_source != "oracle" else None,
         )
         if results_cache is not None
         else {}

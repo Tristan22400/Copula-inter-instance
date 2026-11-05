@@ -11,7 +11,7 @@ Usage:
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000000 data.shard_size=512
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl_split
-    python -m copula_inter.generate_pit_dataset data.n_tasks=500 data.z_train_source=tabpfn
+    python -m copula_inter.generate_pit_dataset data.n_tasks=500 data.z_train_source=kumo_small
 """
 
 from __future__ import annotations
@@ -35,7 +35,12 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from copula_inter.artifacts import atomic_json_save, atomic_torch_save, file_digest
-from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
+from copula_inter.backend_registry import (
+    GENERIC_MARGINAL_BACKENDS,
+    TABICL_Z_TRAIN_SOURCES,
+    validate_z_train_source,
+    z_train_marginal_ckpt,
+)
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
 from copula_inter.data.contracts import validate_episode
@@ -278,8 +283,12 @@ def main(cfg: DictConfig) -> None:
         # Build one backend regressor for all shards (CPU is allowed here, only slower).
         from copula_inter.marginal.backends import make_regressor
 
-        print(f"Building {z_train_source} marginal for data.z_train_source={z_train_source} on {device}")
-        marginal_regressor = make_regressor(marginal_backend, device=device)
+        ckpt = z_train_marginal_ckpt(cfg)
+        print(
+            f"Building {z_train_source} marginal for data.z_train_source={z_train_source} on {device}"
+            + (f" from {ckpt}" if ckpt else "")
+        )
+        marginal_regressor = make_regressor(marginal_backend, device=device, ckpt=ckpt)
 
     manifest = ensure_manifest(pit_dir, generation_spec(cfg, ckpt))
     for name in os.listdir(pit_dir):

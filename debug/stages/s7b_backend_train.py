@@ -4,8 +4,8 @@ All backends start from the same initialization and use a plain AdamW loop
 (no Muon, no AMP).
 
 Usage:
-    python debug/run_debug.py s7b --backends tabicl,tabpfn --steps 200
-    python debug/stages/s7b_backend_train.py --backends tabicl,tabpfn --steps 200 --batch-size 8
+    python debug/run_debug.py s7b --backends tabicl,kumo_small --steps 200
+    python debug/stages/s7b_backend_train.py --backends tabicl,kumo_small --steps 200 --batch-size 8
 """
 
 from __future__ import annotations
@@ -199,7 +199,7 @@ def run(
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(p)
-    p.add_argument("--backends", default="tabicl,tabpfn")
+    p.add_argument("--backends", default="tabicl,tabpfn35_fast,kumo_small")
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -210,7 +210,7 @@ def main() -> None:
         "--probs-n",
         type=int,
         default=DEFAULT_PROBS_N,
-        help="Quantile grid size for tabpfn (default 99; TabICL always uses its own 999)",
+        help="Quantile grid size for tabpfn35_fast/kumo_small (default 99; TabICL always uses its own 999)",
     )
     args = p.parse_args()
 

@@ -21,6 +21,17 @@ if [[ ! -f "$COPULA_VENV/bin/activate" ]]; then
 fi
 source "$COPULA_VENV/bin/activate"
 
+# The tabpfn35_fast marginal needs a PriorLabs API key whose account accepted the
+# TabPFN-3.5 licence (https://ux.priorlabs.ai). Never pass it as a CLI arg
+# (oarstat/ps show job command lines to other users on this shared cluster) or
+# commit it: it is read from a private, untracked file outside the repo when
+# TABPFN_TOKEN isn't already set.
+TABPFN_TOKEN_FILE="${TABPFN_TOKEN_FILE:-$HOME/.config/tabpfn_token}"
+if [[ -z "${TABPFN_TOKEN:-}" && -f "$TABPFN_TOKEN_FILE" ]]; then
+    export TABPFN_TOKEN
+    TABPFN_TOKEN="$(cat "$TABPFN_TOKEN_FILE")"
+fi
+
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:$REPO_ROOT/tabicl_upstream/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
