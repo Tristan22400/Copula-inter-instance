@@ -224,6 +224,28 @@ def test_tabpfn_bar_icdf_matches_bar_distribution() -> None:
     torch.testing.assert_close(bar_icdf(bardist, logits, torch.tensor(levels)), reference, atol=1e-5, rtol=1e-5)
 
 
+def test_tabpfn_batched_fingerprints_match_the_library_step() -> None:
+    """fingerprints() equals TorchAddFingerprintFeaturesStep bit for bit, incl. duplicate and all-NaN rows."""
+    pytest.importorskip("tabpfn", reason="tabpfn not installed (uv extra)")
+    from tabpfn.preprocessing.torch.steps import TorchAddFingerprintFeaturesStep
+
+    from copula_inter.marginal.tabpfn_marginal import fingerprints
+
+    rng = np.random.default_rng(0)
+    x = torch.as_tensor(rng.normal(size=(40, 5, 3)), dtype=torch.float32)
+    x[7] = x[3]  # duplicate training rows: collision re-salting
+    x[12] = x[3]
+    x[35] = x[3]  # a test row equal to a training row: not re-salted
+    x[20, 1] = float("nan")  # all-NaN rows are exempt from the collision loop
+    x[21, 1] = float("nan")
+    x[5, 2, 0] = float("nan")
+    n_train = 30
+    ref = TorchAddFingerprintFeaturesStep().fit_transform(x, list(range(3)), num_train_rows=n_train).added_columns
+    got = fingerprints(x, n_train, n_train * x.shape[-1])
+    assert got.shape == ref.shape == (40, 5, 1)
+    assert torch.equal(got, ref)
+
+
 def test_tabpfn_bar_pit_matches_bar_distribution() -> None:
     """bar_pit equals FullSupportBarDistribution.cdf and its negative log-density, in the bins, on the borders and in both tails."""
     _require("tabpfn35_fast", "tabpfn")

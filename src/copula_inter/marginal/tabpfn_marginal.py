@@ -23,6 +23,7 @@ accepted at https://ux.priorlabs.ai (never commit the key).
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
 from typing import TYPE_CHECKING, Any, Sequence
@@ -38,6 +39,7 @@ __all__ = [
     "make_tabpfn_regressor",
     "bar_icdf",
     "bar_pit",
+    "fingerprints",
     "tabpfn_quantiles",
     "tabpfn_pit",
     "tabpfn_run_pit_batched",
@@ -152,6 +154,7 @@ class TabPFNMarginal:
         mean = X_context.mean(dim=1, keepdim=True)
         std = X_context.std(dim=1, keepdim=True)
         x_full = torch.cat([(X_context - mean) / std, (X_query - mean) / std], dim=1).transpose(0, 1)
+        _batch_fingerprint_step(member.gpu_preprocessor)
         out = member.gpu_preprocessor(x_full, feature_schema=member.feature_schema, num_train_rows=n)
         model: Any = self.module
         kwargs: dict[str, object] = {"task_type": "regression"} if _model_expectes_task_type_arg(model) else {}
@@ -193,6 +196,86 @@ class TabPFNMarginal:
         y_z = (y_query.to(logits.device, torch.float32) - mean[:, None]) / std[:, None]
         u, log_pdf_z = bar_pit(self.regressor.znorm_space_bardist_, logits, y_z)
         return u, log_pdf_z - std.log()[:, None]
+
+
+def fingerprints(x: torch.Tensor, num_train_rows: int, n_cells: int) -> torch.Tensor:
+    """TabPFN's row fingerprint feature for a (rows, B, C) batch: (rows, B, 1), in x's dtype and device.
+
+    The same values as tabpfn's TorchAddFingerprintFeaturesStep (SHA-256 of each
+    row, rounded to 12 decimals, salted with n_cells; training rows re-salted
+    until unique, test rows not), which copies and rounds every member
+    separately. Here x crosses to the CPU and is rounded once, and the low 64
+    bits of the digest are read directly instead of through a hex string.
+    tests/test_marginal_backends.py checks it against the library step.
+    """
+    from tabpfn.preprocessing.steps.add_fingerprint_features_step import (
+        _CONSTANT,
+        _HASH_ROUND_DECIMALS,
+        _MAX_COLLISION_RETRIES,
+    )
+
+    x_np = x.detach().cpu().numpy()
+    rounded = np.ascontiguousarray(np.around(x_np, decimals=_HASH_ROUND_DECIMALS).transpose(1, 0, 2))  # (B, rows, C)
+    all_nan = np.isnan(x_np).all(axis=2).T  # (B, rows)
+    rows, B = x_np.shape[:2]
+    out = np.empty((B, rows), dtype=x_np.dtype)
+
+    def h(row: bytes, salt: int) -> float:
+        low = int.from_bytes(hashlib.sha256(row + salt.to_bytes(8, "little", signed=False)).digest()[-8:], "big")
+        return (low & _CONSTANT) / _CONSTANT
+
+    for b in range(B):
+        seen: set[float] = set()
+        counter: dict[float, int] = {}
+        for i in range(rows):
+            row = rounded[b, i].tobytes()
+            base = h(row, n_cells)
+            if i >= num_train_rows:  # test rows: no collision handling
+                out[b, i] = base
+                continue
+            add = counter.get(base, 0)
+            v = base if add == 0 else h(row, n_cells + add)
+            retries = 0
+            while v in seen and not all_nan[b, i]:
+                add += 1
+                retries += 1
+                if retries > _MAX_COLLISION_RETRIES:
+                    raise RuntimeError(
+                        f"Fingerprint hash collision not resolved after {_MAX_COLLISION_RETRIES} retries."
+                    )
+                v = h(row, n_cells + add)
+            out[b, i] = v
+            seen.add(v)
+            counter[base] = add + 1
+    return torch.from_numpy(out.T.copy()).float().unsqueeze(-1).to(dtype=x.dtype, device=x.device)
+
+
+def _batch_fingerprint_step(pipeline: Any) -> None:
+    """Make the fingerprint step of this GPU preprocessing pipeline use fingerprints(), for this instance only."""
+    from tabpfn.preprocessing.datamodel import FeatureModality
+    from tabpfn.preprocessing.torch.pipeline_interface import TorchPreprocessingStepResult
+    from tabpfn.preprocessing.torch.steps import TorchAddFingerprintFeaturesStep
+
+    for step, _ in pipeline.steps:
+        if not isinstance(step, TorchAddFingerprintFeaturesStep) or getattr(step, "_copula_batched", False):
+            continue
+
+        def fit_transform(
+            x: torch.Tensor,
+            column_indices: list[int],
+            num_train_rows: int,
+            fitted_cache: dict[str, torch.Tensor] | None = None,
+        ) -> Any:
+            del column_indices
+            if fitted_cache is None:
+                fitted_cache = {"n_cells": torch.tensor(num_train_rows * x.shape[-1])}
+            added = fingerprints(x, num_train_rows, int(fitted_cache["n_cells"].item()))
+            return TorchPreprocessingStepResult(
+                x=x, added_columns=added, added_modality=FeatureModality.NUMERICAL, fitted_cache=fitted_cache
+            )
+
+        step.fit_transform = fit_transform
+        step._copula_batched = True
 
 
 def make_tabpfn_regressor(device: str | None = None) -> TabPFNMarginal:
