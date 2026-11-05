@@ -190,6 +190,14 @@ against independence, the autoregressive row and best_baseline. Every delta
 carries a 95 % cluster-bootstrap CI (2,000 replicates) and a win rate;
 `folds=[...]` restricts both runs to the listed folds for cross-fitting.
 
+Timestamp budget: episode j of a fold owns `timestamp_tries` hourly candidates,
+so a fold supports at most ⌊candidates / timestamp_tries⌋ episodes (400 episodes
+= 80 per fold). The P=64 cell runs with `real.sdwpf.timestamp_tries=7`: fold 0
+has 580 candidates at that P + N, so 8 × 80 = 640 > 580, while 7 × 80 = 560 fits.
+Changing `timestamp_tries` changes the slice boundaries, so the P=64 episodes
+are a different stream from the other cells (they are not paired across P
+anyway). Every other cell keeps the default of 8.
+
 ### The autoregressive row
 
 This row is on by default for the TabICL marginal. It uses the same marginal
