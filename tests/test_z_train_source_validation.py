@@ -8,10 +8,8 @@ rejected by the on-disk generator.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from copula_inter.backend_registry import Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.data.live_dataset import (
@@ -19,9 +17,6 @@ from copula_inter.data.live_dataset import (
     build_live_train_loader,
 )
 from copula_inter.training.setup import _reserve_gpu_headroom_for_live_tabicl
-
-if TYPE_CHECKING:
-    from omegaconf import DictConfig
 
 
 @pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "tabpfn35_fast", "kumo_small", "y_train"])
@@ -143,3 +138,35 @@ def test_missing_z_train_source_defaults_to_tabicl() -> None:
     assert z_train_source(OmegaConf.create({"data": {}})) == "tabicl"
     assert z_train_source(OmegaConf.create({})) == "tabicl"
     assert z_train_source(OmegaConf.create({"data": {"z_train_source": "analytic"}})) == "analytic"
+
+
+@pytest.mark.parametrize("source", ["tabicl", "tabpfn35_fast", "kumo_small"])
+def test_fixed_live_val_episodes_are_drawn_on_one_device_for_every_source(
+    source: str, small_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every marginal synthesises the val GP episodes on `device`, so one seed gives the same episodes for all sources.
+
+    CPU and CUDA draw different streams from one seed: a source synthesising on
+    CPU would be validated on other episodes, and its val/* totals would not be
+    comparable with TabICL's.
+    """
+    import copula_inter.data.live_dataset as live
+    import copula_inter.marginal.backends as backends
+
+    devices: list[str] = []
+
+    def fake_generate(cfg: DictConfig, batch_size: int, device: str = "cpu", **_: object) -> list[dict]:
+        devices.append(str(device))
+        return []
+
+    monkeypatch.setattr(live, "generate_gp_batch", fake_generate)
+    monkeypatch.setattr(live, "collate_fn", lambda episodes: {})
+    monkeypatch.setattr(live, "load_tabicl", lambda ckpt, device: object())
+    monkeypatch.setattr(backends, "make_regressor", lambda *a, **k: object())
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    assert isinstance(cfg, DictConfig)
+    cfg.data.z_train_source = source
+    cfg.tabicl = {"pit_ckpt": "fake.ckpt", "pretrained": True}
+    t = OmegaConf.create({"val_episodes": 8, "batch_size": 4})
+    build_fixed_live_val_batches(cfg, t, device="cuda")
+    assert devices == ["cuda", "cuda"]

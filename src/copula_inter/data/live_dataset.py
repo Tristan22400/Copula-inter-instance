@@ -381,7 +381,10 @@ def build_fixed_live_val_batches(
         tabicl_model = load_tabicl(ckpt, device)
         gen_device = device
 
-    # Build the backend regressor once in the main process; GP synthesis stays on CPU.
+    # Build the backend regressor once in the main process. GP synthesis runs on the
+    # same device as for TabICL: CPU and CUDA draw different streams from one seed,
+    # so this keeps the validation episodes identical across z_train sources and the
+    # val/* totals comparable between marginals.
     marginal_regressor = None
     marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     if generic_marginal_enabled:
@@ -389,6 +392,7 @@ def build_fixed_live_val_batches(
 
         print(f"[live_dataset] Loading {z_train_source} marginal for fixed val batches on {device}")
         marginal_regressor = make_regressor(z_train_source, device=device, ckpt=z_train_marginal_ckpt(cfg))
+        gen_device = device
 
     batches = []
     episodes_by_batch: List[List[dict]] = []
