@@ -30,9 +30,16 @@ __all__ = ["backend_pit_fn", "group_by_varying_columns", "run_kfold_pit_batched"
 
 PitFn = Callable[[list, list, list, list], tuple[np.ndarray, np.ndarray]]
 
-# Members per call are capped so that members * rows * columns stays below this
-# (~2M cells: a few hundred MB of activations for either backend).
-DEFAULT_MAX_CELLS = 1 << 21
+# Members per call are capped so that members * rows * columns stays below this.
+# Live generation runs 6 DataLoader workers per GPU, each with its own CUDA
+# context, and the trainer leaves them ~1.6 GB each. Peak memory reserved by one
+# worker call of 32 GP episodes (P=32, N=256) on an A5000:
+#     cells     kumo_small          tabpfn35_fast
+#     2**21     1.55 GiB, 0.62 s    2.68 GiB, 1.70 s   (OOM'd the trainer at 6 workers)
+#     2**15     0.65 GiB, 0.70 s    1.21 GiB, 1.79 s
+#     2**14     0.38 GiB, 0.87 s    0.86 GiB, 1.95 s
+DEFAULT_MAX_CELLS = 1 << 15
+TABPFN_MAX_CELLS = 1 << 14  # TabPFN's 5000-bin logits make each cell ~2x Kumo's
 
 
 def backend_pit_fn(name: str, regressor: Any) -> PitFn:
@@ -96,7 +103,7 @@ def run_kfold_pit_batched(
     k_folds: int = 10,
     eps: float = 1e-6,
     seed: int = 0,
-    max_cells: int = DEFAULT_MAX_CELLS,
+    max_cells: int | None = None,
 ) -> dict:
     """K-fold PIT for z_train and a full-context pass for z_test/log_pdf_test, batched across episodes and folds.
 
@@ -108,7 +115,8 @@ def run_kfold_pit_batched(
         eps: u is clipped to [eps, 1 - eps] before the probit (|z| <= 4.75 at 1e-6).
         seed: episode b's folds are default_rng(seed + b).permutation(P) % K
             (as eval/metrics/joint_nll.kfold_loo_pit).
-        max_cells: memory bound per pit_fn call (members * rows * columns).
+        max_cells: memory bound per pit_fn call (members * rows * columns);
+            None reads DEFAULT_MAX_CELLS at call time.
 
     Each held-out point is predicted from the other folds of its own episode
     only; the members of one pit_fn call are independent, so how the
@@ -120,6 +128,7 @@ def run_kfold_pit_batched(
     """
     B, P, _p_x = X_train.shape
     K = min(int(k_folds), P)
+    max_cells = DEFAULT_MAX_CELLS if max_cells is None else max_cells
 
     fold_ids = [np.random.default_rng(seed + b).permutation(P) % K for b in range(B)]
     # (fold k, episode b) members grouped by held-out size; the context size is P minus it.

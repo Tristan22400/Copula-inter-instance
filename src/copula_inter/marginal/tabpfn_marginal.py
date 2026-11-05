@@ -306,7 +306,7 @@ def tabpfn_run_pit_batched(
     seed: int = 0,
 ) -> dict:
     """run_pit_batched for TabPFN, via the shared K-fold driver and the full bar distribution."""
-    from copula_inter.marginal.batched_pit import backend_pit_fn, run_kfold_pit_batched
+    from copula_inter.marginal.batched_pit import TABPFN_MAX_CELLS, backend_pit_fn, run_kfold_pit_batched
 
     return run_kfold_pit_batched(
         backend_pit_fn("tabpfn35_fast", regressor),
@@ -317,4 +317,5 @@ def tabpfn_run_pit_batched(
         k_folds=k_folds,
         eps=eps,
         seed=seed,
+        max_cells=TABPFN_MAX_CELLS,
     )
