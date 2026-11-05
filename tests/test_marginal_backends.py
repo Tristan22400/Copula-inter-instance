@@ -224,6 +224,32 @@ def test_tabpfn_bar_icdf_matches_bar_distribution() -> None:
     torch.testing.assert_close(bar_icdf(bardist, logits, torch.tensor(levels)), reference, atol=1e-5, rtol=1e-5)
 
 
+def test_tabpfn_bar_pit_matches_bar_distribution() -> None:
+    """bar_pit equals FullSupportBarDistribution.cdf and its negative log-density, in the bins, on the borders and in both tails."""
+    _require("tabpfn35_fast", "tabpfn")
+    from copula_inter.marginal.backends import make_regressor
+    from copula_inter.marginal.tabpfn_marginal import bar_pit
+
+    marginal: Any = make_regressor("tabpfn35_fast", device="cpu")
+    X_train, Y_train, X_test, _ = _episodes(1, 30, 6, 2, seed=2)
+    marginal.fit(torch.as_tensor(X_train[0]), torch.as_tensor(Y_train[0]))
+    bardist = marginal.regressor.znorm_space_bardist_
+    borders = bardist.borders.float()
+    with torch.no_grad():
+        logits = marginal.logits(torch.as_tensor(X_test[0]))  # (6, n_bars)
+    ys = torch.cat(
+        [
+            torch.linspace(float(borders[0]) - 3.0, float(borders[-1]) + 3.0, 401),
+            borders[[0, 1, 2, len(borders) // 2, -3, -2, -1]],
+        ]
+    )
+    L = logits.repeat_interleave(len(ys), 0)
+    Y = ys.repeat(len(logits))
+    u, log_pdf = bar_pit(bardist, L, Y)
+    torch.testing.assert_close(u, bardist.cdf(L, Y[:, None]).squeeze(-1), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(log_pdf, -bardist(L, Y.clone()), atol=1e-4, rtol=1e-4)
+
+
 def test_tabpfn_feature_count_can_change() -> None:
     """One TabPFNMarginal serves episodes of different feature counts (GP episodes vary d)."""
     _require("tabpfn35_fast", "tabpfn")

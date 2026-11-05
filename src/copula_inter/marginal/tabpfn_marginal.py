@@ -23,6 +23,7 @@ accepted at https://ux.priorlabs.ai (never commit the key).
 from __future__ import annotations
 
 import copy
+import math
 import os
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -36,6 +37,7 @@ __all__ = [
     "TabPFNMarginal",
     "make_tabpfn_regressor",
     "bar_icdf",
+    "bar_pit",
     "tabpfn_quantiles",
     "tabpfn_pit",
     "tabpfn_run_pit_batched",
@@ -183,14 +185,9 @@ class TabPFNMarginal:
         log f(y) = log f_z(y_z) - log s, with y_z = (y - m) / s.
         """
         logits, mean, std = self.batched_logits(X_context, y_context, X_query)
-        bardist = self.regressor.znorm_space_bardist_
-        B, m, n_bars = logits.shape
-        logits = logits.to(bardist.borders.device).reshape(B * m, n_bars)
-        mean, std = mean.to(logits.device), std.to(logits.device)
-        y_z = ((y_query.to(logits.device, torch.float32) - mean[:, None]) / std[:, None]).reshape(B * m)
-        u = bardist.cdf(logits, y_z.unsqueeze(-1)).squeeze(-1).reshape(B, m)
-        log_pdf = (-bardist(logits, y_z)).reshape(B, m) - std.log()[:, None]
-        return u, log_pdf
+        y_z = (y_query.to(logits.device, torch.float32) - mean[:, None]) / std[:, None]
+        u, log_pdf_z = bar_pit(self.regressor.znorm_space_bardist_, logits, y_z)
+        return u, log_pdf_z - std.log()[:, None]
 
 
 def make_tabpfn_regressor(device: str | None = None) -> TabPFNMarginal:
@@ -225,6 +222,57 @@ def _require_tabpfn_token() -> None:
             "API key from the account page, then `export TABPFN_TOKEN=...` "
             "(job scripts read ~/.config/tabpfn_token) before running this backend."
         )
+
+
+def bar_pit(bardist: Any, logits: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(F(y), log f(y)) of FullSupportBarDistribution, on logits' device: (..., n_bars), (...) -> (...), (...).
+
+    The same values as bardist.cdf(logits, y[..., None]) and -bardist(logits, y)
+    (tests/test_marginal_backends.py checks both, tails included), from one
+    log-softmax and one cumsum. The library keeps its borders on the CPU, so
+    calling it moved every (n_query, 5000) logit row to the host and evaluated
+    the distribution there; it also recomputes the softmax for each method.
+    """
+    logits = logits.float()
+    borders = bardist.borders.to(logits)
+    widths = borders[1:] - borders[:-1]
+    n_bars = widths.numel()
+    y = y.to(logits)
+    # map_to_bucket_idx, clamped as both library methods do.
+    idx = torch.searchsorted(borders, y.contiguous()) - 1
+    idx = torch.where(y == borders[0], 0, idx)
+    idx = torch.where(y == borders[-1], n_bars - 1, idx).clamp(0, n_bars - 1)
+    log_p = torch.log_softmax(logits, dim=-1)
+    p = log_p.exp()
+    p_idx = p.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    before = (torch.cumsum(p, dim=-1) - p).gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    share = ((y - borders[idx]) / widths[idx]).clamp(0.0, 1.0)
+    u = before + p_idx * share
+    u = torch.where(y <= borders[0], 0.0, torch.where(y >= borders[-1], 1.0, u))
+    # Half-normal tails beyond borders[1] and borders[-2]: HalfNormal(s).cdf(x) = erf(x / (s sqrt 2)).
+    s_left = _halfnormal_scale(bardist, bardist.bucket_widths[0]).to(logits)
+    s_right = _halfnormal_scale(bardist, bardist.bucket_widths[-1]).to(logits)
+    x_left = (borders[1] - y).clamp_min(0.0)
+    x_right = (y - borders[-2]).clamp_min(0.0)
+    left = p[..., 0] * (1.0 - torch.erf(x_left / (s_left * math.sqrt(2.0))))
+    right = 1.0 - p[..., -1] * (1.0 - torch.erf(x_right / (s_right * math.sqrt(2.0))))
+    u = torch.where(y < borders[1], left, torch.where(y >= borders[-2], right, u)).clip(0.0, 1.0)
+
+    log_pdf = log_p.gather(-1, idx.unsqueeze(-1)).squeeze(-1) - widths[idx].log()
+    # In an outer bin the density is its mass times the half-normal density:
+    # log HalfNormal(s).pdf(x) = 0.5 log(2 / pi) - log s - x^2 / (2 s^2).
+    half_log_2_over_pi = 0.5 * math.log(2.0 / math.pi)
+    x_l = (borders[1] - y).clamp(min=1e-8)
+    x_r = (y - borders[-2]).clamp(min=1e-8)
+    tail_left = half_log_2_over_pi - s_left.log() - x_l.square() / (2 * s_left**2) + widths[0].log()
+    tail_right = half_log_2_over_pi - s_right.log() - x_r.square() / (2 * s_right**2) + widths[-1].log()
+    log_pdf = log_pdf + torch.where(idx == 0, tail_left, 0.0) + torch.where(idx == n_bars - 1, tail_right, 0.0)
+    return u, log_pdf
+
+
+def _halfnormal_scale(bardist: Any, width: torch.Tensor) -> torch.Tensor:
+    """Scale of the half-normal tail the library attaches to an outer bin of this width."""
+    return torch.as_tensor(bardist.halfnormal_with_p_weight_before(width).scale)
 
 
 def bar_icdf(bardist: Any, logits: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
