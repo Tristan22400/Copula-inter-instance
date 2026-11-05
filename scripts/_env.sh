@@ -2,7 +2,7 @@
 # put this checkout's packages first on PYTHONPATH. Source it from scripts/*.sh.
 #
 # The venv is created once per machine, from the checkout root:
-#     uv sync --locked --extra dev --extra gpu      # --extra cpu on a machine without CUDA
+#     uv sync --locked --extra dev --extra gpu --extra tabpfn --extra era5   # --extra cpu on a machine without CUDA
 # A git worktree without its own .venv uses the main checkout's; COPULA_VENV
 # overrides both.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +16,7 @@ if [[ -z "${COPULA_VENV:-}" ]]; then
     fi
 fi
 if [[ ! -f "$COPULA_VENV/bin/activate" ]]; then
-    echo "_env.sh: no virtualenv at $COPULA_VENV; run 'uv sync --locked --extra dev --extra gpu' in $REPO_ROOT" >&2
+    echo "_env.sh: no virtualenv at $COPULA_VENV; run 'uv sync --locked --extra dev --extra gpu --extra tabpfn --extra era5' in $REPO_ROOT" >&2
     exit 1
 fi
 source "$COPULA_VENV/bin/activate"
