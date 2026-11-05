@@ -1,4 +1,5 @@
-Environment: uv. `uv sync --locked --extra dev --extra gpu` (or `--extra cpu`), then
+Environment: uv. `uv sync --locked --extra dev --extra gpu --extra tabpfn --extra era5`
+(or `--extra cpu`; keep every extra on each sync, or uv uninstalls that backend), then
 `.venv/bin/python` / `uv run --no-sync ...`. Job scripts source `scripts/_env.sh`
 (activates the checkout's `.venv`, or the main checkout's from a git worktree,
 and puts this checkout's src/, root and tabicl_upstream/src first on PYTHONPATH).
