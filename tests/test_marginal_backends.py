@@ -237,6 +237,46 @@ def test_tabpfn_feature_count_can_change() -> None:
         assert q.shape == (4, 3) and np.isfinite(q).all()
 
 
+def _mixed_column_episodes() -> tuple[torch.Tensor, ...]:
+    """Four episodes; episode 2 has one feature constant over its context, so it keeps other columns than the rest."""
+    X_train, Y_train, X_test, _ = _episodes(4, 25, 7, 3, seed=5)
+    X_train[2, :, 1] = 0.3
+    X_test[0] *= 30.0  # queries far outside the context: exercises the soft clipping
+    return torch.as_tensor(X_train), torch.as_tensor(Y_train), torch.as_tensor(X_test)
+
+
+def test_kumo_batched_path_matches_the_library_call() -> None:
+    """kumo_native_quantiles (batched torch recipe + one network forward) equals KumoTabular(..., recipe=kumo_recipe())."""
+    _require("kumo_small", "sdm")
+    from copula_inter.marginal.backends import make_regressor
+    from copula_inter.marginal.kumo_marginal import _library_quantiles, kumo_native_quantiles
+
+    model = make_regressor("kumo_small", device="cpu")
+    xc, yc, xq = _mixed_column_episodes()
+    with torch.no_grad():
+        fast = kumo_native_quantiles(model, xc, yc, xq)
+        library = _library_quantiles(model, xc, yc, xq)
+    assert fast.shape == library.shape == (4, 7, 999)
+    torch.testing.assert_close(fast, library, atol=1e-4, rtol=1e-4)
+
+
+def test_tabpfn_batched_logits_match_the_per_episode_fit() -> None:
+    """TabPFNMarginal.batched_logits equals fit + logits run on each episode alone (CPU: no autocast)."""
+    _require("tabpfn35_fast", "tabpfn")
+    from copula_inter.marginal.backends import make_regressor
+
+    marginal: Any = make_regressor("tabpfn35_fast", device="cpu")
+    xc, yc, xq = _mixed_column_episodes()
+    with torch.no_grad():
+        logits, mean, std = marginal.batched_logits(xc, yc, xq)
+        for b in range(len(xc)):
+            keep = (xc[b] != xc[b, :1]).any(dim=0)
+            marginal.fit(xc[b][:, keep], yc[b])
+            torch.testing.assert_close(logits[b], marginal.logits(xq[b][:, keep]), atol=1e-4, rtol=1e-4)
+            assert mean[b].item() == pytest.approx(marginal.regressor.y_train_mean_, rel=1e-6)
+            assert std[b].item() == pytest.approx(marginal.regressor.y_train_std_, rel=1e-6)
+
+
 @pytest.mark.parametrize("backend,module", BACKENDS)
 def test_constant_context_gets_the_feature_free_predictive(backend: str, module: str) -> None:
     """A context whose features are all constant (which both libraries refuse) falls back to N(mean, std) of its targets.

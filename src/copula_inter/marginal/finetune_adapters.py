@@ -4,7 +4,7 @@ For each backbone: which parameters each tier trains, a gradient-carrying
 quantile forward, the checkpoint format and how it is loaded back.
 
     tabicl         tiers 0-3 (pit.run_pit_batched_grad).
-    tabpfn35_fast  tier 0 (tabpfn_marginal.tabpfn_quantiles, one fit per episode).
+    tabpfn35_fast  tier 0 (tabpfn_marginal.tabpfn_quantiles, episodes batched).
     kumo_small     tier 0 (kumo_marginal.kumo_quantiles, episodes batched).
 
 The generic backbones' Phase-A forward is backend_quantiles, the same function
