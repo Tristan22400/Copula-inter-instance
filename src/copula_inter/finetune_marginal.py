@@ -854,7 +854,9 @@ def main(cfg: DictConfig) -> None:
             # Clipping cannot repair a NaN/inf norm, and one AdamW step would
             # write it into every trainable weight. Skip the update instead.
             skipped_nonfinite += 1
-            print(f"[step {step}] non-finite gradient norm ({gnorm.item()}); update skipped ({skipped_nonfinite} so far)")
+            print(
+                f"[step {step}] non-finite gradient norm ({gnorm.item()}); update skipped ({skipped_nonfinite} so far)"
+            )
             run.log({"train/skipped_nonfinite": skipped_nonfinite}, step)
         sched.step()
         profiler.sync(step)
