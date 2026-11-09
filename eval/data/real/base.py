@@ -7,7 +7,13 @@ A dataset module exposes:
     draw(data, rng, cfg, *, seed, ep_i) -> RealDraw | None: one episode in raw
         units from rng = default_rng([seed, ep_i]); None skips the episode;
     fingerprint(data, cfg) -> dict: everything that defines the episodes;
-    label(meta) -> str: a one-line episode description for the tables.
+    label(meta) -> str: a one-line episode description for the tables;
+    validate(cfg): raise ValueError for an out-of-range real.<name> field;
+    episode_shape(cfg) -> (P, N): the smallest context and query sizes an episode has.
+Meta keys every module sets: "cluster" (the CI unit), "fold" (the grouped
+cross-fitting fold, or None when the dataset needs no score-based choice).
+HAS_CI is False only for a dataset whose episodes share rows so heavily that a
+bootstrap CI is meaningless (Meuse); paired_compare then reports mean +- sd.
 
 Rows and the context/query split are drawn before any feature is built, so the
 feature-set variants of one dataset see identical episodes.
@@ -20,7 +26,13 @@ from typing import Any
 
 import numpy as np
 
-__all__ = ["RealDraw", "block_split", "random_split"]
+__all__ = ["RealDraw", "block_split", "check_choice", "random_split"]
+
+
+def check_choice(key: str, value: str | None, choices: tuple[str, ...]) -> None:
+    """Raise ValueError unless value is one of choices (the message eval_args' check_choice gives)."""
+    if value not in choices:
+        raise ValueError(f"{key}={value!r} is not one of {sorted(choices)}")
 
 
 @dataclass

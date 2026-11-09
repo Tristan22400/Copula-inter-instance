@@ -77,6 +77,86 @@ class SdwpfSpec:
 
 
 @dataclass
+class KaustSpec:
+    """KAUST 2022 sub-competitions 1a/1b (eval/data/real/kaust.py): one square window per episode, target z."""
+
+    # Directory with the four <variant>_train.csv files; default copula_inter.paths.KAUST_DATA_DIR.
+    data_dir: str | None = None
+    # "<sub-competition>_<dataset>": 1a_* = 90K training points, 1b_* = 900K; *_1 = mean + iid noise
+    # (the negative control), *_2 = zero-mean nonstationary Matern GP (the main result).
+    variant: str = "1a_2"
+    n_context: int = 128
+    n_query: int = 64
+    # "random" or "block" (the n_query window points nearest a random anchor are the queries).
+    mask: str = "random"
+    # The unit square is cut into window_cells x window_cells cells, a multiple of the 5 strips; the
+    # window side is 1 / window_cells and the CI cluster is the cell holding the window centre.
+    window_cells: int = 15
+    # Window positions drawn per episode until one holds n_context + n_query points.
+    window_tries: int = 20
+
+
+@dataclass
+class EmnistSpec:
+    """EMNIST balanced (eval/data/real/emnist.py): one image per episode, rows = pixels, dequantized intensity."""
+
+    # Directory with the four emnist-balanced-*-idx*-ubyte.gz files; default copula_inter.paths.EMNIST_DATA_DIR.
+    data_dir: str | None = None
+    # "test" for reported runs, "train" for debugging.
+    split: str = "test"
+    n_context: int = 50
+    n_query: int = 64
+    # "random" or "block" (the n_query pixels nearest a random anchor pixel are the queries).
+    mask: str = "random"
+
+
+@dataclass
+class CaliforniaSpec:
+    """California Housing (eval/data/real/california.py): rows = block groups, target median value ($100k)."""
+
+    # sklearn data_home for fetch_california_housing; default copula_inter.paths.CALIFORNIA_DATA_DIR.
+    data_dir: str | None = None
+    n_context: int = 128
+    n_query: int = 64
+    # "random" or "block" (the n_query rows nearest a random anchor in (lat, lon) are the queries).
+    mask: str = "random"
+    # "f0" = all 8 features; "f1" = without Latitude and Longitude (ablation).
+    features: str = "f0"
+    # The target's maximum (the survey's top-code, 5.00001) must be >= this; rows at the top-code are dropped.
+    censor_cap: float = 5.0
+
+
+@dataclass
+class MeuseSpec:
+    """Meuse zinc (eval/data/real/meuse.py): repeated K-fold over the 155 points, target log(zinc)."""
+
+    # Directory with meuse.csv; default copula_inter.paths.MEUSE_DATA_DIR.
+    data_dir: str | None = None
+    # "f0" = (x, y); "f1" = (x, y, dist, elev).
+    features: str = "f0"
+    # Episode ep_i is fold ep_i % n_folds of repetition ep_i // n_folds.
+    n_folds: int = 3
+    n_repeats: int = 67
+
+
+@dataclass
+class Ctr23Spec:
+    """OpenML-CTR23 (suite 353; eval/data/real/ctr23.py): one dataset per run, rows = instances."""
+
+    # sklearn data_home for fetch_openml; default copula_inter.paths.CTR23_DATA_DIR.
+    data_dir: str | None = None
+    # OpenML data id of one CTR23 dataset (eval.data.real.ctr23.CTR23_TASKS); required.
+    data_id: int = 0
+    n_context: int = 128
+    n_query: int = 64
+    # "dyadic_knn": the n_query / 2 nearest neighbours of each of two anchors are the queries;
+    # "random": uniform query set (the negative control).
+    mask: str = "dyadic_knn"
+    # A dataset whose most common target value holds more than this fraction of rows is excluded.
+    max_atom_frac: float = 0.05
+
+
+@dataclass
 class RealSpec:
     """Real-data benchmark episodes (eval/data/real): same baselines and tables, no oracle rows."""
 
@@ -87,6 +167,11 @@ class RealSpec:
     # Z-score each episode's target before fitting the baselines and add log(std) back (as era5.standardize_y).
     standardize_y: bool = True
     sdwpf: SdwpfSpec = field(default_factory=SdwpfSpec)
+    kaust: KaustSpec = field(default_factory=KaustSpec)
+    emnist: EmnistSpec = field(default_factory=EmnistSpec)
+    california: CaliforniaSpec = field(default_factory=CaliforniaSpec)
+    meuse: MeuseSpec = field(default_factory=MeuseSpec)
+    ctr23: Ctr23Spec = field(default_factory=Ctr23Spec)
 
 
 @dataclass
@@ -218,17 +303,24 @@ class EvalSpec:
     output: OutputSpec = field(default_factory=OutputSpec)
 
 
-def real_dataset_spec(spec: EvalSpec) -> SdwpfSpec:
-    """The real.<name> sub-config of the selected real.dataset."""
-    assert spec.real.dataset is not None
-    sub: SdwpfSpec = getattr(spec.real, spec.real.dataset)
+RealDatasetSpec = SdwpfSpec | KaustSpec | EmnistSpec | CaliforniaSpec | MeuseSpec | Ctr23Spec
+
+
+def real_dataset_spec_of(real: RealSpec) -> RealDatasetSpec:
+    """The <name> sub-config of real.dataset."""
+    assert real.dataset is not None
+    sub: RealDatasetSpec = getattr(real, real.dataset)
     return sub
+
+
+def real_dataset_spec(spec: EvalSpec) -> RealDatasetSpec:
+    """The real.<name> sub-config of the selected real.dataset."""
+    return real_dataset_spec_of(spec.real)
 
 
 def _validate_real(spec: EvalSpec) -> None:
     """real.dataset: exclusive source, learned marginal, enough queries, and every choice field in range."""
-    from eval.data.real import REAL_DATASETS
-    from eval.data.real import sdwpf as sdwpf_mod
+    from eval.data.real import REAL_DATASETS, dataset_module
 
     check_choice("real.dataset", spec.real.dataset, REAL_DATASETS)
     if spec.era5.enabled:
@@ -242,35 +334,24 @@ def _validate_real(spec: EvalSpec) -> None:
             "real.dataset has no oracle marginal: real data has no generating GP to take an exact "
             "LOO-PIT residual from. Use marginal.z_train_source=tabicl (default) or tabpfn."
         )
+    name = spec.real.dataset
+    assert name is not None
     sub = real_dataset_spec(spec)
+    # Dataset-specific choice fields and ranges first, so a bad choice is named before the shape checks.
+    dataset_module(name).validate(sub)
+    n_context, n_query = dataset_module(name).episode_shape(sub)
     min_test = (
         spec.selection.min_test_points
         if spec.selection.min_test_points is not None
         else 2 * spec.selection.min_fold_size
     )
-    if sub.n_query < min_test:
+    if n_query < min_test:
         raise ValueError(
-            f"real.{spec.real.dataset}.n_query={sub.n_query} is below selection.min_test_points={min_test}: "
+            f"real.{name}.n_query={n_query} is below selection.min_test_points={min_test}: "
             "best_baseline needs at least two nested-CV folds of test points."
         )
-    if sub.n_context < 2:
-        raise ValueError(f"real.{spec.real.dataset}.n_context must be at least 2 for the K-fold PIT")
-    if spec.real.dataset == "sdwpf":
-        s = spec.real.sdwpf
-        check_choice("real.sdwpf.mask", s.mask, sdwpf_mod.MASKS)
-        check_choice("real.sdwpf.features", s.features, sdwpf_mod.FEATURE_SETS)
-        check_choice("real.sdwpf.regime", s.regime, sdwpf_mod.REGIMES)
-        check_choice(
-            "real.sdwpf.direction_offset_deg",
-            str(s.direction_offset_deg),
-            tuple(str(o) for o in sdwpf_mod.DIRECTION_OFFSETS),
-        )
-        if not 0.0 < s.atom_hi_frac <= 1.0:
-            raise ValueError("real.sdwpf.atom_hi_frac must lie in (0, 1]")
-        if not 0.5 < s.rated_quantile <= 1.0:
-            raise ValueError("real.sdwpf.rated_quantile must lie in (0.5, 1]")
-        if s.timestamp_tries < 1:
-            raise ValueError("real.sdwpf.timestamp_tries must be at least 1")
+    if n_context < 2:
+        raise ValueError(f"real.{name}.n_context must be at least 2 for the K-fold PIT")
 
 
 def validate_eval_spec(spec: EvalSpec) -> None:

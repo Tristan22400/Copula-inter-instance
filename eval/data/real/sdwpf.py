@@ -75,7 +75,7 @@ import pandas as pd
 
 from copula_inter.artifacts import artifact_identity, atomic_write, canonical_digest
 from copula_inter.paths import SDWPF_DATA_DIR
-from eval.data.real.base import RealDraw, block_split, random_split
+from eval.data.real.base import RealDraw, block_split, check_choice, random_split
 
 if TYPE_CHECKING:
     from eval.runners.eval_args import SdwpfSpec
@@ -98,12 +98,14 @@ __all__ = [
     "absolute_wind_direction",
     "circular_mean_deg",
     "draw",
+    "episode_shape",
     "estimate_rated_power",
     "fingerprint",
     "fold_of",
     "label",
     "load",
     "load_sdwpf",
+    "validate",
     "wind_aligned_axes",
 ]
 
@@ -123,6 +125,8 @@ REGIMES = ("partial_load", "all")
 DIRECTION_OFFSETS = (0, 90, 180, -90)
 # Every episode has P and N fixed by the config, so the PIT can batch.
 FIXED_SHAPE = True
+# Episodes are distinct timestamps; the day-cluster bootstrap is valid.
+HAS_CI = True
 
 RAW_COLUMNS = (
     "TurbID",
@@ -557,6 +561,27 @@ def draw(data: SdwpfData, rng: np.random.Generator, cfg: SdwpfSpec, *, seed: int
     else:
         print(f"  [sdwpf] ep {ep_i}: no timestamp of its {len(slice_)} passed regime={cfg.regime}; skipping")
     return None
+
+
+def validate(cfg: SdwpfSpec) -> None:
+    """Raise ValueError for an out-of-range real.sdwpf field."""
+    check_choice("real.sdwpf.mask", cfg.mask, MASKS)
+    check_choice("real.sdwpf.features", cfg.features, FEATURE_SETS)
+    check_choice("real.sdwpf.regime", cfg.regime, REGIMES)
+    check_choice(
+        "real.sdwpf.direction_offset_deg", str(cfg.direction_offset_deg), tuple(str(o) for o in DIRECTION_OFFSETS)
+    )
+    if not 0.0 < cfg.atom_hi_frac <= 1.0:
+        raise ValueError("real.sdwpf.atom_hi_frac must lie in (0, 1]")
+    if not 0.5 < cfg.rated_quantile <= 1.0:
+        raise ValueError("real.sdwpf.rated_quantile must lie in (0.5, 1]")
+    if cfg.timestamp_tries < 1:
+        raise ValueError("real.sdwpf.timestamp_tries must be at least 1")
+
+
+def episode_shape(cfg: SdwpfSpec) -> tuple[int, int]:
+    """(P, N) of every episode."""
+    return int(cfg.n_context), int(cfg.n_query)
 
 
 def fingerprint(data: SdwpfData, cfg: SdwpfSpec) -> dict[str, Any]:

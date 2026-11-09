@@ -22,7 +22,7 @@ from eval.data.episode_packaging import PitSettings, RawEpisode, check_pit_setti
 __all__ = ["REAL_DATASETS", "build_real_eval_episodes", "dataset_module", "real_episode_fingerprint"]
 
 # real.dataset choices; each names eval/data/real/<name>.py and the real.<name> sub-config.
-REAL_DATASETS = ("sdwpf",)
+REAL_DATASETS = ("sdwpf", "kaust", "emnist", "california", "meuse", "ctr23")
 
 
 def dataset_module(name: str) -> ModuleType:

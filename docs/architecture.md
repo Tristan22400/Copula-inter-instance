@@ -128,7 +128,10 @@ Subpackages:
 | `data/era5_episodes.py` | Real-ERA5 evaluation episodes |
 | `data/episode_packaging.py` | The PIT / autoregressive chain / `standardize_y` packaging shared by ERA5 and every real dataset |
 | `data/real/` | Real-data benchmark episodes for `eval_checkpoint real.dataset=<name>`: one module per dataset (`load`, `draw`, `fingerprint`; contract in `base.py`), raw files under `REAL_DATA_DIR/<name>/` |
-| `runners/paired_compare.py` | Paired per-episode NLL deltas between two `output.dump_episodes` files, with cluster-bootstrap CIs |
+| `data/real/{sdwpf,kaust,emnist,california,meuse,ctr23}.py` | The six real-data benchmarks; each module's docstring is its episode contract (rows, split, folds, CI cluster, atom rule) |
+| `runners/paired_compare.py` | Paired per-episode NLL deltas between two `output.dump_episodes` files, with cluster-bootstrap CIs (mean ± sd for Meuse), and the across-dataset Wilcoxon test (CTR23) |
+| `runners/ctr23_full_eval.py` | CTR23 on the full datasets: official 10-fold CV, whole training fold as context; marginal RMSE / R² / CRPS / NLL and the copula NLL over the whole test fold and its 64-row chunks |
+| `runners/real_audit.py`, `runners/real_calibration_gate.py` | Model-free audit of a real dataset; the marginal calibration gate on a dump's `z_test` |
 | `datasets/` | Real-world benchmark datasets (`run_benchmarks`) |
 | `metrics/` | Joint NLL from a quantile grid, energy score |
 | `spatial/` | Spatial-correlation diagnostics, sweeps, calibration plots |

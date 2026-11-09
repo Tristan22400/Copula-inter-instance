@@ -14,11 +14,14 @@ from hydra.core.global_hydra import GlobalHydra
 from copula_inter.config_path import config_dir
 from copula_inter.training.setup import prepare_training_inputs
 from eval.runners.autoregressive_baseline_eval import AutoregressiveBaselineSpec
+from eval.runners.ctr23_full_eval import Ctr23FullEvalSpec
 from eval.runners.era5_calibration_eval import Era5CalibrationSpec
 from eval.runners.eval_args import EvalSpec
 from eval.runners.hydra_cli import compose_spec, reject_argparse_flags
 from eval.runners.marginal_calibration_eval import MarginalCalibrationSpec
 from eval.runners.paired_compare import PairedCompareSpec
+from eval.runners.real_audit import RealAuditSpec
+from eval.runners.real_calibration_gate import RealCalibrationGateSpec
 from eval.runners.run_benchmarks import BenchmarkSpec
 from eval.runners.sdwpf_audit import SdwpfAuditSpec
 from eval.runners.spatial_correlation_eval import (
@@ -42,7 +45,10 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "autoregressive_baseline_eval": (AutoregressiveBaselineSpec, []),
     "summarize_results_cache": (SummarizeSpec, ["caches=[a.json]"]),
     "paired_compare": (PairedCompareSpec, ["a=a.json"]),
+    "real_audit": (RealAuditSpec, ["real.dataset=kaust"]),
+    "real_calibration_gate": (RealCalibrationGateSpec, ["dumps=[a.json]"]),
     "sdwpf_audit": (SdwpfAuditSpec, []),
+    "ctr23_full_eval": (Ctr23FullEvalSpec, ["ckpt=x.pt", "tabicl_ckpt=m.pt", "data_id=44957", "out_json=o.json"]),
 }
 
 
