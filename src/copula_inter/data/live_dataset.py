@@ -17,10 +17,15 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
+from copula_inter.backend_registry import (
+    GENERIC_MARGINAL_BACKENDS,
+    TABICL_Z_TRAIN_SOURCES,
+    validate_z_train_source,
+    z_train_marginal_ckpt,
+)
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.data.dataset import collate_fn
-from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.data.gp_episodes import generate_fixed_gp_batch, generate_gp_batch
 from copula_inter.data.gp_kernels import _COMPOSABLE_KERNELS
 from copula_inter.marginal.pit import configure_tabicl_inference_amp, load_tabicl, resolve_pit_ckpt
 
@@ -116,7 +121,6 @@ class LiveGPDataset(IterableDataset):
         tabicl_mix_weights: Optional[torch.Tensor] = None,
         marginal_backend: Optional[str] = None,
         marginal_device: Optional[str] = None,
-        marginal_probs_n: int = 99,
     ) -> None:
         # Deep copy so per-call seed changes don't touch the caller's cfg.
         self._cfg = copy.deepcopy(cfg)
@@ -131,7 +135,6 @@ class LiveGPDataset(IterableDataset):
         # Non-TabICL backend: each worker builds its own regressor lazily.
         self.marginal_backend = marginal_backend
         self.marginal_device = marginal_device
-        self.marginal_probs_n = marginal_probs_n
 
     def __iter__(self) -> Iterator[dict]:
         info = get_worker_info()
@@ -181,11 +184,13 @@ class LiveGPDataset(IterableDataset):
         if self.marginal_backend is not None:
             from copula_inter.marginal.backends import make_regressor
 
+            marginal_ckpt = z_train_marginal_ckpt(cfg)
             print(
                 f"[live_dataset] worker {worker_id}: loading {self.marginal_backend} marginal "
                 f"for data.z_train_source={self.marginal_backend} on {self.marginal_device}"
+                + (f" from {marginal_ckpt}" if marginal_ckpt else "")
             )
-            marginal_regressor = make_regressor(self.marginal_backend, device=self.marginal_device)
+            marginal_regressor = make_regressor(self.marginal_backend, device=self.marginal_device, ckpt=marginal_ckpt)
 
         while True:
             cfg.seed = worker_seed(self._base_seed, worker_id, call_idx)
@@ -201,7 +206,6 @@ class LiveGPDataset(IterableDataset):
                 tabicl_mix_weights=self.tabicl_mix_weights,
                 marginal_backend=self.marginal_backend,
                 marginal_regressor=marginal_regressor,
-                marginal_probs_n=self.marginal_probs_n,
                 raw_y_override=raw_y_override,
             )
             for ep in episodes:
@@ -297,7 +301,6 @@ def build_live_train_loader(
         # Floor fraction until train.py writes the measured values.
         floor_frac = float(cfg.data.get("z_train_tabicl_mix_floor_frac", 0.05))
         tabicl_mix_weights = torch.full((n,), floor_frac, dtype=torch.float32).share_memory_()
-    marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     live_ds = LiveGPDataset(
         cfg,
         group_size=group_size,
@@ -306,7 +309,6 @@ def build_live_train_loader(
         tabicl_mix_weights=tabicl_mix_weights,
         marginal_backend=z_train_source if generic_marginal_enabled else None,
         marginal_device=marginal_device,
-        marginal_probs_n=marginal_probs_n,
     )
     # CUDA-resident worker models require spawn.
     loader = DataLoader(
@@ -330,10 +332,12 @@ def build_fixed_live_val_batches(
 ) -> Tuple[List[dict], List[List[dict]]]:
     """Fixed validation set for live-generation training.
 
-    n_batches generate_gp_batch calls with fixed seeds (each batch is one kernel
-    family and shape), collated on CPU. For TabICL / backend z_train sources a
-    marginal is loaded once in the main process. Episodes keep kernel metadata
-    (with _L_ff/_alpha moved to CPU) for posterior scoring in validate().
+    n_batches generate_fixed_gp_batch calls with fixed seeds (each batch is one
+    kernel family and shape), collated on CPU. The episodes are synthesized on
+    CPU in float64, so they are identical for every z_train source and on every
+    machine. For TabICL / backend z_train sources a marginal is loaded once in
+    the main process and computes the PIT on device. Episodes keep kernel
+    metadata (with _L_ff/_alpha on CPU) for posterior scoring in validate().
 
     Returns:
         (batches, episodes_by_batch): the collated batches, and for each the list
@@ -354,10 +358,10 @@ def build_fixed_live_val_batches(
             f"training.live_generation with data.z_train_source={z_train_source} "
             f"requires device='cuda' (got {device!r}) -- see build_live_train_loader's "
             "batched_marginal_worker_enabled docstring for why CPU is rejected "
-            "rather than silently slow for tabpfn too."
+            "rather than silently slow for tabpfn35_fast/kumo_small too."
         )
     tabicl_model = None
-    gen_device = "cpu"
+    pit_device = "cpu"
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
     tabicl_split_calib_frac = (
         float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
@@ -372,16 +376,18 @@ def build_fixed_live_val_batches(
             )
         print(f"[live_dataset] Loading frozen TabICL marginal for fixed val batches: {ckpt}")
         tabicl_model = load_tabicl(ckpt, device)
-        gen_device = device
+        pit_device = device
 
-    # Build the backend regressor once in the main process; GP synthesis stays on CPU.
+    # Build the backend regressor once in the main process. The episodes themselves
+    # come from generate_fixed_gp_batch (CPU, float64), so they are the same for
+    # every z_train source and on every machine; only the marginal PIT runs on device.
     marginal_regressor = None
-    marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     if generic_marginal_enabled:
         from copula_inter.marginal.backends import make_regressor
 
         print(f"[live_dataset] Loading {z_train_source} marginal for fixed val batches on {device}")
-        marginal_regressor = make_regressor(z_train_source, device=device)
+        marginal_regressor = make_regressor(z_train_source, device=device, ckpt=z_train_marginal_ckpt(cfg))
+        pit_device = device
 
     batches = []
     episodes_by_batch: List[List[dict]] = []
@@ -391,23 +397,18 @@ def build_fixed_live_val_batches(
         for i in range(n_batches):
             val_cfg = copy.deepcopy(cfg)
             val_cfg.seed = val_seed + i * 104_729  # distinct, fixed, reproducible per batch
-            episodes = generate_gp_batch(
+            episodes = generate_fixed_gp_batch(
                 val_cfg,
                 batch_size,
-                device=gen_device,
+                pit_device=pit_device,
                 tabicl_model=tabicl_model,
                 tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 return_kernel_metadata=True,
                 marginal_backend=z_train_source if generic_marginal_enabled else None,
                 marginal_regressor=marginal_regressor,
-                marginal_probs_n=marginal_probs_n,
                 raw_y_override=raw_y_override,
             )
-            if gen_device == "cuda":
-                for ep in episodes:
-                    ep["_L_ff"] = ep["_L_ff"].cpu()
-                    ep["_alpha"] = ep["_alpha"].cpu()
             batches.append(collate_fn(episodes))
             episodes_by_batch.append(episodes)
 

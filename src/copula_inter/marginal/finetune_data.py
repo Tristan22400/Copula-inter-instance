@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.data.gp_episodes import generate_fixed_gp_batch, generate_gp_batch
 from copula_inter.marginal.pit import (
     normalize_targets,
 )
@@ -87,9 +87,21 @@ def _gp_cfg(cfg: DictConfig) -> DictConfig:
     return OmegaConf.create({"data": OmegaConf.to_container(cfg.data, resolve=True), "seed": int(cfg.seed)})
 
 
-def _generate_phase_a_gp_batch(gp_cfg: DictConfig, batch_size: int, device: str, *, max_rounds: int = 20) -> list[dict]:
-    """generate_gp_batch with P, N and d pinned after the first call, so every episode has the same shape."""
-    episodes = generate_gp_batch(gp_cfg, batch_size, device, return_kernel_metadata=True)
+def _generate_phase_a_gp_batch(
+    gp_cfg: DictConfig, batch_size: int, device: str, *, max_rounds: int = 20, fixed_set: bool = False
+) -> list[dict]:
+    """generate_gp_batch with P, N and d pinned after the first call, so every episode has the same shape.
+
+    fixed_set=True synthesizes through generate_fixed_gp_batch (CPU, float64;
+    device is then unused), so a fixed validation set does not depend on the GPU.
+    """
+
+    def generate(cfg: Any, n: int, **kwargs: Any) -> list[dict]:
+        if fixed_set:
+            return generate_fixed_gp_batch(cfg, n, return_kernel_metadata=True, **kwargs)
+        return generate_gp_batch(cfg, n, device, return_kernel_metadata=True, **kwargs)
+
+    episodes = generate(gp_cfg, batch_size)
     P = int(episodes[0]["x_norm_train"].shape[0])
     N = int(episodes[0]["x_norm_test"].shape[0])
     d = int(episodes[0]["x_norm_train"].shape[1])
@@ -103,15 +115,7 @@ def _generate_phase_a_gp_batch(gp_cfg: DictConfig, batch_size: int, device: str,
     base_seed = int(gp_cfg.seed)
     for round_idx in range(1, max_rounds + 1):
         fixed.seed = base_seed + round_idx * 1_000_003
-        out.extend(
-            generate_gp_batch(
-                fixed,
-                batch_size - len(out),
-                device,
-                return_kernel_metadata=True,
-                d_override=d,
-            )
-        )
+        out.extend(generate(fixed, batch_size - len(out), d_override=d))
         if len(out) >= batch_size:
             return out[:batch_size]
     raise RuntimeError(
@@ -121,7 +125,7 @@ def _generate_phase_a_gp_batch(gp_cfg: DictConfig, batch_size: int, device: str,
 
 
 def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
-    """Fixed synthetic GP validation batches, drawn once with their own seed."""
+    """Fixed synthetic GP validation batches, drawn once with their own seed (on CPU, so the same on every machine)."""
     gp_cfg = _gp_cfg(cfg)
     batches = []
     for i in range(int(cfg.validation.gp_n_batches)):
@@ -131,6 +135,7 @@ def _build_gp_val_batches(cfg: DictConfig, device: str) -> list[list[dict]]:
                 gp_cfg,
                 int(cfg.validation.gp_batch_size),
                 device,
+                fixed_set=True,
             )
         )
     return batches

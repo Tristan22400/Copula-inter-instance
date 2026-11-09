@@ -9,8 +9,10 @@ import pytest
     "name,tier,ok",
     [
         ("tabicl", 3, True),
-        ("tabpfn", 0, True),
-        ("tabpfn", 1, False),
+        ("tabpfn35_fast", 0, True),
+        ("tabpfn35_fast", 1, False),
+        ("kumo_small", 0, True),
+        ("kumo_small", 1, False),
     ],
 )
 def test_resolve_tier_gates_the_ladder(name: str, tier: int, ok: bool) -> None:

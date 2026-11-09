@@ -9,6 +9,7 @@ import matplotlib
 from copula_inter.training.probe_batches import _name_seed, _tabicl_pit_batch
 
 if TYPE_CHECKING:
+    from copula_inter.marginal.backends import BackendMarginal
     from copula_inter.marginal.pit import MarginalDistribution, TabICLLike
     from tabicl._model.quantile_dist import QuantileDistribution
 
@@ -40,11 +41,14 @@ from copula_inter.viz.field_grids import (
 )
 
 
-def _build_era5_val_batches(cfg: DictConfig, tabicl_marginal: TabICLLike | None, device: str) -> dict[str, dict]:
+def _build_era5_val_batches(
+    cfg: DictConfig, tabicl_marginal: TabICLLike | BackendMarginal | None, device: str
+) -> dict[str, dict]:
     """Fixed real-ERA5 probes per region for the era5_fit/<region> metrics.
 
     For each region, copula_inter.era5.probe.build_era5_probe freezes a context
-    sample (PIT'd with tabicl_marginal, or standardized when it is None) on a few
+    sample (PIT'd with tabicl_marginal -- a frozen TabICL or the run's
+    BackendMarginal -- or standardized when it is None) on a few
     days. With tabicl_marginal, the held-out points are PIT'd too
     (nll_test_z / nll_test_log_pdf) so validate() can score a Y-space NLL. A
     classical GP-MLE baseline NLL is fitted once per region with the

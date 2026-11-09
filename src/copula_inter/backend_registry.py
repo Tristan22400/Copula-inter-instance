@@ -17,13 +17,30 @@ class Backend:
     copula_backbone: bool = False
     batched_pit: str | None = None
     autoregressive: bool = False
+    # Quantile levels the Phase-A forward emits when no grid is requested
+    # (linspace(1/(n+1), n/(n+1), n)); TabICL reads its own from the decoder.
+    native_quantiles: int | None = None
 
 
+# The three marginals: TabICL v2, PriorLabs TabPFN-3.5 (Fast checkpoint) and
+# NVIDIA Kumo Tabular (small). The weights variant is part of the name, so a
+# z_train_source recorded in a manifest or results cache names exact weights.
 BACKENDS = {
     spec.name: spec
     for spec in (
         Backend("tabicl", 3, copula_backbone=True, autoregressive=True),
-        Backend("tabpfn", 0, batched_pit="copula_inter.marginal.tabpfn_batched:tabpfn_run_pit_batched"),
+        Backend(
+            "tabpfn35_fast",
+            0,
+            batched_pit="copula_inter.marginal.tabpfn_marginal:tabpfn_run_pit_batched",
+            native_quantiles=999,
+        ),
+        Backend(
+            "kumo_small",
+            0,
+            batched_pit="copula_inter.marginal.kumo_marginal:kumo_run_pit_batched",
+            native_quantiles=999,
+        ),
     )
 }
 
@@ -41,6 +58,13 @@ def z_train_source(cfg: HasDataConfig) -> str:
     """The configured ``data.z_train_source``, defaulting to TabICL."""
     data = cfg.get("data") if hasattr(cfg, "get") else None
     return str((data or {}).get("z_train_source", DEFAULT_Z_TRAIN_SOURCE))
+
+
+def z_train_marginal_ckpt(cfg: HasDataConfig) -> str | None:
+    """The configured ``data.z_train_marginal_ckpt``: Phase-A weights for a generic marginal backend, or None."""
+    data = cfg.get("data") if hasattr(cfg, "get") else None
+    ckpt = (data or {}).get("z_train_marginal_ckpt", None)
+    return None if ckpt is None else str(ckpt)
 
 
 def validate_z_train_source(value: str) -> None:

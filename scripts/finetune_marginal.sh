@@ -5,10 +5,12 @@
 #OAR -E logs/finetune_marginal_%jobid%.err
 #OAR -q p1
 #
-# Phase A — fine-tune a standalone TabICL so its MARGINAL posterior predictive
+# Phase A — fine-tune a standalone marginal (marginal.backbone=tabicl, the
+# default, tabpfn35_fast or kumo_small) so its MARGINAL posterior predictive
 # is correct for the GP prior the copula is trained on
 # (src/copula_inter/finetune_marginal.py). This trains nothing jointly with the copula; the
-# output is a drop-in tabicl.pit_ckpt for a later src/copula_inter/train.py run.
+# output is a drop-in tabicl.pit_ckpt (tabicl) or data.z_train_marginal_ckpt
+# (tabpfn35_fast/kumo_small) for a later src/copula_inter/train.py run.
 #
 # Prerequisites:
 #   * the ERA5 mixture corpus (one-time, needs network not GPU -- run on a
@@ -25,6 +27,7 @@
 # Any Hydra override passes straight through, e.g.:
 #     oarsub -S "./scripts/finetune_marginal.sh marginal.tier=1 training.lr=2e-5"
 #     oarsub -S "./scripts/finetune_marginal.sh marginal.era5.mix_frac=0.3 training.steps=40000"
+#     oarsub -S "./scripts/finetune_marginal.sh marginal.backbone=kumo_small"
 # ERA5-only control (validation remains the held-out 2023 ERA5 split):
 #     oarsub -S "./scripts/finetune_marginal.sh marginal.era5.mix_frac=1.0"
 

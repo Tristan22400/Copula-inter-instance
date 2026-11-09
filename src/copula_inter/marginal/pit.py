@@ -24,6 +24,7 @@ from tabicl._model.inference_config import InferenceConfig, MgrConfig
 from tabicl._model.tabicl import TabICL
 
 if TYPE_CHECKING:
+    from copula_inter.marginal.backends import BackendMarginal
     from copula_inter.type_aliases import Device
 
 DEFAULT_K_FOLDS = 10
@@ -856,8 +857,8 @@ def mvn_nll_parts(y: torch.Tensor, mean: torch.Tensor, Sigma: torch.Tensor) -> d
 def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     """Exact GP posterior over the test points, conditioned on (x_train, y_train).
 
-    Sigma_post = K_ss - K_sf K_ff^{-1} K_fs (noise on K_ss's diagonal), computed in
-    float64. Eigenvalues are floored at max(eig_floor * max|diag(Sigma_post)|,
+    Sigma_post = K_ss - K_sf K_ff^{-1} K_fs (noise on K_ss's diagonal), with the
+    kernels and the solve in float64. Eigenvalues are floored at max(eig_floor * max|diag(Sigma_post)|,
     nugget) before converting to a correlation matrix. Raises NotImplementedError
     for chain episodes with outer sign modulation.
 
@@ -872,9 +873,11 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     x_train_raw = task.get("x_kernel_train", task["x_norm_train"])
     x_test_raw = task.get("x_kernel_test", task["x_norm_test"])
     ref_device = task["_L_ff"].device if "_L_ff" in task else x_train_raw.device
-    x_train = x_train_raw.to(ref_device)  # (P, d), float32
-    x_test = x_test_raw.to(ref_device)  # (N, d), float32
-    y_train = task["y_train"].to(ref_device)  # (P,)
+    # Kernels in float64: a degree-5 polynomial kernel reaches ~1e9 on its
+    # diagonal, where float32 rounding alone makes K_ss indefinite (min eig ~ -1e2).
+    x_train = x_train_raw.to(ref_device).double()  # (P, d)
+    x_test = x_test_raw.to(ref_device).double()  # (N, d)
+    y_train = task["y_train"].to(ref_device).double()  # (P,)
     P, N = x_train.shape[0], x_test.shape[0]
 
     if "_L_ff" in task and "_alpha" in task:
@@ -962,15 +965,25 @@ def gaussian_corr_kl(R_model: torch.Tensor, R_post: torch.Tensor) -> float:
 def compute_context_z_train(
     x_train_norm: np.ndarray,
     context_values: np.ndarray,
-    tabicl_marginal: TabICLLike | None,
+    tabicl_marginal: TabICLLike | BackendMarginal | None,
     device: Device,
     k_folds: int = 10,
 ) -> np.ndarray:
-    """K-fold PIT z_train of a real context sample under tabicl_marginal (standardized values when it is None)."""
+    """K-fold PIT z_train of a real context sample under tabicl_marginal (standardized values when it is None).
+
+    tabicl_marginal may also be a marginal.backends.BackendMarginal.
+    """
     if tabicl_marginal is None:
         y_mean = context_values.mean()
         y_std = max(context_values.std(), 1e-8)
         return (context_values - y_mean) / y_std
+    from copula_inter.marginal.backends import BackendMarginal
+
+    if isinstance(tabicl_marginal, BackendMarginal):
+        scaled = (context_values - context_values.mean()) / max(float(context_values.std(ddof=1)), 1e-8)
+        x = np.asarray(x_train_norm, dtype=np.float32)
+        y = np.asarray(scaled, dtype=np.float32)
+        return tabicl_marginal.pit(x, y, x[:1], y[:1], k_folds=k_folds)["z_train"]
 
     X_train_t = torch.as_tensor(x_train_norm, dtype=torch.float32, device=device)
     context_values_t = torch.as_tensor(context_values, dtype=torch.float32, device=device)

@@ -13,7 +13,7 @@ pins the tested environment.
 
 ```bash
 uv sync --locked --extra dev --extra cpu    # laptop / CI (CPU PyTorch wheel)
-uv sync --locked --extra dev --extra gpu    # CUDA machine, e.g. a Grid5000 node
+uv sync --locked --extra dev --extra gpu --extra tabpfn --extra kumo --extra era5    # CUDA machine, e.g. a Grid5000 node
 uv run --no-sync pre-commit install         # ruff check + format on every commit
 ```
 
@@ -31,16 +31,19 @@ storage:
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh      # installs uv into ~/.local/bin
 cd ~/thoth_storage/copula-inter
-uv sync --locked --extra dev --extra gpu
+uv sync --locked --extra dev --extra gpu --extra tabpfn --extra kumo --extra era5
 ```
 
 The `.venv` lives in the checkout, so every OAR job on that storage reuses it.
 
-**TabPFN (optional).** The TabPFN marginal backend is the `tabpfn` extra:
-add `--extra tabpfn` to the `uv sync` command, and keep it on every later
-`uv sync`, which otherwise uninstalls it. It also needs a PriorLabs API key in
-`TABPFN_TOKEN` (see [architecture](architecture.md)). Without the extra, the
-TabPFN tests are skipped and selecting it raises an ImportError.
+**TabPFN-3.5 and Kumo (optional).** The two extra marginal backends are uv
+extras: `--extra tabpfn` (`tabpfn35_fast`, PriorLabs TabPFN-3.5 Fast) and
+`--extra kumo` (`kumo_small`, NVIDIA Kumo Tabular small); `--extra era5` is the
+real-data loader. The Grid5000 command above includes all of them: keep every
+extra on every later `uv sync` (including repairs with `--reinstall-package`),
+which otherwise uninstalls the ones left out. TabPFN also needs a PriorLabs API key in `TABPFN_TOKEN` whose
+account accepted the TabPFN-3.5 licence (see [architecture](architecture.md)).
+Without an extra, its tests are skipped and selecting it raises an ImportError.
 If your laptop mounts the same storage (sshfs), don't run `uv sync` through the
 mount. That would overwrite the cluster's GPU venv with a CPU one linked to the
 laptop's Python. Keep a laptop venv elsewhere:
@@ -58,8 +61,9 @@ oarsub -S "./scripts/generate_dataset.sh data.n_tasks=5000"        # on Grid5000
 
 `data.z_train_source` selects the marginal that produces the PIT: `analytic`
 (the exact-GP oracle, no model weights needed), `tabicl` (default),
-`tabicl_split` or `tabpfn`. TabPFN needs no GPU at generation time; it is
-just slower.
+`tabicl_split`, `tabpfn35_fast` or `kumo_small`. The last two read Phase-A
+weights from `data.z_train_marginal_ckpt` (default: pretrained). They need no
+GPU at generation time; they are just slower.
 
 Generation writes a manifest. It refuses to resume into a directory created with
 different settings or different marginal checkpoint bytes, so use a fresh
@@ -78,6 +82,10 @@ DataLoader workers. Useful overrides:
 - `training.startup_probes=false` to skip building the fixed validation probes
   (`kernel_fit/*`, `era5_fit/*`, `oracle_diag/*`);
 - `WANDB_MODE=disabled` to run offline.
+
+`scripts/train.sh` starts a private CUDA MPS daemon for the job (`start_cuda_mps`
+in `scripts/_env.sh`) so the workers' kernels share the GPU concurrently instead
+of time-slicing; `CUDA_MPS=0` turns it off.
 
 ### Fine-tune on real ERA5
 
@@ -112,7 +120,9 @@ table compares correlations on a shared `z_test`.
 `marginal.z_train_source` decides where the context PIT comes from:
 - `tabicl` (default): K-fold TabICL, as in deployment;
 - `oracle`: the exact-GP LOO, an idealized upper bound;
-- `tabpfn`: score against the marginal a run was trained with. Also pass
+- `tabpfn35_fast` / `kumo_small`: score against the marginal a run was trained
+  with. Its weights default to the checkpoint's own `data.z_train_marginal_ckpt`
+  (override with `marginal.backend_ckpt=<path>`). Also pass
   `autoregressive.enabled=false`.
 
 `output.dump_episodes=scores.json` saves per-episode scores, and
@@ -210,14 +220,20 @@ standalone marginal; the two phases meet only at a checkpoint path.
    |---|---|---|
    | tabicl | 153 | 854K (2.91 %) |
 
-   The tier ladder is an ablation: `marginal.lora_all_layers=false marginal.tier=1`.
-   Only tabicl can climb it (`backend_registry.Backend.max_tier`). TabPFN is
-   wired for tier 0 but `load_backbone` refuses it until its parameter names
-   are checked against a loaded model.
+   `marginal.backbone` picks the model: `tabicl` (default), `tabpfn35_fast` or
+   `kumo_small`. The tier ladder is an ablation:
+   `marginal.lora_all_layers=false marginal.tier=1`. Only tabicl can climb it
+   (`backend_registry.Backend.max_tier`); the other two stop at tier 0.
 
-   Each model is scored on its native 999-level decoder grid
-   (`marginal.probs_n=null`), so the objective is comparable across backbones.
-   Set `probs_n=<int>` only to resample onto a coarser grid.
+   Each model is scored on a 999-level grid (`marginal.probs_n=null`): TabICL's
+   and Kumo's native decoder levels, TabPFN's bar distribution read at the same
+   levels. The objective is therefore comparable across backbones. Set
+   `probs_n=<int>` only to resample onto a coarser grid. The generic backbones'
+   PIT (`finetune_adapters.backend_pit`) reads the same model forward as their
+   Phase-A quantiles (`backend_quantiles`), as a full predictive distribution:
+   TabPFN's bar distribution with its half-normal tails, Kumo's 999 quantiles
+   through TabICL's `QuantileToDistribution`. So a fine-tuned model is scored
+   as it was trained, with a proper density like TabICL's.
 
 3. **Re-measure and gate on real data.** The point of a TabICL marginal is
    non-Gaussian tabular transfer, which GP-only training can destroy, so real
@@ -229,10 +245,18 @@ standalone marginal; the two phases meet only at a checkpoint path.
    python -m copula_inter.train tabicl.pit_ckpt=<the _final.pt>
    ```
 
+   For `tabpfn35_fast` / `kumo_small` the copula run selects the backend and its
+   weights together:
+
+   ```bash
+   python -m copula_inter.train data.z_train_source=kumo_small \
+       data.z_train_marginal_ckpt=<the _final.pt>
+   ```
+
 Non-TabICL Phase-A checkpoints load back through
 `copula_inter.marginal.backends.make_regressor(..., ckpt=<path>)`, not
-`marginal.pit.load_tabicl`. Register finished runs in
-`checkpoint_registry.py::MARGINAL_FAMILIES`.
+`marginal.pit.load_tabicl`; a checkpoint written for another backbone is
+refused. Register finished runs in `checkpoint_registry.py::MARGINAL_FAMILIES`.
 
 ## Spatial-correlation diagnostics
 

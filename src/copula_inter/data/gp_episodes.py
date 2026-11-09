@@ -13,14 +13,15 @@ structural_warps.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import random
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional
 
 import gpytorch
-import numpy as np
 import torch
 from gpytorch.utils.cholesky import psd_safe_cholesky
 from gpytorch.utils.errors import NanError, NotPSDError
@@ -548,6 +549,29 @@ def _draw_gp(
     )
 
 
+@contextmanager
+def _default_dtype(dtype: Optional[torch.dtype]) -> Iterator[None]:
+    """torch's default floating dtype set to dtype inside the block (no-op for None)."""
+    if dtype is None:
+        yield
+        return
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def _draw_to(draw: _GPDraw, device: Device) -> _GPDraw:
+    """The draw on device, floating fields in float32 (the dtype every marginal PIT expects)."""
+
+    def move(t: Tensor) -> Tensor:
+        return t.to(device=device, dtype=torch.float32) if t.is_floating_point() else t.to(device)
+
+    return dataclasses.replace(draw, **{f.name: move(getattr(draw, f.name)) for f in dataclasses.fields(draw)})
+
+
 def _degenerate_episodes(draw: _GPDraw, shape: _CallShape, x_norm: Tensor) -> Tensor:
     """(B,) bool: episodes with a degenerate LOO z or whose every active kernel column is near-constant."""
     B = shape.B
@@ -574,58 +598,6 @@ def _degenerate_episodes(draw: _GPDraw, shape: _CallShape, x_norm: Tensor) -> Te
     return degen | degenerate_active_col
 
 
-def _backend_pit_per_episode(
-    cfg: HasDataConfig,
-    draw: _GPDraw,
-    shape: _CallShape,
-    device: Device,
-    marginal_backend: str,
-    marginal_regressor: Any,
-    k_folds: int,
-    probs_n: int,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """K-fold PIT, episode by episode, through a backend without a batched module (slow)."""
-    from copula_inter.marginal.backends import loo_pit as _backend_loo_pit
-    from copula_inter.marginal.backends import quantiles as _backend_quantiles
-    from copula_inter.marginal.kfold import compute_pit
-
-    B, P, N = shape.B, shape.P, shape.N
-    y_train, y_test = draw.y_train, draw.y_test
-    y_mean = y_train.mean(dim=1, keepdim=True)
-    y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-    probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
-    base_seed = int(getattr(cfg, "seed", None) or 0)
-    z_train_np = np.empty((B, P), dtype=np.float32)
-    z_test_np = np.empty((B, N), dtype=np.float32)
-    log_pdf_np = np.empty((B, N), dtype=np.float32)
-    for b in range(B):
-        xc = draw.x_norm_train[b].detach().cpu().numpy()
-        xq = draw.x_norm_test[b].detach().cpu().numpy()
-        y_std_b = float(y_std[b])
-        yc = ((y_train[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
-        yq = ((y_test[b] - y_mean[b]) / y_std[b]).detach().cpu().numpy()
-        seed_b = (base_seed + b) % (2**31)
-        z_train_np[b] = _backend_loo_pit(
-            marginal_backend,
-            marginal_regressor,
-            xc,
-            yc,
-            probs,
-            k_folds=k_folds,
-            seed=seed_b,
-        )
-        q_test = _backend_quantiles(marginal_backend, marginal_regressor, xc, yc, xq, probs, seed=seed_b)
-        z_test_b, log_pdf_b = compute_pit(q_test, probs, yq)
-        z_test_np[b] = z_test_b
-        # Jacobian back to raw-y nats.
-        log_pdf_np[b] = log_pdf_b - math.log(y_std_b)
-    return (
-        torch.from_numpy(z_train_np).to(device=device),
-        torch.from_numpy(z_test_np).to(device=device),
-        torch.from_numpy(log_pdf_np).to(device=device),
-    )
-
-
 def _marginal_pit(
     cfg: HasDataConfig,
     draw: _GPDraw,
@@ -638,7 +610,6 @@ def _marginal_pit(
     tabicl_split_calib_frac: float,
     marginal_backend: Optional[str],
     marginal_regressor: Any,
-    marginal_probs_n: int,
     raw_y_override: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """(z_train, z_test, log_pdf_test): the exact PIT, or its replacement by a marginal model.
@@ -654,7 +625,8 @@ def _marginal_pit(
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         z_train = ((y_train - y_mean) / y_std).detach()
     elif marginal_backend in GENERIC_MARGINAL_BACKENDS:
-        # Batched PIT for a non-TabICL backend: (k_folds + 1) fused forwards for the call.
+        # Batched PIT for a non-TabICL backend from its full predictive distribution:
+        # (k_folds + 1) fused forwards for the call.
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_s = ((y_train - y_mean) / y_std).detach().cpu().numpy()
@@ -670,7 +642,6 @@ def _marginal_pit(
             x_test_np,
             y_test_s,
             k_folds=tabicl_k_folds,
-            probs_n=marginal_probs_n,
             seed=base_seed,
         )
         z_train = torch.from_numpy(out["z_train"]).to(device=device)
@@ -678,9 +649,7 @@ def _marginal_pit(
         # Jacobian back to raw-y nats.
         log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
     elif marginal_backend is not None and marginal_backend != "tabicl":
-        z_train, z_test, log_pdf_test = _backend_pit_per_episode(
-            cfg, draw, shape, device, marginal_backend, marginal_regressor, tabicl_k_folds, marginal_probs_n
-        )
+        raise ValueError(f"marginal_backend={marginal_backend!r} has no batched PIT (backend_registry.batched_pit).")
     elif apply_tabicl and tabicl_split_calib_frac > 0:
         # "tabicl_split": one forward with the calibration points as context.
         from copula_inter.marginal.pit import run_pit_calib_split_batched  # local: pit.py imports from this module
@@ -805,8 +774,9 @@ def _generate_gp_batch_raw(
     tabicl_mix_weights: Optional[Tensor] = None,
     marginal_backend: Optional[str] = None,
     marginal_regressor: Any = None,
-    marginal_probs_n: int = 99,
     raw_y_override: bool = False,
+    pit_device: Optional[Device] = None,
+    synthesis_dtype: Optional[torch.dtype] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate up to B GP episodes in one vectorized call.
 
@@ -832,8 +802,11 @@ def _generate_gp_batch_raw(
         marginal_backend: a non-TabICL marginal (copula_inter.marginal.backends)
             whose PIT replaces z_train, z_test and log_pdf_test.
         marginal_regressor: that backend's regressor.
-        marginal_probs_n: quantile grid size for marginal_backend.
         raw_y_override: z_train = per-episode z-scored y_train (no PIT).
+        pit_device: where the marginal PIT runs (default: device). The GP is
+            synthesized on device and the draw moved here in float32.
+        synthesis_dtype: default floating dtype while the GP is synthesized
+            (None: torch's default); returned fields are float32 either way.
 
     Returns:
         list of episode dicts.
@@ -842,13 +815,18 @@ def _generate_gp_batch_raw(
     if seed is not None:
         seed_everything(seed)
 
-    shape = _sample_call_shape(cfg, B, device, d_override, kernel_weights, tabicl_split_calib_frac)
-    priors = _sample_episode_priors(cfg, shape, device)
-    feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)
-    draw = _draw_gp(cfg, shape, priors, feats, device)
-    if draw is None:
-        return []
-    discard = draw.discard | _degenerate_episodes(draw, shape, feats.x_norm)
+    with _default_dtype(synthesis_dtype):
+        shape = _sample_call_shape(cfg, B, device, d_override, kernel_weights, tabicl_split_calib_frac)
+        priors = _sample_episode_priors(cfg, shape, device)
+        feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)
+        synthesized = _draw_gp(cfg, shape, priors, feats, device)
+        if synthesized is None:
+            return []
+        discard = synthesized.discard | _degenerate_episodes(synthesized, shape, feats.x_norm)
+    convert = synthesis_dtype is not None or (pit_device is not None and pit_device != device)
+    if pit_device is None:
+        pit_device = device
+    draw = _draw_to(synthesized, pit_device) if convert else synthesized
 
     # With tabicl_mix_weights the TabICL override applies with the kernel's mix probability.
     if tabicl_mix_weights is not None:
@@ -861,14 +839,13 @@ def _generate_gp_batch_raw(
         cfg,
         draw,
         shape,
-        device,
+        pit_device,
         apply_tabicl=apply_tabicl,
         tabicl_model=tabicl_model,
         tabicl_k_folds=tabicl_k_folds,
         tabicl_split_calib_frac=tabicl_split_calib_frac,
         marginal_backend=marginal_backend,
         marginal_regressor=marginal_regressor,
-        marginal_probs_n=marginal_probs_n,
         raw_y_override=raw_y_override,
     )
     # Optional z_train corruption, skipped when this call used the adaptive TabICL mix.
@@ -905,9 +882,12 @@ def _generate_gp_batch_raw(
 
     extra: Dict[str, object] = {"n_train": torch.tensor(shape.P), "n_test": torch.tensor(shape.N)}
     if return_kernel_metadata:
-        meta_tensors, meta_extra = _kernel_metadata(shape, priors, feats, draw)
+        # From the draw as synthesized: the cached factors stay on the synthesis device.
+        meta_tensors, meta_extra = _kernel_metadata(shape, priors, feats, synthesized)
         tensors.update(meta_tensors)
         extra.update(meta_extra)
+    if convert:
+        tensors = {k: v.float() if v.is_floating_point() else v for k, v in tensors.items()}
 
     # Drop discarded episodes from the per-episode tensors (the extra fields are call-shared).
     chains = (
@@ -932,8 +912,9 @@ def generate_gp_batch(
     tabicl_mix_weights: Optional[Tensor] = None,
     marginal_backend: Optional[str] = None,
     marginal_regressor: Any = None,
-    marginal_probs_n: int = 99,
     raw_y_override: bool = False,
+    pit_device: Optional[Device] = None,
+    synthesis_dtype: Optional[torch.dtype] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, topping up discarded ones with further calls.
 
@@ -954,8 +935,9 @@ def generate_gp_batch(
         tabicl_mix_weights=tabicl_mix_weights,
         marginal_backend=marginal_backend,
         marginal_regressor=marginal_regressor,
-        marginal_probs_n=marginal_probs_n,
         raw_y_override=raw_y_override,
+        pit_device=pit_device,
+        synthesis_dtype=synthesis_dtype,
     )
     # Pin every top-up round to the first round's d (or d_override).
     d_fixed: Optional[int]
@@ -984,8 +966,9 @@ def generate_gp_batch(
             tabicl_mix_weights=tabicl_mix_weights,
             marginal_backend=marginal_backend,
             marginal_regressor=marginal_regressor,
-            marginal_probs_n=marginal_probs_n,
             raw_y_override=raw_y_override,
+            pit_device=pit_device,
+            synthesis_dtype=synthesis_dtype,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
@@ -999,3 +982,30 @@ def generate_gp_batch(
             f"combination in this call appears to be persistently non-PSD."
         )
     return episodes[:B]
+
+
+# Fixed evaluation sets are synthesized on CPU in float64.
+FIXED_SET_SYNTHESIS_DEVICE = "cpu"
+FIXED_SET_SYNTHESIS_DTYPE = torch.float64
+
+
+def generate_fixed_gp_batch(
+    cfg: HasDataConfig, B: int, *, pit_device: Device = "cpu", **kwargs: Any
+) -> List[Dict[str, Tensor]]:
+    """generate_gp_batch for a fixed evaluation set: one seed gives the same episodes on every machine.
+
+    The GP is synthesized on CPU in float64: CUDA draws a different random
+    stream than CPU from the same seed, float32 Cholesky factors differ between
+    GPU architectures, and on CUDA the batch is capped by free memory. Only the
+    marginal PIT runs on pit_device, so the (x, y) episodes do not depend on the
+    GPU, its free memory or the z_train source, and validation totals are
+    comparable across runs and marginals. kwargs go to generate_gp_batch.
+    """
+    return generate_gp_batch(
+        cfg,
+        B,
+        FIXED_SET_SYNTHESIS_DEVICE,
+        pit_device=pit_device,
+        synthesis_dtype=FIXED_SET_SYNTHESIS_DTYPE,
+        **kwargs,
+    )

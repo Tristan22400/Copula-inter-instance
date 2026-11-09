@@ -15,23 +15,15 @@ from omegaconf import OmegaConf
         ("analytic", None),  # no generating GP on real data -> stay on TabICL
         ("tabicl", None),
         ("tabicl_split", None),
-        ("tabpfn", "tabpfn"),
+        ("tabpfn35_fast", "tabpfn35_fast"),
+        ("kumo_small", "kumo_small"),
     ],
 )
 def test_resolve_marginal_maps_z_train_source(source: str, expected: str | None) -> None:
     from copula_inter.data.era5_live_dataset import _resolve_marginal
 
     cfg = OmegaConf.create({"data": {"z_train_source": source}})
-    backend, probs_n = _resolve_marginal(cfg)
-    assert backend == expected
-    assert probs_n == 99
-
-
-def test_resolve_marginal_reads_probs_n() -> None:
-    from copula_inter.data.era5_live_dataset import _resolve_marginal
-
-    cfg = OmegaConf.create({"data": {"z_train_source": "tabpfn", "z_train_marginal_probs_n": 33}})
-    assert _resolve_marginal(cfg) == ("tabpfn", 33)
+    assert _resolve_marginal(cfg) == expected
 
 
 def test_resolve_marginal_rejects_typo() -> None:
@@ -44,11 +36,11 @@ def test_resolve_marginal_rejects_typo() -> None:
 
 
 @pytest.mark.pretrained
-@pytest.mark.parametrize("backend", ["tabpfn"])
-def test_pit_group_and_episode_agree_under_backend(backend: str) -> None:
+@pytest.mark.parametrize("backend,module", [("tabpfn35_fast", "tabpfn"), ("kumo_small", "sdm")])
+def test_pit_group_and_episode_agree_under_backend(backend: str, module: str) -> None:
     """A backend reaches the PIT, and the grouped and single-episode paths agree."""
-    pytest.importorskip(backend, reason=f"{backend} not installed")
-    if not os.environ.get("TABPFN_TOKEN"):
+    pytest.importorskip(module, reason=f"{module} not installed")
+    if backend == "tabpfn35_fast" and not os.environ.get("TABPFN_TOKEN"):
         pytest.skip("TABPFN_TOKEN not set")
     from copula_inter.data.era5_live_dataset import _pit_episode, _pit_group
     from copula_inter.marginal.backends import make_regressor
@@ -62,7 +54,6 @@ def test_pit_group_and_episode_agree_under_backend(backend: str) -> None:
     kw = dict(
         marginal_backend=backend,
         marginal_regressor=regressor,
-        marginal_probs_n=9,
         seed=7,
     )
     grouped = _pit_group(x_train, y_train, x_test, y_test, None, 2, **kw)

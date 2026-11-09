@@ -14,7 +14,8 @@ already revealed ones. Its total NLL is an exact factorization of a joint
 density, so it is the copula-free reference the copula head has to beat.
 
 **Backend / backbone.** A *marginal backend* is a tabular foundation model used
-for the PIT: `tabicl` or `tabpfn`, listed in
+for the PIT: `tabicl` (TabICL v2), `tabpfn35_fast` (TabPFN-3.5, Fast
+checkpoint) or `kumo_small` (Kumo Tabular, small), listed in
 `backend_registry.py`. A *copula backbone* is the ICL trunk the copula head sits
 on (`model.backbone`: only `tabicl`). The two choices are independent.
 
@@ -67,4 +68,4 @@ NLL scores.
 
 **`z_train_source`.** Which marginal produces the PIT for generated episodes:
 `analytic`, `tabicl`, `tabicl_split` (query scored against a disjoint
-calibration split) or `tabpfn`.
+calibration split), `tabpfn35_fast` or `kumo_small`.

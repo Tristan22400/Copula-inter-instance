@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from omegaconf import DictConfig
 
 from copula_inter.artifacts import artifact_identity, atomic_json_save
+from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS
 from copula_inter.checkpoint_registry import DEFAULT_MARGINAL_FAMILY, resolve_marginal_checkpoint
 from copula_inter.config_path import config_dict
 from copula_inter.rng import resolve_device, seed_everything
@@ -94,7 +95,8 @@ def _results_fingerprint(
         ),
         "tabicl_pit_k_folds": tabicl_pit_k_folds,
         "tabicl_amp": spec.marginal.tabicl_amp,
-        "marginal_probs_n": spec.marginal.probs_n,
+        # tabpfn35_fast / kumo_small PIT estimator; invalidates results cached with the old 99-quantile grid.
+        "generic_marginal_pit": "full_distribution",
         "n_folds": spec.selection.n_folds,
         "min_fold_size": spec.selection.min_fold_size,
         "seed": spec.seed,
@@ -160,7 +162,9 @@ def _baseline_cache_fingerprint(
         # The cached z-space baseline NLLs are scored against this marginal's PIT z_test, so which
         # TabICL checkpoint (and precision) produced it is part of the identity. Pre-refactor caches
         # were all written with the default marginal under AMP; that case keeps the old key set.
-        if spec.marginal.z_train_source == "tabicl" and tabicl_ckpt is not None:
+        if spec.marginal.z_train_source in GENERIC_MARGINAL_BACKENDS and tabicl_ckpt is not None:
+            fingerprint["era5"]["pit_marginal_identity"] = {"ckpt": artifact_identity(tabicl_ckpt)}
+        elif spec.marginal.z_train_source == "tabicl" and tabicl_ckpt is not None:
             legacy = tabicl_ckpt == resolve_marginal_checkpoint(DEFAULT_MARGINAL_FAMILY) and spec.marginal.tabicl_amp
             if not legacy:
                 fingerprint["era5"]["pit_marginal_identity"] = {
@@ -362,7 +366,7 @@ def run_evaluation(spec: EvalSpec) -> None:
             fingerprint,
             spec,
             tabicl_pit_k_folds,
-            resolved_marginal=tabicl_ckpt if spec.marginal.z_train_source == "tabicl" else None,
+            resolved_marginal=tabicl_ckpt if spec.marginal.z_train_source != "oracle" else None,
         )
         if results_cache is not None
         else {}
@@ -490,7 +494,6 @@ _FLAG_ALIASES = {
     "refresh_baselines": "baselines.refresh",
     "no_baseline_cache": "baselines.cache=null",
     "no_results_cache": "output.results_cache=null",
-    "marginal_probs_n": "marginal.probs_n",
 }
 
 main = hydra_entry("eval_checkpoint", EvalSpec, run_evaluation, _FLAG_ALIASES, validate=prepare_eval_spec)

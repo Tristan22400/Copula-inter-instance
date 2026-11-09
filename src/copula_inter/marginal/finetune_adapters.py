@@ -3,11 +3,14 @@
 For each backbone: which parameters each tier trains, a gradient-carrying
 quantile forward, the checkpoint format and how it is loaded back.
 
-    tabicl  tiers 0-3 (pit.run_pit_batched_grad).
-    tabpfn  tier 0 only; patterns untested, and load_backbone refuses it
-            until they are checked against a loaded model.
+    tabicl         tiers 0-3 (pit.run_pit_batched_grad).
+    tabpfn35_fast  tier 0 (tabpfn_marginal.tabpfn_quantiles, episodes batched).
+    kumo_small     tier 0 (kumo_marginal.kumo_quantiles, episodes batched).
 
-All-layer LoRA (lora.apply_lora_all_layers) works for every backbone.
+The generic backbones' Phase-A forward is backend_quantiles, the same function
+their PIT reads (marginal/backends.py, the *_run_pit_batched drivers), so a
+Phase-A checkpoint is scored exactly as it was trained. All-layer LoRA
+(lora.apply_lora_all_layers) works for every backbone.
 """
 
 from __future__ import annotations
@@ -45,10 +48,26 @@ TIER0_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^icl_predictor\.tf_icl\.blocks\.\d+\.norm[12]\.",
         r"^icl_predictor\.decoder\.",
     ),
-    # From TabPFN v3's published layout (untested here).
-    "tabpfn": (
-        r"^y_encoder\.",
-        r"^decoder_dict\.",
+    # TabPFNRegressor.model_ (TabPFNV3p5): target encoders of both stages,
+    # the ICL-block norms, the output norm and the regression head.
+    "tabpfn35_fast": (
+        r"^col_y_encoder\.regression\.",
+        r"^col_y_layernorm\.",
+        r"^icl_y_encoder\.regression\.",
+        r"^icl_y_layernorm\.",
+        r"^icl_blocks\.\d+\.(layernorm|layernorm_mlp)\.",
+        r"^output_norm\.",
+        r"^heads\.mlp_regression\.",
+        r"^heads\.output_projection\.",
+    ),
+    # KumoTabular (task="regression"): target encoders of both stages, the ICL
+    # norms and the quantile head.
+    "kumo_small": (
+        r"^models\.regression\.row_embedding\.y_lin\.",
+        r"^models\.regression\.icl_block\.y_lin\.",
+        r"^models\.regression\.icl_block\.layers\.\d+\.(query_norm|key_value_norm)\.",
+        r"^models\.regression\.icl_block\.norm\.",
+        r"^models\.regression\.icl_block\.head\.",
     ),
 }
 
@@ -92,14 +111,15 @@ class MarginalBackbone:
 
     @property
     def native_quantile_count(self) -> int:
-        """Number of quantile levels the decoder emits (999 for every backbone here)."""
+        """Number of quantile levels quantile_forward(probs=None) returns (999 for every backbone here)."""
         own = getattr(self.module, "quantile_dist", None)
         levels = getattr(own, "alpha_levels", None) if own is not None else None
         if levels is not None:
             return int(levels.numel() if torch.is_tensor(levels) else len(levels))
-        if self.handle is not None and hasattr(self.handle, "manifest"):
-            return int(self.handle.manifest.output_width)
-        raise RuntimeError(f"cannot determine native quantile count for {self.name!r}")
+        count = get_backend(self.name).native_quantiles
+        if count is None:
+            raise RuntimeError(f"cannot determine native quantile count for {self.name!r}")
+        return count
 
     @property
     def native_probs(self) -> np.ndarray:
@@ -119,7 +139,13 @@ class MarginalBackbone:
 
         probs=None returns the native decoder grid; explicit probs are interpolated.
         """
-        return _QUANTILE_FORWARDS[self.name](self, X_context, y_context, X_query, probs)
+        if self.name == "tabicl":
+            raise NotImplementedError(
+                "tabicl's Phase-A forward goes through pit.py::run_pit_batched_grad, which "
+                "finetune_marginal.py calls directly -- it carries K-fold rotation and PIT "
+                "semantics this generic per-call interface does not."
+            )
+        return backend_quantiles(self.name, self.handle, X_context, y_context, X_query, probs)
 
     def quantile_dist_module(self, probs: "np.ndarray | None" = None) -> QuantileToDistribution:
         """Quantile-grid-to-distribution module for the grid quantile_forward(probs) returns.
@@ -155,25 +181,141 @@ class MarginalBackbone:
         atomic_torch_save(payload, path)
 
 
-# Gradient-carrying quantile forwards, one per architecture.
-def _tabicl_quantile_forward(
-    bb: MarginalBackbone,
+def backend_quantiles(
+    name: str,
+    regressor: Any,
     X_context: Sequence[np.ndarray],
     y_context: Sequence[np.ndarray],
     X_query: Sequence[np.ndarray],
-    probs: np.ndarray | None,
+    probs: "np.ndarray | None" = None,
 ) -> torch.Tensor:
-    raise NotImplementedError(
-        "tabicl's Phase-A forward goes through pit.py::run_pit_batched_grad, which "
-        "finetune_marginal.py calls directly -- it carries K-fold rotation and PIT "
-        "semantics this generic per-call interface does not. This entry exists so "
-        "the registry is total; it is never reached for backbone='tabicl'."
+    """(B, n_query, Q) quantiles of a generic backend in y_context's units; differentiable when grad is enabled.
+
+    The one quantile function of tabpfn35_fast and kumo_small: their PIT
+    (inference) and their Phase-A forward (training) both call it.
+    probs=None returns the backend's native_quantiles levels.
+
+    An episode whose context features are all constant carries no feature
+    information, and both libraries refuse it (they drop constant columns and
+    are left with none). It gets the feature-free predictive instead: the
+    Gaussian with its context targets' mean and standard deviation, constant in
+    the weights.
+    """
+    if name == "tabpfn35_fast":
+        from copula_inter.marginal.tabpfn_marginal import tabpfn_quantiles
+
+        model_quantiles: Callable[..., torch.Tensor] = tabpfn_quantiles
+    elif name == "kumo_small":
+        from copula_inter.marginal.kumo_marginal import kumo_quantiles
+
+        model_quantiles = kumo_quantiles
+    else:
+        raise ValueError(f"No generic quantile function for backbone {name!r}.")
+    levels = probs if probs is not None else _native_levels(name)
+    informative = [b for b, xc in enumerate(X_context) if _has_varying_feature(xc)]
+    if len(informative) == len(X_context):
+        return model_quantiles(regressor, X_context, y_context, X_query, probs)
+    device = next(_trainable_module(name, regressor).parameters()).device
+    out = torch.stack(
+        [_feature_free_quantiles(y_context[b], X_query[b].shape[0], levels, device) for b in range(len(X_context))]
     )
+    if informative:
+        q = model_quantiles(
+            regressor,
+            [X_context[b] for b in informative],
+            [y_context[b] for b in informative],
+            [X_query[b] for b in informative],
+            probs,
+        )
+        index = torch.as_tensor(informative, device=device)
+        out = out.to(q.dtype).index_copy(0, index, q)
+    return out
 
 
-_QUANTILE_FORWARDS: dict[str, Callable] = {
-    "tabicl": _tabicl_quantile_forward,
-}
+def backend_pit(
+    name: str,
+    regressor: Any,
+    X_context: Sequence[np.ndarray],
+    y_context: Sequence[np.ndarray],
+    X_query: Sequence[np.ndarray],
+    y_query: Sequence[np.ndarray],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(u, log_pdf), each (B, n_query): the predictive CDF and log-density of y_query under the backend's full distribution.
+
+    In y_context's units, evaluated directly at y_query -- no quantile grid:
+    tabpfn35_fast reads its bar distribution (5000 bins, half-normal tails),
+    kumo_small its 999 quantiles through TabICL's QuantileToDistribution (the
+    spline-with-exponential-tails density TabICL's own PIT uses), so all three
+    marginals score a proper density with tails.
+
+    Episodes whose context features are all constant get the feature-free
+    Gaussian predictive, as in backend_quantiles.
+    """
+    if name == "tabpfn35_fast":
+        from copula_inter.marginal.tabpfn_marginal import tabpfn_pit
+
+        model_pit: Callable[..., tuple[torch.Tensor, torch.Tensor]] = tabpfn_pit
+    elif name == "kumo_small":
+        from copula_inter.marginal.kumo_marginal import kumo_pit
+
+        model_pit = kumo_pit
+    else:
+        raise ValueError(f"No generic PIT function for backbone {name!r}.")
+    informative = [b for b, xc in enumerate(X_context) if _has_varying_feature(xc)]
+    if len(informative) == len(X_context):
+        return model_pit(regressor, X_context, y_context, X_query, y_query)
+    device = next(_trainable_module(name, regressor).parameters()).device
+    pairs = [_feature_free_pit(y_context[b], y_query[b], device) for b in range(len(X_context))]
+    u = torch.stack([p[0] for p in pairs])
+    log_pdf = torch.stack([p[1] for p in pairs])
+    if informative:
+        u_inf, lp_inf = model_pit(
+            regressor,
+            [X_context[b] for b in informative],
+            [y_context[b] for b in informative],
+            [X_query[b] for b in informative],
+            [y_query[b] for b in informative],
+        )
+        index = torch.as_tensor(informative, device=device)
+        u = u.to(u_inf.dtype).index_copy(0, index, u_inf.to(device))
+        log_pdf = log_pdf.to(lp_inf.dtype).index_copy(0, index, lp_inf.to(device))
+    return u, log_pdf
+
+
+def _feature_free_pit(
+    y_context: np.ndarray, y_query: np.ndarray, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(u, log_pdf) of y_query under N(mean, std) of the context targets."""
+    y = np.asarray(y_context, dtype=np.float64)
+    std = max(float(y.std(ddof=1)) if y.size > 1 else 0.0, 1e-8)
+    normal = torch.distributions.Normal(float(y.mean()), std)
+    yq = torch.as_tensor(np.asarray(y_query, dtype=np.float64))
+    return normal.cdf(yq).float().to(device), normal.log_prob(yq).float().to(device)
+
+
+def _has_varying_feature(X_context: np.ndarray) -> bool:
+    """Whether a feature column varies over the context rows (TabPFN's and Kumo's constant-column test)."""
+    X = np.asarray(X_context)
+    varies = (X != X[:1]).any(axis=0) & ~np.isnan(X).all(axis=0)
+    return bool(varies.any())
+
+
+def _native_levels(name: str) -> np.ndarray:
+    n = get_backend(name).native_quantiles
+    assert n is not None
+    return np.linspace(1.0 / (n + 1), n / (n + 1), n)
+
+
+def _feature_free_quantiles(
+    y_context: np.ndarray, n_query: int, levels: np.ndarray, device: torch.device
+) -> torch.Tensor:
+    """(n_query, Q) quantiles of N(mean, std) of the context targets, the same for every query row."""
+    from scipy.stats import norm
+
+    y = np.asarray(y_context, dtype=np.float64)
+    std = max(float(y.std(ddof=1)) if y.size > 1 else 0.0, 1e-8)
+    q = y.mean() + std * norm.ppf(np.asarray(levels, dtype=np.float64))
+    return torch.as_tensor(q, dtype=torch.float32, device=device).expand(n_query, -1)
 
 
 def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda") -> MarginalBackbone:
@@ -187,16 +329,6 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
         tabicl, config = load_tabicl(ckpt or PRETRAINED_TABICL_CKPT, device, return_config=True)
         return MarginalBackbone(name=name, module=tabicl, handle=None, config=config)
 
-    if name == "tabpfn":
-        raise NotImplementedError(
-            "Phase-A fine-tuning for tabpfn is wired (TIER0_PATTERNS above, max_tier in backend_registry) "
-            "but has never been executed: PriorLabs gates the weights behind a licence "
-            "and TABPFN_TOKEN, which this environment does not have, so its parameter "
-            "names are taken from published layout rather than from a loaded model. "
-            "Set TABPFN_TOKEN, run tests/test_marginal_backbones.py to confirm the "
-            "patterns match real parameters, then remove this guard."
-        )
-
     from copula_inter.marginal.backends import make_regressor
 
     regressor = make_regressor(name, device=device, ckpt=ckpt)
@@ -206,8 +338,10 @@ def load_backbone(name: str, *, ckpt: Optional[str] = None, device: str = "cuda"
 
 def _trainable_module(name: str, regressor: Any) -> nn.Module:
     """The nn.Module inside a regressor whose parameters Phase A trains."""
-    if name == "tabpfn":
-        return regressor.model_  # unverified, see load_backbone's guard
+    if name == "tabpfn35_fast":
+        return cast("nn.Module", regressor.module)  # TabPFNMarginal -> TabPFNRegressor.model_
+    if name == "kumo_small":
+        return cast("nn.Module", regressor)  # KumoTabular is itself the module
     raise ValueError(f"No trainable module known for backbone {name!r}.")
 
 

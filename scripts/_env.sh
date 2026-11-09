@@ -2,7 +2,9 @@
 # put this checkout's packages first on PYTHONPATH. Source it from scripts/*.sh.
 #
 # The venv is created once per machine, from the checkout root:
-#     uv sync --locked --extra dev --extra gpu --extra tabpfn --extra era5   # --extra cpu on a machine without CUDA
+#     uv sync --locked --extra dev --extra gpu --extra tabpfn --extra kumo --extra era5
+# (--extra cpu instead of gpu on a machine without CUDA; every later sync must
+# keep the same extras, or uv uninstalls the backends left out)
 # A git worktree without its own .venv uses the main checkout's; COPULA_VENV
 # overrides both.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,10 +18,21 @@ if [[ -z "${COPULA_VENV:-}" ]]; then
     fi
 fi
 if [[ ! -f "$COPULA_VENV/bin/activate" ]]; then
-    echo "_env.sh: no virtualenv at $COPULA_VENV; run 'uv sync --locked --extra dev --extra gpu --extra tabpfn --extra era5' in $REPO_ROOT" >&2
+    echo "_env.sh: no virtualenv at $COPULA_VENV; run 'uv sync --locked --extra dev --extra gpu --extra tabpfn --extra kumo --extra era5' in $REPO_ROOT" >&2
     exit 1
 fi
 source "$COPULA_VENV/bin/activate"
+
+# The tabpfn35_fast marginal needs a PriorLabs API key whose account accepted the
+# TabPFN-3.5 licence (https://ux.priorlabs.ai). Never pass it as a CLI arg
+# (oarstat/ps show job command lines to other users on this shared cluster) or
+# commit it: it is read from a private, untracked file outside the repo when
+# TABPFN_TOKEN isn't already set.
+TABPFN_TOKEN_FILE="${TABPFN_TOKEN_FILE:-$HOME/.config/tabpfn_token}"
+if [[ -z "${TABPFN_TOKEN:-}" && -f "$TABPFN_TOKEN_FILE" ]]; then
+    export TABPFN_TOKEN
+    TABPFN_TOKEN="$(cat "$TABPFN_TOKEN_FILE")"
+fi
 
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:$REPO_ROOT/tabicl_upstream/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -93,3 +106,46 @@ configure_cuda_devices() {
     echo "[$tag] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (excluded: ${rejected[*]:-none})"
 }
 
+
+# Start a private CUDA MPS daemon for this job and stop it when the shell exits.
+# Live generation runs several DataLoader workers per GPU, each with its own CUDA
+# context; without MPS the GPU time-slices between contexts, so their small
+# marginal-inference kernels never run concurrently. On an A5000 with 6 workers,
+# MPS raised generation throughput by 46% (TabPFN), 35% (Kumo), 25% (TabICL)
+# (logs/speed/worker_scaling.py). The daemon runs unprivileged, with pipe/log
+# directories private to this job, after configure_cuda_devices so it only
+# manages this job's GPUs. CUDA_MPS=0 disables it; failure to start only warns.
+#     start_cuda_mps <log tag>
+start_cuda_mps() {
+    local tag="${1:-job}"
+    if [[ "${CUDA_MPS:-1}" == "0" ]]; then
+        echo "[$tag] CUDA MPS disabled (CUDA_MPS=0)."
+        return
+    fi
+    if [[ -n "${CUDA_MPS_PIPE_DIRECTORY:-}" ]]; then
+        echo "[$tag] Using existing CUDA MPS daemon at $CUDA_MPS_PIPE_DIRECTORY."
+        return
+    fi
+    if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+        echo "[$tag] nvidia-cuda-mps-control not found; running without CUDA MPS."
+        return
+    fi
+    local dir="${TMPDIR:-/tmp}/mps_${USER:-$(id -u)}_${OAR_JOB_ID:-$$}"
+    mkdir -p "$dir/pipe" "$dir/log"
+    if CUDA_MPS_PIPE_DIRECTORY="$dir/pipe" CUDA_MPS_LOG_DIRECTORY="$dir/log" nvidia-cuda-mps-control -d; then
+        export CUDA_MPS_PIPE_DIRECTORY="$dir/pipe" CUDA_MPS_LOG_DIRECTORY="$dir/log"
+        _CUDA_MPS_DIR="$dir"
+        trap stop_cuda_mps EXIT
+        echo "[$tag] CUDA MPS daemon started ($dir)."
+    else
+        echo "[$tag] Could not start the CUDA MPS daemon; running without it." >&2
+        rm -rf "$dir"
+    fi
+}
+
+stop_cuda_mps() {
+    [[ -n "${_CUDA_MPS_DIR:-}" ]] || return 0
+    echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+    rm -rf "$_CUDA_MPS_DIR"
+    unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY _CUDA_MPS_DIR
+}

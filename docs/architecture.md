@@ -95,8 +95,8 @@ Subpackages:
 - **`marginal/`** turns targets into *z*.
   - `pit.py`: PIT through TabICL, batched and differentiable variants, and the exact-GP equivalent.
   - `kfold.py`: backend-agnostic PIT from any quantile grid.
-  - `backends.py`: the K-fold PIT for every marginal backend (TabICL, TabPFN).
-  - `batched_pit.py`, `tabpfn_batched.py`: fast batched path for TabPFN.
+  - `backends.py`: the K-fold PIT for every marginal backend (TabICL, TabPFN-3.5 Fast, Kumo small).
+  - `batched_pit.py`: the K-fold PIT driver for the generic backends; `tabpfn_marginal.py` (TabPFN-3.5 Fast) and `kumo_marginal.py` (Kumo Tabular small): their quantile functions, shared by the PIT and Phase A.
   - `tabicl_regressor.py`: helpers around the sklearn-style `TabICLRegressor`.
   - `calibration.py`: quantile ECE.
   - Phase A: `finetune_adapters.py` (per-architecture parameter selection and checkpoint format), `tiers.py`, `lora.py`, `objective.py`, `finetune_data.py`.
@@ -159,5 +159,13 @@ tag for non-TabICL backbones), so they load wherever a TabICL checkpoint does.
   `import tabicl` resolves to this copy. To upgrade, replace the tree with the
   new upstream tag, re-apply `dfca17b`, and rerun the full suite.
 - TabPFN is licence-gated. It needs a PriorLabs API key in `TABPFN_TOKEN`
-  (the job scripts read it from `~/.config/tabpfn_token`). Never pass the key
-  on a command line or commit it.
+  whose account has accepted the TabPFN-3.5 licence (the job scripts read it
+  from `~/.config/tabpfn_token`). Never pass the key on a command line or
+  commit it. It runs through `TabPFNRegressor`'s differentiable-input path
+  (one estimator, identity feature preprocessing), the only path that keeps
+  gradients to its weights, so the PIT and Phase A score the same function.
+- Kumo Tabular (`structured-data-models`, OpenMDW weights from the
+  `nvidia/Kumo-Tabular` HF repo) runs through `KumoTabular.forward` with
+  `kumo_marginal.kumo_recipe()`: Kumo's default recipe with its random
+  ensemble augmentations pinned to the canonical member, so the marginal is
+  deterministic and episodes batch as recipe members.
