@@ -289,6 +289,23 @@ A real-mode sweep also scores the total (marginal + copula) joint NLL on
 held-out ERA5 points. The correlation-curve `model_r2` can't say how many nats
 worse the predictive density is.
 
+## Compare training runs from wandb
+
+`eval.runners.wandb_report` reads runs from wandb. It prints three things:
+
+- **Full NLL split:** the full validation NLL as marginal + copula, for the run and for the oracle. The marginal alone is the run's full NLL under independence.
+- **Best steps:** the step with the best full NLL, and the step with the best copula on analytic $z$.
+- **Size grid:** the analytic-$z$ copula NLL for each context size $P$.
+
+Run it on a compute node: the frontend's CPU can't import numpy. It reads credentials from `~/.netrc`.
+
+```bash
+python -m eval.runners.wandb_report filter=_PN_ since=2026-11-09
+python -m eval.runners.wandb_report ids=[splmz6y3,0jkldstb] sort_by=grid out=report.json
+```
+
+The `.claude/skills/wandb-results` skill explains how to read the tables.
+
 ## Debug pipeline
 
 `debug/` holds a staged investigation of why training with

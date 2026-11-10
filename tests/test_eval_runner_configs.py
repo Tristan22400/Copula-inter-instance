@@ -27,6 +27,7 @@ from eval.runners.spatial_correlation_eval import (
     validate_spatial_spec,
 )
 from eval.runners.summarize_results_cache import SummarizeSpec
+from eval.runners.wandb_report import WandbReportSpec
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -39,6 +40,7 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "era5_calibration_eval": (Era5CalibrationSpec, []),
     "autoregressive_baseline_eval": (AutoregressiveBaselineSpec, []),
     "summarize_results_cache": (SummarizeSpec, ["caches=[a.json]"]),
+    "wandb_report": (WandbReportSpec, []),
 }
 
 
