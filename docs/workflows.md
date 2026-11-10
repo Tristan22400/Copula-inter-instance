@@ -81,6 +81,12 @@ DataLoader workers. Useful overrides:
 - `training.steps=500` for a bounded run;
 - `training.startup_probes=false` to skip building the fixed validation probes
   (`kernel_fit/*`, `era5_fit/*`, `oracle_diag/*`);
+- `baselines.size_grid_enabled=true` to add `val/size_fit/*`: gap to the GP
+  posterior and copula capture on a fixed grid of context sizes P and test-set
+  sizes N (`baselines.size_grid_P`, `baselines.size_grid_N`), for runs trained
+  on varying `data.P_*`/`data.N_*`;
+- `training.val_at_start=true` to validate once before the first update, e.g.
+  to log the parent checkpoint's scores at step 0 of a post-training run;
 - `WANDB_MODE=disabled` to run offline.
 
 `scripts/train.sh` starts a private CUDA MPS daemon for the job (`start_cuda_mps`
@@ -282,6 +288,23 @@ python -m eval.runners.era5_calibration_eval
 A real-mode sweep also scores the total (marginal + copula) joint NLL on
 held-out ERA5 points. The correlation-curve `model_r2` can't say how many nats
 worse the predictive density is.
+
+## Compare training runs from wandb
+
+`eval.runners.wandb_report` reads runs from wandb. It prints three things:
+
+- **Full NLL split:** the full validation NLL as marginal + copula, for the run and for the oracle. The marginal alone is the run's full NLL under independence.
+- **Best steps:** the step with the best full NLL, and the step with the best copula on analytic $z$.
+- **Size grid:** the analytic-$z$ copula NLL for each context size $P$.
+
+Run it on a compute node: the frontend's CPU can't import numpy. It reads credentials from `~/.netrc`.
+
+```bash
+python -m eval.runners.wandb_report filter=_PN_ since=2026-11-09
+python -m eval.runners.wandb_report ids=[splmz6y3,0jkldstb] sort_by=grid out=report.json
+```
+
+The `.claude/skills/wandb-results` skill explains how to read the tables.
 
 ## Debug pipeline
 

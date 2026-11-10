@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterator, TypeAlias, cast
 
 import torch.nn as nn
@@ -20,9 +20,11 @@ from copula_inter.training.era5_probes import _build_era5_val_batches, _build_er
 from copula_inter.training.probe_batches import (
     _build_analytic_val_z,
     _build_posterior_probe_batches,
+    _build_size_grid_batches,
     _build_synthetic_kernel_batches,
     _build_tabicl_kernel_fit_z,
     _build_tabicl_val_z,
+    size_grid_key,
 )
 
 if TYPE_CHECKING:
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
 
 from glob import glob
 
+import numpy as np
 import torch
 import wandb
 from omegaconf import DictConfig, OmegaConf
@@ -150,6 +153,8 @@ class ValidationProbes:
     tabicl_kernel_fit_z: dict
     era5_val_batches: dict
     era5_viz_batch: dict | None
+    # size_fit/* (P, N) grid cells; empty unless baselines.size_grid_enabled.
+    size_grid_batches: dict = field(default_factory=dict)
 
 
 def resolve_train_device(cfg: DictConfig) -> tuple[str, float | None]:
@@ -443,6 +448,19 @@ def build_validation_probes(
     posterior_probe = (
         _build_posterior_probe_batches(cfg, device) if (baselines_on and val_episodes_meta is None) else None
     )
+    size_grid_batches: dict = {}
+    if baselines_on and bool(cfg.get("baselines", {}).get("size_grid_enabled", False)):
+        print("[train] Building the size_fit/* (P, N) grid probes and their analytic-posterior ceilings...")
+        size_grid_batches = _build_size_grid_batches(cfg, device)
+        if wandb.run is not None:
+            # Fixed per run (the oracle's copula gain per cell): a summary value, not a logged curve.
+            wandb.run.summary.update(
+                {
+                    f"val/size_fit/{size_grid_key(P, N)}/copula_headroom": -float(np.nanmean(c["oracle_copula"]))
+                    for (P, N), c in size_grid_batches.items()
+                    if np.isfinite(c["oracle_copula"]).any()
+                }
+            )
 
     # Frozen TabICL marginal (quantile head intact) for PIT-ing validation episodes; see pit.resolve_pit_ckpt.
     pit_ckpt = resolve_pit_ckpt(cfg)
@@ -580,6 +598,7 @@ def build_validation_probes(
         tabicl_kernel_fit_z=tabicl_kernel_fit_z,
         era5_val_batches=era5_val_batches,
         era5_viz_batch=era5_viz_batch,
+        size_grid_batches=size_grid_batches,
     )
 
 

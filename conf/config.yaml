@@ -49,6 +49,9 @@ training:
   clip_grad_norm: 10.0
   log_every: 200
   val_every: 1000
+  # Also validate once before the first update (logged at the start step): the
+  # baseline of a resumed or post-training run, e.g. its parent checkpoint.
+  val_at_start: false
   save_every: 10000
   ckpt_dir: null
   # Path to a checkpoint saved by save_checkpoint() (model + optimizer +
@@ -310,6 +313,20 @@ baselines:
   probe_P_max: 512
   probe_N_min: 8
   probe_N_max: 1024
+
+  # size_fit/* validation metrics (validation.py::_size_fit_metrics): the copula
+  # scored on a fixed (P, N) grid of episodes with exactly P context and N test
+  # points, drawn from this run's kernel prior, against the analytic GP
+  # posterior. Tracks whether training on varying data.P_*/N_* ranges makes
+  # the model equally good at every context and test-set size. Read gap_nll
+  # (>= 0) and copula_capture (1 = all the correlation gain the oracle gets,
+  # 0 = independence) per cell, per P, per N, and P_spread/N_spread_gap_nll.
+  # Off by default: the 1000 x 1000 cells add a forward pass per validation.
+  size_grid_enabled: false
+  size_grid_P: [10, 32, 100, 316, 1000]
+  size_grid_N: [10, 100, 1000]
+  size_grid_n_episodes: 32  # per cell, fixed seed per cell
+  size_grid_batch_size: 8   # episodes per forward pass (bounds memory at P = N = 1000)
 
   # era5_fit/<region>/* validation metrics (see train.py::_build_era5_val_batches):
   # real ARCO-ERA5 spatial-correlation probes, one per src/copula_inter/era5/regions.py

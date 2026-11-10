@@ -309,6 +309,7 @@ def _validate_and_log(
         posterior_probe=probes.posterior_probe,
         val_episodes_meta=data.val_episodes_meta,
         include_oracle_diagnostics=bool(cfg.training.get("startup_probes", True)),
+        size_grid_batches=probes.size_grid_batches,
     )
     # oracle_diag/* keys are logged as-is; others get the val/ prefix.
     log_dict: dict[str, Any] = {(k if k.startswith("oracle_diag/") else f"val/{k}"): v for k, v in metrics.items()}
@@ -341,6 +342,18 @@ def _validate_and_log(
         f"corr_kl={_fmt_metric(metrics, 'oracle_diag/corr_kl', '.4f')}  "
         f"lr={lr:.2e}"
     )
+    if probes.size_grid_batches:
+        P_values = sorted({P for P, _ in probes.size_grid_batches})
+        per_P = "  ".join(
+            f"P{P}={_fmt_metric(metrics, f'size_fit/P{P}/gap_nll', '.4f')}"
+            f"/{_fmt_metric(metrics, f'size_fit/P{P}/copula_capture', '.2f')}"
+            for P in P_values
+        )
+        print(
+            f"[{step:6d}] SIZE gap_nll/capture by P: {per_P}  "
+            f"P_spread={_fmt_metric(metrics, 'size_fit/P_spread_gap_nll', '.4f')}  "
+            f"N_spread={_fmt_metric(metrics, 'size_fit/N_spread_gap_nll', '.4f')}"
+        )
 
 
 def _refresh_tabicl_mix(
@@ -402,6 +415,10 @@ def main(cfg: DictConfig) -> None:
     loss_ema: float | None = None
     triu_cache: dict[int, torch.Tensor] = {}
     timer = _PhaseTimer(device)
+
+    if bool(t.get("val_at_start", False)):
+        # Score the weights before any update: the baseline of a resumed / post-training run.
+        _validate_and_log(bundle.start_step, cfg, device, model, data, probes, float(bundle.scheduler.get_last_lr()[0]))
 
     for step in range(bundle.start_step, t.steps + 1):
         t_data0 = time.perf_counter()
