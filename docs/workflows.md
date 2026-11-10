@@ -81,6 +81,12 @@ DataLoader workers. Useful overrides:
 - `training.steps=500` for a bounded run;
 - `training.startup_probes=false` to skip building the fixed validation probes
   (`kernel_fit/*`, `era5_fit/*`, `oracle_diag/*`);
+- `baselines.size_grid_enabled=true` to add `val/size_fit/*`: gap to the GP
+  posterior and copula capture on a fixed grid of context sizes P and test-set
+  sizes N (`baselines.size_grid_P`, `baselines.size_grid_N`), for runs trained
+  on varying `data.P_*`/`data.N_*`;
+- `training.val_at_start=true` to validate once before the first update, e.g.
+  to log the parent checkpoint's scores at step 0 of a post-training run;
 - `WANDB_MODE=disabled` to run offline.
 
 `scripts/train.sh` starts a private CUDA MPS daemon for the job (`start_cuda_mps`

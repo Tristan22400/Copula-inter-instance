@@ -19,6 +19,7 @@ from copula_inter.marginal.backends import BackendMarginal
 from copula_inter.marginal.pit import (
     TabICLLike,
     gp_analytical_pit,
+    gp_analytical_posterior,
     normalize_targets,
     run_pit,
 )
@@ -111,6 +112,71 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
         batch = collate_fn(episodes)
         batches[family] = {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
     return batches
+
+
+def size_grid_key(P: int, N: int) -> str:
+    """Metric-name fragment of one size_fit/* grid cell, e.g. "P32_N100"."""
+    return f"P{P}_N{N}"
+
+
+def _build_size_grid_batches(cfg: DictConfig, device: str) -> dict[tuple[int, int], dict]:
+    """Fixed probe episodes on a (P, N) grid for the size_fit/* metrics.
+
+    One cell per (P, N) in baselines.size_grid_P x baselines.size_grid_N, each
+    with exactly P context and N test points (no padding), the run's own
+    cfg.data kernel prior and a per-cell fixed seed. The grid ignores
+    cfg.data.P_*/N_*, so the metrics are comparable between runs trained on
+    different size ranges. The analytic posterior ceiling of every episode is
+    computed here once, not at each validation.
+
+    Returns:
+        {(P, N): {"batch": collated batch on device, "oracle_total": (E,),
+        "oracle_copula": (E,)}}, oracle values in nats per test point, NaN
+        where gp_analytical_posterior does not support the episode's kernel.
+    """
+    bcfg = cfg.get("baselines", {}) or {}
+    P_values = [int(p) for p in bcfg.get("size_grid_P", [10, 32, 100, 316, 1000])]
+    N_values = [int(n) for n in bcfg.get("size_grid_N", [10, 100, 1000])]
+    n_episodes = int(bcfg.get("size_grid_n_episodes", 32))
+    base_seed = int(bcfg.get("synth_seed", 20260718)) + 3  # +1, +2 are the other fixed probes
+
+    cells: dict[tuple[int, int], dict] = {}
+    for P in P_values:
+        for N in N_values:
+            cell_cfg = OmegaConf.merge(
+                cfg,
+                OmegaConf.create(
+                    {
+                        "seed": _name_seed(base_seed, size_grid_key(P, N)),
+                        "data": {"P_min": P, "P_max": P, "N_min": N, "N_max": N},
+                    }
+                ),
+            )
+            episodes = generate_fixed_gp_batch(cell_cfg, n_episodes, return_kernel_metadata=True)
+            oracle_total = np.full(len(episodes), np.nan)
+            oracle_copula = np.full(len(episodes), np.nan)
+            for e, ep in enumerate(episodes):
+                n_te = int(ep["x_norm_test"].shape[0])
+                try:
+                    post = gp_analytical_posterior(ep)
+                except (KeyError, NotImplementedError):
+                    continue  # rare unsupported kernel schema, as in kernel_fit/*
+                oracle_total[e] = post["nll_post"] / n_te
+                oracle_copula[e] = post["nll_post_copula"] / n_te
+            batch = collate_fn(episodes)
+            cells[(P, N)] = {
+                "batch": {k: v.to(device) for k, v in batch.items()},
+                "oracle_total": oracle_total,
+                "oracle_copula": oracle_copula,
+            }
+    # Fixed per run, so printed once instead of logged at every validation.
+    headroom = "  ".join(
+        f"{size_grid_key(P, N)}={-float(np.nanmean(c['oracle_copula'])):.4f}"
+        for (P, N), c in cells.items()
+        if np.isfinite(c["oracle_copula"]).any()
+    )
+    print(f"[train] size_fit copula headroom (oracle gain over independence, nats/point): {headroom}")
+    return cells
 
 
 def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
