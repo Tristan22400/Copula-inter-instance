@@ -13,8 +13,9 @@ from copula_inter.baselines.classical_kernels import DEFAULT_FAMILIES
 from copula_inter.data.dataset import (
     collate_fn,
 )
-from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.data.gp_episodes import generate_fixed_gp_batch
 from copula_inter.data.gp_kernels import KERNEL_REGISTRY
+from copula_inter.marginal.backends import BackendMarginal
 from copula_inter.marginal.pit import (
     TabICLLike,
     gp_analytical_pit,
@@ -106,7 +107,7 @@ def _build_synthetic_kernel_batches(cfg: DictConfig, device: str) -> dict[str, d
                 }
             ),
         )
-        episodes = generate_gp_batch(synth_cfg, n_episodes, device=device, return_kernel_metadata=True)
+        episodes = generate_fixed_gp_batch(synth_cfg, n_episodes, return_kernel_metadata=True)
         batch = collate_fn(episodes)
         batches[family] = {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
     return batches
@@ -126,7 +127,7 @@ def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
     n_episodes = int(bcfg.get("posterior_probe_n_episodes", 64))
     base_seed = int(bcfg.get("synth_seed", 20260718)) + 2  # +1 is _compute_tabicl_z_train_gap's
     probe_cfg = OmegaConf.merge(cfg, OmegaConf.create({"seed": base_seed}))
-    episodes = generate_gp_batch(probe_cfg, n_episodes, device=device, return_kernel_metadata=True)
+    episodes = generate_fixed_gp_batch(probe_cfg, n_episodes, return_kernel_metadata=True)
     batch = collate_fn(episodes)
     return {"episodes": episodes, "batch": {k: v.to(device) for k, v in batch.items()}}
 
@@ -134,11 +135,11 @@ def _build_posterior_probe_batches(cfg: DictConfig, device: str) -> dict:
 @torch.no_grad()
 def _tabicl_pit_batch(
     batch: dict,
-    tabicl_marginal: TabICLLike,
+    tabicl_marginal: TabICLLike | BackendMarginal,
     k_folds: int,
     device: str,
 ) -> dict[str, torch.Tensor]:
-    """TabICL K-fold PIT (pit.run_pit) of each episode in a collated batch.
+    """K-fold PIT of each episode in a collated batch: pit.run_pit for TabICL, BackendMarginal.pit otherwise.
 
     Targets are z-scored with pit.normalize_targets; log_pdf_test is converted
     back to raw-y nats.
@@ -166,6 +167,18 @@ def _tabicl_pit_batch(
         X_b = x_train[b, :n]
         X_te = x_test[b, :n_te]
         y_b_scaled, y_te_scaled, _, std = normalize_targets(y_train[b, :n], y_test[b, :n_te])
+        if isinstance(tabicl_marginal, BackendMarginal):
+            out = tabicl_marginal.pit(
+                X_b.cpu().numpy(),
+                y_b_scaled.cpu().numpy(),
+                X_te.cpu().numpy(),
+                y_te_scaled.cpu().numpy(),
+                k_folds=k_folds,
+            )
+            z_tabicl[b, :n] = torch.as_tensor(out["z_train"], device=device)
+            z_test_tabicl[b, :n_te] = torch.as_tensor(out["z_test"], device=device)
+            log_pdf_test_tabicl[b, :n_te] = torch.as_tensor(out["log_pdf_test"], device=device) - std.log()
+            continue
         Y_b = y_b_scaled.unsqueeze(-1)
         Y_te = y_te_scaled.unsqueeze(-1)
         pit_out = run_pit(

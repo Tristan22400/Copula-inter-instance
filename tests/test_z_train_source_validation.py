@@ -8,10 +8,8 @@ rejected by the on-disk generator.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from copula_inter.backend_registry import Z_TRAIN_SOURCES, validate_z_train_source
 from copula_inter.data.live_dataset import (
@@ -20,11 +18,8 @@ from copula_inter.data.live_dataset import (
 )
 from copula_inter.training.setup import _reserve_gpu_headroom_for_live_tabicl
 
-if TYPE_CHECKING:
-    from omegaconf import DictConfig
 
-
-@pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "tabpfn", "y_train"])
+@pytest.mark.parametrize("value", ["analytic", "tabicl", "tabicl_split", "tabpfn35_fast", "kumo_small", "y_train"])
 def testvalidate_z_train_source_accepts_known_values(value: str) -> None:
     validate_z_train_source(value)  # must not raise
 
@@ -37,6 +32,7 @@ def testvalidate_z_train_source_accepts_known_values(value: str) -> None:
         "oracle",
         "",
         "tabicl_splitt",
+        "tabpfn",  # renamed to tabpfn35_fast: the weights variant is part of the name
     ],
 )
 def testvalidate_z_train_source_rejects_unknown_values(value: str) -> None:
@@ -50,7 +46,8 @@ def test_valid_z_train_sources_matches_documented_set() -> None:
         "analytic",
         "tabicl",
         "tabicl_split",
-        "tabpfn",
+        "tabpfn35_fast",
+        "kumo_small",
         "y_train",
     }
 
@@ -141,3 +138,42 @@ def test_missing_z_train_source_defaults_to_tabicl() -> None:
     assert z_train_source(OmegaConf.create({"data": {}})) == "tabicl"
     assert z_train_source(OmegaConf.create({})) == "tabicl"
     assert z_train_source(OmegaConf.create({"data": {"z_train_source": "analytic"}})) == "analytic"
+
+
+@pytest.mark.parametrize(
+    ("source", "pit_device"),
+    [("analytic", "cpu"), ("tabicl", "cuda"), ("tabpfn35_fast", "cuda"), ("kumo_small", "cuda")],
+)
+def test_fixed_live_val_episodes_are_synthesized_on_cpu_for_every_source(
+    source: str, pit_device: str, small_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every z_train source draws its val episodes through generate_fixed_gp_batch; only the marginal PIT runs on the GPU.
+
+    CUDA draws a different stream than CPU from one seed and its float32
+    Cholesky differs between GPU models, so synthesizing the episodes on the
+    training device would give each run, marginal or GPU its own validation set.
+    """
+    import copula_inter.data.live_dataset as live
+    import copula_inter.marginal.backends as backends
+
+    pit_devices: list[str] = []
+
+    def fake_fixed(cfg: DictConfig, batch_size: int, *, pit_device: str = "cpu", **_: object) -> list[dict]:
+        pit_devices.append(str(pit_device))
+        return []
+
+    def forbidden(*_: object, **__: object) -> list[dict]:
+        raise AssertionError("validation episodes must come from generate_fixed_gp_batch")
+
+    monkeypatch.setattr(live, "generate_fixed_gp_batch", fake_fixed)
+    monkeypatch.setattr(live, "generate_gp_batch", forbidden)
+    monkeypatch.setattr(live, "collate_fn", lambda episodes: {})
+    monkeypatch.setattr(live, "load_tabicl", lambda ckpt, device: object())
+    monkeypatch.setattr(backends, "make_regressor", lambda *a, **k: object())
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    assert isinstance(cfg, DictConfig)
+    cfg.data.z_train_source = source
+    cfg.tabicl = {"pit_ckpt": "fake.ckpt", "pretrained": True}
+    t = OmegaConf.create({"val_episodes": 8, "batch_size": 4})
+    build_fixed_live_val_batches(cfg, t, device="cuda")
+    assert pit_devices == [pit_device, pit_device]

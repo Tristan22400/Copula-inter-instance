@@ -37,7 +37,12 @@ from omegaconf import DictConfig, OmegaConf
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
-from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
+from copula_inter.backend_registry import (
+    GENERIC_MARGINAL_BACKENDS,
+    TABICL_Z_TRAIN_SOURCES,
+    validate_z_train_source,
+    z_train_marginal_ckpt,
+)
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.checkpoint_registry import resolve_checkpoint
 from copula_inter.config_path import config_dict
@@ -377,6 +382,37 @@ def build_model_and_optimizer(cfg: DictConfig, device: str, resume_ckpt: str | N
     return ModelBundle(model, optimizer, scheduler, scaler, trainable, start_step, use_amp, amp_dtype)
 
 
+def _generic_marginal_probes(
+    cfg: DictConfig, device: str, val_loader: ValLoader, era5_on: bool
+) -> tuple[dict[int, dict[str, torch.Tensor]], dict]:
+    """(val z cache, era5_fit probes) for a generic data.z_train_source.
+
+    The val batches were PIT'd by the run's own marginal when they were built,
+    so val/y_nll_* reads their z_train/z_test/log_pdf_test directly. The ERA5
+    probes are PIT'd by the same backend and weights (data.z_train_marginal_ckpt).
+    """
+    from copula_inter.marginal.backends import BackendMarginal, make_regressor
+
+    name = z_train_source_of(cfg)
+    val_z = {
+        batch_idx: {key: batch[key].detach().cpu() for key in ("z_train", "z_test", "log_pdf_test")}
+        for batch_idx, batch in enumerate(val_loader)
+    }
+    era5_val_batches: dict = {}
+    if era5_on:
+        print(f"[train] Building frozen real-ERA5 spatial-correlation probes with the {name} marginal...")
+        marginal = BackendMarginal(
+            name,
+            make_regressor(name, device=device, ckpt=z_train_marginal_ckpt(cfg)),
+        )
+        era5_val_batches = _build_era5_val_batches(cfg, marginal, device)
+        del marginal
+        if device == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
+    return val_z, era5_val_batches
+
+
 def build_validation_probes(
     cfg: DictConfig,
     device: str,
@@ -410,6 +446,10 @@ def build_validation_probes(
 
     # Frozen TabICL marginal (quantile head intact) for PIT-ing validation episodes; see pit.resolve_pit_ckpt.
     pit_ckpt = resolve_pit_ckpt(cfg)
+    # A generic z_train_source (tabpfn35_fast, kumo_small) is the run's marginal:
+    # val/y_nll_* and era5_fit/* are scored through it (_generic_marginal_probes),
+    # while TabICL keeps feeding only its own diagnostics (kernel_fit z, mix fractions).
+    generic_marginal = z_train_source_of(cfg) in GENERIC_MARGINAL_BACKENDS
     tabicl_val_z: dict = {}
     tabicl_kernel_fit_z: dict = {}
     # Analytic z for the oracle_diag/* metrics when the val batches use a TabICL PIT.
@@ -445,7 +485,8 @@ def build_validation_probes(
                     f"data.z_train_tabicl_k_folds), matching how the val episodes "
                     f"were generated, not tabicl.pit_k_folds={pit_k_folds}."
                 )
-        tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, val_pit_k_folds, device)
+        if not generic_marginal:
+            tabicl_val_z = _build_tabicl_val_z(val_loader, tabicl_marginal, val_pit_k_folds, device)
         if synth_kernel_batches:
             print(
                 "[train] Building TabICL PIT cache for kernel_fit/<family> "
@@ -485,10 +526,10 @@ def build_validation_probes(
                     },
                     step=0,
                 )
-        if era5_on:
+        if era5_on and not generic_marginal:
             print("[train] Building frozen real-ERA5 spatial-correlation probes...")
             era5_val_batches = _build_era5_val_batches(cfg, tabicl_marginal, device)
-        if era5_viz_on:
+        if era5_viz_on and not generic_marginal:
             print("[train] Building frozen real-ERA5 prediction-viz probe...")
             era5_viz_batch = _build_era5_viz_batch(cfg, tabicl_marginal, device)
         del tabicl_marginal  # only the caches built above are needed from here on
@@ -496,7 +537,7 @@ def build_validation_probes(
             # gc.collect() before empty_cache() so cyclic references release CUDA memory.
             gc.collect()
             torch.cuda.empty_cache()
-    elif era5_on:
+    elif era5_on and not generic_marginal:
         # No pit_ckpt: use tabicl.ckpt for the ERA5 probes if set.
         era5_ckpt = cfg.tabicl.get("ckpt", None)
         if era5_ckpt:
@@ -523,6 +564,13 @@ def build_validation_probes(
             era5_val_batches = _build_era5_val_batches(cfg, None, device)
             if era5_viz_on:
                 era5_viz_batch = _build_era5_viz_batch(cfg, None, device)
+    if generic_marginal and baselines_on:
+        tabicl_val_z, era5_val_batches = _generic_marginal_probes(cfg, device, val_loader, era5_on)
+        if era5_viz_on:
+            print(
+                f"[train] Skipping the val/era5_* figure probe: it plots TabICL's own quantile "
+                f"distribution, not data.z_train_source={z_train_source_of(cfg)}."
+            )
     return ValidationProbes(
         synth_kernel_batches=synth_kernel_batches,
         posterior_probe=posterior_probe,

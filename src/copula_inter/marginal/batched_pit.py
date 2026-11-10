@@ -1,87 +1,176 @@
-"""K-fold PIT driver for the batched marginal backends (tabpfn).
+"""K-fold PIT driver for the batched marginal backends (tabpfn35_fast, kumo_small).
 
-The backend supplies bank_fn:
+The backend supplies pit_fn:
 
-    bank_fn(X_context: list of B (n_context, p_x) arrays,
-            y_context: list of B (n_context,) arrays,
-            X_query:   list of B (n_query, p_x) arrays,
-            probs:     (Q,) array) -> (B, n_query, Q) array in raw y units
+    pit_fn(X_context: list of M (n_context, p_x) arrays,
+           y_context: list of M (n_context,) arrays,
+           X_query:   list of M (n_query, p_x) arrays,
+           y_query:   list of M (n_query,) arrays) -> (u, log_pdf), each (M, n_query)
 
-probs is the caller's grid; backends with a fixed native grid interpolate
-inside bank_fn.
+u = F(y_query) and log_pdf = log f(y_query) under the backend's full predictive
+distribution, in y_context's units (finetune_adapters.backend_pit). No quantile
+grid is involved, so z keeps its tails and the density is proper.
+
+Both backends run all members of a call in one network forward. The driver
+therefore stacks every (fold, episode) pair that shares the context and query
+sizes into one call: at most two fold sizes exist (P = q K + r gives r folds of
+q + 1 and K - r of q), so a K-fold PIT is <= 3 calls (2 fold groups + the test
+pass) instead of K + 1, each split only to bound memory (max_cells).
 """
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
+import torch
+from scipy.special import ndtri
 
-__all__ = ["run_kfold_pit_batched"]
+__all__ = ["backend_pit_fn", "group_by_kept_columns", "run_kfold_pit_batched", "take_columns"]
+
+PitFn = Callable[[list, list, list, list], tuple[np.ndarray, np.ndarray]]
+
+# Members per call are capped so that members * rows * columns stays below this.
+# Live generation runs 6 DataLoader workers per GPU, each with its own CUDA
+# context, and the trainer leaves them ~1.6 GB each. Peak memory reserved by one
+# worker call of 32 GP episodes (P=32, N=256) on an A5000:
+#     cells     kumo_small          tabpfn35_fast
+#     2**21     1.55 GiB, 0.62 s    2.68 GiB, 1.70 s   (OOM'd the trainer at 6 workers)
+#     2**15     0.65 GiB, 0.70 s    1.21 GiB, 1.79 s
+#     2**14     0.38 GiB, 0.87 s    0.86 GiB, 1.95 s
+DEFAULT_MAX_CELLS = 1 << 15
+TABPFN_MAX_CELLS = 1 << 14  # TabPFN's 5000-bin logits make each cell ~2x Kumo's
+
+
+def backend_pit_fn(name: str, regressor: Any) -> PitFn:
+    """pit_fn for a generic backend: finetune_adapters.backend_pit without gradients, as float64 numpy arrays."""
+    from copula_inter.marginal.finetune_adapters import backend_pit
+
+    def pit_fn(X_ctx: list, y_ctx: list, X_qry: list, y_qry: list) -> tuple[np.ndarray, np.ndarray]:
+        with torch.no_grad():
+            u, log_pdf = backend_pit(name, regressor, X_ctx, y_ctx, X_qry, y_qry)
+        return u.double().cpu().numpy(), log_pdf.double().cpu().numpy()
+
+    return pit_fn
+
+
+def group_by_kept_columns(X_context: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Group a batch of contexts (B, n, C) by how many feature columns vary over their rows.
+
+    Both libraries drop the columns that are constant over the context (a NaN
+    column counts as constant) and keep the others in their order, so the
+    network only sees the kept columns, compacted. Members that keep the same
+    number of columns can therefore share a forward once each one's kept
+    columns are gathered (take_columns), whichever columns those are; grouping
+    by the exact pattern instead split batches with discrete features into
+    hundreds of forwards. With a single context row every column is kept
+    (sdm.processing.DropConstantColumns).
+
+    Returns:
+        [(member indices (G,), kept column indices (G, C'), ascending per row)],
+        one entry per distinct kept-column count C'.
+    """
+    B, n, C = X_context.shape
+    if n <= 1:
+        keep = torch.ones(B, C, dtype=torch.bool, device=X_context.device)
+    else:
+        keep = (X_context != X_context[:, :1]).any(dim=1) & ~X_context.isnan().all(dim=1)
+    counts = keep.sum(dim=1)
+    groups = []
+    for count in torch.unique(counts).tolist():
+        members = torch.nonzero(counts == count).squeeze(1)
+        cols = torch.nonzero(keep[members])[:, 1].reshape(len(members), count)  # row-major: ascending per member
+        groups.append((members, cols))
+    return groups
+
+
+def take_columns(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    """x (G, rows, C) restricted to each member's columns cols (G, C'): (G, rows, C')."""
+    return x.gather(-1, cols.unsqueeze(1).expand(-1, x.shape[1], -1))
+
+
+def _probit(u: np.ndarray, eps: float) -> np.ndarray:
+    """Phi^{-1}(u) with u clipped to [eps, 1 - eps], as TabICL's PIT (pit._probit)."""
+    return ndtri(np.clip(u, eps, 1.0 - eps))
+
+
+def _chunked_pit(
+    pit_fn: PitFn, X_ctx: list, y_ctx: list, X_qry: list, y_qry: list, max_cells: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """pit_fn over M same-shape members, in chunks of at most max_cells members * rows * columns."""
+    M = len(X_ctx)
+    rows = X_ctx[0].shape[0] + X_qry[0].shape[0]
+    cols = X_ctx[0].shape[1] + 1
+    step = max(1, max_cells // (rows * cols))
+    parts = [
+        pit_fn(X_ctx[i : i + step], y_ctx[i : i + step], X_qry[i : i + step], y_qry[i : i + step])
+        for i in range(0, M, step)
+    ]
+    return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
 
 
 def run_kfold_pit_batched(
-    bank_fn: Callable[..., np.ndarray],
+    pit_fn: PitFn,
     X_train: np.ndarray,
     Y_train: np.ndarray,
     X_test: np.ndarray,
     Y_test: np.ndarray,
     k_folds: int = 10,
-    probs_n: int = 99,
     eps: float = 1e-6,
     seed: int = 0,
+    max_cells: int | None = None,
 ) -> dict:
-    """K-fold PIT for z_train and a full-context pass for z_test/log_pdf_test, batched across episodes.
+    """K-fold PIT for z_train and a full-context pass for z_test/log_pdf_test, batched across episodes and folds.
 
     Args:
-        bank_fn: the backend's quantile-bank function.
+        pit_fn: the backend's PIT function (module docstring).
         X_train: (B, P, p_x); X_test: (B, N, p_x).
         Y_train: (B, P); Y_test: (B, N), already scaled by the caller.
         k_folds: clamped to [1, P].
-        probs_n: quantile grid size.
+        eps: u is clipped to [eps, 1 - eps] before the probit (|z| <= 4.75 at 1e-6).
         seed: episode b's folds are default_rng(seed + b).permutation(P) % K
-            (as eval/metrics/joint_nll.kfold_loo_pit); fold sizes are equal
-            across episodes, so folds can be batched.
+            (as eval/metrics/joint_nll.kfold_loo_pit).
+        max_cells: memory bound per pit_fn call (members * rows * columns);
+            None reads DEFAULT_MAX_CELLS at call time.
+
+    Each held-out point is predicted from the other folds of its own episode
+    only; the members of one pit_fn call are independent, so how the
+    (fold, episode) pairs are grouped into calls does not change the result.
 
     Returns:
         dict with z_train (B, P), z_test (B, N), log_pdf_test (B, N) in the
         scaled y units (callers apply the Jacobian).
     """
-    from copula_inter.marginal.kfold import compute_pit
-
     B, P, _p_x = X_train.shape
-    N = X_test.shape[1]
     K = min(int(k_folds), P)
-    probs = np.linspace(1.0 / (probs_n + 1), probs_n / (probs_n + 1), probs_n)
+    max_cells = DEFAULT_MAX_CELLS if max_cells is None else max_cells
 
     fold_ids = [np.random.default_rng(seed + b).permutation(P) % K for b in range(B)]
+    # (fold k, episode b) members grouped by held-out size; the context size is P minus it.
+    groups: dict[int, list[tuple[int, np.ndarray, np.ndarray]]] = {}
+    for k in range(K):
+        for b in range(B):
+            held = fold_ids[b] == k
+            qry_idx, ctx_idx = np.where(held)[0], np.where(~held)[0]
+            if qry_idx.size and ctx_idx.size:
+                groups.setdefault(qry_idx.size, []).append((b, ctx_idx, qry_idx))
 
     z_train = np.empty((B, P), dtype=np.float32)
-    for k in range(K):
-        held = [fold_ids[b] == k for b in range(B)]
-        qry_idx = [np.where(held[b])[0] for b in range(B)]
-        ctx_idx = [np.where(~held[b])[0] for b in range(B)]
-        if qry_idx[0].size == 0 or ctx_idx[0].size == 0:
-            continue  # size is shared across b (see docstring); checking b=0 suffices
-        X_ctx = [X_train[b][ctx_idx[b]] for b in range(B)]
-        y_ctx = [Y_train[b][ctx_idx[b]] for b in range(B)]
-        X_qry = [X_train[b][qry_idx[b]] for b in range(B)]
-        bank = bank_fn(X_ctx, y_ctx, X_qry, probs)  # (B, F, Q)
-        for b in range(B):
-            z_held, _ = compute_pit(bank[b], probs, Y_train[b][qry_idx[b]], eps)
-            z_train[b, qry_idx[b]] = z_held
+    for members in groups.values():
+        u_held, _ = _chunked_pit(
+            pit_fn,
+            [X_train[b][ctx] for b, ctx, _ in members],
+            [Y_train[b][ctx] for b, ctx, _ in members],
+            [X_train[b][qry] for b, _, qry in members],
+            [Y_train[b][qry] for b, _, qry in members],
+            max_cells,
+        )  # (members, fold size)
+        for (b, _, qry), u in zip(members, u_held, strict=True):
+            z_train[b, qry] = _probit(u, eps)
 
-    bank_test = bank_fn(
-        [X_train[b] for b in range(B)],
-        [Y_train[b] for b in range(B)],
-        [X_test[b] for b in range(B)],
-        probs,
-    )  # (B, N, Q)
-    z_test = np.empty((B, N), dtype=np.float32)
-    log_pdf_test = np.empty((B, N), dtype=np.float32)
-    for b in range(B):
-        z_b, log_pdf_b = compute_pit(bank_test[b], probs, Y_test[b], eps)
-        z_test[b] = z_b
-        log_pdf_test[b] = log_pdf_b
-
-    return {"z_train": z_train, "z_test": z_test, "log_pdf_test": log_pdf_test}
+    u_test, log_pdf_test = _chunked_pit(pit_fn, list(X_train), list(Y_train), list(X_test), list(Y_test), max_cells)
+    return {
+        "z_train": z_train,
+        "z_test": _probit(u_test, eps).astype(np.float32),
+        "log_pdf_test": log_pdf_test.astype(np.float32),
+    }

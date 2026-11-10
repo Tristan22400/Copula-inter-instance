@@ -44,7 +44,6 @@ class PitSettings:
     device: str | torch.device = "cpu"
     marginal_backend: Optional[str] = None
     marginal_regressor: Any = None
-    marginal_probs_n: int = 99
     standardize_y: bool = True
     autoregressive: bool = False
     ar_order: str = "random"
@@ -110,7 +109,6 @@ def package_pit_episodes(
             s.k_folds,
             marginal_backend=s.marginal_backend,
             marginal_regressor=s.marginal_regressor,
-            marginal_probs_n=s.marginal_probs_n,
             seed=chunk[0].ep_i,
         )
         pits = [

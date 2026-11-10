@@ -184,13 +184,13 @@ training:
   # in-training data-wait time from ~85ms/step average, spiking to 170ms, down
   # to ~1ms/step average on an idle RTX 6000 Ada at z_train_tabicl_k_folds=2).
   # live_tabicl_num_workers/live_tabicl_group_multiplier (above) are SHARED
-  # with data.z_train_source=tabpfn too, not just tabicl/tabicl_split
-  # -- it batches its own forward across the whole group_size call
-  # (src/copula_inter/marginal/tabpfn_batched.py), the same batched-
+  # with data.z_train_source=tabpfn35_fast/kumo_small too, not just
+  # tabicl/tabicl_split -- each worker runs its own copy over the whole
+  # group_size call (src/copula_inter/marginal/*_marginal.py), the same batched-
   # GPU-worker shape as tabicl (see live_dataset.py::build_live_train_loader's
   # batched_marginal_worker_enabled). The auto-sizing formula's constants are
   # still calibrated against TabICL's own per-worker VRAM specifically (no
-  # dedicated tabpfn benchmark exists yet) -- a reasonable common
+  # dedicated tabpfn35_fast/kumo_small benchmark exists yet) -- a reasonable common
   # starting point, not a validated per-backend figure; set
   # live_tabicl_num_workers explicitly once you've measured your own
   # node/backend/context-size combination.

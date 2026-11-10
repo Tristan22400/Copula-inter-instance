@@ -583,8 +583,8 @@ def build_kernel_fn(
 
     kernel = _wrap_concrete_sign_modulated(kernel, sign_w_outer, sign_b_outer, sign_a_outer, active_dims=active_dims)
 
-    # Move the kernel to X1's device at call time.
-    return lambda X1, X2: kernel.to(X1.device)(X1, X2).to_dense()
+    # Move the kernel to X1's device and dtype at call time (float64 inputs give a float64 kernel).
+    return lambda X1, X2: kernel.to(device=X1.device, dtype=X1.dtype)(X1, X2).to_dense()
 
 
 def rbf_kernel(X1: Tensor, X2: Tensor, *, l: float | Tensor, alpha2: float | Tensor, **_: Any) -> Tensor:

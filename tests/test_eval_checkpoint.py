@@ -15,7 +15,7 @@ from pytest import MonkeyPatch
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
 from copula_inter.data.gp_episodes import generate_gp_batch
-from copula_inter.marginal.pit import gp_analytical_posterior
+from copula_inter.marginal.pit import _kernel_fn_from_task, gp_analytical_posterior
 from eval.baselines.classical import (
     baseline_fingerprint,
     episode_cache_key,
@@ -289,20 +289,35 @@ def _near_duplicate_rbf_task(alpha2: float) -> dict:
 
 
 def test_gp_analytical_posterior_eig_floor_scale_invariant() -> None:
-    """The eigenvalue floor scales with Sigma_post, so a large-alpha2 repaired episode gets a sensible NLL."""
+    """The eigenvalue floor scales with Sigma_post, so a large-alpha2 repaired episode gets a sensible NLL.
+
+    The near-duplicate test points leave Sigma_post an eigenvalue (~0.04) that
+    is zero at its scale (~1e8): below eig_floor * scale, so the floor fires.
+    """
     task = _near_duplicate_rbf_task(alpha2=1e8)
     post = gp_analytical_posterior(task)
     n = task["x_norm_test"].shape[0]
 
-    assert post["min_eig"] < 0, "test construction should force an indefinite Sigma_post"
+    assert post["min_eig"] < 1e-6 * post["Sigma_post"].double().diagonal().max().item()
     assert post["repaired"], "eigenvalue floor should have fired"
     # The scale-invariant floor gives ~7.8 nats/point here; 50 catches a regression.
     assert post["nll_post"] / n < 50.0
 
 
 def test_gp_analytical_posterior_eig_floor_nugget_bound() -> None:
-    """The eigenvalue floor is never below the nugget (small-scale Sigma_post, alpha2=1e-2)."""
+    """The eigenvalue floor is never below the nugget (small-scale Sigma_post, alpha2=1e-2).
+
+    Sigma_post's least eigenvalue is the nugget in exact arithmetic. Two
+    identical test points and the float32 cached factor that real episodes
+    carry (_L_ff, _alpha) put the measured one just below it.
+    """
     task = _near_duplicate_rbf_task(alpha2=1e-2)
+    task["x_norm_test"] = torch.tensor([[0.5], [0.5], [-0.7]])
+    kernel_fn, nugget = _kernel_fn_from_task(task)
+    x_train = task["x_norm_train"].double()
+    L_ff = torch.linalg.cholesky(kernel_fn(x_train, x_train) + nugget * torch.eye(3, dtype=torch.float64))
+    task["_L_ff"] = L_ff.float()
+    task["_alpha"] = torch.cholesky_solve(task["y_train"].double().unsqueeze(-1), L_ff).squeeze(-1).float()
     post = gp_analytical_posterior(task)
 
     assert post["min_eig"] < 1e-4, (

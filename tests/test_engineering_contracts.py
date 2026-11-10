@@ -278,11 +278,11 @@ def test_eval_uses_configured_dataset_directory_in_cache_key() -> None:
 
 def test_backend_registry_capabilities() -> None:
     assert set(COPULA_BACKBONES) == {"tabicl"}
-    assert set(GENERIC_MARGINAL_BACKENDS) == {"tabpfn"}
+    assert set(GENERIC_MARGINAL_BACKENDS) == {"tabpfn35_fast", "kumo_small"}
     assert all(name == backend.name for name, backend in BACKENDS.items())
     assert set(BACKENDS) == set(TIER0_PATTERNS)
     with pytest.raises(ValueError, match="does not support"):
-        require_capability("tabpfn", "copula_backbone")
+        require_capability("kumo_small", "copula_backbone")
 
 
 def test_training_core_import_does_not_load_reporting_or_era5() -> None:

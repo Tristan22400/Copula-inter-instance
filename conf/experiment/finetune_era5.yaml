@@ -7,7 +7,8 @@
 #
 # resume_ckpt takes a path or a CHECKPOINT_FAMILIES name[:step]. Common extras:
 #   training.resume_reset_schedule=false   continue the source run's schedule
-#   data.z_train_source=tabpfn             another marginal for the ERA5 PIT
+#   data.z_train_source=kumo_small         another marginal for the ERA5 PIT
+#                                          (or tabpfn35_fast; + data.z_train_marginal_ckpt)
 #   era5_live.val_corpus_dir=<dir>         held-out-year validation corpus
 #   era5_live.grid_size_min/max, era5_live.box_deg_min/max
 training:

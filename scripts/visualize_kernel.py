@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.cluster.hierarchy as sch
 from omegaconf import DictConfig, OmegaConf
+from scipy.spatial.distance import squareform
 
 from copula_inter.config_path import merge_configs
 
@@ -75,7 +76,7 @@ def visualize(kernel_name: str) -> None:
         distance_matrix = np.clip(0.5 * (distance_matrix + distance_matrix.T), 0, 1)
         np.fill_diagonal(distance_matrix, 0.0)
 
-        linkage = sch.linkage(sch.distance.squareform(distance_matrix), method="average")
+        linkage = sch.linkage(squareform(distance_matrix), method="average")
         dendro = sch.dendrogram(linkage, no_plot=True)
         idx = dendro["leaves"]
         R_sorted = R[idx, :][:, idx]

@@ -1,14 +1,18 @@
-"""Phase A: fine-tune a standalone TabICL marginal (quantile decoder intact).
+"""Phase A: fine-tune a standalone marginal (quantile decoder intact).
 
 Trains the marginal's posterior predictive on GP episodes (optionally mixed
-with real ERA5) and writes a TabICL-schema checkpoint usable as
-tabicl.pit_ckpt:
+with real ERA5). marginal.backbone picks the model: tabicl (default) writes a
+TabICL-schema checkpoint usable as tabicl.pit_ckpt; tabpfn35_fast and
+kumo_small write MarginalBackbone.save checkpoints usable as
+data.z_train_marginal_ckpt:
 
     python -m copula_inter.train tabicl.pit_ckpt=<checkpoint>
+    python -m copula_inter.train data.z_train_source=kumo_small data.z_train_marginal_ckpt=<checkpoint>
 
 Usage:
     python -m copula_inter.finetune_marginal
     python -m copula_inter.finetune_marginal marginal.tier=1 training.lr=2e-5
+    python -m copula_inter.finetune_marginal marginal.backbone=kumo_small
     python -m copula_inter.finetune_marginal wandb.mode=disabled training.steps=20
 """
 
@@ -747,12 +751,21 @@ def _export_final(run: _PhaseARun, selector: _BestSelector, total_steps: int) ->
     else:
         export_step = total_steps
     final = run.save(export_step, tag="_final")
-    if final:
+    if not final:
+        return
+    path = os.path.abspath(final)
+    backbone = str(run.cfg.marginal.get("backbone", "tabicl"))
+    if backbone == "tabicl":
         print(
             "\nPhase A done. Use it as the copula run's marginal with:\n"
-            f"    python -m copula_inter.train tabicl.pit_ckpt={os.path.abspath(final)}\n"
+            f"    python -m copula_inter.train tabicl.pit_ckpt={path}\n"
             "and measure it first with:\n"
-            f"    python -m eval.runners.marginal_calibration_eval ckpt={os.path.abspath(final)}"
+            f"    python -m eval.runners.marginal_calibration_eval ckpt={path}"
+        )
+    else:
+        print(
+            "\nPhase A done. Use it as the copula run's marginal with:\n"
+            f"    python -m copula_inter.train data.z_train_source={backbone} data.z_train_marginal_ckpt={path}"
         )
 
 
@@ -791,6 +804,7 @@ def main(cfg: DictConfig) -> None:
     log_every = int(cfg.training.log_every)
     t_last = time.time()
     profiler = _StepProfiler(int(cfg.training.get("profile_steps", 0)), device)
+    skipped_nonfinite = 0
 
     for step in range(1, total_steps + 1):
         profiling = profiler.active(step)
@@ -834,7 +848,16 @@ def main(cfg: DictConfig) -> None:
         profiler.sync(step)
         backward_seconds = time.perf_counter() - backward_started
         optimizer_started = time.perf_counter()
-        opt.step()
+        if torch.isfinite(gnorm):
+            opt.step()
+        else:
+            # Clipping cannot repair a NaN/inf norm, and one AdamW step would
+            # write it into every trainable weight. Skip the update instead.
+            skipped_nonfinite += 1
+            print(
+                f"[step {step}] non-finite gradient norm ({gnorm.item()}); update skipped ({skipped_nonfinite} so far)"
+            )
+            run.log({"train/skipped_nonfinite": skipped_nonfinite}, step)
         sched.step()
         profiler.sync(step)
         optimizer_seconds = time.perf_counter() - optimizer_started

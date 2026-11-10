@@ -11,7 +11,7 @@
 # probe -- one OAR job, one shared --run-id, ending in an aggregated
 # debug/results/<run_id>/report.md (see debug/report.py).
 #
-# Prerequisite for the tabpfn backend (S7b): one-time license acceptance at
+# Prerequisite for the tabpfn35_fast backend (S7b): one-time license acceptance at
 # https://ux.priorlabs.ai, then save the API key to a PRIVATE file (never
 # commit it, never pass it as a CLI arg -- oarstat/ps show job command
 # lines to other users on this shared cluster):
@@ -45,7 +45,7 @@ if [[ -z "${TABPFN_TOKEN:-}" && -f "$TABPFN_TOKEN_FILE" ]]; then
 fi
 BACKENDS="tabicl"
 if [[ -n "${TABPFN_TOKEN:-}" ]]; then
-    BACKENDS="tabicl,tabpfn"
+    BACKENDS="tabicl,tabpfn35_fast,kumo_small"
 fi
 
 N_EPISODES="${N_EPISODES:-200}"
@@ -106,7 +106,7 @@ echo "=========================================================="
 echo "[4/5] S7b -- real training comparison across backends=$BACKENDS"
 echo "=========================================================="
 python debug/stages/s7b_backend_train.py --backends "$BACKENDS" --steps "$S7B_STEPS" --batch-size 4 \
-    --eval-every 10 --n-eval 8 --k-folds 5 --probs-n 49 --n-episodes "$N_EPISODES" --device cuda --run-id "$RUN_ID"
+    --eval-every 10 --n-eval 8 --k-folds 5 --n-episodes "$N_EPISODES" --device cuda --run-id "$RUN_ID"
 echo "[$(date +%H:%M:%S)] stage 4 exit=$?"
 
 echo "=========================================================="

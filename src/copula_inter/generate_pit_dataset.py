@@ -11,7 +11,7 @@ Usage:
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000000 data.shard_size=512
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl
     python -m copula_inter.generate_pit_dataset data.n_tasks=5000 data.z_train_source=tabicl_split
-    python -m copula_inter.generate_pit_dataset data.n_tasks=500 data.z_train_source=tabpfn
+    python -m copula_inter.generate_pit_dataset data.n_tasks=500 data.z_train_source=kumo_small
 """
 
 from __future__ import annotations
@@ -35,7 +35,12 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from copula_inter.artifacts import atomic_json_save, atomic_torch_save, file_digest
-from copula_inter.backend_registry import GENERIC_MARGINAL_BACKENDS, TABICL_Z_TRAIN_SOURCES, validate_z_train_source
+from copula_inter.backend_registry import (
+    GENERIC_MARGINAL_BACKENDS,
+    TABICL_Z_TRAIN_SOURCES,
+    validate_z_train_source,
+    z_train_marginal_ckpt,
+)
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
 from copula_inter.data.contracts import validate_episode
@@ -82,7 +87,6 @@ def _generate_shard_with_oom_retry(
     tabicl_split_calib_frac: float = 0.0,
     marginal_backend: str | None = None,
     marginal_regressor: Any = None,
-    marginal_probs_n: int = 99,
 ) -> list:
     """Generate n_this episodes for one shard, halving the chunk size on CUDA OOM.
 
@@ -112,7 +116,6 @@ def _generate_shard_with_oom_retry(
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
-                marginal_probs_n=marginal_probs_n,
             )
             if d_fixed is None and new_episodes:
                 d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
@@ -256,7 +259,6 @@ def main(cfg: DictConfig) -> None:
     tabicl_model = None
     marginal_backend = z_train_source if z_train_source in GENERIC_MARGINAL_BACKENDS else None
     marginal_regressor = None
-    marginal_probs_n = int(cfg.data.get("z_train_marginal_probs_n", 99))
     tabicl_k_folds = int(cfg.data.get("z_train_tabicl_k_folds", 10))
     tabicl_split_calib_frac = (
         float(cfg.data.get("z_train_split_calib_frac", 1.0)) if z_train_source == "tabicl_split" else 0.0
@@ -278,8 +280,12 @@ def main(cfg: DictConfig) -> None:
         # Build one backend regressor for all shards (CPU is allowed here, only slower).
         from copula_inter.marginal.backends import make_regressor
 
-        print(f"Building {z_train_source} marginal for data.z_train_source={z_train_source} on {device}")
-        marginal_regressor = make_regressor(marginal_backend, device=device)
+        ckpt = z_train_marginal_ckpt(cfg)
+        print(
+            f"Building {z_train_source} marginal for data.z_train_source={z_train_source} on {device}"
+            + (f" from {ckpt}" if ckpt else "")
+        )
+        marginal_regressor = make_regressor(marginal_backend, device=device, ckpt=ckpt)
 
     manifest = ensure_manifest(pit_dir, generation_spec(cfg, ckpt))
     for name in os.listdir(pit_dir):
@@ -329,7 +335,6 @@ def main(cfg: DictConfig) -> None:
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
-                marginal_probs_n=marginal_probs_n,
             )
             # Don't store R_prior and Sigma_star (reconstructed at load).
             for ep in episodes:

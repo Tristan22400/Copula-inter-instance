@@ -33,7 +33,10 @@ cpu = ["torch>=2.5,<3"]
 gpu = ["torch>=2.5,<3"]
 era5 = ["netCDF4>=1.7,<2", "dask[array]>=2024.1", "zarr>=3,<4", "gcsfs>=2024.1"]
 # Licence-gated marginal backend: needs TABPFN_TOKEN at runtime (docs/architecture.md).
-tabpfn = ["tabpfn>=8.3,<9"]
+# 9.x ships the TabPFN-3.5 checkpoints (ModelVersion.V3_5_FAST).
+tabpfn = ["tabpfn>=9.2,<10"]
+# NVIDIA Kumo Tabular marginal backend (sdm.models.KumoTabular, OpenMDW weights).
+kumo = ["structured-data-models>=0.2.1,<0.3"]
 
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]

@@ -87,7 +87,6 @@ def _legacy_package(
             k_folds,
             marginal_backend=None,
             marginal_regressor=None,
-            marginal_probs_n=99,
             seed=chunk[0]["ep_i"],
         )
         pits = [

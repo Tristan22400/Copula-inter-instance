@@ -85,7 +85,7 @@ These invariants are easy to break and hard to notice:
 3. Optionally add a batched path, `src/copula_inter/marginal/<name>_batched.py`,
    on top of `batched_pit.py`.
 4. For Phase A, add an adapter in `src/copula_inter/marginal/finetune_adapters.py`.
-5. Follow `tests/test_tabpfn_batched.py` and `tests/test_marginal_backbones.py`:
+5. Follow `tests/test_marginal_backends.py` and `tests/test_marginal_backbones.py`:
    check that the batched path matches the per-episode path.
 
 ### Add a setting to an eval runner

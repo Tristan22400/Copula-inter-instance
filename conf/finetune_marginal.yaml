@@ -35,8 +35,10 @@ wandb:
 
 marginal:
   # Which tabular foundation model's marginal to fine-tune (see
-  # src/copula_inter/marginal/finetune_adapters.py). tabicl reaches tiers 0-3;
-  # tabpfn is wired for tier 0 but licence-gated and never executed here.
+  # src/copula_inter/marginal/finetune_adapters.py): tabicl (tiers 0-3),
+  # tabpfn35_fast or kumo_small (tier 0 + the all-layer LoRA below). The
+  # output of a tabpfn35_fast/kumo_small run is used by a copula run as
+  #   data.z_train_source=<backbone> data.z_train_marginal_ckpt=<_final.pt>
   backbone: tabicl
 
   # Resume a previous Phase-A run of a NON-tabicl backbone (a file written by
@@ -46,7 +48,8 @@ marginal:
 
   # Quantile grid size for non-tabicl backbones' Phase-A forward.
   #
-  # null (the default) = the model's OWN native decoder grid (999 levels),
+  # null (the default) = the backbone's native grid (999 levels: Kumo's own
+  # decoder levels; TabPFN's bar distribution read at the same 999 levels),
   # which keeps the objective comparable with the tabicl path, always scored
   # at 999.
   #

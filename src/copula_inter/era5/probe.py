@@ -22,6 +22,7 @@ from copula_inter.era5.spatial_stats import (
 from copula_inter.marginal.pit import compute_context_z_train, normalize_features
 
 if TYPE_CHECKING:
+    from copula_inter.marginal.backends import BackendMarginal
     from copula_inter.marginal.pit import TabICLLike
 
 __all__ = ["build_era5_probe", "MAX_DIST_PERCENTILE", "N_NLL_TEST", "PIT_K_FOLDS", "PROBE_SEED"]
@@ -40,7 +41,7 @@ def build_era5_probe(
     n_days_probe: int,
     n_context: int,
     n_bins: int,
-    tabicl_marginal: TabICLLike | None,
+    tabicl_marginal: TabICLLike | BackendMarginal | None,
     device: str,
     seed: int = PROBE_SEED,
 ) -> dict:
