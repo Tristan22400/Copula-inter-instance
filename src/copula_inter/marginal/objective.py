@@ -17,6 +17,7 @@ from copula_inter.marginal.pit import (
     _kernel_fn_from_task,
     _mean_train_from_task,
     _safe_cholesky,
+    kernel_space_inputs,
 )
 
 if TYPE_CHECKING:
@@ -38,11 +39,14 @@ def analytic_marginal_targets(
     sigma^2 = k(x, x) + nugget - ||L^{-1} K_fs||^2 (diagonal only, float64),
     floored at the nugget.
 
+    x_ctx and x_qry must be kernel-space inputs (pit.kernel_space_inputs: x_kernel_*
+    when the episode has a hidden warp), not the model-visible x_norm_*.
+
     Args:
         task: episode dict with kernel metadata.
-        x_ctx: (P_c, d) context features.
+        x_ctx: (P_c, d) context features, kernel space.
         y_ctx: (P_c,) raw context targets.
-        x_qry: (M, d) query features.
+        x_qry: (M, d) query features, kernel space.
         kernel_fn: kernel; rebuilt from task if omitted.
         nugget: noise variance; read from task if omitted.
 
@@ -90,7 +94,7 @@ def episode_fold_targets(
     Folds are pit.py's contiguous ceil(P/K) blocks. Returns (mu, sigma) in
     query_idx order, raw scale.
     """
-    x_train = task["x_norm_train"].to(device)
+    x_train = kernel_space_inputs(task)[0].to(device)
     y_train = task["y_train"].to(device)
     P = x_train.shape[0]
     K = max(2, min(int(k_folds), P))

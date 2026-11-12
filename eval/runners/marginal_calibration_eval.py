@@ -39,6 +39,7 @@ from copula_inter.marginal.pit import (
     PRETRAINED_TABICL_CKPT,
     _kernel_fn_from_task,
     gp_analytical_pit,
+    kernel_space_inputs,
     load_tabicl,
     normalize_targets,
     run_pit_batched,
@@ -110,7 +111,11 @@ def _episode_metrics(tabicl: TabICLLike, episodes: list[dict], k_folds: int, eps
         # Analytic references (skipped for kernels that cannot be rebuilt).
         try:
             kfn, nugget = _kernel_fn_from_task(ep)
-            mu, sigma = analytic_marginal_targets(ep, x_tr[b], y_tr[b], x_te[b], kernel_fn=kfn, nugget=nugget)
+            # The kernel's inputs (x_kernel under a hidden warp); x_tr/x_te are the model's x_norm.
+            x_ctx_k, x_qry_k = kernel_space_inputs(ep)
+            mu, sigma = analytic_marginal_targets(
+                ep, x_ctx_k.to(device), y_tr[b], x_qry_k.to(device), kernel_fn=kfn, nugget=nugget
+            )
             rec["nll_oracle"] = oracle_marginal_nll(y_te[b], mu, sigma)
             rec["gap"] = rec["nll"] - rec["nll_oracle"]
         except (NotImplementedError, KeyError):

@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pytest
 import torch
+from omegaconf import DictConfig, OmegaConf
 from pytest import MonkeyPatch
 
-from copula_inter.data.gp_episodes import gp_posterior
+from copula_inter.data.gp_episodes import generate_gp_batch, gp_posterior
 from copula_inter.data.gp_kernels import build_kernel_fn
 from copula_inter.finetune_marginal import phase_a_batch_loss
 from copula_inter.marginal.finetune_data import _generate_phase_a_gp_batch
@@ -29,7 +30,13 @@ from copula_inter.marginal.objective import (
     quantile_level_weights,
     rank_histogram,
 )
-from copula_inter.marginal.pit import _probit, run_pit_batched, run_pit_batched_grad
+from copula_inter.marginal.pit import (
+    _probit,
+    gp_analytical_pit,
+    kernel_space_inputs,
+    run_pit_batched,
+    run_pit_batched_grad,
+)
 from copula_inter.marginal.tiers import TIER0_PATTERNS, apply_tier
 
 if TYPE_CHECKING:
@@ -307,6 +314,65 @@ def test_episode_fold_targets_excludes_the_query_row_from_its_own_context(K: int
         mu_i, sig_i = analytic_marginal_targets(task, x[ctx], y[ctx], x[i : i + 1])
         assert torch.allclose(mu[i], mu_i[0], atol=1e-4), i
         assert torch.allclose(sigma[i], sig_i[0], atol=1e-4), i
+
+
+def _hidden_warp_episodes(small_cfg: DictConfig, P: int = 14, N: int = 6, b: int = 6) -> list[dict]:
+    """Real generator episodes whose GP lives on a hidden warp x_kernel != x_norm."""
+    cfg = OmegaConf.create(OmegaConf.to_container(small_cfg, resolve=True))
+    cfg.data.P_min = cfg.data.P_max = P
+    cfg.data.N_min = cfg.data.N_max = N
+    cfg.data.kernel = "rbf"
+    # d=4 -> a width-2 bottleneck that mixes features; at d=1 the warp can be near-affine, which
+    # an RBF on z-normalized inputs cannot tell from x_norm.
+    cfg.data.d_features = 4
+    cfg.data.kernel_hidden_enabled = True
+    cfg.data.kernel_hidden_prob = 1.0
+    torch.manual_seed(11)
+    episodes = generate_gp_batch(cfg, b, "cpu", return_kernel_metadata=True)
+    assert episodes
+    for ep in episodes:
+        assert not torch.allclose(ep["x_kernel_train"], ep["x_norm_train"]), "warp did not apply; test is vacuous"
+    return episodes
+
+
+def test_analytic_marginal_targets_match_analytic_pit_under_hidden_warp(small_cfg: DictConfig) -> None:
+    """On kernel-space inputs the targets equal gp_analytical_pit's posterior marginals; on x_norm they do not."""
+    for ep in _hidden_warp_episodes(small_cfg):
+        ref = gp_analytical_pit(ep)
+        direct = {k: v for k, v in ep.items() if k not in ("_L_ff", "_alpha")}  # recompute from the inputs
+
+        x_ctx, x_qry = kernel_space_inputs(ep)
+        mu, sigma = analytic_marginal_targets(direct, x_ctx, ep["y_train"], x_qry)
+        z = (ep["y_test"] - mu) / sigma
+        assert torch.allclose(z, ref["z_test"].float(), atol=1e-3), (z - ref["z_test"]).abs().max()
+
+        # The pre-fix call (model-visible x_norm) is a different, wrong GP.
+        mu_bad, sigma_bad = analytic_marginal_targets(direct, ep["x_norm_train"], ep["y_train"], ep["x_norm_test"])
+        z_bad = (ep["y_test"] - mu_bad) / sigma_bad
+        assert not torch.allclose(z_bad, ref["z_test"].float(), atol=1e-2)
+
+
+def test_cached_full_context_targets_agree_under_hidden_warp(small_cfg: DictConfig) -> None:
+    """The cached factors were built on x_kernel, so the cached and direct paths agree on kernel-space inputs."""
+    for ep in _hidden_warp_episodes(small_cfg):
+        x_ctx, x_qry = kernel_space_inputs(ep)
+        direct_task = {k: v for k, v in ep.items() if k not in ("_L_ff", "_alpha")}
+        direct = analytic_marginal_targets(direct_task, x_ctx, ep["y_train"], x_qry)
+        cached = analytic_marginal_targets(ep, x_ctx, ep["y_train"], x_qry, use_cached_full_context=True)
+        assert torch.allclose(cached[0], direct[0], atol=1e-4, rtol=1e-4)
+        assert torch.allclose(cached[1], direct[1], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("K", [3, 5])
+def test_episode_fold_targets_uncached_matches_cached_under_hidden_warp(small_cfg: DictConfig, K: int) -> None:
+    """The uncached fold path rebuilds the kernel on x_kernel, matching the precision path on the cached factors."""
+    for ep in _hidden_warp_episodes(small_cfg):
+        idx = torch.arange(ep["y_train"].shape[0])
+        direct_task = {k: v for k, v in ep.items() if k not in ("_L_ff", "_alpha")}
+        direct = episode_fold_targets(direct_task, idx, K)
+        cached = episode_fold_targets(ep, idx, K)
+        assert torch.allclose(cached[0], direct[0], atol=1e-4, rtol=1e-4)
+        assert torch.allclose(cached[1], direct[1], atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize("K", [3, 5, 10])
