@@ -361,10 +361,34 @@ JSON holds each fold and the mean over folds; a `.npz` beside it holds the
 per-row predictions, log-densities, z_test and Σ's factor rows. A rerun skips
 finished folds.
 
+**Other foundation models (decided with the user on 2026-11-09).** With
+`ckpt` unset the runner scores a marginal alone, i.e. the independence model
+(copula NLL 0 over every query set), on the test fold only: `marginal=tabicl`
+with `tabicl_ckpt=pretrained` (TabICL v2), or `marginal=tabpfn35_fast` /
+`kumo_small` (pretrained; `marginal_ckpt` takes a Phase-A checkpoint). The
+fine-tuned TabICL independence row is the marginal half of the copula run (the
+same test forward). `compare_methods` ranks the methods per dataset on total NLL
+(whole fold, or a chunk partition), CRPS or RMSE: mean and median rank, the
+Friedman test and Holm-corrected pairwise Wilcoxon tests, over the datasets
+every method completed; a run that failed for memory on a 48 GB GPU leaves its
+dataset out of the ranking (`"failed"` in its JSON). TabPFN and Kumo need a venv
+with the `tabpfn` / `kumo` extras (`COPULA_VENV`) and, for TabPFN, `TABPFN_TOKEN`.
+
+A copula on another backend takes `ckpt` with `marginal` and `marginal_ckpt`; the
+runner checks against the copula's training config (`data.z_train_source`,
+`data.z_train_marginal_ckpt` or `tabicl.pit_ckpt`) that it is scored with its own
+marginal, where a null `z_train_marginal_ckpt` means the pretrained weights.
+`scripts/ctr23_full.sh` names the pairs: `kumo_ft_nano` / `tabpfn_ft_nano` (copula
+on the ERA5-fine-tuned marginal) and `pre_tabicl_nano` / `pre_tabpfn_nano` /
+`pre_kumo_nano` (the PRE_nano_PN_* copulas, on the pretrained marginal).
+
 ```bash
 python -m eval.runners.ctr23_full_eval ckpt=<ckpt> tabicl_ckpt=<its marginal> data_id=44957 \
     out_json=results/real/ctr23_full/44957_nano.json
-./scripts/ctr23_full.sh 44957    # the same with the ERA5-report pair, on an OAR GPU node
+python -m eval.runners.ctr23_full_eval marginal=tabpfn35_fast data_id=44957 \
+    out_json=results/real/ctr23_full/44957_tabpfn35_fast.json
+./scripts/ctr23_full.sh 44957               # the copula with the ERA5-report pair, on an OAR GPU node
+./scripts/ctr23_full.sh 44957 tabicl_base   # or tabpfn35_fast, kumo_small: the marginal alone
 ```
 
 ### The autoregressive row

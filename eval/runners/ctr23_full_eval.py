@@ -26,11 +26,27 @@ N = the test rows of that fold:
   copula. Independence has copula NLL 0, so the copula NLL is also the copula
   minus independence; chunk_win_rate is the fraction of chunks where it is < 0.
 
-No GP baselines and no autoregressive row (they do not scale to P ~ 6e4); the
-comparison with other methods is on the marginal metrics (RMSE, R^2, CRPS),
-which published CTR23 results report on the same splits. Each fold is written
-as soon as it finishes; a rerun with the same settings skips the folds the
-output already holds.
+Marginal-only runs (ckpt=null): the method is the marginal alone, i.e. the
+independence model (copula NLL 0, so total_T = marginal_nll for every T). Only
+the test fold is scored (no K-fold pass over the context). marginal selects the
+foundation model: tabicl (tabicl_ckpt: the fine-tuned marginal, or "pretrained"
+for TabICL v2), or a generic backend (tabpfn35_fast, kumo_small; marginal_ckpt:
+an optional Phase-A checkpoint) through finetune_adapters.backend_pit /
+backend_quantiles, query_batch test rows per call (a test row attends only to
+the context), with y scaled by the context's mean and std as eval_checkpoint does.
+
+A copula trained on a generic backend's PIT (data.z_train_source = tabpfn35_fast /
+kumo_small) runs with that backend and its Phase-A checkpoint: the context's
+z_train comes from eval_checkpoint's _pit_group (the backend's K-fold driver), the
+test quantiles from the same regressor. check_marginal_pairing refuses a copula
+whose training config names another marginal or marginal checkpoint.
+
+No GP baselines and no autoregressive row (they do not scale to P ~ 6e4).
+compare_methods ranks any set of runs per dataset (mean / median rank, the
+Friedman test, Holm-corrected pairwise Wilcoxon tests). A CUDA out-of-memory
+error is recorded in the JSON ("failed", with the GPU) and re-raised. Each fold
+is written as soon as it finishes; a rerun with the same settings skips the
+folds the output already holds.
 """
 
 from __future__ import annotations
@@ -52,16 +68,36 @@ if TYPE_CHECKING:
     from copula_inter.copula.model import CopulaTabICL
     from copula_inter.marginal.pit import TabICLLike
 
-__all__ = ["TARGETS", "Ctr23FullEvalSpec", "chunk_copula_nll", "compare_with_independence", "quantile_metrics"]
+__all__ = [
+    "TARGETS",
+    "Ctr23FullEvalSpec",
+    "chunk_copula_nll",
+    "compare_methods",
+    "check_marginal_pairing",
+    "compare_with_independence",
+    "holm",
+    "method_scores",
+    "quantile_metrics",
+]
+
+# The backends' quantile grid for RMSE / CRPS (TabICL uses its own decoder levels).
+_BACKEND_LEVELS = np.arange(1, 1000) / 1000.0
 
 
 @dataclass
 class Ctr23FullEvalSpec:
     """One CTR23 dataset on its official CV folds: the frozen marginal and the copula over the whole test fold."""
 
-    # Copula checkpoint and the TabICL marginal it was trained with (never pair it with another marginal).
-    ckpt: str = MISSING
-    tabicl_ckpt: str = MISSING
+    # Copula checkpoint; null scores the marginal alone (the independence model).
+    ckpt: str | None = None
+    # Marginal backend (copula_inter.backend_registry.MARGINAL_BACKENDS). With a copula: the backend and
+    # checkpoint it was trained with (its cfg's z_train_source and marginal checkpoint; checked at load).
+    marginal: str = "tabicl"
+    # TabICL marginal (path, MARGINAL_FAMILIES name such as "pretrained", or HF file); required for tabicl.
+    # With a copula: the marginal it was trained with (never pair it with another marginal).
+    tabicl_ckpt: str | None = None
+    # Phase-A checkpoint of a non-TabICL backend; null = its pretrained weights.
+    marginal_ckpt: str | None = None
     # OpenML data id (eval.data.real.ctr23.CTR23_TASKS).
     data_id: int = MISSING
     # sklearn data_home / split cache; default copula_inter.paths.CTR23_DATA_DIR.
@@ -91,6 +127,12 @@ def _validate(spec: Ctr23FullEvalSpec) -> None:
         raise ValueError(f"data_id={spec.data_id} is not a CTR23 dataset ({sorted(CTR23_TASKS)})")
     if spec.chunk_size < 2 or spec.query_batch < 1 or spec.pit_k_folds < 2:
         raise ValueError("need chunk_size >= 2, query_batch >= 1, pit_k_folds >= 2")
+    from copula_inter.backend_registry import MARGINAL_BACKENDS
+
+    if spec.marginal not in MARGINAL_BACKENDS:
+        raise ValueError(f"marginal={spec.marginal!r} is not one of {list(MARGINAL_BACKENDS)}")
+    if spec.marginal == "tabicl" and not spec.tabicl_ckpt:
+        raise ValueError("marginal=tabicl needs tabicl_ckpt (the fine-tuned marginal, or pretrained)")
 
 
 def chunk_copula_nll(U: torch.Tensor, D: torch.Tensor, z: torch.Tensor) -> float:
@@ -148,6 +190,118 @@ def _marginal(
     }
 
 
+def _tabicl_test_only(
+    tab: TabICLLike, x_tr: torch.Tensor, y_tr: torch.Tensor, x_te: torch.Tensor, y_te: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """_marginal's test-set outputs from the same single forward, without the K-fold pass over the context."""
+    from copula_inter.marginal.pit import _alpha_levels_of, _run_pit_batched_impl
+
+    mean, std = y_tr.mean(), y_tr.std().clamp(min=1e-8)
+    out = _run_pit_batched_impl(
+        tab,
+        x_tr[None],
+        ((y_tr - mean) / std)[None, :, None],
+        x_te[None],
+        ((y_te - mean) / std)[None, :, None],
+        2,
+        1e-6,
+        return_quantiles=True,
+        fold_subset=[],
+        Y_train_raw=y_tr[None, :, None],
+    )
+    levels = _alpha_levels_of(tab, x_tr.device)
+    if levels is None:
+        raise ValueError("the marginal exposes no quantile levels")
+    return {
+        "z_test": out["z_test"][0, :, 0],
+        "log_pdf_test": out["log_pdf_test"][0, :, 0] - std.log(),
+        "q_test": out["q_test"][0, :, 0] * std + mean,
+        "clamp_frac_test": out["clamp_frac_test"].reshape(-1)[0],
+        "levels": levels,
+    }
+
+
+def _backend_test_only(
+    name: str, reg: Any, x_tr: torch.Tensor, y_tr: torch.Tensor, x_te: torch.Tensor, y_te: torch.Tensor, batch: int
+) -> dict[str, torch.Tensor]:
+    """A generic backend's test-set z, raw-unit log-density and raw-unit quantiles, batch test rows per call."""
+    from copula_inter.marginal.finetune_adapters import backend_pit
+
+    mean, std = y_tr.mean(), y_tr.std().clamp(min=1e-8)
+    xc = [x_tr.cpu().numpy()]
+    yc = [((y_tr - mean) / std).cpu().numpy()]
+    us, lps = [], []
+    for s in range(0, x_te.shape[0], batch):
+        xq = [x_te[s : s + batch].cpu().numpy()]
+        yq = [((y_te[s : s + batch] - mean) / std).cpu().numpy()]
+        u, lp = backend_pit(name, reg, xc, yc, xq, yq)
+        us.append(u[0].double().cpu())
+        lps.append(lp[0].double().cpu())
+    u_all = torch.cat(us).clamp(1e-6, 1 - 1e-6)
+    return {
+        "z_test": torch.special.ndtri(u_all),
+        "log_pdf_test": torch.cat(lps) - std.double().log().cpu(),
+        "q_test": _backend_test_quantiles(name, reg, x_tr, y_tr, x_te, batch),
+        "clamp_frac_test": ((u_all <= 1e-6) | (u_all >= 1 - 1e-6)).double().mean(),
+        "levels": torch.from_numpy(_BACKEND_LEVELS),
+    }
+
+
+def _backend_test_quantiles(
+    name: str, reg: Any, x_tr: torch.Tensor, y_tr: torch.Tensor, x_te: torch.Tensor, batch: int
+) -> torch.Tensor:
+    """(N, Q) raw-unit test quantiles at _BACKEND_LEVELS from the whole context, batch test rows per call."""
+    from copula_inter.marginal.finetune_adapters import backend_quantiles
+
+    mean, std = y_tr.mean().double().cpu(), y_tr.std().clamp(min=1e-8).double().cpu()
+    xc = [x_tr.cpu().numpy()]
+    yc = [((y_tr.double().cpu() - mean) / std).float().numpy()]
+    qs = [
+        backend_quantiles(name, reg, xc, yc, [x_te[s : s + batch].cpu().numpy()], _BACKEND_LEVELS)[0].double().cpu()
+        for s in range(0, x_te.shape[0], batch)
+    ]
+    return torch.cat(qs) * std + mean
+
+
+def _backend_with_context(
+    name: str,
+    reg: Any,
+    x_tr: torch.Tensor,
+    y_tr: torch.Tensor,
+    x_te: torch.Tensor,
+    y_te: torch.Tensor,
+    k_folds: int,
+    batch: int,
+    seed: int,
+) -> dict[str, torch.Tensor]:
+    """A generic backend's context z_train (K-fold) and test outputs, through eval_checkpoint's _pit_group."""
+    from copula_inter.data.era5_live_dataset import _pit_group
+
+    out = _pit_group(
+        x_tr[None],
+        y_tr[None],
+        x_te[None],
+        y_te[None],
+        None,
+        k_folds,
+        marginal_backend=name,
+        marginal_regressor=reg,
+        seed=seed,
+    )
+    if out is None:
+        raise ValueError("the backend PIT is unavailable for this fold (too little context)")
+    z_test = torch.as_tensor(out["z_test"][0]).double().cpu()
+    return {
+        "z_train": torch.as_tensor(out["z_train"][0]).to(x_tr.device),
+        "z_test": z_test,
+        "log_pdf_test": torch.as_tensor(out["log_pdf_test"][0]).double().cpu(),
+        "q_test": _backend_test_quantiles(name, reg, x_tr, y_tr, x_te, batch),
+        # _probit clamps u to [1e-6, 1 - 1e-6], i.e. |z| <= 4.7534.
+        "clamp_frac_test": (z_test.abs() >= 4.7534).double().mean(),
+        "levels": torch.from_numpy(_BACKEND_LEVELS),
+    }
+
+
 def _copula_rows(
     cop: CopulaTabICL, x_tr: torch.Tensor, z_tr: torch.Tensor, x_te: torch.Tensor, batch: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -177,9 +331,46 @@ def _partition_scores(
     return float(sum(nlls) / z.numel()), float(np.mean([v < 0 for v in nlls])), len(chunks)
 
 
+def _ckpt_key(path: str | None) -> str | None:
+    """A checkpoint path compared by its last two components (training configs store repo-relative paths)."""
+    if not path:
+        return None
+    from copula_inter.checkpoint_registry import MARGINAL_FAMILIES
+
+    family = MARGINAL_FAMILIES.get(str(path))
+    if family is not None:  # a family name ("pretrained") stands for its file
+        path = family.get("hf_name") or os.path.join(family["dir"], family["filename"])
+    parts = os.path.normpath(str(path)).split(os.sep)
+    return "/".join(parts[-2:])
+
+
+def check_marginal_pairing(cop_cfg: Any, spec: Ctr23FullEvalSpec) -> None:
+    """Raise unless spec's marginal is the one the copula was trained with (its z_train source and checkpoint)."""
+    from omegaconf import OmegaConf
+
+    source = OmegaConf.select(cop_cfg, "data.z_train_source", default="tabicl")
+    if spec.marginal == "tabicl":
+        trained = OmegaConf.select(cop_cfg, "tabicl.pit_ckpt", default=None)
+        given = spec.tabicl_ckpt
+    else:
+        trained = OmegaConf.select(cop_cfg, "data.z_train_marginal_ckpt", default=None)
+        given = spec.marginal_ckpt
+    # A null z_train_marginal_ckpt means pretrained weights, so it must match a null marginal_ckpt;
+    # an absent tabicl.pit_ckpt is unknown and not compared.
+    compare = trained is not None or spec.marginal != "tabicl"
+    if source != spec.marginal or (compare and _ckpt_key(trained) != _ckpt_key(given)):
+        raise ValueError(
+            f"the copula {spec.ckpt} was trained with marginal {source!r} ({trained}), "
+            f"not {spec.marginal!r} ({given}): a copula is only scored with its own marginal"
+        )
+
+
 def _fingerprint(spec: Ctr23FullEvalSpec, identity: dict[str, Any]) -> str:
     keep = ("ckpt", "tabicl_ckpt", "max_atom_frac", "pit_k_folds", "chunk_size", "seed", "tabicl_amp")
-    return canonical_digest({"data": identity, **{k: getattr(spec, k) for k in keep}})
+    fp: dict[str, Any] = {"data": identity, **{k: getattr(spec, k) for k in keep}}
+    if spec.marginal != "tabicl":  # TabICL runs keep their original fingerprint
+        fp |= {"marginal": spec.marginal, "marginal_ckpt": spec.marginal_ckpt}
+    return canonical_digest(fp)
 
 
 def _write(path: str, blob: dict[str, Any]) -> None:
@@ -197,13 +388,105 @@ def _summary(folds: dict[str, dict[str, Any]]) -> dict[str, float]:
     return {k: float(np.mean([r[k] for r in rows])) for k in keys} | {"n_folds": len(rows)}
 
 
+def _score_fold(
+    spec: Ctr23FullEvalSpec,
+    models: dict[str, Any],
+    data: Any,
+    train: np.ndarray,
+    test: np.ndarray,
+    rng: np.random.Generator,
+    dev: torch.device,
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    """(the fold's JSON row, its per-row arrays) for the marginal and, with a copula, the copula."""
+    from copula_inter.marginal.pit import normalize_features
+    from eval.data.real import ctr23
+
+    x_tr_np, x_te_np = normalize_features(data.X[train], data.X[test])
+    x_tr = torch.from_numpy(x_tr_np.astype(np.float32)).to(dev)
+    x_te = torch.from_numpy(x_te_np.astype(np.float32)).to(dev)
+    y_tr = torch.from_numpy(data.y[train].astype(np.float32)).to(dev)
+    y_te_np = data.y[test].astype(np.float64)
+    y_te = torch.from_numpy(y_te_np.astype(np.float32)).to(dev)
+    P, N = len(train), len(test)
+    cop = models.get("copula")
+
+    t0 = time.time()
+    with torch.no_grad():
+        if spec.marginal != "tabicl" and cop is None:
+            m = _backend_test_only(spec.marginal, models["regressor"], x_tr, y_tr, x_te, y_te, spec.query_batch)
+        elif spec.marginal != "tabicl":
+            m = _backend_with_context(
+                spec.marginal,
+                models["regressor"],
+                x_tr,
+                y_tr,
+                x_te,
+                y_te,
+                spec.pit_k_folds,
+                spec.query_batch,
+                seed=int(rng.integers(2**31)),
+            )
+        elif cop is None:
+            m = _tabicl_test_only(models["tabicl"], x_tr, y_tr, x_te, y_te)
+        else:
+            m = _marginal(models["tabicl"], x_tr, y_tr, x_te, y_te, spec.pit_k_folds)
+    t_marg = time.time() - t0
+    q = m["q_test"].double().cpu().numpy()
+    levels = m["levels"].double().cpu().numpy()
+    log_pdf = m["log_pdf_test"].double().cpu().numpy()
+    z = m["z_test"].float()
+    row: dict[str, Any] = {
+        "P": P,
+        "N": N,
+        "marginal_nll": float(-log_pdf.mean()),
+        **quantile_metrics(q, levels, y_te_np),
+        "z_test_mean": float(z.mean()),
+        "z_test_std": float(z.std()),
+        "clamp_frac_test": float(m["clamp_frac_test"]),
+        "seconds_marginal": t_marg,
+    }
+    arrays = {
+        "test_rows": data.row_ids[test],
+        "y": y_te_np,
+        "pred_mean": q.mean(axis=1),
+        "log_pdf": log_pdf,
+        "z_test": z.cpu().numpy(),
+    }
+    if cop is None:
+        # The independence model: copula NLL 0 over every query set.
+        row |= {f"total_{t}": row["marginal_nll"] for t in TARGETS}
+        return row, arrays
+
+    t0 = time.time()
+    z = z.to(dev)
+    with torch.no_grad():
+        U, D = _copula_rows(cop, x_tr, m["z_train"].float(), x_te, spec.query_batch)
+    row["seconds_copula"] = time.time() - t0
+    row["copula_whole"] = chunk_copula_nll(U, D, z) / N
+    parts = {
+        "random": ctr23.random_partition(rng, np.arange(N), spec.chunk_size),
+        "dyadic_knn": ctr23.dyadic_knn_partition(rng, data.Xs[test], np.arange(N), spec.chunk_size),
+    }
+    for name, chunks in parts.items():
+        c, win, n_chunks = _partition_scores(U, D, z, chunks)
+        row[f"copula_{name}"] = c
+        row[f"chunk_win_rate_{name}"] = win
+        row[f"n_chunks_{name}"] = n_chunks
+    for t in TARGETS:
+        row[f"total_{t}"] = row["marginal_nll"] + row[f"copula_{t}"]
+    # Mean |Sigma_ij| over i != j (Sigma's off-diagonal is U U^T's).
+    offdiag = (U @ U.T).abs().sum() - (U * U).sum(-1).sum() if N <= 20000 else torch.tensor(float("nan"))
+    row["mean_abs_offdiag_corr"] = float(offdiag) / max(N * (N - 1), 1)
+    arrays |= {"U": U.cpu().numpy(), "D": D.cpu().numpy()}
+    return row, arrays
+
+
 def run(spec: Ctr23FullEvalSpec) -> None:
     """Score every requested fold and write out_json (and its .npz) after each."""
     from copula_inter.checkpoint_registry import resolve_marginal_checkpoint
-    from copula_inter.marginal.pit import configure_tabicl_inference_amp, load_tabicl, normalize_features
+    from copula_inter.marginal.pit import configure_tabicl_inference_amp, load_tabicl
     from eval.data.real import ctr23
     from eval.runners.eval_args import Ctr23Spec
-    from inference.copula_inference import load_copula_model
 
     data = ctr23.load(Ctr23Spec(data_dir=spec.data_dir, data_id=int(spec.data_id), max_atom_frac=spec.max_atom_frac))
     splits = ctr23.openml_folds(data, spec.data_dir)
@@ -237,87 +520,60 @@ def run(spec: Ctr23FullEvalSpec) -> None:
         return
 
     dev = torch.device(spec.device)
-    configure_tabicl_inference_amp(spec.tabicl_amp)
-    tab = load_tabicl(resolve_marginal_checkpoint(spec.tabicl_ckpt), str(dev))
-    cop, _ = load_copula_model(spec.ckpt, device=str(dev))
+    models: dict[str, Any] = {}
+    if spec.marginal == "tabicl":
+        assert spec.tabicl_ckpt is not None  # _validate
+        configure_tabicl_inference_amp(spec.tabicl_amp)
+        models["tabicl"] = load_tabicl(resolve_marginal_checkpoint(spec.tabicl_ckpt), str(dev))
+    else:
+        from copula_inter.marginal.backends import make_regressor
+
+        models["regressor"] = make_regressor(spec.marginal, device=str(dev), ckpt=spec.marginal_ckpt)
+    if spec.ckpt:
+        from inference.copula_inference import load_copula_model
+
+        models["copula"], cop_cfg = load_copula_model(spec.ckpt, device=str(dev))
+        check_marginal_pairing(cop_cfg, spec)
 
     for k in todo:
         rng = np.random.default_rng([int(spec.seed), int(spec.data_id), int(k)])
         train, test = splits[k]
         train = rng.permutation(train)  # the K-fold PIT cuts contiguous blocks of the context
-        x_tr_np, x_te_np = normalize_features(data.X[train], data.X[test])
-        x_tr = torch.from_numpy(x_tr_np.astype(np.float32)).to(dev)
-        x_te = torch.from_numpy(x_te_np.astype(np.float32)).to(dev)
-        y_tr = torch.from_numpy(data.y[train].astype(np.float32)).to(dev)
-        y_te_np = data.y[test].astype(np.float64)
-        y_te = torch.from_numpy(y_te_np.astype(np.float32)).to(dev)
-        P, N = len(train), len(test)
-        print(f"\nfold {k}: P={P} N={N}", flush=True)
+        print(f"\nfold {k}: P={len(train)} N={len(test)}", flush=True)
         if dev.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
-
-        t0 = time.time()
-        with torch.no_grad():
-            m = _marginal(tab, x_tr, y_tr, x_te, y_te, spec.pit_k_folds)
-        t_marg = time.time() - t0
-        q = m["q_test"].double().cpu().numpy()
-        levels = m["levels"].double().cpu().numpy()
-        log_pdf = m["log_pdf_test"].double().cpu().numpy()
-        z = m["z_test"].float()
-        row: dict[str, Any] = {
+        try:
+            row, fold_arrays = _score_fold(spec, models, data, train, test, rng, dev)
+        except torch.OutOfMemoryError:
+            # Recorded so compare_methods can leave the dataset out; re-raised so the job shows the failure.
+            props = torch.cuda.get_device_properties(dev)
+            blob["failed"] = {
+                "fold": k,
+                "P": len(train),
+                "error": "CUDA out of memory",
+                "gpu": props.name,
+                "gpu_total_gib": props.total_memory / 2**30,
+            }
+            _write(spec.out_json, blob)
+            raise
+        row = {
             "fold": k,
-            "P": P,
-            "N": N,
-            "marginal_nll": float(-log_pdf.mean()),
-            **quantile_metrics(q, levels, y_te_np),
-            "z_test_mean": float(z.mean()),
-            "z_test_std": float(z.std()),
-            "clamp_frac_test": float(m["clamp_frac_test"]),
+            **row,
+            "peak_gpu_gib": torch.cuda.max_memory_allocated() / 2**30 if dev.type == "cuda" else 0.0,
         }
-
-        t0 = time.time()
-        with torch.no_grad():
-            U, D = _copula_rows(cop, x_tr, m["z_train"].float(), x_te, spec.query_batch)
-        t_cop = time.time() - t0
-        row["copula_whole"] = chunk_copula_nll(U, D, z) / N
-        parts = {
-            "random": ctr23.random_partition(rng, np.arange(N), spec.chunk_size),
-            "dyadic_knn": ctr23.dyadic_knn_partition(rng, data.Xs[test], np.arange(N), spec.chunk_size),
-        }
-        for name, chunks in parts.items():
-            c, win, n_chunks = _partition_scores(U, D, z, chunks)
-            row[f"copula_{name}"] = c
-            row[f"chunk_win_rate_{name}"] = win
-            row[f"n_chunks_{name}"] = n_chunks
-        for name in ("whole", "random", "dyadic_knn"):
-            row[f"total_{name}"] = row["marginal_nll"] + row[f"copula_{name}"]
-        # Mean |Sigma_ij| over i != j (Sigma's off-diagonal is U U^T's).
-        offdiag = (U @ U.T).abs().sum() - (U * U).sum(-1).sum() if N <= 20000 else torch.tensor(float("nan"))
-        row["mean_abs_offdiag_corr"] = float(offdiag) / max(N * (N - 1), 1)
-        row["seconds_marginal"] = t_marg
-        row["seconds_copula"] = t_cop
-        row["peak_gpu_gib"] = torch.cuda.max_memory_allocated() / 2**30 if dev.type == "cuda" else 0.0
+        shown = [
+            key
+            for key in ("marginal_nll", "copula_whole", "copula_random", "copula_dyadic_knn", "rmse", "crps")
+            if key in row
+        ]
         print(
-            "  "
-            + "  ".join(
-                f"{key} {row[key]:+.4f}"
-                for key in ("marginal_nll", "copula_whole", "copula_random", "copula_dyadic_knn", "rmse", "crps")
-            )
-            + f"  ({t_marg:.0f}s + {t_cop:.0f}s, peak {row['peak_gpu_gib']:.1f} GiB)",
+            "  " + "  ".join(f"{key} {row[key]:+.4f}" for key in shown) + f"  (peak {row['peak_gpu_gib']:.1f} GiB)",
             flush=True,
         )
 
         blob["folds"][str(k)] = row
         blob["summary"] = _summary(blob["folds"])
-        arrays |= {
-            f"f{k}_test_rows": data.row_ids[test],
-            f"f{k}_y": y_te_np,
-            f"f{k}_pred_mean": q.mean(axis=1),
-            f"f{k}_log_pdf": log_pdf,
-            f"f{k}_z_test": z.cpu().numpy(),
-            f"f{k}_U": U.cpu().numpy(),
-            f"f{k}_D": D.cpu().numpy(),
-        }
+        arrays |= {f"f{k}_{name}": value for name, value in fold_arrays.items()}
 
         def _save_npz(tmp: str) -> None:
             with open(tmp, "wb") as fh:
@@ -327,9 +583,9 @@ def run(spec: Ctr23FullEvalSpec) -> None:
         _write(spec.out_json, blob)
     s = blob["summary"]
     print(
-        f"\n{data.name} over {s['n_folds']} folds: marginal NLL {s['marginal_nll']:+.4f}, copula whole "
-        f"{s['copula_whole']:+.4f} / random {s['copula_random']:+.4f} / dyadic_knn {s['copula_dyadic_knn']:+.4f}, "
-        f"RMSE {s['rmse']:.4g}, R2 {s['r2']:.4f}, CRPS {s['crps']:.4g}"
+        f"\n{data.name} over {s['n_folds']} folds: marginal NLL {s['marginal_nll']:+.4f}, "
+        + (f"copula whole {s['copula_whole']:+.4f}, " if "copula_whole" in s else "")
+        + f"RMSE {s['rmse']:.4g}, R2 {s['r2']:.4f}, CRPS {s['crps']:.4g}"
     )
 
 
@@ -390,6 +646,85 @@ def compare_with_independence(blobs: list[dict[str, Any]], include_partial: bool
             res |= {"wilcoxon_stat": float(w.statistic), "p_value": float(w.pvalue)}
         summary[t] = res
     return {"per_dataset": rows, "summary": summary}
+
+
+def method_scores(blobs: list[dict[str, Any]], field: str) -> dict[str, float]:
+    """{dataset name: mean over folds of field} for the runs that scored every fold and did not fail."""
+    out: dict[str, float] = {}
+    for b in blobs:
+        folds = list(b["folds"].values())
+        if b.get("failed") or len(folds) < b["dataset"]["n_folds"]:
+            continue
+        out[str(b["dataset"]["name"])] = float(np.mean([f[field] for f in folds]))
+    return out
+
+
+def holm(p: np.ndarray) -> np.ndarray:
+    """Holm-Bonferroni adjusted p-values (step-down, monotone, capped at 1)."""
+    p = np.asarray(p, dtype=float)
+    order = np.argsort(p)
+    adj = np.empty_like(p)
+    running = 0.0
+    for i, j in enumerate(order):
+        running = max(running, min(1.0, (len(p) - i) * p[j]))
+        adj[j] = running
+    return adj
+
+
+def compare_methods(scores: dict[str, dict[str, float]]) -> dict[str, Any]:
+    """Rank methods per dataset on a lower-is-better score, over the datasets every method has.
+
+    scores maps method -> {dataset: score}. A dataset missing from any method
+    (not run, incomplete, or failed) is left out and listed in "excluded".
+    Per method: mean and median rank (1 = best; ties share the average rank),
+    datasets ranked first, mean score. Across methods: the Friedman test (3+
+    methods), and for each pair the datasets each wins and the two-sided Wilcoxon
+    signed-rank test with Holm-adjusted p-values.
+    """
+    from scipy.stats import friedmanchisquare, rankdata, wilcoxon
+
+    methods = list(scores)
+    every = set.union(*(set(v) for v in scores.values())) if scores else set()
+    datasets = sorted(set.intersection(*(set(v) for v in scores.values()))) if scores else []
+    M = np.array([[scores[m][d] for m in methods] for d in datasets], dtype=float).reshape(len(datasets), len(methods))
+    R = rankdata(M, axis=1) if len(datasets) else M
+    summary = {
+        m: {
+            "mean_rank": float(R[:, i].mean()) if len(datasets) else float("nan"),
+            "median_rank": float(np.median(R[:, i])) if len(datasets) else float("nan"),
+            "n_first": int((R[:, i] == R.min(axis=1)).sum()) if len(datasets) else 0,
+            "mean_score": float(M[:, i].mean()) if len(datasets) else float("nan"),
+        }
+        for i, m in enumerate(methods)
+    }
+    out: dict[str, Any] = {
+        "methods": methods,
+        "datasets": datasets,
+        "excluded": sorted(every - set(datasets)),
+        "scores": M.tolist(),
+        "ranks": R.tolist(),
+        "summary": summary,
+    }
+    if len(methods) >= 3 and len(datasets) >= 2:
+        fr = friedmanchisquare(*M.T)
+        out["friedman"] = {"stat": float(fr.statistic), "p_value": float(fr.pvalue)}
+    pairs = []
+    for i in range(len(methods)):
+        for j in range(i + 1, len(methods)):
+            d = M[:, i] - M[:, j]
+            p = float(wilcoxon(d).pvalue) if len(d) >= 2 and np.any(d != 0) else float("nan")
+            pairs.append(
+                {"a": methods[i], "b": methods[j], "a_wins": int((d < 0).sum()), "b_wins": int((d > 0).sum()), "p": p}
+            )
+    ps = np.array([q["p"] for q in pairs])
+    ok = np.isfinite(ps)
+    adj = np.full_like(ps, np.nan)
+    if ok.any():
+        adj[ok] = holm(ps[ok])
+    for q, a in zip(pairs, adj):
+        q["p_holm"] = float(a)
+    out["pairwise"] = pairs
+    return out
 
 
 main = hydra_entry("ctr23_full_eval", Ctr23FullEvalSpec, run, validate=_validate)

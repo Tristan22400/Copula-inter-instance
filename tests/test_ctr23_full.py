@@ -153,3 +153,71 @@ def test_compare_with_independence_ranks_and_tests_across_datasets() -> None:
     assert out["per_dataset"][0]["fold_win_rate_random"] == pytest.approx(2 / 3)
     assert 0 < s["p_value"] < 1
     assert len(compare_with_independence(blobs, include_partial=True)["per_dataset"]) == 7
+
+
+def test_holm_adjusts_step_down_and_stays_monotone() -> None:
+    from eval.runners.ctr23_full_eval import holm
+
+    adj = holm(np.array([0.01, 0.04, 0.03, 0.5]))
+    assert adj.tolist() == pytest.approx([0.04, 0.09, 0.09, 0.5])
+
+
+def test_compare_methods_ranks_over_shared_datasets() -> None:
+    from eval.runners.ctr23_full_eval import compare_methods, method_scores
+
+    scores = {
+        "a": {f"d{i}": 1.0 for i in range(6)},
+        "b": {f"d{i}": 2.0 for i in range(6)},
+        "c": {**{f"d{i}": 0.5 for i in range(5)}, "d5": 3.0},
+    }
+    scores["c"].pop("d0")  # d0 missing for c: excluded
+    out = compare_methods(scores)
+    assert out["datasets"] == ["d1", "d2", "d3", "d4", "d5"] and out["excluded"] == ["d0"]
+    s = out["summary"]
+    assert s["c"]["mean_rank"] == pytest.approx((4 * 1 + 3) / 5) and s["c"]["median_rank"] == 1.0
+    assert s["a"]["mean_rank"] == pytest.approx((4 * 2 + 1) / 5) and s["b"]["n_first"] == 0
+    ab = next(p for p in out["pairwise"] if (p["a"], p["b"]) == ("a", "b"))
+    assert (ab["a_wins"], ab["b_wins"]) == (5, 0) and ab["p_holm"] >= ab["p"]
+    assert 0 <= out["friedman"]["p_value"] <= 1
+    # method_scores skips incomplete and failed runs.
+    blobs = [
+        _blob(1, [0.1, 0.2, 0.3]),
+        _blob(2, [0.1], n_folds=3),
+        {**_blob(3, [0.1, 0.1, 0.1]), "failed": {"fold": 0}},
+    ]
+    assert method_scores(blobs, "marginal_nll") == {"d1": pytest.approx(1.0)}
+
+
+def test_check_marginal_pairing_refuses_a_foreign_marginal() -> None:
+    from omegaconf import OmegaConf
+
+    from eval.runners.ctr23_full_eval import Ctr23FullEvalSpec, check_marginal_pairing
+
+    kumo = OmegaConf.create(
+        {"data": {"z_train_source": "kumo_small", "z_train_marginal_ckpt": "checkpoints/m/kumo_ft/step_1_final.pt"}}
+    )
+    ok = Ctr23FullEvalSpec(
+        ckpt="c.pt", marginal="kumo_small", marginal_ckpt="/abs/root/checkpoints/m/kumo_ft/step_1_final.pt"
+    )
+    check_marginal_pairing(kumo, ok)  # repo-relative vs absolute path of the same file
+    for bad in (
+        Ctr23FullEvalSpec(ckpt="c.pt", marginal="kumo_small", marginal_ckpt=None),  # pretrained weights
+        Ctr23FullEvalSpec(ckpt="c.pt", marginal="tabpfn35_fast", marginal_ckpt=ok.marginal_ckpt),
+        Ctr23FullEvalSpec(ckpt="c.pt", marginal="tabicl", tabicl_ckpt="m.pt"),
+    ):
+        with pytest.raises(ValueError, match="only scored with its own marginal"):
+            check_marginal_pairing(kumo, bad)
+    tabicl = OmegaConf.create({"tabicl": {"pit_ckpt": "checkpoints/marginal/era5_run1/step_2_final.pt"}})
+    check_marginal_pairing(tabicl, Ctr23FullEvalSpec(ckpt="c.pt", tabicl_ckpt="/x/marginal/era5_run1/step_2_final.pt"))
+    with pytest.raises(ValueError):
+        check_marginal_pairing(tabicl, Ctr23FullEvalSpec(ckpt="c.pt", tabicl_ckpt="pretrained"))
+    # A copula trained on the pretrained TabICL (its HF file) pairs with the family name "pretrained".
+    pre = OmegaConf.create({"tabicl": {"pit_ckpt": "tabicl-regressor-v2-20260212.ckpt"}})
+    check_marginal_pairing(pre, Ctr23FullEvalSpec(ckpt="c.pt", tabicl_ckpt="pretrained"))
+    with pytest.raises(ValueError):
+        check_marginal_pairing(pre, Ctr23FullEvalSpec(ckpt="c.pt", tabicl_ckpt="m/step_2_final.pt"))
+    # Pretrained TabPFN / Kumo copulas: z_train_marginal_ckpt null, scored with the pretrained weights only.
+    pfn = OmegaConf.create({"data": {"z_train_source": "tabpfn35_fast", "z_train_marginal_ckpt": None}})
+    check_marginal_pairing(pfn, Ctr23FullEvalSpec(ckpt="c.pt", marginal="tabpfn35_fast"))
+    with pytest.raises(ValueError, match="only scored with its own marginal"):
+        check_marginal_pairing(pfn, Ctr23FullEvalSpec(ckpt="c.pt", marginal="tabpfn35_fast", marginal_ckpt="m/s.pt"))

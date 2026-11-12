@@ -48,7 +48,7 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "real_audit": (RealAuditSpec, ["real.dataset=kaust"]),
     "real_calibration_gate": (RealCalibrationGateSpec, ["dumps=[a.json]"]),
     "sdwpf_audit": (SdwpfAuditSpec, []),
-    "ctr23_full_eval": (Ctr23FullEvalSpec, ["ckpt=x.pt", "tabicl_ckpt=m.pt", "data_id=44957", "out_json=o.json"]),
+    "ctr23_full_eval": (Ctr23FullEvalSpec, ["data_id=44957", "out_json=o.json"]),
 }
 
 
