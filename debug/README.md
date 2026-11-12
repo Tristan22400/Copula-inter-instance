@@ -14,7 +14,7 @@ architecture (`src/copula_inter/copula/model.py`, rank, parametrization) — pas
 python debug/run_debug.py all --n-episodes 200
 
 # Include the frozen-checkpoint stages (S5, S6) too:
-python debug/run_debug.py all --n-episodes 200 --ckpt kernel-sweep-all-tabicl-retrain-15k
+python debug/run_debug.py all --n-episodes 200 --ckpt copula-nano-finetune-marginal-float32
 
 # One stage at a time, full control over its flags:
 python debug/run_debug.py s1 --n-episodes 64 --ranks 8,16,32,64

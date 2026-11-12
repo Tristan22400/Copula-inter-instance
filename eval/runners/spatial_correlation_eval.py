@@ -11,7 +11,7 @@ Subcommands, chosen with command=<name> (settings are command.<key>=<value>):
 
 Usage:
     python -m eval.runners.spatial_correlation_eval
-    python -m eval.runners.spatial_correlation_eval command=diagnose command.ckpt=kernel-sweep-all-tabicl-retrain-15k
+    python -m eval.runners.spatial_correlation_eval command=diagnose command.ckpt=copula-nano-finetune-marginal-float32
     python -m eval.runners.spatial_correlation_eval command=sweep command.mode=synthetic
     python -m eval.runners.spatial_correlation_eval command=diagnose --cfg job   # every diagnose key
 """

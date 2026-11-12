@@ -102,19 +102,19 @@ checkpoint:
 ```bash
 python -m copula_inter.era5.fetch_global --start 2022-01 --n-months 24
 python -m copula_inter.train experiment=finetune_era5 \
-    training.resume_ckpt=kernel-sweep-all-tabicl-retrain-15k model.rank=32
-oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=<ckpt> model.rank=32"
+    training.resume_ckpt=copula-nano-finetune-marginal-float32 model=copula_nano model.rank=512
+oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=<ckpt> model=copula_nano model.rank=512"
 ```
 
-`model.*` must match the checkpoint. That family is rank 32, while the default
-preset is rank 128. `conf/experiment/finetune_era5.yaml` lists the usual extras.
+`model.*` must match the checkpoint. That family is the nano backbone at rank 512,
+while the nano preset is rank 128. `conf/experiment/finetune_era5.yaml` lists the usual extras.
 
 ## 3. Evaluate against classical baselines
 
 ### Synthetic GP episodes
 
 ```bash
-python -m eval.runners.eval_checkpoint ckpt=kernel-sweep-all-tabicl-retrain-15k
+python -m eval.runners.eval_checkpoint ckpt=copula-nano-finetune-marginal-float32
 oarsub -S "./scripts/eval_checkpoint.sh ckpt=<ckpt>"
 ```
 
@@ -144,7 +144,7 @@ real 2 m temperature (`eval/data/era5_episodes.py`):
 python -m copula_inter.era5.fetch_global --start 2023-01 --n-months 12 \
     --cache-dir ./eval/data/cache/era5_global_val            # once: the held-out year
 python -m eval.runners.eval_checkpoint era5.enabled=true n_episodes=400 \
-    ckpt=kernel-sweep-all-tabicl-retrain-15k
+    ckpt=copula-nano-finetune-marginal-float32
 oarsub -S "./scripts/eval_checkpoint_era5.sh ckpt=<ckpt>"
 ```
 
@@ -508,7 +508,7 @@ python -m eval.runners.spatial_correlation_eval
 
 # One subcommand at a time (command=<name> --cfg job lists its keys):
 python -m eval.runners.spatial_correlation_eval command=diagnose \
-    command.ckpt=kernel-sweep-all-tabicl-retrain-15k command.mode=real \
+    command.ckpt=copula-nano-finetune-marginal-float32 command.mode=real \
     command.region=western_europe command.grid_size=24
 python -m eval.runners.spatial_correlation_eval command=sweep command.mode=synthetic command.checkpoints=all
 python -m eval.runners.spatial_correlation_eval command=baseline command.mode=real

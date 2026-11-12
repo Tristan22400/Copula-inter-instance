@@ -14,11 +14,11 @@ The Grenoble frontend can't import numpy, so run on a node. Reuse one of the use
 ```bash
 ssh grenoble.g5k.remote 'oarstat -u'                                  # pick a running job id
 ssh grenoble.g5k.remote 'oarstat -j <id> -f | grep assigned_hostnames' # its node
-ssh grenoble.g5k.remote 'OAR_JOB_ID=<id> oarsh <node> "cd ~/thoth_storage/copula-inter/<checkout> && source scripts/_env.sh >/dev/null 2>&1 && python -m eval.runners.wandb_report filter=<regex> since=<YYYY-MM-DD>" 2>&1 | grep -v ^wandb:'
+ssh grenoble.g5k.remote 'OAR_JOB_ID=<id> oarsh <node> "cd ~/thoth_storage/copula-inter && source scripts/_env.sh >/dev/null 2>&1 && python -m eval.runners.wandb_report filter=<regex> since=<YYYY-MM-DD>" 2>&1 | grep -v ^wandb:'
 ```
 
-- `<checkout>` is a checkout that contains this runner: `.claude/worktrees/size-grid-metrics` until that branch is merged.
-- For worktree checkouts, prefix the command with `COPULA_VENV=$HOME/thoth_storage/copula-inter/.claude/worktrees/marginal-backend-choice/.venv`; the main checkout's venv lacks the kumo/tabpfn extras.
+- The runner is on `main`; run it from the main checkout. A worktree branched before 2026-11-10 lacks `eval/runners/wandb_report.py`.
+- The report only needs `wandb`. The main checkout's venv is synced with every extra (dev, gpu, tabpfn, kumo, era5), so no `COPULA_VENV` override is needed.
 
 Keys (Hydra `key=value` overrides, never `--flags`):
 
@@ -29,7 +29,7 @@ Keys (Hydra `key=value` overrides, never `--flags`):
 | `since=YYYY-MM-DD` | Only runs created on or after this date |
 | `states=[running,finished]` | Default; add `crashed` or `killed` to include those |
 | `sort_by=full` | Or `copula_exact`, `excess`, `marginal`, `grid` |
-| `out=<file>.json` | Also write the per-run records |
+| `out=<file>.json` | Also write the per-run records (see section 5) |
 
 Hydra's override grammar rejects `(`, `|` and similar characters in unquoted values. Prefer plain substrings such as `filter=_PN_` or `filter=_nano_`. If you need a real regex, quote it inside the override: `'filter="^(FT|PT)_"'`.
 
@@ -43,11 +43,12 @@ $$\text{full} = \underbrace{-\tfrac1N\textstyle\sum_i\log f(y_i)}_{\text{margina
 - **The oracle is the GP posterior:** oracle full = oracle marginal + oracle copula, with oracle copula $= -$headroom.
 - **Excess** over the oracle = marginal excess + copula excess. Use it to see which part to improve.
 - **copula exact z** is the copula NLL on analytic $z$, where the marginal is exact. It measures how much GP correlation the model learned. The `copula` column is measured on the learned marginal's $z$, so it also rewards dependence left in the marginal's PIT residuals. A large live-$z$ copula gain with an exact-$z$ value near 0 means the copula is fitting marginal errors, not the GP.
-- **Size grid** (runs with `baselines.size_grid_enabled=true`): the copula NLL on exact $z$ for each context size $P$, averaged over the test sizes $N$. It is computed as $c_{P,N}=\texttt{gap\_nll}-H_{P,N}$.
-  - Independence is 0 and the oracle is $-H$.
+- **Size grid** (runs with `baselines.size_grid_enabled=true`): the copula NLL on exact $z$ per cell $(P, N) \in \{10, 32, 100, 316, 1000\} \times \{10, 100, 1000\}$, 32 episodes per cell. It is computed as $c_{P,N}=\texttt{gap\_nll}-H_{P,N}$.
+  - Two tables: by context size $P$ (mean over $N$) and by query size $N$ (mean over $P$).
+  - Independence is 0 and the oracle is $-H$. The oracle gain grows with $N$ and shrinks with $P$ (at $P = 1000$ it is about $-0.013$, below the noise), so read small-$P$, large-$N$ cells for copula quality.
   - `captured` = grid mean / oracle grid mean.
-  - `first logged` is step 0 when `training.val_at_start=true`.
-  - A value above 0 at some $P$ means the model does worse than independence at that size.
+  - `first logged` is step 0 when `training.val_at_start=true`. A scratch copula starts near $+5$ nats; a run resumed from a trained copula (`training.resume_ckpt`, e.g. `PT_*`) starts near 0. It is a starting point, not a baseline.
+  - A value above 0 at some $P$ or $N$ means the model does worse than independence at that size.
 
 ## 3. Comparing runs fairly
 
@@ -65,3 +66,12 @@ $$\text{full} = \underbrace{-\tfrac1N\textstyle\sum_i\log f(y_i)}_{\text{margina
 - **Best copula:** the lowest copula on exact $z$, plus the grid mean, with no cell above 0 at small $P$.
 
 Give both when they disagree, and say whether the gap from the leader comes from the marginal or the copula. Keep the answer to tables plus a short verdict, following the user's style.
+
+## 5. Using the records in a notebook
+
+`out=<file>.json` writes one record per run:
+- `last`, `best_full`, `best_copula_exact`: the section-2 decomposition (`full`, `marginal`, `copula`, `copula_exact`, `oracle_*`, `excess*`, `step`).
+- `grid_first`, `grid_last`: `cells` and `oracle_cells` (keyed `P10_N100`), `per_P` / `oracle_per_P`, `per_N` / `oracle_per_N`, `mean`, `oracle_mean`, `captured`. The per-size keys are strings once written as JSON.
+
+`notebooks/experiments.ipynb` (branch `real-data-datasets`) calls the runner through `wandb_report(name, *overrides)`, caches the records in `results/experiments/wandb_report_<name>.json`, and reruns it while a cached run is still running. The report holds final-step values only. For training curves, read `scan_history` (the notebook's `history()` helper).
+

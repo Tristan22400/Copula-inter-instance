@@ -45,7 +45,7 @@ default builds validation probes that fetch ERA5 data. Add
 Evaluate a checkpoint against the classical baselines:
 
 ```bash
-uv run --no-sync python -m eval.runners.eval_checkpoint ckpt=kernel-sweep-all-tabicl-retrain-15k
+uv run --no-sync python -m eval.runners.eval_checkpoint ckpt=copula-nano-finetune-marginal-float32
 ```
 
 Every command is a Hydra app. Pass settings as `key=value`, and add `--cfg job`

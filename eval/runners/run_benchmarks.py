@@ -143,7 +143,7 @@ def run_episode(
 class BenchmarkSpec:
     """TabICL + copula inter-instance benchmark suite."""
 
-    copula_ckpt: str = "./checkpoints/systematic-composition-k5/step_0045000.pt"
+    copula_ckpt: str = "copula-nano-finetune-marginal-float32"
     # TabICL marginal checkpoint; null uses make_tabicl_regressor's default.
     tabicl_ckpt: str | None = None
     device: str = "auto"
