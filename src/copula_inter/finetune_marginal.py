@@ -60,6 +60,7 @@ from copula_inter.marginal.objective import (
 from copula_inter.marginal.pit import (
     DEFAULT_K_FOLDS,
     _kernel_fn_from_task,
+    kernel_space_inputs,
     load_tabicl,
     normalize_targets,
     run_pit_batched_grad,
@@ -188,11 +189,13 @@ def phase_a_batch_loss(
         for b, ep in enumerate(episodes):
             try:
                 kernel_fn, nugget = _kernel_fn_from_task(ep)
+                # The kernel's inputs (x_kernel under a hidden warp), not the model's x_norm in batch.
+                x_ctx_k, x_qry_k = kernel_space_inputs(ep)
                 mu_te, sig_te = analytic_marginal_targets(
                     ep,
-                    batch["x_train"][b],
+                    x_ctx_k.to(device),
                     batch["y_train_raw"][b],
-                    batch["x_test"][b],
+                    x_qry_k.to(device),
                     kernel_fn=kernel_fn,
                     nugget=nugget,
                     use_cached_full_context=True,

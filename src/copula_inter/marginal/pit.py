@@ -91,6 +91,20 @@ def _optional_param(t: torch.Tensor) -> float | torch.Tensor | None:
     return t.item() if t.numel() == 1 else t
 
 
+def kernel_space_inputs(task: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """(x_train, x_test) as the episode's kernel and mean function saw them.
+
+    With data.kernel_hidden_enabled the GP is drawn on x_kernel, a hidden warp of
+    the model-visible x_norm. Any analytic reference that rebuilds the kernel from
+    the task (_kernel_fn_from_task) must use these inputs: the true hyperparameters
+    on x_norm give a confident GP in the wrong coordinates. Falls back to x_norm_*
+    for tasks saved without x_kernel_* (no warp, or older shards).
+    """
+    x_train = task.get("x_kernel_train", task["x_norm_train"])
+    x_test = task.get("x_kernel_test", task["x_norm_test"])
+    return x_train, x_test
+
+
 def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
     """Evaluate the episode's saved mean function at x_train (all-zero when the task has no mean_* fields)."""
     zero = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
@@ -792,8 +806,7 @@ def gp_analytical_pit(task: dict, eps: float = 1e-6) -> dict:
         dict with z_train (P,), z_test (N,), log_pdf_test (N,).
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
-    x_k_train = task.get("x_kernel_train", task["x_norm_train"])  # (P, d_features)
-    x_k_test = task.get("x_kernel_test", task["x_norm_test"])  # (N, d_features)
+    x_k_train, x_k_test = kernel_space_inputs(task)  # (P, d_features), (N, d_features)
     y_train = task["y_train"]  # (P,)
     y_test = task["y_test"]  # (N,)
     mu_star = task["mu_star"]  # (N,) PRIOR mean at the test points
@@ -870,8 +883,7 @@ def gp_analytical_posterior(task: dict, eig_floor: float = 1e-6) -> dict:
     """
     kernel_fn, nugget = _kernel_fn_from_task(task)
     # Run on the device of the cached _L_ff/_alpha (x_train's device when absent).
-    x_train_raw = task.get("x_kernel_train", task["x_norm_train"])
-    x_test_raw = task.get("x_kernel_test", task["x_norm_test"])
+    x_train_raw, x_test_raw = kernel_space_inputs(task)
     ref_device = task["_L_ff"].device if "_L_ff" in task else x_train_raw.device
     # Kernels in float64: a degree-5 polynomial kernel reaches ~1e9 on its
     # diagonal, where float32 rounding alone makes K_ss indefinite (min eig ~ -1e2).
