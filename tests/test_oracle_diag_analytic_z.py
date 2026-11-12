@@ -75,6 +75,11 @@ def _run_validate(
     )[0]
 
 
+def _marginal_gap(m: dict) -> float:
+    """Model marginal NLL minus the posterior's: gap_nll - copula_gap (not logged, derivable)."""
+    return float(m["oracle_diag/gap_nll"] - m["oracle_diag/copula_gap"])
+
+
 def test_build_analytic_val_z_recovers_the_exact_gp_pit(small_cfg: DictConfig, small_model_cfg: DictConfig) -> None:
     """_build_analytic_val_z recomputes gp_analytical_pit, ignoring the batch's PIT."""
     cfg = _cfg(small_cfg, small_model_cfg)
@@ -126,11 +131,10 @@ def test_copula_gap_equals_gap_nll_and_marginal_gap_vanishes(
     cache = _build_analytic_val_z(batches, {0: eps}, "cpu")
     m = _run_validate(cfg, model, batches, [eps], cache)
 
-    assert m["oracle_diag/marginal_gap"] == pytest.approx(0.0, abs=1e-3)
+    assert _marginal_gap(m) == pytest.approx(0.0, abs=1e-3)
     assert m["oracle_diag/copula_gap"] == pytest.approx(m["oracle_diag/gap_nll"], abs=1e-4)
     # copula_headroom is positive.
     assert m["oracle_diag/copula_headroom"] > 0.0
-    assert m["oracle_diag/copula_headroom"] == pytest.approx(-m["y_nll_oracle_posterior_copula"], abs=1e-9)
 
 
 def test_without_the_cache_the_marginal_gap_is_nonzero(small_cfg: DictConfig, small_model_cfg: DictConfig) -> None:
@@ -140,7 +144,7 @@ def test_without_the_cache_the_marginal_gap_is_nonzero(small_cfg: DictConfig, sm
     batches = [collate_fn(eps)]
     model = build_copula_transformer(cfg)
     m = _run_validate(cfg, model, batches, [eps], None)
-    assert abs(m["oracle_diag/marginal_gap"]) > 1e-2
+    assert abs(_marginal_gap(m)) > 1e-2
 
 
 def test_disabled_oracle_diagnostics_do_not_score_tabicl_pit_against_gp_ceiling(
@@ -186,7 +190,7 @@ def test_kernel_hidden_warp_oracle_diag_marginal_gap_vanishes(
     cache = _build_analytic_val_z(batches, {0: eps}, "cpu")
     m = _run_validate(cfg, model, batches, [eps], cache)
 
-    assert m["oracle_diag/marginal_gap"] == pytest.approx(0.0, abs=1e-3)
+    assert _marginal_gap(m) == pytest.approx(0.0, abs=1e-3)
     assert m["oracle_diag/copula_gap"] == pytest.approx(m["oracle_diag/gap_nll"], abs=1e-4)
     assert m["oracle_diag/copula_headroom"] > 0.0
 

@@ -32,6 +32,7 @@ from eval.runners.spatial_correlation_eval import (
     validate_spatial_spec,
 )
 from eval.runners.summarize_results_cache import SummarizeSpec
+from eval.runners.wandb_report import WandbReportSpec
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -49,6 +50,7 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "real_calibration_gate": (RealCalibrationGateSpec, ["dumps=[a.json]"]),
     "sdwpf_audit": (SdwpfAuditSpec, []),
     "ctr23_full_eval": (Ctr23FullEvalSpec, ["data_id=44957", "out_json=o.json"]),
+    "wandb_report": (WandbReportSpec, []),
 }
 
 

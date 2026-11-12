@@ -35,9 +35,8 @@ positional args on every stage, same syntax as `train.py`/`train_fast.py`.
 `total − oracle_posterior_total`, which bundles a copula term the model can
 improve with a marginal term it can't (the marginal comes from a *separate
 frozen* TabICL, `gp_episodes.py`'s `z_train_source=tabicl` override). `src/
-train.py::validate()` now also logs `oracle_diag/copula_gap` and
-`oracle_diag/marginal_gap` so the split is visible without re-deriving it
-(plus `oracle_diag/copula_headroom`, the Bayes-optimal copula reward the gap
+train.py::validate()` now also logs `oracle_diag/copula_gap`; the marginal
+part is `gap_nll − copula_gap` (plus `oracle_diag/copula_headroom`, the Bayes-optimal copula reward the gap
 is measured against).
 
 ## What the evidence said before this pipeline existed
