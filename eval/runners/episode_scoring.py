@@ -397,6 +397,26 @@ def _add_autoregressive_log_pdf(ctx: _EvalContext, ep: dict, local_i: int, ep_i:
     )
 
 
+def _baselines_in_raw_nats(ep: dict, baselines: _BaselineResults) -> _BaselineResults:
+    """Put the fitted baselines' Y-space rows in raw nats.
+
+    They are fitted on ep["y_test"], which is standardized when the episode carries
+    y_log_std = log sigma_y > 0; the change of variables adds log sigma_y per point to
+    the marginal and total NLL (not the copula). Call this before merging rows that
+    are already in raw nats (the zero-mean GP rows, scored on marginal_pit), or those
+    rows get the shift a second time.
+    """
+    shift = float(ep.get("y_log_std", 0.0))
+    if not shift:
+        return baselines
+    baseline_nlls, baseline_R, baseline_y_nlls = baselines
+    shifted = {
+        k: {"total": v["total"] + shift, "marginal": v["marginal"] + shift, "copula": v["copula"]}
+        for k, v in baseline_y_nlls.items()
+    }
+    return baseline_nlls, baseline_R, shifted
+
+
 def _with_zero_mean_gp(
     ctx: _EvalContext, ep: dict, marginal_pit: dict[str, Tensor], fit_seed: int, baselines: _BaselineResults
 ) -> _BaselineResults:
@@ -434,20 +454,11 @@ def _total_nll_rows(
     y_space_nlls: dict[str, dict[str, float]],
     marginal_pit: dict[str, Tensor] | None,
 ) -> dict[str, dict[str, float]]:
-    """Per-point total/marginal/copula Y-space NLL for every row of the TOTAL table."""
+    """Per-point total/marginal/copula Y-space NLL for every row of the TOTAL table.
+
+    Every input row is already in raw nats (baseline_y_nlls via _baselines_in_raw_nats).
+    """
     n_test = ep["z_test"].shape[0]
-    # Episodes with rescaled targets carry a per-point Jacobian shift, applied to the
-    # baselines' marginal and total (not the copula).
-    _shift = float(ep.get("y_log_std", 0.0))
-    if _shift:
-        baseline_y_nlls = {
-            k: {
-                "total": v["total"] + _shift,
-                "marginal": v["marginal"] + _shift,
-                "copula": v["copula"],
-            }
-            for k, v in baseline_y_nlls.items()
-        }
     # Autoregressive row (already in raw nats).
     ar_log_pdf = ep.get("ar_log_pdf")
     ar_parts = (
@@ -565,6 +576,9 @@ def _score_episode(
     spec, device = ctx.spec, ctx.device
     marginal_pit = _episode_marginal_pit(ctx, ep, ep_i)
     _add_autoregressive_log_pdf(ctx, ep, local_i, ep_i)
+    # Shift the standardized-y baseline rows to raw nats before adding the zero-mean GP
+    # rows, which are scored on marginal_pit and already in raw nats.
+    baselines = _baselines_in_raw_nats(ep, baselines)
     if spec.baselines.zeromean_gp and marginal_pit is not None:
         baselines = _with_zero_mean_gp(ctx, ep, marginal_pit, fit_seed, baselines)
     baseline_nlls, baseline_R, baseline_y_nlls = baselines
@@ -581,6 +595,11 @@ def _score_episode(
         "n_test": ep["z_test"].shape[0],
         "kernel": _kernel_composition_label(ep),
     }
+    if "real_meta" in ep:
+        # Identifies the episode (rows, split, group) for paired comparisons and cluster bootstraps.
+        meta["episode"] = ep["real_meta"]
+        # The marginal-calibration gate reads these.
+        meta["z_test"] = [float(z) for z in ep["z_test"].tolist()]
     nlls = {**baseline_nlls, **icl_nlls}
     R_dict = {**baseline_R, **icl_R}
 

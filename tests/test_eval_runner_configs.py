@@ -14,11 +14,16 @@ from hydra.core.global_hydra import GlobalHydra
 from copula_inter.config_path import config_dir
 from copula_inter.training.setup import prepare_training_inputs
 from eval.runners.autoregressive_baseline_eval import AutoregressiveBaselineSpec
+from eval.runners.ctr23_full_eval import Ctr23FullEvalSpec
 from eval.runners.era5_calibration_eval import Era5CalibrationSpec
 from eval.runners.eval_args import EvalSpec
 from eval.runners.hydra_cli import compose_spec, reject_argparse_flags
 from eval.runners.marginal_calibration_eval import MarginalCalibrationSpec
+from eval.runners.paired_compare import PairedCompareSpec
+from eval.runners.real_audit import RealAuditSpec
+from eval.runners.real_calibration_gate import RealCalibrationGateSpec
 from eval.runners.run_benchmarks import BenchmarkSpec
+from eval.runners.sdwpf_audit import SdwpfAuditSpec
 from eval.runners.spatial_correlation_eval import (
     AllSpec,
     DiagnoseSpec,
@@ -40,6 +45,11 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "era5_calibration_eval": (Era5CalibrationSpec, []),
     "autoregressive_baseline_eval": (AutoregressiveBaselineSpec, []),
     "summarize_results_cache": (SummarizeSpec, ["caches=[a.json]"]),
+    "paired_compare": (PairedCompareSpec, ["a=a.json"]),
+    "real_audit": (RealAuditSpec, ["real.dataset=kaust"]),
+    "real_calibration_gate": (RealCalibrationGateSpec, ["dumps=[a.json]"]),
+    "sdwpf_audit": (SdwpfAuditSpec, []),
+    "ctr23_full_eval": (Ctr23FullEvalSpec, ["data_id=44957", "out_json=o.json"]),
     "wandb_report": (WandbReportSpec, []),
 }
 
@@ -59,6 +69,33 @@ def test_eval_spec_overrides_reach_nested_groups() -> None:
     assert spec.era5.enabled and spec.era5.grid_size == 16
     assert spec.autoregressive.order == "natural"
     assert spec.baselines.cache is None
+
+
+def test_real_dataset_defaults_compose_and_invalid_combinations_are_rejected() -> None:
+    from eval.runners.eval_args import compose_eval_spec
+
+    spec = compose_eval_spec(["ckpt=x.pt", "real.dataset=sdwpf"])
+    assert spec.real.dataset == "sdwpf" and spec.real.sdwpf.n_context == 32 and spec.real.sdwpf.n_query == 64
+    spec = compose_eval_spec(["ckpt=x.pt", "real.dataset=sdwpf", "real.sdwpf.features=f1b", "real.sdwpf.mask=block"])
+    assert spec.real.sdwpf.features == "f1b"
+    bad = {
+        "real.dataset=nope": "real.dataset",
+        "era5.enabled=true": "mutually exclusive",
+        "dataset_dir=/tmp": "mutually exclusive",
+        "live_generate=true": "mutually exclusive",
+        "marginal.z_train_source=oracle": "no oracle marginal",
+        "real.sdwpf.n_query=10": "min_test_points",
+        "real.sdwpf.mask=dyadic_knn": "real.sdwpf.mask",
+        "real.sdwpf.features=f2": "real.sdwpf.features",
+        "real.sdwpf.regime=none": "real.sdwpf.regime",
+        "real.sdwpf.direction_offset_deg=45": "direction_offset_deg",
+    }
+    for override, message in bad.items():
+        extra = [] if override.startswith("real.dataset") else ["real.dataset=sdwpf"]
+        if override == "marginal.z_train_source=oracle":
+            extra.append("autoregressive.enabled=false")
+        with pytest.raises(ValueError, match=message):
+            compose_eval_spec(["ckpt=x.pt", *extra, override])
 
 
 def test_spatial_command_group_selects_the_command_schema() -> None:

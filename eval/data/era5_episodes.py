@@ -10,6 +10,7 @@ Geometry, centred area-uniformly over the globe:
     vary_geometry=True: grid_size and n_context_frac drawn per episode from
         ranges (era5_live's training distribution); PIT per episode.
 d_x = 6: lon, lat and the four fetch_era5_static.STATIC_VARS fields.
+The PIT/chain/standardize_y packaging is eval/data/episode_packaging.py.
 """
 
 from __future__ import annotations
@@ -26,8 +27,8 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 from copula_inter.era5.corpus import GlobalERA5Corpus
-from copula_inter.marginal.pit import normalize_targets
 from eval.configs.constants import ERA5_DEFAULT_CORPUS_DIR
+from eval.data.episode_packaging import PitSettings, RawEpisode, check_pit_settings, package_pit_episodes
 
 __all__ = ["build_era5_eval_episodes", "era5_episode_fingerprint", "DEFAULT_CORPUS_DIR"]
 
@@ -115,22 +116,20 @@ def build_era5_eval_episodes(
     (raw nats) for the first ar_n_episodes episodes. The PIT and the chain run on
     raw y.
     """
-    from copula_inter.data.era5_live_dataset import _pit_group
-    from eval.baselines.autoregressive import autoregressive_log_pdf
-
-    if tabicl_model is None and marginal_backend is None:
-        raise ValueError(
-            "ERA5 episodes need a real marginal to PIT with: pass tabicl_model "
-            "(marginal.z_train_source=tabicl) or a marginal_backend + marginal_regressor. "
-            "There is no analytic/oracle PIT on real data."
-        )
-    if autoregressive and marginal_backend is not None:
-        # The chain needs TabICL; other backends have no incremental entry point.
-        raise NotImplementedError(
-            f"autoregressive.enabled is implemented for the TabICL marginal only, not "
-            f"for backend {marginal_backend!r}. Re-run with autoregressive.enabled=false, "
-            f"or with the default marginal.z_train_source=tabicl."
-        )
+    settings = PitSettings(
+        tabicl_model=tabicl_model,
+        k_folds=k_folds,
+        device=device,
+        marginal_backend=marginal_backend,
+        marginal_regressor=marginal_regressor,
+        standardize_y=standardize_y,
+        autoregressive=autoregressive,
+        ar_order=ar_order,
+        ar_conditioning=ar_conditioning,
+        ar_max_context=ar_max_context,
+        ar_n_episodes=ar_n_episodes,
+    )
+    check_pit_settings(settings, "ERA5")
 
     if verbose:
         print(f"  [era5] loading corpus from {corpus_dir}")
@@ -142,7 +141,7 @@ def build_era5_eval_episodes(
         )
 
     # ---- Geographic/target draws (CPU, cheap) ----
-    raw: list[dict] = []
+    raw: list[RawEpisode] = []
     for local_i in range(n_episodes):
         ep_i = offset + local_i
         drawn = _draw_episode(
@@ -156,126 +155,42 @@ def build_era5_eval_episodes(
             n_context_frac_range=n_context_frac_range,
         )
         raw.append(
-            {
-                "ep_i": ep_i,
-                "x_norm_train": torch.from_numpy(drawn["x_norm_train"]),
-                "x_norm_test": torch.from_numpy(drawn["x_norm_test"]),
-                "y_train": torch.from_numpy(drawn["y_train"]),
-                "y_test": torch.from_numpy(drawn["y_test"]),
+            RawEpisode(
+                ep_i=ep_i,
+                x_norm_train=torch.from_numpy(drawn["x_norm_train"]),
+                x_norm_test=torch.from_numpy(drawn["x_norm_test"]),
+                y_train=torch.from_numpy(drawn["y_train"]),
+                y_test=torch.from_numpy(drawn["y_test"]),
                 # Both samplers always return these keys.
-                "grid_size": int(drawn["grid_size"]),
-                "lat_bounds": drawn["lat_bounds"],
-                "lon_bounds": drawn["lon_bounds"],
-            }
+                meta={
+                    "grid_size": int(drawn["grid_size"]),
+                    "lat_bounds": drawn["lat_bounds"],
+                    "lon_bounds": drawn["lon_bounds"],
+                },
+            )
         )
+
+    def _era5_meta(r: RawEpisode, P: int, N: int) -> dict[str, Any]:
+        return {
+            "ep_i": r.ep_i,
+            "grid_size": r.meta["grid_size"],
+            "P": P,
+            "N": N,
+            "lat_bounds": r.meta["lat_bounds"],
+            "lon_bounds": r.meta["lon_bounds"],
+        }
 
     # PIT: batched for fixed shapes, per episode for varying geometry.
-    dev = torch.device(device)
-    group = 1 if vary_geometry else max(1, int(pit_group_size))
-    episodes: list[dict] = []
-    for chunk_i, start in enumerate(range(0, len(raw), group)):
-        chunk = raw[start : start + group]
-        # _pit_group also handles B=1.
-        out = _pit_group(
-            torch.stack([r["x_norm_train"] for r in chunk]).to(dev),
-            torch.stack([r["y_train"] for r in chunk]).to(dev),
-            torch.stack([r["x_norm_test"] for r in chunk]).to(dev),
-            torch.stack([r["y_test"] for r in chunk]).to(dev),
-            tabicl_model,
-            k_folds,
-            marginal_backend=marginal_backend,
-            marginal_regressor=marginal_regressor,
-            seed=chunk[0]["ep_i"],
-        )
-        pits = [
-            None if out is None else {k: out[k][b] for k in ("z_train", "z_test", "log_pdf_test")}
-            for b in range(len(chunk))
-        ]
-
-        # Autoregressive chain on the same group and marginal, raw y.
-        ar_log_pdf: list[Optional[torch.Tensor]] = [None] * len(chunk)
-        n_ar = len(chunk) if ar_n_episodes is None else max(0, min(len(chunk), int(ar_n_episodes) - start))
-        if autoregressive and out is not None and n_ar > 0:
-            sub = chunk[:n_ar]
-            assert tabicl_model is not None  # autoregressive rejects every other backend above
-            ar_out = autoregressive_log_pdf(
-                tabicl_model,
-                torch.stack([r["x_norm_train"] for r in sub]).to(dev),
-                torch.stack([r["y_train"] for r in sub]).to(dev),
-                torch.stack([r["x_norm_test"] for r in sub]).to(dev),
-                torch.stack([r["y_test"] for r in sub]).to(dev),
-                order=ar_order,
-                conditioning=ar_conditioning,
-                max_context=ar_max_context,
-                seed=seed,
-                episode_indices=[r["ep_i"] for r in sub],
-            )
-            for b in range(len(sub)):
-                ar_log_pdf[b] = ar_out["log_pdf"][b]
-
-        for r, pit, ar in zip(chunk, pits, ar_log_pdf):
-            if pit is None:
-                print(f"  [era5] ep {r['ep_i']}: PIT unavailable (too little context), skipping")
-                continue
-            P = int(r["x_norm_train"].shape[0])
-            N = int(r["x_norm_test"].shape[0])
-            # Same normalize_targets call as the PIT, so y_log_std is its exact Jacobian.
-            y_tr_scaled, y_te_scaled, _, y_std = normalize_targets(r["y_train"], r["y_test"])
-            if standardize_y:
-                y_tr, y_te = y_tr_scaled, y_te_scaled
-                y_log_std = float(y_std.log())
-            else:
-                y_tr, y_te = r["y_train"], r["y_test"]
-                y_log_std = 0.0
-            episode = {
-                "x_norm_train": r["x_norm_train"],
-                "x_norm_test": r["x_norm_test"],
-                "y_train": y_tr,
-                "y_test": y_te,
-                "z_train": pit["z_train"].detach().float().cpu(),
-                "z_test": pit["z_test"].detach().float().cpu(),
-                "log_pdf_test": pit["log_pdf_test"].detach().float().cpu(),
-                # Per-point nats to add to NLLs computed on this episode's y (0 when raw).
-                "y_log_std": y_log_std,
-                # Reuse this PIT in the runner.
-                "marginal_pit": {
-                    "z_train": pit["z_train"].detach().float().cpu(),
-                    "z_test": pit["z_test"].detach().float().cpu(),
-                    "log_pdf_test": pit["log_pdf_test"].detach().float().cpu(),
-                },
-                "era5_meta": {
-                    "ep_i": r["ep_i"],
-                    "grid_size": r["grid_size"],
-                    "P": P,
-                    "N": N,
-                    "lat_bounds": r["lat_bounds"],
-                    "lon_bounds": r["lon_bounds"],
-                },
-            }
-            # Absent (not NaN) when the chain did not run for this episode.
-            if ar is not None:
-                episode["ar_log_pdf"] = ar.detach().float().cpu()
-            episodes.append(episode)
-        # Report progress every chunk when the chain is on.
-        if verbose and (autoregressive or chunk_i % 10 == 0):
-            print(f"  [era5] PIT {min(start + group, len(raw))}/{len(raw)} episodes", flush=True)
-
-    if verbose and autoregressive:
-        n_with = sum(1 for e in episodes if "ar_log_pdf" in e)
-        print(
-            f"  [era5] autoregressive chain: {n_with}/{len(episodes)} episodes, "
-            f"order={ar_order}, conditioning={ar_conditioning}, "
-            f"max_context={ar_max_context}"
-        )
-    if verbose and episodes:
-        Ps = [e["era5_meta"]["P"] for e in episodes]
-        Ns = [e["era5_meta"]["N"] for e in episodes]
-        print(
-            f"  [era5] built {len(episodes)} episodes — "
-            f"P {min(Ps)}..{max(Ps)}, N {min(Ns)}..{max(Ns)}, d_x="
-            f"{episodes[0]['x_norm_train'].shape[-1]}"
-        )
-    return episodes
+    return package_pit_episodes(
+        raw,
+        settings,
+        seed=seed,
+        group=1 if vary_geometry else max(1, int(pit_group_size)),
+        meta_key="era5_meta",
+        make_meta=_era5_meta,
+        tag="era5",
+        verbose=verbose,
+    )
 
 
 def era5_episode_fingerprint(

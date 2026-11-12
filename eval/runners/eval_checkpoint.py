@@ -15,6 +15,7 @@ baselines.workers processes, one per physical core by default.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -73,7 +74,7 @@ from eval.results import (
 from eval.results import (
     save_results_cache as _save_results_cache,
 )
-from eval.runners.eval_args import EvalSpec, prepare_eval_spec, validate_eval_spec
+from eval.runners.eval_args import EvalSpec, prepare_eval_spec, real_dataset_spec, validate_eval_spec
 from eval.runners.hydra_cli import hydra_entry
 from eval.viz.correlation_plots import plot_corr_grid
 
@@ -125,6 +126,7 @@ def _baseline_cache_fingerprint(
     era5_geometry: dict | None,
     tabicl_pit_k_folds: int,
     tabicl_ckpt: str | None,
+    real_fp: dict | None = None,
 ) -> dict:
     """Baseline-cache fingerprint: everything besides the episode index that the cached fits depend on.
 
@@ -171,6 +173,14 @@ def _baseline_cache_fingerprint(
                     "ckpt": artifact_identity(tabicl_ckpt),
                     "amp": bool(spec.marginal.tabicl_amp),
                 }
+    if real_fp is not None:
+        # Real data has no legacy caches: the PIT marginal's identity is always recorded.
+        fingerprint["real"] = dict(real_fp)
+        if spec.marginal.z_train_source == "tabicl" and tabicl_ckpt is not None:
+            fingerprint["real"]["pit_marginal_identity"] = {
+                "ckpt": artifact_identity(tabicl_ckpt),
+                "amp": bool(spec.marginal.tabicl_amp),
+            }
     return fingerprint
 
 
@@ -193,11 +203,14 @@ def _report_results(
     if not all_nlls:
         raise RuntimeError(f"no episodes evaluated successfully out of {n_ep} requested")
 
-    _print_table(all_nlls, z_train_source=spec.marginal.z_train_source, era5=era5, attempted=n_ep)
-    if era5:
+    real_label = _real_header(spec)
+    _print_table(
+        all_nlls, z_train_source=spec.marginal.z_train_source, era5=era5, attempted=n_ep, real_label=real_label
+    )
+    if era5 or real_label is not None:
         print(
-            "GP oracle total NLL (Y-space): unavailable on real ERA5 — that table is "
-            "the analytic prior/posterior of the GP that generated the episode, and "
+            f"GP oracle total NLL (Y-space): unavailable on real {'ERA5' if era5 else spec.real.dataset} — "
+            "that table is the analytic prior/posterior of the GP that generated the episode, and "
             "no such GP exists here.\n"
         )
     else:
@@ -206,6 +219,7 @@ def _report_results(
         all_total_nlls,
         z_train_source=spec.marginal.z_train_source,
         era5=era5,
+        real_label=real_label,
         attempted=n_ep,
         ar_note=_ar_note(
             all_total_nlls, spec.autoregressive.order, spec.autoregressive.conditioning, spec.autoregressive.max_context
@@ -241,6 +255,9 @@ def _report_results(
             "live_generate": live_generate,
             "dataset_dir": dataset_dir,
             "z_train_source": spec.marginal.z_train_source,
+            "marginal_ckpt": spec.marginal.tabicl_ckpt,
+            "real_dataset": spec.real.dataset,
+            "real_config": (dataclasses.asdict(real_dataset_spec(spec)) if spec.real.dataset is not None else None),
             "episodes": [
                 {**meta, "nlls": nlls, "total_nlls": total_nlls}
                 for meta, nlls, total_nlls in zip(all_episode_meta, all_nlls, all_total_nlls)
@@ -274,6 +291,15 @@ def _report_results(
         print(f"Saved corr_grid to: {out_path}")
 
     print("Done.")
+
+
+def _real_header(spec: EvalSpec) -> str | None:
+    """Table header naming the real dataset and its episode settings; None off real data."""
+    if spec.real.dataset is None:
+        return None
+    sub = dataclasses.asdict(real_dataset_spec(spec))
+    sub.pop("data_dir", None)
+    return f"{spec.real.dataset} ({', '.join(f'{k}={v}' for k, v in sub.items())})"
 
 
 def run_evaluation(spec: EvalSpec) -> None:
@@ -312,7 +338,7 @@ def run_evaluation(spec: EvalSpec) -> None:
         else 2 * spec.selection.min_fold_size
     )
 
-    (dataset, era5_geometry, live_episodes, marginal_regressor, n_available, tabicl_marginal) = _load_episodes(
+    (dataset, era5_geometry, live_episodes, marginal_regressor, n_available, tabicl_marginal, real_fp) = _load_episodes(
         spec=spec,
         cfg=cfg,
         dataset_dir=dataset_dir,
@@ -355,6 +381,7 @@ def run_evaluation(spec: EvalSpec) -> None:
         era5_geometry=era5_geometry if era5 else None,
         tabicl_pit_k_folds=tabicl_pit_k_folds,
         tabicl_ckpt=tabicl_ckpt,
+        real_fp=real_fp,
     )
     cache_entries = load_baseline_cache(baseline_cache, fingerprint) if baseline_cache is not None else {}
 

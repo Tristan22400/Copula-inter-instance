@@ -164,6 +164,239 @@ checkpoint. To compare a second checkpoint on the same episodes, share
 `baselines.cache` and give each checkpoint its own `output.results_cache`; only
 the ICL forward pass is redone.
 
+### Real-data benchmarks
+
+`real.dataset=<name>` swaps the episode source for one of `eval/data/real/`,
+with the same baselines, tables and caches as ERA5 (no oracle rows, the
+shared `z_test` is the marginal's PIT, read the total Y-space table). Raw
+files live under `REAL_DATA_DIR/<name>/` (default `eval/data/cache/`; from a
+git worktree, point `REAL_DATA_DIR` at the main checkout's cache). Episode
+`ep_i` is drawn from `default_rng([seed, ep_i])`, so `episode_offset` shards
+reproduce the unsharded stream; smoke runs use `seed=43` so none of their
+episodes is a reported one. Pair every copula checkpoint with the marginal it
+was trained with (`tabicl.pit_ckpt` in its config) via `marginal.tabicl_ckpt`.
+
+#### SDWPF wind farm
+
+One timestamp per episode, rows = turbines, target `Patv` (kW); five 49-day
+folds, CI cluster = day (`eval/data/real/sdwpf.py` documents the episode
+contract, the cleaning and the partial-load rule).
+
+Feature set: **F0 = (x, y) only.** F1b (positions rotated by the farm wind
+direction) is dropped: the audit (`sdwpf_audit`, 2026-11-04) found the
+per-timestamp circular std of $\phi_i = (\mathrm{Ndir}_i + \mathrm{Wdir}_i) \bmod 360$
+across turbines at about 73° in every fold (68 of 134 turbines biased more than
+30° from the farm mean), far above the pre-declared 30° limit, so all five
+cross-fitted decisions rejected it. The code path stays, for the audit and
+its tests, but no reported run uses it.
+
+```bash
+python -m eval.runners.sdwpf_audit output_dir=results/sdwpf_audit    # model-free, per fold
+python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
+    real.dataset=sdwpf real.sdwpf.features=f0 real.sdwpf.mask=random n_episodes=400 \
+    output.dump_episodes=results/sdwpf/f0_random.json
+python -m eval.runners.paired_compare a=results/sdwpf/f0_random.json \
+    b=results/sdwpf/f1b_random.json
+python -m eval.runners.paired_compare a=results/sdwpf/f0_random.json
+```
+
+The second command is F1b minus F0 on identical episodes (it fails if the
+episode meta differs); the third gives the copula's within-run contrasts
+against independence, the autoregressive row and best_baseline. Every delta
+carries a 95 % cluster-bootstrap CI (2,000 replicates) and a win rate;
+`folds=[...]` restricts both runs to the listed folds for cross-fitting.
+
+Timestamp budget: episode j of a fold owns `timestamp_tries` hourly candidates,
+so a fold supports at most ⌊candidates / timestamp_tries⌋ episodes (400 episodes
+= 80 per fold). The P=64 cell runs with `real.sdwpf.timestamp_tries=7`: fold 0
+has 580 candidates at that P + N, so 8 × 80 = 640 > 580, while 7 × 80 = 560 fits.
+Changing `timestamp_tries` changes the slice boundaries, so the P=64 episodes
+are a different stream from the other cells (they are not paired across P
+anyway). Every other cell keeps the default of 8.
+
+#### Real-data grid protocol (fixed 2026-11-05, before any grid score)
+
+Written before the grid ran; nothing below changes after scores are seen.
+
+- **Episodes.** Reported seed 42 (smoke runs used 43). Every drawn episode is
+  reported; no held-out half. 400 episodes per cell, except Meuse (201 = 67 ×
+  3 folds) and CTR23 (100 per dataset and mask: the unit there is the dataset,
+  24 of them). Cells run as shards (`scripts/real_grid.sh <cell> <offset> <n>`);
+  `paired_compare` and `real_calibration_gate` read a shard glob.
+- **Checkpoints.** `copula-nano-finetune-marginal-float32` (630k) with its
+  marginal `marginal_finetune_era5_run1`, zero-shot. A second checkpoint runs
+  with its own marginal and its own baseline caches (`REAL_CKPT_TAG`).
+- **Cells** (`./scripts/real_grid.sh list`), P/N as in each dataset section:
+  SDWPF F0 random, block; KAUST {1a_2, 1b_2, 1a_1, 1b_1} × {random, block};
+  EMNIST test split, P ∈ {50, 200} × {random, block}; California {f0, f1} ×
+  {random, block}; Meuse {f0, f1}; CTR23 the 24 kept datasets × {dyadic_knn,
+  random}.
+- **P sweep** (½P, 2P) on the main mask: `random` for SDWPF (P = 16, 64), KAUST
+  1a_2 (P = 64, 256) and California F0 (P = 64, 256); EMNIST's two P values are
+  its sweep. The CTR23 sweep (dyadic_knn, P = 64, 256) is deferred until the
+  main CTR23 cells are in.
+- **Statistics per cell.** The total Y-space NLL table; paired Δ for copula −
+  independence, copula − autoregressive, copula − best_baseline, each with a
+  95 % cluster-bootstrap CI (2,000 replicates, the dataset's CI cluster) and a
+  win rate; Meuse reports mean ± sd and no CI; CTR23 per-dataset Δ then a
+  Wilcoxon signed-rank test across datasets. The calibration gate runs on
+  every cell; a z_test std outside [0.8, 1.25] is flagged.
+- **Cross-fitted choices.** SDWPF only: F1b was dropped by all five
+  cross-fitted direction-audit decisions, so every SDWPF cell is F0. No other
+  dataset makes a score-based choice.
+- **Exclusions fixed in advance.** SDWPF cleaning and partial load; California
+  top-code; CTR23 atom rule (11 of 35 datasets excluded).
+
+#### Shared tools for every real dataset
+
+```bash
+python -m eval.runners.real_audit real.dataset=kaust real.kaust.variant=1a_2    # model-free audit, smoke seed 43
+python -m eval.runners.real_calibration_gate dumps=[results/real/kaust/1a_2_random.json]
+```
+
+`real_audit` verifies and loads the data as `eval_checkpoint` does, prints the
+module's dataset checks (cleaning counts, atoms and ties, layout), then draws
+episodes with the smoke seed and reports skips, shapes, clusters and folds.
+`real_calibration_gate` is the marginal gate: mean, std, |z| > 3 fraction, KS
+statistic against N(0, 1) and quantile ECE of the stored `z_test`, flagging a
+std outside [0.8, 1.25]. `scripts/eval_checkpoint_real.sh` runs one cell on a
+whole GPU node; set `REAL_CELL` per cell so baseline caches never mix cells.
+
+#### KAUST 2022 (sub-competitions 1a, 1b)
+
+One square window of side `1 / real.kaust.window_cells` (default 1/15) per
+episode, inside one of five vertical strips (fold = strip = `ep_i % 5`);
+P = 128, N = 64, masks `random` and `block`, features (x, y). CI cluster: the
+window-grid cell holding the window's centre. Variants `*_2` (zero-mean
+nonstationary Matérn GP) are the main result; `*_1` (deterministic mean plus
+iid noise) are the negative control where the copula must not hurt
+(`eval/data/real/kaust.py`).
+
+```bash
+python -m eval.runners.real_audit real.dataset=kaust real.kaust.variant=1b_2
+python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
+    real.dataset=kaust real.kaust.variant=1a_2 real.kaust.mask=block n_episodes=400 \
+    output.dump_episodes=results/real/kaust/1a_2_block.json
+```
+
+#### EMNIST (balanced)
+
+One image per episode (each episode a different image), rows = pixels,
+features (row, col), target $y = (\text{pixel} + U)/256$ with $U \sim U(0,1)$
+drawn per episode; P ∈ {50, 200}, N = 64, masks `random` and `block`. Report on
+`real.emnist.split=test`, debug on `train`. CI cluster: the image. The gate
+also prints bits/pixel, $(\text{NLL} + \ln 256)/\ln 2$.
+
+```bash
+python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
+    real.dataset=emnist real.emnist.n_context=200 real.emnist.mask=block n_episodes=400 \
+    output.dump_episodes=results/real/emnist/p200_block.json
+```
+
+#### California Housing
+
+`fetch_california_housing` into `REAL_DATA_DIR/california`. Rows at the
+$500,001 top-code (the maximum, 5.00001, checked to be ≥
+`real.california.censor_cap` = 5.0) are dropped once, at the dataset level;
+rows at exactly 5.0 ($500,000) are kept. P = 128, N = 64, masks `random` and `block`
+(kNN in latitude/longitude); `features=f0` (all 8) or `f1` (without
+latitude/longitude, the ablation; same episodes). CI cluster: the block
+anchor, or the episode for `random`.
+
+```bash
+python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
+    real.dataset=california real.california.mask=block real.california.features=f1 n_episodes=400 \
+    output.dump_episodes=results/real/california/f1_block.json
+```
+
+#### Meuse
+
+Repeated 3-fold over the 155 points: 67 repetitions × 3 folds = 201 episodes,
+query = one fold (51–52 points), context = the rest; every point is queried 67
+times. Target log(zinc); `features=f0` (x, y) or `f1` (x, y, dist, elev). The
+folds share points, so there is **no CI**: `paired_compare` reports mean ± sd.
+
+```bash
+python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
+    real.dataset=meuse real.meuse.features=f1 n_episodes=201 \
+    output.dump_episodes=results/real/meuse/f1.json
+```
+
+#### OpenML-CTR23 (suite 353)
+
+One dataset per run (`real.ctr23.data_id`, one of the 35 pinned in
+`eval/data/real/ctr23.py`), fetched by `fetch_openml` into
+`REAL_DATA_DIR/ctr23`; categoricals ordinal-encoded and numerics
+mean-imputed as TabICL does. A dataset whose most common target value holds
+more than 5 % of its rows is excluded (`real.ctr23.max_atom_frac`; a real point
+mass, not mere rounding; fixed before any CTR23 score was seen; the audit lists
+them). P = 128, N = 64; `dyadic_knn` (the N/2 nearest neighbours of each of
+two anchors in standardized feature space) is the main mask, `random` the
+negative control. The unit is the dataset: a per-dataset mean Δ, then a
+Wilcoxon signed-rank test across datasets.
+
+```bash
+python -m eval.runners.real_audit real.dataset=ctr23 ctr23_all=true
+python -m eval.runners.eval_checkpoint ckpt=<ckpt> marginal.tabicl_ckpt=<its marginal> \
+    real.dataset=ctr23 real.ctr23.data_id=44957 real.ctr23.mask=dyadic_knn n_episodes=100 \
+    output.dump_episodes=results/real/ctr23/44957_dyadic_knn.json
+python -m eval.runners.paired_compare across=[results/real/ctr23/44957_dyadic_knn.json]
+```
+
+#### OpenML-CTR23 on the full datasets (decided with the user on 2026-11-09)
+
+A second protocol, next to the episodes: the task's **official 10-fold CV**
+(OpenML split file, repeat 0, fetched once into `REAL_DATA_DIR/ctr23`), with
+the **whole training fold as context** and the **whole test fold as queries**,
+so the marginal is comparable with published CTR23 results and the copula is
+tested far beyond its training P. Same 24 datasets (atom rule), same
+preprocessing and checkpoint pair. Per fold:
+
+- the marginal PITs the context with its 10-fold pass (context rows shuffled
+  first) and predicts the test fold: marginal NLL per point, RMSE and R² of the
+  quantile mean, MAE of the median, CRPS on the quantile grid, all in raw units;
+- the copula's Σ over the test rows (a test row attends only to the context, so
+  the forward runs in exact `query_batch` slices) scores the copula NLL over the
+  whole fold and over two partitions into chunks of 64 (`random`, and
+  `dyadic_knn`: two kNN clusters per chunk), each test row in exactly one chunk.
+  A chunk's NLL uses Σ's sub-block, the copula's own joint over that chunk.
+  Independence has copula NLL 0, so `copula_*` is the copula minus independence.
+
+No GP baselines and no autoregressive row: neither scales to P ≈ 6·10⁴. The
+JSON holds each fold and the mean over folds; a `.npz` beside it holds the
+per-row predictions, log-densities, z_test and Σ's factor rows. A rerun skips
+finished folds.
+
+**Other foundation models (decided with the user on 2026-11-09).** With
+`ckpt` unset the runner scores a marginal alone, i.e. the independence model
+(copula NLL 0 over every query set), on the test fold only: `marginal=tabicl`
+with `tabicl_ckpt=pretrained` (TabICL v2), or `marginal=tabpfn35_fast` /
+`kumo_small` (pretrained; `marginal_ckpt` takes a Phase-A checkpoint). The
+fine-tuned TabICL independence row is the marginal half of the copula run (the
+same test forward). `compare_methods` ranks the methods per dataset on total NLL
+(whole fold, or a chunk partition), CRPS or RMSE: mean and median rank, the
+Friedman test and Holm-corrected pairwise Wilcoxon tests, over the datasets
+every method completed; a run that failed for memory on a 48 GB GPU leaves its
+dataset out of the ranking (`"failed"` in its JSON). TabPFN and Kumo need a venv
+with the `tabpfn` / `kumo` extras (`COPULA_VENV`) and, for TabPFN, `TABPFN_TOKEN`.
+
+A copula on another backend takes `ckpt` with `marginal` and `marginal_ckpt`; the
+runner checks against the copula's training config (`data.z_train_source`,
+`data.z_train_marginal_ckpt` or `tabicl.pit_ckpt`) that it is scored with its own
+marginal, where a null `z_train_marginal_ckpt` means the pretrained weights.
+`scripts/ctr23_full.sh` names the pairs: `kumo_ft_nano` / `tabpfn_ft_nano` (copula
+on the ERA5-fine-tuned marginal) and `pre_tabicl_nano` / `pre_tabpfn_nano` /
+`pre_kumo_nano` (the PRE_nano_PN_* copulas, on the pretrained marginal).
+
+```bash
+python -m eval.runners.ctr23_full_eval ckpt=<ckpt> tabicl_ckpt=<its marginal> data_id=44957 \
+    out_json=results/real/ctr23_full/44957_nano.json
+python -m eval.runners.ctr23_full_eval marginal=tabpfn35_fast data_id=44957 \
+    out_json=results/real/ctr23_full/44957_tabpfn35_fast.json
+./scripts/ctr23_full.sh 44957               # the copula with the ERA5-report pair, on an OAR GPU node
+./scripts/ctr23_full.sh 44957 tabicl_base   # or tabpfn35_fast, kumo_small: the marginal alone
+```
+
 ### The autoregressive row
 
 This row is on by default for the TabICL marginal. It uses the same marginal
