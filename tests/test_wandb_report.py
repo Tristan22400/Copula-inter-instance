@@ -75,6 +75,9 @@ def test_grid_copula_is_gap_minus_headroom_with_per_P_and_oracle_means() -> None
     assert g["mean"] == pytest.approx(-0.05)
     assert g["oracle_mean"] == pytest.approx(-(0.5 + 0.8 + 0.04 + 0.35) / 4)
     assert g["captured"] == pytest.approx(g["mean"] / g["oracle_mean"])
+    assert g["per_N"][1000] == pytest.approx(-0.085)
+    assert g["oracle_per_N"][100] == pytest.approx(-(0.5 + 0.04) / 2)
+    assert g["oracle_cells"]["P100_N1000"] == pytest.approx(-0.35)
     assert grid_copula({"_step": 1}, HEADROOM) == {}
 
 
@@ -96,6 +99,7 @@ def test_render_groups_by_validation_set_and_lists_marginal_setups() -> None:
     assert text.count("## Validation set") == 1
     assert "**+0.7000**" in text and "**+0.6500**" in text
     assert "## Size grid" in text and "**oracle**" in text
+    assert "## Size grid by query size" in text
     assert "- B (b, finished): x" in text
 
 

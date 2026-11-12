@@ -7,7 +7,7 @@ model_r2) when that z_train is fed to --ckpt; and the Y-space joint NLL on
 held-out points. tabpfn35_fast needs TABPFN_TOKEN.
 
 Usage:
-    python debug/stages/s7_backbone.py --ckpt kernel-sweep-classic-prod --backends tabicl,tabpfn35_fast,kumo_small
+    python debug/stages/s7_backbone.py --ckpt copula-nano-finetune-marginal-float32 --backends tabicl,tabpfn35_fast,kumo_small
 """
 
 from __future__ import annotations
@@ -151,7 +151,7 @@ def run_task(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--ckpt", type=str, default="kernel-sweep-classic-prod")
+    parser.add_argument("--ckpt", type=str, default="copula-nano-finetune-marginal-float32")
     parser.add_argument(
         "--backends",
         type=str,

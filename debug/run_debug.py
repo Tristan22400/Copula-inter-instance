@@ -7,7 +7,7 @@ only directly.
 
 Usage:
     python debug/run_debug.py all --n-episodes 200
-    python debug/run_debug.py all --ckpt kernel-sweep-all-tabicl-retrain-15k
+    python debug/run_debug.py all --ckpt copula-nano-finetune-marginal-float32
     python debug/run_debug.py s1 --n-episodes 64 --ranks 8,16,32,64
     python debug/run_debug.py s4 --kernel rbf --target posterior
     python debug/run_debug.py s7b --backends tabicl,kumo_small --steps 200

@@ -7,7 +7,7 @@ bound.
 
 Usage:
     python debug/run_debug.py s5 --ckpt <name>
-    python debug/stages/s5_kfold.py --ckpt kernel-sweep-all-tabicl-retrain-15k --n-episodes 50
+    python debug/stages/s5_kfold.py --ckpt copula-nano-finetune-marginal-float32 --n-episodes 50
 """
 
 from __future__ import annotations

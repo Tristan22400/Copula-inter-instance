@@ -5,7 +5,7 @@ episode's own test order. Sample plots use ancestral sampling.
 
 Usage:
     python -m eval.runners.autoregressive_baseline_eval ckpt=<copula checkpoint> \
-        tabicl_marginal_ckpt=era5-33y n_episodes=20 n_plot_episodes=3
+        tabicl_marginal_ckpt=era5-run1 n_episodes=20 n_plot_episodes=3
 """
 
 from __future__ import annotations
@@ -103,8 +103,8 @@ class AutoregressiveBaselineSpec:
     config: str = "conf/config.yaml"
     # Copula model checkpoint.
     ckpt: str = _DEFAULT_CKPT
-    # Marginal shared by both methods: a MARGINAL_FAMILIES name or a path (era5-33y: TabICL v2 fine-tuned on ERA5).
-    tabicl_marginal_ckpt: str = "era5-33y"
+    # Marginal shared by both methods: a MARGINAL_FAMILIES name or a path (era5-run1: TabICL v2 fine-tuned on ERA5).
+    tabicl_marginal_ckpt: str = "era5-run1"
     # The chain does N forward passes per episode, so fewer than eval_checkpoint's 30.
     n_episodes: int = 20
     # Evaluated episodes that also get a sample-comparison PNG in out_dir.

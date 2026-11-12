@@ -1,7 +1,7 @@
 """Evaluate a copula checkpoint against the classical baselines and the oracle.
 
 Usage:
-    python -m eval.runners.eval_checkpoint ckpt=kernel-sweep-all-tabicl-retrain-15k
+    python -m eval.runners.eval_checkpoint ckpt=copula-nano-finetune-marginal-float32
     python -m eval.runners.eval_checkpoint ckpt=<ckpt> era5.enabled=true n_episodes=400
 
 Settings are Hydra overrides on eval_args.EvalSpec; `--cfg job` prints them all.

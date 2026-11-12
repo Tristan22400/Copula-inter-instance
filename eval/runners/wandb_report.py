@@ -84,8 +84,12 @@ def _mean_by_P(values: dict[tuple[int, int], float]) -> dict[int, float]:
     return {P: sum(v for (p, _), v in values.items() if p == P) / sum(1 for p, _ in values if p == P) for P in Ps}
 
 
+def _mean_by_N(values: dict[tuple[int, int], float]) -> dict[int, float]:
+    return _mean_by_P({(N, P): v for (P, N), v in values.items()})
+
+
 def grid_copula(row: dict[str, float], headroom: dict[tuple[int, int], float]) -> dict[str, Any]:
-    """Exact-z copula NLL per cell, its per-P and grid means, and the same for the oracle (-headroom)."""
+    """Exact-z copula NLL per cell, its per-P, per-N and grid means, and the same for the oracle (-headroom)."""
     cells = {
         pn: float(row[gap_key(*pn)]) - H for pn, H in headroom.items() if _finite(row.get(gap_key(*pn))) and _finite(H)
     }
@@ -97,8 +101,11 @@ def grid_copula(row: dict[str, float], headroom: dict[tuple[int, int], float]) -
     return {
         "step": float(row.get("_step", math.nan)),
         "cells": {f"P{P}_N{N}": v for (P, N), v in cells.items()},
+        "oracle_cells": {f"P{P}_N{N}": v for (P, N), v in oracle.items()},
         "per_P": _mean_by_P(cells),
         "oracle_per_P": _mean_by_P(oracle),
+        "per_N": _mean_by_N(cells),
+        "oracle_per_N": _mean_by_N(oracle),
         "mean": mean,
         "oracle_mean": oracle_mean,
         "captured": mean / oracle_mean if oracle_mean < 0 else math.nan,
@@ -222,6 +229,14 @@ def render(records: list[dict[str, Any]]) -> str:
             markdown_table(["run", "step"] + [f"P{P}" for P in Ps] + ["grid mean", "captured", "first logged"], rows)
             + "\n"
         )
+        Ns = sorted(ref["per_N"])
+        out.append("## Size grid by query size: copula NLL on exact z, mean over P\n")
+        rows = [["**oracle**", ""] + [_fmt(ref["oracle_per_N"][N]) for N in Ns]]
+        rows += [
+            [r["label"], str(int(r["grid_last"]["step"]))] + [_fmt(r["grid_last"]["per_N"].get(N)) for N in Ns]
+            for r in gridded
+        ]
+        out.append(markdown_table(["run", "step"] + [f"N{N}" for N in Ns], rows) + "\n")
     out.append("## Marginal setup\n")
     out.extend(f"- {r['label']} ({r['run_id']}, {r['state']}): {r['marginal_setup']}" for r in records)
     return "\n".join(out)

@@ -15,7 +15,7 @@
 #
 # Submit with:
 #     mkdir -p logs
-#     oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=kernel-sweep-all-tabicl-retrain-15k model.rank=32"
+#     oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=copula-nano-finetune-marginal-float32 model=copula_nano model.rank=512"
 #
 # Pass any other override through, e.g.:
 #     oarsub -S "./scripts/finetune_era5.sh training.resume_ckpt=./checkpoints/<run>/step_XXXXXXX.pt training.steps=20000 era5_live.corpus_dir=./eval/data/cache/era5_global"
