@@ -539,7 +539,9 @@ def fit_and_eval_gpytorch(
                     best_loss, best_model, best_likelihood = final_loss, model, likelihood
             except Exception as exc:
                 # Skip a (degree, restart) whose kernel matrix is not PSD; raise only if all fail.
-                print(f"  [gp_mle_polynomial power={poly_power}] restart failed: {exc}")
+                degree = f" power={poly_power}" if kernel_name == "polynomial" else ""
+                ard_tag = " ard" if ard else ""
+                print(f"  [gp_mle {kernel_name}{ard_tag}{degree}] restart failed: {exc}")
                 continue
 
     if best_model is None:
