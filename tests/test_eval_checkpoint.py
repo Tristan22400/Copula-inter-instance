@@ -18,6 +18,7 @@ from copula_inter.data.gp_episodes import generate_gp_batch
 from copula_inter.marginal.pit import _kernel_fn_from_task, gp_analytical_posterior
 from eval.baselines.classical import (
     baseline_fingerprint,
+    corr_nll_single,
     episode_cache_key,
     eval_baselines_episode,
     load_baseline_cache,
@@ -173,6 +174,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         "dkl_rq",
         "dkl_dot_product",
         "per_ep_transformer",
+        "gp_evidence",
     }
     # y_space_nlls excludes the unfitted references.
     expected_y_keys = expected_keys - {"independence", "gp_prior_rbf"}
@@ -194,6 +196,35 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
             assert torch.isfinite(torch.tensor(val)), f"{method}'s {part_name} Y-space NLL is non-finite"
         # total = marginal + copula exactly.
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
+    # gp_evidence copies one gp_mle_* row; the mixture has a total only.
+    gp_rows = {k: v for k, v in y_space_nlls.items() if k.startswith("gp_mle_")}
+    assert y_space_nlls["gp_evidence"] in gp_rows.values()
+    assert math.isfinite(y_space_nlls["gp_evidence_mix"]["total"])
+    assert math.isnan(y_space_nlls["gp_evidence_mix"]["copula"])
+
+
+def test_eval_baselines_episode_posterior_constant_mean(tiny_episode: dict[str, torch.Tensor]) -> None:
+    """The default eval setting (posterior, constant mean) fits every GP row with finite, consistent parts."""
+    _, R_dict, y_space_nlls = eval_baselines_episode(
+        ep=tiny_episode,
+        icl_rank=2,
+        n_steps_mle=3,
+        lr_mle=0.1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
+        device=torch.device("cpu"),
+        oracle_mode="posterior",
+        n_restarts_mle=1,
+        gp_mean="constant",
+    )
+    n_test = tiny_episode["x_norm_test"].shape[0]
+    for method in ("gp_mle_rbf", "gp_mle_ard_matern32", "dkl_rbf", "gp_evidence"):
+        _assert_valid_correlation(R_dict[method], n_test)
+        parts = y_space_nlls[method]
+        assert all(math.isfinite(v) for v in parts.values()), method
+        assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
 
 
 def test_eval_icl_episode_scores_against_oracle(tiny_episode: dict[str, torch.Tensor]) -> None:
@@ -210,8 +241,13 @@ def test_eval_icl_episode_scores_against_oracle(tiny_episode: dict[str, torch.Te
     assert torch.isfinite(torch.tensor(nlls["icl"]))
     assert torch.isfinite(torch.tensor(nlls["oracle"]))
     _assert_valid_correlation(R_dict["icl"], n_test)
+    # The z-space oracle is the known-theta posterior correlation, not the generator's prior R_star.
     assert R_oracle is not None
-    assert torch.equal(R_oracle, tiny_episode["R_star"])
+    R_post = gp_analytical_posterior(tiny_episode)["R_post"]
+    assert torch.allclose(R_oracle, R_post)
+    assert torch.equal(R_dict["oracle"], R_oracle)
+    assert torch.equal(R_dict["oracle_prior"], tiny_episode["R_star"])
+    assert nlls["oracle"] == pytest.approx(corr_nll_single(R_post, tiny_episode["z_test"]))
     # Without a marginal PIT there is no ICL Y-space NLL.
     assert set(icl_y_parts.keys()) == {"total", "marginal", "copula"}
     for val in icl_y_parts.values():
@@ -374,7 +410,10 @@ def test_baseline_cache_round_trip(tiny_episode: dict[str, torch.Tensor], tmp_pa
     reloaded = load_baseline_cache(cache_path, fingerprint)
     assert key in reloaded
     assert reloaded[key]["nlls"] == nlls
-    assert reloaded[key]["y_nlls"] == y_space_nlls
+    # nan-aware: the BIC mixture row has no marginal/copula split.
+    assert reloaded[key]["y_nlls"].keys() == y_space_nlls.keys()
+    for method, parts in y_space_nlls.items():
+        assert reloaded[key]["y_nlls"][method] == pytest.approx(parts, nan_ok=True)
     for method, R in R_dict.items():
         assert torch.equal(reloaded[key]["R_dict"][method], R)
 
@@ -522,7 +561,7 @@ def _cache_fp(
         live_generate=live_generate,
         dataset_dir=None,
         icl_rank=2,
-        oracle_mode="prior",
+        oracle_mode=spec.baselines.gp_predict,  # as run_evaluation passes it
         era5_geometry=era5_geometry,
         tabicl_pit_k_folds=5,
         tabicl_ckpt=tabicl_ckpt,
@@ -530,8 +569,13 @@ def _cache_fp(
 
 
 def test_alternate_noncomposite_is_part_of_the_live_cache_identity(tmp_path: Path) -> None:
+    # Since 2026-11-13 the default baselines (posterior, constant mean) differ from the old
+    # caches' fits, so the default identity records gp_mean; the old settings keep the old key set.
     default = _cache_fp(_eval_spec(tmp_path))
-    assert set(default) == _PRE_REFACTOR_FINGERPRINT_KEYS  # old caches still match by default
+    assert set(default) == _PRE_REFACTOR_FINGERPRINT_KEYS | {"gp_mean"}
+    legacy = _cache_fp(_eval_spec(tmp_path, "baselines.gp_predict=prior", "baselines.gp_mean=zero"))
+    assert set(legacy) == _PRE_REFACTOR_FINGERPRINT_KEYS
+    assert legacy["oracle_mode"] == "prior" and default["oracle_mode"] == "posterior"
     assert _cache_fp(_eval_spec(tmp_path, "alternate_noncomposite=false")) != default
 
 

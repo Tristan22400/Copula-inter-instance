@@ -28,6 +28,7 @@ _METHOD_ORDER = [
     ("gp_mle_ard_rq", "GP-MLE-ARD-RQ"),
     ("gp_mle_dot_product", "GP-MLE-DotProduct"),
     ("gp_mle_polynomial", "GP-MLE-Polynomial"),
+    ("gp_evidence", "GP-MLE (BIC-selected, context only)"),
     ("gp_zeromean_rbf", "Marginal + Zero Mean GP (RBF)"),
     ("gp_zeromean_matern32", "Marginal + Zero Mean GP (Matern32)"),
     ("dkl_rbf", "Deep Kernel Learning (RBF)"),
@@ -35,14 +36,14 @@ _METHOD_ORDER = [
     ("dkl_rq", "Deep Kernel Learning (RQ)"),
     ("dkl_dot_product", "Deep Kernel Learning (DotProduct)"),
     ("per_ep_transformer", "PerEp-Transformer"),
-    ("best_baseline", "Best-of-Baselines (per-episode)"),
+    ("best_baseline", "Best-of-Baselines (nested CV on query labels)"),
     ("icl", "ICL (pretrained)"),
-    ("oracle", "Oracle (prior)"),
+    ("oracle", "Oracle (posterior corr., known theta)"),
 ]
 
 
-# oracle_posterior appears only in the correlation-grid plot.
-_METHOD_LABELS = dict(_METHOD_ORDER) | {"oracle_posterior": "Oracle (posterior)"}
+# oracle_prior (the generator's unconditioned R_star) appears only in the correlation-grid plot.
+_METHOD_LABELS = dict(_METHOD_ORDER) | {"oracle_prior": "Oracle prior corr. (unconditioned)"}
 
 
 def _kernel_composition_label(ep: dict) -> str:
@@ -117,7 +118,7 @@ def _print_table(
             "Episodes: REAL ARCO-ERA5 2m-temperature. The shared z_test every row "
             "is scored against is the frozen-{s} K-fold PIT, NOT a ground-truth "
             "marginal (none exists on real data) — rows still differ only in their "
-            "correlation matrix R, so the ranking is valid, but 'Oracle (prior)' is "
+            "correlation matrix R, so the ranking is valid, but the Oracle row is "
             "structurally unavailable and prints nan.".format(s=z_train_source)
         )
     if real_label is not None:
@@ -125,7 +126,7 @@ def _print_table(
             f"Episodes: REAL data, {real_label}. The shared z_test is the frozen-{z_train_source} "
             "K-fold PIT, not a ground-truth marginal, so this table ranks correlation matrices "
             "against an estimated marginal and must NOT be read across methods as the result; "
-            "read the total Y-space NLL table. 'Oracle (prior)' prints nan."
+            "read the total Y-space NLL table. The Oracle row prints nan."
         )
     print(
         f"ICL z_train source: {z_train_source}"
@@ -138,13 +139,11 @@ def _print_table(
         m, s, n_valid = summaries[key]
         marker = ""
         if key == "best_baseline":
-            marker = "  ← per-episode best baseline (nested CV)"
+            marker = "  ← selected with the query labels (nested CV): a reference, not a method"
         elif key == "icl":
             marker = "  ← our model"
         elif key == "oracle":
-            marker = (
-                "  ← unconditional kernel corr. among test pts (NOT Bayes-optimal; see GP oracle Y-space NLL below)"
-            )
+            marker = "  ← copula of the known-theta GP posterior: the target under exact marginals"
         print(f"{label:<{col}}{m:>12.4f}{s:>12.4f}{f'{n_valid}/{attempted}':>12}{marker}")
     print(f"{'─' * total}\n")
 
@@ -164,9 +163,19 @@ def _print_y_space_oracle(y_space_nlls: list[dict[str, dict[str, float]]]) -> No
     print(f"  posterior (Schur-conditioned): mean={post_mean:.4f}  std={post_std:.4f}\n")
 
 
-# Fitted competitors (icl included) for the total table and both rank tables.
+# Fitted competitors (icl included) for the total table and both rank tables. gp_evidence is
+# left out: it copies one gp_mle_* row per episode, so ranking it would tie with its source.
 _RANK_KEYS = [
-    (k, label) for k, label in _METHOD_ORDER if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle")
+    (k, label)
+    for k, label in _METHOD_ORDER
+    if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle", "gp_evidence")
+]
+
+# Context-only GP selections and the plug-in competitor of the copula head (total table only).
+_GP_SELECTION_ROWS = [
+    ("gp_evidence", "GP-MLE (BIC-selected, context only)"),
+    ("gp_evidence_mix", "GP-MLE (BIC-weighted mixture)"),
+    ("marg_gp_evidence", "Marginal + GP-MLE posterior corr. (BIC)"),
 ]
 
 
@@ -174,22 +183,32 @@ _RANK_KEYS = [
 _GP_TOTAL_KEYS = tuple(k for k, _ in _RANK_KEYS if k.startswith("gp_mle_") or k.startswith("gp_zeromean_"))
 
 
-# Total-NLL rank: adds independence, the autoregressive row and best_gp_total; no oracles.
-_TOTAL_RANK_ORDER = _RANK_KEYS + [
-    ("independence_marginal", "Independence (marginal only)"),
-    ("autoregressive", "Autoregressive marginal (chain rule)"),
-    ("best_gp_total", "Best GP (per-episode, post hoc)"),
-]
+# Total-NLL rank: adds the context-only GP selections (not gp_evidence, a copy of a ranked row),
+# independence, the autoregressive row and best_gp_total; no oracles.
+_TOTAL_RANK_ORDER = (
+    _RANK_KEYS
+    + [row for row in _GP_SELECTION_ROWS if row[0] != "gp_evidence"]
+    + [
+        ("independence_marginal", "Independence (marginal only)"),
+        ("autoregressive", "Autoregressive marginal (chain rule)"),
+        ("best_gp_total", "Best GP (oracle pick on y_test)"),
+    ]
+)
 
 
 # Total-table row order: competitors, independence, autoregressive, then the
 # oracle references. autoregressive has no R, so it is only in Y-space tables.
-_TOTAL_NLL_ORDER = _RANK_KEYS + [
-    ("independence_marginal", "Independence (marginal only)"),
-    ("autoregressive", "Autoregressive marginal (chain rule)"),
-    ("oracle_prior", "Oracle (prior, unconditioned)"),
-    ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
-]
+_TOTAL_NLL_ORDER = (
+    _RANK_KEYS
+    + _GP_SELECTION_ROWS
+    + [
+        ("independence_marginal", "Independence (marginal only)"),
+        ("autoregressive", "Autoregressive marginal (chain rule)"),
+        ("marg_oracle_corr", "Marginal + oracle posterior corr. (known theta)"),
+        ("oracle_prior", "Oracle (prior, unconditioned)"),
+        ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
+    ]
+)
 
 
 def _ar_note(

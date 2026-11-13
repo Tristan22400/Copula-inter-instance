@@ -41,8 +41,8 @@ extras: `--extra tabpfn` (`tabpfn35_fast`, PriorLabs TabPFN-3.5 Fast) and
 `--extra kumo` (`kumo_small`, NVIDIA Kumo Tabular small); `--extra era5` is the
 real-data loader. The Grid5000 command above includes all of them: keep every
 extra on every later `uv sync` (including repairs with `--reinstall-package`),
-which otherwise uninstalls the ones left out. TabPFN also needs a PriorLabs API key in `TABPFN_TOKEN` whose
-account accepted the TabPFN-3.5 licence (see [architecture](architecture.md)).
+which otherwise uninstalls the ones left out. TabPFN also needs a PriorLabs API key whose account accepted the TabPFN-3.5
+licence (see **Credentials** below).
 Without an extra, its tests are skipped and selecting it raises an ImportError.
 If your laptop mounts the same storage (sshfs), don't run `uv sync` through the
 mount. That would overwrite the cluster's GPU venv with a CPU one linked to the
@@ -50,6 +50,28 @@ laptop's Python. Keep a laptop venv elsewhere:
 
 ```bash
 UV_PROJECT_ENVIRONMENT=~/.local/share/venvs/copula-inter-cpu uv sync --locked --extra dev --extra cpu
+```
+
+**Credentials.** `copula_inter.credentials` resolves the TabPFN API key
+(`TABPFN_TOKEN`) and the path of your Grid5000 SSH key (`COPULA_SSH_KEY`);
+nothing secret is committed. The first source that holds a value wins:
+
+1. the environment variable;
+2. `.env` at the checkout root (git-ignored; template `.env.example`);
+3. a one-line file in `~/.config/copula-inter/` (`tabpfn_token`, `ssh_key_path`;
+   `COPULA_CONFIG_DIR` moves the directory);
+4. for TabPFN only, the legacy `~/.config/tabpfn_token` (or `$TABPFN_TOKEN_FILE`).
+
+Every file must be mode 600 or the loader refuses it. Never pass a key on a
+command line, because `ps`/`oarstat` show job command lines to every cluster user.
+
+```bash
+cp .env.example .env && chmod 600 .env       # then fill in TABPFN_TOKEN, COPULA_SSH_KEY
+# or, outside the checkout (shared by every worktree):
+install -d -m 700 ~/.config/copula-inter
+install -m 600 /dev/null ~/.config/copula-inter/tabpfn_token && $EDITOR ~/.config/copula-inter/tabpfn_token
+# Load the SSH key into the running ssh-agent (once per agent; asks the passphrase):
+uv run --no-sync python -c "from copula_inter.credentials import ssh_add; ssh_add(lifetime_s=8*3600)"
 ```
 
 ### Other Grid5000 sites (when the thoth GPUs are full)
@@ -218,6 +240,24 @@ table compares correlations on a shared `z_test`.
 `python -m eval.results scores.json` re-renders the totals later without loading
 any model.
 
+**GP baselines.** Every GP-MLE, DKL and zero-mean GP row predicts its
+posterior given the context (`baselines.gp_predict=posterior`), with a learned
+mean (`baselines.gp_mean=constant`; `zero` or `linear` also work). Tables made
+before 2026-11-13 used `gp_predict=prior`: those rows scored the fitted kernel's
+prior at the queries and ignored the context, so do not compare them with newer
+tables. Rows that pick or mix GPs:
+
+| Row | Selects with | Role |
+|---|---|---|
+| GP-MLE (BIC-selected) | context only: $\max_k \log p(y_C\mid\hat\theta_k) - \tfrac{k}{2}\log P$ | competitor |
+| GP-MLE (BIC-weighted mixture) | context only, weights $\propto e^{\mathrm{BIC}_k}$ | competitor |
+| Marginal + GP-MLE posterior corr. (BIC) | the same marginal as our model, $R_{po}(\hat\theta)$ as copula | matched competitor of the copula head |
+| Marginal + oracle posterior corr. | the same marginal, $R_{po}(\theta)$ of the true GP | reference (synthetic only) |
+| Best-of-Baselines, Best GP | query labels | reference, not a method |
+
+The z-space "Oracle" row is the copula of the known-θ GP posterior, $R_{po}$:
+under exact marginals $z_{\text{test}}\sim\mathcal N(0, R_{po})$.
+
 ### Real ERA5 episodes
 
 These are the same baselines, nested-CV best-of-baselines, tables and caches, on
@@ -232,7 +272,7 @@ oarsub -S "./scripts/eval_checkpoint_era5.sh ckpt=<ckpt>"
 ```
 
 Differences from synthetic data:
-- Real data has no generating kernel, so the "Oracle (prior)" row and the
+- Real data has no generating kernel, so the "Oracle" rows and the
   analytic GP rows are `nan`, and `marginal.z_train_source=oracle` is rejected.
 - The shared `z_test` is the frozen-TabICL K-fold PIT, not a ground-truth
   marginal. Read the total table.
@@ -461,7 +501,8 @@ same test forward). `compare_methods` ranks the methods per dataset on total NLL
 Friedman test and Holm-corrected pairwise Wilcoxon tests, over the datasets
 every method completed; a run that failed for memory on a 48 GB GPU leaves its
 dataset out of the ranking (`"failed"` in its JSON). TabPFN and Kumo need a venv
-with the `tabpfn` / `kumo` extras (`COPULA_VENV`) and, for TabPFN, `TABPFN_TOKEN`.
+with the `tabpfn` / `kumo` extras (`COPULA_VENV`) and, for TabPFN, the API key
+(see **Credentials** under Environment).
 
 A copula on another backend takes `ckpt` with `marginal` and `marginal_ckpt`; the
 runner checks against the copula's training config (`data.z_train_source`,

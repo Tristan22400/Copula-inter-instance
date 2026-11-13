@@ -106,7 +106,7 @@ def _results_fingerprint(
         "lr_zeromean_gp": spec.baselines.lr_zeromean_gp,
         "n_restarts_zeromean_gp": spec.baselines.n_restarts_zeromean_gp,
         # Bump when the derived total-NLL or rank rows change.
-        "result_schema": 3,
+        "result_schema": 4,
         "autoregressive": bool(spec.autoregressive.enabled),
         "ar_order": spec.autoregressive.order if spec.autoregressive.enabled else None,
         "ar_conditioning": spec.autoregressive.conditioning if spec.autoregressive.enabled else None,
@@ -149,6 +149,7 @@ def _baseline_cache_fingerprint(
         spec.baselines.patience_per_ep,
         gp_val_select=spec.baselines.gp_val_select,
         n_restarts_dkl=spec.baselines.n_restarts_dkl,
+        gp_mean=spec.baselines.gp_mean,
     )
     if live_generate and not spec.alternate_noncomposite:
         # Changes which kernel every even-index live episode draws (pre-refactor always alternated).
@@ -319,9 +320,10 @@ def run_evaluation(spec: EvalSpec) -> None:
     )
     print(f"z_train source (ICL conditioning input): {spec.marginal.z_train_source}")
 
-    # Baselines score against the same oracle_mode as R_star (default "prior").
-    oracle_mode = spec.selection.oracle_mode or OmegaConf.select(cfg, "data.oracle_mode", default="prior")
-    print(f"Oracle mode: {oracle_mode}")
+    # What the fitted GP baselines predict at the queries ("posterior": conditioned on the context).
+    # Independent of data.oracle_mode, which only names the generator's stored R_star.
+    oracle_mode = spec.baselines.gp_predict
+    print(f"GP baselines predict: {oracle_mode} (mean function: {spec.baselines.gp_mean})")
 
     # Baseline hyperpriors from cfg.data, falling back to classical._DEFAULT_PRIOR_CFG.
     data_cfg = OmegaConf.select(cfg, "data", default=None)
@@ -427,6 +429,7 @@ def run_evaluation(spec: EvalSpec) -> None:
             n_restarts_mle=spec.baselines.n_restarts_mle,
             n_restarts_dkl=spec.baselines.n_restarts_dkl,
             gp_val_select=spec.baselines.gp_val_select,
+            gp_mean=spec.baselines.gp_mean,
         ),
         baseline_cache=baseline_cache,
         fingerprint=fingerprint,

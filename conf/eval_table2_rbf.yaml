@@ -1,0 +1,107 @@
+# Episode distribution of the thesis Table 2/3 'rbf' eval (eval_checkpoint config=conf/eval_table2_rbf.yaml).
+# data is pinned verbatim from the 2026-09-22/23 run's baseline-cache fingerprint
+# (eval/results/table2/rbf/results_partial.json), so later gp_tasks.yaml edits do not change it.
+defaults:
+  - config
+  - _self_
+
+data:
+  d_features: 10
+  d_features_lognormal_loc: 2.302585
+  d_features_lognormal_scale: 0.4
+  inactive_frac_min: 0.1
+  inactive_frac_max: 0.8
+  P_min: 32
+  P_max: 32
+  N_min: 64
+  N_max: 64
+  n_tasks: 20000000
+  l_lognormal_loc: 0.0
+  l_lognormal_scale: 1.0
+  l_lognormal_k_exponent: 0.5
+  l_lognormal_k_cap: 15
+  alpha2_gamma_concentration: 4.0
+  alpha2_gamma_rate: 3.0
+  ard: true
+  isotropic_ratio: 0.3
+  mlp_mixing_enabled: true
+  mlp_mixing_prob: 0.9
+  mlp_num_layers_min: 1
+  mlp_num_layers_max: 4
+  mlp_mix_weight_std: 1.0
+  kernel_hidden_enabled: true
+  kernel_hidden_prob: 1.0
+  kernel_hidden_layers_min: 1
+  kernel_hidden_layers_max: 2
+  kernel_hidden_bottleneck_frac: 0.5
+  kernel_hidden_weight_std: 1.0
+  structural_warp_enabled: true
+  structural_warp_prob: 0.3
+  structural_warp_num_ops_min: 2
+  structural_warp_num_ops_max: 6
+  structural_warp_category_weights:
+    invariances: 0.6
+    structure: 0.6
+    seasonality: 0.5
+    artifacts: 0.3
+    analytic: 0.4
+    discrete: 0.6
+  structural_warp_index_axis_enabled: false
+  structural_warp_index_axis_ratio: 0.5
+  mean_fn_enabled: true
+  mean_fn_prob: 0.5
+  mean_fn_family_probs:
+  - 0.5
+  - 0.25
+  - 0.25
+  mean_fn_linear_prob: 0.5
+  mean_fn_weight_std: 0.5
+  mean_fn_bias_std: 1.0
+  mean_fn_exp_rate_std: 0.5
+  mean_fn_exp_scale_std: 1.0
+  mean_fn_anomaly_frac: 0.1
+  mean_fn_anomaly_magnitude_std: 2.0
+  nugget_lognormal_loc: -4.63
+  nugget_lognormal_scale: 0.5
+  oracle_mode: prior
+  kernel: rbf
+  systematic_composition: false
+  composite_num_kernels_min: 1
+  composite_num_kernels_max: 8
+  composite_num_kernels_lognormal_loc: 0.55
+  composite_num_kernels_lognormal_scale: 1.05
+  composite_exclude_kernels:
+  - cosine
+  - periodic
+  - dot_product
+  - polynomial
+  period_lognormal_loc: 0.1823
+  period_lognormal_scale: 0.4
+  rq_alpha_gamma_concentration: 2.0
+  rq_alpha_gamma_rate: 1.0
+  poly_power_min: 2
+  poly_power_max: 5
+  poly_offset_gamma_concentration: 2.0
+  poly_offset_gamma_rate: 1.0
+  sign_modulation_sharpness_lognormal_loc: 1.0986
+  sign_modulation_sharpness_lognormal_scale: 0.5
+  sign_modulation_component_prob: 0.0
+  sign_modulation_outer_prob: 0.0
+  pit_eps: 1.0e-06
+  z_train_source: tabicl
+  z_train_marginal_probs_n: 99
+  z_train_tabicl_k_folds: 5
+  z_train_split_calib_frac: 1.0
+  z_train_tabicl_mix_enabled: false
+  z_train_tabicl_mix_floor_frac: 0.05
+  z_train_tabicl_mix_max_frac: 0.35
+  z_train_tabicl_mix_adaptive: false
+  z_train_corruption_enabled: false
+  z_train_corruption_prob: 1.0
+  z_train_corruption_rho_beta_a: 3.5
+  z_train_corruption_rho_beta_b: 1.5
+  shard_size: 256
+  dataset_dir: ./data/systematic_composition
+  pit_dir: ${data.dataset_dir}/pit
+  resume: false
+  kernels: null

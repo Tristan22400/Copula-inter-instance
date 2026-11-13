@@ -23,13 +23,17 @@ from torch.optim import Adam
 
 from copula_inter.copula.loss import gp_oracle_y_nll
 
-__all__ = ["ARD_ELIGIBLE", "GP_LR_MLE", "fit_and_eval_gpytorch", "fit_gp_baseline_nll"]
+__all__ = ["ARD_ELIGIBLE", "GP_LR_MLE", "GP_MEANS", "fit_and_eval_gpytorch", "fit_gp_baseline_nll"]
 
 # Default Adam learning rate of the MAP fit (eval_checkpoint and the ERA5 training probes).
 GP_LR_MLE = 0.05
 
 # Silence psd_safe_cholesky's jitter warnings during fitting.
 warnings.filterwarnings("ignore", category=NumericalWarning)
+
+
+# Mean functions of the fitted GP: zero, a learned constant, or a learned affine function of x.
+GP_MEANS = ("zero", "constant", "linear")
 
 
 # Matern nu per kernel name.
@@ -158,10 +162,22 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         feature_extractor: nn.Module | None = None,
         kernel_priors: dict[str, Prior] | None = None,
         poly_power: int = _POLY_BASELINE_POWER,
+        mean: str = "zero",
     ) -> None:
         super().__init__(X_train, y_train, likelihood)
         self.feature_extractor = feature_extractor
-        self.mean_module = gpytorch.means.ZeroMean()
+        # The mean acts on the raw inputs (before any feature extractor), initialized at y_train's mean.
+        y_bar = float(y_train.mean()) if y_train.numel() else 0.0
+        if mean == "zero":
+            self.mean_module: gpytorch.means.Mean = gpytorch.means.ZeroMean()
+        elif mean == "constant":
+            self.mean_module = gpytorch.means.ConstantMean()
+            self.mean_module.initialize(constant=y_bar)
+        elif mean == "linear":
+            self.mean_module = gpytorch.means.LinearMean(input_size=X_train.shape[-1])
+            self.mean_module.initialize(weights=torch.zeros_like(self.mean_module.weights), bias=y_bar)
+        else:
+            raise ValueError(f"Unknown GP mean {mean!r}; expected one of {GP_MEANS}")
         kp = kernel_priors or {}
 
         # Omit ard_num_dims instead of passing None (PeriodicKernel does not accept None).
@@ -200,9 +216,10 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         )
 
     def forward(self, x: Tensor) -> gpytorch.distributions.MultivariateNormal:
+        mean_x = self.mean_module(x)
         if self.feature_extractor is not None:
             x = self.feature_extractor(x)
-        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
+        return gpytorch.distributions.MultivariateNormal(mean_x, self.covar_module(x))
 
 
 def _val_check_steps(n_steps: int) -> set[int]:
@@ -227,8 +244,9 @@ def fit_and_eval_gpytorch(
     prior_cfg: dict | None = None,
     n_restarts: int = 1,
     val_select: bool = False,
+    mean: str = "zero",
 ) -> dict[str, Tensor]:
-    """Fit a GP (or DKL) on raw y_train and return {"R", "mean", "Sigma"} at X_test.
+    """Fit a GP (or DKL) on raw y_train and return {"R", "mean", "Sigma", "log_ml", "n_hparams"} at X_test.
 
     Maximizes the exact marginal likelihood plus the hyperpriors (MAP) from
     n_restarts random initializations and keeps the best. oracle_mode="posterior"
@@ -237,8 +255,13 @@ def fit_and_eval_gpytorch(
     the fit for every candidate degree. With a feature extractor, or when
     val_select applies, 20% of the training points are held out and the step
     with the best held-out NLL is kept (not below P = 8). mean and Sigma are in
-    raw y units.
+    raw y units. mean is the GP mean function (GP_MEANS). log_ml is the log
+    marginal likelihood log p(y_train | X_train, theta_hat) of the kept fit
+    (no hyperprior term), n_hparams its trainable parameter count; together
+    they give a context-only model-selection score (e.g. BIC).
     """
+    if mean not in GP_MEANS:
+        raise ValueError(f"Unknown GP mean {mean!r}; expected one of {GP_MEANS}")
     if kernel_name == "periodic" and feature_extractor_factory is not None:
         raise ValueError("kernel_name='periodic' is not PD in a >1D DKL latent space")
     if ard and feature_extractor_factory is not None:
@@ -301,6 +324,7 @@ def fit_and_eval_gpytorch(
                     feature_extractor=feature_extractor,
                     kernel_priors=kernel_priors,
                     poly_power=poly_power,
+                    mean=mean,
                 ).to(X_train.device)
                 _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
 
@@ -358,6 +382,12 @@ def fit_and_eval_gpytorch(
     if use_val:
         # Condition on the full training set for the final evaluation.
         model.set_train_data(inputs=X_train, targets=y_train, strict=False)
+    # Log marginal likelihood of the full context under the kept hyperparameters (train mode = prior marginal).
+    model.train()
+    likelihood.train()
+    with torch.no_grad():
+        log_ml = likelihood(model(X_train)).log_prob(y_train)
+    n_hparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model.eval()
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
@@ -374,7 +404,13 @@ def fit_and_eval_gpytorch(
     )
 
     R, _ = sigma_to_correlation(Sigma_post)
-    return {"R": R, "mean": mean_post, "Sigma": Sigma_post}
+    return {
+        "R": R,
+        "mean": mean_post,
+        "Sigma": Sigma_post,
+        "log_ml": log_ml.detach(),
+        "n_hparams": torch.tensor(float(n_hparams)),
+    }
 
 
 # GP baseline NLL cache (fits do not depend on the checkpoint).

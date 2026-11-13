@@ -281,6 +281,10 @@ def _train_step(m: SimpleNamespace, out: dict[str, torch.Tensor]) -> dict[str, t
     return init_state
 
 
+# The GP fit outputs main @ 42c0402 returned; later additions (log_ml, n_hparams) are not pinned.
+_GP_FIT_KEYS = ("R", "mean", "Sigma")
+
+
 def _baselines(m: SimpleNamespace, out: dict[str, torch.Tensor]) -> None:
     c = m.classical
     _seed(3)
@@ -289,11 +293,11 @@ def _baselines(m: SimpleNamespace, out: dict[str, torch.Tensor]) -> None:
     for name, ard in (("rbf", False), ("matern32", True)):
         _seed(4)
         res = c.fit_and_eval_gpytorch(X_train, y_train, X_test, name, n_steps=15, lr=0.05, ard=ard)
-        _flatten(f"baseline.gp_mle.{name}.ard{int(ard)}", res, out)
+        _flatten(f"baseline.gp_mle.{name}.ard{int(ard)}", {k: res[k] for k in _GP_FIT_KEYS}, out)
     _seed(5)
     z_train = torch.randn(14)
     res = c.fit_zero_mean_gp_on_marginal(X_train, z_train, X_test, "rbf", n_steps=15, lr=0.05, n_restarts=1)
-    _flatten("baseline.zero_mean_gp.rbf", res, out)
+    _flatten("baseline.zero_mean_gp.rbf", {k: res[k] for k in _GP_FIT_KEYS}, out)
     out["baseline.corr_nll_single"] = torch.tensor(c.corr_nll_single(res["R"], torch.randn(8)), dtype=torch.float64)
 
 

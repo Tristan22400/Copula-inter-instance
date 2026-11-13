@@ -28,7 +28,7 @@
 # both summary tables, and the resumable per-episode baseline/results caches.
 #
 # What CANNOT carry over: real ERA5 has no generating kernel, so the
-# "Oracle (prior)" row and the analytic GP prior/posterior Y-space rows are
+# Oracle rows and the analytic GP prior/posterior Y-space rows are
 # nan, and the shared z_test every row is scored against is the frozen-TabICL
 # K-fold PIT rather than a ground-truth marginal. The Y-space total-NLL
 # table (each method's own predictive density, scored at the same real

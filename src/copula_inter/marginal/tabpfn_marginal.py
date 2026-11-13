@@ -16,8 +16,9 @@ its CDF and log-density at y, tails included. Phase A's quantiles come from
 bar_icdf, a vectorized, differentiable copy of FullSupportBarDistribution.icdf
 (tests/test_marginal_backends.py checks it against the original).
 
-Needs the `tabpfn` uv extra and TABPFN_TOKEN, with the TabPFN-3.5 licence
-accepted at https://ux.priorlabs.ai (never commit the key).
+Needs the `tabpfn` uv extra and a PriorLabs API key with the TabPFN-3.5 licence
+accepted at https://ux.priorlabs.ai, resolved by copula_inter.credentials
+(TABPFN_TOKEN, .env or ~/.config/copula-inter/tabpfn_token; never commit it).
 """
 
 from __future__ import annotations
@@ -25,11 +26,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
-import os
 from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import torch
+
+from copula_inter.credentials import export_tabpfn_token
 
 if TYPE_CHECKING:
     from tabpfn import TabPFNRegressor
@@ -303,13 +305,8 @@ def make_tabpfn_regressor(device: str | None = None) -> TabPFNMarginal:
 
 
 def _require_tabpfn_token() -> None:
-    if not os.environ.get("TABPFN_TOKEN"):
-        raise RuntimeError(
-            "TabPFN-3.5 requires a one-time license acceptance: open "
-            "https://ux.priorlabs.ai, log in, accept the TabPFN-3.5 license, copy your "
-            "API key from the account page, then `export TABPFN_TOKEN=...` "
-            "(job scripts read ~/.config/tabpfn_token) before running this backend."
-        )
+    """Resolve the key (copula_inter.credentials) into os.environ, where tabpfn reads it."""
+    export_tabpfn_token()
 
 
 def bar_pit(bardist: Any, logits: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
