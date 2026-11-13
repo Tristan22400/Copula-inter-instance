@@ -38,10 +38,13 @@ from eval.runners.hydra_cli import check_choice, hydra_entry
 __all__ = ["PairedCompareSpec", "across_datasets", "paired_deltas", "within_run_deltas"]
 
 TERMS = ("total", "marginal", "copula")
-# The within-run contrasts: (label, copula-model key, reference key).
+# The within-run contrasts: (label, copula-model key, reference key). "marg_gp_evidence" is the
+# matched competitor: the same marginal with the BIC-selected GP-MLE posterior correlation.
 WITHIN_RUN = (
     ("copula - independence", "icl", "independence_marginal"),
     ("copula - autoregressive", "icl", "autoregressive"),
+    ("copula - marginal+GP corr (BIC)", "icl", "marg_gp_evidence"),
+    ("copula - GP-MLE (BIC)", "icl", "gp_evidence"),
     ("copula - best_baseline", "icl", "best_baseline"),
 )
 

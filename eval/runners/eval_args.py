@@ -17,6 +17,8 @@ from eval.configs.constants import (
     AR_CONDITIONINGS,
     AR_ORDERS,
     ERA5_DEFAULT_CORPUS_DIR,
+    GP_MEANS,
+    GP_PREDICT_MODES,
     GP_VAL_SELECT_MODES,
     N_CONTEXT,
 )
@@ -212,6 +214,12 @@ class BaselineSpec:
     patience_per_ep: int = 500
     # GP-MLE kernels that select their fit on a held-out 20% split: "ard", "always" or "never".
     gp_val_select: str = "ard"
+    # What the GP-MLE, DKL and zero-mean GP rows predict at the queries: "posterior" (conditioned
+    # on the context, the competitor) or "prior" (ignores the context; reproduces tables made
+    # before 2026-11-13, when the baselines followed data.oracle_mode=prior).
+    gp_predict: str = "posterior"
+    # Mean function of the GP-MLE and DKL fits: "zero", "constant" or "linear" (affine in x).
+    gp_mean: str = "constant"
     # "cpu" (faster for these 32-point fits), "cuda", or "auto" to follow the top-level device.
     device: str = "cpu"
     # Fitting processes; 0 = one per physical core (capped at 32), 1 = serial. CPU only.
@@ -252,8 +260,6 @@ class SelectionSpec:
     # Test-point floor per episode; default 2 * min_fold_size. Raises data.N_min for live
     # generation, skips smaller episodes from a dataset.
     min_test_points: int | None = None
-    # "prior" or "posterior" R_star; default: the checkpoint config's data.oracle_mode, else "prior".
-    oracle_mode: str | None = None
 
 
 @dataclass
@@ -362,7 +368,8 @@ def validate_eval_spec(spec: EvalSpec) -> None:
     check_choice("autoregressive.conditioning", spec.autoregressive.conditioning, AR_CONDITIONINGS)
     check_choice("baselines.gp_val_select", spec.baselines.gp_val_select, GP_VAL_SELECT_MODES)
     check_choice("baselines.device", spec.baselines.device, ("cpu", "cuda", "auto"))
-    check_choice("selection.oracle_mode", spec.selection.oracle_mode, ("prior", "posterior"))
+    check_choice("baselines.gp_predict", spec.baselines.gp_predict, GP_PREDICT_MODES)
+    check_choice("baselines.gp_mean", spec.baselines.gp_mean, GP_MEANS)
     if spec.era5.enabled:
         if spec.dataset_dir is not None:
             raise ValueError("era5.enabled and dataset_dir are mutually exclusive episode sources.")

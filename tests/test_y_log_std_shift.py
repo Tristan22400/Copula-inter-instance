@@ -67,6 +67,26 @@ def test_each_row_gets_the_jacobian_once(monkeypatch: MonkeyPatch, y_log_std: fl
     assert rows["icl"]["total"] == pytest.approx(0.5)
 
 
+@pytest.mark.parametrize("y_log_std", [0.0, _LOG_STD])
+def test_gp_selection_rows_shift_once(monkeypatch: MonkeyPatch, y_log_std: float) -> None:
+    """gp_evidence / gp_evidence_mix are fitted rows (shifted); the plug-in marginal row is raw nats (not shifted)."""
+    _stub_scoring(monkeypatch)
+    ep = {"z_test": torch.zeros(_N), "y_log_std": y_log_std}
+    mix = {"total": 1.5, "marginal": float("nan"), "copula": float("nan")}
+    baselines = (
+        {"gp_evidence": 0.0},
+        {"gp_evidence": torch.eye(_N)},
+        {"gp_evidence": dict(_STD_ROW), "gp_evidence_mix": dict(mix)},
+    )
+
+    rows = scoring._score_episode(_ctx(zeromean_gp=False), ep, 0, 0, 0, baselines).total_nlls
+
+    assert rows["gp_evidence"]["total"] == pytest.approx(1.0 + y_log_std)
+    assert rows["gp_evidence_mix"]["total"] == pytest.approx(1.5 + y_log_std)
+    # Stub marginal: z_test = 0 and log_pdf = 0, so with R = I every part is 0, whatever y_log_std.
+    assert rows["marg_gp_evidence"] == pytest.approx({"total": 0.0, "marginal": 0.0, "copula": 0.0}, abs=1e-5)
+
+
 def test_shift_does_not_mutate_cached_rows(monkeypatch: MonkeyPatch) -> None:
     """The baseline cache entry passed in keeps its standardized-y values."""
     _stub_scoring(monkeypatch)

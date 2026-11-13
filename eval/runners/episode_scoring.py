@@ -89,12 +89,18 @@ def _eval_icl_episode(
     marginal_pit, when given, replaces the episode's z_train as the model input
     and supplies the marginal (z_test, log_pdf_test) for the model's Y-space NLL.
 
+    The z-space oracle is R_post, the correlation of the known-theta GP posterior
+    Sigma_post = K_QQ - K_QC K_CC^{-1} K_CQ: the shared z_test is the exact
+    posterior PIT, so z_test ~ N(0, R_post) and R_post is the copula target. The
+    generator's R_star (prior correlation among the queries, ignoring the context)
+    is kept in R_dict["oracle_prior"] for the plot only.
+
     Returns:
         (nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts): nlls holds the
-        shared-z_test copula NLLs of icl and oracle; y_space_nlls the analytic GP
-        prior/posterior Y-space NLLs ({total, marginal, copula}, NaN when
-        unavailable); icl_y_parts the model's own Y-space split (NaN without
-        marginal_pit).
+        shared-z_test copula NLLs of icl and oracle; R_oracle is R_post (None on
+        real data); y_space_nlls the analytic GP prior/posterior Y-space NLLs
+        ({total, marginal, copula}, NaN when unavailable); icl_y_parts the
+        model's own Y-space split (NaN without marginal_pit).
     """
     X_train = ep["x_norm_train"].to(device)  # (P, d_x)
     z_train = (
@@ -103,8 +109,9 @@ def _eval_icl_episode(
     X_test = ep["x_norm_test"].to(device)  # (N, d_x)
     z_test = ep["z_test"].to(device)  # (N,)
     assert_shared_z_test(z_test, ep)
-    # Real-ERA5 episodes have no generating kernel: skip the oracle part.
-    R_oracle = ep["R_star"].to(device) if "R_star" in ep else None  # (N, N) or None
+    # Real episodes have no generating kernel: no R_star, no oracle.
+    R_prior = ep["R_star"].to(device) if "R_star" in ep else None  # (N, N) or None
+    R_oracle: Tensor | None = None
 
     P, N = X_train.shape[0], X_test.shape[0]
     nlls: dict[str, float] = {}
@@ -145,20 +152,17 @@ def _eval_icl_episode(
         nlls["icl"] = float("nan")
         R_dict["icl"] = R_I.clone()
 
-    if R_oracle is not None:
-        nlls["oracle"] = corr_nll_single(R_oracle, z_test)
-        R_dict["oracle"] = R_oracle
-
-    # "oracle" is the prior reference (R_star). The posterior Y-space reference
-    # comes from gp_analytical_posterior; R_post is only kept for plotting.
     y_space_nlls = {"prior": _NAN_PARTS.copy(), "posterior": _NAN_PARTS.copy()}
     try:
-        if R_oracle is None:
+        if R_prior is None:
             raise NotImplementedError(
                 "no generating kernel (real-data episode) -- no analytic GP prior/posterior reference exists"
             )
         post = gp_analytical_posterior(ep)
-        R_dict["oracle_posterior"] = post["R_post"].to(device)
+        R_oracle = post["R_post"].to(device=device, dtype=z_test.dtype)
+        nlls["oracle"] = corr_nll_single(R_oracle, z_test)
+        R_dict["oracle"] = R_oracle
+        R_dict["oracle_prior"] = R_prior
         y_space_nlls = {
             "prior": {
                 "total": post["nll_prior"],
@@ -174,7 +178,8 @@ def _eval_icl_episode(
         if post["repaired"]:
             print(f"    [oracle_posterior] PSD repair fired (min_eig={post['min_eig']:.2e})")
     except (KeyError, NotImplementedError) as exc:
-        R_dict["oracle_posterior"] = R_I.clone()
+        if R_prior is not None:
+            nlls["oracle"] = float("nan")
         print(f"  [oracle_posterior] unavailable: {exc}")
 
     return nlls, R_dict, R_oracle, y_space_nlls, icl_y_parts
@@ -447,6 +452,36 @@ def _with_zero_mean_gp(
     )
 
 
+def _marginal_plugin_rows(
+    marginal_pit: dict[str, Tensor] | None,
+    baseline_nlls: dict[str, float],
+    baseline_R: dict[str, Tensor],
+    R_oracle: Tensor | None,
+    device: torch.device,
+) -> dict[str, dict[str, float]]:
+    """The learned marginal with a plug-in Gaussian-copula correlation, in raw nats.
+
+    marg_gp_evidence: R_post(theta_hat) of the BIC-selected GP-MLE, the matched
+    competitor of the copula head (same marginal, GP-structured dependence).
+    marg_oracle_corr: R_post(theta) of the known-theta GP, a reference (synthetic only).
+    """
+    rows = {"marg_gp_evidence": _NAN_PARTS.copy(), "marg_oracle_corr": _NAN_PARTS.copy()}
+    if marginal_pit is None:
+        return rows
+    z = marginal_pit["z_test"].to(device).unsqueeze(0)
+    log_pdf = marginal_pit["log_pdf_test"].to(device).unsqueeze(0)
+    mask = torch.ones_like(z, dtype=torch.bool)
+    # A failed BIC selection has a nan shared-z NLL (and a placeholder identity R).
+    gp_ok = np.isfinite(baseline_nlls.get("gp_evidence", float("nan")))
+    sources = {"marg_gp_evidence": baseline_R.get("gp_evidence") if gp_ok else None, "marg_oracle_corr": R_oracle}
+    for key, R in sources.items():
+        if R is None or not torch.isfinite(R).all():
+            continue
+        parts = y_space_nll(R.to(device=device, dtype=z.dtype).unsqueeze(0), z, log_pdf, mask)
+        rows[key] = {k: v.item() for k, v in parts.items()}
+    return rows
+
+
 def _total_nll_rows(
     ep: dict,
     baseline_y_nlls: dict[str, dict[str, float]],
@@ -512,7 +547,7 @@ def _print_episode(
     # Per-point numbers against the shared z_test.
     print(
         f"    icl(shared_marginal)={icl_nll:.4f}  "
-        f"oracle_prior(shared_marginal, z-space copula)={ora_nll:.4f}  "
+        f"oracle(shared_marginal, R_post known theta)={ora_nll:.4f}  "
         f"GP-oracle-y-space-total(prior={total_nlls['oracle_prior']['total']:.4f}, "
         f"posterior={total_nlls['oracle_posterior']['total']:.4f})"
     )
@@ -589,7 +624,8 @@ def _score_episode(
         device=device,
         marginal_pit=marginal_pit,
     )
-    total_nlls = _total_nll_rows(ep, baseline_y_nlls, icl_y_parts, y_space_nlls, marginal_pit)
+    plugin_rows = _marginal_plugin_rows(marginal_pit, baseline_nlls, baseline_R, R_oracle, device)
+    total_nlls = _total_nll_rows(ep, {**baseline_y_nlls, **plugin_rows}, icl_y_parts, y_space_nlls, marginal_pit)
     meta = {
         "ep_i": ep_i,
         "n_test": ep["z_test"].shape[0],

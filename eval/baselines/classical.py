@@ -4,9 +4,15 @@ Methods:
     independence: R = I (copula NLL 0).
     gp_prior_rbf: RBF prior correlation with a median bandwidth.
     gp_mle_{rbf, matern32, periodic, rq, dot_product, polynomial} and ARD
-        variants (gp_mle_ard_*): GP posterior with MAP-fitted hyperparameters,
-        fitted on raw y; polynomial searches every degree in
+        variants (gp_mle_ard_*): GP with MAP-fitted hyperparameters and mean
+        function (gp_mean), fitted on raw y, predicting its posterior given the
+        context (oracle_mode="posterior"; "prior" ignores the context and is
+        kept only to reproduce old tables); polynomial searches every degree in
         [poly_power_min, poly_power_max].
+    gp_evidence: the gp_mle_* fit with the highest BIC,
+        log p(y_C | theta_hat) - (k / 2) log P, a selection from the context
+        alone. gp_evidence_mix (Y-space only): the BIC-weighted mixture of the
+        gp_mle_* predictive densities.
     dkl_{rbf, matern32, rq, dot_product}: deep kernel learning, an MLP
         (d_x -> 32 -> 16) feeding a GP, trained on the marginal likelihood.
     per_ep_transformer: small set transformer trained on the episode's
@@ -22,6 +28,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import os
 from typing import TYPE_CHECKING
 
@@ -84,6 +91,7 @@ EXPECTED_BASELINE_KEYS = frozenset(
         "gp_mle_ard_rq",
         "gp_mle_dot_product",
         "gp_mle_polynomial",
+        "gp_evidence",
     }
     | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
 )
@@ -104,6 +112,50 @@ def _resolve_val_select(mode: str, ard: bool) -> bool:
     if mode == "ard":
         return ard
     raise ValueError(f"gp_val_select={mode!r} is not one of {GP_VAL_SELECT_MODES}")
+
+
+def _evidence_rows(
+    fits: dict[str, dict[str, Tensor]],
+    y_space_nlls: dict[str, dict[str, float]],
+    z_test: Tensor,
+    n_context: int,
+) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]], str | None]:
+    """Context-only GP selection: the BIC-best fit ("gp_evidence") and the BIC-weighted mixture ("gp_evidence_mix").
+
+    BIC_k = log p(y_C | theta_hat_k) - (n_hparams_k / 2) log P. The mixture's density is
+    sum_k w_k N(y_Q; mean_k, Sigma_k) with w = softmax(BIC); its per-point total NLL is
+    -log(sum_k w_k exp(-N * total_k)) / N. It is not a Gaussian copula, so its
+    marginal/copula split is nan. Returns (nlls, R_dict, y_space_nlls, selected label).
+    """
+    nan_parts = _NAN_PARTS.copy()
+    n_test = z_test.shape[0]
+    bic = {
+        k: float(f["log_ml"]) - 0.5 * float(f["n_hparams"]) * math.log(max(n_context, 2))
+        for k, f in fits.items()
+        if math.isfinite(float(f["log_ml"])) and math.isfinite(y_space_nlls[k]["total"])
+    }
+    if not bic:
+        R_I = torch.eye(n_test, dtype=z_test.dtype, device=z_test.device)
+        return (
+            {"gp_evidence": float("nan")},
+            {"gp_evidence": R_I},
+            {"gp_evidence": nan_parts, "gp_evidence_mix": _NAN_PARTS.copy()},
+            None,
+        )
+    best = max(bic, key=lambda k: bic[k])
+    keys = list(bic)
+    log_w = torch.log_softmax(torch.tensor([bic[k] for k in keys], dtype=torch.float64), dim=0)
+    log_p = torch.tensor([-n_test * y_space_nlls[k]["total"] for k in keys], dtype=torch.float64)
+    mix_total = -torch.logsumexp(log_w + log_p, dim=0).item() / n_test
+    return (
+        {"gp_evidence": corr_nll_single(fits[best]["R"], z_test)},
+        {"gp_evidence": fits[best]["R"]},
+        {
+            "gp_evidence": dict(y_space_nlls[best]),
+            "gp_evidence_mix": {"total": mix_total, "marginal": float("nan"), "copula": float("nan")},
+        },
+        best,
+    )
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
@@ -365,11 +417,14 @@ def eval_baselines_episode(
     n_restarts_dkl: int = 1,
     fit_seed: int | None = None,
     gp_val_select: str = "ard",
+    gp_mean: str = "zero",
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
     """Evaluate every baseline (all but the ICL model and the oracle) on one episode.
 
     fit_seed, when given, reseeds torch first so the fit depends only on the
     episode and settings (derive it from the episode's global index).
+    oracle_mode="posterior" makes the GP-MLE and DKL rows condition on the
+    context; gp_mean is their mean function (GP_MEANS).
 
     Returns:
         nlls: {method: copula NLL} against the shared z_test.
@@ -415,6 +470,7 @@ def eval_baselines_episode(
 
     # --- GP MLE baselines (plain + ARD for lengthscale kernels) ---
     _GP_KERNELS = ["rbf", "matern32", "periodic", "rational_quadratic", "dot_product", "polynomial"]
+    gp_fits: dict[str, dict[str, Tensor]] = {}
     _LABEL_MAP = {
         ("rbf", False): "gp_mle_rbf",
         ("rbf", True): "gp_mle_ard_rbf",
@@ -444,15 +500,23 @@ def eval_baselines_episode(
                     prior_cfg=prior_cfg,
                     n_restarts=n_restarts_mle,
                     val_select=_resolve_val_select(gp_val_select, ard),
+                    mean=gp_mean,
                 )
                 nlls[label] = corr_nll_single(fit["R"], z_test)
                 R_dict[label] = fit["R"]
                 y_space_nlls[label] = _nll_parts(fit["mean"], fit["Sigma"])
+                gp_fits[label] = fit
             except Exception as exc:
                 print(f"  [{label}] failed: {exc}")
                 nlls[label] = float("nan")
                 R_dict[label] = R_I.clone()
                 y_space_nlls[label] = _NAN_PARTS.copy()
+
+    ev_nlls, ev_R, ev_y, selected = _evidence_rows(gp_fits, y_space_nlls, z_test, X_train.shape[0])
+    nlls.update(ev_nlls)
+    R_dict.update(ev_R)
+    y_space_nlls.update(ev_y)
+    print(f"  [gp_evidence] BIC-selected: {selected}")
 
     # DKL kernels (periodic excluded).
     _DKL_KERNELS = ["rbf", "matern32", "rational_quadratic", "dot_product"]
@@ -481,6 +545,7 @@ def eval_baselines_episode(
                 oracle_mode=oracle_mode,
                 prior_cfg=prior_cfg,
                 n_restarts=n_restarts_dkl,
+                mean=gp_mean,
             )
             nlls[label] = corr_nll_single(fit["R"], z_test)
             R_dict[label] = fit["R"]
@@ -542,11 +607,13 @@ def baseline_fingerprint(
     patience_per_ep: int,
     gp_val_select: str = "ard",
     n_restarts_dkl: int = 1,
+    gp_mean: str = "zero",
 ) -> dict:
     """Digest of everything, besides the episode itself, that determines the baseline fits.
 
     Includes gen_cfg.data (the generating config, not the checkpoint's own),
-    icl_rank, oracle_mode and the fitting settings.
+    icl_rank, oracle_mode and the fitting settings. gp_mean is recorded only
+    when it is not "zero", so the pre-refactor key set is unchanged.
     """
     data_cfg = OmegaConf.select(gen_cfg, "data", default=None)
     fp = {
@@ -567,6 +634,8 @@ def baseline_fingerprint(
         "patience_per_ep": patience_per_ep,
         "gp_val_select": gp_val_select,
     }
+    if gp_mean != "zero":
+        fp["gp_mean"] = gp_mean
     # Only on-disk datasets get a content identity (same-path replacement). Live / ERA5 runs keep
     # 42c0402's exact key set, so baseline caches written before the refactor stay valid.
     if dataset_dir and not live_generate and os.path.isdir(dataset_dir):

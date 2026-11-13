@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from copula_inter.baselines.gp_mle import GP_LR_MLE as GP_LR_MLE
+from copula_inter.baselines.gp_mle import GP_MEANS as GP_MEANS
 from copula_inter.era5.io import EARTH_RADIUS_KM as EARTH_RADIUS_KM
 from copula_inter.era5.probe import MAX_DIST_PERCENTILE as MAX_DIST_PERCENTILE
 from copula_inter.era5.probe import N_NLL_TEST as N_NLL_TEST
@@ -19,6 +20,8 @@ from copula_inter.paths import ERA5_GLOBAL_VAL_CACHE_DIR
 AR_ORDERS = ("random", "natural")
 AR_CONDITIONINGS = ("teacher_forcing", "sample")
 GP_VAL_SELECT_MODES = ("ard", "always", "never")
+# What a fitted GP baseline predicts at the queries: its posterior given the context, or its prior.
+GP_PREDICT_MODES = ("posterior", "prior")
 # Held-out ERA5 year, disjoint from the training corpus.
 ERA5_DEFAULT_CORPUS_DIR = str(ERA5_GLOBAL_VAL_CACHE_DIR)
 

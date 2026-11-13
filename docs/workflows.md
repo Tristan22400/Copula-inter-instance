@@ -135,6 +135,24 @@ table compares correlations on a shared `z_test`.
 `python -m eval.results scores.json` re-renders the totals later without loading
 any model.
 
+**GP baselines.** Every GP-MLE, DKL and zero-mean GP row predicts its
+posterior given the context (`baselines.gp_predict=posterior`), with a learned
+mean (`baselines.gp_mean=constant`; `zero` or `linear` also work). Tables made
+before 2026-11-13 used `gp_predict=prior`: those rows scored the fitted kernel's
+prior at the queries and ignored the context, so do not compare them with newer
+tables. Rows that pick or mix GPs:
+
+| Row | Selects with | Role |
+|---|---|---|
+| GP-MLE (BIC-selected) | context only: $\max_k \log p(y_C\mid\hat\theta_k) - \tfrac{k}{2}\log P$ | competitor |
+| GP-MLE (BIC-weighted mixture) | context only, weights $\propto e^{\mathrm{BIC}_k}$ | competitor |
+| Marginal + GP-MLE posterior corr. (BIC) | the same marginal as our model, $R_{po}(\hat\theta)$ as copula | matched competitor of the copula head |
+| Marginal + oracle posterior corr. | the same marginal, $R_{po}(\theta)$ of the true GP | reference (synthetic only) |
+| Best-of-Baselines, Best GP | query labels | reference, not a method |
+
+The z-space "Oracle" row is the copula of the known-θ GP posterior, $R_{po}$:
+under exact marginals $z_{\text{test}}\sim\mathcal N(0, R_{po})$.
+
 ### Real ERA5 episodes
 
 These are the same baselines, nested-CV best-of-baselines, tables and caches, on
@@ -149,7 +167,7 @@ oarsub -S "./scripts/eval_checkpoint_era5.sh ckpt=<ckpt>"
 ```
 
 Differences from synthetic data:
-- Real data has no generating kernel, so the "Oracle (prior)" row and the
+- Real data has no generating kernel, so the "Oracle" rows and the
   analytic GP rows are `nan`, and `marginal.z_train_source=oracle` is rejected.
 - The shared `z_test` is the frozen-TabICL K-fold PIT, not a ground-truth
   marginal. Read the total table.
