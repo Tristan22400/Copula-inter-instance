@@ -608,3 +608,29 @@ def test_era5_cache_identity_records_the_pit_marginal(tmp_path: Path) -> None:
     assert "pit_marginal_identity" not in era5_fp(default_ckpt, amp=True)
     assert era5_fp(default_ckpt, amp=False)["pit_marginal_identity"]["amp"] is False
     assert era5_fp(str(other), amp=True) != era5_fp(default_ckpt, amp=True)
+
+
+def test_laplace_off_skips_its_rows_and_reuses_caches_without_them(tiny_episode: dict[str, torch.Tensor]) -> None:
+    """baselines.laplace=false: no gp_laplace rows, and a cached entry lacking them is still valid."""
+    from eval.baselines.classical import EXPECTED_BASELINE_KEYS, expected_baseline_keys
+    from eval.baselines.prefit import _valid_cached_entry
+
+    nlls, _, y_space_nlls = eval_baselines_episode(
+        ep=tiny_episode,
+        icl_rank=2,
+        n_steps_mle=3,
+        lr_mle=0.1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
+        device=torch.device("cpu"),
+        oracle_mode="posterior",
+        gp_mean="constant",
+        laplace=False,
+    )
+    assert "gp_laplace" not in nlls and "gp_laplace_mix" not in y_space_nlls
+    entry = {"nlls": nlls, "y_nlls": y_space_nlls}
+    assert _valid_cached_entry({"k": entry}, "k", 0, expected_baseline_keys(False)) is entry
+    assert _valid_cached_entry({"k": entry}, "k", 0, expected_baseline_keys(True)) is None
+    assert expected_baseline_keys(False) == EXPECTED_BASELINE_KEYS

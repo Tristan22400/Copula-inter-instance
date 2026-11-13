@@ -222,14 +222,16 @@ def _baseline_fit_seed(seed: int, cache_key: str) -> int:
     return (zlib.crc32(cache_key.encode()) ^ (seed * 2_654_435_761)) % (2**31 - 1)
 
 
-def _valid_cached_entry(cache_entries: dict, cache_key: str, ep_i: int) -> dict | None:
-    """The cached entry for this episode, or None if missing or written with an older result schema."""
+def _valid_cached_entry(
+    cache_entries: dict, cache_key: str, ep_i: int, expected: frozenset[str] = EXPECTED_BASELINE_KEYS
+) -> dict | None:
+    """The cached entry for this episode, or None if missing, lacking an expected key, or of an older schema."""
     cached = cache_entries.get(cache_key)
     if cached is None:
         return None
-    if not EXPECTED_BASELINE_KEYS.issubset(cached["nlls"].keys()):
+    if not expected.issubset(cached["nlls"].keys()):
         # Missing a baseline added later.
-        missing = EXPECTED_BASELINE_KEYS - cached["nlls"].keys()
+        missing = expected - cached["nlls"].keys()
         print(f"  [ep {ep_i}] cached baselines missing {sorted(missing)} — refitting")
         return None
     if "y_nlls" not in cached:

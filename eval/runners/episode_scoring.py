@@ -58,6 +58,7 @@ from eval.baselines.classical import (
     assert_shared_z_test,
     corr_nll_single,
     eval_baselines_episode,
+    expected_baseline_keys,
     save_baseline_entry,
 )
 from eval.results import (
@@ -306,7 +307,9 @@ def _prefit_baselines(ctx: _EvalContext, episode_plan: list[_PlannedEpisode], ca
     fitted: dict[str, dict] = {}
     if ctx.baseline_cache is not None and not spec.baselines.refresh:
         for planned in episode_plan:
-            entry = _valid_cached_entry(cache_entries, planned.cache_key, planned.ep_i)
+            entry = _valid_cached_entry(
+                cache_entries, planned.cache_key, planned.ep_i, expected_baseline_keys(spec.baselines.laplace)
+            )
             if entry is not None:
                 fitted[planned.cache_key] = entry
 

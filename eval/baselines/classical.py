@@ -64,6 +64,8 @@ __all__ = [
     "save_baseline_entry",
     "GP_VAL_SELECT_MODES",
     "EXPECTED_BASELINE_KEYS",
+    "LAPLACE_BASELINE_KEYS",
+    "expected_baseline_keys",
     "assert_shared_z_test",
     "fit_zero_mean_gp_on_marginal",
     "zero_mean_gp_prior_cfg",
@@ -95,10 +97,18 @@ EXPECTED_BASELINE_KEYS = frozenset(
         "gp_mle_dot_product",
         "gp_mle_polynomial",
         "gp_evidence",
-        "gp_laplace",
     }
     | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
 )
+
+# Expected only when the Laplace selection runs (baselines.laplace=true).
+LAPLACE_BASELINE_KEYS = frozenset({"gp_laplace"})
+
+
+def expected_baseline_keys(laplace: bool = True) -> frozenset[str]:
+    """Keys a cached entry must hold to be reused (EXPECTED_BASELINE_KEYS, plus gp_laplace with laplace)."""
+    return EXPECTED_BASELINE_KEYS | LAPLACE_BASELINE_KEYS if laplace else EXPECTED_BASELINE_KEYS
+
 
 # Bump when a fitting algorithm changes in a way the fingerprint cannot detect.
 _BASELINE_ALGO_VERSION = 4
@@ -440,13 +450,15 @@ def eval_baselines_episode(
     fit_seed: int | None = None,
     gp_val_select: str = "ard",
     gp_mean: str = "zero",
+    laplace: bool = True,
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]]]:
     """Evaluate every baseline (all but the ICL model and the oracle) on one episode.
 
     fit_seed, when given, reseeds torch first so the fit depends only on the
     episode and settings (derive it from the episode's global index).
     oracle_mode="posterior" makes the GP-MLE and DKL rows condition on the
-    context; gp_mean is their mean function (GP_MEANS).
+    context; gp_mean is their mean function (GP_MEANS). laplace adds the
+    Laplace-evidence selection rows (gp_laplace, gp_laplace_mix).
 
     Returns:
         nlls: {method: copula NLL} against the shared z_test.
@@ -523,7 +535,7 @@ def eval_baselines_episode(
                     n_restarts=n_restarts_mle,
                     val_select=_resolve_val_select(gp_val_select, ard),
                     mean=gp_mean,
-                    laplace=True,
+                    laplace=laplace,
                 )
                 nlls[label] = corr_nll_single(fit["R"], z_test)
                 R_dict[label] = fit["R"]
@@ -539,10 +551,12 @@ def eval_baselines_episode(
     nlls.update(ev_nlls)
     R_dict.update(ev_R)
     y_space_nlls.update(ev_y)
-    lp_nlls, lp_R, lp_y, lp_selected = _laplace_rows(gp_fits, y_space_nlls, z_test)
-    nlls.update(lp_nlls)
-    R_dict.update(lp_R)
-    y_space_nlls.update(lp_y)
+    lp_selected = None
+    if laplace:
+        lp_nlls, lp_R, lp_y, lp_selected = _laplace_rows(gp_fits, y_space_nlls, z_test)
+        nlls.update(lp_nlls)
+        R_dict.update(lp_R)
+        y_space_nlls.update(lp_y)
     print(f"  [gp_evidence] BIC-selected: {selected}; Laplace-selected: {lp_selected}")
 
     # DKL kernels (periodic excluded).

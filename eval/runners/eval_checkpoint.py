@@ -432,6 +432,7 @@ def run_evaluation(spec: EvalSpec) -> None:
             n_restarts_dkl=spec.baselines.n_restarts_dkl,
             gp_val_select=spec.baselines.gp_val_select,
             gp_mean=spec.baselines.gp_mean,
+            laplace=spec.baselines.laplace,
         ),
         baseline_cache=baseline_cache,
         fingerprint=fingerprint,

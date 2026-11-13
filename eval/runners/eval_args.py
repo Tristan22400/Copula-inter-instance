@@ -220,6 +220,9 @@ class BaselineSpec:
     gp_predict: str = "posterior"
     # Mean function of the GP-MLE and DKL fits: "zero", "constant" or "linear" (affine in x).
     gp_mean: str = "constant"
+    # Laplace-evidence kernel selection rows (gp_laplace*). false skips them and reuses caches
+    # written without them (e.g. to add the attainable copulas to an existing run).
+    laplace: bool = True
     # "cpu" (faster for these 32-point fits), "cuda", or "auto" to follow the top-level device.
     device: str = "cpu"
     # Fitting processes; 0 = one per physical core (capped at 32), 1 = serial. CPU only.
