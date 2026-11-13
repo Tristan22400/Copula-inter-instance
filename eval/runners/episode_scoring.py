@@ -461,19 +461,25 @@ def _marginal_plugin_rows(
 ) -> dict[str, dict[str, float]]:
     """The learned marginal with a plug-in Gaussian-copula correlation, in raw nats.
 
-    marg_gp_evidence: R_post(theta_hat) of the BIC-selected GP-MLE, the matched
-    competitor of the copula head (same marginal, GP-structured dependence).
+    marg_gp_evidence / marg_gp_laplace: R_post(theta_hat) of the BIC- / Laplace-selected
+    GP-MLE, the matched competitors of the copula head (same marginal, GP-structured
+    dependence).
     marg_oracle_corr: R_post(theta) of the known-theta GP, a reference (synthetic only).
     """
-    rows = {"marg_gp_evidence": _NAN_PARTS.copy(), "marg_oracle_corr": _NAN_PARTS.copy()}
+    rows = {
+        "marg_gp_evidence": _NAN_PARTS.copy(),
+        "marg_gp_laplace": _NAN_PARTS.copy(),
+        "marg_oracle_corr": _NAN_PARTS.copy(),
+    }
     if marginal_pit is None:
         return rows
     z = marginal_pit["z_test"].to(device).unsqueeze(0)
     log_pdf = marginal_pit["log_pdf_test"].to(device).unsqueeze(0)
     mask = torch.ones_like(z, dtype=torch.bool)
-    # A failed BIC selection has a nan shared-z NLL (and a placeholder identity R).
-    gp_ok = np.isfinite(baseline_nlls.get("gp_evidence", float("nan")))
-    sources = {"marg_gp_evidence": baseline_R.get("gp_evidence") if gp_ok else None, "marg_oracle_corr": R_oracle}
+    # A failed selection has a nan shared-z NLL (and a placeholder identity R).
+    sources: dict[str, Tensor | None] = {"marg_oracle_corr": R_oracle}
+    for key, sel in (("marg_gp_evidence", "gp_evidence"), ("marg_gp_laplace", "gp_laplace")):
+        sources[key] = baseline_R.get(sel) if np.isfinite(baseline_nlls.get(sel, float("nan"))) else None
     for key, R in sources.items():
         if R is None or not torch.isfinite(R).all():
             continue

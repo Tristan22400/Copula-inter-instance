@@ -175,6 +175,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         "dkl_dot_product",
         "per_ep_transformer",
         "gp_evidence",
+        "gp_laplace",
     }
     # y_space_nlls excludes the unfitted references.
     expected_y_keys = expected_keys - {"independence", "gp_prior_rbf"}
@@ -198,9 +199,10 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
     # gp_evidence copies one gp_mle_* row; the mixture has a total only.
     gp_rows = {k: v for k, v in y_space_nlls.items() if k.startswith("gp_mle_")}
-    assert y_space_nlls["gp_evidence"] in gp_rows.values()
-    assert math.isfinite(y_space_nlls["gp_evidence_mix"]["total"])
-    assert math.isnan(y_space_nlls["gp_evidence_mix"]["copula"])
+    for sel in ("gp_evidence", "gp_laplace"):
+        assert y_space_nlls[sel] in gp_rows.values()
+        assert math.isfinite(y_space_nlls[f"{sel}_mix"]["total"])
+        assert math.isnan(y_space_nlls[f"{sel}_mix"]["copula"])
 
 
 def test_eval_baselines_episode_posterior_constant_mean(tiny_episode: dict[str, torch.Tensor]) -> None:

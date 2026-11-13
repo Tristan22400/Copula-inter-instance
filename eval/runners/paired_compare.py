@@ -45,6 +45,8 @@ WITHIN_RUN = (
     ("copula - autoregressive", "icl", "autoregressive"),
     ("copula - marginal+GP corr (BIC)", "icl", "marg_gp_evidence"),
     ("copula - GP-MLE (BIC)", "icl", "gp_evidence"),
+    ("copula - marginal+GP corr (Laplace)", "icl", "marg_gp_laplace"),
+    ("copula - GP Laplace BMA", "icl", "gp_laplace_mix"),
     ("copula - best_baseline", "icl", "best_baseline"),
 )
 

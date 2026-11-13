@@ -147,11 +147,24 @@ tables. Rows that pick or mix GPs:
 | GP-MLE (BIC-selected) | context only: $\max_k \log p(y_C\mid\hat\theta_k) - \tfrac{k}{2}\log P$ | competitor |
 | GP-MLE (BIC-weighted mixture) | context only, weights $\propto e^{\mathrm{BIC}_k}$ | competitor |
 | Marginal + GP-MLE posterior corr. (BIC) | the same marginal as our model, $R_{po}(\hat\theta)$ as copula | matched competitor of the copula head |
+| GP-MLE (Laplace-evidence-selected), Laplace BMA, Marginal + GP-MLE posterior corr. (Laplace) | the same three with the Laplace evidence $\log p(y_C\mid k)$ in place of BIC (`laplace_log_evidence`: the MAP point refined with the constraint Jacobian, minus $\tfrac12\log\det H$) | competitors |
 | Marginal + oracle posterior corr. | the same marginal, $R_{po}(\theta)$ of the true GP | reference (synthetic only) |
 | Best-of-Baselines, Best GP | query labels | reference, not a method |
 
 The z-space "Oracle" row is the copula of the known-θ GP posterior, $R_{po}$:
 under exact marginals $z_{\text{test}}\sim\mathcal N(0, R_{po})$.
+
+**Well-specified GP-MLE diagnostics (D1, D2).** Draws episodes from the GP-MLE's
+own model (one kernel, hyperparameters and noise from its hyperpriors, a constant
+mean, $x\sim\mathcal N(0,I_d)$, no nuisance features or warps) and fits it with
+the eval's optimizer settings. D1: the total-NLL gap to the known-θ posterior per
+context size P should shrink toward 0. D2: the fraction of episodes where
+$J(\hat\theta) < J(\theta_{\text{true}})$ ($J$ = log marginal likelihood + log
+hyperprior, the fit's objective) is the optimizer failure rate.
+
+```bash
+python -m eval.runners.gp_wellspecified_diag out_json=eval/results/gp_diag/d1_d2.json
+```
 
 ### Real ERA5 episodes
 

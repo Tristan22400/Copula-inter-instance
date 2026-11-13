@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/ registered as gp_wellspecified_diag_schema.
+defaults:
+  - gp_wellspecified_diag_schema
+  - _runner
+  - _self_

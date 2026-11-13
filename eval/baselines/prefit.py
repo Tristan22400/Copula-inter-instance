@@ -155,8 +155,8 @@ def _select_best_baseline_cv(
 
 
 # Not candidates for best baseline: unfitted references, icl, oracle, best_baseline and
-# gp_evidence (a copy of one gp_mle_* row).
-_NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle", "best_baseline", "gp_evidence"}
+# the gp_evidence / gp_laplace selections (copies of one gp_mle_* row).
+_NON_FITTED_EXCLUDED = {"independence", "gp_prior_rbf", "icl", "oracle", "best_baseline", "gp_evidence", "gp_laplace"}
 
 
 @dataclass(frozen=True)

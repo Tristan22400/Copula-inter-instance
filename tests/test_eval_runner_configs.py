@@ -17,6 +17,7 @@ from eval.runners.autoregressive_baseline_eval import AutoregressiveBaselineSpec
 from eval.runners.ctr23_full_eval import Ctr23FullEvalSpec
 from eval.runners.era5_calibration_eval import Era5CalibrationSpec
 from eval.runners.eval_args import EvalSpec
+from eval.runners.gp_wellspecified_diag import GpDiagSpec
 from eval.runners.hydra_cli import compose_spec, reject_argparse_flags
 from eval.runners.marginal_calibration_eval import MarginalCalibrationSpec
 from eval.runners.paired_compare import PairedCompareSpec
@@ -46,6 +47,7 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "autoregressive_baseline_eval": (AutoregressiveBaselineSpec, []),
     "summarize_results_cache": (SummarizeSpec, ["caches=[a.json]"]),
     "paired_compare": (PairedCompareSpec, ["a=a.json"]),
+    "gp_wellspecified_diag": (GpDiagSpec, []),
     "real_audit": (RealAuditSpec, ["real.dataset=kaust"]),
     "real_calibration_gate": (RealCalibrationGateSpec, ["dumps=[a.json]"]),
     "sdwpf_audit": (SdwpfAuditSpec, []),

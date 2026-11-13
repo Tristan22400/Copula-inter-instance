@@ -29,6 +29,7 @@ _METHOD_ORDER = [
     ("gp_mle_dot_product", "GP-MLE-DotProduct"),
     ("gp_mle_polynomial", "GP-MLE-Polynomial"),
     ("gp_evidence", "GP-MLE (BIC-selected, context only)"),
+    ("gp_laplace", "GP-MLE (Laplace-evidence-selected, context only)"),
     ("gp_zeromean_rbf", "Marginal + Zero Mean GP (RBF)"),
     ("gp_zeromean_matern32", "Marginal + Zero Mean GP (Matern32)"),
     ("dkl_rbf", "Deep Kernel Learning (RBF)"),
@@ -163,12 +164,13 @@ def _print_y_space_oracle(y_space_nlls: list[dict[str, dict[str, float]]]) -> No
     print(f"  posterior (Schur-conditioned): mean={post_mean:.4f}  std={post_std:.4f}\n")
 
 
-# Fitted competitors (icl included) for the total table and both rank tables. gp_evidence is
-# left out: it copies one gp_mle_* row per episode, so ranking it would tie with its source.
+# Fitted competitors (icl included) for the total table and both rank tables. gp_evidence and
+# gp_laplace are left out: each copies one gp_mle_* row per episode, so ranking it would tie.
+_SELECTION_COPIES = ("gp_evidence", "gp_laplace")
 _RANK_KEYS = [
     (k, label)
     for k, label in _METHOD_ORDER
-    if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle", "gp_evidence")
+    if k not in _SELECTION_COPIES and k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle")
 ]
 
 # Context-only GP selections and the plug-in competitor of the copula head (total table only).
@@ -176,6 +178,9 @@ _GP_SELECTION_ROWS = [
     ("gp_evidence", "GP-MLE (BIC-selected, context only)"),
     ("gp_evidence_mix", "GP-MLE (BIC-weighted mixture)"),
     ("marg_gp_evidence", "Marginal + GP-MLE posterior corr. (BIC)"),
+    ("gp_laplace", "GP-MLE (Laplace-evidence-selected, context only)"),
+    ("gp_laplace_mix", "GP-MLE (Laplace BMA over kernels)"),
+    ("marg_gp_laplace", "Marginal + GP-MLE posterior corr. (Laplace)"),
 ]
 
 
@@ -183,11 +188,11 @@ _GP_SELECTION_ROWS = [
 _GP_TOTAL_KEYS = tuple(k for k, _ in _RANK_KEYS if k.startswith("gp_mle_") or k.startswith("gp_zeromean_"))
 
 
-# Total-NLL rank: adds the context-only GP selections (not gp_evidence, a copy of a ranked row),
+# Total-NLL rank: adds the context-only GP selections (not the copies of a ranked row),
 # independence, the autoregressive row and best_gp_total; no oracles.
 _TOTAL_RANK_ORDER = (
     _RANK_KEYS
-    + [row for row in _GP_SELECTION_ROWS if row[0] != "gp_evidence"]
+    + [row for row in _GP_SELECTION_ROWS if row[0] not in _SELECTION_COPIES]
     + [
         ("independence_marginal", "Independence (marginal only)"),
         ("autoregressive", "Autoregressive marginal (chain rule)"),

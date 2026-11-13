@@ -23,7 +23,16 @@ from torch.optim import Adam
 
 from copula_inter.copula.loss import gp_oracle_y_nll
 
-__all__ = ["ARD_ELIGIBLE", "GP_LR_MLE", "GP_MEANS", "fit_and_eval_gpytorch", "fit_gp_baseline_nll"]
+__all__ = [
+    "ARD_ELIGIBLE",
+    "GP_LR_MLE",
+    "GP_MEANS",
+    "fit_and_eval_gpytorch",
+    "fit_gp_baseline_nll",
+    "gp_map_objective",
+    "laplace_log_evidence",
+    "sample_prior_gp",
+]
 
 # Default Adam learning rate of the MAP fit (eval_checkpoint and the ERA5 training probes).
 GP_LR_MLE = 0.05
@@ -149,6 +158,20 @@ def _randomize_init(
         )
 
 
+def _sampled_likelihood(noise_prior: Prior, device: torch.device) -> gpytorch.likelihoods.GaussianLikelihood:
+    """Gaussian likelihood with noise in exp(-8)..exp(2) under noise_prior, its noise drawn from that prior.
+
+    Built fresh per fit (the constraint's bounds are mutable tensors).
+    """
+    noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
+    likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_constraint=noise_constraint, noise_prior=noise_prior)
+    # Random initial noise inside the constraint.
+    likelihood.noise = (
+        noise_prior.sample(likelihood.noise.shape).to(device).clamp(min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99)
+    )
+    return likelihood
+
+
 class _ExactGPModel(gpytorch.models.ExactGP):
     """ExactGP over one baseline kernel with a zero mean, optionally after a learned feature extractor (DKL)."""
 
@@ -222,6 +245,160 @@ class _ExactGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(mean_x, self.covar_module(x))
 
 
+def _submodule_attr(root: nn.Module, dotted: str) -> Tensor:
+    """root.<dotted> by attribute access (sees the tensors torch.func.functional_call swaps in)."""
+    obj: object = root
+    for part in dotted.split("."):
+        obj = getattr(obj, part)
+    assert isinstance(obj, Tensor), dotted
+    return obj
+
+
+def _raw_param_priors(model: _ExactGPModel) -> dict[str, Prior]:
+    """{raw parameter name: its registered hyperprior}, e.g. covar_module.raw_outputscale -> outputscale_prior.
+
+    gpytorch registers "<stem>_prior" on the module holding "raw_<stem>"; raise if a
+    prior does not follow that convention (its density could not be placed on a raw parameter).
+    """
+    param_names = {n for n, _ in model.named_parameters()}
+    out: dict[str, Prior] = {}
+    for name, _module, prior, _closure, _setting in model.named_priors():
+        prefix, _, prior_name = name.rpartition(".")
+        stem = prior_name.removesuffix("_prior")
+        raw = f"{prefix}.raw_{stem}" if prefix else f"raw_{stem}"
+        if raw not in param_names:
+            raise ValueError(f"prior {name!r} has no raw parameter {raw!r}")
+        out[raw] = prior
+    return out
+
+
+class _RawLogJoint(nn.Module):
+    """log p(y | g(r)) + sum_j [log pi_j(g_j(r_j)) + log |g_j'(r_j)|] over the raw hyperparameters r.
+
+    g_j is parameter j's gpytorch constraint transform (identity if unconstrained), so the
+    prior term is the hyperprior's density pushed to raw coordinates. Parameters without a
+    prior (mean function) get a flat density there.
+    """
+
+    def __init__(self, model: _ExactGPModel, X: Tensor, y: Tensor, priors: dict[str, Prior]) -> None:
+        super().__init__()
+        self.model = model
+        self.X, self.y = X, y
+        self.priors = priors
+        self.constraints = {n.removesuffix("_constraint"): c for n, c in model.named_constraints()}
+
+    def forward(self) -> Tensor:
+        out = self.model.likelihood(self.model(self.X)).log_prob(self.y)
+        for name, prior in self.priors.items():
+            raw = _submodule_attr(self.model, name)
+            constraint = self.constraints.get(name)
+            if constraint is None:
+                out = out + prior.log_prob(raw).sum()
+                continue
+            value = constraint.transform(raw)
+            # The transforms are elementwise, so d(sum g)/dr is the Jacobian's diagonal.
+            (dvalue,) = torch.autograd.grad(value.sum(), raw, create_graph=True)
+            out = out + prior.log_prob(value).sum() + torch.log(dvalue).sum()
+        return out
+
+
+def laplace_log_evidence(
+    model: _ExactGPModel,
+    X: Tensor,
+    y: Tensor,
+    extra_priors: dict[str, Prior] | None = None,
+    max_iter: int = 200,
+) -> float:
+    """Laplace approximation of the evidence log p(y | M) = log int p(y | theta) p(theta) dtheta.
+
+    Works in the raw (unconstrained) hyperparameters r, where the prior carries the
+    constraint's Jacobian, so the result does not depend on the parameterization:
+        log p(y | M) ~= L(r*) + (k / 2) log(2 pi) - (1 / 2) log det H,
+        L(r) = log p(y | g(r)) + log pi(r),  r* = argmax L,  H = -grad^2 L(r*),
+    with k = dim r. r* is found by L-BFGS from the fitted model (a copy, in float64), whose
+    MAP objective omits the Jacobian (and, for held-out selected fits, is not at the mode).
+    extra_priors adds priors for raw parameters fitted without one (e.g. ARD lengthscales);
+    parameters left without a prior (mean function) are flat, a constant shared by every
+    kernel family with the same mean, so it cancels when comparing families. Returns nan if
+    H is not positive definite or the optimization fails.
+    """
+    m = copy.deepcopy(model).double()
+    X64, y64 = X.double(), y.double()
+    m.set_train_data(inputs=X64, targets=y64, strict=False)
+    m.train()
+    priors = _raw_param_priors(m)
+    for name, prior in (extra_priors or {}).items():
+        priors.setdefault(name, copy.deepcopy(prior).double())
+    joint = _RawLogJoint(m, X64, y64, priors)
+
+    names = [n for n, p in m.named_parameters() if p.requires_grad]
+    params = [m.get_parameter(n) for n in names]
+    opt = torch.optim.LBFGS(params, lr=1.0, max_iter=max_iter, line_search_fn="strong_wolfe")
+
+    def closure() -> Tensor:
+        opt.zero_grad()
+        loss = -joint()
+        loss.backward()
+        return loss
+
+    try:
+        opt.step(closure)
+        shapes = [p.shape for p in params]
+        sizes = [p.numel() for p in params]
+        flat = torch.cat([p.detach().reshape(-1) for p in params])
+
+        def neg_joint(v: Tensor) -> Tensor:
+            swapped = {f"model.{n}": c.reshape(s) for n, c, s in zip(names, torch.split(v, sizes), shapes)}
+            return -torch.func.functional_call(joint, swapped, ())
+
+        H = torch.autograd.functional.hessian(neg_joint, flat)
+        assert isinstance(H, Tensor)
+        # The Jacobian term differentiates through r, so r must require grad here too.
+        log_joint = -neg_joint(flat.clone().requires_grad_(True)).item()
+    except Exception as exc:  # a non-PSD kernel matrix along the line search
+        print(f"  [laplace_log_evidence] failed: {exc}")
+        return float("nan")
+    L, info = torch.linalg.cholesky_ex(0.5 * (H + H.T))
+    if int(info) != 0 or not math.isfinite(log_joint):
+        return float("nan")
+    k = flat.numel()
+    logdet = 2.0 * torch.log(torch.diagonal(L)).sum().item()
+    return log_joint + 0.5 * k * math.log(2.0 * math.pi) - 0.5 * logdet
+
+
+def gp_map_objective(model: _ExactGPModel, X: Tensor, y: Tensor) -> float:
+    """The MAP fit's objective J(theta) = log p(y | X, theta) + sum_j log pi_j(theta_j) at the model's hyperparameters.
+
+    The priors are the ones registered on the model, evaluated on the constrained values
+    (no Jacobian), exactly what fit_and_eval_gpytorch maximizes (times |y|).
+    """
+    model.set_train_data(inputs=X, targets=y, strict=False)
+    model.train()
+    with torch.no_grad():
+        out = model.likelihood(model(X)).log_prob(y)
+        for _name, module, prior, closure, _setting in model.named_priors():
+            out = out + prior.log_prob(closure(module)).sum()
+    return float(out)
+
+
+def sample_prior_gp(
+    X: Tensor, kernel_name: str, prior_cfg: dict | None = None, mean_constant: float = 0.0
+) -> _ExactGPModel:
+    """A constant-mean GP over X whose kernel hyperparameters and noise are drawn from the MAP fit's own hyperpriors.
+
+    The well-specified generator: data sampled from it (model.train(); likelihood(model(X)).sample())
+    follow exactly the model that fit_and_eval_gpytorch(kernel_name, ard=False, mean="constant") fits.
+    """
+    cfg = prior_cfg or {}
+    kernel_priors = _kernel_priors(cfg, kernel_name)
+    likelihood = _sampled_likelihood(_noise_prior(cfg), X.device)
+    y0 = torch.zeros(X.shape[0], dtype=X.dtype, device=X.device)
+    model = _ExactGPModel(X, y0, likelihood, kernel_name, kernel_priors=kernel_priors, mean="constant").to(X.device)
+    _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=_lengthscale_init_prior(cfg))
+    model.mean_module.initialize(constant=mean_constant)
+    return model
+
+
 def _val_check_steps(n_steps: int) -> set[int]:
     """Steps at which to evaluate held-out NLL: every 10 steps up to 500, plus every n_steps // 100."""
     coarse_every = max(1, n_steps // 100)
@@ -245,8 +422,9 @@ def fit_and_eval_gpytorch(
     n_restarts: int = 1,
     val_select: bool = False,
     mean: str = "zero",
+    laplace: bool = False,
 ) -> dict[str, Tensor]:
-    """Fit a GP (or DKL) on raw y_train and return {"R", "mean", "Sigma", "log_ml", "n_hparams"} at X_test.
+    """Fit a GP (or DKL) on raw y_train; return {"R", "mean", "Sigma", "log_ml", "n_hparams", "log_evidence", "map_objective"}.
 
     Maximizes the exact marginal likelihood plus the hyperpriors (MAP) from
     n_restarts random initializations and keeps the best. oracle_mode="posterior"
@@ -258,7 +436,10 @@ def fit_and_eval_gpytorch(
     raw y units. mean is the GP mean function (GP_MEANS). log_ml is the log
     marginal likelihood log p(y_train | X_train, theta_hat) of the kept fit
     (no hyperprior term), n_hparams its trainable parameter count; together
-    they give a context-only model-selection score (e.g. BIC).
+    they give a context-only model-selection score (e.g. BIC). With laplace=True
+    (no feature extractor), log_evidence is laplace_log_evidence of the kept
+    fit, with the lengthscale prior on ARD lengthscales; otherwise nan.
+    map_objective is gp_map_objective of the kept fit on the full context.
     """
     if mean not in GP_MEANS:
         raise ValueError(f"Unknown GP mean {mean!r}; expected one of {GP_MEANS}")
@@ -300,18 +481,7 @@ def fit_and_eval_gpytorch(
     for poly_power in poly_powers:
         for _ in range(max(1, n_restarts)):
             try:
-                # Noise constraint exp(-8)..exp(2), built fresh each restart (its bounds are mutable tensors).
-                noise_constraint = gpytorch.constraints.Interval(math.exp(-8.0), math.exp(2.0))
-                likelihood = gpytorch.likelihoods.GaussianLikelihood(
-                    noise_constraint=noise_constraint,
-                    noise_prior=noise_prior,
-                )
-                # Random initial noise inside the constraint.
-                likelihood.noise = (
-                    noise_prior.sample(likelihood.noise.shape)
-                    .to(X_train.device)
-                    .clamp(min=math.exp(-8.0) * 1.01, max=math.exp(2.0) * 0.99)
-                )
+                likelihood = _sampled_likelihood(noise_prior, X_train.device)
 
                 # Fresh feature extractor each restart.
                 feature_extractor = feature_extractor_factory() if feature_extractor_factory is not None else None
@@ -388,6 +558,16 @@ def fit_and_eval_gpytorch(
     with torch.no_grad():
         log_ml = likelihood(model(X_train)).log_prob(y_train)
     n_hparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    map_objective = gp_map_objective(model, X_train, y_train)
+    model.train()
+    likelihood.train()
+    log_evidence = float("nan")
+    if laplace and feature_extractor_factory is None:
+        extra: dict[str, Prior] = {}
+        if ard_num_dims is not None:
+            # ARD fits carry no lengthscale prior; score them under the shared one.
+            extra["covar_module.base_kernel.raw_lengthscale"] = lengthscale_init_prior
+        log_evidence = laplace_log_evidence(model, X_train, y_train, extra)
     model.eval()
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
@@ -410,6 +590,8 @@ def fit_and_eval_gpytorch(
         "Sigma": Sigma_post,
         "log_ml": log_ml.detach(),
         "n_hparams": torch.tensor(float(n_hparams)),
+        "log_evidence": torch.tensor(log_evidence),
+        "map_objective": torch.tensor(map_objective),
     }
 
 

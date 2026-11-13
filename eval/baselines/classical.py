@@ -13,6 +13,9 @@ Methods:
         log p(y_C | theta_hat) - (k / 2) log P, a selection from the context
         alone. gp_evidence_mix (Y-space only): the BIC-weighted mixture of the
         gp_mle_* predictive densities.
+    gp_laplace / gp_laplace_mix: the same with the Laplace approximation of
+        the evidence log p(y_C | kernel) (laplace_log_evidence) in place of BIC;
+        the mixture is a Laplace Bayesian model average over kernels.
     dkl_{rbf, matern32, rq, dot_product}: deep kernel learning, an MLP
         (d_x -> 32 -> 16) feeding a GP, trained on the marginal likelihood.
     per_ep_transformer: small set transformer trained on the episode's
@@ -92,6 +95,7 @@ EXPECTED_BASELINE_KEYS = frozenset(
         "gp_mle_dot_product",
         "gp_mle_polynomial",
         "gp_evidence",
+        "gp_laplace",
     }
     | {"dkl_rbf", "dkl_matern32", "dkl_rq", "dkl_dot_product"}
 )
@@ -114,48 +118,66 @@ def _resolve_val_select(mode: str, ard: bool) -> bool:
     raise ValueError(f"gp_val_select={mode!r} is not one of {GP_VAL_SELECT_MODES}")
 
 
+def _selection_rows(
+    name: str,
+    fits: dict[str, dict[str, Tensor]],
+    scores: dict[str, float],
+    y_space_nlls: dict[str, dict[str, float]],
+    z_test: Tensor,
+) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]], str | None]:
+    """The score-best fit (row `name`) and the score-weighted mixture (row `name`_mix) of the gp_mle_* fits.
+
+    scores are log model weights up to a constant (BIC or log evidence); fits with a
+    non-finite score or total NLL are dropped. The mixture's density is
+    sum_k w_k N(y_Q; mean_k, Sigma_k) with w = softmax(scores); its per-point total NLL is
+    -log(sum_k w_k exp(-N * total_k)) / N. It is not a Gaussian copula, so its
+    marginal/copula split is nan. Returns (nlls, R_dict, y_space_nlls, selected label).
+    """
+    n_test = z_test.shape[0]
+    valid = {k: s for k, s in scores.items() if math.isfinite(s) and math.isfinite(y_space_nlls[k]["total"])}
+    if not valid:
+        R_I = torch.eye(n_test, dtype=z_test.dtype, device=z_test.device)
+        return (
+            {name: float("nan")},
+            {name: R_I},
+            {name: _NAN_PARTS.copy(), f"{name}_mix": _NAN_PARTS.copy()},
+            None,
+        )
+    best = max(valid, key=lambda k: valid[k])
+    keys = list(valid)
+    log_w = torch.log_softmax(torch.tensor([valid[k] for k in keys], dtype=torch.float64), dim=0)
+    log_p = torch.tensor([-n_test * y_space_nlls[k]["total"] for k in keys], dtype=torch.float64)
+    mix_total = -torch.logsumexp(log_w + log_p, dim=0).item() / n_test
+    return (
+        {name: corr_nll_single(fits[best]["R"], z_test)},
+        {name: fits[best]["R"]},
+        {
+            name: dict(y_space_nlls[best]),
+            f"{name}_mix": {"total": mix_total, "marginal": float("nan"), "copula": float("nan")},
+        },
+        best,
+    )
+
+
 def _evidence_rows(
     fits: dict[str, dict[str, Tensor]],
     y_space_nlls: dict[str, dict[str, float]],
     z_test: Tensor,
     n_context: int,
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]], str | None]:
-    """Context-only GP selection: the BIC-best fit ("gp_evidence") and the BIC-weighted mixture ("gp_evidence_mix").
+    """BIC selection ("gp_evidence", "gp_evidence_mix"): BIC_k = log p(y_C | theta_hat_k) - (n_hparams_k / 2) log P."""
+    bic = {k: float(f["log_ml"]) - 0.5 * float(f["n_hparams"]) * math.log(max(n_context, 2)) for k, f in fits.items()}
+    return _selection_rows("gp_evidence", fits, bic, y_space_nlls, z_test)
 
-    BIC_k = log p(y_C | theta_hat_k) - (n_hparams_k / 2) log P. The mixture's density is
-    sum_k w_k N(y_Q; mean_k, Sigma_k) with w = softmax(BIC); its per-point total NLL is
-    -log(sum_k w_k exp(-N * total_k)) / N. It is not a Gaussian copula, so its
-    marginal/copula split is nan. Returns (nlls, R_dict, y_space_nlls, selected label).
-    """
-    nan_parts = _NAN_PARTS.copy()
-    n_test = z_test.shape[0]
-    bic = {
-        k: float(f["log_ml"]) - 0.5 * float(f["n_hparams"]) * math.log(max(n_context, 2))
-        for k, f in fits.items()
-        if math.isfinite(float(f["log_ml"])) and math.isfinite(y_space_nlls[k]["total"])
-    }
-    if not bic:
-        R_I = torch.eye(n_test, dtype=z_test.dtype, device=z_test.device)
-        return (
-            {"gp_evidence": float("nan")},
-            {"gp_evidence": R_I},
-            {"gp_evidence": nan_parts, "gp_evidence_mix": _NAN_PARTS.copy()},
-            None,
-        )
-    best = max(bic, key=lambda k: bic[k])
-    keys = list(bic)
-    log_w = torch.log_softmax(torch.tensor([bic[k] for k in keys], dtype=torch.float64), dim=0)
-    log_p = torch.tensor([-n_test * y_space_nlls[k]["total"] for k in keys], dtype=torch.float64)
-    mix_total = -torch.logsumexp(log_w + log_p, dim=0).item() / n_test
-    return (
-        {"gp_evidence": corr_nll_single(fits[best]["R"], z_test)},
-        {"gp_evidence": fits[best]["R"]},
-        {
-            "gp_evidence": dict(y_space_nlls[best]),
-            "gp_evidence_mix": {"total": mix_total, "marginal": float("nan"), "copula": float("nan")},
-        },
-        best,
-    )
+
+def _laplace_rows(
+    fits: dict[str, dict[str, Tensor]],
+    y_space_nlls: dict[str, dict[str, float]],
+    z_test: Tensor,
+) -> tuple[dict[str, float], dict[str, Tensor], dict[str, dict[str, float]], str | None]:
+    """Laplace-evidence selection ("gp_laplace", "gp_laplace_mix"): the mixture is the Laplace BMA over kernels."""
+    scores = {k: float(f.get("log_evidence", torch.tensor(float("nan")))) for k, f in fits.items()}
+    return _selection_rows("gp_laplace", fits, scores, y_space_nlls, z_test)
 
 
 def corr_nll_single(R: Tensor, z: Tensor) -> float:
@@ -501,6 +523,7 @@ def eval_baselines_episode(
                     n_restarts=n_restarts_mle,
                     val_select=_resolve_val_select(gp_val_select, ard),
                     mean=gp_mean,
+                    laplace=True,
                 )
                 nlls[label] = corr_nll_single(fit["R"], z_test)
                 R_dict[label] = fit["R"]
@@ -516,7 +539,11 @@ def eval_baselines_episode(
     nlls.update(ev_nlls)
     R_dict.update(ev_R)
     y_space_nlls.update(ev_y)
-    print(f"  [gp_evidence] BIC-selected: {selected}")
+    lp_nlls, lp_R, lp_y, lp_selected = _laplace_rows(gp_fits, y_space_nlls, z_test)
+    nlls.update(lp_nlls)
+    R_dict.update(lp_R)
+    y_space_nlls.update(lp_y)
+    print(f"  [gp_evidence] BIC-selected: {selected}; Laplace-selected: {lp_selected}")
 
     # DKL kernels (periodic excluded).
     _DKL_KERNELS = ["rbf", "matern32", "rational_quadratic", "dot_product"]
