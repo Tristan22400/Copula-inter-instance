@@ -11,13 +11,14 @@ TABPFN_TOKEN with the TabPFN-3.5 licence accepted).
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
+
+from copula_inter.credentials import TABPFN_TOKEN, get_secret
 
 pytestmark = pytest.mark.pretrained
 
@@ -29,8 +30,8 @@ BACKENDS = [
 
 def _require(backend: str, module: str) -> None:
     pytest.importorskip(module, reason=f"{module} not installed (uv extra)")
-    if backend == "tabpfn35_fast" and not os.environ.get("TABPFN_TOKEN"):
-        pytest.skip("TABPFN_TOKEN not set")
+    if backend == "tabpfn35_fast" and get_secret(TABPFN_TOKEN, required=False) is None:
+        pytest.skip("no TabPFN key (see copula_inter.credentials)")
 
 
 def _episodes(B: int, P: int, N: int, p_x: int, seed: int = 0) -> tuple[np.ndarray, ...]:

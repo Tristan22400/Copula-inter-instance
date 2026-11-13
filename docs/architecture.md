@@ -73,6 +73,7 @@ Top-level modules are the command-line entry points plus a few shared utilities:
 | `backend_registry.py` | Which marginal/copula backends exist and what each supports |
 | `checkpoint_registry.py` | Named checkpoint families (`ckpt=<name>`), copula and marginal kept separate |
 | `paths.py` | Default locations: repo root, `checkpoints/`, ERA5 caches |
+| `credentials.py` | Secrets kept out of git: TabPFN key, SSH key path (env, `.env`, `~/.config/copula-inter/`), `ssh_add` |
 | `artifacts.py`, `config_path.py`, `rng.py`, `type_aliases.py` | Atomic file writes, Hydra config lookup, seeding/device, shared type aliases |
 
 Subpackages:
@@ -164,10 +165,11 @@ tag for non-TabICL backbones), so they load wherever a TabICL checkpoint does.
   as the `tabicl` package, and `tests/test_tabicl_vendored.py` checks that
   `import tabicl` resolves to this copy. To upgrade, replace the tree with the
   new upstream tag, re-apply `dfca17b`, and rerun the full suite.
-- TabPFN is licence-gated. It needs a PriorLabs API key in `TABPFN_TOKEN`
-  whose account has accepted the TabPFN-3.5 licence (the job scripts read it
-  from `~/.config/tabpfn_token`). Never pass the key on a command line or
-  commit it. It runs through `TabPFNRegressor`'s differentiable-input path
+- TabPFN is licence-gated. It needs a PriorLabs API key whose account has
+  accepted the TabPFN-3.5 licence; `credentials.export_tabpfn_token()` resolves
+  it (environment, `.env`, `~/.config/copula-inter/`; see workflows.md,
+  Credentials) into `TABPFN_TOKEN` before the model loads. Never pass the key on
+  a command line or commit it. It runs through `TabPFNRegressor`'s differentiable-input path
   (one estimator, identity feature preprocessing), the only path that keeps
   gradients to its weights, so the PIT and Phase A score the same function.
 - Kumo Tabular (`structured-data-models`, OpenMDW weights from the

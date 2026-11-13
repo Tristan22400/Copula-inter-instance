@@ -19,7 +19,7 @@ configure_cuda_devices train.sh
 # HF_HUB_OFFLINE=0 before calling this script if a checkpoint isn't cached yet.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
-# data.z_train_source=tabpfn35_fast reads TABPFN_TOKEN, which _env.sh loads.
+# data.z_train_source=tabpfn35_fast reads the TabPFN key via copula_inter.credentials.
 
 echo "Starting Training... (Job ID: ${OAR_JOB_ID:-local})"
 if [[ "${TRAIN_SH_DRY_RUN:-0}" == "1" ]]; then

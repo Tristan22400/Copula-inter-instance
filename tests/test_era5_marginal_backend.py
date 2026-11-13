@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 from omegaconf import OmegaConf
+
+from copula_inter.credentials import TABPFN_TOKEN, get_secret
 
 
 @pytest.mark.parametrize(
@@ -40,8 +40,8 @@ def test_resolve_marginal_rejects_typo() -> None:
 def test_pit_group_and_episode_agree_under_backend(backend: str, module: str) -> None:
     """A backend reaches the PIT, and the grouped and single-episode paths agree."""
     pytest.importorskip(module, reason=f"{module} not installed")
-    if backend == "tabpfn35_fast" and not os.environ.get("TABPFN_TOKEN"):
-        pytest.skip("TABPFN_TOKEN not set")
+    if backend == "tabpfn35_fast" and get_secret(TABPFN_TOKEN, required=False) is None:
+        pytest.skip("no TabPFN key (see copula_inter.credentials)")
     from copula_inter.data.era5_live_dataset import _pit_episode, _pit_group
     from copula_inter.marginal.backends import make_regressor
 
