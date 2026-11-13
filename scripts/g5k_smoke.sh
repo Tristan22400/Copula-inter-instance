@@ -35,5 +35,5 @@ echo "HF_HOME=${HF_HOME:-unset} ($(du -sh "${HF_HOME:-$HOME/.cache/huggingface}"
 echo "wandb api: HTTP $(curl -s -o /dev/null -m 15 -w '%{http_code}' https://api.wandb.ai)"
 echo "huggingface: HTTP $(curl -s -o /dev/null -m 15 -w '%{http_code}' https://huggingface.co)"
 [[ -f ~/.netrc ]] && echo "~/.netrc (wandb) present" || echo "~/.netrc (wandb) MISSING: g5k_gpus.py setup-site <site> --copy-secrets"
-for f in ~/.config/copula-inter/tabpfn_token ~/.config/tabpfn_token; do [[ -f $f ]] && echo "TabPFN key source present: $f"; done
+for f in .env ~/.config/copula-inter/tabpfn_token ~/.config/tabpfn_token; do [[ -f $f ]] && echo "TabPFN key source present: $f"; done
 echo "total ${SECONDS}s"

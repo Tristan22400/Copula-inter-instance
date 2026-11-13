@@ -1,6 +1,6 @@
 ---
 name: g5k-launch
-description: Decide where on Grid5000 to run a test, training or eval job, and launch it there — reuse a running node, else find free GPUs on Grenoble/Nancy/Rennes/Sophia with scripts/g5k_gpus.py and submit where the job starts soonest. Use whenever you need to run pytest or any GPU/heavy command, launch or relaunch a training/eval job, when the thoth GPUs (Grenoble vercors) are full or a job waits in the queue, or when asked where GPUs are free.
+description: Decide where on Grid5000 to run a test, training or eval job, and launch it there — reuse a running node, else find free GPUs on every Grid5000 site (Abaca: Grenoble/Nancy/Rennes/Sophia; SLICES-FR default queue: Lille/Lyon/Nantes) with scripts/g5k_gpus.py and submit where the job starts soonest. Use whenever you need to run pytest or any GPU/heavy command, launch or relaunch a training/eval job, when the thoth GPUs (Grenoble vercors) are full or a job waits in the queue, or when asked where GPUs are free.
 ---
 
 # Launching tests and jobs on the right Grid5000 site
@@ -63,6 +63,17 @@ python3 scripts/g5k_gpus.py submit --dry-run --walltime 12 -- scripts/eval_check
 | p2 | Grenoble vercors17 (L40S); Sophia musa (H100) | 96 h; musa nodes 6 h |
 | p3 | Nancy (granite, gres, gruss, grat...), Rennes abacus*, Sophia esterel10-29 | 48 h; Nancy granite, gruss, grele, grue and graffiti nodes 24 h |
 | besteffort (`--besteffort`) | most other esterel/abacus (H100, A100 80GB...) | preempted at any time |
+| default (SLICES-FR, on unless `--abaca-only`) | Lille chuc (32 A100), chifflot (V100), chicoree (H200); Lyon sirius (A100), gemini (V100); Nantes ecotaxe (A100 80GB); Nancy grouille (A100) | clock rule, see below |
+
+The `default` queue follows the clock (Europe/Paris), and `status` shows the
+cap for a job starting now:
+- on a weekday, a job may not cross 09:00 or 19:00; one submitted from 17:00
+  may cross 19:00;
+- outside weekends a job lasts at most 14 h;
+- from Friday evening a job may run until Monday 09:00.
+
+These clusters suit evening, overnight and weekend runs, or short daytime
+tests. `submit` adds `-q default`, and `-t exotic` where needed.
 
 `train.sh` defaults to 96 h, which fits only Grenoble. For other sites pass
 `--walltime 48` (or 24) and plan to resume with `training.resume_ckpt=<ckpt>`.
@@ -71,12 +82,15 @@ job (`-t idempotent`), but it restarts from scratch.
 
 ## 4. Remote-site checks (Nancy / Rennes / Sophia)
 
-- `setup-site` already ran for nancy, rennes and sophia on 2026-11-13. It
-  linked the uv Python and `~/thoth_storage` into those homes. For any other
-  site, run `python3 scripts/g5k_gpus.py setup-site <site>` first, and rerun it
-  after a `uv python` upgrade.
-- Secrets live in each site's home. If `~/.netrc` (wandb) or
-  `~/.config/tabpfn_token` is missing on that site, wandb and TabPFN fail. Ask
+- `setup-site` already ran for nancy, rennes, sophia, lille, lyon and nantes
+  on 2026-11-13. It linked the uv Python and `~/thoth_storage` into those
+  homes. For any other site, run `python3 scripts/g5k_gpus.py setup-site <site>`
+  first, and rerun it after a `uv python` upgrade.
+- Never import numpy or torch on a frontend. On Lille it fails anyway: the
+  frontend VM lacks x86-64-v2, while the nodes are fine.
+- Secrets live in each site's home. If `~/.netrc` (wandb) or the TabPFN key is
+  missing on that site, wandb and TabPFN fail. A key in the checkout's `.env`
+  is shared by every site. Ask
   the user to run `setup-site <site> --copy-secrets`; don't copy credentials
   yourself. Never fall back to `WANDB_MODE=offline` for training.
   `test_full.sh` disables wandb, so tests don't need `.netrc`.

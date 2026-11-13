@@ -77,16 +77,17 @@ uv run --no-sync python -c "from copula_inter.credentials import ssh_add; ssh_ad
 ### Other Grid5000 sites (when the thoth GPUs are full)
 
 `scripts/g5k_gpus.py` finds GPUs you can use on every Abaca site (Grenoble,
-Nancy, Rennes, Sophia) and submits where the job starts soonest. It runs on any
+Nancy, Rennes, Sophia) and on the SLICES-FR `default` queue (Lille, Lyon,
+Nantes), and submits where the job starts soonest. It runs on any
 frontend; from a laptop with the sshfs checkout it re-runs itself on the
 frontend behind the mount.
 
 ```bash
-python3 scripts/g5k_gpus.py status --walltime 24 [--gpus 2] [--besteffort] [--all]
+python3 scripts/g5k_gpus.py status --walltime 24 [--gpus 2] [--besteffort] [--abaca-only] [--all]
 python3 scripts/g5k_gpus.py submit --walltime 40 -- scripts/train.sh model=copula_nano
 python3 scripts/g5k_gpus.py submit --dry-run --walltime 12 -- scripts/eval_checkpoint.sh ckpt=<ckpt>
 python3 scripts/g5k_gpus.py jobs                          # your jobs on every site
-python3 scripts/g5k_gpus.py setup-site nancy rennes sophia [--copy-secrets]   # once
+python3 scripts/g5k_gpus.py setup-site nancy rennes sophia lille lyon nantes [--copy-secrets]   # once
 python3 scripts/g5k_gpus.py submit --walltime 0:20 -- scripts/g5k_smoke.sh    # check a site
 ```
 
@@ -110,19 +111,50 @@ For thoth on 2026-11-13:
 | p3 | Nancy granite (RTX PRO 6000), gres (L40S), gruss (A40), grat (A100), graffiti, grele, grue, gratouille; Rennes abacus1/2/4/8/9/11/14/16/25/28/30-B (V100, A40, A5000, P100); Sophia esterel10/19/20/27/28/29 |
 | besteffort | most other esterel (A100 80GB, H100, A40, L40S...), abacus (H100, A100, L40S...), vercors2-8, kinovis |
 
-Non-Abaca clusters (Lille chuc A100, Lyon...) are in the `default` queue
-(`--default-queue`). They are capped at 14 h on weekdays, and the usage policy
-forbids crossing 09:00 or 19:00 on weekdays. Use them for nights and weekends.
+**SLICES-FR `default` queue.** Every account can use these clusters (checked
+for thoth on 2026-11-13). Abaca users must name the queue (`-q default`), which
+`submit` does. Exotic clusters also get `-t exotic`. The NVIDIA x86 clusters are:
+
+| site | cluster | GPUs |
+|---|---|---|
+| Lille | chuc | 8 × 4 A100-SXM4 40GB |
+| Lille | chifflot | V100 32GB / P100 |
+| Lille | chicoree (exotic) | 4 H200 NVL 140GB |
+| Lyon | sirius (exotic) | 8 A100 40GB |
+| Lyon | gemini (exotic) | 2 × 8 V100 32GB |
+| Nantes | ecotaxe (exotic) | 2 × 3 A100 80GB |
+| Nancy | grouille (exotic) | 2 × 2 A100 40GB |
+
+The usage policy limits them by the clock (Europe/Paris), and the tool caps the
+walltime to what a job starting now may use:
+- on a weekday, a job may not cross 09:00 or 19:00; one submitted from 17:00
+  may cross 19:00;
+- outside weekends a job lasts at most 14 h;
+- a job starting Friday evening or at the weekend may run until Monday 09:00.
+
+Use them for nights and weekends, or for short daytime jobs. `--abaca-only`
+skips them.
+
+Other GPUs need a different venv and are filtered out by `--arch x86_64` and
+`--min-cc 7`:
+- AMD GPUs (a ROCm torch build): Luxembourg larochette (MI210) and vianden
+  (MI300X), Lyon neowise (MI50);
+- ARM nodes: Lyon hydra (GH200), Toulouse estats;
+- ppc64le: Grenoble drac.
+
+The Lille frontend is a VM whose CPU lacks x86-64-v2. numpy can't load there,
+but it works on the Lille nodes.
 
 **How `submit` decides.** The tool queries the API resources, `oarstat` on each
 site frontend, and the OAR Gantt (`/status?waiting=yes`). From them it ranks
 targets by:
 
-1. whether some host has `--gpus` GPUs free for the whole walltime;
-2. the estimated wait;
-3. besteffort last;
-4. compute capability, then VRAM;
-5. Grenoble first on ties.
+1. whether the walltime fits the cap;
+2. whether some host has `--gpus` GPUs free for the whole walltime;
+3. the estimated wait;
+4. besteffort last;
+5. compute capability, then VRAM;
+6. Grenoble first on ties.
 
 `submit` then submits to the first target (`-q <level> -p "nodeset='<x>'"`). It
 reads OAR's `scheduled_start` and keeps the job if it starts within
@@ -146,7 +178,8 @@ need from the Grenoble home:
   `<storage>/.g5k-sites/uv-python` and links it.
 
 With `--copy-secrets` it also copies `~/.netrc` (wandb) and the TabPFN key
-file (`~/.config/tabpfn_token`) at mode 600. `submit` forwards `HF_HOME` and
+files under `~/.config` at mode 600. A key kept in the checkout's `.env` is on
+the shared storage, so every site sees it without a copy. `submit` forwards `HF_HOME` and
 `UV_CACHE_DIR` as absolute storage paths, because remote `.bashrc` files don't
 set them. Rerun `setup-site` after a `uv python` upgrade.
 

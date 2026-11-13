@@ -43,16 +43,18 @@ import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 API = "https://api.grid5000.fr/stable"
 ABACA_SITES = ["grenoble", "nancy", "rennes", "sophia"]
-DEFAULT_QUEUE_SITES = ["lille", "lyon", "nantes", "luxembourg"]
+# Sites whose only NVIDIA x86 GPUs are in the SLICES-FR `default` queue (Lille chuc/chifflot/chicoree,
+# Lyon sirius/gemini, Nantes ecotaxe). Luxembourg (AMD), Toulouse (ARM) and the other sites have none.
+DEFAULT_QUEUE_SITES = ["lille", "lyon", "nantes"]
 # Production-queue walltime cap per priority label (Grid5000 "Production" page).
 LEVEL_CAP_H = {"p1": 168.0, "p2": 96.0, "p3": 48.0, "p4": 24.0}
-# Default queue: weekday jobs may not exceed 14 h (Grid5000 usage policy).
-DEFAULT_QUEUE_CAP_H = 14.0
 QUEUE_LEVEL = {"admin": 100, "p1": 40, "p2": 30, "p3": 20, "p4": 10, "default": 25, "besteffort": 0}
 OCCUPYING_STATES = {"Running", "Launching", "toLaunch", "Finishing", "Resuming", "Suspended", "toAckReservation"}
 # Same GPU models as FORBIDDEN_GPU_REGEX in scripts/_env.sh (known not to work for this project).
@@ -116,6 +118,36 @@ def fmt_h(seconds: float) -> str:
     return f"{h:.1f}h" if h < 48 else f"{h / 24:.1f}d"
 
 
+def parse_cc(value: Any) -> float:
+    """CUDA compute capability as a float; 0 for AMD/unknown ('N/A', null)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def default_queue_cap_h(now: float) -> float:
+    """Longest walltime the SLICES-FR usage policy allows a `default`-queue job starting now.
+
+    Weekdays (Mon-Fri, Europe/Paris): a job may not cross 09:00 or 19:00, except
+    that one submitted at or after 17:00 may cross 19:00; outside weekends a job
+    lasts at most 14 h. A job starting on Friday evening or the weekend may run
+    until Monday 09:00. (The 2 h-per-day full-cluster quota is not modelled: one
+    GPU of a node is far below it.)
+    """
+    t = datetime.fromtimestamp(now, ZoneInfo("Europe/Paris"))
+    if t.weekday() < 5 and 9 <= t.hour < 17:
+        return (t.replace(hour=19, minute=0, second=0, microsecond=0) - t).total_seconds() / 3600
+    end = t.replace(hour=9, minute=0, second=0, microsecond=0)
+    if end <= t:
+        end += timedelta(days=1)
+    while end.weekday() >= 5:
+        end += timedelta(days=1)
+    hours = (end - t).total_seconds() / 3600
+    spans_weekend = end.weekday() == 0 and (t.weekday() >= 4 or t.date() == end.date())
+    return hours if spans_weekend else min(hours, 14.0)
+
+
 def my_groups() -> set[str]:
     names = {grp.getgrgid(g).gr_name for g in os.getgroups()}
     return names
@@ -137,6 +169,7 @@ class Gpu:
     max_wt_h: float  # node limit; inf if none
     exotic: bool
     production: bool
+    arch: str  # cpuarch: x86_64, aarch64, ppc64le
     state: str  # Alive / standby / Absent / Suspected / Dead / maintenance
     jobs: set[int] = field(default_factory=set)
     blocked_at: float = INF  # start of an advance reservation already holding this GPU
@@ -180,10 +213,11 @@ def fetch_site(site: str) -> SiteData:
             nodeset=r.get("nodeset"),
             model=r["gpu_model"],
             mem_gb=(r.get("gpu_mem") or 0) / 1024,
-            cc=float(r.get("gpu_compute_capability") or 0),
+            cc=parse_cc(r.get("gpu_compute_capability")),
             max_wt_h=mwt / 3600 if mwt > 0 else INF,
             exotic=r.get("exotic") == "YES",
             production=r.get("production") == "YES",
+            arch=r.get("cpuarch") or "?",
             state=state,
         )
     try:
@@ -238,6 +272,7 @@ class Request:
     exclude: str
     min_vram: float
     min_cc: float
+    arch: str
 
 
 @dataclass
@@ -289,21 +324,23 @@ def summarize(sites: list[SiteData], access: dict[str, tuple[str, int, str]], re
     for sd in sites:
         groups: dict[str, list[Gpu]] = defaultdict(list)
         for g in sd.gpus.values():
-            if g.nodeset:
-                if g.nodeset not in access:
-                    continue
-                groups[g.nodeset].append(g)
-            elif not g.production and req.default_queue:
+            if g.production:  # Abaca: per-nodeset access level
+                if g.nodeset in access:
+                    groups[g.nodeset].append(g)
+            elif req.default_queue:  # SLICES-FR default queue, open to every account
                 groups[g.cluster].append(g)
         for target, all_gpus in groups.items():
             gpus = [
                 g
                 for g in all_gpus
-                if not (excl and excl.search(g.model)) and g.mem_gb + 0.5 >= req.min_vram and g.cc + 1e-9 >= req.min_cc
+                if not (excl and excl.search(g.model))
+                and g.mem_gb + 0.5 >= req.min_vram
+                and g.cc + 1e-9 >= req.min_cc
+                and (not req.arch or g.arch == req.arch)
             ]
             if not gpus:
                 continue
-            if target in access and gpus[0].nodeset:
+            if gpus[0].production:
                 label, level, group = access[target]
                 prop_key = "nodeset"
             else:
@@ -313,7 +350,7 @@ def summarize(sites: list[SiteData], access: dict[str, tuple[str, int, str]], re
             node_cap = min(g.max_wt_h for g in gpus)
             cap = min(LEVEL_CAP_H.get(label, INF), node_cap)
             if label == "default":
-                cap = min(cap, DEFAULT_QUEUE_CAP_H)
+                cap = min(cap, default_queue_cap_h(now))
             c = Candidate(
                 site=sd.site,
                 target=target,
@@ -379,15 +416,16 @@ def summarize(sites: list[SiteData], access: dict[str, tuple[str, int, str]], re
 
 
 def collect(args: argparse.Namespace) -> tuple[list[SiteData], list[Candidate], Request]:
-    sites = args.sites or (ABACA_SITES + (DEFAULT_QUEUE_SITES if args.default_queue else []))
+    sites = args.sites or (ABACA_SITES + ([] if args.abaca_only else DEFAULT_QUEUE_SITES))
     req = Request(
         gpus=args.gpus,
         walltime_h=parse_walltime(args.walltime),
         besteffort=args.besteffort,
-        default_queue=args.default_queue,
+        default_queue=not args.abaca_only,
         exclude=args.exclude,
         min_vram=args.min_vram,
         min_cc=args.min_cc,
+        arch=args.arch,
     )
     with ThreadPoolExecutor(len(sites) + 1) as ex:
         acc_f = ex.submit(load_access)
@@ -412,7 +450,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(
         f"request: host=1/gpu={req.gpus}, walltime={fmt_walltime(req.walltime_h)}, "
         f"exclude=/{req.exclude}/ min_vram={req.min_vram:g}GB min_cc={req.min_cc:g}"
-        f"{', +besteffort' if req.besteffort else ''}{', +default queue' if req.default_queue else ''}"
+        f"{', +besteffort' if req.besteffort else ''}{'' if req.default_queue else ', Abaca only'}"
     )
     hdr = (
         f"{'site':9s} {'target':12s} {'queue':10s} {'gpu model':28s} {'GB':>4s} {'cap':>5s} "
@@ -455,7 +493,7 @@ def oarsub_args(c: Candidate, req: Request, name: str, project: str | None) -> l
     if c.label == "besteffort":
         a += ["-q", "besteffort", "-t", "besteffort", "-t", "idempotent"]
     else:
-        a += ["-q", c.label]
+        a += ["-q", c.label]  # p1..p4, or `default`: Abaca users must name the SLICES-FR queue
     if c.exotic:
         a += ["-t", "exotic"]
     proj = project or c.group
@@ -603,6 +641,20 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def find_venv(repo: Path) -> Path:
+    """The venv jobs use, resolved like scripts/_env.sh: $COPULA_VENV, the checkout's .venv, else the main checkout's."""
+    if os.environ.get("COPULA_VENV"):
+        return Path(os.environ["COPULA_VENV"])
+    if (repo / ".venv").is_dir():
+        return repo / ".venv"
+    out = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+    )
+    return Path(out.stdout.strip()).parent / ".venv"
+
+
 def cmd_setup_site(args: argparse.Namespace) -> int:
     """Replicate the home-directory paths jobs depend on, on other sites' homes (shared group storage)."""
     home = Path.home()
@@ -610,9 +662,10 @@ def cmd_setup_site(args: argparse.Namespace) -> int:
     # 1. home symlinks pointing into group storage (e.g. ~/thoth_storage)
     links = [p for p in home.iterdir() if p.is_symlink() and os.readlink(p).startswith("/srv/storage/")]
     # 2. the venv's interpreter, if it lives in this site's home (uv-managed python)
-    py_real = Path(os.path.realpath(repo / ".venv/bin/python"))
+    venv = find_venv(repo)
+    py_real = Path(os.path.realpath(venv / "bin/python"))
     uv_python = home / ".local/share/uv/python"
-    storage_root = Path(os.path.realpath(repo)).parent
+    storage_root = Path(os.path.realpath(venv)).parent.parent  # the directory holding the main checkout
     py_copy = storage_root / ".g5k-sites/uv-python"
     need_py = str(py_real).startswith(str(home) + "/")
     if need_py:
@@ -632,8 +685,10 @@ def cmd_setup_site(args: argparse.Namespace) -> int:
                 f"echo 'skip: ~/.local/share/uv/python exists as a real dir'; "
                 f"else ln -sfn {shlex.quote(str(py_copy))} ~/.local/share/uv/python; fi",
             ]
+        # Only check that the venv's interpreter resolves: frontends are not compute nodes (Lille's is a VM
+        # whose CPU lacks x86-64-v2, so numpy/torch can't load there). g5k_smoke.sh tests a real node.
         steps.append(
-            f"{shlex.quote(str(repo / '.venv/bin/python'))} -c 'import sys, torch; print(sys.version.split()[0], torch.__version__)'"
+            f"{shlex.quote(str(venv / 'bin/python'))} -c 'import sys; print(\"venv python\", sys.version.split()[0])'"
         )
         print(f"\n[{site}]")
         out = subprocess.run([*SSH, site, " && ".join(steps)], capture_output=True, text=True, timeout=300)
@@ -680,11 +735,16 @@ def main() -> int:
         sp.add_argument("--gpus", type=int, default=None if walltime_default is None else 1, help="GPUs on one host")
         sp.add_argument("--walltime", default=walltime_default, help="hours: 48, 36h, 90m, 12:30:00")
         sp.add_argument("--besteffort", action="store_true", help="also use besteffort-only targets (preemptable)")
-        sp.add_argument("--default-queue", action="store_true", help="also use non-production clusters (default queue)")
+        sp.add_argument(
+            "--abaca-only",
+            action="store_true",
+            help="skip the SLICES-FR default-queue clusters (Lille, Lyon, Nantes, Nancy grouille)",
+        )
         sp.add_argument("--exclude", default=DEFAULT_EXCLUDE, help="regex of GPU models to skip ('' for none)")
         sp.add_argument("--min-vram", type=float, default=20.0, help="GB per GPU")
-        sp.add_argument("--min-cc", type=float, default=7.0, help="CUDA compute capability")
-        sp.add_argument("--sites", nargs="+", help=f"default {' '.join(ABACA_SITES)}")
+        sp.add_argument("--min-cc", type=float, default=7.0, help="CUDA compute capability (drops AMD GPUs)")
+        sp.add_argument("--arch", default="x86_64", help="node CPU architecture the venv runs on ('' for any)")
+        sp.add_argument("--sites", nargs="+", help=f"default {' '.join(ABACA_SITES + DEFAULT_QUEUE_SITES)}")
         sp.add_argument("--prefer-site", default="grenoble", help="tie-break: the site holding the data")
 
     st = sub.add_parser("status", help="free GPUs per cluster you can use")
