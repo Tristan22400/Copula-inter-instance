@@ -56,8 +56,9 @@ for cell in "${cells[@]}"; do
       cmd=(./scripts/eval_checkpoint.sh "config=conf/eval_${cell}.yaml" selection.min_test_points=16 "${common[@]}") ;;
     *) echo "unknown cell: $cell" >&2; exit 1 ;;
   esac
-  # A whole GPU node (baseline fitting is CPU-bound across all cores), never an L4.
-  oarsub -q p1 -n "rerun-${cell}-${mode}" -l "host=1,walltime=$walltime" \
+  # One GPU (never an L4) and its share of the node's cores: baseline fitting runs one process
+  # per allocated core, and a single GPU starts far sooner than a whole free node.
+  oarsub -q p1 -n "rerun-${cell}-${mode}" -l "gpu=1,walltime=$walltime" \
     -p "gpu_count > 0 AND gpu_model NOT LIKE '%L4%'" \
     -O "logs/rerun_${cell}_${mode}_%jobid%.out" -E "logs/rerun_${cell}_${mode}_%jobid%.err" \
     "ERA5_EVAL_OUT_DIR=$out ${cmd[*]}"
