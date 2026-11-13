@@ -91,6 +91,18 @@ _DEFAULT_PRIOR_CFG: dict[str, float] = {
 }
 
 
+# Periodic fits: minimum restarts, each started at its own quantile of the period prior.
+_PERIODIC_MIN_RESTARTS = 8
+
+
+def _period_prior_quantiles(prior_cfg: dict, n: int) -> list[float]:
+    """The (i + 1/2)/n quantiles of the LogNormal period prior, i = 0..n-1 (stratified restart inits)."""
+    cfg = {**_DEFAULT_PRIOR_CFG, **prior_cfg}
+    normal = torch.distributions.Normal(0.0, 1.0)
+    qs = normal.icdf(torch.tensor([(i + 0.5) / n for i in range(n)], dtype=torch.float64))
+    return [math.exp(cfg["period_lognormal_loc"] + cfg["period_lognormal_scale"] * float(q)) for q in qs]
+
+
 def _kernel_priors(prior_cfg: dict, kernel_name: str, ard: bool = False) -> dict[str, Prior]:
     """LogNormal/Gamma hyperpriors matching gp_episodes's generative priors, for MAP fitting.
 
@@ -427,7 +439,9 @@ def fit_and_eval_gpytorch(
     """Fit a GP (or DKL) on raw y_train; return {"R", "mean", "Sigma", "log_ml", "n_hparams", "log_evidence", "map_objective"}.
 
     Maximizes the exact marginal likelihood plus the hyperpriors (MAP) from
-    n_restarts random initializations and keeps the best. oracle_mode="posterior"
+    n_restarts random initializations and keeps the best (periodic: at least 8, each
+    started at its own quantile of the period prior, as its likelihood is multimodal
+    in the period). oracle_mode="posterior"
     returns the fitted posterior at X_test (with noise); "prior" returns the
     fitted kernel's prior covariance at X_test (with noise). "polynomial" repeats
     the fit for every candidate degree. With a feature extractor, or when
@@ -478,8 +492,16 @@ def fit_and_eval_gpytorch(
     best_model: _ExactGPModel | None = None
     best_likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
 
+    # The periodic likelihood is multimodal in the period: take at least _PERIODIC_MIN_RESTARTS
+    # restarts and start each at a different quantile of the period prior instead of a random draw.
+    n_fits = max(1, n_restarts)
+    period_inits: list[float] = []
+    if kernel_name == "periodic":
+        n_fits = max(n_fits, _PERIODIC_MIN_RESTARTS)
+        period_inits = _period_prior_quantiles(prior_cfg or {}, n_fits)
+
     for poly_power in poly_powers:
-        for _ in range(max(1, n_restarts)):
+        for restart in range(n_fits):
             try:
                 likelihood = _sampled_likelihood(noise_prior, X_train.device)
 
@@ -497,6 +519,9 @@ def fit_and_eval_gpytorch(
                     mean=mean,
                 ).to(X_train.device)
                 _randomize_init(model, kernel_priors, kernel_name, lengthscale_init_prior=lengthscale_init_prior)
+                if period_inits:
+                    base = model.covar_module.base_kernel
+                    base.period_length = torch.full_like(base.period_length, period_inits[restart])
 
                 model.train()
                 likelihood.train()

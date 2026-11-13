@@ -228,6 +228,52 @@ def _scale_fold_targets(y_context: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 
 
 @torch.no_grad()
+def _test_logits(
+    tabicl: TabICLLike, X_train: torch.Tensor, Y_train: torch.Tensor, X_test: torch.Tensor
+) -> torch.Tensor:
+    """(d, N, Q) quantile logits of the N test rows given the full context, one forward with the d targets batched."""
+    d = Y_train.shape[1]
+    X_concat = torch.cat([X_train, X_test], dim=0)  # (P+N, p_x)
+    X_test_batch = X_concat.unsqueeze(0).expand(d, -1, -1).contiguous()  # (d, P+N, p_x)
+    y_train_batch = Y_train.permute(1, 0).contiguous()  # (d, P)
+    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)  # (d, N, Q)
+    # TabICL may return its output on CPU under memory pressure; move it back to X_train's device.
+    return logits.to(X_train.device)
+
+
+class QueryMarginal:
+    """The frozen marginal predictive distributions of N query rows (those behind run_pit's z_test).
+
+    One TabICL forward; cdf and log_prob take (C, N) values (column j through query row j's
+    distribution) and rebuild the distribution per chunk, so any number of draws fits in memory.
+    """
+
+    def __init__(self, tabicl: TabICLLike, logits: torch.Tensor) -> None:
+        self.tabicl = tabicl
+        self.logits = logits  # (N, Q)
+
+    def _flat(self, values: torch.Tensor) -> tuple[Any, torch.Tensor]:
+        C, N = values.shape
+        dist = self.tabicl.quantile_dist(self.logits.repeat(C, 1))  # rows ordered (c, j)
+        return dist, values.reshape(C * N).to(self.logits.dtype)
+
+    def cdf(self, values: torch.Tensor) -> torch.Tensor:
+        dist, flat = self._flat(values)
+        return dist.cdf(flat).reshape(values.shape)
+
+    def log_prob(self, values: torch.Tensor) -> torch.Tensor:
+        dist, flat = self._flat(values)
+        return dist.log_prob(flat).reshape(values.shape)
+
+
+def query_marginal(
+    tabicl: TabICLLike, X_train: torch.Tensor, y_train: torch.Tensor, X_test: torch.Tensor
+) -> QueryMarginal:
+    """The frozen marginals of the N test rows given the full context; y_train (P,) on the caller's scale."""
+    return QueryMarginal(tabicl, _test_logits(tabicl, X_train, y_train.unsqueeze(-1), X_test)[0])
+
+
+@torch.no_grad()
 def run_pit(
     tabicl: TabICLLike,
     X_train: torch.Tensor,
@@ -263,13 +309,7 @@ def run_pit(
     fold_targets = Y_train if Y_train_raw is None else Y_train_raw
 
     # A) Test instances: one forward over the full train context, d targets on the batch axis.
-    X_concat = torch.cat([X_train, X_test], dim=0)  # (P+N, p_x)
-    X_test_batch = X_concat.unsqueeze(0).expand(d, -1, -1).contiguous()  # (d, P+N, p_x)
-    y_train_batch = Y_train.permute(1, 0).contiguous()  # (d, P)
-
-    logits = tabicl_forward(tabicl, X_test_batch, y_train_batch)  # (d, N, Q)
-    # TabICL may return its output on CPU under memory pressure; move it back to `device`.
-    logits = logits.to(device)
+    logits = _test_logits(tabicl, X_train, Y_train, X_test)  # (d, N, Q)
     Q = logits.shape[-1]
     dist = tabicl.quantile_dist(logits.reshape(d * N, Q))
 

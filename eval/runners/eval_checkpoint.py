@@ -38,6 +38,7 @@ from eval.runners.eval_tables import (
     _RANK_KEYS,
     _TOTAL_RANK_ORDER,
     _ar_note,
+    _print_copula_efficiency,
     _print_rank_table,
     _print_table,
     _print_total_nll_table,
@@ -106,7 +107,7 @@ def _results_fingerprint(
         "lr_zeromean_gp": spec.baselines.lr_zeromean_gp,
         "n_restarts_zeromean_gp": spec.baselines.n_restarts_zeromean_gp,
         # Bump when the derived total-NLL or rank rows change.
-        "result_schema": 4,
+        "result_schema": 5,
         "autoregressive": bool(spec.autoregressive.enabled),
         "ar_order": spec.autoregressive.order if spec.autoregressive.enabled else None,
         "ar_conditioning": spec.autoregressive.conditioning if spec.autoregressive.enabled else None,
@@ -226,6 +227,7 @@ def _report_results(
             all_total_nlls, spec.autoregressive.order, spec.autoregressive.conditioning, spec.autoregressive.max_context
         ),
     )
+    _print_copula_efficiency(all_episode_meta)
     _print_rank_table(
         all_nlls,
         _RANK_KEYS,

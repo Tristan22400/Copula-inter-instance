@@ -35,12 +35,19 @@ if TYPE_CHECKING:
     from copula_inter.copula.model import CopulaTabICL
     from eval.runners.eval_args import EvalSpec
 
+from copula_inter.copula.attainable import (
+    any_copula_bound,
+    attainable_correlation,
+    expected_copula_nll,
+    pit_second_moment,
+)
 from copula_inter.copula.loss import y_space_nll
 from copula_inter.copula.model import low_rank_correlation
 from copula_inter.marginal.pit import (
     TabICLLike,
     gp_analytical_posterior,
     normalize_targets,
+    query_marginal,
     run_pit,
 )
 from eval.baselines.autoregressive import (
@@ -488,6 +495,101 @@ def _marginal_plugin_rows(
     return rows
 
 
+# Correlations whose expected copula loss the efficiency table compares with R_dagger:
+# (key in the efficiency dict, source key in the scored R dicts).
+_EFFICIENCY_SOURCES = (
+    ("icl", "icl"),
+    ("gp_evidence", "gp_evidence"),
+    ("gp_laplace", "gp_laplace"),
+    ("oracle_posterior", "oracle"),
+)
+
+
+def _attainable_rows(
+    ctx: _EvalContext,
+    ep: dict,
+    ep_i: int,
+    marginal_pit: dict[str, Tensor] | None,
+    R_scored: dict[str, Tensor],
+    nlls: dict[str, float],
+) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+    """The attainable copulas under the frozen TabICL marginals, and the copula-efficiency losses.
+
+    Draws y_Q ~ the known-theta GP posterior and maps each draw through the frozen marginals
+    (query_marginal: the distributions behind marginal_pit's z_test). From the draws:
+      M = E[z z'] gives the best Gaussian copula R_dagger over all correlations and in the
+      head's covnorm family at each rank r (the head's rank plus attainable.ranks);
+      any_copula_bound = E[-log p_U(U)] / N bounds every copula from below (equal for
+      calibrated marginals), so the best copula of any family lies in [bound, l(R_dagger)].
+    Rows (raw nats, the TOTAL table): marg_attainable (full rank) and marg_attainable_lowrank
+    (the head's rank), each with the marginal. Efficiency (meta): l(R) = E[-log c_R(z)] / N
+    for "attainable", "attainable_r<r>", "any_copula_bound" and every scored R in
+    _EFFICIENCY_SOURCES (independence is 0); "m_diag" = mean(diag M), 1 for calibrated marginals.
+    Empty/nan without a known-theta posterior (ERA5, real data), a TabICL marginal, or attainable.enabled.
+    """
+    rows = {"marg_attainable": _NAN_PARTS.copy(), "marg_attainable_lowrank": _NAN_PARTS.copy()}
+    att = ctx.spec.attainable
+    if not att.enabled or marginal_pit is None or ctx.tabicl_marginal is None or ctx.marginal_backend is not None:
+        return rows, {}
+    try:
+        post = gp_analytical_posterior(ep)
+    except (KeyError, NotImplementedError):
+        return rows, {}
+    device = ctx.device
+    y_train = ep["y_train"].to(device)
+    _, _, y_mean, y_std = normalize_targets(y_train)
+    marginal = query_marginal(
+        ctx.tabicl_marginal, ep["x_norm_train"].to(device), (y_train - y_mean) / y_std, ep["x_norm_test"].to(device)
+    )
+    mu = post["mu_post"].to(device).double()
+    Sigma = post["Sigma_post"].to(device).double()
+    N = mu.shape[0]
+    Sigma = 0.5 * (Sigma + Sigma.T) + 1e-9 * torch.eye(N, dtype=torch.float64, device=device)
+    gen = torch.Generator(device="cpu").manual_seed((ctx.spec.seed * 1_000_003 + ep_i) % (2**31 - 1))
+    noise = torch.randn(att.n_samples, N, generator=gen, dtype=torch.float64).to(device)
+    y_draws = mu + noise @ torch.linalg.cholesky(Sigma).T  # (L, N) raw
+    scaled = (y_draws - y_mean.double()) / y_std.double()  # on the marginal's scale
+    chunk = 256
+    with torch.no_grad():
+        M = pit_second_moment(marginal.cdf, scaled, chunk=chunk)
+        # sum_j log f_j(y_j) in raw nats (the scaled density's Jacobian is 1 / std per coordinate).
+        log_marg = torch.cat(
+            [marginal.log_prob(scaled[i : i + chunk]).double().sum(-1) for i in range(0, att.n_samples, chunk)]
+        ) - N * torch.log(y_std.double())
+        log_joint = torch.distributions.MultivariateNormal(mu, covariance_matrix=Sigma).log_prob(y_draws)
+
+    head_rank = int(ctx.fit_kwargs["icl_rank"])
+    parametrization = getattr(ctx.icl_model, "correlation_parametrization", "covnorm")
+    R_full = attainable_correlation(M, None, max_iter=att.max_iter)
+    efficiency = {
+        "m_diag": float(M.diagonal().mean()),
+        "any_copula_bound": any_copula_bound(log_joint, log_marg, N),
+        "attainable": expected_copula_nll(R_full, M),
+    }
+    R_head = None
+    if parametrization == "covnorm":
+        for r in sorted({head_rank, *att.ranks}):
+            R_r = attainable_correlation(M, r, max_iter=att.max_iter, parametrization=parametrization)
+            efficiency[f"attainable_r{r}"] = expected_copula_nll(R_r, M)
+            if r == head_rank:
+                R_head = R_r
+
+    z = marginal_pit["z_test"].to(device).unsqueeze(0)
+    log_pdf = marginal_pit["log_pdf_test"].to(device).unsqueeze(0)
+    mask = torch.ones_like(z, dtype=torch.bool)
+    for key, R in (("marg_attainable", R_full), ("marg_attainable_lowrank", R_head)):
+        if R is not None:
+            parts = y_space_nll(R.to(device=device, dtype=z.dtype).unsqueeze(0), z, log_pdf, mask)
+            rows[key] = {k: v.item() for k, v in parts.items()}
+    for key, source in _EFFICIENCY_SOURCES:
+        R = R_scored.get(source)
+        # A failed fit or selection has a nan NLL and a placeholder identity R.
+        if R is not None and np.isfinite(nlls.get(source, float("nan"))) and torch.isfinite(R).all():
+            efficiency[key] = expected_copula_nll(R.to(device), M)
+    efficiency["head_rank"] = float(head_rank)
+    return rows, efficiency
+
+
 def _total_nll_rows(
     ep: dict,
     baseline_y_nlls: dict[str, dict[str, float]],
@@ -631,12 +733,19 @@ def _score_episode(
         marginal_pit=marginal_pit,
     )
     plugin_rows = _marginal_plugin_rows(marginal_pit, baseline_nlls, baseline_R, R_oracle, device)
-    total_nlls = _total_nll_rows(ep, {**baseline_y_nlls, **plugin_rows}, icl_y_parts, y_space_nlls, marginal_pit)
+    R_scored = {**baseline_R, **icl_R, **({"oracle": R_oracle} if R_oracle is not None else {})}
+    attainable_rows, efficiency = _attainable_rows(ctx, ep, ep_i, marginal_pit, R_scored, {**baseline_nlls, **icl_nlls})
+    total_nlls = _total_nll_rows(
+        ep, {**baseline_y_nlls, **plugin_rows, **attainable_rows}, icl_y_parts, y_space_nlls, marginal_pit
+    )
     meta = {
         "ep_i": ep_i,
         "n_test": ep["z_test"].shape[0],
         "kernel": _kernel_composition_label(ep),
     }
+    if efficiency:
+        # Expected copula NLL per point under M (see _attainable_rows); 0 = independence.
+        meta["copula_efficiency"] = efficiency
     if "real_meta" in ep:
         # Identifies the episode (rows, split, group) for paired comparisons and cluster bootstraps.
         meta["episode"] = ep["real_meta"]

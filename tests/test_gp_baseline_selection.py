@@ -9,7 +9,12 @@ import pytest
 import torch
 from gpytorch.priors import GammaPrior
 
-from copula_inter.baselines.gp_mle import _ExactGPModel, fit_and_eval_gpytorch, laplace_log_evidence
+from copula_inter.baselines.gp_mle import (
+    _ExactGPModel,
+    _period_prior_quantiles,
+    fit_and_eval_gpytorch,
+    laplace_log_evidence,
+)
 from eval.baselines.classical import _evidence_rows, _laplace_rows
 from eval.runners.episode_scoring import _marginal_plugin_rows
 from eval.runners.eval_tables import _METHOD_LABELS, _TOTAL_NLL_ORDER, _TOTAL_RANK_ORDER
@@ -229,3 +234,11 @@ def test_tables_rank_only_context_only_selections() -> None:
     assert "marg_oracle_corr" in total
     assert "marg_oracle_corr" not in rank and "oracle_posterior" not in rank
     assert "oracle_prior" in _METHOD_LABELS
+
+
+def test_periodic_restarts_start_at_stratified_period_quantiles() -> None:
+    """Increasing, symmetric in log space around the prior median exp(loc) = 1.2 (n odd: the median itself)."""
+    q = _period_prior_quantiles({}, 9)
+    assert q == sorted(q) and len(set(q)) == 9
+    assert q[4] == pytest.approx(1.2)
+    assert math.log(q[0]) + math.log(q[-1]) == pytest.approx(2 * math.log(1.2))

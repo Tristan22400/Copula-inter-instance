@@ -210,10 +210,59 @@ _TOTAL_NLL_ORDER = (
         ("independence_marginal", "Independence (marginal only)"),
         ("autoregressive", "Autoregressive marginal (chain rule)"),
         ("marg_oracle_corr", "Marginal + oracle posterior corr. (known theta)"),
+        ("marg_attainable_lowrank", "Marginal + attainable copula R-dagger (head rank, known theta)"),
+        ("marg_attainable", "Marginal + attainable copula R-dagger (full rank, known theta)"),
         ("oracle_prior", "Oracle (prior, unconditioned)"),
         ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
     ]
 )
+
+
+# Copula-efficiency rows after the attainable ones: (key in meta["copula_efficiency"], label).
+_EFFICIENCY_ROWS = (
+    ("icl", "ICL copula head"),
+    ("oracle_posterior", "R_po (known-theta posterior corr.)"),
+    ("gp_laplace", "GP-MLE posterior corr. (Laplace pick)"),
+    ("gp_evidence", "GP-MLE posterior corr. (BIC pick)"),
+)
+
+
+def _efficiency_rows(effs: list[dict]) -> list[tuple[str, str]]:
+    """Attainable rows (any-copula bound, full rank, each tracked rank r), then _EFFICIENCY_ROWS."""
+    head = {int(e["head_rank"]) for e in effs if "head_rank" in e}
+    ranks = sorted({int(k.removeprefix("attainable_r")) for e in effs for k in e if k.startswith("attainable_r")})
+    rows = [
+        ("any_copula_bound", "Any copula: lower bound (= if calibrated)"),
+        ("attainable", "Best Gaussian copula R-dagger (full rank)"),
+    ]
+    rows += [(f"attainable_r{r}", f"Best Gaussian copula, rank {r}" + (" (head)" if r in head else "")) for r in ranks]
+    return rows + list(_EFFICIENCY_ROWS)
+
+
+def _print_copula_efficiency(all_episode_meta: list[dict]) -> None:
+    """Expected copula NLL l(R) under the frozen marginals, and the share of the attainable gain each R captures.
+
+    l(R) = E[-log c_R(z)] / N with E[z z'] = M from the known-theta posterior (0 = independence).
+    efficiency = mean l(R) / mean l(R_dagger) over the episodes where both exist (1 = the best
+    Gaussian copula, 0 = no better than independence, < 0 = worse). The best copula of any family
+    lies between the bound and R_dagger. Synthetic episodes with a TabICL marginal only.
+    """
+    effs = [m["copula_efficiency"] for m in all_episode_meta if m.get("copula_efficiency")]
+    if not effs:
+        return
+    print(
+        f"\nCopula efficiency under the frozen marginals ({len(effs)} episodes; l in nats per point, 0 = independence)"
+    )
+    print(f"  mean diag(M) = {np.mean([e['m_diag'] for e in effs]):.4f}  (1 for calibrated marginals)")
+    print(f"  {'copula':<46}{'n':>5}{'mean l':>10}{'l - l(R-dagger)':>17}{'efficiency':>12}")
+    for key, label in _efficiency_rows(effs):
+        pairs = [(e[key], e["attainable"]) for e in effs if key in e and np.isfinite(e[key])]
+        if not pairs:
+            continue
+        l_r, l_att = np.array(pairs).T
+        eff = l_r.mean() / l_att.mean() if l_att.mean() != 0 else float("nan")
+        print(f"  {label:<46}{len(pairs):>5}{l_r.mean():>+10.4f}{(l_r - l_att).mean():>+17.4f}{eff:>12.3f}")
+    print()
 
 
 def _ar_note(

@@ -44,7 +44,12 @@ def _ctx(zeromean_gp: bool) -> Any:
     baselines = SimpleNamespace(
         zeromean_gp=zeromean_gp, n_steps_zeromean_gp=1, lr_zeromean_gp=0.1, n_restarts_zeromean_gp=1
     )
-    spec = SimpleNamespace(baselines=baselines, seed=0, selection=SimpleNamespace(n_folds=2, min_fold_size=1))
+    spec = SimpleNamespace(
+        baselines=baselines,
+        seed=0,
+        selection=SimpleNamespace(n_folds=2, min_fold_size=1),
+        attainable=SimpleNamespace(enabled=False),
+    )
     cpu = torch.device("cpu")
     return SimpleNamespace(
         spec=spec, device=cpu, baseline_device=cpu, icl_model=None, oracle_mode="prior", prior_cfg={}

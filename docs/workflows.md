@@ -154,6 +154,23 @@ tables. Rows that pick or mix GPs:
 The z-space "Oracle" row is the copula of the known-θ GP posterior, $R_{po}$:
 under exact marginals $z_{\text{test}}\sim\mathcal N(0, R_{po})$.
 
+**Attainable copulas (synthetic, TabICL marginal).** With the marginals frozen,
+the copula sees $u_j=\hat F_j(y_j)$. Drawing $y_Q$ from the known-θ posterior
+(`attainable.n_samples`) and pushing the draws through the frozen marginals gives
+$M=\mathbb E[zz^\top]$, $z=\Phi^{-1}(u)$, and three references:
+
+| Reference | Definition |
+|---|---|
+| Best copula, any family | between $\tfrac1N\mathbb E[-\log p_U(U)]$ (a lower bound, exact for calibrated marginals) and the best Gaussian copula |
+| Best Gaussian copula $R^\dagger$ | $\arg\min_R \log\det R+\mathrm{tr}(R^{-1}M)$ over all correlation matrices |
+| Best Gaussian copula of rank $r$ | the same in the head's covnorm family, for the head's rank and each `attainable.ranks` |
+
+The total table adds "Marginal + attainable copula R-dagger" (full rank and head
+rank). The copula-efficiency table gives each one's expected copula NLL
+$\ell(R)=\tfrac1{2N}[\log\det R+\mathrm{tr}((R^{-1}-I)M)]$ (0 = independence),
+next to the ICL head, $R_{po}$ and the GP picks, and efficiency
+$\ell(R)/\ell(R^\dagger)$. `attainable.enabled=false` turns it off.
+
 **Well-specified GP-MLE diagnostics (D1, D2).** Draws episodes from the GP-MLE's
 own model (one kernel, hyperparameters and noise from its hyperpriors, a constant
 mean, $x\sim\mathcal N(0,I_d)$, no nuisance features or warps) and fits it with

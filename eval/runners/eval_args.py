@@ -263,6 +263,24 @@ class SelectionSpec:
 
 
 @dataclass
+class AttainableSpec:
+    """Attainable copulas under the frozen marginals (synthetic episodes, TabICL marginal only).
+
+    Tracks the best Gaussian copula (full rank), the best rank-r Gaussian copula per rank, and a
+    lower bound on the best copula of any family (exact for calibrated marginals).
+    """
+
+    # Score the attainable copulas and print the copula-efficiency table.
+    enabled: bool = True
+    # Draws of y_Q from the known-theta GP posterior for M = E[z z'] (entry SE ~ 1/sqrt(n)).
+    n_samples: int = 8192
+    # Extra ranks r for the best rank-r Gaussian copula (the head's own rank is always included).
+    ranks: list[int] = field(default_factory=lambda: [1, 2, 4, 16])
+    # L-BFGS iterations of each R_dagger fit.
+    max_iter: int = 500
+
+
+@dataclass
 class OutputSpec:
     """Plots, per-episode dumps and the scored-results cache."""
 
@@ -307,6 +325,7 @@ class EvalSpec:
     baselines: BaselineSpec = field(default_factory=BaselineSpec)
     marginal: MarginalSpec = field(default_factory=MarginalSpec)
     selection: SelectionSpec = field(default_factory=SelectionSpec)
+    attainable: AttainableSpec = field(default_factory=AttainableSpec)
     output: OutputSpec = field(default_factory=OutputSpec)
 
 
@@ -370,6 +389,8 @@ def validate_eval_spec(spec: EvalSpec) -> None:
     check_choice("baselines.device", spec.baselines.device, ("cpu", "cuda", "auto"))
     check_choice("baselines.gp_predict", spec.baselines.gp_predict, GP_PREDICT_MODES)
     check_choice("baselines.gp_mean", spec.baselines.gp_mean, GP_MEANS)
+    if spec.attainable.n_samples < 2 or spec.attainable.max_iter < 1 or min(spec.attainable.ranks, default=1) < 1:
+        raise ValueError("attainable.n_samples must be >= 2, attainable.max_iter and every attainable.ranks >= 1")
     if spec.era5.enabled:
         if spec.dataset_dir is not None:
             raise ValueError("era5.enabled and dataset_dir are mutually exclusive episode sources.")
