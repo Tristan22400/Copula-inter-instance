@@ -15,6 +15,8 @@ Where things are:
                           vendored code
   - docs/glossary.md      vocabulary (PIT, z_train_source, oracle, tiers, ...)
   - CONTRIBUTING.md       checks, conventions, scientific contracts, recipes
+  - .claude/skills/g5k-launch  where to run tests/jobs on Grid5000: reuse a node, or
+                          scripts/g5k_gpus.py finds free GPUs on every site and submits
 
 Rules that are easy to break:
   - Layering: src/copula_inter imports only itself and tabicl; inference imports

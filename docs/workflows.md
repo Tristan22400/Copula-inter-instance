@@ -52,6 +52,89 @@ laptop's Python. Keep a laptop venv elsewhere:
 UV_PROJECT_ENVIRONMENT=~/.local/share/venvs/copula-inter-cpu uv sync --locked --extra dev --extra cpu
 ```
 
+### Other Grid5000 sites (when the thoth GPUs are full)
+
+`scripts/g5k_gpus.py` finds GPUs you can use on every Abaca site (Grenoble,
+Nancy, Rennes, Sophia) and submits where the job starts soonest. It runs on any
+frontend; from a laptop with the sshfs checkout it re-runs itself on the
+frontend behind the mount.
+
+```bash
+python3 scripts/g5k_gpus.py status --walltime 24 [--gpus 2] [--besteffort] [--all]
+python3 scripts/g5k_gpus.py submit --walltime 40 -- scripts/train.sh model=copula_nano
+python3 scripts/g5k_gpus.py submit --dry-run --walltime 12 -- scripts/eval_checkpoint.sh ckpt=<ckpt>
+python3 scripts/g5k_gpus.py jobs                          # your jobs on every site
+python3 scripts/g5k_gpus.py setup-site nancy rennes sophia [--copy-secrets]   # once
+python3 scripts/g5k_gpus.py submit --walltime 0:20 -- scripts/g5k_smoke.sh    # check a site
+```
+
+**Priority.** Each Abaca *nodeset* (e.g. `vercors9`, `gres`, `abacus25`) grants
+each group a level: `p1` > `p2` > `p3` > `p4` > `besteffort`. The tool reads the
+group's levels from `https://api.grid5000.fr/stable/accesses` and takes the best
+over your unix groups. The queue sets the walltime cap: p1 168 h, p2 96 h, p3 48 h,
+p4 24 h. A node's own `max_walltime` can be lower (Nancy graffiti, granite,
+grele, grue and gruss: 24 h; Sophia `musa` H100: 6 h). Within a queue, OAR orders
+jobs by Karma, a fair-share score that rises with your recent usage
+(`oarstat -j <id> -f`, `message`). A
+`besteffort` job runs only on idle GPUs and is killed as soon as a regular job
+needs them. `submit` adds `-t idempotent` to besteffort jobs so OAR resubmits
+them, but `train.sh` then restarts from scratch unless given `training.resume_ckpt`.
+For thoth on 2026-11-13:
+
+| level | GPU nodesets |
+|---|---|
+| p1 | Grenoble vercors9/10 (A5000), 11 (Quadro RTX 8000), 12 (TITAN RTX), 13 (A6000), 14 (RTX 6000 Ada), 18 (RTX PRO 6000) |
+| p2 | Grenoble vercors16 (L4), vercors17 (L40S); Sophia musa (H100 NVL, 6 h nodes) |
+| p3 | Nancy granite (RTX PRO 6000), gres (L40S), gruss (A40), grat (A100), graffiti, grele, grue, gratouille; Rennes abacus1/2/4/8/9/11/14/16/25/28/30-B (V100, A40, A5000, P100); Sophia esterel10/19/20/27/28/29 |
+| besteffort | most other esterel (A100 80GB, H100, A40, L40S...), abacus (H100, A100, L40S...), vercors2-8, kinovis |
+
+Non-Abaca clusters (Lille chuc A100, Lyon...) are in the `default` queue
+(`--default-queue`). They are capped at 14 h on weekdays, and the usage policy
+forbids crossing 09:00 or 19:00 on weekdays. Use them for nights and weekends.
+
+**How `submit` decides.** The tool queries the API resources, `oarstat` on each
+site frontend, and the OAR Gantt (`/status?waiting=yes`). From them it ranks
+targets by:
+
+1. whether some host has `--gpus` GPUs free for the whole walltime;
+2. the estimated wait;
+3. besteffort last;
+4. compute capability, then VRAM;
+5. Grenoble first on ties.
+
+`submit` then submits to the first target (`-q <level> -p "nodeset='<x>'"`). It
+reads OAR's `scheduled_start` and keeps the job if it starts within
+`--max-wait` minutes. Otherwise it tries the next target (`--tries`), keeps the
+job with the earliest start and cancels the others. It submits the script as a
+command, not with `-S`, so the `#OAR` lines in `train.sh` (`-q p1`, 96 h) don't
+apply; their `-n`, `gpu=` and `walltime=` serve as defaults. GPU filters default
+to the project's exclusions (TITAN RTX, Quadro RTX 8000, L4), `--min-vram 20`
+and `--min-cc 7`. Logs go to `logs/g5k/<name>.<site>.<jobid>.out`; job ids are
+per site.
+
+**What makes other sites work.** The thoth group storage
+(`/srv/storage/thoth1@storage4.grenoble.grid5000.fr`) is NFS-mounted on every
+site, so the checkout, venv, checkpoints and HF cache are shared. The home
+directory is per site. `setup-site` recreates on the remote homes what jobs
+need from the Grenoble home:
+
+- the `~/thoth_storage` link;
+- the uv-managed Python the venv links to: `.venv/bin/python` points to
+  `~/.local/share/uv/python/...`. The tool mirrors it to
+  `<storage>/.g5k-sites/uv-python` and links it.
+
+With `--copy-secrets` it also copies `~/.netrc` (wandb) and the TabPFN key
+file (`~/.config/tabpfn_token`) at mode 600. `submit` forwards `HF_HOME` and
+`UV_CACHE_DIR` as absolute storage paths, because remote `.bashrc` files don't
+set them. Rerun `setup-site` after a `uv python` upgrade.
+
+Measured from Nancy (`g5k_smoke.sh`, L40S, 2026-11-13):
+- environment setup: 142 s, mostly the torch import over the cross-site NFS;
+- reads from the Grenoble storage: 35 MB/s.
+
+Live generation and checkpoint loads are fine at that rate. For an on-disk
+`data.dataset_dir`, copy the dataset to the node's local disk first.
+
 ## 1. Generate an on-disk dataset
 
 ```bash
