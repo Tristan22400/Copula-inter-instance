@@ -9,7 +9,14 @@ noise, mean function, sign modulation). Its Bayes-optimal predictive at the quer
 with theta_k drawn by the generator's own sampler (_sample_episode_priors) for the episode's
 kernel family (or chain) and active dims, and the kernel inputs x_kernel held at the episode's.
 So "Bayes" here marginalises the hyperparameters only: the kernel family, the feature warps and
-the hidden kernel warp stay known.
+the hidden kernel warp stay known, which a context-only model does not have. Two fairer variants
+were tried on table2_rbf (2026-11-14, 8 episodes, 262144 draws) and dropped: drawing the family,
+active dims and hidden warp from the prior too collapses the importance ESS to ~1-7 (NLL 0.2-2.0
+nats/point, worse than the warp-known prior); evaluating the kernel on the visible x_norm with
+every column active gives NLL -0.1-1.7, worse than the TabICL marginal alone. So this reference
+estimates the gain with the warp known, which (more information never hurts the Bayes-optimal
+predictor in expectation) roughly bounds what a context-only copula can reach; it is not a
+target a context-only model is known to attain.
 """
 
 from __future__ import annotations
