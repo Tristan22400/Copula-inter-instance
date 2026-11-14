@@ -139,7 +139,10 @@ def test_attainable_rows_on_a_live_episode() -> None:
     device = torch.device("cpu")
     marginal_pit = _marginal_pit(ep, tabicl, k_folds=2, device=device)
     ctx: Any = SimpleNamespace(
-        spec=SimpleNamespace(attainable=AttainableSpec(n_samples=4096, max_iter=200, ranks=[1]), seed=0),
+        spec=SimpleNamespace(
+            attainable=AttainableSpec(n_samples=4096, max_iter=200, ranks=[1], bayes_draws=2048, bayes_keep=128), seed=0
+        ),
+        prior_cfg=OmegaConf.to_container(cfg.data),
         tabicl_marginal=tabicl,
         marginal_backend=None,
         device=device,
@@ -151,7 +154,7 @@ def test_attainable_rows_on_a_live_episode() -> None:
     rows, eff = _attainable_rows(
         ctx, ep, 0, marginal_pit, {"oracle": R_po, "icl": torch.eye(n)}, {"oracle": 0.0, "icl": 0.0}
     )
-    for key in ("marg_attainable", "marg_attainable_lowrank"):
+    for key in ("marg_attainable", "marg_attainable_lowrank", "marg_bayes_attainable", "oracle_bayes"):
         parts = rows[key]
         assert all(math.isfinite(v) for v in parts.values()), key
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-4)
@@ -163,8 +166,66 @@ def test_attainable_rows_on_a_live_episode() -> None:
     assert eff["any_copula_bound"] <= eff["attainable"] + 0.02
     assert eff["icl"] == pytest.approx(0.0, abs=1e-9)  # R = I
     assert eff["m_diag"] > 0
+    # R_bayes is fit to M_bayes, so it cannot beat R_dagger on the true M; on its own M it beats I.
+    assert eff["attainable"] <= eff["bayes_attainable"] + 1e-6
+    assert eff["bayes_attainable_self"] <= 1e-9 and eff["bayes_ess"] >= 1.0
 
     # Without a TabICL marginal (or a known theta) nothing is computed.
     ctx.tabicl_marginal = None
     rows, eff = _attainable_rows(ctx, ep, 0, marginal_pit, {}, {})
     assert eff == {} and math.isnan(rows["marg_attainable"]["total"])
+
+
+def _bayes_cfg() -> Any:
+    return OmegaConf.create(
+        {
+            "seed": 3,
+            "data": {"d_features": 1, "P_min": 12, "P_max": 12, "N_min": 6, "N_max": 6, "n_tasks": 4, "l_min": 0.5},
+        }
+    )
+
+
+def test_bayes_predictive_is_a_normalised_mixture_between_prior_and_known_theta() -> None:
+    """Weights sum to 1, RNG states are restored, and on average the Bayes NLL lies between the known-theta
+    posterior's (a lower bound in expectation) and the prior's."""
+    from copula_inter.data.gp_bayes import bayes_predictive
+
+    cfg = _bayes_cfg()
+    torch.manual_seed(0)
+    nll_post, nll_bayes, nll_prior = [], [], []
+    for seed in range(12):
+        cfg.seed = seed
+        ep = generate_gp_batch(cfg, B=1, device="cpu", return_kernel_metadata=True)[0]
+        state = torch.get_rng_state()
+        bp = bayes_predictive(cfg.data, ep, 4096, torch.device("cpu"), seed=100 + seed, max_keep=256)
+        assert torch.equal(state, torch.get_rng_state())
+        assert bp.log_weights.exp().sum().item() == pytest.approx(1.0, abs=1e-9)
+        assert bp.mu.shape[0] <= 256 and bp.ess >= 1.0
+        y = ep["y_test"].double().unsqueeze(0)
+        n = y.shape[1]
+        joint = bp.log_prob(y).item()
+        assert bp.marginal_log_prob(y).item() >= joint - 50 * n  # finite and of the same scale
+        post = gp_analytical_posterior(ep)
+        nll_post.append(post["nll_post"] / n)
+        nll_bayes.append(-joint / n)
+        nll_prior.append(post["nll_prior"] / n)
+    mean = lambda xs: sum(xs) / len(xs)  # noqa: E731
+    assert mean(nll_post) <= mean(nll_bayes) + 0.05
+    assert mean(nll_bayes) <= mean(nll_prior) + 0.05
+
+
+def test_bayes_predictive_with_one_component_is_that_gaussian() -> None:
+    from copula_inter.data.gp_bayes import bayes_predictive
+
+    cfg = _bayes_cfg()
+    ep = generate_gp_batch(cfg, B=1, device="cpu", return_kernel_metadata=True)[0]
+    bp = bayes_predictive(cfg.data, ep, 64, torch.device("cpu"), seed=1, max_keep=1)
+    assert bp.mu.shape[0] == 1 and bp.log_weights.item() == pytest.approx(0.0)
+    y = torch.randn(5, bp.mu.shape[1], dtype=torch.float64)
+    cov = bp.chol[0] @ bp.chol[0].T
+    ref = torch.distributions.MultivariateNormal(bp.mu[0], cov).log_prob(y)
+    assert torch.allclose(bp.log_prob(y), ref, atol=1e-8)
+    ref_marg = torch.distributions.Normal(bp.mu[0], cov.diagonal().sqrt()).log_prob(y).sum(-1)
+    assert torch.allclose(bp.marginal_log_prob(y), ref_marg, atol=1e-8)
+    draws = bp.sample(20_000, torch.Generator().manual_seed(0))
+    assert torch.allclose(draws.mean(0), bp.mu[0], atol=0.1 * cov.diagonal().sqrt().max().item())

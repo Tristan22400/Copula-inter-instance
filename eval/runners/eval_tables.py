@@ -212,6 +212,8 @@ _TOTAL_NLL_ORDER = (
         ("marg_oracle_corr", "Marginal + oracle posterior corr. (known theta)"),
         ("marg_attainable_lowrank", "Marginal + attainable copula R-dagger (head rank, known theta)"),
         ("marg_attainable", "Marginal + attainable copula R-dagger (full rank, known theta)"),
+        ("marg_bayes_attainable", "Marginal + Bayes attainable copula (theta marginalised)"),
+        ("oracle_bayes", "Bayes oracle (theta marginalised, family known)"),
         ("oracle_prior", "Oracle (prior, unconditioned)"),
         ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
     ]
@@ -236,6 +238,7 @@ def _efficiency_rows(effs: list[dict]) -> list[tuple[str, str]]:
         ("attainable", "Best Gaussian copula R-dagger (full rank)"),
     ]
     rows += [(f"attainable_r{r}", f"Best Gaussian copula, rank {r}" + (" (head)" if r in head else "")) for r in ranks]
+    rows.append(("bayes_attainable", "Bayes attainable (theta marginalised)"))
     return rows + list(_EFFICIENCY_ROWS)
 
 
@@ -262,6 +265,16 @@ def _print_copula_efficiency(all_episode_meta: list[dict]) -> None:
         l_r, l_att = np.array(pairs).T
         eff = l_r.mean() / l_att.mean() if l_att.mean() != 0 else float("nan")
         print(f"  {label:<46}{len(pairs):>5}{l_r.mean():>+10.4f}{(l_r - l_att).mean():>+17.4f}{eff:>12.3f}")
+    bayes = [e for e in effs if "bayes_attainable" in e and "icl" in e and np.isfinite(e["icl"])]
+    if bayes:
+        l_icl = np.mean([e["icl"] for e in bayes])
+        l_bayes = np.mean([e["bayes_attainable"] for e in bayes])
+        ess = np.array([e["bayes_ess"] for e in bayes])
+        print(
+            f"  ICL / Bayes attainable = {l_icl / l_bayes:.3f} over {len(bayes)} episodes"
+            f"  (Bayes on its own M: {np.mean([e['bayes_attainable_self'] for e in bayes]):+.4f};"
+            f" importance ESS median {np.median(ess):.0f}, < 10 in {np.mean(ess < 10):.0%})"
+        )
     print()
 
 

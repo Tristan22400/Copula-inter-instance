@@ -281,6 +281,11 @@ class AttainableSpec:
     ranks: list[int] = field(default_factory=lambda: [1, 2, 4, 16])
     # L-BFGS iterations of each R_dagger fit.
     max_iter: int = 500
+    # Prior draws of theta for the Bayes reference (copula_inter.data.gp_bayes): the best Gaussian
+    # copula and the predictive NLL with theta marginalised given the context (0 = off).
+    bayes_draws: int = 262144
+    # Mixture components kept from those draws (priority sampling).
+    bayes_keep: int = 4096
 
 
 @dataclass
@@ -394,6 +399,8 @@ def validate_eval_spec(spec: EvalSpec) -> None:
     check_choice("baselines.gp_mean", spec.baselines.gp_mean, GP_MEANS)
     if spec.attainable.n_samples < 2 or spec.attainable.max_iter < 1 or min(spec.attainable.ranks, default=1) < 1:
         raise ValueError("attainable.n_samples must be >= 2, attainable.max_iter and every attainable.ranks >= 1")
+    if spec.attainable.bayes_draws < 0 or spec.attainable.bayes_keep < 1:
+        raise ValueError("attainable.bayes_draws must be >= 0 and attainable.bayes_keep >= 1")
     if spec.era5.enabled:
         if spec.dataset_dir is not None:
             raise ValueError("era5.enabled and dataset_dir are mutually exclusive episode sources.")
