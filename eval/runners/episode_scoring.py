@@ -23,6 +23,7 @@ from eval.baselines.prefit import (
     _prefit_baselines_parallel,
     _select_best_baseline_cv,
     _valid_cached_entry,
+    episode_digest,
 )
 from eval.runners.eval_inputs import _PlannedEpisode
 from eval.runners.eval_tables import (
@@ -309,7 +310,11 @@ def _prefit_baselines(ctx: _EvalContext, episode_plan: list[_PlannedEpisode], ca
     if ctx.baseline_cache is not None and not spec.baselines.refresh:
         for planned in episode_plan:
             entry = _valid_cached_entry(
-                cache_entries, planned.cache_key, planned.ep_i, expected_baseline_keys(spec.baselines.laplace)
+                cache_entries,
+                planned.cache_key,
+                planned.ep_i,
+                expected_baseline_keys(spec.baselines.laplace),
+                digest=episode_digest(planned.ep),
             )
             if entry is not None:
                 fitted[planned.cache_key] = entry
@@ -362,6 +367,7 @@ def _episode_baselines(
                 "nlls": baseline_nlls,
                 "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
                 "y_nlls": baseline_y_nlls,
+                "episode_digest": episode_digest(ep),
             },
         )
     return baseline_nlls, baseline_R, baseline_y_nlls

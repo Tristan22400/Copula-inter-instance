@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import multiprocessing as mp
 import time
 import zlib
@@ -202,7 +203,8 @@ def _fit_baselines_task(payload: tuple) -> tuple:
         import traceback
 
         return cache_key, None, f"{exc}\n{traceback.format_exc()}"
-    return cache_key, _pool_encode_tensors({"nlls": nlls, "R_dict": R_dict, "y_nlls": y_nlls}), None
+    result = {"nlls": nlls, "R_dict": R_dict, "y_nlls": y_nlls, "episode_digest": episode_digest(ep)}
+    return cache_key, _pool_encode_tensors(result), None
 
 
 def _count_physical_cores(cpus: set[int]) -> int:
@@ -222,12 +224,35 @@ def _baseline_fit_seed(seed: int, cache_key: str) -> int:
     return (zlib.crc32(cache_key.encode()) ^ (seed * 2_654_435_761)) % (2**31 - 1)
 
 
+def episode_digest(ep: dict) -> str:
+    """Content digest of an episode's targets (y_train, y_test rounded to 1e-4), stored with its cached fits.
+
+    The cache key names an episode by seed and index only, and live generation draws different
+    episodes on CPU and GPU for the same key, so a cached fit is only reused for the same targets.
+    """
+    h = hashlib.sha1()
+    for key in ("y_train", "y_test"):
+        h.update(np.round(ep[key].detach().double().cpu().numpy(), 4).tobytes())
+    return h.hexdigest()
+
+
 def _valid_cached_entry(
-    cache_entries: dict, cache_key: str, ep_i: int, expected: frozenset[str] = EXPECTED_BASELINE_KEYS
+    cache_entries: dict,
+    cache_key: str,
+    ep_i: int,
+    expected: frozenset[str] = EXPECTED_BASELINE_KEYS,
+    digest: str | None = None,
 ) -> dict | None:
-    """The cached entry for this episode, or None if missing, lacking an expected key, or of an older schema."""
+    """The cached entry for this episode, or None if missing, fitted on other targets, lacking an expected key, or of an older schema.
+
+    Entries written before episode digests existed carry none and are accepted as they are.
+    """
     cached = cache_entries.get(cache_key)
     if cached is None:
+        return None
+    if digest is not None and cached.get("episode_digest", digest) != digest:
+        # Same key, different episode (e.g. generated on another device).
+        print(f"  [ep {ep_i}] cached baselines were fitted on a different episode — refitting")
         return None
     if not expected.issubset(cached["nlls"].keys()):
         # Missing a baseline added later.

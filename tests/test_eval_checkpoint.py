@@ -634,3 +634,23 @@ def test_laplace_off_skips_its_rows_and_reuses_caches_without_them(tiny_episode:
     assert _valid_cached_entry({"k": entry}, "k", 0, expected_baseline_keys(False)) is entry
     assert _valid_cached_entry({"k": entry}, "k", 0, expected_baseline_keys(True)) is None
     assert expected_baseline_keys(False) == EXPECTED_BASELINE_KEYS
+
+
+def test_cached_fits_are_only_reused_for_the_same_episode(tiny_episode: dict[str, torch.Tensor]) -> None:
+    """A cache key names an episode by seed and index; live generation differs across devices, so the
+    entry's episode digest must match (entries without one, written earlier, are still accepted)."""
+    from eval.baselines.classical import expected_baseline_keys
+    from eval.baselines.prefit import _valid_cached_entry, episode_digest
+
+    nlls = dict.fromkeys(expected_baseline_keys(False), 0.0)
+    digest = episode_digest(tiny_episode)
+    entry = {"nlls": nlls, "y_nlls": {}, "episode_digest": digest}
+    keys = expected_baseline_keys(False)
+    assert _valid_cached_entry({"k": entry}, "k", 0, keys, digest=digest) is entry
+    other = {**tiny_episode, "y_test": tiny_episode["y_test"] + 0.1}
+    assert episode_digest(other) != digest
+    assert _valid_cached_entry({"k": entry}, "k", 0, keys, digest=episode_digest(other)) is None
+    legacy = {"nlls": nlls, "y_nlls": {}}
+    assert _valid_cached_entry({"k": legacy}, "k", 0, keys, digest=digest) is legacy
+    # Float noise far below the rounding does not change the digest.
+    assert episode_digest({**tiny_episode, "y_train": tiny_episode["y_train"] + 1e-7}) == digest
