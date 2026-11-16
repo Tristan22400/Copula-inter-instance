@@ -170,6 +170,16 @@ rank). The copula-efficiency table gives each one's expected copula NLL
 $\ell(R)=\tfrac1{2N}[\log\det R+\mathrm{tr}((R^{-1}-I)M)]$ (0 = independence),
 next to the ICL head, $R_{po}$ and the GP picks, and efficiency
 $\ell(R)/\ell(R^\dagger)$. `attainable.enabled=false` turns it off.
+With $m=\mathbb E[z]$ (the marginals' bias), it also splits $R^\dagger$'s gain:
+$\mathrm{corr}(M-mm^\top)$ models dependence only, the best $R$ fitted to
+$M-mm^\top$ adds the trade against over/under-dispersion, and $R^\dagger$ adds the bias.
+
+`attainable.bayes_draws=262144` (off by default, ~20 s per episode) adds the Bayes
+reference (`copula_inter.data.gp_bayes`): θ is importance-sampled from the generator's
+prior given the context, with the kernel family, active dims and hidden kernel warp kept
+known, and $M_{\text{Bayes}}$ from its predictive gives $R_{\text{Bayes}}$ (full rank and
+each rank $r$), scored under the true $M$. It is a warp-known reference that roughly bounds a
+context-only copula, not a target one is known to attain.
 
 **Well-specified GP-MLE diagnostics (D1, D2).** Draws episodes from the GP-MLE's
 own model (one kernel, hyperparameters and noise from its hyperpriors, a constant
