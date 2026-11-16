@@ -30,13 +30,14 @@ d_features_lognormal_scale: 0.4
 inactive_frac_min: 0.1
 inactive_frac_max: 0.8
 
-# Training/context set size range
-P_min: 32
-P_max: 32             # fewer train points → more residual posterior uncertainty
+# Training/context set size range. P ~ Uniform{P_min..P_max}, drawn once per
+# generate_gp_batch call (gp_episodes.py), so every episode in a call shares P.
+P_min: 8
+P_max: 512            # fewer train points → more residual posterior uncertainty
 
-# Test/query set size range (copula is over these N instances)
-N_min: 256
-N_max: 256
+# Test/query set size range (copula is over these N instances), sampled like P.
+N_min: 8
+N_max: 512
 
 # Number of tasks to generate
 n_tasks: 20000000
