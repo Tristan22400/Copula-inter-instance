@@ -29,6 +29,7 @@ _METHOD_ORDER = [
     ("gp_mle_dot_product", "GP-MLE-DotProduct"),
     ("gp_mle_polynomial", "GP-MLE-Polynomial"),
     ("gp_evidence", "GP-MLE (BIC-selected, context only)"),
+    ("gp_laplace", "GP-MLE (Laplace-evidence-selected, context only)"),
     ("gp_zeromean_rbf", "Marginal + Zero Mean GP (RBF)"),
     ("gp_zeromean_matern32", "Marginal + Zero Mean GP (Matern32)"),
     ("dkl_rbf", "Deep Kernel Learning (RBF)"),
@@ -163,12 +164,13 @@ def _print_y_space_oracle(y_space_nlls: list[dict[str, dict[str, float]]]) -> No
     print(f"  posterior (Schur-conditioned): mean={post_mean:.4f}  std={post_std:.4f}\n")
 
 
-# Fitted competitors (icl included) for the total table and both rank tables. gp_evidence is
-# left out: it copies one gp_mle_* row per episode, so ranking it would tie with its source.
+# Fitted competitors (icl included) for the total table and both rank tables. gp_evidence and
+# gp_laplace are left out: each copies one gp_mle_* row per episode, so ranking it would tie.
+_SELECTION_COPIES = ("gp_evidence", "gp_laplace")
 _RANK_KEYS = [
     (k, label)
     for k, label in _METHOD_ORDER
-    if k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle", "gp_evidence")
+    if k not in _SELECTION_COPIES and k not in ("independence", "gp_prior_rbf", "best_baseline", "oracle")
 ]
 
 # Context-only GP selections and the plug-in competitor of the copula head (total table only).
@@ -176,6 +178,9 @@ _GP_SELECTION_ROWS = [
     ("gp_evidence", "GP-MLE (BIC-selected, context only)"),
     ("gp_evidence_mix", "GP-MLE (BIC-weighted mixture)"),
     ("marg_gp_evidence", "Marginal + GP-MLE posterior corr. (BIC)"),
+    ("gp_laplace", "GP-MLE (Laplace-evidence-selected, context only)"),
+    ("gp_laplace_mix", "GP-MLE (Laplace BMA over kernels)"),
+    ("marg_gp_laplace", "Marginal + GP-MLE posterior corr. (Laplace)"),
 ]
 
 
@@ -183,11 +188,11 @@ _GP_SELECTION_ROWS = [
 _GP_TOTAL_KEYS = tuple(k for k, _ in _RANK_KEYS if k.startswith("gp_mle_") or k.startswith("gp_zeromean_"))
 
 
-# Total-NLL rank: adds the context-only GP selections (not gp_evidence, a copy of a ranked row),
+# Total-NLL rank: adds the context-only GP selections (not the copies of a ranked row),
 # independence, the autoregressive row and best_gp_total; no oracles.
 _TOTAL_RANK_ORDER = (
     _RANK_KEYS
-    + [row for row in _GP_SELECTION_ROWS if row[0] != "gp_evidence"]
+    + [row for row in _GP_SELECTION_ROWS if row[0] not in _SELECTION_COPIES]
     + [
         ("independence_marginal", "Independence (marginal only)"),
         ("autoregressive", "Autoregressive marginal (chain rule)"),
@@ -205,10 +210,92 @@ _TOTAL_NLL_ORDER = (
         ("independence_marginal", "Independence (marginal only)"),
         ("autoregressive", "Autoregressive marginal (chain rule)"),
         ("marg_oracle_corr", "Marginal + oracle posterior corr. (known theta)"),
+        ("marg_attainable_lowrank", "Marginal + attainable copula R-dagger (head rank, known theta)"),
+        ("marg_attainable", "Marginal + attainable copula R-dagger (full rank, known theta)"),
+        ("marg_bayes_attainable", "Marginal + Bayes attainable copula (theta marginalised)"),
+        ("oracle_bayes", "Bayes oracle (theta marginalised, family known)"),
         ("oracle_prior", "Oracle (prior, unconditioned)"),
         ("oracle_posterior", "Oracle (posterior, Schur-conditioned)"),
     ]
 )
+
+
+# Copula-efficiency rows after the attainable ones: (key in meta["copula_efficiency"], label).
+_EFFICIENCY_ROWS = (
+    ("icl", "ICL copula head"),
+    ("oracle_posterior", "R_po (known-theta posterior corr.)"),
+    ("gp_laplace", "GP-MLE posterior corr. (Laplace pick)"),
+    ("gp_evidence", "GP-MLE posterior corr. (BIC pick)"),
+)
+
+
+def _efficiency_rows(effs: list[dict]) -> list[tuple[str, str]]:
+    """Attainable rows (any-copula bound, full rank, each tracked rank r), then _EFFICIENCY_ROWS."""
+    head = {int(e["head_rank"]) for e in effs if "head_rank" in e}
+    ranks = sorted({int(k.removeprefix("attainable_r")) for e in effs for k in e if k.startswith("attainable_r")})
+    rows = [
+        ("any_copula_bound", "Any copula: lower bound (= if calibrated)"),
+        ("attainable", "Best Gaussian copula R-dagger (full rank)"),
+    ]
+    rows += [(f"attainable_r{r}", f"Best Gaussian copula, rank {r}" + (" (head)" if r in head else "")) for r in ranks]
+    rows.append(("attainable_centered", "R-dagger fitted to Cov(z) (bias m ignored)"))
+    rows.append(("corr_z", "corr(z): dependence only (no bias, no dispersion)"))
+    rows.append(("bayes_attainable", "Bayes attainable (theta marginalised)"))
+    rows += [
+        (f"bayes_attainable_r{r}", f"Bayes attainable, rank {r}" + (" (head)" if r in head else "")) for r in ranks
+    ]
+    rows.append(("bayes_attainable_centered", "Bayes attainable fitted to Cov(z)"))
+    rows.append(("bayes_corr_z", "Bayes corr(z)"))
+    return rows + list(_EFFICIENCY_ROWS)
+
+
+def _print_copula_efficiency(all_episode_meta: list[dict]) -> None:
+    """Expected copula NLL l(R) under the frozen marginals, and the share of the attainable gain each R captures.
+
+    l(R) = E[-log c_R(z)] / N with E[z z'] = M from the known-theta posterior (0 = independence).
+    efficiency = mean l(R) / mean l(R_dagger) over the episodes where both exist (1 = the best
+    Gaussian copula, 0 = no better than independence, < 0 = worse). The best copula of any family
+    lies between the bound and R_dagger. Synthetic episodes with a TabICL marginal only.
+    """
+    effs = [m["copula_efficiency"] for m in all_episode_meta if m.get("copula_efficiency")]
+    if not effs:
+        return
+    print(
+        f"\nCopula efficiency under the frozen marginals ({len(effs)} episodes; l in nats per point, 0 = independence)"
+    )
+    print(f"  mean diag(M) = {np.mean([e['m_diag'] for e in effs]):.4f}  (1 for calibrated marginals)")
+    print(f"  {'copula':<46}{'n':>5}{'mean l':>10}{'l - l(R-dagger)':>17}{'efficiency':>12}")
+    for key, label in _efficiency_rows(effs):
+        pairs = [(e[key], e["attainable"]) for e in effs if key in e and np.isfinite(e[key])]
+        if not pairs:
+            continue
+        l_r, l_att = np.array(pairs).T
+        eff = l_r.mean() / l_att.mean() if l_att.mean() != 0 else float("nan")
+        print(f"  {label:<46}{len(pairs):>5}{l_r.mean():>+10.4f}{(l_r - l_att).mean():>+17.4f}{eff:>12.3f}")
+    bayes = [e for e in effs if "bayes_attainable" in e and "icl" in e and np.isfinite(e["icl"])]
+    if bayes:
+        l_icl = np.mean([e["icl"] for e in bayes])
+        l_bayes = np.mean([e["bayes_attainable"] for e in bayes])
+        ess = np.array([e["bayes_ess"] for e in bayes])
+        print(
+            f"  ICL / Bayes attainable = {l_icl / l_bayes:.3f} over {len(bayes)} episodes"
+            f"  (Bayes on its own M: {np.mean([e['bayes_attainable_self'] for e in bayes]):+.4f};"
+            f" importance ESS median {np.median(ess):.0f}, < 10 in {np.mean(ess < 10):.0%})"
+        )
+    diag = {
+        "mean_bias_sq": "mean(E[z]^2), the marginals' bias",
+        "bayes_bias_cos": "cos(E_bayes[z], E[z])",
+        "icl_offdiag_abs": "mean |R_icl off-diagonal|",
+        "attainable_offdiag_abs": "mean |R-dagger off-diagonal|",
+        "bayes_offdiag_abs": "mean |R_bayes off-diagonal|",
+        "icl_attainable_offdiag_corr": "corr(R_icl, R-dagger) off-diagonal",
+        "icl_bayes_offdiag_corr": "corr(R_icl, R_bayes) off-diagonal",
+    }
+    for key, label in diag.items():
+        vals = np.array([e[key] for e in effs if key in e and np.isfinite(e[key])])
+        if vals.size:
+            print(f"  {label:<46}{vals.size:>5}{vals.mean():>+10.4f}  (median {np.median(vals):+.4f})")
+    print()
 
 
 def _ar_note(

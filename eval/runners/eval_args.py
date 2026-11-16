@@ -220,6 +220,9 @@ class BaselineSpec:
     gp_predict: str = "posterior"
     # Mean function of the GP-MLE and DKL fits: "zero", "constant" or "linear" (affine in x).
     gp_mean: str = "constant"
+    # Laplace-evidence kernel selection rows (gp_laplace*). false skips them and reuses caches
+    # written without them (e.g. to add the attainable copulas to an existing run).
+    laplace: bool = True
     # "cpu" (faster for these 32-point fits), "cuda", or "auto" to follow the top-level device.
     device: str = "cpu"
     # Fitting processes; 0 = one per physical core (capped at 32), 1 = serial. CPU only.
@@ -260,6 +263,30 @@ class SelectionSpec:
     # Test-point floor per episode; default 2 * min_fold_size. Raises data.N_min for live
     # generation, skips smaller episodes from a dataset.
     min_test_points: int | None = None
+
+
+@dataclass
+class AttainableSpec:
+    """Attainable copulas under the frozen marginals (synthetic episodes, TabICL marginal only).
+
+    Tracks the best Gaussian copula (full rank), the best rank-r Gaussian copula per rank, and a
+    lower bound on the best copula of any family (exact for calibrated marginals).
+    """
+
+    # Score the attainable copulas and print the copula-efficiency table.
+    enabled: bool = True
+    # Draws of y_Q from the known-theta GP posterior for M = E[z z'] (entry SE ~ 1/sqrt(n)).
+    n_samples: int = 8192
+    # Extra ranks r for the best rank-r Gaussian copula (the head's own rank is always included).
+    ranks: list[int] = field(default_factory=lambda: [1, 2, 4, 16])
+    # L-BFGS iterations of each R_dagger fit.
+    max_iter: int = 500
+    # Prior draws of theta for the Bayes reference (copula_inter.data.gp_bayes): the best Gaussian
+    # copula and the predictive NLL with theta marginalised given the context. 0 = off (default:
+    # it adds ~20 s per episode); the 2026-11 attainable_bayes runs used 262144.
+    bayes_draws: int = 0
+    # Mixture components kept from those draws (priority sampling).
+    bayes_keep: int = 4096
 
 
 @dataclass
@@ -307,6 +334,7 @@ class EvalSpec:
     baselines: BaselineSpec = field(default_factory=BaselineSpec)
     marginal: MarginalSpec = field(default_factory=MarginalSpec)
     selection: SelectionSpec = field(default_factory=SelectionSpec)
+    attainable: AttainableSpec = field(default_factory=AttainableSpec)
     output: OutputSpec = field(default_factory=OutputSpec)
 
 
@@ -370,6 +398,10 @@ def validate_eval_spec(spec: EvalSpec) -> None:
     check_choice("baselines.device", spec.baselines.device, ("cpu", "cuda", "auto"))
     check_choice("baselines.gp_predict", spec.baselines.gp_predict, GP_PREDICT_MODES)
     check_choice("baselines.gp_mean", spec.baselines.gp_mean, GP_MEANS)
+    if spec.attainable.n_samples < 2 or spec.attainable.max_iter < 1 or min(spec.attainable.ranks, default=1) < 1:
+        raise ValueError("attainable.n_samples must be >= 2, attainable.max_iter and every attainable.ranks >= 1")
+    if spec.attainable.bayes_draws < 0 or spec.attainable.bayes_keep < 1:
+        raise ValueError("attainable.bayes_draws must be >= 0 and attainable.bayes_keep >= 1")
     if spec.era5.enabled:
         if spec.dataset_dir is not None:
             raise ValueError("era5.enabled and dataset_dir are mutually exclusive episode sources.")

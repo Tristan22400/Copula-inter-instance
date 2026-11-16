@@ -175,6 +175,7 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         "dkl_dot_product",
         "per_ep_transformer",
         "gp_evidence",
+        "gp_laplace",
     }
     # y_space_nlls excludes the unfitted references.
     expected_y_keys = expected_keys - {"independence", "gp_prior_rbf"}
@@ -198,9 +199,10 @@ def test_eval_baselines_episode_runs_and_returns_valid_correlations(tiny_episode
         assert parts["total"] == pytest.approx(parts["marginal"] + parts["copula"], abs=1e-3)
     # gp_evidence copies one gp_mle_* row; the mixture has a total only.
     gp_rows = {k: v for k, v in y_space_nlls.items() if k.startswith("gp_mle_")}
-    assert y_space_nlls["gp_evidence"] in gp_rows.values()
-    assert math.isfinite(y_space_nlls["gp_evidence_mix"]["total"])
-    assert math.isnan(y_space_nlls["gp_evidence_mix"]["copula"])
+    for sel in ("gp_evidence", "gp_laplace"):
+        assert y_space_nlls[sel] in gp_rows.values()
+        assert math.isfinite(y_space_nlls[f"{sel}_mix"]["total"])
+        assert math.isnan(y_space_nlls[f"{sel}_mix"]["copula"])
 
 
 def test_eval_baselines_episode_posterior_constant_mean(tiny_episode: dict[str, torch.Tensor]) -> None:
@@ -606,3 +608,49 @@ def test_era5_cache_identity_records_the_pit_marginal(tmp_path: Path) -> None:
     assert "pit_marginal_identity" not in era5_fp(default_ckpt, amp=True)
     assert era5_fp(default_ckpt, amp=False)["pit_marginal_identity"]["amp"] is False
     assert era5_fp(str(other), amp=True) != era5_fp(default_ckpt, amp=True)
+
+
+def test_laplace_off_skips_its_rows_and_reuses_caches_without_them(tiny_episode: dict[str, torch.Tensor]) -> None:
+    """baselines.laplace=false: no gp_laplace rows, and a cached entry lacking them is still valid."""
+    from eval.baselines.classical import EXPECTED_BASELINE_KEYS, expected_baseline_keys
+    from eval.baselines.prefit import _valid_cached_entry
+
+    nlls, _, y_space_nlls = eval_baselines_episode(
+        ep=tiny_episode,
+        icl_rank=2,
+        n_steps_mle=3,
+        lr_mle=0.1,
+        n_steps_dkl=3,
+        lr_dkl=0.1,
+        n_steps_per_ep=3,
+        patience_per_ep=2,
+        device=torch.device("cpu"),
+        oracle_mode="posterior",
+        gp_mean="constant",
+        laplace=False,
+    )
+    assert "gp_laplace" not in nlls and "gp_laplace_mix" not in y_space_nlls
+    entry = {"nlls": nlls, "y_nlls": y_space_nlls}
+    assert _valid_cached_entry({"k": entry}, "k", 0, expected_baseline_keys(False)) is entry
+    assert _valid_cached_entry({"k": entry}, "k", 0, expected_baseline_keys(True)) is None
+    assert expected_baseline_keys(False) == EXPECTED_BASELINE_KEYS
+
+
+def test_cached_fits_are_only_reused_for_the_same_episode(tiny_episode: dict[str, torch.Tensor]) -> None:
+    """A cache key names an episode by seed and index; live generation differs across devices, so the
+    entry's episode digest must match (entries without one, written earlier, are still accepted)."""
+    from eval.baselines.classical import expected_baseline_keys
+    from eval.baselines.prefit import _valid_cached_entry, episode_digest
+
+    nlls = dict.fromkeys(expected_baseline_keys(False), 0.0)
+    digest = episode_digest(tiny_episode)
+    entry = {"nlls": nlls, "y_nlls": {}, "episode_digest": digest}
+    keys = expected_baseline_keys(False)
+    assert _valid_cached_entry({"k": entry}, "k", 0, keys, digest=digest) is entry
+    other = {**tiny_episode, "y_test": tiny_episode["y_test"] + 0.1}
+    assert episode_digest(other) != digest
+    assert _valid_cached_entry({"k": entry}, "k", 0, keys, digest=episode_digest(other)) is None
+    legacy = {"nlls": nlls, "y_nlls": {}}
+    assert _valid_cached_entry({"k": legacy}, "k", 0, keys, digest=digest) is legacy
+    # Float noise far below the rounding does not change the digest.
+    assert episode_digest({**tiny_episode, "y_train": tiny_episode["y_train"] + 1e-7}) == digest

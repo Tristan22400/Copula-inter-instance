@@ -23,6 +23,7 @@ from eval.baselines.prefit import (
     _prefit_baselines_parallel,
     _select_best_baseline_cv,
     _valid_cached_entry,
+    episode_digest,
 )
 from eval.runners.eval_inputs import _PlannedEpisode
 from eval.runners.eval_tables import (
@@ -35,12 +36,20 @@ if TYPE_CHECKING:
     from copula_inter.copula.model import CopulaTabICL
     from eval.runners.eval_args import EvalSpec
 
+from copula_inter.copula.attainable import (
+    any_copula_bound,
+    attainable_correlation,
+    expected_copula_nll,
+    pit_moments,
+)
 from copula_inter.copula.loss import y_space_nll
 from copula_inter.copula.model import low_rank_correlation
+from copula_inter.data.gp_bayes import bayes_predictive
 from copula_inter.marginal.pit import (
     TabICLLike,
     gp_analytical_posterior,
     normalize_targets,
+    query_marginal,
     run_pit,
 )
 from eval.baselines.autoregressive import (
@@ -51,6 +60,7 @@ from eval.baselines.classical import (
     assert_shared_z_test,
     corr_nll_single,
     eval_baselines_episode,
+    expected_baseline_keys,
     save_baseline_entry,
 )
 from eval.results import (
@@ -299,7 +309,13 @@ def _prefit_baselines(ctx: _EvalContext, episode_plan: list[_PlannedEpisode], ca
     fitted: dict[str, dict] = {}
     if ctx.baseline_cache is not None and not spec.baselines.refresh:
         for planned in episode_plan:
-            entry = _valid_cached_entry(cache_entries, planned.cache_key, planned.ep_i)
+            entry = _valid_cached_entry(
+                cache_entries,
+                planned.cache_key,
+                planned.ep_i,
+                expected_baseline_keys(spec.baselines.laplace),
+                digest=episode_digest(planned.ep),
+            )
             if entry is not None:
                 fitted[planned.cache_key] = entry
 
@@ -351,6 +367,7 @@ def _episode_baselines(
                 "nlls": baseline_nlls,
                 "R_dict": {k: v.cpu() for k, v in baseline_R.items()},
                 "y_nlls": baseline_y_nlls,
+                "episode_digest": episode_digest(ep),
             },
         )
     return baseline_nlls, baseline_R, baseline_y_nlls
@@ -461,25 +478,201 @@ def _marginal_plugin_rows(
 ) -> dict[str, dict[str, float]]:
     """The learned marginal with a plug-in Gaussian-copula correlation, in raw nats.
 
-    marg_gp_evidence: R_post(theta_hat) of the BIC-selected GP-MLE, the matched
-    competitor of the copula head (same marginal, GP-structured dependence).
+    marg_gp_evidence / marg_gp_laplace: R_post(theta_hat) of the BIC- / Laplace-selected
+    GP-MLE, the matched competitors of the copula head (same marginal, GP-structured
+    dependence).
     marg_oracle_corr: R_post(theta) of the known-theta GP, a reference (synthetic only).
     """
-    rows = {"marg_gp_evidence": _NAN_PARTS.copy(), "marg_oracle_corr": _NAN_PARTS.copy()}
+    rows = {
+        "marg_gp_evidence": _NAN_PARTS.copy(),
+        "marg_gp_laplace": _NAN_PARTS.copy(),
+        "marg_oracle_corr": _NAN_PARTS.copy(),
+    }
     if marginal_pit is None:
         return rows
     z = marginal_pit["z_test"].to(device).unsqueeze(0)
     log_pdf = marginal_pit["log_pdf_test"].to(device).unsqueeze(0)
     mask = torch.ones_like(z, dtype=torch.bool)
-    # A failed BIC selection has a nan shared-z NLL (and a placeholder identity R).
-    gp_ok = np.isfinite(baseline_nlls.get("gp_evidence", float("nan")))
-    sources = {"marg_gp_evidence": baseline_R.get("gp_evidence") if gp_ok else None, "marg_oracle_corr": R_oracle}
+    # A failed selection has a nan shared-z NLL (and a placeholder identity R).
+    sources: dict[str, Tensor | None] = {"marg_oracle_corr": R_oracle}
+    for key, sel in (("marg_gp_evidence", "gp_evidence"), ("marg_gp_laplace", "gp_laplace")):
+        sources[key] = baseline_R.get(sel) if np.isfinite(baseline_nlls.get(sel, float("nan"))) else None
     for key, R in sources.items():
         if R is None or not torch.isfinite(R).all():
             continue
         parts = y_space_nll(R.to(device=device, dtype=z.dtype).unsqueeze(0), z, log_pdf, mask)
         rows[key] = {k: v.item() for k, v in parts.items()}
     return rows
+
+
+# Correlations whose expected copula loss the efficiency table compares with R_dagger:
+# (key in the efficiency dict, source key in the scored R dicts).
+_EFFICIENCY_SOURCES = (
+    ("icl", "icl"),
+    ("gp_evidence", "gp_evidence"),
+    ("gp_laplace", "gp_laplace"),
+    ("oracle_posterior", "oracle"),
+)
+
+
+def _corr_of(C: Tensor) -> Tensor:
+    """The correlation matrix of a covariance C (float64), with a 1e-9 ridge so it is positive definite."""
+    d = C.diagonal().clamp_min(1e-12).rsqrt()
+    R = C * d[:, None] * d[None, :]
+    return 0.5 * (R + R.T) + 1e-9 * torch.eye(C.shape[0], dtype=C.dtype, device=C.device)
+
+
+def _attainable_rows(
+    ctx: _EvalContext,
+    ep: dict,
+    ep_i: int,
+    marginal_pit: dict[str, Tensor] | None,
+    R_scored: dict[str, Tensor],
+    nlls: dict[str, float],
+) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+    """The attainable copulas under the frozen TabICL marginals, and the copula-efficiency losses.
+
+    Draws y_Q ~ the known-theta GP posterior and maps each draw through the frozen marginals
+    (query_marginal: the distributions behind marginal_pit's z_test). From the draws:
+      M = E[z z'] gives the best Gaussian copula R_dagger over all correlations and in the
+      head's covnorm family at each rank r (the head's rank plus attainable.ranks);
+      any_copula_bound = E[-log p_U(U)] / N bounds every copula from below (equal for
+      calibrated marginals), so the best copula of any family lies in [bound, l(R_dagger)].
+    Rows (raw nats, the TOTAL table): marg_attainable (full rank) and marg_attainable_lowrank
+    (the head's rank), each with the marginal. Efficiency (meta): l(R) = E[-log c_R(z)] / N
+    for "attainable", "attainable_r<r>", "any_copula_bound" and every scored R in
+    _EFFICIENCY_SOURCES (independence is 0); "m_diag" = mean(diag M), 1 for calibrated marginals.
+    M = C + m m' with m = E[z], the marginals' bias at the queries: "mean_bias_sq" = mean(m^2) and
+    "attainable_centered" = l(R_C) under M for R_C fitted to C alone, the best copula that only
+    models the spread of z and not the shared bias the oracle knows, and "corr_z" = l(corr(C)),
+    z's own correlation: the copula that models dependence only, neither the bias nor the
+    over/under-dispersion of the marginals (diag C != 1) that R_C can still trade against.
+    With attainable.bayes_draws > 0, the same from the Bayes predictive (theta marginalised given the
+    context, gp_bayes.bayes_predictive): M_bayes from its draws gives R_bayes, a copula a context-only
+    model with the kernel family and warps known could reach; "bayes_attainable" = l(R_bayes) under
+    the TRUE M, "bayes_attainable_r<r>" its rank-r version, "bayes_attainable_centered" and "bayes_corr_z" the
+    same from the Bayes covariance, "bayes_bias_cos" = cos(m_bayes, m), "bayes_attainable_self" under
+    M_bayes, "bayes_ess" its importance ESS. Rows marg_bayes_attainable (the marginal + R_bayes)
+    and oracle_bayes (the predictive's own NLL). "icl_offdiag_abs", "<name>_offdiag_abs" and
+    "icl_<name>_offdiag_corr" compare the head's off-diagonal correlations with R_dagger's and R_bayes's.
+    Empty/nan without a known-theta posterior (ERA5, real data), a TabICL marginal, or attainable.enabled.
+    """
+    rows = {
+        key: _NAN_PARTS.copy()
+        for key in ("marg_attainable", "marg_attainable_lowrank", "marg_bayes_attainable", "oracle_bayes")
+    }
+    att = ctx.spec.attainable
+    if not att.enabled or marginal_pit is None or ctx.tabicl_marginal is None or ctx.marginal_backend is not None:
+        return rows, {}
+    try:
+        post = gp_analytical_posterior(ep)
+    except (KeyError, NotImplementedError):
+        return rows, {}
+    device = ctx.device
+    y_train = ep["y_train"].to(device)
+    _, _, y_mean, y_std = normalize_targets(y_train)
+    marginal = query_marginal(
+        ctx.tabicl_marginal, ep["x_norm_train"].to(device), (y_train - y_mean) / y_std, ep["x_norm_test"].to(device)
+    )
+    mu = post["mu_post"].to(device).double()
+    Sigma = post["Sigma_post"].to(device).double()
+    N = mu.shape[0]
+    Sigma = 0.5 * (Sigma + Sigma.T) + 1e-9 * torch.eye(N, dtype=torch.float64, device=device)
+    gen = torch.Generator(device="cpu").manual_seed((ctx.spec.seed * 1_000_003 + ep_i) % (2**31 - 1))
+    noise = torch.randn(att.n_samples, N, generator=gen, dtype=torch.float64).to(device)
+    y_draws = mu + noise @ torch.linalg.cholesky(Sigma).T  # (L, N) raw
+    scaled = (y_draws - y_mean.double()) / y_std.double()  # on the marginal's scale
+    chunk = 256
+    with torch.no_grad():
+        m_true, M = pit_moments(marginal.cdf, scaled, chunk=chunk)
+        # sum_j log f_j(y_j) in raw nats (the scaled density's Jacobian is 1 / std per coordinate).
+        log_marg = torch.cat(
+            [marginal.log_prob(scaled[i : i + chunk]).double().sum(-1) for i in range(0, att.n_samples, chunk)]
+        ) - N * torch.log(y_std.double())
+        log_joint = torch.distributions.MultivariateNormal(mu, covariance_matrix=Sigma).log_prob(y_draws)
+
+    head_rank = int(ctx.fit_kwargs["icl_rank"])
+    parametrization = getattr(ctx.icl_model, "correlation_parametrization", "covnorm")
+    R_full = attainable_correlation(M, None, max_iter=att.max_iter)
+    C_true = M - torch.outer(m_true, m_true)
+    R_centered = attainable_correlation(C_true, None, max_iter=att.max_iter)
+    efficiency = {
+        "m_diag": float(M.diagonal().mean()),
+        "mean_bias_sq": float(m_true.pow(2).mean()),
+        "any_copula_bound": any_copula_bound(log_joint, log_marg, N),
+        "attainable": expected_copula_nll(R_full, M),
+        "attainable_centered": expected_copula_nll(R_centered, M),
+        "corr_z": expected_copula_nll(_corr_of(C_true), M),
+    }
+    ranks = sorted({head_rank, *att.ranks}) if parametrization == "covnorm" else []
+    R_head = None
+    for r in ranks:
+        R_r = attainable_correlation(M, r, max_iter=att.max_iter, parametrization=parametrization)
+        efficiency[f"attainable_r{r}"] = expected_copula_nll(R_r, M)
+        if r == head_rank:
+            R_head = R_r
+
+    R_bayes = None
+    if att.bayes_draws > 0:
+        bayes = bayes_predictive(
+            ctx.prior_cfg,
+            ep,
+            att.bayes_draws,
+            device,
+            seed=(ctx.spec.seed * 1_000_033 + ep_i) % (2**31 - 1),
+            max_keep=att.bayes_keep,
+        )
+        with torch.no_grad():
+            y_bayes = bayes.sample(att.n_samples, gen)
+            m_bayes, M_bayes = pit_moments(marginal.cdf, (y_bayes - y_mean.double()) / y_std.double(), chunk=chunk)
+            y_test = ep["y_test"].to(device).double().unsqueeze(0)
+            total = -float(bayes.log_prob(y_test)) / N
+            marg = -float(bayes.marginal_log_prob(y_test)) / N
+        rows["oracle_bayes"] = {"total": total, "marginal": marg, "copula": total - marg}
+        R_bayes = attainable_correlation(M_bayes, None, max_iter=att.max_iter)
+        efficiency["bayes_attainable"] = expected_copula_nll(R_bayes, M)
+        efficiency["bayes_attainable_self"] = expected_copula_nll(R_bayes, M_bayes)
+        efficiency["bayes_ess"] = bayes.ess
+        C_bayes = M_bayes - torch.outer(m_bayes, m_bayes)
+        R_bayes_centered = attainable_correlation(C_bayes, None, max_iter=att.max_iter)
+        efficiency["bayes_attainable_centered"] = expected_copula_nll(R_bayes_centered, M)
+        efficiency["bayes_corr_z"] = expected_copula_nll(_corr_of(C_bayes), M)
+        efficiency["bayes_bias_cos"] = float(m_bayes @ m_true / (m_bayes.norm() * m_true.norm()).clamp_min(1e-12))
+        for r in ranks:
+            R_r = attainable_correlation(M_bayes, r, max_iter=att.max_iter, parametrization=parametrization)
+            efficiency[f"bayes_attainable_r{r}"] = expected_copula_nll(R_r, M)
+
+    z = marginal_pit["z_test"].to(device).unsqueeze(0)
+    log_pdf = marginal_pit["log_pdf_test"].to(device).unsqueeze(0)
+    mask = torch.ones_like(z, dtype=torch.bool)
+    for key, R in (
+        ("marg_attainable", R_full),
+        ("marg_attainable_lowrank", R_head),
+        ("marg_bayes_attainable", R_bayes),
+    ):
+        if R is not None:
+            parts = y_space_nll(R.to(device=device, dtype=z.dtype).unsqueeze(0), z, log_pdf, mask)
+            rows[key] = {k: v.item() for k, v in parts.items()}
+    for key, source in _EFFICIENCY_SOURCES:
+        R = R_scored.get(source)
+        # A failed fit or selection has a nan NLL and a placeholder identity R.
+        if R is not None and np.isfinite(nlls.get(source, float("nan"))) and torch.isfinite(R).all():
+            efficiency[key] = expected_copula_nll(R.to(device), M)
+    R_icl = R_scored.get("icl")
+    if "icl" in efficiency and R_icl is not None:
+        # How the head's correlations relate to R_dagger's and R_bayes's: off-diagonal pattern
+        # correlation and mean absolute off-diagonal (a shrunk but aligned head has corr ~1, smaller abs).
+        iu = torch.triu_indices(N, N, offset=1, device=device)
+        off_icl = R_icl.to(device).double()[iu[0], iu[1]]
+        efficiency["icl_offdiag_abs"] = float(off_icl.abs().mean())
+        for name, R in (("attainable", R_full), ("bayes", R_bayes)):
+            if R is not None:
+                off = R.double()[iu[0], iu[1]]
+                efficiency[f"{name}_offdiag_abs"] = float(off.abs().mean())
+                if float(off_icl.std()) > 0 and float(off.std()) > 0:
+                    efficiency[f"icl_{name}_offdiag_corr"] = float(torch.corrcoef(torch.stack([off_icl, off]))[0, 1])
+    efficiency["head_rank"] = float(head_rank)
+    return rows, efficiency
 
 
 def _total_nll_rows(
@@ -625,12 +818,19 @@ def _score_episode(
         marginal_pit=marginal_pit,
     )
     plugin_rows = _marginal_plugin_rows(marginal_pit, baseline_nlls, baseline_R, R_oracle, device)
-    total_nlls = _total_nll_rows(ep, {**baseline_y_nlls, **plugin_rows}, icl_y_parts, y_space_nlls, marginal_pit)
+    R_scored = {**baseline_R, **icl_R, **({"oracle": R_oracle} if R_oracle is not None else {})}
+    attainable_rows, efficiency = _attainable_rows(ctx, ep, ep_i, marginal_pit, R_scored, {**baseline_nlls, **icl_nlls})
+    total_nlls = _total_nll_rows(
+        ep, {**baseline_y_nlls, **plugin_rows, **attainable_rows}, icl_y_parts, y_space_nlls, marginal_pit
+    )
     meta = {
         "ep_i": ep_i,
         "n_test": ep["z_test"].shape[0],
         "kernel": _kernel_composition_label(ep),
     }
+    if efficiency:
+        # Expected copula NLL per point under M (see _attainable_rows); 0 = independence.
+        meta["copula_efficiency"] = efficiency
     if "real_meta" in ep:
         # Identifies the episode (rows, split, group) for paired comparisons and cluster bootstraps.
         meta["episode"] = ep["real_meta"]

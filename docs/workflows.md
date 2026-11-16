@@ -285,11 +285,51 @@ tables. Rows that pick or mix GPs:
 | GP-MLE (BIC-selected) | context only: $\max_k \log p(y_C\mid\hat\theta_k) - \tfrac{k}{2}\log P$ | competitor |
 | GP-MLE (BIC-weighted mixture) | context only, weights $\propto e^{\mathrm{BIC}_k}$ | competitor |
 | Marginal + GP-MLE posterior corr. (BIC) | the same marginal as our model, $R_{po}(\hat\theta)$ as copula | matched competitor of the copula head |
+| GP-MLE (Laplace-evidence-selected), Laplace BMA, Marginal + GP-MLE posterior corr. (Laplace) | the same three with the Laplace evidence $\log p(y_C\mid k)$ in place of BIC (`laplace_log_evidence`: the MAP point refined with the constraint Jacobian, minus $\tfrac12\log\det H$) | competitors |
 | Marginal + oracle posterior corr. | the same marginal, $R_{po}(\theta)$ of the true GP | reference (synthetic only) |
 | Best-of-Baselines, Best GP | query labels | reference, not a method |
 
 The z-space "Oracle" row is the copula of the known-θ GP posterior, $R_{po}$:
 under exact marginals $z_{\text{test}}\sim\mathcal N(0, R_{po})$.
+
+**Attainable copulas (synthetic, TabICL marginal).** With the marginals frozen,
+the copula sees $u_j=\hat F_j(y_j)$. Drawing $y_Q$ from the known-θ posterior
+(`attainable.n_samples`) and pushing the draws through the frozen marginals gives
+$M=\mathbb E[zz^\top]$, $z=\Phi^{-1}(u)$, and three references:
+
+| Reference | Definition |
+|---|---|
+| Best copula, any family | between $\tfrac1N\mathbb E[-\log p_U(U)]$ (a lower bound, exact for calibrated marginals) and the best Gaussian copula |
+| Best Gaussian copula $R^\dagger$ | $\arg\min_R \log\det R+\mathrm{tr}(R^{-1}M)$ over all correlation matrices |
+| Best Gaussian copula of rank $r$ | the same in the head's covnorm family, for the head's rank and each `attainable.ranks` |
+
+The total table adds "Marginal + attainable copula R-dagger" (full rank and head
+rank). The copula-efficiency table gives each one's expected copula NLL
+$\ell(R)=\tfrac1{2N}[\log\det R+\mathrm{tr}((R^{-1}-I)M)]$ (0 = independence),
+next to the ICL head, $R_{po}$ and the GP picks, and efficiency
+$\ell(R)/\ell(R^\dagger)$. `attainable.enabled=false` turns it off.
+With $m=\mathbb E[z]$ (the marginals' bias), it also splits $R^\dagger$'s gain:
+$\mathrm{corr}(M-mm^\top)$ models dependence only, the best $R$ fitted to
+$M-mm^\top$ adds the trade against over/under-dispersion, and $R^\dagger$ adds the bias.
+
+`attainable.bayes_draws=262144` (off by default, ~20 s per episode) adds the Bayes
+reference (`copula_inter.data.gp_bayes`): θ is importance-sampled from the generator's
+prior given the context, with the kernel family, active dims and hidden kernel warp kept
+known, and $M_{\text{Bayes}}$ from its predictive gives $R_{\text{Bayes}}$ (full rank and
+each rank $r$), scored under the true $M$. It is a warp-known reference that roughly bounds a
+context-only copula, not a target one is known to attain.
+
+**Well-specified GP-MLE diagnostics (D1, D2).** Draws episodes from the GP-MLE's
+own model (one kernel, hyperparameters and noise from its hyperpriors, a constant
+mean, $x\sim\mathcal N(0,I_d)$, no nuisance features or warps) and fits it with
+the eval's optimizer settings. D1: the total-NLL gap to the known-θ posterior per
+context size P should shrink toward 0. D2: the fraction of episodes where
+$J(\hat\theta) < J(\theta_{\text{true}})$ ($J$ = log marginal likelihood + log
+hyperprior, the fit's objective) is the optimizer failure rate.
+
+```bash
+python -m eval.runners.gp_wellspecified_diag out_json=eval/results/gp_diag/d1_d2.json
+```
 
 ### Real ERA5 episodes
 

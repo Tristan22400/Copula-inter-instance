@@ -1,0 +1,9 @@
+# Diagnostic cell: the table2 'rbf' episodes without the hidden kernel warp, so the kernel sees the
+# model's own x_norm. The gp_bayes reference then knows only the kernel family and active dims
+# beyond the context, which separates "the warp is unknown" from "the head is inefficient".
+defaults:
+  - eval_table2_rbf
+  - _self_
+
+data:
+  kernel_hidden_enabled: false
