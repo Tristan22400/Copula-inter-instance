@@ -238,7 +238,14 @@ def _efficiency_rows(effs: list[dict]) -> list[tuple[str, str]]:
         ("attainable", "Best Gaussian copula R-dagger (full rank)"),
     ]
     rows += [(f"attainable_r{r}", f"Best Gaussian copula, rank {r}" + (" (head)" if r in head else "")) for r in ranks]
+    rows.append(("attainable_centered", "R-dagger fitted to Cov(z) (bias m ignored)"))
+    rows.append(("corr_z", "corr(z): dependence only (no bias, no dispersion)"))
     rows.append(("bayes_attainable", "Bayes attainable (theta marginalised)"))
+    rows += [
+        (f"bayes_attainable_r{r}", f"Bayes attainable, rank {r}" + (" (head)" if r in head else "")) for r in ranks
+    ]
+    rows.append(("bayes_attainable_centered", "Bayes attainable fitted to Cov(z)"))
+    rows.append(("bayes_corr_z", "Bayes corr(z)"))
     return rows + list(_EFFICIENCY_ROWS)
 
 
@@ -275,6 +282,19 @@ def _print_copula_efficiency(all_episode_meta: list[dict]) -> None:
             f"  (Bayes on its own M: {np.mean([e['bayes_attainable_self'] for e in bayes]):+.4f};"
             f" importance ESS median {np.median(ess):.0f}, < 10 in {np.mean(ess < 10):.0%})"
         )
+    diag = {
+        "mean_bias_sq": "mean(E[z]^2), the marginals' bias",
+        "bayes_bias_cos": "cos(E_bayes[z], E[z])",
+        "icl_offdiag_abs": "mean |R_icl off-diagonal|",
+        "attainable_offdiag_abs": "mean |R-dagger off-diagonal|",
+        "bayes_offdiag_abs": "mean |R_bayes off-diagonal|",
+        "icl_attainable_offdiag_corr": "corr(R_icl, R-dagger) off-diagonal",
+        "icl_bayes_offdiag_corr": "corr(R_icl, R_bayes) off-diagonal",
+    }
+    for key, label in diag.items():
+        vals = np.array([e[key] for e in effs if key in e and np.isfinite(e[key])])
+        if vals.size:
+            print(f"  {label:<46}{vals.size:>5}{vals.mean():>+10.4f}  (median {np.median(vals):+.4f})")
     print()
 
 

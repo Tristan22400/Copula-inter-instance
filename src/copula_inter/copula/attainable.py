@@ -26,7 +26,7 @@ from torch import Tensor
 
 from copula_inter.copula.model import low_rank_correlation
 
-__all__ = ["any_copula_bound", "attainable_correlation", "expected_copula_nll", "pit_second_moment"]
+__all__ = ["any_copula_bound", "attainable_correlation", "expected_copula_nll", "pit_moments", "pit_second_moment"]
 
 
 def _normalize(S: Tensor) -> Tensor:
@@ -50,20 +50,30 @@ def expected_copula_nll(R: Tensor, M: Tensor) -> float:
     return float(_expected_copula_nll_t(R.double(), M.double()))
 
 
-def pit_second_moment(cdf: Callable[[Tensor], Tensor], samples: Tensor, eps: float = 1e-6, chunk: int = 256) -> Tensor:
-    """M = mean_l z_l z_l' with z_l = probit(cdf(samples[l])), in float64.
+def pit_moments(
+    cdf: Callable[[Tensor], Tensor], samples: Tensor, eps: float = 1e-6, chunk: int = 256
+) -> tuple[Tensor, Tensor]:
+    """(m, M) = (mean_l z_l, mean_l z_l z_l') with z_l = probit(cdf(samples[l])), in float64.
 
     samples: (L, N) draws of y_Q on the marginal's scale. cdf maps a (C, N) chunk of
     rows to (C, N) uniforms (query j's own CDF in column j). eps clamps u to
-    [eps, 1 - eps] before the probit, as the eval's PIT does.
+    [eps, 1 - eps] before the probit, as the eval's PIT does. M - m m' is the covariance
+    of z; m != 0 is the marginals' bias at these queries, which M (and so R_dagger) absorbs.
     """
     L, N = samples.shape
+    m = torch.zeros(N, dtype=torch.float64, device=samples.device)
     M = torch.zeros(N, N, dtype=torch.float64, device=samples.device)
     for start in range(0, L, chunk):
         u = cdf(samples[start : start + chunk]).double()
         z = torch.special.ndtri(u.clamp(eps, 1.0 - eps))
+        m += z.sum(0)
         M += z.T @ z
-    return M / L
+    return m / L, M / L
+
+
+def pit_second_moment(cdf: Callable[[Tensor], Tensor], samples: Tensor, eps: float = 1e-6, chunk: int = 256) -> Tensor:
+    """M = mean_l z_l z_l' (see pit_moments)."""
+    return pit_moments(cdf, samples, eps, chunk)[1]
 
 
 def attainable_correlation(

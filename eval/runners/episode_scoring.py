@@ -40,7 +40,7 @@ from copula_inter.copula.attainable import (
     any_copula_bound,
     attainable_correlation,
     expected_copula_nll,
-    pit_second_moment,
+    pit_moments,
 )
 from copula_inter.copula.loss import y_space_nll
 from copula_inter.copula.model import low_rank_correlation
@@ -515,6 +515,13 @@ _EFFICIENCY_SOURCES = (
 )
 
 
+def _corr_of(C: Tensor) -> Tensor:
+    """The correlation matrix of a covariance C (float64), with a 1e-9 ridge so it is positive definite."""
+    d = C.diagonal().clamp_min(1e-12).rsqrt()
+    R = C * d[:, None] * d[None, :]
+    return 0.5 * (R + R.T) + 1e-9 * torch.eye(C.shape[0], dtype=C.dtype, device=C.device)
+
+
 def _attainable_rows(
     ctx: _EvalContext,
     ep: dict,
@@ -535,11 +542,19 @@ def _attainable_rows(
     (the head's rank), each with the marginal. Efficiency (meta): l(R) = E[-log c_R(z)] / N
     for "attainable", "attainable_r<r>", "any_copula_bound" and every scored R in
     _EFFICIENCY_SOURCES (independence is 0); "m_diag" = mean(diag M), 1 for calibrated marginals.
+    M = C + m m' with m = E[z], the marginals' bias at the queries: "mean_bias_sq" = mean(m^2) and
+    "attainable_centered" = l(R_C) under M for R_C fitted to C alone, the best copula that only
+    models the spread of z and not the shared bias the oracle knows, and "corr_z" = l(corr(C)),
+    z's own correlation: the copula that models dependence only, neither the bias nor the
+    over/under-dispersion of the marginals (diag C != 1) that R_C can still trade against.
     With attainable.bayes_draws > 0, the same from the Bayes predictive (theta marginalised given the
     context, gp_bayes.bayes_predictive): M_bayes from its draws gives R_bayes, a copula a context-only
     model with the kernel family and warps known could reach; "bayes_attainable" = l(R_bayes) under
-    the TRUE M, "bayes_attainable_self" under M_bayes, "bayes_ess" its importance ESS. Rows
-    marg_bayes_attainable (the marginal + R_bayes) and oracle_bayes (the predictive's own NLL).
+    the TRUE M, "bayes_attainable_r<r>" its rank-r version, "bayes_attainable_centered" and "bayes_corr_z" the
+    same from the Bayes covariance, "bayes_bias_cos" = cos(m_bayes, m), "bayes_attainable_self" under
+    M_bayes, "bayes_ess" its importance ESS. Rows marg_bayes_attainable (the marginal + R_bayes)
+    and oracle_bayes (the predictive's own NLL). "icl_offdiag_abs", "<name>_offdiag_abs" and
+    "icl_<name>_offdiag_corr" compare the head's off-diagonal correlations with R_dagger's and R_bayes's.
     Empty/nan without a known-theta posterior (ERA5, real data), a TabICL marginal, or attainable.enabled.
     """
     rows = {
@@ -569,7 +584,7 @@ def _attainable_rows(
     scaled = (y_draws - y_mean.double()) / y_std.double()  # on the marginal's scale
     chunk = 256
     with torch.no_grad():
-        M = pit_second_moment(marginal.cdf, scaled, chunk=chunk)
+        m_true, M = pit_moments(marginal.cdf, scaled, chunk=chunk)
         # sum_j log f_j(y_j) in raw nats (the scaled density's Jacobian is 1 / std per coordinate).
         log_marg = torch.cat(
             [marginal.log_prob(scaled[i : i + chunk]).double().sum(-1) for i in range(0, att.n_samples, chunk)]
@@ -579,18 +594,23 @@ def _attainable_rows(
     head_rank = int(ctx.fit_kwargs["icl_rank"])
     parametrization = getattr(ctx.icl_model, "correlation_parametrization", "covnorm")
     R_full = attainable_correlation(M, None, max_iter=att.max_iter)
+    C_true = M - torch.outer(m_true, m_true)
+    R_centered = attainable_correlation(C_true, None, max_iter=att.max_iter)
     efficiency = {
         "m_diag": float(M.diagonal().mean()),
+        "mean_bias_sq": float(m_true.pow(2).mean()),
         "any_copula_bound": any_copula_bound(log_joint, log_marg, N),
         "attainable": expected_copula_nll(R_full, M),
+        "attainable_centered": expected_copula_nll(R_centered, M),
+        "corr_z": expected_copula_nll(_corr_of(C_true), M),
     }
+    ranks = sorted({head_rank, *att.ranks}) if parametrization == "covnorm" else []
     R_head = None
-    if parametrization == "covnorm":
-        for r in sorted({head_rank, *att.ranks}):
-            R_r = attainable_correlation(M, r, max_iter=att.max_iter, parametrization=parametrization)
-            efficiency[f"attainable_r{r}"] = expected_copula_nll(R_r, M)
-            if r == head_rank:
-                R_head = R_r
+    for r in ranks:
+        R_r = attainable_correlation(M, r, max_iter=att.max_iter, parametrization=parametrization)
+        efficiency[f"attainable_r{r}"] = expected_copula_nll(R_r, M)
+        if r == head_rank:
+            R_head = R_r
 
     R_bayes = None
     if att.bayes_draws > 0:
@@ -604,7 +624,7 @@ def _attainable_rows(
         )
         with torch.no_grad():
             y_bayes = bayes.sample(att.n_samples, gen)
-            M_bayes = pit_second_moment(marginal.cdf, (y_bayes - y_mean.double()) / y_std.double(), chunk=chunk)
+            m_bayes, M_bayes = pit_moments(marginal.cdf, (y_bayes - y_mean.double()) / y_std.double(), chunk=chunk)
             y_test = ep["y_test"].to(device).double().unsqueeze(0)
             total = -float(bayes.log_prob(y_test)) / N
             marg = -float(bayes.marginal_log_prob(y_test)) / N
@@ -613,6 +633,14 @@ def _attainable_rows(
         efficiency["bayes_attainable"] = expected_copula_nll(R_bayes, M)
         efficiency["bayes_attainable_self"] = expected_copula_nll(R_bayes, M_bayes)
         efficiency["bayes_ess"] = bayes.ess
+        C_bayes = M_bayes - torch.outer(m_bayes, m_bayes)
+        R_bayes_centered = attainable_correlation(C_bayes, None, max_iter=att.max_iter)
+        efficiency["bayes_attainable_centered"] = expected_copula_nll(R_bayes_centered, M)
+        efficiency["bayes_corr_z"] = expected_copula_nll(_corr_of(C_bayes), M)
+        efficiency["bayes_bias_cos"] = float(m_bayes @ m_true / (m_bayes.norm() * m_true.norm()).clamp_min(1e-12))
+        for r in ranks:
+            R_r = attainable_correlation(M_bayes, r, max_iter=att.max_iter, parametrization=parametrization)
+            efficiency[f"bayes_attainable_r{r}"] = expected_copula_nll(R_r, M)
 
     z = marginal_pit["z_test"].to(device).unsqueeze(0)
     log_pdf = marginal_pit["log_pdf_test"].to(device).unsqueeze(0)
@@ -630,6 +658,19 @@ def _attainable_rows(
         # A failed fit or selection has a nan NLL and a placeholder identity R.
         if R is not None and np.isfinite(nlls.get(source, float("nan"))) and torch.isfinite(R).all():
             efficiency[key] = expected_copula_nll(R.to(device), M)
+    R_icl = R_scored.get("icl")
+    if "icl" in efficiency and R_icl is not None:
+        # How the head's correlations relate to R_dagger's and R_bayes's: off-diagonal pattern
+        # correlation and mean absolute off-diagonal (a shrunk but aligned head has corr ~1, smaller abs).
+        iu = torch.triu_indices(N, N, offset=1, device=device)
+        off_icl = R_icl.to(device).double()[iu[0], iu[1]]
+        efficiency["icl_offdiag_abs"] = float(off_icl.abs().mean())
+        for name, R in (("attainable", R_full), ("bayes", R_bayes)):
+            if R is not None:
+                off = R.double()[iu[0], iu[1]]
+                efficiency[f"{name}_offdiag_abs"] = float(off.abs().mean())
+                if float(off_icl.std()) > 0 and float(off.std()) > 0:
+                    efficiency[f"icl_{name}_offdiag_corr"] = float(torch.corrcoef(torch.stack([off_icl, off]))[0, 1])
     efficiency["head_rank"] = float(head_rank)
     return rows, efficiency
 

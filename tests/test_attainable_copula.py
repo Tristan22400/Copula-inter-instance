@@ -14,6 +14,7 @@ from copula_inter.copula.attainable import (
     any_copula_bound,
     attainable_correlation,
     expected_copula_nll,
+    pit_moments,
     pit_second_moment,
 )
 from copula_inter.data.gp_episodes import generate_gp_batch
@@ -71,6 +72,22 @@ def test_any_copula_bound_equals_the_gaussian_optimum_for_calibrated_marginals()
     assert bound == pytest.approx(expected_copula_nll(attainable_correlation(M), M), abs=5e-3)
     # In expectation: (log det R_true) / (2 n).
     assert bound == pytest.approx(float(torch.logdet(R_true)) / (2 * n), abs=5e-3)
+
+
+def test_a_shared_marginal_bias_is_what_r_dagger_exploits_beyond_the_covariance() -> None:
+    """z ~ N(b, I): independent spread, shared bias b. Fitted to Cov(z) = I the copula is I (l = 0);
+    on M = I + b b' R_dagger gains, by (b'R^-1 b - |b|^2)/2N + log det R / 2N < 0."""
+    n = 8
+    b = torch.linspace(-1.0, 1.0, n, dtype=torch.float64) + 0.5
+    g = torch.Generator().manual_seed(7)
+    y = b + torch.randn(200_000, n, generator=g, dtype=torch.float64)
+    m, M = pit_moments(_std_normal_cdf, y)
+    assert torch.allclose(m, b, atol=0.01)
+    assert torch.allclose(M, pit_second_moment(_std_normal_cdf, y))
+    R_centered = attainable_correlation(M - torch.outer(m, m))
+    assert torch.allclose(R_centered, torch.eye(n, dtype=torch.float64), atol=0.02)
+    assert expected_copula_nll(R_centered, M) == pytest.approx(0.0, abs=5e-3)
+    assert expected_copula_nll(attainable_correlation(M), M) < -0.05
 
 
 def test_lowrank_family_is_no_better_than_full_rank_and_fits_a_lowrank_truth() -> None:
@@ -169,6 +186,13 @@ def test_attainable_rows_on_a_live_episode() -> None:
     # R_bayes is fit to M_bayes, so it cannot beat R_dagger on the true M; on its own M it beats I.
     assert eff["attainable"] <= eff["bayes_attainable"] + 1e-6
     assert eff["bayes_attainable_self"] <= 1e-9 and eff["bayes_ess"] >= 1.0
+    # R_dagger is optimal on M, so it beats the copulas fitted to Cov(z) and every Bayes rank.
+    for key in ("attainable_centered", "bayes_attainable_centered", "bayes_attainable_r1", "bayes_attainable_r2"):
+        assert eff["attainable"] <= eff[key] + 1e-6, key
+    assert eff["attainable"] <= eff["corr_z"] + 1e-6 and eff["attainable"] <= eff["bayes_corr_z"] + 1e-6
+    assert eff["mean_bias_sq"] >= 0 and -1.0 - 1e-9 <= eff["bayes_bias_cos"] <= 1.0 + 1e-9
+    assert "icl_bayes_offdiag_corr" not in eff  # R_icl = I has no off-diagonal pattern
+    assert eff["icl_offdiag_abs"] == pytest.approx(0.0, abs=1e-9)
 
     # Without a TabICL marginal (or a known theta) nothing is computed.
     ctx.tabicl_marginal = None
