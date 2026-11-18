@@ -231,6 +231,26 @@ DataLoader workers. Useful overrides:
 in `scripts/_env.sh`) so the workers' kernels share the GPU concurrently instead
 of time-slicing; `CUDA_MPS=0` turns it off.
 
+### Train on the SCM + GP residual prior
+
+`experiment=scm_residual` swaps the synthetic prior for one between TabICL's SCM
+prior and the GP prior (glossary: *SCM residual prior*). It trains live with the
+TabICL marginal; the analytic PIT is refused because it would use the SCM mechanism.
+
+```bash
+# Pilot: a small on-disk dataset, then a bounded run on it
+python -m copula_inter.generate_pit_dataset experiment=scm_residual data.n_tasks=512 data.dataset_dir=./data/scm_pilot
+python -m copula_inter.train experiment=scm_residual training.live_generation=false training.dataset_dir=./data/scm_pilot/pit training.steps=500
+# Live training on Grid5000
+oarsub -S "./scripts/train.sh experiment=scm_residual"
+# Lambda sweep: copula information, discards and throughput per residual share
+python -m debug.scm_residual_sweep experiment=scm_residual
+```
+
+`data.scm_residual.prob` mixes SCM and GP episodes per generation call, and the
+`lambda_*` keys set the residual-share mixture. The preset uses `prior_type=mlp_scm`
+because TabICL's tree SCM needs xgboost, which the environment does not install.
+
 ### Fine-tune on real ERA5
 
 Instead of synthetic GP kernels, this samples a random region and grid

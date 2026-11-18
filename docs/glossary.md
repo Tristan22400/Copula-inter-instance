@@ -54,8 +54,32 @@ standard deviation of an episode's query points under its generating GP
 (synthetic data only). `R_prior` and `Sigma_star` are rebuilt from the saved
 kernel rather than stored.
 
+**Residual share (lambda).** The per-episode weight of the GP residual in the
+*SCM residual prior*: averaged over the episode's rows, the signal variance splits as
+`(1 - lambda)` from the SCM mechanism and `lambda` from the GP residual, plus the nugget
+`sigma_n^2`. lambda = 0 gives TabICL's prior (rows i.i.d. given the SCM, `R_star = I`),
+lambda = 1 the zero-mean GP prior. Drawn from
+`p0 delta_0 + p1 delta_1 + (1 - p0 - p1) Beta(a, b)` (`data.scm_residual.lambda_*`) and saved
+as `lambda_resid` (-1 on GP episodes of an SCM-enabled run).
+
 **Rank (`model.rank`).** The rank r of the low-rank factor W in
 `Sigma ∝ W W^T + diag(D)`. It must match the checkpoint when resuming.
+
+**SCM residual prior.** The synthetic prior of `data.scm_residual`
+(`data/scm_prior.py`). TabICL's SCM prior draws the features and a regression function
+g, and a GP on the observed features adds dependence between rows:
+`y = sqrt(1 - lambda) g~(x) + sqrt(lambda) r~(x) + eps`, with g~ = g standardized over the
+episode, r~ ~ GP(0, K~), K~ = K / mean_i K_ii the episode's kernel normalized to unit
+mean prior variance, and eps the nugget. Its oracle is **conditional on the SCM
+mechanism**: given m = sqrt(1 - lambda) g~, the episode is a GP with a known mean
+vector, so `Sigma_{Q|C} = lambda K~_QQ + sigma_n^2 I - lambda^2 K~_QC (lambda K~_CC + sigma_n^2 I)^{-1} K~_CQ`
+and `R_post = corr(Sigma_{Q|C})` do not depend on g, while
+`mu_post = m_Q + lambda K~_QC (lambda K~_CC + sigma_n^2 I)^{-1} (y_C - m_C)` does. A model
+never sees g, so its gap to this oracle is still non-negative in expectation but now
+includes the cost of not knowing g, and the analytic PIT is not a valid training input
+(`z_train_source=analytic` is refused unless `allow_analytic_pit=true`). Episodes save
+`mean_train`, `mean_test` and `kernel_scale = lambda / mean_i K_ii` (`mean_family = 3`),
+from which `pit._kernel_fn_from_task` and `pit._mean_train_from_task` rebuild this oracle.
 
 **Tier.** How much of the marginal model Phase A trains. Tier 0 covers the label
 path, ICL norms and decoder; higher tiers add LoRA on more attention stages. The
