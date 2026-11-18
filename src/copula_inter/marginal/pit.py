@@ -20,6 +20,7 @@ import torch
 from copula_inter.copula.loss import _safe_cholesky
 from copula_inter.data.gp_episodes import sigma_to_correlation
 from copula_inter.data.gp_kernels import build_kernel_fn
+from copula_inter.data.scm_prior import is_scm_episode, saved_mean_at
 from tabicl._model.inference_config import InferenceConfig, MgrConfig
 from tabicl._model.tabicl import TabICL
 
@@ -107,6 +108,9 @@ def kernel_space_inputs(task: dict) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _mean_train_from_task(task: dict, x: torch.Tensor) -> torch.Tensor:
     """Evaluate the episode's saved mean function at x_train (all-zero when the task has no mean_* fields)."""
+    if is_scm_episode(task):
+        # SCM + GP residual episode: the mean is the saved SCM mechanism, not a mean-bank function.
+        return saved_mean_at(task, x)
     zero = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
     if not bool(task.get("mean_nonzero", torch.tensor(False)).item()):
         return zero
@@ -769,7 +773,26 @@ def _kernel_fn_from_chain_task(task: dict) -> tuple[Callable[[torch.Tensor, torc
 
 
 def _kernel_fn_from_task(task: dict) -> tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]:
-    """Rebuild (kernel_fn, nugget) from a task's saved kernel metadata (flat or chain schema)."""
+    """Rebuild (kernel_fn, nugget) from a task's saved kernel metadata (flat or chain schema).
+
+    An SCM + GP residual episode saves kernel_scale = lambda / mean_i K_ii; its covariance is
+    kernel_scale * K + nugget * I, so the rebuilt kernel carries that factor.
+    """
+    kernel_fn, nugget = _unscaled_kernel_fn_from_task(task)
+    if "kernel_scale" not in task:
+        return kernel_fn, nugget
+    scale = float(task["kernel_scale"])
+
+    def scaled_kernel_fn(X1: torch.Tensor, X2: torch.Tensor) -> torch.Tensor:
+        return scale * kernel_fn(X1, X2)
+
+    return scaled_kernel_fn, nugget
+
+
+def _unscaled_kernel_fn_from_task(
+    task: dict,
+) -> tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]:
+    """(kernel_fn, nugget) from the saved hyperparameters, without an SCM episode's kernel_scale."""
     if "kernel_components" in task:
         return _kernel_fn_from_chain_task(task)
 

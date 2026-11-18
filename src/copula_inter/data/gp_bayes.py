@@ -31,6 +31,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from copula_inter.data.gp_episodes import _CallShape, _evaluate_kernel_dense, _sample_episode_priors
+from copula_inter.data.scm_prior import is_scm_episode
 
 
 @dataclass
@@ -143,6 +144,10 @@ def bayes_predictive(
     weight. ess (Kish) and dropped_mass (the true weight of the draws not kept) are over every
     draw. Python, numpy and torch RNG states are restored afterwards.
     """
+    if is_scm_episode(ep):
+        # The SCM mechanism g is not a draw from the mean bank this sampler marginalises over,
+        # so the importance sampler has no prior over the episode's mean.
+        raise NotImplementedError("bayes_predictive: SCM + GP residual episodes have no hyperparameter-prior reference")
     data = OmegaConf.to_container(data_cfg, resolve=False) if OmegaConf.is_config(data_cfg) else dict(data_cfg)
     cfg = OmegaConf.create({"data": data})
     P = int(ep["x_kernel_train"].shape[0])

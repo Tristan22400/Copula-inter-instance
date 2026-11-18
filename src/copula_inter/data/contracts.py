@@ -31,6 +31,12 @@ def validate_episode(ep: Mapping[str, Any]) -> None:
     optional = {
         "R_prior": (n, n),
         "Sigma_star": (n, n),
+        # SCM + GP residual prior (data.scm_residual): the known mean at the rows, and scalars.
+        "mean_train": (p,),
+        "mean_test": (n,),
+        "lambda_resid": (),
+        "scm_prior_type": (),
+        "kernel_scale": (),
     }
     for key, shape in shapes.items():
         if key not in ep or tuple(ep[key].shape) != shape:

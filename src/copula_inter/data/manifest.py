@@ -25,6 +25,11 @@ def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
     data = config_dict(cfg.data)
     for output_key in ("resume", "dataset_dir", "pit_dir"):
         data.pop(output_key, None)
+    # A disabled SCM residual prior changes no byte, so it stays out of the identity: datasets
+    # generated before the key existed keep their digest, and enabling it changes the digest.
+    scm = data.get("scm_residual")
+    if isinstance(scm, dict) and not scm.get("enabled", False):
+        data.pop("scm_residual")
     return {
         "schema": SCHEMA,
         "seed": OmegaConf.select(cfg, "seed"),
