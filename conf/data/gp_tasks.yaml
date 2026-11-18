@@ -586,6 +586,26 @@ z_train_corruption_prob: 1.0
 z_train_corruption_rho_beta_a: 3.5
 z_train_corruption_rho_beta_b: 1.5
 
+# SCM + GP residual prior (src/copula_inter/data/scm_prior.py). An episode's features
+# and mean come from a TabICL SCM table (X, g); a GP residual on the observed features
+# adds dependence between rows:
+#   y = sqrt(1 - lambda) g~(x) + sqrt(lambda) r~(x) + eps,   r~ ~ GP(0, K / mean_i K_ii),
+# g~ the SCM target standardized over the episode, eps ~ N(0, sigma_n^2) the nugget prior
+# above, and lambda ~ p0 delta_0 + p1 delta_1 + (1 - p0 - p1) Beta(a, b) per episode.
+# lambda = 0 is TabICL's i.i.d. prior, lambda = 1 the zero-mean GP prior. The analytic
+# oracle is conditional on g (which no model sees), so data.z_train_source must be a
+# learned marginal. Off by default; conf/experiment/scm_residual.yaml enables it.
+scm_residual:
+  enabled: false
+  prob: 1.0                  # per-call probability of an SCM episode (else a GP episode)
+  prior_type: mix_scm        # mlp_scm | tree_scm | mix_scm (tree/mix need xgboost)
+  lambda_p0: 0.2
+  lambda_p1: 0.2
+  lambda_beta_a: 2.0
+  lambda_beta_b: 2.0
+  allow_analytic_pit: false  # diagnostics only: analytic z uses g and leaks it
+  apply_feature_warps: false # also run the TabICLv2 / structural / MLP warps on the SCM features
+
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
 shard_size: 256
