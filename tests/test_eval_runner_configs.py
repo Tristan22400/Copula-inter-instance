@@ -143,6 +143,13 @@ def test_finetune_era5_preset_requires_a_checkpoint() -> None:
         prepare_training_inputs(cfg)
 
 
+def test_scm_residual_preset_trains_live_with_a_learned_marginal() -> None:
+    cfg = _compose_train(["experiment=scm_residual"])
+    assert cfg.data.scm_residual.enabled and cfg.data.z_train_source == "tabicl"
+    assert cfg.training.live_generation and cfg.training.live_source == "gp"
+    assert not _compose_train([]).data.scm_residual.enabled
+
+
 def test_finetune_inputs_are_checked_before_startup(tmp_path: Path) -> None:
     checkpoint = tmp_path / "source.pt"
     checkpoint.write_bytes(b"checkpoint")
