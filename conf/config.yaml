@@ -53,6 +53,12 @@ training:
   # baseline of a resumed or post-training run, e.g. its parent checkpoint.
   val_at_start: false
   save_every: 10000
+  # torch.profiler window: profile_steps training steps from step profile_start (null = off);
+  # prints the top CUDA / CPU operators and writes a Chrome trace to profile_dir (default
+  # ckpt_dir). The data wait (DataLoader workers) shows up as time outside the step's ops.
+  profile_start: null
+  profile_steps: 20
+  profile_dir: null
   ckpt_dir: null
   # Path to a checkpoint saved by save_checkpoint() (model + optimizer +
   # scheduler + step). When set, model weights and optimizer/scaler state

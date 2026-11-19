@@ -71,6 +71,48 @@ from copula_inter.training.step import (
 _EMA_ALPHA = 0.98
 
 
+class _StepProfiler:
+    """torch.profiler over training steps [start, start + steps) (training.profile_start; None = off).
+
+    On the last profiled step it prints the top operators by CUDA and by CPU self time and writes
+    a Chrome trace (chrome://tracing, Perfetto) to training.profile_dir, else ckpt_dir, else ./profiles.
+    """
+
+    def __init__(self, t: DictConfig) -> None:
+        start = t.get("profile_start", None)
+        self.start = None if start is None else int(start)
+        self.steps = int(t.get("profile_steps", 20))
+        self.out_dir = str(t.get("profile_dir", None) or t.get("ckpt_dir", None) or "profiles")
+        self.prof: torch.profiler.profile | None = None
+
+    def before_step(self, step: int) -> None:
+        if self.start is None or step != self.start:
+            return
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        self.prof = torch.profiler.profile(activities=activities, record_shapes=True, profile_memory=True)
+        self.prof.__enter__()
+
+    def after_step(self, step: int) -> None:
+        if self.prof is None or self.start is None or step < self.start + self.steps - 1:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.prof.__exit__(None, None, None)
+        averages = self.prof.key_averages()
+        print(f"[profile] steps {self.start}..{step} ({self.steps} steps), top operators by CUDA time:")
+        print(averages.table(sort_by="cuda_time_total", row_limit=25))
+        print("[profile] top operators by CPU self time:")
+        print(averages.table(sort_by="self_cpu_time_total", row_limit=25))
+        os.makedirs(self.out_dir, exist_ok=True)
+        trace = os.path.join(self.out_dir, f"profile_steps_{self.start}_{step}.json")
+        self.prof.export_chrome_trace(trace)
+        print(f"[profile] Chrome trace: {trace}")
+        self.prof = None
+        self.start = None
+
+
 class _PhaseTimer:
     """Per-phase step timings: CUDA events for GPU phases (read at log steps), wall time for data and on CPU."""
 
@@ -415,12 +457,14 @@ def main(cfg: DictConfig) -> None:
     loss_ema: float | None = None
     triu_cache: dict[int, torch.Tensor] = {}
     timer = _PhaseTimer(device)
+    profiler = _StepProfiler(t)
 
     if bool(t.get("val_at_start", False)):
         # Score the weights before any update: the baseline of a resumed / post-training run.
         _validate_and_log(bundle.start_step, cfg, device, model, data, probes, float(bundle.scheduler.get_last_lr()[0]))
 
     for step in range(bundle.start_step, t.steps + 1):
+        profiler.before_step(step)
         t_data0 = time.perf_counter()
         # Pre-clear loop references so an OOM can release them.
         batch = None
@@ -536,6 +580,7 @@ def main(cfg: DictConfig) -> None:
 
         # Release this step's graph before validation and checkpointing.
         out = Sigma = parts = loss = aux_mae = grad_norm = batch = None
+        profiler.after_step(step)
 
         if step % t.val_every == 0 and step > 0:
             _validate_and_log(step, cfg, device, model, data, probes, float(scheduler.get_last_lr()[0]))
