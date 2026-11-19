@@ -67,7 +67,7 @@ as `lambda_resid` (-1 on GP episodes of an SCM-enabled run).
 `Sigma ∝ W W^T + diag(D)`. It must match the checkpoint when resuming.
 
 **SCM residual prior.** The synthetic prior of `data.scm_residual`
-(`data/scm_prior.py`). TabICL's SCM prior draws the features and a regression function
+(`data/scm_prior.py`). TabICLv2's graph SCM prior (`graph_scm`, its regressor's pretraining prior) draws the features and a regression function
 g, and a GP on the observed features adds dependence between rows:
 `y = sqrt(1 - lambda) g~(x) + sqrt(lambda) r~(x) + eps`, with g~ = g standardized over the
 episode, r~ ~ GP(0, K~), K~ = K / mean_i K_ii the episode's kernel normalized to unit

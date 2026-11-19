@@ -598,7 +598,7 @@ z_train_corruption_rho_beta_b: 1.5
 scm_residual:
   enabled: false
   prob: 1.0                  # per-call probability of an SCM episode (else a GP episode)
-  prior_type: mix_scm        # mlp_scm | tree_scm | mix_scm (TabICL's 0.7/0.3 mlp/tree mix)
+  prior_type: graph_scm      # TabICLv2's graph SCM prior (its regressor's pretraining prior); the only option
   lambda_p0: 0.2
   lambda_p1: 0.2
   lambda_beta_a: 2.0

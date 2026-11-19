@@ -25,11 +25,11 @@ from copula_inter.data.gp_episodes import (
 from copula_inter.data.manifest import generation_spec
 from copula_inter.data.scm_prior import (
     MEAN_FAMILY_SCM,
+    SCM_PRIOR_CODES,
     ScmResidualSettings,
     sample_lambda,
     sample_scm_tables,
     saved_mean_at,
-    xgboost_available,
 )
 from copula_inter.marginal.pit import (
     _kernel_fn_from_task,
@@ -59,7 +59,7 @@ def _cfg(seed: int = 7, P: int = 12, N: int = 6, d: int = 4, **scm: Any) -> Dict
         "systematic_composition": False,
         "kernel": "rbf",
         "z_train_source": "tabicl",
-        "scm_residual": {"enabled": True, "prior_type": "mlp_scm", "amplitude_mode": "coupled", **scm},
+        "scm_residual": {"enabled": True, "prior_type": "graph_scm", "amplitude_mode": "coupled", **scm},
     }
     return OmegaConf.create({"seed": seed, "data": OmegaConf.merge(data, overrides)})
 
@@ -209,11 +209,8 @@ def test_analytic_pit_is_refused_unless_for_diagnostics() -> None:
     assert len(generate_gp_batch(cfg, 2)) == 2
 
 
-def test_tree_prior_without_xgboost_names_the_fix(monkeypatch: pytest.MonkeyPatch) -> None:
-    import copula_inter.data.scm_prior as scm_prior
-
-    monkeypatch.setattr(scm_prior, "xgboost_available", lambda: False)
-    with pytest.raises(ImportError, match="prior_type=mlp_scm"):
+def test_only_the_tabiclv2_graph_prior_is_accepted() -> None:
+    with pytest.raises(ValueError, match="graph_scm"):
         generate_gp_batch(_cfg(prior_type="mix_scm"), 2)
 
 
@@ -232,7 +229,7 @@ def test_episodes_satisfy_the_contracts_and_align_rows() -> None:
         noise_sd = float(ep["nugget"]) ** 0.5
         assert float((ep["y_train"] - ep["mean_train"]).abs().max()) < 6 * noise_sd
         assert float((ep["y_test"] - ep["mean_test"]).abs().max()) < 6 * noise_sd
-        assert int(ep["scm_prior_type"]) == 0
+        assert int(ep["scm_prior_type"]) == SCM_PRIOR_CODES["graph_scm"]
         assert not bool(ep["mean_weight"].any())
     with pytest.raises(ValueError, match="mean_train"):
         validate_episode(episodes[0] | {"mean_train": torch.zeros(P + 1)})
@@ -258,22 +255,29 @@ def test_same_seed_same_episodes() -> None:
             if isinstance(value, torch.Tensor):
                 assert torch.equal(value, b[key]), key
     seed_everything(5)
-    first = sample_scm_tables(3, 20, 3, "mlp_scm", device="cpu")
+    first = sample_scm_tables(3, 20, 3, "graph_scm", device="cpu")
     seed_everything(5)
-    second = sample_scm_tables(3, 20, 3, "mlp_scm", device="cpu")
+    second = sample_scm_tables(3, 20, 3, "graph_scm", device="cpu")
     assert torch.equal(first.X, second.X) and torch.equal(first.g, second.g)
 
 
-@pytest.mark.skipif(not xgboost_available(), reason="TabICL's tree SCM needs xgboost")
-def test_tree_and_mixed_scm_episodes() -> None:
-    seed_everything(1)
-    tree = sample_scm_tables(3, 40, 4, "tree_scm", device="cpu")
-    assert tree.X.shape == (3, 40, 4) and bool((tree.prior_type == 1).all())
-    episodes = generate_gp_batch(_cfg(prior_type="mix_scm"), 8, return_kernel_metadata=True)
-    assert len(episodes) == 8
-    for ep in episodes:
-        validate_episode(ep)
-        assert int(ep["scm_prior_type"]) in (0, 1)
+def test_graph_tables_are_filtered_like_tabiclv2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A table TabICLv2's should_filter rejects is redrawn, and an always-rejected episode is invalid."""
+    import copula_inter.data.scm_prior as scm_prior
+
+    dataset = scm_prior._prior_module("_dataset")
+    calls: list[int] = []
+
+    def reject_all(*args: Any, **kwargs: Any) -> bool:
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(dataset, "should_filter", reject_all)
+    seed_everything(0)
+    draw = sample_scm_tables(2, 40, 3, "graph_scm", device="cpu")
+    assert not bool(draw.valid.any())
+    assert len(calls) <= 2 * scm_prior._MAX_TABLE_ATTEMPTS
+    assert torch.isfinite(draw.X).all() and torch.isfinite(draw.g).all()
 
 
 def test_fixed_sets_synthesize_scm_episodes_in_float64() -> None:
@@ -287,7 +291,7 @@ def test_fixed_sets_synthesize_scm_episodes_in_float64() -> None:
 
 def test_scm_tables_have_the_requested_shape() -> None:
     seed_everything(0)
-    draw = sample_scm_tables(4, 30, 6, "mlp_scm", device="cpu")
+    draw = sample_scm_tables(4, 30, 6, "graph_scm", device="cpu")
     assert draw.X.shape == (4, 30, 6) and draw.g.shape == (4, 30)
     assert bool(draw.valid.all())
     assert torch.allclose(draw.g.mean(1), torch.zeros(4), atol=1e-5)

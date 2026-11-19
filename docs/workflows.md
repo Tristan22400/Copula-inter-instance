@@ -248,9 +248,12 @@ python -m debug.scm_residual_sweep experiment=scm_residual
 ```
 
 `data.scm_residual.prob` mixes SCM and GP episodes per generation call, and the
-`lambda_*` keys set the residual-share mixture. `prior_type` is `mix_scm` (TabICL's 0.7/0.3
-mix of MLP and tree SCMs; the tree SCM uses the `xgboost-cpu` dependency), or `mlp_scm` /
-`tree_scm` alone.
+`lambda_*` keys set the residual-share mixture. The tables come from TabICLv2's graph SCM
+prior (`prior_type: graph_scm`, the only option) with its regressor's pretraining settings:
+2-32 node Cauchy DAGs, no node noise, unpredictable graphs and datasets filtered
+(`V2_REGRESSOR_PRIOR_CONFIG` in `src/copula_inter/data/scm_prior.py`). The graph's target
+node may have feature descendants; the GP residual is added to it as a new leaf, so the
+oracle stays exact (module docstring).
 
 ### Fine-tune on real ERA5
 

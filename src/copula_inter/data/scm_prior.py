@@ -1,51 +1,68 @@
-"""TabICL SCM prior adapter and the settings of the SCM + GP residual prior.
+"""TabICLv2 graph-SCM prior adapter and the settings of the SCM + GP residual prior.
 
 The SCM + GP residual prior (cfg.data.scm_residual) draws one episode as
 
-    y = sqrt(1 - lambda) * g~(x) + L_all eps,   K_all = lambda * K~ + sigma_n^2 I,
+    y = a_g * g~(x) + r(x) + eps,   r ~ GP(0, c K),   eps ~ N(0, sigma_n^2 I),
 
-where (X, g) is a TabICL SCM table, g~ its target standardized over the episode, K~ the
-episode's GP kernel normalized to unit mean prior variance and lambda ~ p0 delta_0 +
-p1 delta_1 + (1 - p0 - p1) Beta(a, b) the residual share. lambda = 0 is the TabICL prior
-(rows i.i.d. given the SCM), lambda = 1 the zero-mean GP prior. gp_episodes builds the
-target; this module owns the settings, the lambda draw and every use of TabICL's
-private prior modules, so a TabICL upgrade touches one file.
+where (X, g) is a table from TabICLv2's graph SCM prior (the prior its regressor was
+pretrained on), g~ its target standardized over the episode, and (a_g^2, c) the amplitudes
+of sample_amplitudes (coupled: a_g^2 = 1 - lambda, c K = lambda K~ with K~ normalized to unit
+mean prior variance; decoupled: independent amplitudes). a_g = 0 is the zero-mean GP prior,
+c = 0 TabICLv2's prior (rows i.i.d. given the graph). gp_episodes builds the target; this
+module owns the settings, the amplitude draw and every use of TabICL's private prior
+modules, so a TabICL upgrade touches one file.
 
-TabICL's prior package imports xgboost at import time (its tree SCM), and the package
-__init__ pulls that in for every submodule. The MLP SCM does not need xgboost, so when
-xgboost is absent the submodules are loaded without running the package __init__.
+Where y sits in the graph. The graph SCM writes the target as one column of some node of a
+random DAG; that node may have descendants, and feature columns of those descendants are
+functions of the target value the graph wrote. g is that written value, so the graph (X, g)
+is a complete, acyclic SCM. The observed target y = a_g g~ + r(X) + eps is a new *leaf* node
+whose parents are g and all of X: nothing downstream sees r, so r is independent of X a
+priori, its conditional given X is the GP prior, and the conditional oracle (which knows g)
+stays exact. Injecting r into g's node before propagation would need r to depend only on
+the non-descendants of that node (else the graph has a cycle) and would make the descendant
+features informative about r, so p(r | X) would no longer be the GP and no oracle would be
+available.
 """
 
 from __future__ import annotations
 
 import importlib
-import importlib.util
-import sys
 import types
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Mapping
 
-import numpy as np
 import torch
 from torch import Tensor
 
 from copula_inter.type_aliases import Device, HasDataConfig
 
-SCM_PRIOR_TYPES = ("mlp_scm", "tree_scm", "mix_scm")
+# TabICLv2's graph SCM only; TabICLv1's mlp / tree / mix SCMs are not offered.
+SCM_PRIOR_TYPES = ("graph_scm",)
 AMPLITUDE_MODES = ("coupled", "decoupled")
 # scm_prior_type codes saved per episode (-1: a GP-prior episode of an SCM-enabled run).
-SCM_PRIOR_CODES = {"mlp_scm": 0, "tree_scm": 1}
+# 0 and 1 were TabICLv1's mlp_scm and tree_scm in earlier datasets; they are not reused.
+SCM_PRIOR_CODES = {"graph_scm": 2}
 GP_EPISODE_PRIOR_CODE = -1
 # mean_family of an SCM episode (the mean bank's codes are 0 linear, 1 exponential, 2 anomaly):
 # its mean is the saved mean_train / mean_test vectors, not a mean-bank function.
 MEAN_FAMILY_SCM = 3
 # Learned marginals the SCM prior can train with; "analytic" would leak g through m.
 _ANALYTIC_SOURCES = ("analytic",)
-# Redraws of one episode whose SCM table loses a feature (constant column) or is degenerate
-# before it is marked invalid and left to generate_gp_batch's top-up.
-_MAX_TABLE_ATTEMPTS = 4
+# Redraws of one episode whose table loses a feature (constant column), is degenerate or is
+# filtered as unpredictable, before it is marked invalid and left to generate_gp_batch's top-up.
+_MAX_TABLE_ATTEMPTS = 8
+# graph_lib PriorConfig of TabICLv2's regressor pretraining, identical in its three stages
+# (tabicl_upstream/scripts/train_v2_reg_stage{1,2,3}.sh); other fields keep PriorConfig's defaults.
+V2_REGRESSOR_PRIOR_CONFIG: dict[str, Any] = {
+    "add_gaussian_noise": False,  # --graph_noise False
+    "filter_unpredictable_graphs": True,
+    "filter_unpredictable_datasets": True,
+    "allow_act_warping": False,
+    "min_n_nodes": 2,
+    "max_n_nodes": 32,
+    "cauchy_dag_offset": 0.0,
+}
 
 
 @dataclass(frozen=True)
@@ -54,7 +71,7 @@ class ScmResidualSettings:
 
     enabled: bool = False
     prob: float = 1.0
-    prior_type: str = "mix_scm"
+    prior_type: str = "graph_scm"
     lambda_p0: float = 0.2
     lambda_p1: float = 0.2
     lambda_beta_a: float = 2.0
@@ -154,11 +171,6 @@ def validate_scm_settings(cfg: HasDataConfig, settings: ScmResidualSettings) -> 
             "(data.z_train_source=tabicl, tabicl_split, tabpfn35_fast or kumo_small), or set "
             "data.scm_residual.allow_analytic_pit=true for diagnostics only."
         )
-    if settings.prior_type in ("tree_scm", "mix_scm") and not xgboost_available():
-        raise ImportError(
-            f"data.scm_residual.prior_type={settings.prior_type} needs xgboost (TabICL's tree SCM), "
-            "which is not installed. Use data.scm_residual.prior_type=mlp_scm."
-        )
 
 
 def sample_lambda(settings: ScmResidualSettings, B: int, device: Device) -> Tensor:
@@ -207,129 +219,79 @@ def sample_amplitudes(settings: ScmResidualSettings, B: int, device: Device) -> 
     return Amplitudes(mean_amp2=mean_amp2, kernel_factor=kernel_factor, normalize_kernel=False)
 
 
-def xgboost_available() -> bool:
-    """Whether TabICL's tree SCM can be imported."""
-    return importlib.util.find_spec("xgboost") is not None
-
-
 @lru_cache(maxsize=None)
 def _prior_module(name: str) -> types.ModuleType:
-    """tabicl.prior.<name>, loaded without the package __init__ when xgboost is missing."""
-    full = f"tabicl.prior.{name}"
-    if full in sys.modules:
-        return sys.modules[full]
-    if xgboost_available():
-        return importlib.import_module(full)
-    if name == "_tree_scm":
-        raise ImportError("TabICL's tree SCM needs xgboost, which is not installed. Use prior_type=mlp_scm.")
-    spec = importlib.util.find_spec("tabicl")
-    if spec is None or not spec.submodule_search_locations:
-        raise ImportError("cannot locate the vendored tabicl package")
-    # A stand-in parent package so the relative imports inside the prior modules resolve; it is
-    # removed again so a later `import tabicl.prior` runs the real __init__.
-    stub = types.ModuleType("tabicl.prior")
-    stub.__path__ = [str(Path(next(iter(spec.submodule_search_locations))) / "prior")]
-    stub.__package__ = "tabicl.prior"
-    previous = sys.modules.get("tabicl.prior")
-    sys.modules["tabicl.prior"] = stub
-    try:
-        return importlib.import_module(full)
-    finally:
-        if previous is None:
-            sys.modules.pop("tabicl.prior", None)
-        else:
-            sys.modules["tabicl.prior"] = previous
+    """tabicl.prior.<name> (the package imports xgboost through TabICLv1's tree SCM: xgboost-cpu)."""
+    return importlib.import_module(f"tabicl.prior.{name}")
 
 
 @dataclass
 class ScmDraw:
-    """B SCM tables of T rows and d features (float32 on the requested device)."""
+    """B graph-SCM tables of T rows and d features (float32 on the requested device)."""
 
     X: Tensor  # (B, T, d)
     g: Tensor  # (B, T) SCM target, standardized over the T rows
-    valid: Tensor  # (B,) bool: every feature non-constant, finite, g non-constant
+    valid: Tensor  # (B,) bool: every feature non-constant, finite, g non-constant, predictable
     prior_type: Tensor  # (B,) long, SCM_PRIOR_CODES
 
 
 @lru_cache(maxsize=1)
-def _hp_sampler() -> Any:
-    """TabICL's hyperparameter sampler, built once per process.
+def _v2_prior_config() -> Any:
+    """graph_lib PriorConfig with TabICLv2's regressor settings (no random draws)."""
+    return _prior_module("graph_lib._config").PriorConfig(**V2_REGRESSOR_PRIOR_CONFIG)
 
-    Building it draws no random numbers (its samplers are closures that draw when called), so
-    reusing it keeps every seed's episodes identical; rebuilding it per episode was half the
-    SCM generation time.
+
+def _draw_table(T: int, d: int) -> tuple[Tensor, Tensor, bool]:
+    """One (X (T, d), y (T,)) graph-SCM table and whether TabICLv2's generator would keep it.
+
+    Mirrors GraphPrior.generate_dataset for one regression dataset: GraphSCM (outlier removal
+    and standard scaling of X and y inside), then should_filter (an ExtraTrees whose OOB error
+    does not beat the mean is unpredictable). TabICLv2 drops constant columns instead; here a
+    dropped column would change d, which every episode of a call shares, so the table is redrawn.
     """
-    config = _prior_module("_prior_config")
-    return _prior_module("_hp_sampling").HpSamplerList(config.DEFAULT_SAMPLED_HP, device="cpu")
-
-
-def _episode_params(prior_type: str, T: int, d: int) -> dict[str, Any]:
-    """One dataset's parameters, as SCMPrior.get_batch builds them for one regression dataset."""
-    config = _prior_module("_prior_config")
-    sampler = _hp_sampler()
-    sampled = {k: v() if callable(v) else v for k, v in sampler.sample().items()}
-    return {
-        "regression": True,
-        "device": "cpu",
-        **config.DEFAULT_FIXED_HP,
-        "seq_len": T,
-        "train_size": T,  # unused for regression (no class-balance check)
-        "max_features": d,
-        **sampled,
-        "prior_type": prior_type,
-        "num_features": d,
-        "num_classes": None,
-    }
-
-
-def _draw_table(prior_type: str, T: int, d: int) -> tuple[Tensor, Tensor, bool]:
-    """One (X (T, d), y (T,)) table and whether it kept all d features and a usable target."""
-    params = _episode_params(prior_type, T, d)
-    scm_cls = _prior_module("_mlp_scm").MLPSCM if prior_type == "mlp_scm" else _prior_module("_tree_scm").TreeSCM
-    X, y = scm_cls(**params)()
-    X, y = _prior_module("_reg2cls").Reg2Cls(params)(X, y)
+    config = _v2_prior_config()
+    scm = _prior_module("_graph_scm").GraphSCM(
+        regression=True,
+        seq_len=T,
+        num_features=d,
+        max_features=d,
+        num_classes=0,
+        permute_features=True,
+        config=config,
+        device="cpu",
+    )
+    X, y = scm()
     X, y = X.float(), y.float()
     finite = bool(torch.isfinite(X).all()) and bool(torch.isfinite(y).all())
-    # TabICL's delete_unique_features drops constant columns; here a dropped column would
-    # change d, which every episode of a call shares, so the table is redrawn instead.
     all_features = all(int(torch.unique(X[:, j]).numel()) > 1 for j in range(d))
-    target_ok = finite and float(y.std()) > 1e-6
-    return X, y, finite and all_features and target_ok
-
-
-def _resolve_prior_types(prior_type: str, B: int) -> list[str]:
-    """Each episode's SCM family; mix_scm draws it with TabICL's mix_probs."""
-    if prior_type != "mix_scm":
-        return [prior_type] * B
-    probs = _prior_module("_prior_config").DEFAULT_FIXED_HP.get("mix_probs", (0.7, 0.3))
-    return [str(t) for t in np.random.choice(["mlp_scm", "tree_scm"], size=B, p=list(probs))]
+    if not (finite and all_features and float(y.std()) > 1e-6):
+        return X, y, False
+    predictable = not _prior_module("_dataset").should_filter(X, y, config, is_classif=False)
+    return X, y, predictable
 
 
 @torch.no_grad()
 def sample_scm_tables(B: int, T: int, d: int, prior_type: str, *, device: Device) -> ScmDraw:
-    """Draw B regression tables from TabICL's SCM prior with exactly d features and T rows.
+    """Draw B regression tables from TabICLv2's graph SCM prior with exactly d features and T rows.
 
-    Every episode draws its own SCM hyperparameters (TabICL groups datasets by shared
-    hyperparameters; here episodes are independent, as the GP prior's are). Generation is
-    sequential on the CPU (n_jobs=1, it runs inside DataLoader workers) from the global
-    random / numpy / torch RNGs, so seed_everything fixes it. A table that loses a feature
-    or has a degenerate target is redrawn up to _MAX_TABLE_ATTEMPTS times, then returned
-    with valid=False.
+    Every episode draws its own DAG, node functions and feature/target placement (TabICLv2
+    groups datasets only by shape). Generation is sequential on the CPU (it runs inside
+    DataLoader workers) from the global numpy / torch RNGs, so seed_everything fixes it. A
+    rejected table is redrawn up to _MAX_TABLE_ATTEMPTS times, then returned with valid=False.
     """
     if prior_type not in SCM_PRIOR_TYPES:
-        raise ValueError(f"prior_type={prior_type!r}; expected one of {SCM_PRIOR_TYPES}")
-    types_per_ep = _resolve_prior_types(prior_type, B)
+        raise ValueError(f"prior_type={prior_type!r}; expected one of {SCM_PRIOR_TYPES} (TabICLv2's prior)")
     X = torch.zeros(B, T, d, dtype=torch.float32)
     g = torch.zeros(B, T, dtype=torch.float32)
     valid = torch.zeros(B, dtype=torch.bool)
-    # TabICL's SCMs build their layers in the default dtype but sample inputs in float32; fixed
-    # evaluation sets synthesize under a float64 default (generate_fixed_gp_batch), so pin float32.
+    # Fixed evaluation sets synthesize under a float64 default (generate_fixed_gp_batch); the
+    # graph prior is written for float32, so pin it.
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)
     try:
-        for b, kind in enumerate(types_per_ep):
+        for b in range(B):
             for _ in range(_MAX_TABLE_ATTEMPTS):
-                Xb, yb, ok = _draw_table(kind, T, d)
+                Xb, yb, ok = _draw_table(T, d)
                 if ok:
                     X[b], g[b], valid[b] = Xb, yb, True
                     break
@@ -341,5 +303,5 @@ def sample_scm_tables(B: int, T: int, d: int, prior_type: str, *, device: Device
         X[bad] = torch.randn(int(bad.sum()), T, d, dtype=torch.float32)
         g[bad] = torch.randn(int(bad.sum()), T, dtype=torch.float32)
     g = (g - g.mean(1, keepdim=True)) / g.std(1, keepdim=True).clamp(min=1e-8)
-    codes = torch.tensor([SCM_PRIOR_CODES[t] for t in types_per_ep], dtype=torch.long)
+    codes = torch.full((B,), SCM_PRIOR_CODES[prior_type], dtype=torch.long)
     return ScmDraw(X=X.to(device), g=g.to(device), valid=valid.to(device), prior_type=codes.to(device))
