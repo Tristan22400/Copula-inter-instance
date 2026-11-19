@@ -53,6 +53,35 @@ def _copula_gain(R: torch.Tensor, z: torch.Tensor) -> float:
     return float((z @ z - logdet - z @ sol) / (2 * z.shape[0]))
 
 
+SHRINK_GRID = [i / 10 for i in range(11)]
+
+
+def _standardize(z: torch.Tensor) -> torch.Tensor:
+    """z with the episode's own mean and std removed (marginal bias and scale miscalibration)."""
+    z = z.double()
+    return (z - z.mean()) / z.std().clamp(min=1e-8)
+
+
+def _best_shrink(R: torch.Tensor, z: torch.Tensor) -> tuple[float, float]:
+    """max_t gain of R_t = (1 - t) I + t R on z, and the argmax t (R's shape with a learned strength)."""
+    eye = torch.eye(R.shape[0], dtype=torch.float64)
+    gains = [_copula_gain((1 - t) * eye + t * R.double(), z) for t in SHRINK_GRID]
+    best = max(range(len(gains)), key=lambda i: gains[i])
+    return gains[best], SHRINK_GRID[best]
+
+
+def _nn_autocorr(x: torch.Tensor, z: torch.Tensor) -> float:
+    """mean z_i z_nn(i) of standardized z over each row's nearest neighbour in x (0 under independence).
+
+    Shape-agnostic: positive when nearby rows (in the features the copula sees) have similar z,
+    whatever the dependence's shape. Its null sd is about 1 / sqrt(n).
+    """
+    zs = _standardize(z)
+    dist = torch.cdist(x.double(), x.double())
+    dist.fill_diagonal_(float("inf"))
+    return float((zs * zs[dist.argmin(dim=1)]).mean())
+
+
 def _prior_cfgs(cfg: DictConfig) -> dict[str, DictConfig]:
     gp = merge_configs(cfg)
     gp.data.scm_residual.enabled = False
@@ -87,15 +116,17 @@ def _episodes(cfg: DictConfig, marginal: Any, device: str) -> list[dict]:
     return eps[:EPISODES]
 
 
-def _summary(rows: list[dict[str, float]]) -> str:
-    d = torch.tensor([r["delta"] for r in rows])
-    d_or = torch.tensor([r["delta_oracle"] for r in rows])
-    info = torch.tensor([r["info"] for r in rows])
-    q = d.quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()
+def _summary(rows: list[dict[str, float]], n_test: int = 256) -> str:
+    def col(key: str) -> torch.Tensor:
+        return torch.tensor([r[key] for r in rows])
+
+    nn_test = col("nn_test")
+    null_sd = n_test**-0.5
     return (
-        f"{len(rows)} | {info.mean():.3f} | {d_or.mean():.3f} | {d.mean():.3f} | "
-        f"{q[0]:.3f} / {q[1]:.3f} / {q[2]:.3f} | {100 * (d > SIGNAL_THRESHOLD).float().mean():.0f}% | "
-        f"{100 * (d > 0).float().mean():.0f}%"
+        f"{len(rows)} | {col('info').mean():.3f} | {col('delta_oracle').mean():.3f} | {col('delta').mean():.3f} | "
+        f"{col('delta_std').mean():.3f} | {col('shrink_gain').mean():.3f} (t*={col('shrink_t').mean():.2f}) | "
+        f"{100 * (col('shrink_gain') > SIGNAL_THRESHOLD).float().mean():.0f}% | "
+        f"{nn_test.mean():+.3f} | {100 * (nn_test > 2 * null_sd).float().mean():.0f}% | {col('nn_train').mean():+.3f}"
     )
 
 
@@ -104,10 +135,11 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     marginals = {"config PIT": resolve_pit_ckpt(cfg), "pretrained v2": PRETRAINED_V2}
     priors = _prior_cfgs(cfg)
-    header = (
-        "| prior | marginal | episodes | I/N (oracle) | delta on analytic z | delta on marginal z | "
-        "delta p10 / p50 / p90 | delta > 0.01 | delta > 0 |\n|---|---|---:|---:|---:|---:|---|---:|---:|"
+    cols = (
+        "episodes | I/N | gain analytic z | gain marginal z | gain std z | best shrink gain (t*) | shrink > 0.01 | "
+        "nn-corr z_test | nn-corr > 2/sqrt(N) | nn-corr z_train"
     )
+    header = f"| prior | marginal | {cols} |\n|---|---|" + "---:|" * 10
     lines, bin_lines = [header], []
     for m_name, ckpt in marginals.items():
         assert ckpt is not None
@@ -118,9 +150,16 @@ def main() -> None:
                 post = gp_analytical_posterior(ep)
                 R = post["R_post"]
                 N = R.shape[0]
+                z_std = _standardize(ep["z_test"])
+                shrink_gain, shrink_t = _best_shrink(R, z_std)
                 rows.append(
                     {
                         "delta": _copula_gain(R, ep["z_test"]),
+                        "delta_std": _copula_gain(R, z_std),
+                        "shrink_gain": shrink_gain,
+                        "shrink_t": shrink_t,
+                        "nn_test": _nn_autocorr(ep["x_norm_test"], ep["z_test"]),
+                        "nn_train": _nn_autocorr(ep["x_norm_train"], ep["z_train"]),
                         "delta_oracle": _copula_gain(R, gp_analytical_pit(ep)["z_test"].reshape(-1)),
                         "info": -0.5 * float(torch.linalg.slogdet(R.double()).logabsdet) / N,
                         "lam": float(ep.get("lambda_resid", torch.tensor(1.0))),
@@ -139,10 +178,8 @@ def main() -> None:
     print("\n## Copula signal per prior and marginal\n")
     print("\n".join(lines))
     print("\n## By residual share (SCM priors)\n")
-    print(
-        "| prior | marginal | lambda bin | episodes | I/N | delta analytic | delta marginal | p10/p50/p90 | >0.01 | >0 |"
-    )
-    print("|---|---|---|---:|---:|---:|---:|---|---:|---:|")
+    print(f"| prior | marginal | lambda bin | {cols} |")
+    print("|---|---|---|" + "---:|" * 10)
     print("\n".join(bin_lines))
 
     print("\n## CPU generation profile (32 episodes, no marginal)\n")

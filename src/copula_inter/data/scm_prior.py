@@ -251,10 +251,22 @@ class ScmDraw:
     prior_type: Tensor  # (B,) long, SCM_PRIOR_CODES
 
 
+@lru_cache(maxsize=1)
+def _hp_sampler() -> Any:
+    """TabICL's hyperparameter sampler, built once per process.
+
+    Building it draws no random numbers (its samplers are closures that draw when called), so
+    reusing it keeps every seed's episodes identical; rebuilding it per episode was half the
+    SCM generation time.
+    """
+    config = _prior_module("_prior_config")
+    return _prior_module("_hp_sampling").HpSamplerList(config.DEFAULT_SAMPLED_HP, device="cpu")
+
+
 def _episode_params(prior_type: str, T: int, d: int) -> dict[str, Any]:
     """One dataset's parameters, as SCMPrior.get_batch builds them for one regression dataset."""
     config = _prior_module("_prior_config")
-    sampler = _prior_module("_hp_sampling").HpSamplerList(config.DEFAULT_SAMPLED_HP, device="cpu")
+    sampler = _hp_sampler()
     sampled = {k: v() if callable(v) else v for k, v in sampler.sample().items()}
     return {
         "regression": True,
