@@ -5,6 +5,8 @@
 d_features: 10          # total feature columns; fallback used only when
                         # d_features_lognormal_loc/scale below are unset.
 
+# GP-prior episodes only: SCM + GP residual episodes take d from TabICLv2's prior
+# (round(Uniform(1, 100)), scm_prior.sample_v2_num_features).
 # Total feature count d ~ round(LogNormal(d_features_lognormal_loc,
 # d_features_lognormal_scale)), clipped to a minimum of 2, sampled once per
 # shard (every episode within one shard shares the same d — see
@@ -599,20 +601,20 @@ scm_residual:
   enabled: false
   prob: 1.0                  # per-call probability of an SCM episode (else a GP episode)
   prior_type: graph_scm      # TabICLv2's graph SCM prior (its regressor's pretraining prior); the only option
-  lambda_p0: 0.2
-  lambda_p1: 0.2
-  lambda_beta_a: 2.0
-  lambda_beta_b: 2.0
+  lambda_p0: 0.2             # probability of an i.i.d. TabICLv2 episode (no residual, a_g = 1)
+  lambda_p1: 0.2             # probability of a zero-mean GP episode (a_g = 0)
   allow_analytic_pit: false  # diagnostics only: analytic z uses g and leaks it
   apply_feature_warps: false # also run the TabICLv2 / structural / MLP warps on the SCM features
-  # coupled:   y = sqrt(1 - lambda) g~ + GP(0, lambda K / mean_i K_ii) + eps, lambda from the
-  #            mixture above (signal variance 1, relative noise sigma_n^2 at every lambda).
-  # decoupled: y = a_g g~ + GP(0, K) + eps with a_g^2 ~ LogNormal(0, mean_amp_lognormal_scale^2)
-  #            and the kernel's own amplitude (alpha2 prior), independently; the share
-  #            lambda = mean_i K_ii / (a_g^2 + mean_i K_ii) and the relative noise are induced.
-  #            lambda_p0 / lambda_p1 still give exact TabICL / GP-prior episodes; the Beta is unused.
+  # y = a_g g~ + GP(0, K) + eps with a_g^2 ~ LogNormal(loc, scale^2) and the kernel's own
+  # amplitude (alpha2 prior), independently; the share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii)
+  # and the relative noise are induced. (The coupled amplitude mode was removed.)
   amplitude_mode: decoupled
+  mean_amp_lognormal_loc: 0.0
   mean_amp_lognormal_scale: 1.5
+
+# Save the oracle correlation R_star (N x N) in on-disk shards (generate_pit_dataset). false cuts
+# an N=256 episode from ~270 KB to ~12 KB; training never reads R_star.
+store_r_star: true
 
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.

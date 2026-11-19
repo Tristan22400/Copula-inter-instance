@@ -56,6 +56,7 @@ from copula_inter.data.scm_prior import (
     ScmResidualSettings,
     sample_amplitudes,
     sample_scm_tables,
+    sample_v2_num_features,
     validate_scm_settings,
 )
 from copula_inter.data.structural_warps import apply_structural_feature_warp
@@ -465,14 +466,12 @@ class _GPDraw:
 class _ResidualMean:
     """A known per-row mean and the kernel's factor, replacing the mean function (SCM + GP residual prior).
 
-    K_all = kernel_factor * K / mean_i K_ii + sigma_n^2 I when normalize_kernel (coupled amplitudes,
-    kernel_factor = lambda), else kernel_factor * K + sigma_n^2 I (decoupled: the kernel keeps its
-    own output scale).
+    K_all = kernel_factor * K + sigma_n^2 I: the kernel keeps its own output scale, kernel_factor
+    is 1 (or 0 for an i.i.d. TabICLv2 episode).
     """
 
     mean: Tensor  # (B, T) a_g * g~
     kernel_factor: Tensor  # (B,)
-    normalize_kernel: bool
 
 
 def _draw_gp(
@@ -486,8 +485,7 @@ def _draw_gp(
     """Sample y jointly from each episode's GP; None when kernel evaluation fails for the whole batch.
 
     With residual the mean is residual.mean instead of priors.mean_module(x_kernel), and the
-    kernel is scaled by residual.kernel_factor, after normalizing it to unit mean prior variance
-    over the T rows when residual.normalize_kernel. Every oracle formula below then holds with
+    kernel is scaled by residual.kernel_factor. Every oracle formula below then holds with
     the known mean vector in place of the mean function.
     """
     B, P, N, T = shape.B, shape.P, shape.N, shape.T
@@ -513,9 +511,6 @@ def _draw_gp(
     if residual is not None:
         diag_mean = K_full_dense.diagonal(dim1=1, dim2=2).mean(-1).clamp(min=1e-12)  # (B,)
         kernel_scale = residual.kernel_factor.to(K_full_dense.dtype)
-        if residual.normalize_kernel:
-            # K~ = K / mean_i K_ii: the kernel's own output scale is neutralized, lambda sets the split.
-            kernel_scale = kernel_scale / diag_mean
         K_full_dense = K_full_dense * kernel_scale.reshape(B, 1, 1)
     nugget_eye = torch.eye(T, device=device, dtype=K_full_dense.dtype).expand(B, T, T)
     K_all_raw = K_full_dense + likelihood.noise.reshape(B, 1, 1) * nugget_eye
@@ -809,8 +804,7 @@ def residual_share(residual: _ResidualMean, draw: _GPDraw) -> Tensor:
     """(B,) effective residual share lambda = c mean_i K_ii / (a_g^2 + c mean_i K_ii).
 
     The SCM mean a_g g~ has variance a_g^2 over the T rows and the residual c K has mean prior
-    variance c mean_i K_ii, so this is the GP residual's share of the signal variance: lambda
-    itself under coupled amplitudes, the induced share under decoupled ones.
+    variance c mean_i K_ii, so this is the GP residual's share of the signal variance.
     """
     assert draw.kernel_scale is not None and draw.kernel_diag_mean is not None
     resid_var = draw.kernel_scale * draw.kernel_diag_mean
@@ -946,6 +940,9 @@ def _generate_gp_batch_raw(
         validate_scm_settings(cfg, scm)
     # Drawn only when enabled, so the disabled prior's random stream is unchanged.
     use_scm = scm.enabled and random.random() < scm.prob
+    if use_scm and d_override is None:
+        # The table's shape comes from TabICLv2's prior, not from data.d_features*.
+        d_override = sample_v2_num_features()
 
     residual: Optional[_ResidualMean] = None
     scm_prior_type: Optional[Tensor] = None
@@ -968,7 +965,6 @@ def _generate_gp_batch_raw(
             residual = _ResidualMean(
                 mean=amps.mean_amp2.to(g_tilde.dtype).clamp(min=0.0).sqrt().unsqueeze(-1) * g_tilde,
                 kernel_factor=amps.kernel_factor,
-                normalize_kernel=amps.normalize_kernel,
             )
             scm_prior_type = tables.prior_type
         else:

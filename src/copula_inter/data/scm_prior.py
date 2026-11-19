@@ -5,10 +5,10 @@ The SCM + GP residual prior (cfg.data.scm_residual) draws one episode as
     y = a_g * g~(x) + r(x) + eps,   r ~ GP(0, c K),   eps ~ N(0, sigma_n^2 I),
 
 where (X, g) is a table from TabICLv2's graph SCM prior (the prior its regressor was
-pretrained on), g~ its target standardized over the episode, and (a_g^2, c) the amplitudes
-of sample_amplitudes (coupled: a_g^2 = 1 - lambda, c K = lambda K~ with K~ normalized to unit
-mean prior variance; decoupled: independent amplitudes). a_g = 0 is the zero-mean GP prior,
-c = 0 TabICLv2's prior (rows i.i.d. given the graph). gp_episodes builds the target; this
+pretrained on), g~ its target standardized over the episode, K the episode's GP kernel at its
+own output scale, and a_g^2 ~ LogNormal(loc, scale^2), c = 1 drawn independently
+(sample_amplitudes); the residual share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii) is induced.
+a_g = 0 is the zero-mean GP prior, c = 0 TabICLv2's prior (rows i.i.d. given the graph). gp_episodes builds the target; this
 module owns the settings, the amplitude draw and every use of TabICL's private prior
 modules, so a TabICL upgrade touches one file.
 
@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Mapping
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -39,7 +40,9 @@ from copula_inter.type_aliases import Device, HasDataConfig
 
 # TabICLv2's graph SCM only; TabICLv1's mlp / tree / mix SCMs are not offered.
 SCM_PRIOR_TYPES = ("graph_scm",)
-AMPLITUDE_MODES = ("coupled", "decoupled")
+# The coupled mode (a_g^2 = 1 - lambda, normalized kernel) was removed; configs that still ask
+# for it are refused rather than silently switched.
+AMPLITUDE_MODES = ("decoupled",)
 # scm_prior_type codes saved per episode (-1: a GP-prior episode of an SCM-enabled run).
 # 0 and 1 were TabICLv1's mlp_scm and tree_scm in earlier datasets; they are not reused.
 SCM_PRIOR_CODES = {"graph_scm": 2}
@@ -54,6 +57,10 @@ _ANALYTIC_SOURCES = ("analytic",)
 _MAX_TABLE_ATTEMPTS = 8
 # graph_lib PriorConfig of TabICLv2's regressor pretraining, identical in its three stages
 # (tabicl_upstream/scripts/train_v2_reg_stage{1,2,3}.sh); other fields keep PriorConfig's defaults.
+# Feature count of TabICLv2's regressor pretraining (--min_features 1 --max_features 100,
+# log_n_features=False): d = round(Uniform(1, 100)), shared by a group of datasets (here, a call).
+V2_MIN_FEATURES = 1
+V2_MAX_FEATURES = 100
 V2_REGRESSOR_PRIOR_CONFIG: dict[str, Any] = {
     "add_gaussian_noise": False,  # --graph_noise False
     "filter_unpredictable_graphs": True,
@@ -74,12 +81,10 @@ class ScmResidualSettings:
     prior_type: str = "graph_scm"
     lambda_p0: float = 0.2
     lambda_p1: float = 0.2
-    lambda_beta_a: float = 2.0
-    lambda_beta_b: float = 2.0
     allow_analytic_pit: bool = False
     apply_feature_warps: bool = False
-    # Absent from configs written before the decoupled mode existed: they keep the coupled one.
-    amplitude_mode: str = "coupled"
+    amplitude_mode: str = "decoupled"
+    mean_amp_lognormal_loc: float = 0.0
     mean_amp_lognormal_scale: float = 1.5
 
     @classmethod
@@ -99,11 +104,10 @@ class ScmResidualSettings:
             prior_type=str(get("prior_type", cls.prior_type)),
             lambda_p0=float(get("lambda_p0", cls.lambda_p0)),
             lambda_p1=float(get("lambda_p1", cls.lambda_p1)),
-            lambda_beta_a=float(get("lambda_beta_a", cls.lambda_beta_a)),
-            lambda_beta_b=float(get("lambda_beta_b", cls.lambda_beta_b)),
             allow_analytic_pit=bool(get("allow_analytic_pit", cls.allow_analytic_pit)),
             apply_feature_warps=bool(get("apply_feature_warps", cls.apply_feature_warps)),
             amplitude_mode=str(get("amplitude_mode", cls.amplitude_mode)),
+            mean_amp_lognormal_loc=float(get("mean_amp_lognormal_loc", cls.mean_amp_lognormal_loc)),
             mean_amp_lognormal_scale=float(get("mean_amp_lognormal_scale", cls.mean_amp_lognormal_scale)),
         )
 
@@ -144,7 +148,7 @@ def saved_mean_at(task: Mapping[str, Any], x: Tensor) -> Tensor:
 def validate_scm_settings(cfg: HasDataConfig, settings: ScmResidualSettings) -> None:
     """Refuse configurations the SCM prior cannot train with (only called when it is enabled).
 
-    The analytic PIT standardizes by m = sqrt(1 - lambda) g~, i.e. it hands the copula the
+    The analytic PIT standardizes by m = a_g g~, i.e. it hands the copula the
     SCM mechanism no model sees; it is allowed only for diagnostics (allow_analytic_pit).
     """
     if settings.prior_type not in SCM_PRIOR_TYPES:
@@ -156,67 +160,54 @@ def validate_scm_settings(cfg: HasDataConfig, settings: ScmResidualSettings) -> 
         raise ValueError(f"data.scm_residual.lambda_p0={p0}, lambda_p1={p1}: need p0, p1 >= 0 and p0 + p1 <= 1.")
     if settings.amplitude_mode not in AMPLITUDE_MODES:
         raise ValueError(
-            f"data.scm_residual.amplitude_mode={settings.amplitude_mode!r}; expected one of {AMPLITUDE_MODES}."
+            f"data.scm_residual.amplitude_mode={settings.amplitude_mode!r}; expected one of {AMPLITUDE_MODES} "
+            "(the coupled mode was removed)."
         )
     if settings.mean_amp_lognormal_scale < 0.0:
         raise ValueError("data.scm_residual.mean_amp_lognormal_scale must be non-negative.")
-    if settings.lambda_beta_a <= 0.0 or settings.lambda_beta_b <= 0.0:
-        raise ValueError("data.scm_residual.lambda_beta_a and lambda_beta_b must be positive.")
     source = str(getattr(cfg.data, "z_train_source", "analytic"))
     if source in _ANALYTIC_SOURCES and not settings.allow_analytic_pit:
         raise ValueError(
             "data.scm_residual.enabled=true with data.z_train_source=analytic: the analytic PIT "
-            "of an SCM episode uses the SCM mechanism g (z = (y - m) / sigma with m = sqrt(1 - lambda) g~), "
+            "of an SCM episode uses the SCM mechanism g (z = (y - m) / sigma with m = a_g g~), "
             "which leaks the target's mean into z_train. Train with a learned marginal "
             "(data.z_train_source=tabicl, tabicl_split, tabpfn35_fast or kumo_small), or set "
             "data.scm_residual.allow_analytic_pit=true for diagnostics only."
         )
 
 
-def sample_lambda(settings: ScmResidualSettings, B: int, device: Device) -> Tensor:
-    """(B,) residual shares lambda ~ p0 delta_0 + p1 delta_1 + (1 - p0 - p1) Beta(a, b)."""
-    u = torch.rand(B, device=device)
-    beta = torch.distributions.Beta(
-        torch.tensor(settings.lambda_beta_a, device=device), torch.tensor(settings.lambda_beta_b, device=device)
-    ).sample((B,))
-    lam = torch.where(u < settings.lambda_p0, torch.zeros_like(beta), beta)
-    p01 = settings.lambda_p0 + settings.lambda_p1
-    lam = torch.where((u >= settings.lambda_p0) & (u < p01), torch.ones_like(beta), lam)
-    return lam.clamp(0.0, 1.0)
-
-
 @dataclass
 class Amplitudes:
-    """Per-episode amplitudes of y = a_g g~ + r + eps, r ~ GP(0, kernel_factor * K[~])."""
+    """Per-episode amplitudes of y = a_g g~ + r + eps, r ~ GP(0, kernel_factor * K)."""
 
     mean_amp2: Tensor  # (B,) a_g^2, the SCM mean's variance (g~ is standardized)
-    kernel_factor: Tensor  # (B,) multiplies K (decoupled) or K~ = K / mean_i K_ii (coupled)
-    normalize_kernel: bool
+    kernel_factor: Tensor  # (B,) 1, or 0 for an i.i.d. TabICLv2 episode
 
 
 def sample_amplitudes(settings: ScmResidualSettings, B: int, device: Device) -> Amplitudes:
-    """Draw the amplitudes of the SCM mean and the GP residual.
+    """Draw the amplitudes of the SCM mean and the GP residual independently.
 
-    coupled:   a_g^2 = 1 - lambda and r ~ GP(0, lambda K~), lambda from sample_lambda, so the
-               signal variance is 1 and the relative noise sigma_n^2 does not depend on lambda.
-    decoupled: a_g^2 ~ LogNormal(0, mean_amp_lognormal_scale^2) and r ~ GP(0, K) with the kernel's
-               own output scale, independently; the share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii)
-               and the relative noise sigma_n^2 / (a_g^2 + mean_i K_ii) are then induced. With
-               probability lambda_p0 the residual is dropped (TabICL's prior) and with lambda_p1 the
-               mean (the zero-mean GP prior, kernel amplitude and noise included); the Beta keys are unused.
+    a_g^2 ~ LogNormal(mean_amp_lognormal_loc, mean_amp_lognormal_scale^2) and r ~ GP(0, K) with the
+    kernel's own output scale, so the share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii) and the
+    relative noise sigma_n^2 / (a_g^2 + mean_i K_ii) are induced. With probability lambda_p0 the
+    residual is dropped (TabICLv2's prior, a_g = 1) and with lambda_p1 the mean (the zero-mean GP
+    prior, kernel amplitude and noise included). Scale 0 pins a_g^2 = exp(loc).
     """
-    if settings.amplitude_mode == "coupled":
-        lam = sample_lambda(settings, B, device)
-        return Amplitudes(mean_amp2=1.0 - lam, kernel_factor=lam, normalize_kernel=True)
     u = torch.rand(B, device=device)
-    mean_amp2 = torch.exp(settings.mean_amp_lognormal_scale * torch.randn(B, device=device))
+    log_amp2 = settings.mean_amp_lognormal_loc + settings.mean_amp_lognormal_scale * torch.randn(B, device=device)
+    mean_amp2 = torch.exp(log_amp2)
     iid = u < settings.lambda_p0
     gp_only = (u >= settings.lambda_p0) & (u < settings.lambda_p0 + settings.lambda_p1)
     mean_amp2 = torch.where(
         iid, torch.ones_like(mean_amp2), torch.where(gp_only, torch.zeros_like(mean_amp2), mean_amp2)
     )
     kernel_factor = torch.where(iid, torch.zeros_like(mean_amp2), torch.ones_like(mean_amp2))
-    return Amplitudes(mean_amp2=mean_amp2, kernel_factor=kernel_factor, normalize_kernel=False)
+    return Amplitudes(mean_amp2=mean_amp2, kernel_factor=kernel_factor)
+
+
+def sample_v2_num_features() -> int:
+    """A call's feature count d ~ round(Uniform(1, 100)), as GraphPrior.get_batch draws it."""
+    return int(round(np.random.uniform(V2_MIN_FEATURES, V2_MAX_FEATURES)))
 
 
 @lru_cache(maxsize=None)

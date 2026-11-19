@@ -1,6 +1,6 @@
 """Is there copula signal to learn? Per-episode dependence left in a TabICL marginal's z_test.
 
-For each prior (GP; SCM coupled; SCM decoupled) and each frozen marginal (the config's PIT
+For each prior (GP; SCM + GP residual) and each frozen marginal (the config's PIT
 checkpoint and the pretrained TabICLv2), draws EPISODES episodes with the marginal's PIT and reports
 
     delta = -copula_nll(z_test; R_post) / N   (nats per query point)
@@ -86,12 +86,10 @@ def _prior_cfgs(cfg: DictConfig) -> dict[str, DictConfig]:
     gp = merge_configs(cfg)
     gp.data.scm_residual.enabled = False
     out = {"GP prior": gp}
-    for mode in ("coupled", "decoupled"):
-        c = merge_configs(cfg)
-        c.data.scm_residual.enabled = True
-        c.data.scm_residual.prob = 1.0
-        c.data.scm_residual.amplitude_mode = mode
-        out[f"SCM {mode}"] = c
+    c = merge_configs(cfg)
+    c.data.scm_residual.enabled = True
+    c.data.scm_residual.prob = 1.0
+    out["SCM + GP residual"] = c
     return out
 
 

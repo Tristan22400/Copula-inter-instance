@@ -1,8 +1,10 @@
-"""Lambda sweep of the SCM + GP residual prior: dependence strength, discards and throughput.
+"""Mean-amplitude sweep of the SCM + GP residual prior: dependence strength, discards and throughput.
 
-For each residual share lambda in LAMBDAS, draws EPISODES SCM episodes from the composed
-training config (conf/config.yaml + Hydra overrides from the command line) with lambda held
-fixed, and prints a markdown table of
+For each SCM mean variance a_g^2 in MEAN_AMP2 (inf: the i.i.d. TabICLv2 endpoint, 0: the
+zero-mean GP endpoint), draws EPISODES SCM episodes from the composed training config
+(conf/config.yaml + Hydra overrides from the command line) with a_g^2 held fixed (the induced
+share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii) still varies with the kernel amplitude),
+and prints a markdown table of
 
     I        = mean over episodes of -1/2 log det R*   (copula information, nats per episode)
     |offdiag| = mean |R*_ij|, i != j
@@ -31,25 +33,18 @@ from copula_inter.config_path import compose_config, config_dir, merge_configs
 from copula_inter.data.gp_episodes import _generate_gp_batch_raw
 from copula_inter.marginal.pit import gp_analytical_posterior
 
-LAMBDAS = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+MEAN_AMP2 = (math.inf, 16.0, 4.0, 1.0, 0.25, 0.0625, 0.0)
 EPISODES = 200
 CALL_SIZE = 50
-# Beta(c lambda, c (1 - lambda)) with this c pins lambda to ~1e-4.
-_PIN_CONCENTRATION = 1e8
 
 
-def _lambda_overrides(lam: float) -> dict[str, float]:
-    """scm_residual keys that make every episode's residual share equal lam."""
-    if lam <= 0.0:
+def _amp_overrides(a2: float) -> dict[str, float]:
+    """scm_residual keys that pin every episode's a_g^2 (LogNormal scale 0) or select an endpoint."""
+    if math.isinf(a2):
         return {"lambda_p0": 1.0, "lambda_p1": 0.0}
-    if lam >= 1.0:
+    if a2 <= 0.0:
         return {"lambda_p0": 0.0, "lambda_p1": 1.0}
-    return {
-        "lambda_p0": 0.0,
-        "lambda_p1": 0.0,
-        "lambda_beta_a": _PIN_CONCENTRATION * lam,
-        "lambda_beta_b": _PIN_CONCENTRATION * (1.0 - lam),
-    }
+    return {"lambda_p0": 0.0, "lambda_p1": 0.0, "mean_amp_lognormal_loc": math.log(a2), "mean_amp_lognormal_scale": 0.0}
 
 
 def _sweep_row(cfg: DictConfig, base_seed: int) -> dict[str, Any]:
@@ -92,20 +87,17 @@ def main() -> None:
     gp_cfg = merge_configs(cfg)
     gp_cfg.data.scm_residual.enabled = False
     rows.append(("GP prior (current)", _sweep_row(gp_cfg, base_seed)))
-    for lam in LAMBDAS:
-        lam_cfg = merge_configs(cfg)
-        lam_cfg.data.scm_residual.enabled = True
-        lam_cfg.data.scm_residual.prob = 1.0
-        lam_cfg.data.scm_residual.amplitude_mode = "coupled"  # lambda pinned by the coupled mixture
-        for key, value in _lambda_overrides(lam).items():
-            lam_cfg.data.scm_residual[key] = value
-        rows.append((f"SCM lambda={lam:g}", _sweep_row(lam_cfg, base_seed)))
-    for mode in ("coupled", "decoupled"):
-        prior_cfg = merge_configs(cfg)
-        prior_cfg.data.scm_residual.enabled = True
-        prior_cfg.data.scm_residual.prob = 1.0
-        prior_cfg.data.scm_residual.amplitude_mode = mode
-        rows.append((f"SCM {mode} prior", _sweep_row(prior_cfg, base_seed)))
+    for a2 in MEAN_AMP2:
+        amp_cfg = merge_configs(cfg)
+        amp_cfg.data.scm_residual.enabled = True
+        amp_cfg.data.scm_residual.prob = 1.0
+        for key, value in _amp_overrides(a2).items():
+            amp_cfg.data.scm_residual[key] = value
+        rows.append((f"SCM a_g^2={a2:g}", _sweep_row(amp_cfg, base_seed)))
+    prior_cfg = merge_configs(cfg)
+    prior_cfg.data.scm_residual.enabled = True
+    prior_cfg.data.scm_residual.prob = 1.0
+    rows.append(("SCM prior (config)", _sweep_row(prior_cfg, base_seed)))
 
     P, N = int(cfg.data.P_max), int(cfg.data.N_max)
     print(
