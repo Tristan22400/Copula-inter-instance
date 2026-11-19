@@ -115,9 +115,8 @@ training:
   # regions and grid resolutions instead of synthetic kernels. Requires a
   # local corpus from `python -m copula_inter.era5.fetch_global` first, and a
   # resolvable TabICL checkpoint (tabicl.ckpt/tabicl.pit_ckpt) -- there is no
-  # oracle-PIT option for real data, so training.aux_mae_weight is forced to
-  # 0.0 automatically under this source (no R_star exists to regress
-  # against). Use experiment=finetune_era5 for the ready-made preset.
+  # oracle-PIT option for real data. Use experiment=finetune_era5 for the
+  # ready-made preset.
   live_source: gp
   # CPU-bound generation is heavier than a shard read; size to keep the GPU
   # fed. 16 (not 8) because generate_gp_batch's fixed per-call overhead means
@@ -270,11 +269,6 @@ training:
   muon_adamw_eps: 1.0e-8
   # Scalar weight on the Y-space NLL (copula + marginal); 1.0 = standard.
   nll_weight: 1.0
-  # Auxiliary MAE (L1) loss on off-diagonal correlations vs oracle R_star.
-  # Provides a direct gradient signal and, unlike MSE, pushes near-zero
-  # correlations to exact zero — encourages sparsity in the predicted
-  # covariance structure. 0.0 disables it entirely.
-  aux_mae_weight: 0.0
   # Precision for the frozen TabICL marginal used by PIT/z_train/z_test and
   # marginal log densities. Keep AMP for speed by default; set false when
   # quantile-grid precision is more important than live-generation throughput.

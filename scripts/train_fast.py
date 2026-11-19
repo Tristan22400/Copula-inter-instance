@@ -300,8 +300,6 @@ def main(cfg: DictConfig) -> None:
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
-    aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
-    triu_cache: dict[int, torch.Tensor] = {}
 
     print(
         f"[train_fast] Ready to train after {time.perf_counter() - t_script0:.1f}s (steps={int(t.steps)}, batch_size={int(t.batch_size)})"
@@ -325,7 +323,7 @@ def main(cfg: DictConfig) -> None:
         data_ms = (time.perf_counter() - step_t0) * 1000.0
 
         optimizer.zero_grad(set_to_none=True)
-        out, Sigma, parts, loss, aux_mae, grad_norm = _run_train_step(
+        out, Sigma, parts, loss, grad_norm = _run_train_step(
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -337,9 +335,7 @@ def main(cfg: DictConfig) -> None:
             scaler=scaler,
             clip_grad_norm=float(t.clip_grad_norm),
             nll_weight=nll_weight,
-            aux_mae_weight=aux_mae_weight,
             jitter=jitter,
-            triu_cache=triu_cache,
             phase_start=lambda: None,
             phase_end=lambda name, s: None,
             parametrization=parametrization,
@@ -352,7 +348,7 @@ def main(cfg: DictConfig) -> None:
             lr_now = optimizer.param_groups[0]["lr"]
             print(
                 f"[{step:6d}/{int(t.steps)}] loss={loss.item():.4f} "
-                f"(cop={parts['copula'].item():.4f} mar={parts['marginal'].item():.4f} aux={aux_mae.item():.4f}) "
+                f"(cop={parts['copula'].item():.4f} mar={parts['marginal'].item():.4f}) "
                 f"offdiag_mean={stats['offdiag_mean']:+.4f} offdiag_std={stats['offdiag_std']:.4f} "
                 f"grad_norm={gn:.3f} lr={lr_now:.2e} | data={data_ms:.0f}ms step={step_ms:.0f}ms"
             )
@@ -362,16 +358,14 @@ def main(cfg: DictConfig) -> None:
             totals, copulas, marginals = [], [], []
             with torch.no_grad():
                 for vb in val_batches:
-                    _, _, val_parts, _, _ = _forward_and_loss(
+                    _, _, val_parts, _ = _forward_and_loss(
                         model=model,
                         batch=vb,
                         device=device,
                         use_amp=use_amp,
                         amp_dtype=amp_dtype,
                         nll_weight=nll_weight,
-                        aux_mae_weight=0.0,
                         jitter=jitter,
-                        triu_cache=triu_cache,
                         parametrization=parametrization,
                     )
                     totals.append(val_parts["total"].item())

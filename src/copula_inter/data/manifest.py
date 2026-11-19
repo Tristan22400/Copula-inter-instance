@@ -27,6 +27,9 @@ def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
         data.pop(output_key, None)
     # A disabled SCM residual prior changes no byte, so it stays out of the identity: datasets
     # generated before the key existed keep their digest, and enabling it changes the digest.
+    # store_r_star=true (the default) is the historical format, so it stays out too.
+    if data.get("store_r_star", True) is True:
+        data.pop("store_r_star", None)
     scm = data.get("scm_residual")
     if isinstance(scm, dict) and not scm.get("enabled", False):
         data.pop("scm_residual")

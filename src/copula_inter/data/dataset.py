@@ -28,7 +28,12 @@ def _episode_is_finite(ep: dict) -> bool:
 
 
 def _add_derived_fields(ep: dict) -> dict:
-    """Add R_prior (= R_star) and Sigma_star (= R_star * sigma_star sigma_star^T) when a shard omits them."""
+    """Add R_prior (= R_star) and Sigma_star (= R_star * sigma_star sigma_star^T) when a shard omits them.
+
+    A shard written with data.store_r_star=false has no R_star, so neither is derived.
+    """
+    if "R_star" not in ep:
+        return ep
     if "Sigma_star" not in ep:
         sigma = ep["sigma_star"]
         ep["Sigma_star"] = ep["R_star"] * sigma.unsqueeze(0) * sigma.unsqueeze(1)
@@ -205,7 +210,7 @@ def collate_fn(samples: List[dict]) -> dict:
         x_train (B, P_max, d_x), x_test (B, N_max, d_x), y_train, z_train
         (B, P_max), y_test, z_test, log_pdf_test (B, N_max; 0 on padding),
         train_mask (B, P_max) and test_mask (B, N_max) bool, R_star and
-        Sigma_star (B, N_max, N_max), R_prior when present, mu_star and
+        Sigma_star (B, N_max, N_max) when every episode has R_star, R_prior when present, mu_star and
         sigma_star (B, N_max), n_train and n_test (B,).
     """
     if not samples:
@@ -239,8 +244,10 @@ def collate_fn(samples: List[dict]) -> dict:
     log_pdf_test = torch.zeros(B, N_max)
     train_mask = torch.zeros(B, P_max, dtype=torch.bool)
     test_mask = torch.zeros(B, N_max, dtype=torch.bool)
-    R_star = torch.zeros(B, N_max, N_max)
-    Sigma_star = torch.zeros(B, N_max, N_max)
+    # The oracle matrices are optional (data.store_r_star=false shards omit them).
+    has_star = all("R_star" in s for s in samples)
+    R_star = torch.zeros(B, N_max, N_max) if has_star else None
+    Sigma_star = torch.zeros(B, N_max, N_max) if has_star else None
     mu_star = torch.zeros(B, N_max)
     sigma_star = torch.zeros(B, N_max)
     # R_prior is optional.
@@ -260,8 +267,9 @@ def collate_fn(samples: List[dict]) -> dict:
         log_pdf_test[b, :N] = s["log_pdf_test"]
         train_mask[b, :P] = True
         test_mask[b, :N] = True
-        R_star[b, :N, :N] = s["R_star"]
-        Sigma_star[b, :N, :N] = s["Sigma_star"]
+        if R_star is not None and Sigma_star is not None:
+            R_star[b, :N, :N] = s["R_star"]
+            Sigma_star[b, :N, :N] = s["Sigma_star"]
         mu_star[b, :N] = s["mu_star"]
         sigma_star[b, :N] = s["sigma_star"]
         if R_prior is not None:
@@ -277,13 +285,14 @@ def collate_fn(samples: List[dict]) -> dict:
         "log_pdf_test": log_pdf_test,
         "train_mask": train_mask,
         "test_mask": test_mask,
-        "R_star": R_star,
-        "Sigma_star": Sigma_star,
         "mu_star": mu_star,
         "sigma_star": sigma_star,
         "n_train": torch.tensor(P_list, dtype=torch.long),
         "n_test": torch.tensor(N_list, dtype=torch.long),
     }
+    if R_star is not None and Sigma_star is not None:
+        out["R_star"] = R_star
+        out["Sigma_star"] = Sigma_star
     if R_prior is not None:
         out["R_prior"] = R_prior
     return out

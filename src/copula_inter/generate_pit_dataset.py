@@ -336,10 +336,15 @@ def main(cfg: DictConfig) -> None:
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
             )
-            # Don't store R_prior and Sigma_star (reconstructed at load).
+            # Don't store R_prior and Sigma_star (reconstructed at load), nor R_star when
+            # data.store_r_star=false (N x N floats, ~96% of an N=256 episode; training never
+            # reads it, only oracle diagnostics do).
+            store_r_star = bool(cfg.data.get("store_r_star", True))
             for ep in episodes:
                 ep.pop("R_prior", None)
                 ep.pop("Sigma_star", None)
+                if not store_r_star:
+                    ep.pop("R_star", None)
             if len(episodes) != n_this:
                 raise ValueError(f"generator returned {len(episodes)} episodes; expected {n_this}")
             _save_shard_atomic(episodes, out_path)

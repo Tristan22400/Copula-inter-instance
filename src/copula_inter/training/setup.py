@@ -645,7 +645,6 @@ def init_wandb_run(cfg: DictConfig, dataset_name: str, t: DictConfig) -> None:
             ("muon_ns_steps", "ns"),
             ("clip_grad_norm", "clip"),
             ("nll_weight", "nll"),
-            ("aux_mae_weight", "aux"),
             ("compile", "compile"),
         ],
     )

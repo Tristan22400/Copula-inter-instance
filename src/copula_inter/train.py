@@ -201,7 +201,6 @@ def _log_train_step(
     Sigma: Any,
     parts: dict[str, torch.Tensor],
     loss: torch.Tensor,
-    aux_mae: torch.Tensor,
     grad_norm: torch.Tensor,
     test_mask: torch.Tensor,
     loss_ema: float | None,
@@ -210,7 +209,6 @@ def _log_train_step(
     step_flops: float | None,
     gpu_peak_flops: float | None,
     batch_size: int,
-    aux_mae_weight: float,
     device: str,
 ) -> float:
     """Log and print one training step's losses, Sigma statistics and performance; returns the updated loss EMA."""
@@ -221,7 +219,6 @@ def _log_train_step(
     amp_scale = bundle.scaler.get_scale() if bundle.scaler is not None else 1.0
     cop_val = parts["copula"].item()
     mar_val = parts["marginal"].item()
-    aux_mae_val = aux_mae.item()
     with torch.no_grad():
         w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
         Sigma_dense = Sigma.dense()
@@ -249,7 +246,6 @@ def _log_train_step(
             "train/y_nll_total": loss_val,
             "train/y_nll_copula": cop_val,
             "train/y_nll_marginal": mar_val,
-            "train/aux_mae": aux_mae_val,
             "train/lr": lr_now,
             "train/grad_norm": grad_norm_val,
             "train/amp_scale": amp_scale,
@@ -272,11 +268,10 @@ def _log_train_step(
         },
         step=step,
     )
-    aux_str = f" aux_mae={aux_mae_val:.4f}" if aux_mae_weight > 0.0 else ""
     nonfinite_str = f" | sigma_nonfinite={sigma_nonfinite}" if sigma_nonfinite else ""
     print(
         f"[{step:6d}] loss={loss_val:.4f} "
-        f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}{aux_str}) "
+        f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}) "
         f"| grad_norm={grad_norm_val:.3f} "
         f"| od_μ={sig_stats['offdiag_mean']:+.4f} od_σ={sig_stats['offdiag_std']:.4f} "
         f"| lr={lr_now:.2e}{nonfinite_str}\n"
@@ -427,10 +422,6 @@ def main(cfg: DictConfig) -> None:
     print(f"[train] frozen TabICL marginal inference AMP={'on' if tabicl_amp else 'off (float32)'}")
     live_generation = bool(t.get("live_generation", False))
     live_source = str(t.get("live_source", "gp"))
-    if live_generation and live_source == "era5" and float(t.get("aux_mae_weight", 0.0)) > 0.0:
-        # Real ERA5 has no oracle R_star.
-        print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
-        t.aux_mae_weight = 0.0
     init_wandb_run(cfg=cfg, dataset_name=dataset_name(t, cfg.data, live_generation), t=t)
 
     data = build_data_loaders(cfg=cfg, device=device, live_generation=live_generation, live_source=live_source, t=t)
@@ -448,14 +439,12 @@ def main(cfg: DictConfig) -> None:
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
-    aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
     adaptive_mix = bool(cfg.data.get("z_train_tabicl_mix_adaptive", False))
 
     model.train()
     # Recreate the iterator on StopIteration (not itertools.cycle) so every epoch reshuffles.
     train_iter = data.train_iter if data.train_iter is not None else iter(data.train_loader)
     loss_ema: float | None = None
-    triu_cache: dict[int, torch.Tensor] = {}
     timer = _PhaseTimer(device)
     profiler = _StepProfiler(t)
 
@@ -468,7 +457,7 @@ def main(cfg: DictConfig) -> None:
         t_data0 = time.perf_counter()
         # Pre-clear loop references so an OOM can release them.
         batch = None
-        out = Sigma = parts = loss = aux_mae = grad_norm = None
+        out = Sigma = parts = loss = grad_norm = None
         step_flops = None
         try:
             # Keep the CPU batch separate so a transfer OOM is recoverable.
@@ -494,7 +483,7 @@ def main(cfg: DictConfig) -> None:
             timer.ms["data"] += (time.perf_counter() - t_data0) * 1000.0
             timer.T_sum += batch["x_train"].shape[1] + batch["x_test"].shape[1]
 
-            out, Sigma, parts, loss, aux_mae, grad_norm = _run_train_step(
+            out, Sigma, parts, loss, grad_norm = _run_train_step(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -506,9 +495,7 @@ def main(cfg: DictConfig) -> None:
                 scaler=scaler,
                 clip_grad_norm=t.clip_grad_norm,
                 nll_weight=nll_weight,
-                aux_mae_weight=aux_mae_weight,
                 jitter=jitter,
-                triu_cache=triu_cache,
                 phase_start=timer.start,
                 phase_end=timer.end,
                 parametrization=parametrization,
@@ -524,9 +511,7 @@ def main(cfg: DictConfig) -> None:
                         use_amp=bundle.use_amp,
                         amp_dtype=bundle.amp_dtype,
                         nll_weight=nll_weight,
-                        aux_mae_weight=aux_mae_weight,
                         jitter=jitter,
-                        triu_cache=triu_cache,
                         parametrization=parametrization,
                     )
                 except torch.cuda.OutOfMemoryError:
@@ -548,7 +533,7 @@ def main(cfg: DictConfig) -> None:
             del exc
             optimizer.zero_grad(set_to_none=True)
             timer.drop_events()
-            del raw_batch, batch, shape_batch, out, Sigma, parts, loss, aux_mae, grad_norm
+            del raw_batch, batch, shape_batch, out, Sigma, parts, loss, grad_norm
             # gc.collect() breaks the failed graph's reference cycles so empty_cache() can free its memory.
             gc.collect()
             torch.cuda.empty_cache()
@@ -565,7 +550,6 @@ def main(cfg: DictConfig) -> None:
                 Sigma=Sigma,
                 parts=parts,
                 loss=loss,
-                aux_mae=aux_mae,
                 grad_norm=grad_norm,
                 test_mask=batch["test_mask"],
                 loss_ema=loss_ema,
@@ -574,12 +558,11 @@ def main(cfg: DictConfig) -> None:
                 step_flops=step_flops,
                 gpu_peak_flops=gpu_peak_flops,
                 batch_size=int(t.batch_size),
-                aux_mae_weight=aux_mae_weight,
                 device=device,
             )
 
         # Release this step's graph before validation and checkpointing.
-        out = Sigma = parts = loss = aux_mae = grad_norm = batch = None
+        out = Sigma = parts = loss = grad_norm = batch = None
         profiler.after_step(step)
 
         if step % t.val_every == 0 and step > 0:

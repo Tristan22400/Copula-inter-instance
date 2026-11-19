@@ -137,7 +137,6 @@ def test_finetune_era5_preset_requires_a_checkpoint() -> None:
     cfg = _compose_train(["experiment=finetune_era5"])
     assert cfg.training.live_source == "era5" and cfg.training.live_generation
     assert cfg.training.resume_required and cfg.training.resume_ckpt is None
-    assert cfg.training.aux_mae_weight == 0.0
     assert not _compose_train([]).training.resume_required
     with pytest.raises(ValueError, match="training.resume_ckpt is required"):
         prepare_training_inputs(cfg)
