@@ -18,6 +18,7 @@ from copula_inter.data.gp_episodes import (
     _sample_call_shape,
     _sample_episode_priors,
     _sample_features,
+    generate_fixed_gp_batch,
     generate_gp_batch,
     sigma_to_correlation,
 )
@@ -224,6 +225,15 @@ def test_tree_and_mixed_scm_episodes() -> None:
     for ep in episodes:
         validate_episode(ep)
         assert int(ep["scm_prior_type"]) in (0, 1)
+
+
+def test_fixed_sets_synthesize_scm_episodes_in_float64() -> None:
+    """Validation probes synthesize under a float64 default dtype; the SCM tables must still draw."""
+    episodes = generate_fixed_gp_batch(_cfg(**LAMBDA_HALF), 3, return_kernel_metadata=True)
+    assert len(episodes) == 3 and torch.get_default_dtype() == torch.float32
+    for ep in episodes:
+        validate_episode(ep)
+        assert ep["y_train"].dtype == torch.float32
 
 
 def test_scm_tables_have_the_requested_shape() -> None:

@@ -261,20 +261,27 @@ def sample_scm_tables(B: int, T: int, d: int, prior_type: str, *, device: Device
     if prior_type not in SCM_PRIOR_TYPES:
         raise ValueError(f"prior_type={prior_type!r}; expected one of {SCM_PRIOR_TYPES}")
     types_per_ep = _resolve_prior_types(prior_type, B)
-    X = torch.zeros(B, T, d)
-    g = torch.zeros(B, T)
+    X = torch.zeros(B, T, d, dtype=torch.float32)
+    g = torch.zeros(B, T, dtype=torch.float32)
     valid = torch.zeros(B, dtype=torch.bool)
-    for b, kind in enumerate(types_per_ep):
-        for _ in range(_MAX_TABLE_ATTEMPTS):
-            Xb, yb, ok = _draw_table(kind, T, d)
-            if ok:
-                X[b], g[b], valid[b] = Xb, yb, True
-                break
+    # TabICL's SCMs build their layers in the default dtype but sample inputs in float32; fixed
+    # evaluation sets synthesize under a float64 default (generate_fixed_gp_batch), so pin float32.
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        for b, kind in enumerate(types_per_ep):
+            for _ in range(_MAX_TABLE_ATTEMPTS):
+                Xb, yb, ok = _draw_table(kind, T, d)
+                if ok:
+                    X[b], g[b], valid[b] = Xb, yb, True
+                    break
+    finally:
+        torch.set_default_dtype(previous_dtype)
     # Invalid episodes get finite placeholders so the batched GP algebra stays finite; they are discarded.
     if not bool(valid.all()):
         bad = ~valid
-        X[bad] = torch.randn(int(bad.sum()), T, d)
-        g[bad] = torch.randn(int(bad.sum()), T)
+        X[bad] = torch.randn(int(bad.sum()), T, d, dtype=torch.float32)
+        g[bad] = torch.randn(int(bad.sum()), T, dtype=torch.float32)
     g = (g - g.mean(1, keepdim=True)) / g.std(1, keepdim=True).clamp(min=1e-8)
     codes = torch.tensor([SCM_PRIOR_CODES[t] for t in types_per_ep], dtype=torch.long)
     return ScmDraw(X=X.to(device), g=g.to(device), valid=valid.to(device), prior_type=codes.to(device))
