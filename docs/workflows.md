@@ -248,8 +248,9 @@ python -m debug.scm_residual_sweep experiment=scm_residual
 ```
 
 `data.scm_residual.prob` mixes SCM and GP episodes per generation call, and the
-`lambda_*` keys set the residual-share mixture. The preset uses `prior_type=mlp_scm`
-because TabICL's tree SCM needs xgboost, which the environment does not install.
+`lambda_*` keys set the residual-share mixture. `prior_type` is `mix_scm` (TabICL's 0.7/0.3
+mix of MLP and tree SCMs; the tree SCM uses the `xgboost-cpu` dependency), or `mlp_scm` /
+`tree_scm` alone.
 
 ### Fine-tune on real ERA5
 

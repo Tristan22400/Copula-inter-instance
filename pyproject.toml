@@ -27,6 +27,9 @@ dependencies = [
   "psutil>=5.9,<8",
   # copula_inter.credentials reads the git-ignored .env (TabPFN key, SSH key path).
   "python-dotenv>=1.0,<2",
+  # TabICL's tree SCM (data.scm_residual.prior_type=tree_scm/mix_scm); the CPU-only wheel,
+  # since the SCM fits its trees on the CPU inside DataLoader workers.
+  "xgboost-cpu>=2.1,<4",
 ]
 
 [project.optional-dependencies]

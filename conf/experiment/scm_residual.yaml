@@ -1,18 +1,15 @@
 # @package _global_
 # SCM + GP residual prior (see conf/data/gp_tasks.yaml, scm_residual): features and a
-# mainstream regression function from TabICL's SCM prior, a lambda-weighted GP residual
-# for the dependence between rows. Trained live with a learned TabICL marginal, since the
-# analytic PIT would hand the copula the SCM mechanism.
+# mainstream regression function from TabICL's SCM prior (MLP and tree SCMs mixed, as
+# TabICL pretrains), a lambda-weighted GP residual for the dependence between rows.
+# Trained live with a learned TabICL marginal, since the analytic PIT would hand the
+# copula the SCM mechanism.
 #
 #   python -m copula_inter.train experiment=scm_residual
-#
-# prior_type is mlp_scm because TabICL's tree SCM needs xgboost, which this environment
-# does not install; set data.scm_residual.prior_type=mix_scm where xgboost is available.
 data:
   z_train_source: tabicl
   scm_residual:
     enabled: true
-    prior_type: mlp_scm
 
 training:
   live_generation: true

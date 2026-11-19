@@ -28,6 +28,7 @@ from copula_inter.data.scm_prior import (
     sample_lambda,
     sample_scm_tables,
     saved_mean_at,
+    xgboost_available,
 )
 from copula_inter.marginal.pit import (
     _kernel_fn_from_task,
@@ -211,6 +212,18 @@ def test_same_seed_same_episodes() -> None:
     seed_everything(5)
     second = sample_scm_tables(3, 20, 3, "mlp_scm", device="cpu")
     assert torch.equal(first.X, second.X) and torch.equal(first.g, second.g)
+
+
+@pytest.mark.skipif(not xgboost_available(), reason="TabICL's tree SCM needs xgboost")
+def test_tree_and_mixed_scm_episodes() -> None:
+    seed_everything(1)
+    tree = sample_scm_tables(3, 40, 4, "tree_scm", device="cpu")
+    assert tree.X.shape == (3, 40, 4) and bool((tree.prior_type == 1).all())
+    episodes = generate_gp_batch(_cfg(prior_type="mix_scm"), 8, return_kernel_metadata=True)
+    assert len(episodes) == 8
+    for ep in episodes:
+        validate_episode(ep)
+        assert int(ep["scm_prior_type"]) in (0, 1)
 
 
 def test_scm_tables_have_the_requested_shape() -> None:
