@@ -54,7 +54,7 @@ from copula_inter.data.scm_prior import (
     GP_EPISODE_PRIOR_CODE,
     MEAN_FAMILY_SCM,
     ScmResidualSettings,
-    sample_lambda,
+    sample_amplitudes,
     sample_scm_tables,
     validate_scm_settings,
 )
@@ -454,18 +454,25 @@ class _GPDraw:
     log_pdf_test: Tensor  # (B, N)
     discard: Tensor  # (B,) bool, Cholesky failures
     # SCM + GP residual prior only (None otherwise): the known mean m of the P train and N
-    # test rows (B, P + N) and the factor c = lambda / mean_i K_ii (B,) applied to the kernel,
-    # so K_all = c K + sigma_n^2 I.
+    # test rows (B, P + N), the factor c (B,) applied to the kernel, so K_all = c K + sigma_n^2 I,
+    # and the kernel's unscaled mean prior variance mean_i K_ii over the T rows (B,).
     mean_all: Optional[Tensor] = None
     kernel_scale: Optional[Tensor] = None
+    kernel_diag_mean: Optional[Tensor] = None
 
 
 @dataclass
 class _ResidualMean:
-    """A known per-row mean and residual share replacing the mean function (SCM + GP residual prior)."""
+    """A known per-row mean and the kernel's factor, replacing the mean function (SCM + GP residual prior).
 
-    mean: Tensor  # (B, T) sqrt(1 - lambda) * g~
-    lam: Tensor  # (B,) residual share lambda
+    K_all = kernel_factor * K / mean_i K_ii + sigma_n^2 I when normalize_kernel (coupled amplitudes,
+    kernel_factor = lambda), else kernel_factor * K + sigma_n^2 I (decoupled: the kernel keeps its
+    own output scale).
+    """
+
+    mean: Tensor  # (B, T) a_g * g~
+    kernel_factor: Tensor  # (B,)
+    normalize_kernel: bool
 
 
 def _draw_gp(
@@ -479,8 +486,8 @@ def _draw_gp(
     """Sample y jointly from each episode's GP; None when kernel evaluation fails for the whole batch.
 
     With residual the mean is residual.mean instead of priors.mean_module(x_kernel), and the
-    kernel is normalized to unit mean prior variance over the T rows and scaled by lambda:
-    K_all = lambda * K / mean_i K_ii + sigma_n^2 I. Every oracle formula below then holds with
+    kernel is scaled by residual.kernel_factor, after normalizing it to unit mean prior variance
+    over the T rows when residual.normalize_kernel. Every oracle formula below then holds with
     the known mean vector in place of the mean function.
     """
     B, P, N, T = shape.B, shape.P, shape.N, shape.T
@@ -502,10 +509,13 @@ def _draw_gp(
             )
             return None
     kernel_scale: Optional[Tensor] = None
+    diag_mean: Optional[Tensor] = None
     if residual is not None:
-        # K~ = K / mean_i K_ii: the kernel's own output scale is neutralized, lambda sets the variance split.
         diag_mean = K_full_dense.diagonal(dim1=1, dim2=2).mean(-1).clamp(min=1e-12)  # (B,)
-        kernel_scale = residual.lam.to(K_full_dense.dtype) / diag_mean
+        kernel_scale = residual.kernel_factor.to(K_full_dense.dtype)
+        if residual.normalize_kernel:
+            # K~ = K / mean_i K_ii: the kernel's own output scale is neutralized, lambda sets the split.
+            kernel_scale = kernel_scale / diag_mean
         K_full_dense = K_full_dense * kernel_scale.reshape(B, 1, 1)
     nugget_eye = torch.eye(T, device=device, dtype=K_full_dense.dtype).expand(B, T, T)
     K_all_raw = K_full_dense + likelihood.noise.reshape(B, 1, 1) * nugget_eye
@@ -608,6 +618,7 @@ def _draw_gp(
         discard=failed_all | failed_ff,
         mean_all=None if residual is None else torch.cat([mean_train, mean_test], dim=1),
         kernel_scale=kernel_scale,
+        kernel_diag_mean=diag_mean,
     )
 
 
@@ -794,6 +805,19 @@ _MEAN_KEYS = (
 )
 
 
+def residual_share(residual: _ResidualMean, draw: _GPDraw) -> Tensor:
+    """(B,) effective residual share lambda = c mean_i K_ii / (a_g^2 + c mean_i K_ii).
+
+    The SCM mean a_g g~ has variance a_g^2 over the T rows and the residual c K has mean prior
+    variance c mean_i K_ii, so this is the GP residual's share of the signal variance: lambda
+    itself under coupled amplitudes, the induced share under decoupled ones.
+    """
+    assert draw.kernel_scale is not None and draw.kernel_diag_mean is not None
+    resid_var = draw.kernel_scale * draw.kernel_diag_mean
+    mean_var = residual.mean.pow(2).sum(1) / max(residual.mean.shape[1] - 1, 1)  # a_g^2 (g~ has unit std)
+    return resid_var / (mean_var.to(resid_var.dtype) + resid_var).clamp(min=1e-12)
+
+
 def _scm_metadata(
     shape: _CallShape,
     priors: _EpisodePriors,
@@ -804,7 +828,7 @@ def _scm_metadata(
     """The SCM + GP residual fields, saved for every episode of an SCM-enabled run.
 
     An SCM episode carries mean_family=MEAN_FAMILY_SCM, its residual share lambda_resid, the
-    kernel factor kernel_scale = lambda / mean_i K_ii and the mean vectors mean_train (P,) and
+    kernel factor kernel_scale (lambda / mean_i K_ii coupled, 1 decoupled) and the mean vectors mean_train (P,) and
     mean_test (N,), from which pit._kernel_fn_from_task and pit._mean_train_from_task rebuild
     the conditional oracle without the mean bank. A GP-prior episode of the same run keeps its
     mean-bank fields and gets lambda_resid=-1, scm_prior_type=-1, kernel_scale=1 and its mean
@@ -823,7 +847,7 @@ def _scm_metadata(
         }
     assert draw.mean_all is not None and draw.kernel_scale is not None and scm_prior_type is not None
     return {
-        "lambda_resid": residual.lam.float().cpu(),
+        "lambda_resid": residual_share(residual, draw).float().cpu(),
         "scm_prior_type": scm_prior_type.cpu(),
         "kernel_scale": draw.kernel_scale.float().cpu(),
         "mean_train": draw.mean_all[:, :P].float().cpu(),
@@ -939,9 +963,13 @@ def _generate_gp_batch_raw(
                 x_base=tables.X.to(torch.get_default_dtype()),
                 apply_warps=scm.apply_feature_warps,
             )
-            lam = sample_lambda(scm, shape.B, device)
+            amps = sample_amplitudes(scm, shape.B, device)
             g_tilde = tables.g.to(torch.get_default_dtype())
-            residual = _ResidualMean(mean=(1.0 - lam).clamp(min=0.0).sqrt().unsqueeze(-1) * g_tilde, lam=lam)
+            residual = _ResidualMean(
+                mean=amps.mean_amp2.to(g_tilde.dtype).clamp(min=0.0).sqrt().unsqueeze(-1) * g_tilde,
+                kernel_factor=amps.kernel_factor,
+                normalize_kernel=amps.normalize_kernel,
+            )
             scm_prior_type = tables.prior_type
         else:
             feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)

@@ -59,7 +59,7 @@ def _cfg(seed: int = 7, P: int = 12, N: int = 6, d: int = 4, **scm: Any) -> Dict
         "systematic_composition": False,
         "kernel": "rbf",
         "z_train_source": "tabicl",
-        "scm_residual": {"enabled": True, "prior_type": "mlp_scm", **scm},
+        "scm_residual": {"enabled": True, "prior_type": "mlp_scm", "amplitude_mode": "coupled", **scm},
     }
     return OmegaConf.create({"seed": seed, "data": OmegaConf.merge(data, overrides)})
 
@@ -90,7 +90,14 @@ def test_lambda_one_matches_the_zero_mean_gp_path_on_the_normalized_kernel() -> 
     priors = _sample_episode_priors(cfg, shape, "cpu")
     feats = _sample_features(cfg, shape, "cpu", with_gates=False)
     zero = torch.zeros(shape.B, shape.T)
-    scm = _draw_gp(cfg, shape, priors, feats, "cpu", _ResidualMean(mean=zero, lam=torch.ones(shape.B)))
+    scm = _draw_gp(
+        cfg,
+        shape,
+        priors,
+        feats,
+        "cpu",
+        _ResidualMean(mean=zero, kernel_factor=torch.ones(shape.B), normalize_kernel=True),
+    )
     assert scm is not None and scm.kernel_scale is not None
     # The existing path on K~ = K / mean_i K_ii: same correlation as K with the noise scaled by mean_i K_ii.
     noise = priors.likelihood.noise.reshape(shape.B).clone()
@@ -132,6 +139,48 @@ def test_conditional_oracle_matches_monte_carlo() -> None:
     assert (z.var(0) - 1.0).abs().max() < 0.05
     R_emp = torch.corrcoef(z.T)
     assert torch.allclose(R_emp, post["R_post"].double(), atol=0.03)
+
+
+DECOUPLED: dict[str, Any] = {"amplitude_mode": "decoupled", "lambda_p0": 0.0, "lambda_p1": 0.0}
+
+
+def test_decoupled_share_is_induced_by_the_two_amplitudes() -> None:
+    episodes = generate_gp_batch(_cfg(**DECOUPLED), 16, return_kernel_metadata=True)
+    shares = []
+    for ep in episodes:
+        validate_episode(ep)
+        # The kernel keeps its own output scale; lambda = mean_i K_ii / (a_g^2 + mean_i K_ii).
+        assert float(ep["kernel_scale"]) == 1.0
+        k_raw, _ = _unscaled_kernel_fn_from_task(ep)
+        x = torch.cat(kernel_space_inputs(ep))
+        k_bar = float(k_raw(x, x).diagonal().mean())
+        a_g2 = float(torch.cat([ep["mean_train"], ep["mean_test"]]).var())
+        assert abs(float(ep["lambda_resid"]) - k_bar / (a_g2 + k_bar)) < 1e-3
+        shares.append(float(ep["lambda_resid"]))
+    # a_g^2 ~ LogNormal(0, 1.5^2) spreads the share over (0, 1).
+    assert min(shares) < 0.3 and max(shares) > 0.7
+
+
+def test_decoupled_endpoints() -> None:
+    iid = generate_gp_batch(_cfg(amplitude_mode="decoupled", **LAMBDA_ZERO), 4, return_kernel_metadata=True)
+    for ep in iid:
+        assert float(ep["lambda_resid"]) == 0.0 and float(ep["kernel_scale"]) == 0.0
+        assert torch.allclose(ep["R_star"], torch.eye(int(ep["n_test"])), atol=1e-5)
+    # lambda = 1 is the zero-mean GP prior with the kernel's own amplitude: R* = corr(K_QQ + sigma_n^2 I).
+    gp = generate_gp_batch(_cfg(amplitude_mode="decoupled", **LAMBDA_ONE), 4, return_kernel_metadata=True)
+    for ep in gp:
+        assert float(ep["lambda_resid"]) == 1.0 and not bool(ep["mean_test"].any())
+        k_raw, nugget = _unscaled_kernel_fn_from_task(ep)
+        _, x_te = kernel_space_inputs(ep)
+        R_ref, _ = sigma_to_correlation(k_raw(x_te, x_te) + nugget * torch.eye(x_te.shape[0]))
+        assert torch.allclose(ep["R_star"], R_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["coupled", "decoupled"])
+def test_analytic_pit_matches_the_generator_in_both_modes(mode: str) -> None:
+    amps = LAMBDA_HALF if mode == "coupled" else DECOUPLED
+    for ep in generate_gp_batch(_cfg(**amps), 3, return_kernel_metadata=True):
+        assert torch.allclose(gp_analytical_pit(ep)["z_test"], ep["z_test"], atol=1e-3)
 
 
 def test_saved_mean_drives_the_analytic_pit() -> None:

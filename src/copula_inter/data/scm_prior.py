@@ -34,6 +34,7 @@ from torch import Tensor
 from copula_inter.type_aliases import Device, HasDataConfig
 
 SCM_PRIOR_TYPES = ("mlp_scm", "tree_scm", "mix_scm")
+AMPLITUDE_MODES = ("coupled", "decoupled")
 # scm_prior_type codes saved per episode (-1: a GP-prior episode of an SCM-enabled run).
 SCM_PRIOR_CODES = {"mlp_scm": 0, "tree_scm": 1}
 GP_EPISODE_PRIOR_CODE = -1
@@ -60,6 +61,9 @@ class ScmResidualSettings:
     lambda_beta_b: float = 2.0
     allow_analytic_pit: bool = False
     apply_feature_warps: bool = False
+    # Absent from configs written before the decoupled mode existed: they keep the coupled one.
+    amplitude_mode: str = "coupled"
+    mean_amp_lognormal_scale: float = 1.5
 
     @classmethod
     def from_cfg(cls, cfg: HasDataConfig) -> ScmResidualSettings:
@@ -82,6 +86,8 @@ class ScmResidualSettings:
             lambda_beta_b=float(get("lambda_beta_b", cls.lambda_beta_b)),
             allow_analytic_pit=bool(get("allow_analytic_pit", cls.allow_analytic_pit)),
             apply_feature_warps=bool(get("apply_feature_warps", cls.apply_feature_warps)),
+            amplitude_mode=str(get("amplitude_mode", cls.amplitude_mode)),
+            mean_amp_lognormal_scale=float(get("mean_amp_lognormal_scale", cls.mean_amp_lognormal_scale)),
         )
 
 
@@ -131,6 +137,12 @@ def validate_scm_settings(cfg: HasDataConfig, settings: ScmResidualSettings) -> 
     p0, p1 = settings.lambda_p0, settings.lambda_p1
     if p0 < 0.0 or p1 < 0.0 or p0 + p1 > 1.0:
         raise ValueError(f"data.scm_residual.lambda_p0={p0}, lambda_p1={p1}: need p0, p1 >= 0 and p0 + p1 <= 1.")
+    if settings.amplitude_mode not in AMPLITUDE_MODES:
+        raise ValueError(
+            f"data.scm_residual.amplitude_mode={settings.amplitude_mode!r}; expected one of {AMPLITUDE_MODES}."
+        )
+    if settings.mean_amp_lognormal_scale < 0.0:
+        raise ValueError("data.scm_residual.mean_amp_lognormal_scale must be non-negative.")
     if settings.lambda_beta_a <= 0.0 or settings.lambda_beta_b <= 0.0:
         raise ValueError("data.scm_residual.lambda_beta_a and lambda_beta_b must be positive.")
     source = str(getattr(cfg.data, "z_train_source", "analytic"))
@@ -159,6 +171,40 @@ def sample_lambda(settings: ScmResidualSettings, B: int, device: Device) -> Tens
     p01 = settings.lambda_p0 + settings.lambda_p1
     lam = torch.where((u >= settings.lambda_p0) & (u < p01), torch.ones_like(beta), lam)
     return lam.clamp(0.0, 1.0)
+
+
+@dataclass
+class Amplitudes:
+    """Per-episode amplitudes of y = a_g g~ + r + eps, r ~ GP(0, kernel_factor * K[~])."""
+
+    mean_amp2: Tensor  # (B,) a_g^2, the SCM mean's variance (g~ is standardized)
+    kernel_factor: Tensor  # (B,) multiplies K (decoupled) or K~ = K / mean_i K_ii (coupled)
+    normalize_kernel: bool
+
+
+def sample_amplitudes(settings: ScmResidualSettings, B: int, device: Device) -> Amplitudes:
+    """Draw the amplitudes of the SCM mean and the GP residual.
+
+    coupled:   a_g^2 = 1 - lambda and r ~ GP(0, lambda K~), lambda from sample_lambda, so the
+               signal variance is 1 and the relative noise sigma_n^2 does not depend on lambda.
+    decoupled: a_g^2 ~ LogNormal(0, mean_amp_lognormal_scale^2) and r ~ GP(0, K) with the kernel's
+               own output scale, independently; the share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii)
+               and the relative noise sigma_n^2 / (a_g^2 + mean_i K_ii) are then induced. With
+               probability lambda_p0 the residual is dropped (TabICL's prior) and with lambda_p1 the
+               mean (the zero-mean GP prior, kernel amplitude and noise included); the Beta keys are unused.
+    """
+    if settings.amplitude_mode == "coupled":
+        lam = sample_lambda(settings, B, device)
+        return Amplitudes(mean_amp2=1.0 - lam, kernel_factor=lam, normalize_kernel=True)
+    u = torch.rand(B, device=device)
+    mean_amp2 = torch.exp(settings.mean_amp_lognormal_scale * torch.randn(B, device=device))
+    iid = u < settings.lambda_p0
+    gp_only = (u >= settings.lambda_p0) & (u < settings.lambda_p0 + settings.lambda_p1)
+    mean_amp2 = torch.where(
+        iid, torch.ones_like(mean_amp2), torch.where(gp_only, torch.zeros_like(mean_amp2), mean_amp2)
+    )
+    kernel_factor = torch.where(iid, torch.zeros_like(mean_amp2), torch.ones_like(mean_amp2))
+    return Amplitudes(mean_amp2=mean_amp2, kernel_factor=kernel_factor, normalize_kernel=False)
 
 
 def xgboost_available() -> bool:

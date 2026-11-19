@@ -59,7 +59,8 @@ kernel rather than stored.
 `(1 - lambda)` from the SCM mechanism and `lambda` from the GP residual, plus the nugget
 `sigma_n^2`. lambda = 0 gives TabICL's prior (rows i.i.d. given the SCM, `R_star = I`),
 lambda = 1 the zero-mean GP prior. Drawn from
-`p0 delta_0 + p1 delta_1 + (1 - p0 - p1) Beta(a, b)` (`data.scm_residual.lambda_*`) and saved
+`p0 delta_0 + p1 delta_1 + (1 - p0 - p1) Beta(a, b)` under coupled amplitudes, induced by the two
+amplitude priors under decoupled ones (`data.scm_residual.*`), and saved
 as `lambda_resid` (-1 on GP episodes of an SCM-enabled run).
 
 **Rank (`model.rank`).** The rank r of the low-rank factor W in
@@ -80,6 +81,10 @@ includes the cost of not knowing g, and the analytic PIT is not a valid training
 (`z_train_source=analytic` is refused unless `allow_analytic_pit=true`). Episodes save
 `mean_train`, `mean_test` and `kernel_scale = lambda / mean_i K_ii` (`mean_family = 3`),
 from which `pit._kernel_fn_from_task` and `pit._mean_train_from_task` rebuild this oracle.
+`data.scm_residual.amplitude_mode=decoupled` (the default) draws the two amplitudes
+independently instead, `y = a_g g~ + r + eps` with `a_g^2 ~ LogNormal(0, s^2)` and
+`r ~ GP(0, K)` at the kernel's own output scale, so lambda and the relative noise
+`sigma_n^2 / (a_g^2 + mean_i K_ii)` are induced; `kernel_scale` is then 1.
 
 **Tier.** How much of the marginal model Phase A trains. Tier 0 covers the label
 path, ICL norms and decoder; higher tiers add LoRA on more attention stages. The

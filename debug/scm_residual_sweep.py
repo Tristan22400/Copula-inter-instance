@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 import sys
 import time
+from typing import Any
 
 import torch
 from omegaconf import DictConfig
@@ -51,9 +52,9 @@ def _lambda_overrides(lam: float) -> dict[str, float]:
     }
 
 
-def _sweep_row(cfg: DictConfig, base_seed: int) -> dict[str, float]:
+def _sweep_row(cfg: DictConfig, base_seed: int) -> dict[str, Any]:
     """Generate EPISODES episodes (in CALL_SIZE calls) and summarize their R*."""
-    infos, offdiags = [], []
+    infos, offdiags, shares = [], [], []
     requested = returned = 0
     elapsed = 0.0
     call = 0
@@ -69,9 +70,13 @@ def _sweep_row(cfg: DictConfig, base_seed: int) -> dict[str, float]:
             R = gp_analytical_posterior(ep)["R_post"].double()
             N = R.shape[0]
             infos.append(-0.5 * float(torch.linalg.slogdet(R).logabsdet))
+            if "lambda_resid" in ep:
+                shares.append(float(ep["lambda_resid"]))
             offdiags.append(float((R - torch.eye(N, dtype=R.dtype)).abs().sum()) / max(N * (N - 1), 1))
     n = max(len(infos), 1)
+    q = torch.tensor(shares).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist() if shares else [math.nan] * 3
     return {
+        "lam_q": q,
         "I": sum(infos) / n,
         "offdiag": sum(offdiags) / n,
         "discard": 1.0 - returned / max(requested, 1),
@@ -82,7 +87,7 @@ def _sweep_row(cfg: DictConfig, base_seed: int) -> dict[str, float]:
 def main() -> None:
     cfg = compose_config(config_dir(__file__), "config", sys.argv[1:])
     base_seed = int(cfg.seed)
-    rows: list[tuple[str, dict[str, float]]] = []
+    rows: list[tuple[str, dict[str, Any]]] = []
 
     gp_cfg = merge_configs(cfg)
     gp_cfg.data.scm_residual.enabled = False
@@ -91,20 +96,30 @@ def main() -> None:
         lam_cfg = merge_configs(cfg)
         lam_cfg.data.scm_residual.enabled = True
         lam_cfg.data.scm_residual.prob = 1.0
+        lam_cfg.data.scm_residual.amplitude_mode = "coupled"  # lambda pinned by the coupled mixture
         for key, value in _lambda_overrides(lam).items():
             lam_cfg.data.scm_residual[key] = value
         rows.append((f"SCM lambda={lam:g}", _sweep_row(lam_cfg, base_seed)))
+    for mode in ("coupled", "decoupled"):
+        prior_cfg = merge_configs(cfg)
+        prior_cfg.data.scm_residual.enabled = True
+        prior_cfg.data.scm_residual.prob = 1.0
+        prior_cfg.data.scm_residual.amplitude_mode = mode
+        rows.append((f"SCM {mode} prior", _sweep_row(prior_cfg, base_seed)))
 
     P, N = int(cfg.data.P_max), int(cfg.data.N_max)
     print(
         f"\nP={P}, N={N}, prior_type={cfg.data.scm_residual.prior_type}, "
         f"{EPISODES} episodes per row, seed={base_seed}, torch threads={torch.get_num_threads()}\n"
     )
-    print("| prior | I = -1/2 log det R* (nats) | mean abs offdiag R* | discarded | episodes/s |")
-    print("|---|---:|---:|---:|---:|")
+    print(
+        "| prior | lambda p10 / p50 / p90 | I = -1/2 log det R* (nats) | mean abs offdiag R* | discarded | episodes/s |"
+    )
+    print("|---|---|---:|---:|---:|---:|")
     for name, r in rows:
         info = "nan" if math.isnan(r["I"]) else f"{r['I']:.2f}"
-        print(f"| {name} | {info} | {r['offdiag']:.4f} | {100 * r['discard']:.1f}% | {r['eps_per_s']:.1f} |")
+        shares = "-" if math.isnan(r["lam_q"][0]) else " / ".join(f"{v:.2f}" for v in r["lam_q"])
+        print(f"| {name} | {shares} | {info} | {r['offdiag']:.4f} | {100 * r['discard']:.1f}% | {r['eps_per_s']:.1f} |")
 
 
 if __name__ == "__main__":
