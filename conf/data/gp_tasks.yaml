@@ -5,8 +5,8 @@
 d_features: 10          # total feature columns; fallback used only when
                         # d_features_lognormal_loc/scale below are unset.
 
-# GP-prior episodes only: SCM + GP residual episodes take d from TabICLv2's prior
-# (round(Uniform(1, 100)), scm_prior.sample_v2_num_features).
+# GP-prior episodes only (and SCM episodes with scm_residual.prior_shapes=false): SCM + GP
+# residual episodes take d, P and N from TabICLv2's prior (scm_residual.prior_shapes).
 # Total feature count d ~ round(LogNormal(d_features_lognormal_loc,
 # d_features_lognormal_scale)), clipped to a minimum of 2, sampled once per
 # shard (every episode within one shard shares the same d — see
@@ -588,15 +588,16 @@ z_train_corruption_prob: 1.0
 z_train_corruption_rho_beta_a: 3.5
 z_train_corruption_rho_beta_b: 1.5
 
-# SCM + GP residual prior (src/copula_inter/data/scm_prior.py). An episode's features
-# and mean come from a TabICL SCM table (X, g); a GP residual on the observed features
-# adds dependence between rows:
-#   y = sqrt(1 - lambda) g~(x) + sqrt(lambda) r~(x) + eps,   r~ ~ GP(0, K / mean_i K_ii),
-# g~ the SCM target standardized over the episode, eps ~ N(0, sigma_n^2) the nugget prior
-# above, and lambda ~ p0 delta_0 + p1 delta_1 + (1 - p0 - p1) Beta(a, b) per episode.
-# lambda = 0 is TabICL's i.i.d. prior, lambda = 1 the zero-mean GP prior. The analytic
-# oracle is conditional on g (which no model sees), so data.z_train_source must be a
-# learned marginal. Off by default; conf/experiment/scm_residual.yaml enables it.
+# SCM + GP residual prior (src/copula_inter/data/scm_prior.py). Everything about the table
+# comes from TabICLv2's regressor prior: the graph SCM's features X and target g (no feature
+# warps of ours), and the shape d, P, N (prior_shapes). This file contributes only the GP
+# residual: kernel choice and composition, its hyperparameter priors, active dims, hidden
+# kernel warp and the nugget:
+#   y = a_g g~(x) + r(x) + eps,   r ~ GP(0, K),   eps ~ N(0, sigma_n^2),
+# g~ the SCM target standardized over the episode. lambda = 0 is TabICLv2's i.i.d. prior,
+# lambda = 1 the zero-mean GP prior. The analytic oracle is conditional on g (which no model
+# sees), so data.z_train_source must be a learned marginal. Off by default;
+# conf/experiment/scm_residual.yaml enables it.
 scm_residual:
   enabled: false
   prob: 1.0                  # per-call probability of an SCM episode (else a GP episode)
@@ -604,11 +605,13 @@ scm_residual:
   lambda_p0: 0.2             # probability of an i.i.d. TabICLv2 episode (no residual, a_g = 1)
   lambda_p1: 0.2             # probability of a zero-mean GP episode (a_g = 0)
   allow_analytic_pit: false  # diagnostics only: analytic z uses g and leaks it
-  apply_feature_warps: false # also run the TabICLv2 / structural / MLP warps on the SCM features
   # y = a_g g~ + GP(0, K) + eps with a_g^2 ~ LogNormal(loc, scale^2) and the kernel's own
   # amplitude (alpha2 prior), independently; the share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii)
   # and the relative noise are induced. (The coupled amplitude mode was removed.)
   amplitude_mode: decoupled
+  # Episode shape from TabICLv2's regressor prior: d = round(Uniform(1, 100)), 1024 rows,
+  # P = int(1024 Uniform(0.3, 0.9)), N = 1024 - P. false: d_features* and P_*/N_* above.
+  prior_shapes: true
   mean_amp_lognormal_loc: 0.0
   mean_amp_lognormal_scale: 1.5
 

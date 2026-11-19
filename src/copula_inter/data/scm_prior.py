@@ -61,6 +61,12 @@ _MAX_TABLE_ATTEMPTS = 8
 # log_n_features=False): d = round(Uniform(1, 100)), shared by a group of datasets (here, a call).
 V2_MIN_FEATURES = 1
 V2_MAX_FEATURES = 100
+# Rows and train split of TabICLv2's regressor stage 1 (500K of its 550K pretraining steps):
+# --max_seq_len 1024 (no min: fixed), --min_train_size 0.3 --max_train_size 0.9, so
+# P = int(1024 * Uniform(0.3, 0.9)) context rows and N = 1024 - P query rows.
+V2_SEQ_LEN = 1024
+V2_TRAIN_FRAC_MIN = 0.3
+V2_TRAIN_FRAC_MAX = 0.9
 V2_REGRESSOR_PRIOR_CONFIG: dict[str, Any] = {
     "add_gaussian_noise": False,  # --graph_noise False
     "filter_unpredictable_graphs": True,
@@ -82,8 +88,10 @@ class ScmResidualSettings:
     lambda_p0: float = 0.2
     lambda_p1: float = 0.2
     allow_analytic_pit: bool = False
-    apply_feature_warps: bool = False
     amplitude_mode: str = "decoupled"
+    # Draw the episode shape (d, P, N) from TabICLv2's prior; false keeps data.d_features* and
+    # data.P_*/N_* (small shapes for tests and diagnostics).
+    prior_shapes: bool = True
     mean_amp_lognormal_loc: float = 0.0
     mean_amp_lognormal_scale: float = 1.5
 
@@ -105,8 +113,8 @@ class ScmResidualSettings:
             lambda_p0=float(get("lambda_p0", cls.lambda_p0)),
             lambda_p1=float(get("lambda_p1", cls.lambda_p1)),
             allow_analytic_pit=bool(get("allow_analytic_pit", cls.allow_analytic_pit)),
-            apply_feature_warps=bool(get("apply_feature_warps", cls.apply_feature_warps)),
             amplitude_mode=str(get("amplitude_mode", cls.amplitude_mode)),
+            prior_shapes=bool(get("prior_shapes", cls.prior_shapes)),
             mean_amp_lognormal_loc=float(get("mean_amp_lognormal_loc", cls.mean_amp_lognormal_loc)),
             mean_amp_lognormal_scale=float(get("mean_amp_lognormal_scale", cls.mean_amp_lognormal_scale)),
         )
@@ -208,6 +216,12 @@ def sample_amplitudes(settings: ScmResidualSettings, B: int, device: Device) -> 
 def sample_v2_num_features() -> int:
     """A call's feature count d ~ round(Uniform(1, 100)), as GraphPrior.get_batch draws it."""
     return int(round(np.random.uniform(V2_MIN_FEATURES, V2_MAX_FEATURES)))
+
+
+def sample_v2_train_test_sizes() -> tuple[int, int]:
+    """A call's (P, N): P = int(1024 u), u ~ Uniform(0.3, 0.9), N = 1024 - P (Prior.sample_train_size)."""
+    P = int(V2_SEQ_LEN * np.random.uniform(V2_TRAIN_FRAC_MIN, V2_TRAIN_FRAC_MAX))
+    return P, V2_SEQ_LEN - P
 
 
 @lru_cache(maxsize=None)

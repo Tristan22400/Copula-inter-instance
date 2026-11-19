@@ -57,6 +57,7 @@ from copula_inter.data.scm_prior import (
     sample_amplitudes,
     sample_scm_tables,
     sample_v2_num_features,
+    sample_v2_train_test_sizes,
     validate_scm_settings,
 )
 from copula_inter.data.structural_warps import apply_structural_feature_warp
@@ -300,8 +301,12 @@ def _sample_call_shape(
     d_override: Optional[int],
     kernel_weights: Optional[Tensor],
     tabicl_split_calib_frac: float,
+    pn_override: Optional[tuple[int, int]] = None,
 ) -> _CallShape:
-    """Draw the call-shared kernel, feature count, (P, N) and active dims; cap B to fit memory."""
+    """Draw the call-shared kernel, feature count, (P, N) and active dims; cap B to fit memory.
+
+    pn_override fixes (P, N) (SCM episodes take them from TabICLv2's prior) without drawing them.
+    """
     # d_override pins d across generate_gp_batch's top-up calls.
     d = d_override if d_override is not None else _sample_d_features(cfg)
 
@@ -313,8 +318,11 @@ def _sample_call_shape(
         chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg, kernel_weights=kernel_weights)
     else:
         kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
-    P = random.randint(cfg.data.P_min, cfg.data.P_max)
-    N = random.randint(cfg.data.N_min, cfg.data.N_max)
+    if pn_override is not None:
+        P, N = pn_override
+    else:
+        P = random.randint(cfg.data.P_min, cfg.data.P_max)
+        N = random.randint(cfg.data.N_min, cfg.data.N_max)
     # Calibration-only points for tabicl_split_calib_frac > 0, placed after train and
     # test so the train/test sample does not depend on them.
     P_C = max(1, round(tabicl_split_calib_frac * P)) if tabicl_split_calib_frac > 0 else 0
@@ -940,14 +948,19 @@ def _generate_gp_batch_raw(
         validate_scm_settings(cfg, scm)
     # Drawn only when enabled, so the disabled prior's random stream is unchanged.
     use_scm = scm.enabled and random.random() < scm.prob
-    if use_scm and d_override is None:
-        # The table's shape comes from TabICLv2's prior, not from data.d_features*.
-        d_override = sample_v2_num_features()
+    pn_override: Optional[tuple[int, int]] = None
+    if use_scm and scm.prior_shapes:
+        # The table's shape comes from TabICLv2's prior, not from data.d_features* / P_* / N_*.
+        if d_override is None:
+            d_override = sample_v2_num_features()
+        pn_override = sample_v2_train_test_sizes()
 
     residual: Optional[_ResidualMean] = None
     scm_prior_type: Optional[Tensor] = None
     with _default_dtype(synthesis_dtype):
-        shape = _sample_call_shape(cfg, B, device, d_override, kernel_weights, tabicl_split_calib_frac)
+        shape = _sample_call_shape(
+            cfg, B, device, d_override, kernel_weights, tabicl_split_calib_frac, pn_override=pn_override
+        )
         priors = _sample_episode_priors(cfg, shape, device)
         if use_scm:
             # SCM table -> the same per-episode z-score and hidden kernel warp as the GP features.
@@ -958,7 +971,7 @@ def _generate_gp_batch_raw(
                 device,
                 with_gates=return_kernel_metadata,
                 x_base=tables.X.to(torch.get_default_dtype()),
-                apply_warps=scm.apply_feature_warps,
+                apply_warps=False,  # features are TabICLv2's; only the GP residual is ours
             )
             amps = sample_amplitudes(scm, shape.B, device)
             g_tilde = tables.g.to(torch.get_default_dtype())

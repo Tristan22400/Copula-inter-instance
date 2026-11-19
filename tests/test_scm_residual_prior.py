@@ -59,7 +59,7 @@ def _cfg(seed: int = 7, P: int = 12, N: int = 6, d: int = 4, **scm: Any) -> Dict
         "systematic_composition": False,
         "kernel": "rbf",
         "z_train_source": "tabicl",
-        "scm_residual": {"enabled": True, "prior_type": "graph_scm", **scm},
+        "scm_residual": {"enabled": True, "prior_type": "graph_scm", "prior_shapes": False, **scm},
     }
     return OmegaConf.create({"seed": seed, "data": OmegaConf.merge(data, overrides)})
 
@@ -212,10 +212,7 @@ def test_episodes_satisfy_the_contracts_and_align_rows() -> None:
     assert len(episodes) == 12
     for ep in episodes:
         validate_episode(ep)
-        # The feature count comes from TabICLv2's prior (one per call), not from data.d_features.
-        d_ep = ep["x_norm_train"].shape[1]
-        assert d_ep == episodes[0]["x_norm_train"].shape[1] and 1 <= d_ep <= 100
-        assert ep["x_norm_test"].shape == (N, d_ep) and ep["x_norm_train"].shape[0] == P
+        assert ep["x_norm_train"].shape == (P, d) and ep["x_norm_test"].shape == (N, d)
         assert ep["mean_train"].shape == (P,) and ep["mean_test"].shape == (N,)
         noise_sd = float(ep["nugget"]) ** 0.5
         assert float((ep["y_train"] - ep["mean_train"]).abs().max()) < 6 * noise_sd
@@ -301,10 +298,16 @@ def test_amplitude_mixture_weights_and_location() -> None:
     assert abs(float(inner.log().median()) + 1.0) < 0.05  # LogNormal(-1, 1.5^2)
 
 
-def test_scm_feature_count_follows_the_tabiclv2_prior() -> None:
-    """d ~ round(Uniform(1, 100)) per call, whatever data.d_features says."""
-    ds = {generate_gp_batch(_cfg(seed=s, d=4), 1)[0]["x_norm_train"].shape[1] for s in range(12)}
-    assert len(ds) > 3 and all(1 <= d <= 100 for d in ds) and max(ds) > 20
+def test_scm_shapes_follow_the_tabiclv2_prior() -> None:
+    """prior_shapes: d ~ round(Uniform(1, 100)), P = int(1024 Uniform(0.3, 0.9)), N = 1024 - P per call."""
+    shapes = []
+    for seed in range(6):
+        ep = generate_gp_batch(_cfg(seed=seed, d=4, prior_shapes=True), 1)[0]
+        P, d = ep["x_norm_train"].shape
+        N = ep["x_norm_test"].shape[0]
+        assert P + N == 1024 and 307 <= P <= 921 and 1 <= d <= 100
+        shapes.append((P, d))
+    assert len({d for _, d in shapes}) > 2 and len({P for P, _ in shapes}) > 2
 
 
 def test_the_removed_coupled_mode_is_refused() -> None:
