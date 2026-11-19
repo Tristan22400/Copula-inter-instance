@@ -45,6 +45,10 @@ DEFAULT_WORKERS=$(( $(nproc) / 2 ))
 [ "$DEFAULT_WORKERS" -lt 1 ] && DEFAULT_WORKERS=1
 [ "$DEFAULT_WORKERS" -gt 6 ] && DEFAULT_WORKERS=6
 GEN_WORKERS="${GEN_WORKERS:-$DEFAULT_WORKERS}"
+# Several jobs can share one dataset: each runs worker ids GEN_WORKER_OFFSET .. +GEN_WORKERS-1
+# out of GEN_TOTAL_WORKERS, so their shard ranges are disjoint (defaults: this job alone).
+GEN_WORKER_OFFSET="${GEN_WORKER_OFFSET:-0}"
+GEN_TOTAL_WORKERS="${GEN_TOTAL_WORKERS:-$GEN_WORKERS}"
 JOB_TAG="${OAR_JOB_ID:-$$}"
 MAX_WORKER_RETRIES=5
 
@@ -75,10 +79,10 @@ run_worker() {
     local attempt=0
     while true; do
         if [ "$attempt" -eq 0 ]; then
-            python -m copula_inter.generate_pit_dataset "$@" worker_id="$worker_id" num_workers="$GEN_WORKERS" \
+            python -m copula_inter.generate_pit_dataset "$@" worker_id="$worker_id" num_workers="$GEN_TOTAL_WORKERS" \
                 >> "$out" 2>> "$err" && return 0
         else
-            python -m copula_inter.generate_pit_dataset "$@" worker_id="$worker_id" num_workers="$GEN_WORKERS" data.resume=true \
+            python -m copula_inter.generate_pit_dataset "$@" worker_id="$worker_id" num_workers="$GEN_TOTAL_WORKERS" data.resume=true \
                 >> "$out" 2>> "$err" && return 0
         fi
         attempt=$((attempt + 1))
@@ -92,7 +96,7 @@ run_worker() {
 }
 
 pids=()
-for w in $(seq 0 $((GEN_WORKERS - 1))); do
+for w in $(seq "$GEN_WORKER_OFFSET" $((GEN_WORKER_OFFSET + GEN_WORKERS - 1))); do
     run_worker "$w" "$@" &
     pids+=("$!")
     # Stagger startup: concurrent CUDA context creation across freshly
