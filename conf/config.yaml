@@ -87,6 +87,9 @@ training:
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
   val_episodes: 500
+  # On-disk held-out set for validation, shared across runs (null: carve val_episodes out of
+  # dataset_dir). Its episodes must not be in dataset_dir (generate it with another seed).
+  val_dataset_dir: null
   # Override for the on-disk dataset DataLoader worker count (train.py's
   # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
   # variable-d) — set explicitly to tune, e.g. now that dataset.py loads

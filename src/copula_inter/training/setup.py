@@ -712,13 +712,20 @@ def build_data_loaders(
             # Cache a full shard block (+4 for workers straddling blocks).
             full_dataset = CopulaDataset(episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4)
             n = len(full_dataset)
-            n_val = min(int(t.get("val_episodes", 500)), n)
+            # training.val_dataset_dir: a separate held-out set shared by runs (every training
+            # episode is then used); else val is carved out of dataset_dir.
+            val_dir = t.get("val_dataset_dir", None)
+            val_full = CopulaDataset(episode_dir=str(val_dir), shard_cache_size=4) if val_dir else full_dataset
+            n_v = len(val_full)
+            n_val = min(int(t.get("val_episodes", 500)), n_v)
             # Stride validation indices across the dataset so val spans many shards.
-            val_indices = sorted(set(int(i) for i in torch.linspace(0, n - 1, n_val)))
-            val_set = set(val_indices)
+            val_indices = sorted(set(int(i) for i in torch.linspace(0, n_v - 1, n_val)))
+            val_set = set(val_indices) if not val_dir else set()
             train_indices = [i for i in range(n) if i not in val_set]
             train_dataset = Subset(full_dataset, train_indices)
-            val_dataset = Subset(full_dataset, val_indices)
+            val_dataset = Subset(val_full, val_indices)
+            if val_dir:
+                print(f"[train] validation on training.val_dataset_dir={val_dir} ({n_val} of {n_v} episodes).")
 
             # Detect datasets whose d_features varies per shard.
             shard_size = full_dataset.shard_size
@@ -748,7 +755,7 @@ def build_data_loaders(
                 )
                 val_batch_sampler = ShardHomogeneousBatchSampler(
                     val_dataset.indices,
-                    shard_size=shard_size,
+                    shard_size=val_full.shard_size,
                     batch_size=t.batch_size,
                     shuffle=False,
                 )
@@ -758,6 +765,11 @@ def build_data_loaders(
                     train_dataset.indices,
                     shard_size=shard_size,
                     block_shards=shard_block_shards,
+                )
+            if val_dir and val_batch_sampler is None:
+                # An external val set may vary d or (P, N) per shard: batch within one shard.
+                val_batch_sampler = ShardHomogeneousBatchSampler(
+                    val_dataset.indices, shard_size=val_full.shard_size, batch_size=t.batch_size, shuffle=False
                 )
         else:
             all_files = sorted(glob(os.path.join(t.dataset_dir, "task_*.pt")))
