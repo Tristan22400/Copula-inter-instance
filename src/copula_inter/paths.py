@@ -36,3 +36,5 @@ CALIFORNIA_DATA_DIR = REAL_DATA_DIR / "california"
 MEUSE_DATA_DIR = REAL_DATA_DIR / "meuse"
 # OpenML-CTR23 (suite 353): sklearn's data_home for fetch_openml.
 CTR23_DATA_DIR = REAL_DATA_DIR / "ctr23"
+# Neural-process benchmark tasks exported by scripts/npbench/export_eeg.py (EEG of Bruinsma et al. 2023).
+NPBENCH_DATA_DIR = REAL_DATA_DIR / "npbench"

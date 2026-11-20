@@ -15,6 +15,8 @@ from copula_inter.config_path import config_dir
 from copula_inter.training.setup import prepare_training_inputs
 from eval.runners.autoregressive_baseline_eval import AutoregressiveBaselineSpec
 from eval.runners.ctr23_full_eval import Ctr23FullEvalSpec
+from eval.runners.eeg_gp_baselines import EegGpBaselinesSpec
+from eval.runners.eeg_joint_eval import EegJointEvalSpec
 from eval.runners.era5_calibration_eval import Era5CalibrationSpec
 from eval.runners.eval_args import EvalSpec
 from eval.runners.gp_wellspecified_diag import GpDiagSpec
@@ -53,6 +55,8 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "sdwpf_audit": (SdwpfAuditSpec, []),
     "ctr23_full_eval": (Ctr23FullEvalSpec, ["data_id=44957", "out_json=o.json"]),
     "wandb_report": (WandbReportSpec, []),
+    "eeg_joint_eval": (EegJointEvalSpec, ["out_dir=o"]),
+    "eeg_gp_baselines": (EegGpBaselinesSpec, ["out_dir=o"]),
 }
 
 

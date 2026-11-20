@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/eeg_gp_baselines.py registered as eeg_gp_baselines_schema.
+defaults:
+  - eeg_gp_baselines_schema
+  - _runner
+  - _self_

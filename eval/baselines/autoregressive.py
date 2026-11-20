@@ -18,8 +18,9 @@ random permutation per episode).
 from __future__ import annotations
 
 import zlib
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
+import numpy as np
 import torch
 
 from copula_inter.marginal.pit import tabicl_forward
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "autoregressive_log_pdf",
+    "backend_autoregressive_log_pdf",
     "ar_parts_from_log_pdf",
     "AR_ORDERS",
     "AR_CONDITIONINGS",
@@ -162,6 +164,72 @@ def autoregressive_log_pdf(
         "log_pdf": log_pdf_s - std.log(),
         "order": visit,
         "appended": appended * std + mean,
+    }
+
+
+@torch.no_grad()
+def backend_autoregressive_log_pdf(
+    name: str,
+    regressor: Any,
+    x_train: torch.Tensor,
+    y_train: torch.Tensor,
+    x_test: torch.Tensor,
+    y_test: torch.Tensor,
+    *,
+    order: str = "random",
+    conditioning: str = "teacher_forcing",
+    seed: int = 0,
+    episode_indices: Optional[list[int]] = None,
+) -> dict:
+    """autoregressive_log_pdf for a generic backend (tabpfn35_fast, kumo_small) through backend_pit.
+
+    The same chain, orders, target scaling and outputs as the TabICL version. These backends score
+    each query row against the context only, so each step queries just the point it reveals; the
+    first step therefore equals the one-shot PIT's log_pdf_test. Sampling ("sample") draws the
+    revealed value by inverting the backend's quantile function at a uniform draw.
+    """
+    from copula_inter.marginal.finetune_adapters import _native_levels, backend_pit, backend_quantiles
+
+    if conditioning not in AR_CONDITIONINGS:
+        raise ValueError(f"conditioning must be one of {AR_CONDITIONINGS}, got {conditioning!r}")
+    B, P, d_x = x_train.shape
+    N = x_test.shape[1]
+    mean = y_train.double().mean(dim=-1, keepdim=True).cpu()
+    std = y_train.double().std(dim=-1, keepdim=True).clamp(min=1e-8).cpu()
+    y_train_s = ((y_train.double().cpu() - mean) / std).numpy()
+    y_test_s = ((y_test.double().cpu() - mean) / std).numpy()
+    xq_all = x_test.detach().cpu().numpy()
+    visit = _orderings(B, N, order, seed, episode_indices)  # (B, N), CPU
+    ctx_x = np.empty((B, P + N, d_x), dtype=np.float32)
+    ctx_y = np.empty((B, P + N), dtype=np.float32)
+    ctx_x[:, :P] = x_train.detach().cpu().numpy()
+    ctx_y[:, :P] = y_train_s
+    log_pdf_s = torch.empty(B, N, dtype=torch.float64)
+    appended = np.empty((B, N))
+    levels = _native_levels(name)
+    rows = np.arange(B)
+    for i in range(N):
+        tgt = visit[:, i].numpy()
+        xq = [xq_all[b, tgt[b]][None] for b in range(B)]
+        yq_true = y_test_s[rows, tgt]
+        xc = [ctx_x[b, : P + i] for b in range(B)]
+        yc = [ctx_y[b, : P + i] for b in range(B)]
+        _, lp = backend_pit(name, regressor, xc, yc, xq, [np.array([v], dtype=np.float32) for v in yq_true])
+        log_pdf_s[torch.as_tensor(rows), torch.as_tensor(tgt)] = lp[:, 0].double().cpu()
+        if conditioning == "teacher_forcing":
+            y_next = yq_true
+        else:
+            g = np.random.default_rng(zlib.crc32(f"ar-sample:{seed}:{i}".encode()))
+            u = g.random(B)
+            q = backend_quantiles(name, regressor, xc, yc, xq, levels)[:, 0].double().cpu().numpy()  # (B, Q)
+            y_next = np.array([np.interp(u[b], levels, q[b]) for b in range(B)])
+        ctx_x[rows, P + i] = xq_all[rows, tgt]
+        ctx_y[:, P + i] = y_next
+        appended[:, i] = y_next
+    return {
+        "log_pdf": log_pdf_s - std.log(),
+        "order": visit,
+        "appended": torch.as_tensor(appended) * std + mean,
     }
 
 

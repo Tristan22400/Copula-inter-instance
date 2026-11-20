@@ -1,0 +1,5 @@
+# Keys and defaults: the dataclass in eval/runners/eeg_joint_eval.py registered as eeg_joint_eval_schema.
+defaults:
+  - eeg_joint_eval_schema
+  - _runner
+  - _self_
