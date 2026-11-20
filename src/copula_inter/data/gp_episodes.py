@@ -905,8 +905,9 @@ def _generate_gp_batch_raw(
     raw_y_override: bool = False,
     pit_device: Optional[Device] = None,
     synthesis_dtype: Optional[torch.dtype] = None,
+    pn_pin: Optional[tuple[int, int]] = None,
 ) -> List[Dict[str, Tensor]]:
-    """Generate up to B GP episodes in one vectorized call.
+    """Generate up to B GP episodes in one vectorized call (pn_pin fixes its (P, N)).
 
     All episodes share one kernel family, (P, N) and active_dims, with independent
     hyperparameters, noise and features. Episodes whose Cholesky fails are
@@ -953,7 +954,9 @@ def _generate_gp_batch_raw(
         # The table's shape comes from TabICLv2's prior, not from data.d_features* / P_* / N_*.
         if d_override is None:
             d_override = sample_v2_num_features()
-        pn_override = sample_v2_train_test_sizes()
+        pn_override = sample_v2_train_test_sizes(scm.prior_P_min, scm.prior_P_max, scm.prior_P_dist)
+    if pn_pin is not None:
+        pn_override = pn_pin
 
     residual: Optional[_ResidualMean] = None
     scm_prior_type: Optional[Tensor] = None
@@ -1071,6 +1074,11 @@ def _generate_gp_batch_raw(
     return assemble_episodes(tensors, extra, discard, chains)
 
 
+def episode_shape(episode: Dict[str, Tensor]) -> tuple[int, int]:
+    """(P, N) of an episode: its context and query row counts."""
+    return int(episode["x_norm_train"].shape[0]), int(episode["x_norm_test"].shape[0])
+
+
 def generate_gp_batch(
     cfg: HasDataConfig,
     B: int,
@@ -1088,11 +1096,13 @@ def generate_gp_batch(
     raw_y_override: bool = False,
     pit_device: Optional[Device] = None,
     synthesis_dtype: Optional[torch.dtype] = None,
+    pn_override: Optional[tuple[int, int]] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, topping up discarded ones with further calls.
 
-    Top-up calls resample kernel, P, N and active_dims but keep d (pinned to
-    d_override if given, else to the first call's d). Raises after max_rounds.
+    Top-up calls resample kernel and active_dims but keep d and (P, N) (pinned to
+    d_override / pn_override if given, else to the first call's), so the B episodes
+    share one shape and batch without padding. Raises after max_rounds.
     """
     base_seed = getattr(cfg, "seed", None)
     episodes = _generate_gp_batch_raw(
@@ -1111,11 +1121,14 @@ def generate_gp_batch(
         raw_y_override=raw_y_override,
         pit_device=pit_device,
         synthesis_dtype=synthesis_dtype,
+        pn_pin=pn_override,
     )
-    # Pin every top-up round to the first round's d (or d_override).
+    # Pin every top-up round to the first round's d and (P, N) (or the overrides).
     d_fixed: Optional[int]
+    pn_fixed: Optional[tuple[int, int]] = pn_override
     if episodes:
         d_fixed = int(episodes[0]["x_norm_train"].shape[-1])
+        pn_fixed = episode_shape(episodes[0])
     else:
         d_fixed = d_override
     max_rounds = 20
@@ -1142,9 +1155,12 @@ def generate_gp_batch(
             raw_y_override=raw_y_override,
             pit_device=pit_device,
             synthesis_dtype=synthesis_dtype,
+            pn_pin=pn_fixed,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
+        if pn_fixed is None and new_episodes:
+            pn_fixed = episode_shape(new_episodes[0])
         episodes += new_episodes
     if base_seed is not None:
         setattr(cfg, "seed", base_seed)

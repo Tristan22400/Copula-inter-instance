@@ -92,6 +92,13 @@ class ScmResidualSettings:
     # Draw the episode shape (d, P, N) from TabICLv2's prior; false keeps data.d_features* and
     # data.P_*/N_* (small shapes for tests and diagnostics).
     prior_shapes: bool = True
+    # Context rows P of a prior-shaped call (rows stay V2_SEQ_LEN, N = V2_SEQ_LEN - P). None/None
+    # keeps TabICLv2's split P = int(1024 Uniform(0.3, 0.9)); otherwise P in [prior_P_min,
+    # prior_P_max], log-uniform or uniform (prior_P_dist). The rows are exchangeable given the
+    # graph, so the split changes which rows are context, not the table.
+    prior_P_min: int | None = None
+    prior_P_max: int | None = None
+    prior_P_dist: str = "loguniform"
     mean_amp_lognormal_loc: float = 0.0
     mean_amp_lognormal_scale: float = 1.5
 
@@ -115,6 +122,9 @@ class ScmResidualSettings:
             allow_analytic_pit=bool(get("allow_analytic_pit", cls.allow_analytic_pit)),
             amplitude_mode=str(get("amplitude_mode", cls.amplitude_mode)),
             prior_shapes=bool(get("prior_shapes", cls.prior_shapes)),
+            prior_P_min=None if get("prior_P_min", None) is None else int(get("prior_P_min", None)),
+            prior_P_max=None if get("prior_P_max", None) is None else int(get("prior_P_max", None)),
+            prior_P_dist=str(get("prior_P_dist", cls.prior_P_dist)),
             mean_amp_lognormal_loc=float(get("mean_amp_lognormal_loc", cls.mean_amp_lognormal_loc)),
             mean_amp_lognormal_scale=float(get("mean_amp_lognormal_scale", cls.mean_amp_lognormal_scale)),
         )
@@ -218,9 +228,33 @@ def sample_v2_num_features() -> int:
     return int(round(np.random.uniform(V2_MIN_FEATURES, V2_MAX_FEATURES)))
 
 
-def sample_v2_train_test_sizes() -> tuple[int, int]:
-    """A call's (P, N): P = int(1024 u), u ~ Uniform(0.3, 0.9), N = 1024 - P (Prior.sample_train_size)."""
-    P = int(V2_SEQ_LEN * np.random.uniform(V2_TRAIN_FRAC_MIN, V2_TRAIN_FRAC_MAX))
+P_DISTS = ("loguniform", "uniform")
+
+
+def sample_v2_train_test_sizes(
+    P_min: int | None = None, P_max: int | None = None, dist: str = "loguniform"
+) -> tuple[int, int]:
+    """A call's (P, N) with N = 1024 - P.
+
+    Without bounds, TabICLv2's split: P = int(1024 u), u ~ Uniform(0.3, 0.9) (Prior.sample_train_size).
+    With bounds, P = round(exp(Uniform(log P_min, log P_max))) ("loguniform") or
+    round(Uniform(P_min, P_max)) ("uniform"), clipped to [P_min, P_max].
+    """
+    if P_min is None and P_max is None:
+        P = int(V2_SEQ_LEN * np.random.uniform(V2_TRAIN_FRAC_MIN, V2_TRAIN_FRAC_MAX))
+        return P, V2_SEQ_LEN - P
+    if P_min is None or P_max is None or not 2 <= P_min <= P_max <= V2_SEQ_LEN - 2:
+        raise ValueError(
+            f"data.scm_residual.prior_P_min/prior_P_max = {P_min}/{P_max}; set both, with "
+            f"2 <= prior_P_min <= prior_P_max <= {V2_SEQ_LEN - 2}."
+        )
+    if dist == "loguniform":
+        u = float(np.exp(np.random.uniform(np.log(P_min), np.log(P_max))))
+    elif dist == "uniform":
+        u = float(np.random.uniform(P_min, P_max))
+    else:
+        raise ValueError(f"data.scm_residual.prior_P_dist={dist!r}; expected one of {P_DISTS}.")
+    P = min(max(int(round(u)), P_min), P_max)
     return P, V2_SEQ_LEN - P
 
 
