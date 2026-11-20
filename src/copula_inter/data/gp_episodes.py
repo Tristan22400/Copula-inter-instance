@@ -403,6 +403,69 @@ class _Features:
     kernel_hidden_applied: Optional[Tensor]
 
 
+SPLIT_MODES = ("random", "block", "halfspace", "axis")
+
+
+def split_mode_probs(cfg: HasDataConfig) -> Optional[Tensor]:
+    """data.split_mode_probs as a normalized SPLIT_MODES-ordered tensor, or None when only random."""
+    raw = getattr(cfg.data, "split_mode_probs", None)
+    if raw is None:
+        return None
+    get = raw.get if hasattr(raw, "get") else lambda k, d: getattr(raw, k, d)
+    unknown = set(raw.keys()) - set(SPLIT_MODES) if hasattr(raw, "keys") else set()
+    if unknown:
+        raise ValueError(f"data.split_mode_probs has unknown modes {sorted(unknown)}; expected {SPLIT_MODES}.")
+    w = torch.tensor([float(get(m, 0.0) or 0.0) for m in SPLIT_MODES], dtype=torch.float64)
+    if bool((w < 0).any()) or float(w.sum()) <= 0:
+        raise ValueError(
+            f"data.split_mode_probs={dict(zip(SPLIT_MODES, w.tolist()))} must be >= 0 with a positive sum."
+        )
+    if float(w[1:].sum()) == 0.0:
+        return None
+    return w / w.sum()
+
+
+def _split_order(x: Tensor, P: int, N: int, cols: Optional[List[int]], probs: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-episode row order (B, T) whose first P rows are the context and next N the queries.
+
+    Each episode draws a mode from SPLIT_MODES with probs, on its first P + N rows of x (the
+    kernel's view, restricted to cols); later (calibration) rows keep their place:
+      random    a uniform split (the exchangeable default);
+      block     the N rows nearest to a random anchor row are the queries (a hole in the context);
+      halfspace the N rows furthest along a random unit direction (extrapolation past a hyperplane);
+      axis      the same along one random column (a time- or coordinate-like cutoff).
+    The order depends on x only, never on y, so the GP posterior given x stays the oracle.
+    Returns (order, mode index per episode); context and query rows are shuffled within each set.
+    """
+    B, T, _ = x.shape
+    M = P + N
+    xs = x[:, :M] if cols is None else x[:, :M][..., cols]
+    dev = x.device
+    modes = torch.multinomial(probs.to(dev, torch.float64), B, replacement=True)
+    score = torch.rand(B, M, device=dev, dtype=xs.dtype)  # random: any N rows
+    anchor = xs[torch.arange(B, device=dev), torch.randint(M, (B,), device=dev)]  # (B, d')
+    block = -(xs - anchor[:, None]).square().sum(-1)  # nearest to the anchor first
+    u = torch.randn(B, xs.shape[-1], device=dev, dtype=xs.dtype)
+    halfspace = (xs * (u / u.norm(dim=-1, keepdim=True).clamp(min=1e-12))[:, None]).sum(-1)
+    col = torch.randint(xs.shape[-1], (B,), device=dev)
+    axis = xs.gather(2, col.view(B, 1, 1).expand(B, M, 1)).squeeze(-1)
+    for m, s in ((1, block), (2, halfspace), (3, axis)):
+        score = torch.where((modes == m)[:, None], s, score)
+    queries = score.topk(N, dim=1).indices  # (B, N)
+    is_query = torch.zeros(B, M, dtype=torch.bool, device=dev).scatter_(1, queries, True)
+    jitter = torch.rand(B, M, device=dev)
+    # Context first (key in [0, 1)), queries after (key in [1, 2)), each set in random order.
+    head = (jitter + is_query.to(jitter.dtype)).argsort(dim=1)
+    tail = torch.arange(M, T, device=dev).expand(B, T - M)
+    return torch.cat([head, tail], dim=1), modes
+
+
+def _reorder_rows(t: Tensor, order: Tensor) -> Tensor:
+    """t (B, T, ...) with its rows in order (B, T)."""
+    index = order.view(*order.shape, *([1] * (t.dim() - 2))).expand(*order.shape, *t.shape[2:])
+    return t.gather(1, index)
+
+
 def _sample_features(
     cfg: HasDataConfig,
     shape: _CallShape,
@@ -985,6 +1048,18 @@ def _generate_gp_batch_raw(
             scm_prior_type = tables.prior_type
         else:
             feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)
+        split_probs = split_mode_probs(cfg)
+        if split_probs is not None:
+            # Non-random context/query split, chosen from the kernel's view of the features only.
+            order, _ = _split_order(feats.x_kernel, shape.P, shape.N, shape.kernel_cols, split_probs)
+            feats = _Features(
+                _reorder_rows(feats.x_norm, order),
+                _reorder_rows(feats.x_kernel, order),
+                feats.mlp_mixed,
+                feats.kernel_hidden_applied,
+            )
+            if residual is not None:
+                residual = _ResidualMean(mean=_reorder_rows(residual.mean, order), kernel_factor=residual.kernel_factor)
         synthesized = _draw_gp(cfg, shape, priors, feats, device, residual)
         if synthesized is None:
             return []

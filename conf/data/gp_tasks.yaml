@@ -628,6 +628,17 @@ store_r_star: true
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
 shard_size: 256
+# Context / query split of each episode's P + N rows (gp_episodes._split_order), a mode per
+# episode with these weights. random: a uniform split (rows are exchangeable). block: the N
+# rows nearest a random anchor are the queries. halfspace: the N rows furthest along a random
+# direction. axis: the same along one random column (time-like cutoff). The split depends on
+# the features only, so the GP posterior oracle stays exact. Non-random splits leave the
+# queries far from the context, which is where a copula has dependence to learn.
+split_mode_probs:
+  random: 1.0
+  block: 0.0
+  halfspace: 0.0
+  axis: 0.0
 # Episodes per generate_gp_batch call inside a shard (generate_pit_dataset); null = shard_size.
 # Lower it when several workers share one GPU: the peak memory of a call scales with it.
 generate_chunk_size: null

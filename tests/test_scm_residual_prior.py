@@ -373,3 +373,48 @@ def test_a_chunked_shard_keeps_one_shape() -> None:
     episodes = _generate_shard_with_oom_retry(cfg, 6, "cpu", tabicl_model=None, tabicl_k_folds=5, max_chunk=2)
     shapes = {(e["x_norm_train"].shape, e["x_norm_test"].shape) for e in episodes}
     assert len(episodes) == 6 and len(shapes) == 1
+
+
+def test_non_random_splits_put_the_queries_where_the_mode_says() -> None:
+    from copula_inter.data.gp_episodes import SPLIT_MODES, _split_order
+
+    torch.manual_seed(0)
+    B, P, N, d = 6, 30, 10, 3
+    x = torch.randn(B, P + N + 2, d)
+    for m, mode in enumerate(SPLIT_MODES):
+        probs = torch.zeros(len(SPLIT_MODES), dtype=torch.float64)
+        probs[m] = 1.0
+        order, modes = _split_order(x, P, N, None, probs)
+        assert bool((modes == m).all())
+        assert torch.equal(order[:, P + N :], torch.arange(P + N, P + N + 2).expand(B, 2))
+        for b in range(B):
+            assert sorted(order[b].tolist()) == list(range(P + N + 2))
+            ctx, qry = x[b, order[b, :P]], x[b, order[b, P : P + N]]
+            if mode == "block":
+                # Some query (the anchor) is closer to every query than to any context row.
+                d_q = torch.cdist(qry, qry).max(dim=1).values
+                d_c = torch.cdist(qry, ctx).min(dim=1).values
+                assert bool((d_q <= d_c + 1e-6).any())
+            if mode == "axis":
+                assert any(bool(qry[:, j].min() >= ctx[:, j].max()) for j in range(d))
+
+
+def test_split_modes_keep_the_oracle_and_the_default_dataset_identity() -> None:
+    from copula_inter.data.gp_episodes import split_mode_probs
+
+    base = _cfg(**PINNED_MEAN)
+    assert split_mode_probs(base) is None
+    split = _cfg(**PINNED_MEAN)
+    split.data.split_mode_probs = {"random": 0.0, "block": 0.5, "halfspace": 0.0, "axis": 0.5}
+    for ep in generate_gp_batch(split, 4, return_kernel_metadata=True):
+        out = gp_analytical_pit(ep)
+        assert torch.allclose(out["z_test"], ep["z_test"], atol=5e-3)
+        assert torch.allclose(out["z_train"], ep["z_train"], atol=5e-3)
+    no_key = _cfg(**PINNED_MEAN)
+    no_key.data.pop("split_mode_probs")
+    assert generation_spec(base, None) == generation_spec(no_key, None)
+    assert generation_spec(split, None) != generation_spec(base, None)
+    bad = _cfg(**PINNED_MEAN)
+    bad.data.split_mode_probs = {"random": 1.0, "spiral": 1.0}
+    with pytest.raises(ValueError, match="unknown modes"):
+        split_mode_probs(bad)
