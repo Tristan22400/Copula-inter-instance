@@ -14,6 +14,8 @@ from hydra.core.global_hydra import GlobalHydra
 from copula_inter.config_path import config_dir
 from copula_inter.training.setup import prepare_training_inputs
 from eval.runners.autoregressive_baseline_eval import AutoregressiveBaselineSpec
+from eval.runners.beyondarena_joint_eval import BeyondArenaJointSpec
+from eval.runners.beyondarena_report import BeyondArenaReportSpec
 from eval.runners.ctr23_full_eval import Ctr23FullEvalSpec
 from eval.runners.eeg_gp_baselines import EegGpBaselinesSpec
 from eval.runners.eeg_joint_eval import EegJointEvalSpec
@@ -57,6 +59,8 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "wandb_report": (WandbReportSpec, []),
     "eeg_joint_eval": (EegJointEvalSpec, ["out_dir=o"]),
     "eeg_gp_baselines": (EegGpBaselinesSpec, ["out_dir=o"]),
+    "beyondarena_joint_eval": (BeyondArenaJointSpec, ["dataset=d", "method=m", "out_dir=o"]),
+    "beyondarena_report": (BeyondArenaReportSpec, []),
 }
 
 

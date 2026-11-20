@@ -55,7 +55,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import torch
@@ -344,7 +344,16 @@ def _ckpt_key(path: str | None) -> str | None:
     return "/".join(parts[-2:])
 
 
-def check_marginal_pairing(cop_cfg: Any, spec: Ctr23FullEvalSpec) -> None:
+class MarginalPairing(Protocol):
+    """The fields check_marginal_pairing reads (Ctr23FullEvalSpec, BeyondArenaJointSpec)."""
+
+    ckpt: str | None
+    marginal: str
+    tabicl_ckpt: str | None
+    marginal_ckpt: str | None
+
+
+def check_marginal_pairing(cop_cfg: Any, spec: MarginalPairing) -> None:
     """Raise unless spec's marginal is the one the copula was trained with (its z_train source and checkpoint)."""
     from omegaconf import OmegaConf
 
