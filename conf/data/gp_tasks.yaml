@@ -612,6 +612,12 @@ scm_residual:
   # Episode shape from TabICLv2's regressor prior: d = round(Uniform(1, 100)), 1024 rows,
   # P = int(1024 Uniform(0.3, 0.9)), N = 1024 - P. false: d_features* and P_*/N_* above.
   prior_shapes: true
+  # Context rows P of a prior-shaped episode, the 1024 rows kept (N = 1024 - P). null/null:
+  # TabICLv2's split, P = int(1024 Uniform(0.3, 0.9)). Else P in [prior_P_min, prior_P_max],
+  # loguniform (equal mass per decade) or uniform.
+  prior_P_min: null
+  prior_P_max: null
+  prior_P_dist: loguniform
   mean_amp_lognormal_loc: 0.0
   mean_amp_lognormal_scale: 1.5
 
@@ -622,6 +628,9 @@ store_r_star: true
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
 shard_size: 256
+# Episodes per generate_gp_batch call inside a shard (generate_pit_dataset); null = shard_size.
+# Lower it when several workers share one GPU: the peak memory of a call scales with it.
+generate_chunk_size: null
 
 # Output directory
 dataset_dir: ./data/systematic_composition

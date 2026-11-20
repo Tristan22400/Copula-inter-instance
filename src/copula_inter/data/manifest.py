@@ -23,7 +23,8 @@ SCHEMA = 1
 
 def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
     data = config_dict(cfg.data)
-    for output_key in ("resume", "dataset_dir", "pit_dir"):
+    # generate_chunk_size only sets how many episodes share one GPU call (memory), not the prior.
+    for output_key in ("resume", "dataset_dir", "pit_dir", "generate_chunk_size"):
         data.pop(output_key, None)
     # A disabled SCM residual prior changes no byte, so it stays out of the identity: datasets
     # generated before the key existed keep their digest, and enabling it changes the digest.

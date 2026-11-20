@@ -29,6 +29,7 @@ from copula_inter.data.scm_prior import (
     ScmResidualSettings,
     sample_amplitudes,
     sample_scm_tables,
+    sample_v2_train_test_sizes,
     saved_mean_at,
 )
 from copula_inter.marginal.pit import (
@@ -337,3 +338,38 @@ def test_disabled_prior_draws_the_same_episodes_as_no_block() -> None:
         for key, value in ea.items():
             if isinstance(value, torch.Tensor):
                 assert torch.equal(value, eb[key]), key
+
+
+def test_context_rows_follow_the_configured_log_uniform_split() -> None:
+    """prior_P_min/max keep the 1024 rows and draw P log-uniformly (equal mass per decade)."""
+    seed_everything(0)
+    draws = [sample_v2_train_test_sizes(10, 1000, "loguniform") for _ in range(4000)]
+    P = torch.tensor([p for p, _ in draws], dtype=torch.float64)
+    assert all(p + n == 1024 for p, n in draws)
+    assert int(P.min()) >= 10 and int(P.max()) <= 1000
+    # Each decade [10, 100) and [100, 1000] holds about half the draws.
+    assert abs(float((P < 100).double().mean()) - 0.5) < 0.04
+    default = [sample_v2_train_test_sizes() for _ in range(500)]
+    assert all(int(1024 * 0.3) - 1 <= p <= int(1024 * 0.9) for p, _ in default)
+    with pytest.raises(ValueError, match="prior_P_min"):
+        sample_v2_train_test_sizes(10, None)
+    with pytest.raises(ValueError, match="prior_P_dist"):
+        sample_v2_train_test_sizes(10, 1000, "normal")
+
+
+def test_prior_shaped_episodes_use_the_configured_context_rows() -> None:
+    cfg = _cfg(prior_shapes=True, prior_P_min=10, prior_P_max=40, **PINNED_MEAN)
+    episodes = generate_gp_batch(cfg, 2)
+    for ep in episodes:
+        P, N = ep["x_norm_train"].shape[0], ep["x_norm_test"].shape[0]
+        assert 10 <= P <= 40 and P + N == 1024
+
+
+def test_a_chunked_shard_keeps_one_shape() -> None:
+    """Chunks and top-ups of one shard share d and (P, N), so its minibatches need no padding."""
+    from copula_inter.generate_pit_dataset import _generate_shard_with_oom_retry
+
+    cfg = _cfg(prior_shapes=True, prior_P_min=10, prior_P_max=40, **PINNED_MEAN)
+    episodes = _generate_shard_with_oom_retry(cfg, 6, "cpu", tabicl_model=None, tabicl_k_folds=5, max_chunk=2)
+    shapes = {(e["x_norm_train"].shape, e["x_norm_test"].shape) for e in episodes}
+    assert len(episodes) == 6 and len(shapes) == 1

@@ -44,7 +44,7 @@ from copula_inter.backend_registry import (
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
 from copula_inter.data.contracts import validate_episode
-from copula_inter.data.gp_episodes import generate_gp_batch
+from copula_inter.data.gp_episodes import episode_shape, generate_gp_batch
 from copula_inter.data.manifest import (
     contiguous_shard_counts,
     ensure_manifest,
@@ -87,20 +87,25 @@ def _generate_shard_with_oom_retry(
     tabicl_split_calib_frac: float = 0.0,
     marginal_backend: str | None = None,
     marginal_regressor: Any = None,
+    max_chunk: int | None = None,
 ) -> list:
-    """Generate n_this episodes for one shard, halving the chunk size on CUDA OOM.
+    """Generate n_this episodes for one shard in chunks of at most max_chunk, halving on CUDA OOM.
 
     Transient errors (_is_transient_cusolver_error) are retried unchanged after a
-    delay. Each chunk uses its own seed offset and the first chunk's d_features.
-    Runs gc.collect() before empty_cache() after an OOM.
+    delay. Each chunk uses its own seed offset and the first chunk's d_features and (P, N).
+    Runs gc.collect() before empty_cache() after an OOM. On CUDA the cache is also
+    emptied after every chunk, so workers sharing one GPU do not hold each other's peaks.
     """
     base_seed = getattr(cfg, "seed", None)
     episodes: list = []
     remaining = n_this
-    chunk = n_this
+    chunk = min(n_this, max_chunk) if max_chunk else n_this
     chunk_idx = 0
     cusolver_retries = 0
+    # Every chunk of a shard keeps the first chunk's d and (P, N): one shape per shard, so a
+    # training minibatch (drawn within one shard) needs no padded context rows.
     d_fixed = None
+    pn_fixed: tuple[int, int] | None = None
     while remaining > 0:
         this_chunk = min(chunk, remaining)
         if base_seed is not None:
@@ -111,6 +116,7 @@ def _generate_shard_with_oom_retry(
                 this_chunk,
                 device,
                 d_override=d_fixed,
+                pn_override=pn_fixed,
                 tabicl_model=tabicl_model,
                 tabicl_k_folds=tabicl_k_folds,
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
@@ -119,9 +125,12 @@ def _generate_shard_with_oom_retry(
             )
             if d_fixed is None and new_episodes:
                 d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
+                pn_fixed = episode_shape(new_episodes[0])
             episodes += new_episodes
             remaining -= this_chunk
             chunk_idx += 1
+            if str(device).startswith("cuda"):
+                torch.cuda.empty_cache()
         except torch.cuda.OutOfMemoryError:
             if this_chunk == 1:
                 raise  # nothing smaller left to try -- a genuine failure
@@ -335,6 +344,7 @@ def main(cfg: DictConfig) -> None:
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
+                max_chunk=cfg.data.get("generate_chunk_size", None),
             )
             # Don't store R_prior and Sigma_star (reconstructed at load), nor R_star when
             # data.store_r_star=false (N x N floats, ~96% of an N=256 episode; training never
