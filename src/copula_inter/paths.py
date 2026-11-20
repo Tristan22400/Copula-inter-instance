@@ -38,3 +38,7 @@ MEUSE_DATA_DIR = REAL_DATA_DIR / "meuse"
 CTR23_DATA_DIR = REAL_DATA_DIR / "ctr23"
 # Neural-process benchmark tasks exported by scripts/npbench/export_eeg.py (EEG of Bruinsma et al. 2023).
 NPBENCH_DATA_DIR = REAL_DATA_DIR / "npbench"
+# BeyondArena (TabArena) regression splits exported by scripts/beyondarena/export_splits.py
+# (one .npz per split and a meta.json per dataset), and the joint-track results.
+BEYONDARENA_DATA_DIR = Path(os.environ.get("BEYONDARENA_DATA_DIR", REPO_ROOT / "data" / "beyondarena"))
+BEYONDARENA_RESULTS_DIR = REPO_ROOT / "results" / "beyondarena"

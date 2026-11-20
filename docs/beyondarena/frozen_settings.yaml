@@ -1,0 +1,33 @@
+# Frozen 2026-11-18, before any grouped or temporal BeyondArena data was scored.
+# The only development run was wine_quality r0_f0 (IID, tabicl-ft), used for the engineering
+# checks (sample CRPS = grid CRPS within MC error; runtime; exch estimator). Nothing was tuned.
+benchmark:
+  tabarena_commit: cc507b84d1f32d2ca5b5704326bf4f086ee6519a
+  subset: [core2k, regression]          # 44 datasets, ~554 splits
+  dev_datasets: [miami_housing-77ada7242bed, qsar_tid_11-34170685abe8, wine_quality-6ad3969edbaa]
+official_track:
+  method: TA-TabICLv2 default config, model_path = ERA5 fine-tuned regressor (TA-TabICLv2-ERA5FT)
+  control: TA-TabICLv2 default rerun on the lite split of every dataset (reproduces the cache?)
+  baselines_from_cache: [TA-TabICLv2, TA-TabPFN-3.5-Fast, TA-Kumo-Tabular-Small]
+  h1_margin: 1.02                       # RMSE ratio, upper CI bound of the median
+joint_track:                            # eval/runners/beyondarena_joint_eval.py defaults
+  k_folds: 10
+  cross_fit: struct
+  p_marg: 50000
+  p_cop: 1000
+  block_size: 32
+  block_max: 128
+  max_blocks: 200
+  block_sweep: [2, 4, 8, 16, 32, 64, 128]
+  n_samples: 1000
+  vs_order: 0.5
+  seed: 42
+  models: [tabicl-ft, tabpfn-ft, kumo-ft, tabicl-pre, tabpfn-pre, kumo-pre]
+ablations:                              # tabicl-ft, grouped + temporal datasets below 100k training rows
+  cross_fit: [random]
+  drop_group: [true]                    # grouped only
+  rank: [1, 4, 16, 64]
+  p_cop: [256, 4000, 50000]             # 50000 = the whole marginal context (extrapolation; may OOM)
+statistics:
+  bootstrap: {resamples: 10000, level: 0.95, seed: 0, unit: dataset}
+  tests: one-sided Wilcoxon signed-rank over datasets; Holm across the 5 secondary copulas
