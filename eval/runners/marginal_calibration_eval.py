@@ -11,6 +11,14 @@ Reported per kernel family and context size P:
     z_gap: mean |z_tabicl - z_analytic| (independent normals give ~1.128).
     probit_clamp / slope_clamp: fractions hitting the probit clamp
         (|z| <= 4.7534) or the density clamp (|log f| <= 13.8).
+
+With gp_baseline_kernels set, also a context-only MAP-GP baseline on the model's
+inputs x_norm (it knows neither the kernel family nor the hidden warp):
+    nll_gp / nll_gp_mix: marginal NLL of the BIC-best fit and of the BIC-weighted
+        mixture over gp_baseline_kernels x gp_baseline_means.
+    gap_gp = nll_gp - nll_oracle; tabicl_minus_gp = nll - nll_gp.
+Any context-only predictor has expected NLL >= the Bayes (BMA) predictive's, so a
+positive mean tabicl_minus_gp lower-bounds TabICL's learnable marginal gap.
 """
 
 from __future__ import annotations
@@ -21,9 +29,11 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
+import gpytorch
 import numpy as np
 import torch
 
+from copula_inter.baselines.gp_mle import ARD_ELIGIBLE, GP_LR_MLE, fit_and_eval_gpytorch
 from copula_inter.checkpoint_registry import resolve_marginal_checkpoint
 from copula_inter.config_path import compose_config, config_dict, config_dir
 from copula_inter.data.gp_episodes import generate_gp_batch
@@ -53,8 +63,76 @@ if TYPE_CHECKING:
 # |log f| bound implied by QuantileDistribution's slope clamp [1e-6, 1e6].
 _LOG_F_CEILING = math.log(1e6)
 
+# gpytorch switches to CG/Lanczos above max_cholesky_size (800 by default); keep the baseline fits exact.
+_EXACT_CHOLESKY_MAX = 8192
 
-def _episode_metrics(tabicl: TabICLLike, episodes: list[dict], k_folds: int, eps: float, device: str) -> list[dict]:
+
+def _gp_baseline_metrics(ep: dict, args: MarginalCalibrationSpec, prior_cfg: dict, device: str) -> dict[str, float]:
+    """Context-only MAP-GP baselines on x_norm: marginal NLL per candidate, of the BIC-best fit and of the BIC mixture.
+
+    Each candidate (kernel, mean) is fitted on the standardized context y and
+    selected or weighted by BIC_k = log p(y_C | theta_hat_k) - (n_k / 2) log P,
+    the same context-only score as eval.baselines.classical. NLLs are in raw-y
+    nats per query point, like nll and nll_oracle.
+    """
+    x_tr = ep["x_norm_train"].to(device).float()
+    x_te = ep["x_norm_test"].to(device).float()
+    y_tr = ep["y_train"].to(device).double()
+    y_te = ep["y_test"].to(device).double()
+    P = x_tr.shape[0]
+    mu_y = y_tr.mean()
+    sd_y = y_tr.std().clamp(min=1e-6)
+    y_std = ((y_tr - mu_y) / sd_y).float()
+
+    out: dict[str, float] = {}
+    bics: list[float] = []
+    logps: list[torch.Tensor] = []  # (N,) per-point log densities of each kept candidate
+    for kernel in args.gp_baseline_kernels:
+        for mean in args.gp_baseline_means:
+            name = f"nll_gp_{kernel}_{mean}"
+            try:
+                with gpytorch.settings.max_cholesky_size(_EXACT_CHOLESKY_MAX):
+                    fit = fit_and_eval_gpytorch(
+                        x_tr,
+                        y_std,
+                        x_te,
+                        kernel,
+                        n_steps=args.gp_baseline_steps,
+                        lr=args.gp_baseline_lr,
+                        ard=args.gp_baseline_ard and ARD_ELIGIBLE.get(kernel, False),
+                        oracle_mode="posterior",
+                        prior_cfg=prior_cfg,
+                        n_restarts=args.gp_baseline_restarts,
+                        mean=mean,
+                    )
+            except RuntimeError:
+                out[name] = float("nan")
+                continue
+            mu = fit["mean"].double() * sd_y + mu_y
+            var = fit["Sigma"].diagonal().double().clamp(min=1e-12) * sd_y**2
+            logp = -0.5 * (torch.log(2 * math.pi * var) + (y_te - mu) ** 2 / var)
+            out[name] = float(-logp.mean())
+            bics.append(float(fit["log_ml"]) - 0.5 * float(fit["n_hparams"]) * math.log(P))
+            logps.append(logp)
+
+    if not logps:
+        out["nll_gp"] = out["nll_gp_mix"] = float("nan")
+        return out
+    out["nll_gp"] = float(-logps[int(np.argmax(bics))].mean())
+    log_w = torch.log_softmax(torch.tensor(bics, dtype=torch.float64, device=y_te.device), dim=0)
+    out["nll_gp_mix"] = float(-torch.logsumexp(log_w[:, None] + torch.stack(logps), dim=0).mean())
+    return out
+
+
+def _episode_metrics(
+    tabicl: TabICLLike,
+    episodes: list[dict],
+    k_folds: int,
+    eps: float,
+    device: str,
+    args: MarginalCalibrationSpec,
+    prior_cfg: dict,
+) -> list[dict]:
     """Score one shared-(P, N) batch of GP episodes through pit.run_pit_batched; one record per episode."""
     B = len(episodes)
     x_tr = torch.stack([e["x_norm_train"] for e in episodes]).to(device)
@@ -130,6 +208,11 @@ def _episode_metrics(tabicl: TabICLLike, episodes: list[dict], k_folds: int, eps
             rec["z_gap_train"] = float("nan")
             rec["z_gap_test"] = float("nan")
 
+        if args.gp_baseline_kernels:
+            rec.update(_gp_baseline_metrics(ep, args, prior_cfg, device))
+            rec["gap_gp"] = rec["nll_gp"] - rec["nll_oracle"]
+            rec["tabicl_minus_gp"] = rec["nll"] - rec["nll_gp"]
+
         records.append(rec)
     return records
 
@@ -189,6 +272,28 @@ class MarginalCalibrationSpec:
     seed: int = 20260902
     # Write the full per-group record (incl. rank histograms) here.
     out_json: str | None = None
+    # Context-only MAP-GP baseline on x_norm (see the module docstring); empty list = off.
+    gp_baseline_kernels: list[str] = field(default_factory=list)
+    # Mean functions tried per kernel (copula_inter.baselines.gp_mle.GP_MEANS).
+    gp_baseline_means: list[str] = field(default_factory=lambda: ["constant"])
+    # ARD lengthscales where the kernel supports them (gp_mle.ARD_ELIGIBLE).
+    gp_baseline_ard: bool = True
+    # Adam steps and random restarts of each MAP fit.
+    gp_baseline_steps: int = 150
+    gp_baseline_restarts: int = 2
+    gp_baseline_lr: float = GP_LR_MLE
+
+
+_GP_KEYS = ["nll", "nll_gp", "nll_gp_mix", "nll_oracle", "gap", "gap_gp", "tabicl_minus_gp"]
+
+
+def _print_gp_table(title: str, rows: list[tuple[str, int, dict]]) -> None:
+    print(f"\n{title}")
+    hdr = f"{'group':<28} {'n':>5} " + " ".join(f"{k:>15}" for k in _GP_KEYS)
+    print(hdr)
+    print("-" * len(hdr))
+    for name, n, m in rows:
+        print(f"{name:<28} {n:>5} " + " ".join(f"{m[k]:>15.4f}" for k in _GP_KEYS))
 
 
 def run(args: MarginalCalibrationSpec) -> None:
@@ -203,6 +308,8 @@ def run(args: MarginalCalibrationSpec) -> None:
 
     from omegaconf import OmegaConf
 
+    # The generator's hyperpriors, reused as the MAP-GP baseline's priors (fixed, so still context-only).
+    prior_cfg = config_dict(full.data)
     all_records: list[dict] = []
     for P in args.p_values:
         gp_cfg = OmegaConf.create({"data": config_dict(full.data), "seed": args.seed})
@@ -217,7 +324,7 @@ def run(args: MarginalCalibrationSpec) -> None:
             B = min(args.batch_size, args.n_episodes - done)
             gp_cfg.seed = args.seed + 1_000_003 * P + batch_i
             episodes = generate_gp_batch(gp_cfg, B, device, return_kernel_metadata=True)
-            all_records.extend(_episode_metrics(tabicl, episodes, args.k_folds, args.eps, device))
+            all_records.extend(_episode_metrics(tabicl, episodes, args.k_folds, args.eps, device, args, prior_cfg))
             done += B
             batch_i += 1
         print(f"  P={P:<4} done ({done} episodes)")
@@ -249,6 +356,23 @@ def run(args: MarginalCalibrationSpec) -> None:
         f"{overall['z_gap_train']:.4f} (train) / {overall['z_gap_test']:.4f} (test); "
         f"the 'two independent standard normals' reference is {2 / math.sqrt(math.pi):.4f}."
     )
+
+    if args.gp_baseline_kernels:
+        gp_overall = _agg(all_records, _GP_KEYS)
+        gp_by_p = [
+            (f"P={P}", len(rs), _agg(rs, _GP_KEYS))
+            for P in args.p_values
+            if (rs := [r for r in all_records if r["P"] == P])
+        ]
+        _print_gp_table(
+            "CONTEXT-ONLY MAP-GP BASELINE ON x_norm (tabicl_minus_gp > 0: TabICL has learnable headroom)", gp_by_p
+        )
+        print(
+            f"\nHEADLINE  TabICL - MAP-GP (BIC-best) marginal NLL: {gp_overall['tabicl_minus_gp']:.4f} nats/point; "
+            f"MAP-GP gap to the oracle {gp_overall['gap_gp']:.4f}."
+        )
+        overall.update({k: gp_overall[k] for k in _GP_KEYS})
+        by_p = [(n, c, {**m, **gm}) for (n, c, m), (_gn, _gc, gm) in zip(by_p, gp_by_p)]
 
     if args.out_json:
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)) or ".", exist_ok=True)
