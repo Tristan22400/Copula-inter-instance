@@ -26,7 +26,13 @@ import numpy as np
 import torch
 from scipy.special import ndtri
 
-__all__ = ["backend_pit_fn", "group_by_kept_columns", "run_kfold_pit_batched", "take_columns"]
+__all__ = [
+    "backend_pit_fn",
+    "group_by_kept_columns",
+    "run_context_pit_batched",
+    "run_kfold_pit_batched",
+    "take_columns",
+]
 
 PitFn = Callable[[list, list, list, list], tuple[np.ndarray, np.ndarray]]
 
@@ -109,37 +115,20 @@ def _chunked_pit(
     return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
 
 
-def run_kfold_pit_batched(
+def run_context_pit_batched(
     pit_fn: PitFn,
     X_train: np.ndarray,
     Y_train: np.ndarray,
-    X_test: np.ndarray,
-    Y_test: np.ndarray,
     k_folds: int = 10,
     eps: float = 1e-6,
     seed: int = 0,
     max_cells: int | None = None,
-) -> dict:
-    """K-fold PIT for z_train and a full-context pass for z_test/log_pdf_test, batched across episodes and folds.
+) -> np.ndarray:
+    """K-fold context z scores (B, P) from features (B, P, d) and scaled targets (B, P).
 
-    Args:
-        pit_fn: the backend's PIT function (module docstring).
-        X_train: (B, P, p_x); X_test: (B, N, p_x).
-        Y_train: (B, P); Y_test: (B, N), already scaled by the caller.
-        k_folds: clamped to [1, P].
-        eps: u is clipped to [eps, 1 - eps] before the probit (|z| <= 4.75 at 1e-6).
-        seed: episode b's folds are default_rng(seed + b).permutation(P) % K
-            (as eval/metrics/joint_nll.kfold_loo_pit).
-        max_cells: memory bound per pit_fn call (members * rows * columns);
-            None reads DEFAULT_MAX_CELLS at call time.
-
-    Each held-out point is predicted from the other folds of its own episode
-    only; the members of one pit_fn call are independent, so how the
-    (fold, episode) pairs are grouped into calls does not change the result.
-
-    Returns:
-        dict with z_train (B, P), z_test (B, N), log_pdf_test (B, N) in the
-        scaled y units (callers apply the Jacobian).
+    Each held-out row uses the other folds of its own episode. Episode b's
+    folds are default_rng(seed + b).permutation(P) % K. The returned probits
+    clip probabilities to [eps, 1-eps]. The memory limit counts cells per call.
     """
     B, P, _p_x = X_train.shape
     K = min(int(k_folds), P)
@@ -167,7 +156,27 @@ def run_kfold_pit_batched(
         )  # (members, fold size)
         for (b, _, qry), u in zip(members, u_held, strict=True):
             z_train[b, qry] = _probit(u, eps)
+    return z_train
 
+
+def run_kfold_pit_batched(
+    pit_fn: PitFn,
+    X_train: np.ndarray,
+    Y_train: np.ndarray,
+    X_test: np.ndarray,
+    Y_test: np.ndarray,
+    k_folds: int = 10,
+    eps: float = 1e-6,
+    seed: int = 0,
+    max_cells: int | None = None,
+) -> dict:
+    """Batched context cross-fitting plus a full-context PIT for labeled query rows.
+
+    Targets are scaled by the caller. Returns z_train (B, P), z_test (B, N)
+    and log_pdf_test (B, N) in the scaled units.
+    """
+    max_cells = DEFAULT_MAX_CELLS if max_cells is None else max_cells
+    z_train = run_context_pit_batched(pit_fn, X_train, Y_train, k_folds, eps, seed, max_cells)
     u_test, log_pdf_test = _chunked_pit(pit_fn, list(X_train), list(Y_train), list(X_test), list(Y_test), max_cells)
     return {
         "z_train": z_train,

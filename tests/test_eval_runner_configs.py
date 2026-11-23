@@ -28,6 +28,8 @@ from eval.runners.marginal_calibration_eval import MarginalCalibrationSpec
 from eval.runners.paired_compare import PairedCompareSpec
 from eval.runners.real_audit import RealAuditSpec
 from eval.runners.real_calibration_gate import RealCalibrationGateSpec
+from eval.runners.risk_bo import RiskBOSpec
+from eval.runners.risk_bo_compare import CompareSpec
 from eval.runners.run_benchmarks import BenchmarkSpec
 from eval.runners.sdwpf_audit import SdwpfAuditSpec
 from eval.runners.spatial_correlation_eval import (
@@ -62,6 +64,8 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "eeg_gp_baselines": (EegGpBaselinesSpec, ["out_dir=o"]),
     "beyondarena_joint_eval": (BeyondArenaJointSpec, ["dataset=d", "method=m", "out_dir=o"]),
     "beyondarena_report": (BeyondArenaReportSpec, []),
+    "risk_bo": (RiskBOSpec, []),
+    "risk_bo_compare": (CompareSpec, []),
     "grid_score": (GridScoreSpec, ["grid_dir=g", "ckpts=[a.pt]"]),
 }
 

@@ -435,6 +435,7 @@ def fit_and_eval_gpytorch(
     val_select: bool = False,
     mean: str = "zero",
     laplace: bool = False,
+    observation_noise: bool = True,
 ) -> dict[str, Tensor]:
     """Fit a GP (or DKL) on raw y_train; return {"R", "mean", "Sigma", "log_ml", "n_hparams", "log_evidence", "map_objective"}.
 
@@ -442,8 +443,8 @@ def fit_and_eval_gpytorch(
     n_restarts random initializations and keeps the best (periodic: at least 8, each
     started at its own quantile of the period prior, as its likelihood is multimodal
     in the period). oracle_mode="posterior"
-    returns the fitted posterior at X_test (with noise); "prior" returns the
-    fitted kernel's prior covariance at X_test (with noise). "polynomial" repeats
+    returns the fitted posterior at X_test; "prior" returns the fitted prior.
+    Both include observation noise by default. "polynomial" repeats
     the fit for every candidate degree. With a feature extractor, or when
     val_select applies, 20% of the training points are held out and the step
     with the best held-out NLL is kept (not below P = 8). mean and Sigma are in
@@ -598,7 +599,8 @@ def fit_and_eval_gpytorch(
     model.eval()
     likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        pred = likelihood(model.forward(X_test)) if oracle_mode == "prior" else likelihood(model(X_test))
+        latent = model.forward(X_test) if oracle_mode == "prior" else model(X_test)
+        pred = likelihood(latent) if observation_noise else latent
         mean_post = pred.mean
         Sigma_post = pred.covariance_matrix
         N = X_test.shape[0]

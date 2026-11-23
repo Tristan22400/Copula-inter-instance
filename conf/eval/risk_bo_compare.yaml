@@ -1,0 +1,4 @@
+defaults:
+  - risk_bo_compare_schema
+  - _runner
+  - _self_

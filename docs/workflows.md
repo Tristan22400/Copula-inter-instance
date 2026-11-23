@@ -808,3 +808,128 @@ oarsub -S ./scripts/test_full.sh                 # full suite on a GPU node, bef
 ```
 
 CI (`.github/workflows/ci.yml`) runs the first command, plus ruff and mypy.
+
+## Risk-averse Bayesian optimization
+
+`eval.runners.risk_bo` compares TabPFN-3.5 Fast pretrained and fine-tuned,
+each with and without its matched Nano copula, against Matérn-5/2 GPs on raw
+and log-transformed losses. It uses the 12 weighted Branin–Williams scenarios
+and upper-tail CVaR at 0.7 from
+[Cakmak et al.](https://proceedings.neurips.cc/paper_files/paper/2020/file/e8f2779682fd11fa2067beffc27a9192-Paper.pdf).
+The comparison uses a deterministic Sobol pool and expected improvement in
+CVaR. The one-design and two-design runs both spend 240 scenario evaluations,
+including six shared starting designs. Pair selection scores the improvement
+over the best design within each joint posterior draw.
+
+On a Grid5000 node, run the six policies with `./scripts/risk_bo.sh`. The
+launcher uses the main checkout's model files when called from a worktree.
+To check the entire model path at small budget, run:
+
+```bash
+./scripts/risk_bo.sh n_seeds=1 pool_size=16 n_initial=2 n_designs=4 n_draws=32 gp_steps=4 out_dir=results/risk_bo_smoke
+```
+
+The output directory contains the resumable `traces.json` and `regret.png`.
+Traces include scenario evaluation counts, regret against the pool minimum,
+and whether independence would have selected a different batch under the
+same history. The summary reports paired bootstrap intervals for final
+regret differences across the same seeds.
+
+### BoRisk benchmark suite
+
+Select a problem with the `problem` override. The runner uses a fixed Sobol
+design pool and expected improvement in the selected risk measure. A round
+reveals all scenario outcomes for each selected design, and all surrogates
+receive the same observations when given the same design history.
+
+| `problem` | Default risk | Scenarios per selected design |
+|---|---|---:|
+| `branin-williams` | CVaR at 0.70 | 12 published scenarios and weights |
+| `f6` | CVaR at 0.75 | 8 fixed Sobol scenarios from the uniform environmental domain |
+| `portfolio` | VaR at 0.80 of negative return | 10 fixed Sobol transaction-cost scenarios |
+| `covid-testing` | CVaR at 0.90 | 27 published scenarios with product weights |
+
+`risk_measure=var` switches Branin–Williams to the published VaR objective.
+The two synthetic functions use deterministic evaluations. For `f6`, the
+released benchmark code subtracts all three squared environmental coordinates.
+The portfolio benchmark uses the frozen GP mean from the authors' released
+observations and fitted parameters. The testing-allocation benchmark uses the
+authors' evaluator averaged over seeds 1–10, and caches the resulting
+design–scenario table. Table preparation performs 10 simulator runs per
+design–scenario input. The BO budget in the traces counts queries to the
+finished table. The runner records that multiplier in `traces.json`.
+
+The first two problems are self-contained. Fetch the pinned public assets for
+the other two problems from the worktree:
+
+```bash
+./scripts/fetch_borisk_assets.sh
+uv pip install --python 3.12 --target results/borisk_assets/python-deps --no-deps botorch==0.15.1 pyro-ppl==1.9.1 pyro-api==0.1.2 pyre-extensions==0.0.32 typing-inspect==0.9.0 multipledispatch==1.0.0 opt-einsum==3.4.0
+```
+
+The optional packages are for the isolated testing-allocation evaluator.
+`covid_python` can select a Python interpreter with the evaluator's
+dependencies. The main project environment stays locked. On Grid5000, a
+small verification run uses the following command:
+
+```bash
+./scripts/risk_bo.sh problem=covid-testing pool_size=4 n_initial=2 n_designs=3 n_seeds=1 batch_sizes=[1] n_draws=32 gp_steps=4 out_dir=results/borisk_smoke/covid-testing
+```
+
+Use `prepare_only=true` to build a table before loading any surrogate.
+Set `BORISK_COVID_WORKERS` to control the number of preparation workers
+(default four, capped by the job's CPU affinity).
+The raw Matérn GP is available for every problem. Branin–Williams also runs
+the log-output GP by default.
+
+Run the acquisition comparison on a Grid5000 node with the following command.
+
+```bash
+./scripts/risk_bo_compare.sh
+```
+
+The comparison uses pretrained TabPFN-3.5 with independent marginals, the same
+TabPFN marginals with their paired copula, and scenario-level ARD Matérn-5/2 and
+Matérn-3/2 GPs. GP inputs are scaled per feature using the fixed pool's
+coordinate ranges. The defaults use six paired initializations on a 24-design pool
+and the published risk measures, including Branin–Williams VaR at 0.70.
+`problems`, `acquisitions`, and `n_seeds` can be overridden.
+
+- EI, MES, KG, UCB, and random reveal every scenario for one design per round.
+  The plots show mean best observed regret. Model-based acquisitions act on
+  the scalar risk computed from each scenario posterior draw. UCB uses the
+  authors' default beta of 0.2. MES estimates
+  mutual information with a histogram. Bundle KG scores a shortlist using
+  simulated observations of all scenarios and a shortlist of recommendations.
+- ρ-random, ρKG-apx, and ρKG reveal one design–scenario pair per round. The
+  plots show mean regret of the posterior recommendation after each observation.
+  ρ-random shares observations across models and uses each model to recommend a
+  design. Both ρKG variants screen actions and refit on scalar fantasies.
+  ρKG-apx considers visited designs in the inner recommendation step, including
+  the action's design. ρKG considers the full design pool there.
+
+Each benchmark writes a combined `regret.png` and separate acquisition
+traces under `results/borisk_paper_acquisitions`. Trace summaries include
+paired final-regret differences. The finite pools, fixed environmental grids,
+and frozen simulator tables define the experiment and its regret reference.
+
+### Environmental model calibration
+
+The same runner supports the composite calibration problem from
+[Astudillo and Frazier (2019)](https://proceedings.mlr.press/v97/astudillo19a.html).
+It uses the concentration equation and bounds from the paper and the grid from
+the [released experiment](https://github.com/RaulAstudillo06/BOCF/blob/master/test_4a.py).
+Each simulator evaluation returns all 12 concentrations. The surrogate sees
+the four design features and the reading's position and time on each row.
+Composite EI computes the squared-error loss against the fixed reference profile
+on each joint posterior draw. Regret is measured relative to the known
+continuous optimum of zero. The runner also records the best loss in the finite
+candidate pool.
+
+The default calibration policies compare both pretrained TabPFN variants and
+both joint Matérn GPs, plus a Matérn-5/2 GP for each reading. Run the paired pilot
+on a Grid5000 node with the following command.
+
+```bash
+./scripts/risk_bo.sh problem=environment-calibration batch_sizes=[1] pool_size=64 n_initial=6 n_designs=16 n_seeds=12 n_draws=128 gp_steps=24 scale_gp_inputs=true out_dir=results/environment_calibration
+```

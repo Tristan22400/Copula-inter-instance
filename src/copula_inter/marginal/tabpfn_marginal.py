@@ -364,7 +364,7 @@ def _halfnormal_scale(bardist: Any, width: torch.Tensor) -> torch.Tensor:
 
 
 def bar_icdf(bardist: Any, logits: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-    """FullSupportBarDistribution.icdf at every level of probs at once: (..., n_bars), (Q,) -> (..., Q).
+    """Invert the bar distribution at levels shared across rows or broadcastable to (..., Q).
 
     Differentiable in logits; probs must lie strictly inside (0, 1).
     """

@@ -1,0 +1,33 @@
+defaults:
+  - risk_bo_schema
+  - _runner
+  - _self_
+
+problem: branin-williams
+risk_measure: default
+acquisition: ei
+kg_candidates: 3
+kg_recommendations: 8
+kg_fantasies: 4
+point_initial: 8
+point_budget: 24
+scenario_seed: 43
+asset_dir: results/borisk_assets
+covid_python: null
+prepare_only: false
+policies: null
+batch_sizes: [1, 2]
+pool_size: 256
+pool_seed: 42
+seed: 0
+n_seeds: 30
+n_initial: 6
+n_designs: 20
+n_draws: 512
+query_batch: 512
+k_folds: 10
+gp_steps: 80
+scale_gp_inputs: false
+device: cuda
+checkpoint_dir: null
+out_dir: results/risk_bo
