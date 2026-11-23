@@ -30,6 +30,9 @@ def _live_r_star(kernel: str, n_episodes: int, n_test: int, seed: int) -> list[t
             f"data.kernel={kernel}",
             "data.systematic_composition=false",
             "data.z_train_source=analytic",
+            # Pin P: R_star does not depend on it, but the default range shifts the random stream.
+            "data.P_min=32",
+            "data.P_max=32",
             f"data.N_min={n_test}",
             f"data.N_max={n_test}",
             f"seed={seed}",
