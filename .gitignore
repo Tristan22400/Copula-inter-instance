@@ -31,3 +31,4 @@ build/
 
 # Neural-process benchmark generator venv (scripts/npbench/install_np_venv.sh) and exported tasks
 .venv-npbench/
+oar_logs/
