@@ -355,6 +355,19 @@ hyperprior, the fit's objective) is the optimizer failure rate.
 python -m eval.runners.gp_wellspecified_diag out_json=eval/results/gp_diag/d1_d2.json
 ```
 
+### The fixed evaluation grid
+
+Copula checkpoints on the 25-cell grid (Kumo stage 1 and the four TabICLv2 split modes at
+P in {10, 32, 100, 316, 896}, N = 128, 128 episodes per cell, exact GP posterior stored):
+total / marginal / copula NLL, gain over independence and gap to the oracle per cell, and each
+checkpoint's paired difference to the first. A copula trained on another marginal's PIT reads the
+grid through that marginal's overlay (`pit_overlay_root`, from `copula_inter.repit_dataset`).
+
+```bash
+python -m eval.runners.grid_score grid_dir=/home/trmartin/thoth_storage/copula-inter/data/eval_grid_v1 \
+    ckpts=[<a.pt>,<b.pt>] out_json=results/grid/a_vs_b.json
+```
+
 ### Real ERA5 episodes
 
 These are the same baselines, nested-CV best-of-baselines, tables and caches, on

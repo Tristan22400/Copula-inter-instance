@@ -18,6 +18,7 @@ from eval.runners.ctr23_full_eval import Ctr23FullEvalSpec
 from eval.runners.era5_calibration_eval import Era5CalibrationSpec
 from eval.runners.eval_args import EvalSpec
 from eval.runners.gp_wellspecified_diag import GpDiagSpec
+from eval.runners.grid_score import GridScoreSpec
 from eval.runners.hydra_cli import compose_spec, reject_argparse_flags
 from eval.runners.marginal_calibration_eval import MarginalCalibrationSpec
 from eval.runners.paired_compare import PairedCompareSpec
@@ -53,6 +54,7 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "sdwpf_audit": (SdwpfAuditSpec, []),
     "ctr23_full_eval": (Ctr23FullEvalSpec, ["data_id=44957", "out_json=o.json"]),
     "wandb_report": (WandbReportSpec, []),
+    "grid_score": (GridScoreSpec, ["grid_dir=g", "ckpts=[a.pt]"]),
 }
 
 
