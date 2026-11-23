@@ -253,3 +253,26 @@ def test_bayes_predictive_with_one_component_is_that_gaussian() -> None:
     assert torch.allclose(bp.marginal_log_prob(y), ref_marg, atol=1e-8)
     draws = bp.sample(20_000, torch.Generator().manual_seed(0))
     assert torch.allclose(draws.mean(0), bp.mu[0], atol=0.1 * cov.diagonal().sqrt().max().item())
+
+
+def test_attainable_correlation_handles_a_singular_second_moment() -> None:
+    """A rank-deficient M (two queries with identical z draws) no longer breaks the Cholesky start point."""
+    torch.manual_seed(2)
+    Z = torch.randn(4000, 6, dtype=torch.float64)
+    Z[:, 5] = Z[:, 4]
+    M = Z.T @ Z / Z.shape[0]
+    R = attainable_correlation(M, None, max_iter=50)
+    assert torch.isfinite(R).all()
+    assert torch.allclose(R.diagonal(), torch.ones(6, dtype=torch.float64), atol=1e-6)
+
+
+def test_expected_copula_nll_scores_a_numerically_indefinite_correlation() -> None:
+    """A scored R with a slightly negative eigenvalue gets a finite expected NLL instead of a crash."""
+    torch.manual_seed(5)
+    v = torch.randn(40, 3, dtype=torch.float64)
+    R = v @ v.T
+    d = R.diagonal().rsqrt()
+    R = R * d[:, None] * d[None, :]  # rank 3: singular
+    R = R - 1e-9 * torch.eye(40, dtype=torch.float64) + 1e-9  # nudge below PSD
+    M = torch.eye(40, dtype=torch.float64)
+    assert math.isfinite(expected_copula_nll(R, M))

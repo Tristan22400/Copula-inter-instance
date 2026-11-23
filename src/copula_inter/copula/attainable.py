@@ -24,6 +24,7 @@ from typing import Callable
 import torch
 from torch import Tensor
 
+from copula_inter.copula.loss import _safe_cholesky
 from copula_inter.copula.model import low_rank_correlation
 
 __all__ = ["any_copula_bound", "attainable_correlation", "expected_copula_nll", "pit_moments", "pit_second_moment"]
@@ -34,9 +35,15 @@ def _normalize(S: Tensor) -> Tensor:
     return S * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
 
 
-def _expected_copula_nll_t(R: Tensor, M: Tensor) -> Tensor:
+def _expected_copula_nll_t(R: Tensor, M: Tensor, safe: bool = False) -> Tensor:
     N = R.shape[-1]
-    L = torch.linalg.cholesky(R)
+    if safe:
+        # Exact factor when R is positive-definite; adaptive jitter only when it is not.
+        L, info = torch.linalg.cholesky_ex(R)
+        if bool(info.any()):
+            L = _safe_cholesky(R)
+    else:
+        L = torch.linalg.cholesky(R)
     logdet = 2.0 * torch.log(torch.diagonal(L)).sum()
     trace_rinv_m = torch.trace(torch.cholesky_solve(M, L))
     return (logdet + trace_rinv_m - torch.trace(M)) / (2 * N)
@@ -45,9 +52,11 @@ def _expected_copula_nll_t(R: Tensor, M: Tensor) -> Tensor:
 def expected_copula_nll(R: Tensor, M: Tensor) -> float:
     """Per-point expected Gaussian-copula NLL of correlation R (N, N) for z with second moment M (N, N).
 
-    For M = z z' this is exactly the copula NLL of that z (oracle_copula_nll).
+    For M = z z' this is exactly the copula NLL of that z (oracle_copula_nll). A scored R that is
+    numerically non-positive-definite in float64 falls back to the adaptive jitter of
+    loss._safe_cholesky, as y_space_nll scores the same R in the total table.
     """
-    return float(_expected_copula_nll_t(R.double(), M.double()))
+    return float(_expected_copula_nll_t(R.double(), M.double(), safe=True))
 
 
 def pit_moments(
@@ -91,7 +100,10 @@ def attainable_correlation(
     M64 = M.double()
     N = M64.shape[0]
     eye = torch.eye(N, dtype=torch.float64, device=M64.device)
-    R0 = _normalize(M64) + 1e-6 * eye
+    # Start point: normalize(M) projected onto the positive-definite cone. A Monte Carlo M (or
+    # M - m m') can be numerically singular, e.g. when clamped PITs make queries' z identical.
+    evals0, evecs0 = torch.linalg.eigh(_normalize(M64))
+    R0 = _normalize((evecs0 * evals0.clamp_min(1e-6)) @ evecs0.T) + 1e-6 * eye
 
     if rank is None:
         B = torch.linalg.cholesky(R0).contiguous().requires_grad_(True)
