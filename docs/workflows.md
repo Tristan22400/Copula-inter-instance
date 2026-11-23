@@ -275,6 +275,10 @@ while the nano preset is rank 128. `conf/experiment/finetune_era5.yaml` lists th
 
 ### Synthetic GP episodes
 
+The synthetic benchmark uses variable context and query sizes in each of its four
+kernel settings. Run the full suite on the Grid5000 frontend with
+`./scripts/rerun_gp_posterior_tables.sh full synthetic`.
+
 ```bash
 python -m eval.runners.eval_checkpoint ckpt=copula-nano-finetune-marginal-float32
 oarsub -S "./scripts/eval_checkpoint.sh ckpt=<ckpt>"
