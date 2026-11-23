@@ -37,6 +37,9 @@ def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
     # Every query row kept (null) is the historical format.
     if data.get("query_rows") is None:
         data.pop("query_rows", None)
+    # The re-PIT source (copula_inter.repit_dataset) never shapes generated episodes.
+    data.pop("repit_source_dir", None)
+    data.pop("repit_max_shards", None)
     # The all-random split is the historical prior: it stays out of the identity too.
     split = data.get("split_mode_probs")
     if split is None or all(float(v or 0.0) == 0.0 for k, v in dict(split).items() if k != "random"):

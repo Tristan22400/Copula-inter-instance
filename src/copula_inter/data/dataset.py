@@ -3,6 +3,10 @@
 Layouts (auto-detected): task_XXXXXX.pt (one episode per file) or
 shard_XXXXXX.pt (a list of episodes per file, with meta.pt). Shards are loaded
 with mmap into a small per-worker LRU cache.
+
+A PIT overlay (copula_inter.repit_dataset) replaces z_train, z_test and
+log_pdf_test of a sharded dataset by those of another marginal model: the
+same tables, read through a different marginal.
 """
 
 from __future__ import annotations
@@ -18,6 +22,10 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from copula_inter.data.contracts import validate_episode
+
+# Keys a PIT overlay replaces (copula_inter.repit_dataset), and its metadata file.
+PIT_OVERLAY_KEYS = ("z_train", "z_test", "log_pdf_test")
+PIT_OVERLAY_META = "overlay.json"
 
 # Keys checked for NaN/Inf when an episode is loaded (older shards may contain some).
 _FINITE_CHECK_KEYS = ("z_train", "z_test", "y_train", "y_test")
@@ -46,12 +54,18 @@ class CopulaDataset(Dataset):
     """Dataset of saved PIT episodes (individual files or shards)."""
 
     _SHARD_CACHE_SIZE = 4  # default shards kept in memory per worker process
+    # Sharded mode (set by _init_sharded).
+    _shard_files: List[str]
+    _shard_size: int
+    _n_total: int
 
     def __init__(
         self,
         episode_dir: Optional[str] = None,
         file_list: Optional[List[str]] = None,
         shard_cache_size: Optional[int] = None,
+        pit_overlay_dir: Optional[str] = None,
+        max_shards: Optional[int] = None,
     ) -> None:
         # Cache size (size it to hold a ShardBlockSampler block).
         if shard_cache_size is not None:
@@ -70,13 +84,53 @@ class CopulaDataset(Dataset):
 
         if shard_files and os.path.exists(meta_path):
             self._init_sharded(shard_files, meta_path)
+            if max_shards is not None:
+                self._keep_first_shards(int(max_shards))
+            if pit_overlay_dir is not None:
+                self._init_overlay(pit_overlay_dir)
         else:
+            if pit_overlay_dir is not None or max_shards is not None:
+                raise ValueError(
+                    f"pit_overlay_dir / max_shards need a sharded dataset; {episode_dir} has no shard_*.pt + meta.pt"
+                )
             indiv_files = sorted(glob(os.path.join(episode_dir, "task_*.pt")))
             if not indiv_files:
                 raise RuntimeError(
                     f"No episode files found in {episode_dir}. Expected shard_*.pt+meta.pt or task_*.pt files."
                 )
             self._init_individual(indiv_files)
+
+    _overlay_files: Optional[List[str]] = None
+
+    def _keep_first_shards(self, max_shards: int) -> None:
+        """Restrict the dataset to its first max_shards shards (a fixed subset, e.g. one pass in a short run)."""
+        if max_shards < 1:
+            raise ValueError(f"max_shards={max_shards} must be at least 1")
+        if max_shards < len(self._shard_files):
+            self._shard_files = self._shard_files[:max_shards]
+            self._n_total = max_shards * self._shard_size
+
+    def _init_overlay(self, overlay_dir: str) -> None:
+        """Check that overlay_dir is a complete PIT overlay of this dataset's tables."""
+        meta_path = os.path.join(overlay_dir, PIT_OVERLAY_META)
+        if not os.path.isfile(meta_path):
+            raise ValueError(f"{overlay_dir} is not a PIT overlay (no {PIT_OVERLAY_META})")
+        with open(meta_path, encoding="utf-8") as source:
+            meta = json.load(source)
+        source_dir = os.path.dirname(self._shard_files[0])
+        with open(os.path.join(source_dir, "manifest.json"), encoding="utf-8") as source:
+            digest = json.load(source).get("digest")
+        if meta.get("source_digest") != digest:
+            raise ValueError(f"PIT overlay {overlay_dir} was computed from another dataset than {source_dir}")
+        if int(meta["shard_size"]) != self._shard_size:
+            raise ValueError(f"PIT overlay {overlay_dir} has shard_size {meta['shard_size']}, not {self._shard_size}")
+        files = [os.path.join(overlay_dir, os.path.basename(path)) for path in self._shard_files]
+        missing = [path for path in files if not os.path.isfile(path)]
+        if missing:
+            raise ValueError(
+                f"PIT overlay {overlay_dir} lacks {len(missing)} of {len(files)} shards, e.g. {missing[0]}"
+            )
+        self._overlay_files = files
 
     def _init_individual(self, files: List[str]) -> None:
         self._mode = "individual"
@@ -120,6 +174,7 @@ class CopulaDataset(Dataset):
             if sum(counts) != self._n_total:
                 raise ValueError(f"shard counts disagree with {meta_path}")
         self._shard_cache: OrderedDict[str, list] = OrderedDict()
+        self._overlay_cache: OrderedDict[str, list] = OrderedDict()
 
     @property
     def shard_size(self) -> int:
@@ -175,7 +230,28 @@ class CopulaDataset(Dataset):
         if local_idx >= len(shard):
             raise ValueError(f"shard {shard_path} has fewer episodes than its metadata declares")
         # Derive R_prior/Sigma_star on a shallow copy so the cached shard stays mmap-only.
-        return _add_derived_fields(dict(shard[local_idx]))
+        ep = dict(shard[local_idx])
+        if self._overlay_files is not None:
+            ep.update(self._overlay_entry(shard_idx, local_idx, ep))
+        return _add_derived_fields(ep)
+
+    def _overlay_entry(self, shard_idx: int, local_idx: int, ep: dict) -> dict:
+        """The PIT_OVERLAY_KEYS of one episode from the overlay, checked against its table shape."""
+        assert self._overlay_files is not None
+        path = self._overlay_files[shard_idx]
+        if path not in self._overlay_cache:
+            if len(self._overlay_cache) >= self._SHARD_CACHE_SIZE:
+                self._overlay_cache.popitem(last=False)
+            self._overlay_cache[path] = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        else:
+            self._overlay_cache.move_to_end(path)
+        overlay = self._overlay_cache[path]
+        if local_idx >= len(overlay):
+            raise ValueError(f"PIT overlay shard {path} has fewer episodes than its table shard")
+        entry = {key: overlay[local_idx][key] for key in PIT_OVERLAY_KEYS}
+        if entry["z_train"].shape != ep["z_train"].shape or entry["z_test"].shape != ep["z_test"].shape:
+            raise ValueError(f"PIT overlay shard {path} episode {local_idx} does not match its table's (P, N)")
+        return entry
 
     def _get_sharded(self, idx: int) -> dict:
         # Skip non-finite episodes, to the next episode in the same shard.

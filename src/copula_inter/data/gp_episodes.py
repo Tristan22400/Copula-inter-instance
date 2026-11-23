@@ -766,30 +766,21 @@ def _marginal_pit(
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         z_train = ((y_train - y_mean) / y_std).detach()
-    elif marginal_backend in GENERIC_MARGINAL_BACKENDS:
-        # Batched PIT for a non-TabICL backend from its full predictive distribution:
-        # (k_folds + 1) fused forwards for the call.
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        y_train_s = ((y_train - y_mean) / y_std).detach().cpu().numpy()
-        y_test_s = ((y_test - y_mean) / y_std).detach().cpu().numpy()
-        x_train_np = draw.x_norm_train.detach().cpu().numpy()
-        x_test_np = draw.x_norm_test.detach().cpu().numpy()
-        base_seed = int(getattr(cfg, "seed", None) or 0)
-        _run_batched = batched_pit(marginal_backend)
-        out = _run_batched(
-            marginal_regressor,
-            x_train_np,
-            y_train_s,
-            x_test_np,
-            y_test_s,
+    elif marginal_backend in GENERIC_MARGINAL_BACKENDS or (
+        apply_tabicl and tabicl_split_calib_frac <= 0 and marginal_backend in (None, "tabicl")
+    ):
+        z_train, z_test, log_pdf_test = marginal_pit_tables(
+            draw.x_norm_train,
+            y_train,
+            draw.x_norm_test,
+            y_test,
+            device,
+            seed=int(getattr(cfg, "seed", None) or 0),
             k_folds=tabicl_k_folds,
-            seed=base_seed,
+            tabicl_model=tabicl_model if marginal_backend in (None, "tabicl") else None,
+            marginal_backend=marginal_backend,
+            marginal_regressor=marginal_regressor,
         )
-        z_train = torch.from_numpy(out["z_train"]).to(device=device)
-        z_test = torch.from_numpy(out["z_test"]).to(device=device)
-        # Jacobian back to raw-y nats.
-        log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
     elif marginal_backend is not None and marginal_backend != "tabicl":
         raise ValueError(f"marginal_backend={marginal_backend!r} has no batched PIT (backend_registry.batched_pit).")
     elif apply_tabicl and tabicl_split_calib_frac > 0:
@@ -812,30 +803,73 @@ def _marginal_pit(
             Y_calib_raw=y_calib.unsqueeze(-1),
         )
         z_train = split_pit["z_train"].squeeze(-1)  # (B, P)
-    elif apply_tabicl:
-        # "tabicl": K-fold PIT on the training points and a full-context PIT on the
-        # real test points; z_train, z_test and log_pdf_test all come from TabICL.
+    return z_train, z_test, log_pdf_test
+
+
+def marginal_pit_tables(
+    x_norm_train: Tensor,
+    y_train: Tensor,
+    x_norm_test: Tensor,
+    y_test: Tensor,
+    device: Device,
+    *,
+    seed: int,
+    k_folds: int,
+    tabicl_model: Optional[TabICLLike] = None,
+    marginal_backend: Optional[str] = None,
+    marginal_regressor: Any = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """(z_train, z_test, log_pdf_test) of a batch of tables under a frozen marginal model.
+
+    z_train is the K-fold PIT of the P context rows (each fold predicted from the
+    other folds), z_test the PIT of the N query rows given all P context rows, and
+    log_pdf_test their log-density in raw-y nats. Targets are z-scored per table
+    before the model sees them. The model is TabICL when tabicl_model is given,
+    else the backend named by marginal_backend (GENERIC_MARGINAL_BACKENDS).
+
+    Args:
+        x_norm_train: (B, P, d). y_train: (B, P). x_norm_test: (B, N, d). y_test: (B, N).
+        seed: fold-assignment seed of the generic backends.
+    """
+    y_mean = y_train.mean(dim=1, keepdim=True)
+    y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+    if tabicl_model is not None:
+        # K-fold PIT on the training points and a full-context PIT on the real test points.
         from copula_inter.marginal.pit import run_pit_batched  # local: pit.py imports from this module
 
-        assert tabicl_model is not None
-
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
         y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)  # (B, N, 1)
         tabicl_pit = run_pit_batched(
             tabicl_model,
-            draw.x_norm_train,
+            x_norm_train,
             y_train_scaled,
-            draw.x_norm_test,
+            x_norm_test,
             y_test_scaled,
-            k_folds=tabicl_k_folds,
+            k_folds=k_folds,
             Y_train_raw=y_train.unsqueeze(-1),
         )
         z_train = tabicl_pit["z_train"].squeeze(-1)  # (B, P)
         z_test = tabicl_pit["z_test"].squeeze(-1)  # (B, N)
         # Jacobian back to raw-y nats: log p_raw = log p_scaled - log(std).
         log_pdf_test = tabicl_pit["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast
+        return z_train, z_test, log_pdf_test
+    if marginal_backend not in GENERIC_MARGINAL_BACKENDS:
+        raise ValueError(f"marginal_backend={marginal_backend!r} has no batched PIT (backend_registry.batched_pit).")
+    # Batched PIT for a non-TabICL backend from its full predictive distribution:
+    # (k_folds + 1) fused forwards for the call.
+    out = batched_pit(marginal_backend)(
+        marginal_regressor,
+        x_norm_train.detach().cpu().numpy(),
+        ((y_train - y_mean) / y_std).detach().cpu().numpy(),
+        x_norm_test.detach().cpu().numpy(),
+        ((y_test - y_mean) / y_std).detach().cpu().numpy(),
+        k_folds=k_folds,
+        seed=seed,
+    )
+    z_train = torch.from_numpy(out["z_train"]).to(device=device)
+    z_test = torch.from_numpy(out["z_test"]).to(device=device)
+    # Jacobian back to raw-y nats.
+    log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
     return z_train, z_test, log_pdf_test
 
 

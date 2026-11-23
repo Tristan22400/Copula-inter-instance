@@ -628,6 +628,11 @@ query_rows: null
 # in on-disk shards: R_star / mu_star / sigma_star are prior quantities, and the kernel metadata the
 # posterior is rebuilt from is not saved. For evaluation sets (oracle headroom, exact-z copula score).
 store_posterior_oracle: false
+# copula_inter.repit_dataset: the pit/ directory of a dataset whose PIT is recomputed with the
+# marginal set by z_train_source into a PIT overlay at pit_dir (read by training.pit_overlay_dir).
+repit_source_dir: null
+# Re-PIT only the first repit_max_shards shards of repit_source_dir (null: all).
+repit_max_shards: null
 
 # Save the oracle correlation R_star (N x N) in on-disk shards (generate_pit_dataset). false cuts
 # an N=256 episode from ~270 KB to ~12 KB; training never reads R_star.

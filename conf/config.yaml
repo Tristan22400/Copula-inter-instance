@@ -90,6 +90,15 @@ training:
   # On-disk held-out set for validation, shared across runs (null: carve val_episodes out of
   # dataset_dir). Its episodes must not be in dataset_dir (generate it with another seed).
   val_dataset_dir: null
+  # PIT overlay of dataset_dir (copula_inter.repit_dataset): the same tables with z_train,
+  # z_test and log_pdf_test from another marginal model. null reads the dataset's own PIT.
+  pit_overlay_dir: null
+  # The overlay of val_dataset_dir, computed with the same marginal (required with
+  # pit_overlay_dir when val_dataset_dir is set).
+  val_pit_overlay_dir: null
+  # Train on the first max_shards shards of dataset_dir only (null: all). With steps x batch_size
+  # = max_shards x shard_size every episode is seen once.
+  max_shards: null
   # Override for the on-disk dataset DataLoader worker count (train.py's
   # loader_num_workers). null keeps the built-in defaults (4 fixed-d, 2
   # variable-d) — set explicitly to tune, e.g. now that dataset.py loads

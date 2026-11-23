@@ -182,6 +182,10 @@ def dataset_name(t: DictConfig, data_cfg: DictConfig, live_generation: bool) -> 
     # Include the parent folder in the dataset name.
     parent_name = os.path.basename(os.path.dirname(dataset_path))
     shard_name = os.path.basename(dataset_path)
+    overlay_dir = t.get("pit_overlay_dir", None)
+    if overlay_dir:
+        # The marginal model that produced the PIT, named by its overlay's folder.
+        shard_name += "+" + os.path.basename(os.path.dirname(os.path.normpath(overlay_dir)))
     return f"{parent_name}/{shard_name}" if parent_name else shard_name
 
 
@@ -710,12 +714,36 @@ def build_data_loaders(
         if shard_files and os.path.exists(meta_path):
             shard_block_shards = int(t.get("shard_block_shards", 16))
             # Cache a full shard block (+4 for workers straddling blocks).
-            full_dataset = CopulaDataset(episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4)
+            # training.pit_overlay_dir: read the tables through another marginal model's PIT
+            # (copula_inter.repit_dataset); training.val_pit_overlay_dir does the same for val_dataset_dir.
+            overlay_dir = t.get("pit_overlay_dir", None)
+            # training.max_shards: train on the first max_shards shards of dataset_dir only.
+            max_shards = t.get("max_shards", None)
+            full_dataset = CopulaDataset(
+                episode_dir=t.dataset_dir,
+                shard_cache_size=shard_block_shards + 4,
+                pit_overlay_dir=overlay_dir,
+                max_shards=None if max_shards is None else int(max_shards),
+            )
+            if max_shards is not None:
+                print(f"[train] training.max_shards={max_shards}: {len(full_dataset)} episodes of {t.dataset_dir}.")
             n = len(full_dataset)
             # training.val_dataset_dir: a separate held-out set shared by runs (every training
             # episode is then used); else val is carved out of dataset_dir.
             val_dir = t.get("val_dataset_dir", None)
-            val_full = CopulaDataset(episode_dir=str(val_dir), shard_cache_size=4) if val_dir else full_dataset
+            val_overlay_dir = t.get("val_pit_overlay_dir", None)
+            if overlay_dir is not None and val_dir and val_overlay_dir is None:
+                raise ValueError(
+                    "training.pit_overlay_dir is set but training.val_pit_overlay_dir is not: validation "
+                    "on training.val_dataset_dir would read another marginal's PIT."
+                )
+            if overlay_dir is not None:
+                print(f"[train] PIT overlay: {overlay_dir} (val: {val_overlay_dir or overlay_dir}).")
+            val_full = (
+                CopulaDataset(episode_dir=str(val_dir), shard_cache_size=4, pit_overlay_dir=val_overlay_dir)
+                if val_dir
+                else full_dataset
+            )
             n_v = len(val_full)
             n_val = min(int(t.get("val_episodes", 500)), n_v)
             # Stride validation indices across the dataset so val spans many shards.
