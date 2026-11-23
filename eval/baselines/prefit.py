@@ -203,7 +203,13 @@ def _fit_baselines_task(payload: tuple) -> tuple:
         import traceback
 
         return cache_key, None, f"{exc}\n{traceback.format_exc()}"
-    result = {"nlls": nlls, "R_dict": R_dict, "y_nlls": y_nlls, "episode_digest": episode_digest(ep)}
+    result = {
+        "nlls": nlls,
+        "R_dict": R_dict,
+        "y_nlls": y_nlls,
+        "episode_digest": episode_digest(ep),
+        "episode_targets": episode_targets(ep),
+    }
     return cache_key, _pool_encode_tensors(result), None
 
 
@@ -236,24 +242,52 @@ def episode_digest(ep: dict) -> str:
     return h.hexdigest()
 
 
+# Tolerance under which a cached fit is reused for targets that differ (relative to max(1, std y)).
+_TARGET_REUSE_TOL = 1e-4
+
+
+def episode_targets(ep: dict) -> dict[str, np.ndarray]:
+    """The targets a cached fit was computed on (float32), stored with it for tolerance matching."""
+    return {k: ep[k].detach().float().cpu().numpy() for k in ("y_train", "y_test")}
+
+
+def targets_match(stored: dict[str, np.ndarray], ep: dict, tol: float = _TARGET_REUSE_TOL) -> bool:
+    """True when ep's targets equal the stored ones up to tol * max(1, std(y_train)) in every entry.
+
+    Live synthetic episodes are generated on the eval device, and GPU models differ by ~1e-6 for the
+    same seed and index: those are the same episode, and a fit made on one is valid for the other
+    (its scores move by a comparable amount). A different draw differs by O(1) and is refitted.
+    """
+    new = episode_targets(ep)
+    if any(stored[k].shape != new[k].shape for k in new):
+        return False
+    scale = max(1.0, float(np.std(new["y_train"])))
+    return all(float(np.max(np.abs(stored[k] - new[k]), initial=0.0)) <= tol * scale for k in new)
+
+
 def _valid_cached_entry(
     cache_entries: dict,
     cache_key: str,
     ep_i: int,
     expected: frozenset[str] = EXPECTED_BASELINE_KEYS,
     digest: str | None = None,
+    ep: dict | None = None,
 ) -> dict | None:
     """The cached entry for this episode, or None if missing, fitted on other targets, lacking an expected key, or of an older schema.
 
-    Entries written before episode digests existed carry none and are accepted as they are.
+    Entries written before episode digests existed carry none and are accepted as they are. When the
+    digest differs, an entry that stores its targets is still reused if they match ep's within
+    tolerance (targets_match): the same episode generated on another device.
     """
     cached = cache_entries.get(cache_key)
     if cached is None:
         return None
     if digest is not None and cached.get("episode_digest", digest) != digest:
-        # Same key, different episode (e.g. generated on another device).
-        print(f"  [ep {ep_i}] cached baselines were fitted on a different episode — refitting")
-        return None
+        stored = cached.get("episode_targets")
+        if ep is None or stored is None or not targets_match(stored, ep):
+            # Same key, different episode.
+            print(f"  [ep {ep_i}] cached baselines were fitted on a different episode — refitting")
+            return None
     if not expected.issubset(cached["nlls"].keys()):
         # Missing a baseline added later.
         missing = expected - cached["nlls"].keys()

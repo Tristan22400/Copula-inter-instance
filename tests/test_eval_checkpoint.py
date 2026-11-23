@@ -654,3 +654,25 @@ def test_cached_fits_are_only_reused_for_the_same_episode(tiny_episode: dict[str
     assert _valid_cached_entry({"k": legacy}, "k", 0, keys, digest=digest) is legacy
     # Float noise far below the rounding does not change the digest.
     assert episode_digest({**tiny_episode, "y_train": tiny_episode["y_train"] + 1e-7}) == digest
+
+
+def test_baseline_cache_reuses_a_fit_across_devices_within_tolerance(tiny_episode: dict) -> None:
+    """The same episode generated on another GPU (targets ~1e-6 apart, digest changed by rounding) reuses the
+    stored fit; a different draw is refitted; an entry without stored targets keeps the digest rule."""
+    from eval.baselines.classical import expected_baseline_keys
+    from eval.baselines.prefit import _valid_cached_entry, episode_digest, episode_targets
+
+    keys = expected_baseline_keys(False)
+    nlls = dict.fromkeys(keys, 0.0)
+    entry = {
+        "nlls": nlls,
+        "y_nlls": {},
+        "episode_digest": "digest-on-another-gpu",
+        "episode_targets": episode_targets(tiny_episode),
+    }
+    near = {**tiny_episode, "y_train": tiny_episode["y_train"] + 2e-6}
+    assert _valid_cached_entry({"k": entry}, "k", 0, keys, digest=episode_digest(near), ep=near) is entry
+    far = {**tiny_episode, "y_test": tiny_episode["y_test"] + 0.1}
+    assert _valid_cached_entry({"k": entry}, "k", 0, keys, digest=episode_digest(far), ep=far) is None
+    no_targets = {k: v for k, v in entry.items() if k != "episode_targets"}
+    assert _valid_cached_entry({"k": no_targets}, "k", 0, keys, digest=episode_digest(near), ep=near) is None

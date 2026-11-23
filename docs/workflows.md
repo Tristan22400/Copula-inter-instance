@@ -360,6 +360,14 @@ checkpoint. To compare a second checkpoint on the same episodes, share
 `baselines.cache` and give each checkpoint its own `output.results_cache`; only
 the ICL forward pass is redone.
 
+Live synthetic episodes are generated on the eval device, so GPU models differ by ~1e-6 for the same
+`seed:idx`. A cached fit stores its targets and is reused when a new episode's targets match within
+1e-4 · max(1, std y) (`eval/baselines/prefit.py::targets_match`); entries written before 2026-11-22 have
+no stored targets and are refitted once on another GPU model. Runs that share a `baselines.cache` but
+start together all fit the same missing episodes: start one run, and the others after its
+`[prefit] fitted` line. For tables that must be bit-identical across checkpoints, generate the episodes
+once to disk and pass `dataset_dir=` to every run.
+
 ### Real-data benchmarks
 
 `real.dataset=<name>` swaps the episode source for one of `eval/data/real/`,
