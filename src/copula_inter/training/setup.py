@@ -182,6 +182,10 @@ def dataset_name(t: DictConfig, data_cfg: DictConfig, live_generation: bool) -> 
     # Include the parent folder in the dataset name.
     parent_name = os.path.basename(os.path.dirname(dataset_path))
     shard_name = os.path.basename(dataset_path)
+    overlay_dir = t.get("pit_overlay_dir", None)
+    if overlay_dir:
+        # The marginal model that produced the PIT, named by its overlay's folder.
+        shard_name += "+" + os.path.basename(os.path.dirname(os.path.normpath(overlay_dir)))
     return f"{parent_name}/{shard_name}" if parent_name else shard_name
 
 
@@ -645,7 +649,6 @@ def init_wandb_run(cfg: DictConfig, dataset_name: str, t: DictConfig) -> None:
             ("muon_ns_steps", "ns"),
             ("clip_grad_norm", "clip"),
             ("nll_weight", "nll"),
-            ("aux_mae_weight", "aux"),
             ("compile", "compile"),
         ],
     )
@@ -711,15 +714,46 @@ def build_data_loaders(
         if shard_files and os.path.exists(meta_path):
             shard_block_shards = int(t.get("shard_block_shards", 16))
             # Cache a full shard block (+4 for workers straddling blocks).
-            full_dataset = CopulaDataset(episode_dir=t.dataset_dir, shard_cache_size=shard_block_shards + 4)
+            # training.pit_overlay_dir: read the tables through another marginal model's PIT
+            # (copula_inter.repit_dataset); training.val_pit_overlay_dir does the same for val_dataset_dir.
+            overlay_dir = t.get("pit_overlay_dir", None)
+            # training.max_shards: train on the first max_shards shards of dataset_dir only.
+            max_shards = t.get("max_shards", None)
+            full_dataset = CopulaDataset(
+                episode_dir=t.dataset_dir,
+                shard_cache_size=shard_block_shards + 4,
+                pit_overlay_dir=overlay_dir,
+                max_shards=None if max_shards is None else int(max_shards),
+            )
+            if max_shards is not None:
+                print(f"[train] training.max_shards={max_shards}: {len(full_dataset)} episodes of {t.dataset_dir}.")
             n = len(full_dataset)
-            n_val = min(int(t.get("val_episodes", 500)), n)
+            # training.val_dataset_dir: a separate held-out set shared by runs (every training
+            # episode is then used); else val is carved out of dataset_dir.
+            val_dir = t.get("val_dataset_dir", None)
+            val_overlay_dir = t.get("val_pit_overlay_dir", None)
+            if overlay_dir is not None and val_dir and val_overlay_dir is None:
+                raise ValueError(
+                    "training.pit_overlay_dir is set but training.val_pit_overlay_dir is not: validation "
+                    "on training.val_dataset_dir would read another marginal's PIT."
+                )
+            if overlay_dir is not None:
+                print(f"[train] PIT overlay: {overlay_dir} (val: {val_overlay_dir or overlay_dir}).")
+            val_full = (
+                CopulaDataset(episode_dir=str(val_dir), shard_cache_size=4, pit_overlay_dir=val_overlay_dir)
+                if val_dir
+                else full_dataset
+            )
+            n_v = len(val_full)
+            n_val = min(int(t.get("val_episodes", 500)), n_v)
             # Stride validation indices across the dataset so val spans many shards.
-            val_indices = sorted(set(int(i) for i in torch.linspace(0, n - 1, n_val)))
-            val_set = set(val_indices)
+            val_indices = sorted(set(int(i) for i in torch.linspace(0, n_v - 1, n_val)))
+            val_set = set(val_indices) if not val_dir else set()
             train_indices = [i for i in range(n) if i not in val_set]
             train_dataset = Subset(full_dataset, train_indices)
-            val_dataset = Subset(full_dataset, val_indices)
+            val_dataset = Subset(val_full, val_indices)
+            if val_dir:
+                print(f"[train] validation on training.val_dataset_dir={val_dir} ({n_val} of {n_v} episodes).")
 
             # Detect datasets whose d_features varies per shard.
             shard_size = full_dataset.shard_size
@@ -749,7 +783,7 @@ def build_data_loaders(
                 )
                 val_batch_sampler = ShardHomogeneousBatchSampler(
                     val_dataset.indices,
-                    shard_size=shard_size,
+                    shard_size=val_full.shard_size,
                     batch_size=t.batch_size,
                     shuffle=False,
                 )
@@ -759,6 +793,11 @@ def build_data_loaders(
                     train_dataset.indices,
                     shard_size=shard_size,
                     block_shards=shard_block_shards,
+                )
+            if val_dir and val_batch_sampler is None:
+                # An external val set may vary d or (P, N) per shard: batch within one shard.
+                val_batch_sampler = ShardHomogeneousBatchSampler(
+                    val_dataset.indices, shard_size=val_full.shard_size, batch_size=t.batch_size, shuffle=False
                 )
         else:
             all_files = sorted(glob(os.path.join(t.dataset_dir, "task_*.pt")))

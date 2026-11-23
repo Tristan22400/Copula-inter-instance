@@ -250,16 +250,14 @@ def _train_step(m: SimpleNamespace, out: dict[str, torch.Tensor]) -> dict[str, t
     )
 
     def step(tag: str) -> torch.Tensor:
-        o, _Sigma, parts, loss, _aux = m.train_core._forward_and_loss(
+        o, _Sigma, parts, loss = m.train_core._forward_and_loss(
             model=model,
             batch=batch,
             device="cpu",
             use_amp=False,
             amp_dtype=torch.float32,
             nll_weight=1.0,
-            aux_mae_weight=0.0,
             jitter=1e-4,
-            triu_cache={},
         )
         out[f"train.{tag}.W"] = o["W"].detach().clone()
         if o.get("s") is not None:

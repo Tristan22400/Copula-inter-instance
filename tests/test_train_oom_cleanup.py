@@ -74,9 +74,7 @@ def test_oom_unwinds_train_step_graph(monkeypatch: MonkeyPatch) -> None:
             scaler=None,
             clip_grad_norm=1.0,
             nll_weight=1.0,
-            aux_mae_weight=0.0,
             jitter=1e-4,
-            triu_cache={},
             phase_start=lambda: None,
             phase_end=lambda *_args: None,
         )

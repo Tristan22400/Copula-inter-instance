@@ -1,8 +1,7 @@
 """Live training episodes from real ARCO-ERA5 2 m temperature (src/copula_inter/era5/corpus.py).
 
 Enabled with training.live_generation=true training.live_source=era5. There
-is no oracle correlation, so episodes carry only what y_space_nll needs
-(training.aux_mae_weight must be 0). z_train/z_test/log_pdf_test come from a
+is no oracle correlation, so episodes carry only what y_space_nll needs. z_train/z_test/log_pdf_test come from a
 frozen TabICL (or another marginal backend) PIT, so a checkpoint is required.
 """
 

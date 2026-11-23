@@ -24,13 +24,21 @@ def validate_episode(ep: Mapping[str, Any]) -> None:
         "z_train": (p,),
         "z_test": (n,),
         "log_pdf_test": (n,),
-        "R_star": (n, n),
         "mu_star": (n,),
         "sigma_star": (n,),
     }
     optional = {
+        # The oracle correlation: absent from shards generated with data.store_r_star=false
+        # (training never reads it; oracle diagnostics do).
+        "R_star": (n, n),
         "R_prior": (n, n),
         "Sigma_star": (n, n),
+        # SCM + GP residual prior (data.scm_residual): the known mean at the rows, and scalars.
+        "mean_train": (p,),
+        "mean_test": (n,),
+        "lambda_resid": (),
+        "scm_prior_type": (),
+        "kernel_scale": (),
     }
     for key, shape in shapes.items():
         if key not in ep or tuple(ep[key].shape) != shape:

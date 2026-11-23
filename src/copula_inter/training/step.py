@@ -33,14 +33,12 @@ def _forward_and_loss(
     use_amp: bool,
     amp_dtype: torch.dtype,
     nll_weight: float,
-    aux_mae_weight: float,
     jitter: float,
-    triu_cache: dict[int, torch.Tensor],
     parametrization: str = "covnorm",
     phase_start: Callable[[], Any] = lambda: None,
     phase_end: Callable[[str, Any], None] = lambda name, start: None,
-) -> tuple[dict[str, torch.Tensor], LowRankCorrelationFactor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    """Forward pass and loss: Y-space NLL, plus the optional aux MAE and MoE auxiliary terms.
+) -> tuple[dict[str, torch.Tensor], LowRankCorrelationFactor, dict[str, torch.Tensor], torch.Tensor]:
+    """Forward pass and loss: the weighted Y-space NLL.
 
     phase_start/phase_end time the phases (no-ops by default).
     """
@@ -69,23 +67,8 @@ def _forward_and_loss(
     )
     loss = nll_weight * parts["total"]
 
-    # Auxiliary MAE (L1) on off-diagonal correlations vs oracle R_star.
-    aux_mae = parts["total"].new_tensor(0.0)
-    if aux_mae_weight > 0.0:
-        Sigma_dense = Sigma.dense()
-        n_test = Sigma_dense.shape[1]
-        mask_2d = batch["test_mask"].unsqueeze(-1) & batch["test_mask"].unsqueeze(-2)
-        if n_test not in triu_cache:
-            triu_cache[n_test] = torch.triu_indices(n_test, n_test, offset=1, device=Sigma_dense.device)
-        ri, ci = triu_cache[n_test]
-        valid_off = mask_2d[:, ri, ci]
-        if valid_off.any():
-            pred_off = Sigma_dense[:, ri, ci][valid_off]
-            oracle_off = batch["R_star"].float()[:, ri, ci][valid_off]
-            aux_mae = (pred_off - oracle_off).abs().mean()
-        loss = loss + aux_mae_weight * aux_mae
     phase_end("loss", ev_loss0)
-    return out, Sigma, parts, loss, aux_mae
+    return out, Sigma, parts, loss
 
 
 def _measure_step_flops(
@@ -96,23 +79,19 @@ def _measure_step_flops(
     use_amp: bool,
     amp_dtype: torch.dtype,
     nll_weight: float,
-    aux_mae_weight: float,
     jitter: float,
-    triu_cache: dict[int, torch.Tensor],
     parametrization: str = "covnorm",
 ) -> float:
     """FLOPs of one forward+backward under FlopCounterMode, without an optimizer step (for MFU)."""
     with FlopCounterMode(display=False) as flop_ctr:
-        _, _, _, loss, _ = _forward_and_loss(
+        _, _, _, loss = _forward_and_loss(
             model=model,
             batch=batch,
             device=device,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             nll_weight=nll_weight,
-            aux_mae_weight=aux_mae_weight,
             jitter=jitter,
-            triu_cache=triu_cache,
             parametrization=parametrization,
         )
         loss.backward()
@@ -133,9 +112,7 @@ def _run_train_step(
     scaler: GradScaler | None,
     clip_grad_norm: float,
     nll_weight: float,
-    aux_mae_weight: float,
     jitter: float,
-    triu_cache: dict[int, torch.Tensor],
     phase_start: Callable[[], Any],
     phase_end: Callable[[str, Any], None],
     parametrization: str = "covnorm",
@@ -145,19 +122,16 @@ def _run_train_step(
     dict[str, torch.Tensor],
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
 ]:
     """Run one training step in its own frame, so an OOM releases every graph tensor when it unwinds."""
-    out, Sigma, parts, loss, aux_mae = _forward_and_loss(
+    out, Sigma, parts, loss = _forward_and_loss(
         model=model,
         batch=batch,
         device=device,
         use_amp=use_amp,
         amp_dtype=amp_dtype,
         nll_weight=nll_weight,
-        aux_mae_weight=aux_mae_weight,
         jitter=jitter,
-        triu_cache=triu_cache,
         phase_start=phase_start,
         phase_end=phase_end,
         parametrization=parametrization,
@@ -177,4 +151,4 @@ def _run_train_step(
 
     scheduler.step()
     phase_end("backward_step", ev_bwd0)
-    return out, Sigma, parts, loss, aux_mae, grad_norm
+    return out, Sigma, parts, loss, grad_norm

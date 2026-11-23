@@ -20,8 +20,6 @@ training:
   warmup_steps: 200
   muon_lr: 4.0e-5
   batch_size: 16
-  # Real ERA5 has no oracle R_star.
-  aux_mae_weight: 0.0
   ckpt_dir: checkpoints/era5-finetune-${path_stem:${training.resume_ckpt}}-${now:%Y%m%d-%H%M%S}
 
 era5_live:

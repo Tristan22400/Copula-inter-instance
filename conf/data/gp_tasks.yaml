@@ -5,6 +5,8 @@
 d_features: 10          # total feature columns; fallback used only when
                         # d_features_lognormal_loc/scale below are unset.
 
+# GP-prior episodes only (and SCM episodes with scm_residual.prior_shapes=false): SCM + GP
+# residual episodes take d, P and N from TabICLv2's prior (scm_residual.prior_shapes).
 # Total feature count d ~ round(LogNormal(d_features_lognormal_loc,
 # d_features_lognormal_scale)), clipped to a minimum of 2, sampled once per
 # shard (every episode within one shard shares the same d — see
@@ -587,9 +589,73 @@ z_train_corruption_prob: 1.0
 z_train_corruption_rho_beta_a: 3.5
 z_train_corruption_rho_beta_b: 1.5
 
+# SCM + GP residual prior (src/copula_inter/data/scm_prior.py). Everything about the table
+# comes from TabICLv2's regressor prior: the graph SCM's features X and target g (no feature
+# warps of ours), and the shape d, P, N (prior_shapes). This file contributes only the GP
+# residual: kernel choice and composition, its hyperparameter priors, active dims, hidden
+# kernel warp and the nugget:
+#   y = a_g g~(x) + r(x) + eps,   r ~ GP(0, K),   eps ~ N(0, sigma_n^2),
+# g~ the SCM target standardized over the episode. lambda = 0 is TabICLv2's i.i.d. prior,
+# lambda = 1 the zero-mean GP prior. The analytic oracle is conditional on g (which no model
+# sees), so data.z_train_source must be a learned marginal. Off by default;
+# conf/experiment/scm_residual.yaml enables it.
+scm_residual:
+  enabled: false
+  prob: 1.0                  # per-call probability of an SCM episode (else a GP episode)
+  prior_type: graph_scm      # TabICLv2's graph SCM prior (its regressor's pretraining prior); the only option
+  lambda_p0: 0.2             # probability of an i.i.d. TabICLv2 episode (no residual, a_g = 1)
+  lambda_p1: 0.2             # probability of a zero-mean GP episode (a_g = 0)
+  allow_analytic_pit: false  # diagnostics only: analytic z uses g and leaks it
+  # y = a_g g~ + GP(0, K) + eps with a_g^2 ~ LogNormal(loc, scale^2) and the kernel's own
+  # amplitude (alpha2 prior), independently; the share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii)
+  # and the relative noise are induced. (The coupled amplitude mode was removed.)
+  amplitude_mode: decoupled
+  # Episode shape from TabICLv2's regressor prior: d = round(Uniform(1, 100)), 1024 rows,
+  # P = int(1024 Uniform(0.3, 0.9)), N = 1024 - P. false: d_features* and P_*/N_* above.
+  prior_shapes: true
+  # Context rows P of a prior-shaped episode, the 1024 rows kept (N = 1024 - P). null/null:
+  # TabICLv2's split, P = int(1024 Uniform(0.3, 0.9)). Else P in [prior_P_min, prior_P_max],
+  # loguniform (equal mass per decade) or uniform.
+  prior_P_min: null
+  prior_P_max: null
+  prior_P_dist: loguniform
+  mean_amp_lognormal_loc: 0.0
+  mean_amp_lognormal_scale: 1.5
+
+# Query rows kept per saved episode (generate_pit_dataset), a random subset in row order; null keeps
+# all. Exact for the oracle and for a marginal predicting queries independently given the context.
+query_rows: null
+# Save the exact GP posterior oracle of the query rows given the context (mu_post, sigma_post, R_post)
+# in on-disk shards: R_star / mu_star / sigma_star are prior quantities, and the kernel metadata the
+# posterior is rebuilt from is not saved. For evaluation sets (oracle headroom, exact-z copula score).
+store_posterior_oracle: false
+# copula_inter.repit_dataset: the pit/ directory of a dataset whose PIT is recomputed with the
+# marginal set by z_train_source into a PIT overlay at pit_dir (read by training.pit_overlay_dir).
+repit_source_dir: null
+# Re-PIT only the first repit_max_shards shards of repit_source_dir (null: all).
+repit_max_shards: null
+
+# Save the oracle correlation R_star (N x N) in on-disk shards (generate_pit_dataset). false cuts
+# an N=256 episode from ~270 KB to ~12 KB; training never reads R_star.
+store_r_star: true
+
 # Episodes per shard file (D: reduces NFS metadata ops by this factor).
 # Increase for large datasets; 256 works well for P_max<=30, N_max<=50.
 shard_size: 256
+# Context / query split of each episode's P + N rows (gp_episodes._split_order), a mode per
+# episode with these weights. random: a uniform split (rows are exchangeable). block: the N
+# rows nearest a random anchor are the queries. halfspace: the N rows furthest along a random
+# direction. axis: the same along one random column (time-like cutoff). The split depends on
+# the features only, so the GP posterior oracle stays exact. Non-random splits leave the
+# queries far from the context, which is where a copula has dependence to learn.
+split_mode_probs:
+  random: 1.0
+  block: 0.0
+  halfspace: 0.0
+  axis: 0.0
+# Episodes per generate_gp_batch call inside a shard (generate_pit_dataset); null = shard_size.
+# Lower it when several workers share one GPU: the peak memory of a call scales with it.
+generate_chunk_size: null
 
 # Output directory
 dataset_dir: ./data/systematic_composition

@@ -82,6 +82,7 @@ Subpackages:
   - `gp_episodes.py`: draw a GP episode end to end (`generate_gp_batch`).
   - `gp_kernels.py`: kernel classes, hyperpriors, composites.
   - `kernel_sampling.py`: per-call prior sampling (feature count, kernel chain, mean function).
+  - `scm_prior.py`: the SCM + GP residual prior's settings and the only adapter to TabICLv2's graph SCM prior (TabICL's private prior modules).
   - `feature_transforms.py`, `structural_warps.py`: input warps applied before the kernel.
   - `dataset.py`, `manifest.py`: on-disk shards and their identity manifests.
   - `live_dataset.py`, `era5_live_dataset.py`: episodes generated on the fly in DataLoader workers.

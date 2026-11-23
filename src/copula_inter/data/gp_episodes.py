@@ -50,6 +50,16 @@ from copula_inter.data.kernel_sampling import (
     _sample_mean_module,
     _tabicl_mix_prob_for_kernel,
 )
+from copula_inter.data.scm_prior import (
+    GP_EPISODE_PRIOR_CODE,
+    MEAN_FAMILY_SCM,
+    ScmResidualSettings,
+    sample_amplitudes,
+    sample_scm_tables,
+    sample_v2_num_features,
+    sample_v2_train_test_sizes,
+    validate_scm_settings,
+)
 from copula_inter.data.structural_warps import apply_structural_feature_warp
 from copula_inter.rng import seed_everything
 from copula_inter.type_aliases import Device, HasDataConfig
@@ -291,8 +301,12 @@ def _sample_call_shape(
     d_override: Optional[int],
     kernel_weights: Optional[Tensor],
     tabicl_split_calib_frac: float,
+    pn_override: Optional[tuple[int, int]] = None,
 ) -> _CallShape:
-    """Draw the call-shared kernel, feature count, (P, N) and active dims; cap B to fit memory."""
+    """Draw the call-shared kernel, feature count, (P, N) and active dims; cap B to fit memory.
+
+    pn_override fixes (P, N) (SCM episodes take them from TabICLv2's prior) without drawing them.
+    """
     # d_override pins d across generate_gp_batch's top-up calls.
     d = d_override if d_override is not None else _sample_d_features(cfg)
 
@@ -304,8 +318,11 @@ def _sample_call_shape(
         chain_names, chain_ops, kernel_name = _sample_kernel_chain_structure(cfg, kernel_weights=kernel_weights)
     else:
         kernel_name = _resolve_kernel_name(cfg, kernel_weights=kernel_weights)
-    P = random.randint(cfg.data.P_min, cfg.data.P_max)
-    N = random.randint(cfg.data.N_min, cfg.data.N_max)
+    if pn_override is not None:
+        P, N = pn_override
+    else:
+        P = random.randint(cfg.data.P_min, cfg.data.P_max)
+        N = random.randint(cfg.data.N_min, cfg.data.N_max)
     # Calibration-only points for tabicl_split_calib_frac > 0, placed after train and
     # test so the train/test sample does not depend on them.
     P_C = max(1, round(tabicl_split_calib_frac * P)) if tabicl_split_calib_frac > 0 else 0
@@ -386,16 +403,94 @@ class _Features:
     kernel_hidden_applied: Optional[Tensor]
 
 
-def _sample_features(cfg: HasDataConfig, shape: _CallShape, device: Device, with_gates: bool) -> _Features:
-    """Features (B, T, d) ~ N(0, 1), warped and normalised per episode, plus the kernel's hidden view."""
-    x_raw = torch.randn(shape.B, shape.T, shape.d, device=device)
-    x_raw = tabiclv2_warp_features(x_raw)
-    x_raw = apply_structural_feature_warp(x_raw, cfg, device)
+SPLIT_MODES = ("random", "block", "halfspace", "axis")
+
+
+def split_mode_probs(cfg: HasDataConfig) -> Optional[Tensor]:
+    """data.split_mode_probs as a normalized SPLIT_MODES-ordered tensor, or None when only random."""
+    raw = getattr(cfg.data, "split_mode_probs", None)
+    if raw is None:
+        return None
+    get = raw.get if hasattr(raw, "get") else lambda k, d: getattr(raw, k, d)
+    unknown = set(raw.keys()) - set(SPLIT_MODES) if hasattr(raw, "keys") else set()
+    if unknown:
+        raise ValueError(f"data.split_mode_probs has unknown modes {sorted(unknown)}; expected {SPLIT_MODES}.")
+    w = torch.tensor([float(get(m, 0.0) or 0.0) for m in SPLIT_MODES], dtype=torch.float64)
+    if bool((w < 0).any()) or float(w.sum()) <= 0:
+        raise ValueError(
+            f"data.split_mode_probs={dict(zip(SPLIT_MODES, w.tolist()))} must be >= 0 with a positive sum."
+        )
+    if float(w[1:].sum()) == 0.0:
+        return None
+    return w / w.sum()
+
+
+def _split_order(x: Tensor, P: int, N: int, cols: Optional[List[int]], probs: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-episode row order (B, T) whose first P rows are the context and next N the queries.
+
+    Each episode draws a mode from SPLIT_MODES with probs, on its first P + N rows of x (the
+    kernel's view, restricted to cols); later (calibration) rows keep their place:
+      random    a uniform split (the exchangeable default);
+      block     the N rows nearest to a random anchor row are the queries (a hole in the context);
+      halfspace the N rows furthest along a random unit direction (extrapolation past a hyperplane);
+      axis      the same along one random column (a time- or coordinate-like cutoff).
+    The order depends on x only, never on y, so the GP posterior given x stays the oracle.
+    Returns (order, mode index per episode); context and query rows are shuffled within each set.
+    """
+    B, T, _ = x.shape
+    M = P + N
+    xs = x[:, :M] if cols is None else x[:, :M][..., cols]
+    dev = x.device
+    modes = torch.multinomial(probs.to(dev, torch.float64), B, replacement=True)
+    score = torch.rand(B, M, device=dev, dtype=xs.dtype)  # random: any N rows
+    anchor = xs[torch.arange(B, device=dev), torch.randint(M, (B,), device=dev)]  # (B, d')
+    block = -(xs - anchor[:, None]).square().sum(-1)  # nearest to the anchor first
+    u = torch.randn(B, xs.shape[-1], device=dev, dtype=xs.dtype)
+    halfspace = (xs * (u / u.norm(dim=-1, keepdim=True).clamp(min=1e-12))[:, None]).sum(-1)
+    col = torch.randint(xs.shape[-1], (B,), device=dev)
+    axis = xs.gather(2, col.view(B, 1, 1).expand(B, M, 1)).squeeze(-1)
+    for m, s in ((1, block), (2, halfspace), (3, axis)):
+        score = torch.where((modes == m)[:, None], s, score)
+    queries = score.topk(N, dim=1).indices  # (B, N)
+    is_query = torch.zeros(B, M, dtype=torch.bool, device=dev).scatter_(1, queries, True)
+    jitter = torch.rand(B, M, device=dev)
+    # Context first (key in [0, 1)), queries after (key in [1, 2)), each set in random order.
+    head = (jitter + is_query.to(jitter.dtype)).argsort(dim=1)
+    tail = torch.arange(M, T, device=dev).expand(B, T - M)
+    return torch.cat([head, tail], dim=1), modes
+
+
+def _reorder_rows(t: Tensor, order: Tensor) -> Tensor:
+    """t (B, T, ...) with its rows in order (B, T)."""
+    index = order.view(*order.shape, *([1] * (t.dim() - 2))).expand(*order.shape, *t.shape[2:])
+    return t.gather(1, index)
+
+
+def _sample_features(
+    cfg: HasDataConfig,
+    shape: _CallShape,
+    device: Device,
+    with_gates: bool,
+    *,
+    x_base: Optional[Tensor] = None,
+    apply_warps: bool = True,
+) -> _Features:
+    """Features (B, T, d) ~ N(0, 1), warped and normalised per episode, plus the kernel's hidden view.
+
+    x_base replaces the N(0, 1) draw (the SCM prior's tables); apply_warps=False skips the
+    TabICLv2, structural and MLP warps on it. The hidden kernel warp always applies.
+    """
+    x_raw = torch.randn(shape.B, shape.T, shape.d, device=device) if x_base is None else x_base
     mlp_mixed = kernel_hidden_applied = None
-    if with_gates:
-        x_raw, mlp_mixed = apply_mlp_feature_mixing(x_raw, cfg, device, return_gate=True)
-    else:
-        x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
+    if apply_warps:
+        x_raw = tabiclv2_warp_features(x_raw)
+        x_raw = apply_structural_feature_warp(x_raw, cfg, device)
+        if with_gates:
+            x_raw, mlp_mixed = apply_mlp_feature_mixing(x_raw, cfg, device, return_gate=True)
+        else:
+            x_raw = apply_mlp_feature_mixing(x_raw, cfg, device)
+    elif with_gates:
+        mlp_mixed = torch.zeros(shape.B, dtype=torch.bool, device=device)
     x_norm = (x_raw - x_raw.mean(1, keepdim=True)) / x_raw.std(1, keepdim=True).clamp(min=1e-8)
 
     # The kernel and mean are evaluated on x_kernel, a hidden transform of x_norm
@@ -430,12 +525,40 @@ class _GPDraw:
     z_test: Tensor  # (B, N) exact posterior PIT
     log_pdf_test: Tensor  # (B, N)
     discard: Tensor  # (B,) bool, Cholesky failures
+    # SCM + GP residual prior only (None otherwise): the known mean m of the P train and N
+    # test rows (B, P + N), the factor c (B,) applied to the kernel, so K_all = c K + sigma_n^2 I,
+    # and the kernel's unscaled mean prior variance mean_i K_ii over the T rows (B,).
+    mean_all: Optional[Tensor] = None
+    kernel_scale: Optional[Tensor] = None
+    kernel_diag_mean: Optional[Tensor] = None
+
+
+@dataclass
+class _ResidualMean:
+    """A known per-row mean and the kernel's factor, replacing the mean function (SCM + GP residual prior).
+
+    K_all = kernel_factor * K + sigma_n^2 I: the kernel keeps its own output scale, kernel_factor
+    is 1 (or 0 for an i.i.d. TabICLv2 episode).
+    """
+
+    mean: Tensor  # (B, T) a_g * g~
+    kernel_factor: Tensor  # (B,)
 
 
 def _draw_gp(
-    cfg: HasDataConfig, shape: _CallShape, priors: _EpisodePriors, feats: _Features, device: Device
+    cfg: HasDataConfig,
+    shape: _CallShape,
+    priors: _EpisodePriors,
+    feats: _Features,
+    device: Device,
+    residual: Optional[_ResidualMean] = None,
 ) -> Optional[_GPDraw]:
-    """Sample y jointly from each episode's GP; None when kernel evaluation fails for the whole batch."""
+    """Sample y jointly from each episode's GP; None when kernel evaluation fails for the whole batch.
+
+    With residual the mean is residual.mean instead of priors.mean_module(x_kernel), and the
+    kernel is scaled by residual.kernel_factor. Every oracle formula below then holds with
+    the known mean vector in place of the mean function.
+    """
     B, P, N, T = shape.B, shape.P, shape.N, shape.T
     x_norm, x_kernel = feats.x_norm, feats.x_kernel
     likelihood, mean_module = priors.likelihood, priors.mean_module
@@ -454,6 +577,12 @@ def _draw_gp(
                 RuntimeWarning,
             )
             return None
+    kernel_scale: Optional[Tensor] = None
+    diag_mean: Optional[Tensor] = None
+    if residual is not None:
+        diag_mean = K_full_dense.diagonal(dim1=1, dim2=2).mean(-1).clamp(min=1e-12)  # (B,)
+        kernel_scale = residual.kernel_factor.to(K_full_dense.dtype)
+        K_full_dense = K_full_dense * kernel_scale.reshape(B, 1, 1)
     nugget_eye = torch.eye(T, device=device, dtype=K_full_dense.dtype).expand(B, T, T)
     K_all_raw = K_full_dense + likelihood.noise.reshape(B, 1, 1) * nugget_eye
 
@@ -462,11 +591,19 @@ def _draw_gp(
     L_all, failed_all = _psd_safe_batch(K_all_raw)
     K_all = L_all @ L_all.mT  # (B, T, T), PSD by construction
     y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero-mean GP sample
-    # Add the mean function (evaluated on x_kernel).
-    y_all = y_all + mean_module(x_kernel)
 
     x_kernel_train = x_kernel[:, :P]
     x_kernel_test = x_kernel[:, P : P + N]
+    if residual is None:
+        # Add the mean function (evaluated on x_kernel).
+        y_all = y_all + mean_module(x_kernel)
+        mean_train = mean_module(x_kernel_train)  # (B, P)
+        mean_test = mean_module(x_kernel_test)  # (B, N)
+    else:
+        mean_all = residual.mean.to(y_all.dtype)
+        y_all = y_all + mean_all
+        mean_train = mean_all[:, :P]
+        mean_test = mean_all[:, P : P + N]
     y_train = y_all[:, :P]
     y_test = y_all[:, P : P + N]
 
@@ -476,14 +613,13 @@ def _draw_gp(
 
     # LOO PIT needs L_ff and alpha = K_ff^{-1} (y_train - mean_train).
     L_ff, failed_ff = _batched_cholesky(K_ff)
-    mean_train = mean_module(x_kernel_train)  # (B, P)
     alpha = torch.cholesky_solve((y_train - mean_train).unsqueeze(-1), L_ff).squeeze(-1)  # (B, P)
 
     oracle_mode = getattr(cfg.data, "oracle_mode", "prior")
     if oracle_mode == "prior":
         # Prior oracle: R_star is the prior correlation of the test block of K_all.
         # The copula target is the posterior correlation R_post (see z_test below).
-        mu_star = mean_module(x_kernel_test)
+        mu_star = mean_test
         Sigma_star = K_ss
     else:
         raise ValueError(f"Unknown data.oracle_mode '{oracle_mode}'; only 'prior' is supported.")
@@ -546,6 +682,9 @@ def _draw_gp(
         z_test=z_test,
         log_pdf_test=log_pdf_test,
         discard=failed_all | failed_ff,
+        mean_all=None if residual is None else torch.cat([mean_train, mean_test], dim=1),
+        kernel_scale=kernel_scale,
+        kernel_diag_mean=diag_mean,
     )
 
 
@@ -566,10 +705,13 @@ def _default_dtype(dtype: Optional[torch.dtype]) -> Iterator[None]:
 def _draw_to(draw: _GPDraw, device: Device) -> _GPDraw:
     """The draw on device, floating fields in float32 (the dtype every marginal PIT expects)."""
 
-    def move(t: Tensor) -> Tensor:
+    def move(t: Optional[Tensor]) -> Optional[Tensor]:
+        if t is None:
+            return None
         return t.to(device=device, dtype=torch.float32) if t.is_floating_point() else t.to(device)
 
-    return dataclasses.replace(draw, **{f.name: move(getattr(draw, f.name)) for f in dataclasses.fields(draw)})
+    changes: Dict[str, Any] = {f.name: move(getattr(draw, f.name)) for f in dataclasses.fields(draw)}
+    return dataclasses.replace(draw, **changes)
 
 
 def _degenerate_episodes(draw: _GPDraw, shape: _CallShape, x_norm: Tensor) -> Tensor:
@@ -624,30 +766,21 @@ def _marginal_pit(
         y_mean = y_train.mean(dim=1, keepdim=True)
         y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         z_train = ((y_train - y_mean) / y_std).detach()
-    elif marginal_backend in GENERIC_MARGINAL_BACKENDS:
-        # Batched PIT for a non-TabICL backend from its full predictive distribution:
-        # (k_folds + 1) fused forwards for the call.
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
-        y_train_s = ((y_train - y_mean) / y_std).detach().cpu().numpy()
-        y_test_s = ((y_test - y_mean) / y_std).detach().cpu().numpy()
-        x_train_np = draw.x_norm_train.detach().cpu().numpy()
-        x_test_np = draw.x_norm_test.detach().cpu().numpy()
-        base_seed = int(getattr(cfg, "seed", None) or 0)
-        _run_batched = batched_pit(marginal_backend)
-        out = _run_batched(
-            marginal_regressor,
-            x_train_np,
-            y_train_s,
-            x_test_np,
-            y_test_s,
+    elif marginal_backend in GENERIC_MARGINAL_BACKENDS or (
+        apply_tabicl and tabicl_split_calib_frac <= 0 and marginal_backend in (None, "tabicl")
+    ):
+        z_train, z_test, log_pdf_test = marginal_pit_tables(
+            draw.x_norm_train,
+            y_train,
+            draw.x_norm_test,
+            y_test,
+            device,
+            seed=int(getattr(cfg, "seed", None) or 0),
             k_folds=tabicl_k_folds,
-            seed=base_seed,
+            tabicl_model=tabicl_model if marginal_backend in (None, "tabicl") else None,
+            marginal_backend=marginal_backend,
+            marginal_regressor=marginal_regressor,
         )
-        z_train = torch.from_numpy(out["z_train"]).to(device=device)
-        z_test = torch.from_numpy(out["z_test"]).to(device=device)
-        # Jacobian back to raw-y nats.
-        log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
     elif marginal_backend is not None and marginal_backend != "tabicl":
         raise ValueError(f"marginal_backend={marginal_backend!r} has no batched PIT (backend_registry.batched_pit).")
     elif apply_tabicl and tabicl_split_calib_frac > 0:
@@ -670,30 +803,73 @@ def _marginal_pit(
             Y_calib_raw=y_calib.unsqueeze(-1),
         )
         z_train = split_pit["z_train"].squeeze(-1)  # (B, P)
-    elif apply_tabicl:
-        # "tabicl": K-fold PIT on the training points and a full-context PIT on the
-        # real test points; z_train, z_test and log_pdf_test all come from TabICL.
+    return z_train, z_test, log_pdf_test
+
+
+def marginal_pit_tables(
+    x_norm_train: Tensor,
+    y_train: Tensor,
+    x_norm_test: Tensor,
+    y_test: Tensor,
+    device: Device,
+    *,
+    seed: int,
+    k_folds: int,
+    tabicl_model: Optional[TabICLLike] = None,
+    marginal_backend: Optional[str] = None,
+    marginal_regressor: Any = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """(z_train, z_test, log_pdf_test) of a batch of tables under a frozen marginal model.
+
+    z_train is the K-fold PIT of the P context rows (each fold predicted from the
+    other folds), z_test the PIT of the N query rows given all P context rows, and
+    log_pdf_test their log-density in raw-y nats. Targets are z-scored per table
+    before the model sees them. The model is TabICL when tabicl_model is given,
+    else the backend named by marginal_backend (GENERIC_MARGINAL_BACKENDS).
+
+    Args:
+        x_norm_train: (B, P, d). y_train: (B, P). x_norm_test: (B, N, d). y_test: (B, N).
+        seed: fold-assignment seed of the generic backends.
+    """
+    y_mean = y_train.mean(dim=1, keepdim=True)
+    y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
+    if tabicl_model is not None:
+        # K-fold PIT on the training points and a full-context PIT on the real test points.
         from copula_inter.marginal.pit import run_pit_batched  # local: pit.py imports from this module
 
-        assert tabicl_model is not None
-
-        y_mean = y_train.mean(dim=1, keepdim=True)
-        y_std = y_train.std(dim=1, keepdim=True).clamp(min=1e-8)
         y_train_scaled = ((y_train - y_mean) / y_std).unsqueeze(-1)  # (B, P, 1)
         y_test_scaled = ((y_test - y_mean) / y_std).unsqueeze(-1)  # (B, N, 1)
         tabicl_pit = run_pit_batched(
             tabicl_model,
-            draw.x_norm_train,
+            x_norm_train,
             y_train_scaled,
-            draw.x_norm_test,
+            x_norm_test,
             y_test_scaled,
-            k_folds=tabicl_k_folds,
+            k_folds=k_folds,
             Y_train_raw=y_train.unsqueeze(-1),
         )
         z_train = tabicl_pit["z_train"].squeeze(-1)  # (B, P)
         z_test = tabicl_pit["z_test"].squeeze(-1)  # (B, N)
         # Jacobian back to raw-y nats: log p_raw = log p_scaled - log(std).
         log_pdf_test = tabicl_pit["log_pdf_test"].squeeze(-1) - y_std.log()  # (B, N) - (B, 1) broadcast
+        return z_train, z_test, log_pdf_test
+    if marginal_backend not in GENERIC_MARGINAL_BACKENDS:
+        raise ValueError(f"marginal_backend={marginal_backend!r} has no batched PIT (backend_registry.batched_pit).")
+    # Batched PIT for a non-TabICL backend from its full predictive distribution:
+    # (k_folds + 1) fused forwards for the call.
+    out = batched_pit(marginal_backend)(
+        marginal_regressor,
+        x_norm_train.detach().cpu().numpy(),
+        ((y_train - y_mean) / y_std).detach().cpu().numpy(),
+        x_norm_test.detach().cpu().numpy(),
+        ((y_test - y_mean) / y_std).detach().cpu().numpy(),
+        k_folds=k_folds,
+        seed=seed,
+    )
+    z_train = torch.from_numpy(out["z_train"]).to(device=device)
+    z_test = torch.from_numpy(out["z_test"]).to(device=device)
+    # Jacobian back to raw-y nats.
+    log_pdf_test = torch.from_numpy(out["log_pdf_test"]).to(device=device) - y_std.log()  # (B,N) - (B,1) broadcast
     return z_train, z_test, log_pdf_test
 
 
@@ -727,6 +903,55 @@ _MEAN_KEYS = (
     "mean_anomaly_threshold",
     "mean_anomaly_magnitude",
 )
+
+
+def residual_share(residual: _ResidualMean, draw: _GPDraw) -> Tensor:
+    """(B,) effective residual share lambda = c mean_i K_ii / (a_g^2 + c mean_i K_ii).
+
+    The SCM mean a_g g~ has variance a_g^2 over the T rows and the residual c K has mean prior
+    variance c mean_i K_ii, so this is the GP residual's share of the signal variance.
+    """
+    assert draw.kernel_scale is not None and draw.kernel_diag_mean is not None
+    resid_var = draw.kernel_scale * draw.kernel_diag_mean
+    mean_var = residual.mean.pow(2).sum(1) / max(residual.mean.shape[1] - 1, 1)  # a_g^2 (g~ has unit std)
+    return resid_var / (mean_var.to(resid_var.dtype) + resid_var).clamp(min=1e-12)
+
+
+def _scm_metadata(
+    shape: _CallShape,
+    priors: _EpisodePriors,
+    draw: _GPDraw,
+    residual: Optional[_ResidualMean],
+    scm_prior_type: Optional[Tensor],
+) -> Dict[str, Tensor]:
+    """The SCM + GP residual fields, saved for every episode of an SCM-enabled run.
+
+    An SCM episode carries mean_family=MEAN_FAMILY_SCM, its residual share lambda_resid, the
+    kernel factor kernel_scale (lambda / mean_i K_ii coupled, 1 decoupled) and the mean vectors mean_train (P,) and
+    mean_test (N,), from which pit._kernel_fn_from_task and pit._mean_train_from_task rebuild
+    the conditional oracle without the mean bank. A GP-prior episode of the same run keeps its
+    mean-bank fields and gets lambda_resid=-1, scm_prior_type=-1, kernel_scale=1 and its mean
+    function's values as mean_train/mean_test, so every episode has the same keys.
+    """
+    B, P, N = shape.B, shape.P, shape.N
+    if residual is None:
+        mean_train = priors.mean_module(draw.x_kernel_train)
+        mean_test = priors.mean_module(draw.x_kernel_test)
+        return {
+            "lambda_resid": torch.full((B,), -1.0),
+            "scm_prior_type": torch.full((B,), GP_EPISODE_PRIOR_CODE, dtype=torch.long),
+            "kernel_scale": torch.ones(B),
+            "mean_train": mean_train.float().cpu(),
+            "mean_test": mean_test.float().cpu(),
+        }
+    assert draw.mean_all is not None and draw.kernel_scale is not None and scm_prior_type is not None
+    return {
+        "lambda_resid": residual_share(residual, draw).float().cpu(),
+        "scm_prior_type": scm_prior_type.cpu(),
+        "kernel_scale": draw.kernel_scale.float().cpu(),
+        "mean_train": draw.mean_all[:, :P].float().cpu(),
+        "mean_test": draw.mean_all[:, P : P + N].float().cpu(),
+    }
 
 
 def _kernel_metadata(
@@ -777,8 +1002,9 @@ def _generate_gp_batch_raw(
     raw_y_override: bool = False,
     pit_device: Optional[Device] = None,
     synthesis_dtype: Optional[torch.dtype] = None,
+    pn_pin: Optional[tuple[int, int]] = None,
 ) -> List[Dict[str, Tensor]]:
-    """Generate up to B GP episodes in one vectorized call.
+    """Generate up to B GP episodes in one vectorized call (pn_pin fixes its (P, N)).
 
     All episodes share one kernel family, (P, N) and active_dims, with independent
     hyperparameters, noise and features. Episodes whose Cholesky fails are
@@ -815,14 +1041,65 @@ def _generate_gp_batch_raw(
     if seed is not None:
         seed_everything(seed)
 
+    scm = ScmResidualSettings.from_cfg(cfg)
+    if scm.enabled:
+        validate_scm_settings(cfg, scm)
+    # Drawn only when enabled, so the disabled prior's random stream is unchanged.
+    use_scm = scm.enabled and random.random() < scm.prob
+    pn_override: Optional[tuple[int, int]] = None
+    if use_scm and scm.prior_shapes:
+        # The table's shape comes from TabICLv2's prior, not from data.d_features* / P_* / N_*.
+        if d_override is None:
+            d_override = sample_v2_num_features()
+        pn_override = sample_v2_train_test_sizes(scm.prior_P_min, scm.prior_P_max, scm.prior_P_dist)
+    if pn_pin is not None:
+        pn_override = pn_pin
+
+    residual: Optional[_ResidualMean] = None
+    scm_prior_type: Optional[Tensor] = None
     with _default_dtype(synthesis_dtype):
-        shape = _sample_call_shape(cfg, B, device, d_override, kernel_weights, tabicl_split_calib_frac)
+        shape = _sample_call_shape(
+            cfg, B, device, d_override, kernel_weights, tabicl_split_calib_frac, pn_override=pn_override
+        )
         priors = _sample_episode_priors(cfg, shape, device)
-        feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)
-        synthesized = _draw_gp(cfg, shape, priors, feats, device)
+        if use_scm:
+            # SCM table -> the same per-episode z-score and hidden kernel warp as the GP features.
+            tables = sample_scm_tables(shape.B, shape.T, shape.d, scm.prior_type, device=device)
+            feats = _sample_features(
+                cfg,
+                shape,
+                device,
+                with_gates=return_kernel_metadata,
+                x_base=tables.X.to(torch.get_default_dtype()),
+                apply_warps=False,  # features are TabICLv2's; only the GP residual is ours
+            )
+            amps = sample_amplitudes(scm, shape.B, device)
+            g_tilde = tables.g.to(torch.get_default_dtype())
+            residual = _ResidualMean(
+                mean=amps.mean_amp2.to(g_tilde.dtype).clamp(min=0.0).sqrt().unsqueeze(-1) * g_tilde,
+                kernel_factor=amps.kernel_factor,
+            )
+            scm_prior_type = tables.prior_type
+        else:
+            feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)
+        split_probs = split_mode_probs(cfg)
+        if split_probs is not None:
+            # Non-random context/query split, chosen from the kernel's view of the features only.
+            order, _ = _split_order(feats.x_kernel, shape.P, shape.N, shape.kernel_cols, split_probs)
+            feats = _Features(
+                _reorder_rows(feats.x_norm, order),
+                _reorder_rows(feats.x_kernel, order),
+                feats.mlp_mixed,
+                feats.kernel_hidden_applied,
+            )
+            if residual is not None:
+                residual = _ResidualMean(mean=_reorder_rows(residual.mean, order), kernel_factor=residual.kernel_factor)
+        synthesized = _draw_gp(cfg, shape, priors, feats, device, residual)
         if synthesized is None:
             return []
         discard = synthesized.discard | _degenerate_episodes(synthesized, shape, feats.x_norm)
+        if use_scm:
+            discard = discard | ~tables.valid.to(discard.device)
     convert = synthesis_dtype is not None or (pit_device is not None and pit_device != device)
     if pit_device is None:
         pit_device = device
@@ -886,6 +1163,14 @@ def _generate_gp_batch_raw(
         meta_tensors, meta_extra = _kernel_metadata(shape, priors, feats, synthesized)
         tensors.update(meta_tensors)
         extra.update(meta_extra)
+        if scm.enabled:
+            tensors.update(_scm_metadata(shape, priors, synthesized, residual, scm_prior_type))
+            if residual is not None:
+                # The mean is the SCM mechanism, not the mean bank: zero its parameters.
+                for key in _MEAN_KEYS:
+                    tensors[key] = torch.zeros_like(tensors[key])
+                tensors["mean_family"] = torch.full_like(tensors["mean_family"], MEAN_FAMILY_SCM)
+                tensors["mean_nonzero"] = torch.ones_like(tensors["mean_nonzero"])
     if convert:
         tensors = {k: v.float() if v.is_floating_point() else v for k, v in tensors.items()}
 
@@ -896,6 +1181,11 @@ def _generate_gp_batch_raw(
         else None
     )
     return assemble_episodes(tensors, extra, discard, chains)
+
+
+def episode_shape(episode: Dict[str, Tensor]) -> tuple[int, int]:
+    """(P, N) of an episode: its context and query row counts."""
+    return int(episode["x_norm_train"].shape[0]), int(episode["x_norm_test"].shape[0])
 
 
 def generate_gp_batch(
@@ -915,11 +1205,13 @@ def generate_gp_batch(
     raw_y_override: bool = False,
     pit_device: Optional[Device] = None,
     synthesis_dtype: Optional[torch.dtype] = None,
+    pn_override: Optional[tuple[int, int]] = None,
 ) -> List[Dict[str, Tensor]]:
     """Generate exactly B GP episodes, topping up discarded ones with further calls.
 
-    Top-up calls resample kernel, P, N and active_dims but keep d (pinned to
-    d_override if given, else to the first call's d). Raises after max_rounds.
+    Top-up calls resample kernel and active_dims but keep d and (P, N) (pinned to
+    d_override / pn_override if given, else to the first call's), so the B episodes
+    share one shape and batch without padding. Raises after max_rounds.
     """
     base_seed = getattr(cfg, "seed", None)
     episodes = _generate_gp_batch_raw(
@@ -938,11 +1230,14 @@ def generate_gp_batch(
         raw_y_override=raw_y_override,
         pit_device=pit_device,
         synthesis_dtype=synthesis_dtype,
+        pn_pin=pn_override,
     )
-    # Pin every top-up round to the first round's d (or d_override).
+    # Pin every top-up round to the first round's d and (P, N) (or the overrides).
     d_fixed: Optional[int]
+    pn_fixed: Optional[tuple[int, int]] = pn_override
     if episodes:
         d_fixed = int(episodes[0]["x_norm_train"].shape[-1])
+        pn_fixed = episode_shape(episodes[0])
     else:
         d_fixed = d_override
     max_rounds = 20
@@ -969,9 +1264,12 @@ def generate_gp_batch(
             raw_y_override=raw_y_override,
             pit_device=pit_device,
             synthesis_dtype=synthesis_dtype,
+            pn_pin=pn_fixed,
         )
         if d_fixed is None and new_episodes:
             d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
+        if pn_fixed is None and new_episodes:
+            pn_fixed = episode_shape(new_episodes[0])
         episodes += new_episodes
     if base_seed is not None:
         setattr(cfg, "seed", base_seed)
@@ -1009,3 +1307,32 @@ def generate_fixed_gp_batch(
         synthesis_dtype=FIXED_SET_SYNTHESIS_DTYPE,
         **kwargs,
     )
+
+
+# Per-episode fields indexed by query row, and the N x N query matrices (both axes).
+_QUERY_ROW_KEYS = ("mu_star", "sigma_star", "mu_post", "sigma_post")
+_QUERY_MATRIX_KEYS = ("R_star", "R_prior", "Sigma_star", "R_post")
+
+
+def subsample_query_rows(episode: Dict[str, Any], n: int, generator: torch.Generator) -> Dict[str, Any]:
+    """The episode restricted to n query rows drawn without replacement (kept in their order).
+
+    Exact for the oracle (mu_star, sigma_star and R_star of a row subset are the sub-blocks of
+    the Gaussian posterior given the context) and for a marginal whose query predictions are
+    independent given the context (TabICL, TabPFN): the P context rows are untouched.
+    """
+    N = int(episode["x_norm_test"].shape[0])
+    if not 1 <= n <= N:
+        raise ValueError(f"data.query_rows={n}; the episode has {N} query rows.")
+    keep = torch.randperm(N, generator=generator)[:n].sort().values
+    out = dict(episode)
+    for key, value in episode.items():
+        if not isinstance(value, Tensor) or value.dim() == 0:
+            continue
+        if key in _QUERY_MATRIX_KEYS:
+            out[key] = value[keep][:, keep]
+        elif key.endswith("_test") or key in _QUERY_ROW_KEYS:
+            out[key] = value[keep]
+    if "n_test" in episode:
+        out["n_test"] = torch.tensor(n)
+    return out

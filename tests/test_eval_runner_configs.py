@@ -22,6 +22,7 @@ from eval.runners.eeg_joint_eval import EegJointEvalSpec
 from eval.runners.era5_calibration_eval import Era5CalibrationSpec
 from eval.runners.eval_args import EvalSpec
 from eval.runners.gp_wellspecified_diag import GpDiagSpec
+from eval.runners.grid_score import GridScoreSpec
 from eval.runners.hydra_cli import compose_spec, reject_argparse_flags
 from eval.runners.marginal_calibration_eval import MarginalCalibrationSpec
 from eval.runners.paired_compare import PairedCompareSpec
@@ -61,6 +62,7 @@ RUNNERS: dict[str, tuple[type, list[str]]] = {
     "eeg_gp_baselines": (EegGpBaselinesSpec, ["out_dir=o"]),
     "beyondarena_joint_eval": (BeyondArenaJointSpec, ["dataset=d", "method=m", "out_dir=o"]),
     "beyondarena_report": (BeyondArenaReportSpec, []),
+    "grid_score": (GridScoreSpec, ["grid_dir=g", "ckpts=[a.pt]"]),
 }
 
 
@@ -145,10 +147,16 @@ def test_finetune_era5_preset_requires_a_checkpoint() -> None:
     cfg = _compose_train(["experiment=finetune_era5"])
     assert cfg.training.live_source == "era5" and cfg.training.live_generation
     assert cfg.training.resume_required and cfg.training.resume_ckpt is None
-    assert cfg.training.aux_mae_weight == 0.0
     assert not _compose_train([]).training.resume_required
     with pytest.raises(ValueError, match="training.resume_ckpt is required"):
         prepare_training_inputs(cfg)
+
+
+def test_scm_residual_preset_trains_live_with_a_learned_marginal() -> None:
+    cfg = _compose_train(["experiment=scm_residual"])
+    assert cfg.data.scm_residual.enabled and cfg.data.z_train_source == "tabicl"
+    assert cfg.training.live_generation and cfg.training.live_source == "gp"
+    assert not _compose_train([]).data.scm_residual.enabled
 
 
 def test_finetune_inputs_are_checked_before_startup(tmp_path: Path) -> None:

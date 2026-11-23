@@ -71,6 +71,48 @@ from copula_inter.training.step import (
 _EMA_ALPHA = 0.98
 
 
+class _StepProfiler:
+    """torch.profiler over training steps [start, start + steps) (training.profile_start; None = off).
+
+    On the last profiled step it prints the top operators by CUDA and by CPU self time and writes
+    a Chrome trace (chrome://tracing, Perfetto) to training.profile_dir, else ckpt_dir, else ./profiles.
+    """
+
+    def __init__(self, t: DictConfig) -> None:
+        start = t.get("profile_start", None)
+        self.start = None if start is None else int(start)
+        self.steps = int(t.get("profile_steps", 20))
+        self.out_dir = str(t.get("profile_dir", None) or t.get("ckpt_dir", None) or "profiles")
+        self.prof: torch.profiler.profile | None = None
+
+    def before_step(self, step: int) -> None:
+        if self.start is None or step != self.start:
+            return
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        self.prof = torch.profiler.profile(activities=activities, record_shapes=True, profile_memory=True)
+        self.prof.__enter__()
+
+    def after_step(self, step: int) -> None:
+        if self.prof is None or self.start is None or step < self.start + self.steps - 1:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.prof.__exit__(None, None, None)
+        averages = self.prof.key_averages()
+        print(f"[profile] steps {self.start}..{step} ({self.steps} steps), top operators by CUDA time:")
+        print(averages.table(sort_by="cuda_time_total", row_limit=25))
+        print("[profile] top operators by CPU self time:")
+        print(averages.table(sort_by="self_cpu_time_total", row_limit=25))
+        os.makedirs(self.out_dir, exist_ok=True)
+        trace = os.path.join(self.out_dir, f"profile_steps_{self.start}_{step}.json")
+        self.prof.export_chrome_trace(trace)
+        print(f"[profile] Chrome trace: {trace}")
+        self.prof = None
+        self.start = None
+
+
 class _PhaseTimer:
     """Per-phase step timings: CUDA events for GPU phases (read at log steps), wall time for data and on CPU."""
 
@@ -159,7 +201,6 @@ def _log_train_step(
     Sigma: Any,
     parts: dict[str, torch.Tensor],
     loss: torch.Tensor,
-    aux_mae: torch.Tensor,
     grad_norm: torch.Tensor,
     test_mask: torch.Tensor,
     loss_ema: float | None,
@@ -168,7 +209,6 @@ def _log_train_step(
     step_flops: float | None,
     gpu_peak_flops: float | None,
     batch_size: int,
-    aux_mae_weight: float,
     device: str,
 ) -> float:
     """Log and print one training step's losses, Sigma statistics and performance; returns the updated loss EMA."""
@@ -179,7 +219,6 @@ def _log_train_step(
     amp_scale = bundle.scaler.get_scale() if bundle.scaler is not None else 1.0
     cop_val = parts["copula"].item()
     mar_val = parts["marginal"].item()
-    aux_mae_val = aux_mae.item()
     with torch.no_grad():
         w_norm_mean = float(out["W"].float().norm(dim=-1).mean().item())
         Sigma_dense = Sigma.dense()
@@ -207,7 +246,6 @@ def _log_train_step(
             "train/y_nll_total": loss_val,
             "train/y_nll_copula": cop_val,
             "train/y_nll_marginal": mar_val,
-            "train/aux_mae": aux_mae_val,
             "train/lr": lr_now,
             "train/grad_norm": grad_norm_val,
             "train/amp_scale": amp_scale,
@@ -230,11 +268,10 @@ def _log_train_step(
         },
         step=step,
     )
-    aux_str = f" aux_mae={aux_mae_val:.4f}" if aux_mae_weight > 0.0 else ""
     nonfinite_str = f" | sigma_nonfinite={sigma_nonfinite}" if sigma_nonfinite else ""
     print(
         f"[{step:6d}] loss={loss_val:.4f} "
-        f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}{aux_str}) "
+        f"(cop_nll={cop_val:.4f} ema_nll={loss_ema:.4f} mar_nll={mar_val:.4f}) "
         f"| grad_norm={grad_norm_val:.3f} "
         f"| od_μ={sig_stats['offdiag_mean']:+.4f} od_σ={sig_stats['offdiag_std']:.4f} "
         f"| lr={lr_now:.2e}{nonfinite_str}\n"
@@ -385,10 +422,6 @@ def main(cfg: DictConfig) -> None:
     print(f"[train] frozen TabICL marginal inference AMP={'on' if tabicl_amp else 'off (float32)'}")
     live_generation = bool(t.get("live_generation", False))
     live_source = str(t.get("live_source", "gp"))
-    if live_generation and live_source == "era5" and float(t.get("aux_mae_weight", 0.0)) > 0.0:
-        # Real ERA5 has no oracle R_star.
-        print("[train] live_source=era5: forcing training.aux_mae_weight=0.0 (real data has no oracle R_star)")
-        t.aux_mae_weight = 0.0
     init_wandb_run(cfg=cfg, dataset_name=dataset_name(t, cfg.data, live_generation), t=t)
 
     data = build_data_loaders(cfg=cfg, device=device, live_generation=live_generation, live_source=live_source, t=t)
@@ -406,25 +439,25 @@ def main(cfg: DictConfig) -> None:
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     parametrization = str(cfg.model.get("correlation_parametrization", "covnorm"))
     nll_weight = float(t.get("nll_weight", 1.0))
-    aux_mae_weight = float(t.get("aux_mae_weight", 0.0))
     adaptive_mix = bool(cfg.data.get("z_train_tabicl_mix_adaptive", False))
 
     model.train()
     # Recreate the iterator on StopIteration (not itertools.cycle) so every epoch reshuffles.
     train_iter = data.train_iter if data.train_iter is not None else iter(data.train_loader)
     loss_ema: float | None = None
-    triu_cache: dict[int, torch.Tensor] = {}
     timer = _PhaseTimer(device)
+    profiler = _StepProfiler(t)
 
     if bool(t.get("val_at_start", False)):
         # Score the weights before any update: the baseline of a resumed / post-training run.
         _validate_and_log(bundle.start_step, cfg, device, model, data, probes, float(bundle.scheduler.get_last_lr()[0]))
 
     for step in range(bundle.start_step, t.steps + 1):
+        profiler.before_step(step)
         t_data0 = time.perf_counter()
         # Pre-clear loop references so an OOM can release them.
         batch = None
-        out = Sigma = parts = loss = aux_mae = grad_norm = None
+        out = Sigma = parts = loss = grad_norm = None
         step_flops = None
         try:
             # Keep the CPU batch separate so a transfer OOM is recoverable.
@@ -450,7 +483,7 @@ def main(cfg: DictConfig) -> None:
             timer.ms["data"] += (time.perf_counter() - t_data0) * 1000.0
             timer.T_sum += batch["x_train"].shape[1] + batch["x_test"].shape[1]
 
-            out, Sigma, parts, loss, aux_mae, grad_norm = _run_train_step(
+            out, Sigma, parts, loss, grad_norm = _run_train_step(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -462,9 +495,7 @@ def main(cfg: DictConfig) -> None:
                 scaler=scaler,
                 clip_grad_norm=t.clip_grad_norm,
                 nll_weight=nll_weight,
-                aux_mae_weight=aux_mae_weight,
                 jitter=jitter,
-                triu_cache=triu_cache,
                 phase_start=timer.start,
                 phase_end=timer.end,
                 parametrization=parametrization,
@@ -480,9 +511,7 @@ def main(cfg: DictConfig) -> None:
                         use_amp=bundle.use_amp,
                         amp_dtype=bundle.amp_dtype,
                         nll_weight=nll_weight,
-                        aux_mae_weight=aux_mae_weight,
                         jitter=jitter,
-                        triu_cache=triu_cache,
                         parametrization=parametrization,
                     )
                 except torch.cuda.OutOfMemoryError:
@@ -504,7 +533,7 @@ def main(cfg: DictConfig) -> None:
             del exc
             optimizer.zero_grad(set_to_none=True)
             timer.drop_events()
-            del raw_batch, batch, shape_batch, out, Sigma, parts, loss, aux_mae, grad_norm
+            del raw_batch, batch, shape_batch, out, Sigma, parts, loss, grad_norm
             # gc.collect() breaks the failed graph's reference cycles so empty_cache() can free its memory.
             gc.collect()
             torch.cuda.empty_cache()
@@ -521,7 +550,6 @@ def main(cfg: DictConfig) -> None:
                 Sigma=Sigma,
                 parts=parts,
                 loss=loss,
-                aux_mae=aux_mae,
                 grad_norm=grad_norm,
                 test_mask=batch["test_mask"],
                 loss_ema=loss_ema,
@@ -530,12 +558,12 @@ def main(cfg: DictConfig) -> None:
                 step_flops=step_flops,
                 gpu_peak_flops=gpu_peak_flops,
                 batch_size=int(t.batch_size),
-                aux_mae_weight=aux_mae_weight,
                 device=device,
             )
 
         # Release this step's graph before validation and checkpointing.
-        out = Sigma = parts = loss = aux_mae = grad_norm = batch = None
+        out = Sigma = parts = loss = grad_norm = batch = None
+        profiler.after_step(step)
 
         if step % t.val_every == 0 and step > 0:
             _validate_and_log(step, cfg, device, model, data, probes, float(scheduler.get_last_lr()[0]))

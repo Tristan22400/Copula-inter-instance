@@ -23,8 +23,30 @@ SCHEMA = 1
 
 def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
     data = config_dict(cfg.data)
-    for output_key in ("resume", "dataset_dir", "pit_dir"):
+    # generate_chunk_size only sets how many episodes share one GPU call (memory), not the prior.
+    for output_key in ("resume", "dataset_dir", "pit_dir", "generate_chunk_size"):
         data.pop(output_key, None)
+    # A disabled SCM residual prior changes no byte, so it stays out of the identity: datasets
+    # generated before the key existed keep their digest, and enabling it changes the digest.
+    # store_r_star=true (the default) is the historical format, so it stays out too.
+    if data.get("store_r_star", True) is True:
+        data.pop("store_r_star", None)
+    # No posterior oracle saved (false) is the historical format.
+    if not data.get("store_posterior_oracle", False):
+        data.pop("store_posterior_oracle", None)
+    # Every query row kept (null) is the historical format.
+    if data.get("query_rows") is None:
+        data.pop("query_rows", None)
+    # The re-PIT source (copula_inter.repit_dataset) never shapes generated episodes.
+    data.pop("repit_source_dir", None)
+    data.pop("repit_max_shards", None)
+    # The all-random split is the historical prior: it stays out of the identity too.
+    split = data.get("split_mode_probs")
+    if split is None or all(float(v or 0.0) == 0.0 for k, v in dict(split).items() if k != "random"):
+        data.pop("split_mode_probs", None)
+    scm = data.get("scm_residual")
+    if isinstance(scm, dict) and not scm.get("enabled", False):
+        data.pop("scm_residual")
     return {
         "schema": SCHEMA,
         "seed": OmegaConf.select(cfg, "seed"),

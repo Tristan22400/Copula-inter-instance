@@ -1775,6 +1775,16 @@ def test_collate_fn_shapes() -> None:
     assert batch["test_mask"].dtype == torch.bool
 
 
+def test_collate_fn_without_oracle_matrices() -> None:
+    """Shards written with data.store_r_star=false have no R_star: collate omits the oracle matrices."""
+    samples = [
+        _add_derived_fields({k: v for k, v in _make_sample(P, N).items() if k != "R_star"}) for P, N in [(8, 4), (6, 3)]
+    ]
+    batch = collate_fn(samples)
+    assert "R_star" not in batch and "Sigma_star" not in batch and "R_prior" not in batch
+    assert batch["z_test"].shape == (2, 4)
+
+
 def test_collate_fn_masks_correct() -> None:
     samples = [_make_sample(8, 4), _make_sample(6, 3)]
     batch = collate_fn(samples)
