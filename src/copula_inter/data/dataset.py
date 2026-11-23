@@ -31,6 +31,17 @@ PIT_OVERLAY_META = "overlay.json"
 _FINITE_CHECK_KEYS = ("z_train", "z_test", "y_train", "y_test")
 
 
+def has_varying_context_feature(x_train: torch.Tensor) -> bool:
+    """Whether some feature column of a (P, d) context varies over its rows (and is not all NaN).
+
+    An episode without one ("null" episode) gives the features no say: TabPFN and Kumo
+    drop constant columns, so the generic marginals fall back to a Gaussian fitted on the
+    context targets (finetune_adapters.backend_pit).
+    """
+    varies = (x_train != x_train[:1]).any(dim=0) & ~x_train.isnan().all(dim=0)
+    return bool(varies.any())
+
+
 def _episode_is_finite(ep: dict) -> bool:
     return all(torch.isfinite(ep[k]).all() for k in _FINITE_CHECK_KEYS if k in ep)
 

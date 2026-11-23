@@ -153,13 +153,18 @@ def _kumo_forward(
     """kumo_recipe and the regression network for members whose context columns all vary."""
     from sdm import Task
 
+    from copula_inter.marginal.backends import marginal_inference_amp
+
     with torch.no_grad():  # ICLModel.forward preprocesses without gradients too
         xc, xq = _recipe_features(x_context, x_query)
         y_mean, y_scale = _standardize_stats(y_context)
         y = (y_context - y_mean) / y_scale
     network = model.models[Task.regression]
     categorical = torch.zeros(xc.shape[-1], dtype=torch.bool, device=xc.device)
-    out = network(x=torch.cat([xc, xq], dim=-2), y=y, categorical_mask=categorical, cache=None)
+    # Float32 unless training.marginal_inference_amp (CUDA autocast).
+    amp = marginal_inference_amp() and xc.device.type == "cuda"
+    with torch.autocast(xc.device.type, enabled=amp):
+        out = network(x=torch.cat([xc, xq], dim=-2), y=y, categorical_mask=categorical, cache=None)
     out = out.to(x_query.dtype) * y_scale.unsqueeze(-1) + y_mean.unsqueeze(-1)  # Standardize.inverse_transform
     return out.sort(dim=-1).values  # SortQuantiles
 

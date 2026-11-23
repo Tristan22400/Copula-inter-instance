@@ -55,6 +55,7 @@ from copula_inter.data.dataset import (
     ShardBlockSampler,
     ShardHomogeneousBatchSampler,
     collate_fn,
+    has_varying_context_feature,
 )
 from copula_inter.data.era5_live_dataset import build_era5_fixed_val_batches, build_era5_train_loader
 from copula_inter.data.gp_kernels import _COMPOSABLE_KERNELS
@@ -748,6 +749,15 @@ def build_data_loaders(
             n_val = min(int(t.get("val_episodes", 500)), n_v)
             # Stride validation indices across the dataset so val spans many shards.
             val_indices = sorted(set(int(i) for i in torch.linspace(0, n_v - 1, n_val)))
+            if bool(t.get("val_drop_constant_context", False)):
+                # Null episodes (no context feature varies) score the generic marginals through
+                # their feature-free fallback; leave them out of validation.
+                kept = [i for i in val_indices if has_varying_context_feature(val_full[i]["x_norm_train"])]
+                print(
+                    f"[train] training.val_drop_constant_context: {len(val_indices) - len(kept)} of "
+                    f"{len(val_indices)} validation episodes have no varying context feature, dropped."
+                )
+                val_indices = kept
             val_set = set(val_indices) if not val_dir else set()
             train_indices = [i for i in range(n) if i not in val_set]
             train_dataset = Subset(full_dataset, train_indices)

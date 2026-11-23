@@ -60,6 +60,7 @@ from omegaconf import DictConfig
 
 from copula_inter.config_path import config_dir
 from copula_inter.data.gp_kernels import _COMPOSABLE_KERNELS
+from copula_inter.marginal.backends import configure_marginal_inference_amp
 from copula_inter.marginal.pit import (
     configure_tabicl_inference_amp,
 )
@@ -420,6 +421,10 @@ def main(cfg: DictConfig) -> None:
     tabicl_amp = bool(t.get("tabicl_inference_amp", False))
     configure_tabicl_inference_amp(tabicl_amp)
     print(f"[train] frozen TabICL marginal inference AMP={'on' if tabicl_amp else 'off (float32)'}")
+    marginal_amp = bool(t.get("marginal_inference_amp", False))
+    configure_marginal_inference_amp(marginal_amp)
+    if marginal_amp:
+        print("[train] tabpfn35_fast / kumo_small marginal inference AMP=on")
     live_generation = bool(t.get("live_generation", False))
     live_source = str(t.get("live_source", "gp"))
     init_wandb_run(cfg=cfg, dataset_name=dataset_name(t, cfg.data, live_generation), t=t)

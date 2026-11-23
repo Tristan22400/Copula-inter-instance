@@ -87,6 +87,9 @@ training:
   # point count across modes instead of the disk path silently getting a
   # smaller val set on datasets under ~10k episodes.
   val_episodes: 500
+  # Drop the validation episodes whose context features are all constant (TabPFN / Kumo
+  # score them through a feature-free Gaussian fallback); false keeps every episode.
+  val_drop_constant_context: false
   # On-disk held-out set for validation, shared across runs (null: carve val_episodes out of
   # dataset_dir). Its episodes must not be in dataset_dir (generate it with another seed).
   val_dataset_dir: null
@@ -285,6 +288,9 @@ training:
   # marginal log densities. Keep AMP for speed by default; set false when
   # quantile-grid precision is more important than live-generation throughput.
   tabicl_inference_amp: false
+  # The same for the generic marginals (data.z_train_source=tabpfn35_fast / kumo_small):
+  # CUDA autocast in their batched forwards; false = float32.
+  marginal_inference_amp: false
 
 # Model-fit-to-classical-kernel diagnostic, evaluated each validation loop:
 #   val/kernel_fit/<kernel>/{copula_nll,corr_mse,corr_mae,corr_pearson}

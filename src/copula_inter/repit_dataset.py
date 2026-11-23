@@ -68,12 +68,20 @@ def overlay_spec(cfg: DictConfig, source_dir: str, ckpt: str | None) -> dict[str
         "k_folds": int(cfg.data.get("z_train_tabicl_k_folds", 10)),
         # Recorded only when on, so float32 overlays written before the key existed keep their identity.
         **({"tabicl_inference_amp": True} if _tabicl_amp(cfg) else {}),
+        **({"marginal_inference_amp": True} if _marginal_amp(cfg) else {}),
     }
 
 
 def _tabicl_amp(cfg: DictConfig) -> bool:
     """training.tabicl_inference_amp: mixed-precision TabICL forwards (TabICL marginals only)."""
     return z_train_source_of(cfg) == "tabicl" and bool(cfg.training.get("tabicl_inference_amp", False))
+
+
+def _marginal_amp(cfg: DictConfig) -> bool:
+    """training.marginal_inference_amp: mixed-precision forwards of a generic marginal (tabpfn35_fast, kumo_small)."""
+    return z_train_source_of(cfg) in GENERIC_MARGINAL_BACKENDS and bool(
+        cfg.training.get("marginal_inference_amp", False)
+    )
 
 
 def _ensure_overlay_meta(out_dir: str, spec: dict[str, Any]) -> None:
@@ -196,8 +204,9 @@ def main(cfg: DictConfig) -> None:
         print(f"Loading frozen TabICL marginal: {ckpt}")
         tabicl_model = load_tabicl(ckpt, device)
     elif marginal_backend is not None:
-        from copula_inter.marginal.backends import make_regressor
+        from copula_inter.marginal.backends import configure_marginal_inference_amp, make_regressor
 
+        configure_marginal_inference_amp(_marginal_amp(cfg))
         ckpt = z_train_marginal_ckpt(cfg)
         print(f"Building {marginal_backend} marginal on {device}" + (f" from {ckpt}" if ckpt else ""))
         marginal_regressor = make_regressor(marginal_backend, device=device, ckpt=ckpt)

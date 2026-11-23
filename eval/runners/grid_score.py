@@ -42,7 +42,7 @@ from omegaconf import MISSING
 
 from copula_inter.copula.loss import y_space_nll
 from copula_inter.copula.model import build_sigma
-from copula_inter.data.dataset import CopulaDataset, collate_fn
+from copula_inter.data.dataset import CopulaDataset, collate_fn, has_varying_context_feature
 from eval.runners.hydra_cli import hydra_entry
 from inference.copula_inference import load_copula_model
 
@@ -61,6 +61,9 @@ class GridScoreSpec:
     cells: list[str] = field(default_factory=list)
     # PIT overlays of the grid (one per cell at <root>/<group>/P<P>/pit); null reads the grid's own PIT.
     pit_overlay_root: str | None = None
+    # Leave out the episodes whose context features are all constant (scored by TabPFN / Kumo
+    # through a feature-free Gaussian fallback).
+    drop_constant_context: bool = False
     batch_size: int = 32
     device: str = "cuda"
     out_json: str | None = None
@@ -95,13 +98,19 @@ def oracle_nll(y: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor, R: torch.
 
 @torch.no_grad()
 def score_cell(
-    model: torch.nn.Module, cfg: Any, dataset: CopulaDataset, device: str, batch_size: int
+    model: torch.nn.Module,
+    cfg: Any,
+    dataset: CopulaDataset,
+    device: str,
+    batch_size: int,
+    indices: list[int] | None = None,
 ) -> dict[str, np.ndarray]:
-    """Per-episode TERMS of one cell (arrays over its episodes, in dataset order)."""
+    """Per-episode TERMS of one cell (arrays over its episodes, or those in indices, in dataset order)."""
     jitter = float(cfg.model.get("sigma_jitter", 1e-4))
     out: dict[str, list[float]] = {term: [] for term in TERMS}
-    for start in range(0, len(dataset), batch_size):
-        episodes = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
+    order = list(range(len(dataset))) if indices is None else indices
+    for start in range(0, len(order), batch_size):
+        episodes = [dataset[i] for i in order[start : start + batch_size]]
         # Episodes of one batch must share (P, N, d): a cell's shards each hold one shape.
         groups: dict[tuple[int, ...], list[dict]] = {}
         for ep in episodes:
@@ -153,7 +162,10 @@ def run(spec: GridScoreSpec) -> None:
                 raise ValueError(
                     f"{cell} has no stored posterior oracle (generate it with data.store_posterior_oracle=true)"
                 )
-            per_episode[ckpt][cell] = score_cell(model, cfg, dataset, device, spec.batch_size)
+            indices = None
+            if spec.drop_constant_context:
+                indices = [i for i in range(len(dataset)) if has_varying_context_feature(dataset[i]["x_norm_train"])]
+            per_episode[ckpt][cell] = score_cell(model, cfg, dataset, device, spec.batch_size, indices)
         del model
         if device == "cuda":
             torch.cuda.empty_cache()

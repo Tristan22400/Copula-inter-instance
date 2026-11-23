@@ -140,3 +140,37 @@ def test_float32_overlay_identity_has_no_precision_key(tmp_path: Path) -> None:
     )
     assert "tabicl_inference_amp" not in fp32
     assert amp == {**fp32, "tabicl_inference_amp": True}
+
+
+def test_generic_marginal_amp_enters_overlay_identity(tmp_path: Path) -> None:
+    from omegaconf import OmegaConf
+
+    source = _write_dataset(tmp_path, n_shards=1, shard_size=1, digest="abc")
+    (source / "manifest.json").write_text(
+        json.dumps({"digest": "abc", "spec": {"data": {"n_tasks": 1, "shard_size": 1}}})
+    )
+    data = {"z_train_source": "kumo_small", "z_train_tabicl_k_folds": 5}
+    fp32 = repit.overlay_spec(OmegaConf.create({"data": data, "training": {}}), str(source), None)
+    amp = repit.overlay_spec(
+        OmegaConf.create({"data": data, "training": {"marginal_inference_amp": True}}), str(source), None
+    )
+    assert "marginal_inference_amp" not in fp32
+    assert amp == {**fp32, "marginal_inference_amp": True}
+    # The TabICL key does not apply to a generic marginal, nor this one to TabICL.
+    tabicl = {"z_train_source": "tabicl", "z_train_tabicl_k_folds": 5}
+    assert "marginal_inference_amp" not in repit.overlay_spec(
+        OmegaConf.create({"data": tabicl, "training": {"marginal_inference_amp": True}}), str(source), "ckpt"
+    )
+
+
+def test_has_varying_context_feature() -> None:
+    from copula_inter.data.dataset import has_varying_context_feature
+
+    constant = torch.ones(5, 3)
+    assert not has_varying_context_feature(constant)
+    varying = constant.clone()
+    varying[2, 1] = 0.5
+    assert has_varying_context_feature(varying)
+    all_nan = torch.full((5, 2), float("nan"))
+    assert not has_varying_context_feature(all_nan)
+    assert has_varying_context_feature(torch.cat([all_nan, varying], dim=1))
