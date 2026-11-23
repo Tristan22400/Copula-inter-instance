@@ -145,6 +145,8 @@ class TabPFNMarginal:
         from tabpfn.preprocessing.datamodel import FeatureModality
         from tabpfn.utils import get_autocast_context
 
+        from copula_inter.marginal.backends import marginal_inference_amp
+
         reg = self.regressor
         n = X_context.shape[1]
         # The GPU pipeline and its feature schema for this column count: one
@@ -160,7 +162,8 @@ class TabPFNMarginal:
         out = member.gpu_preprocessor(x_full, feature_schema=member.feature_schema, num_train_rows=n)
         model: Any = self.module
         kwargs: dict[str, object] = {"task_type": "regression"} if _model_expectes_task_type_arg(model) else {}
-        with get_autocast_context(x_full.device, enabled=reg.use_autocast_):  # off: float32 (make_tabpfn_regressor)
+        # Off unless training.marginal_inference_amp: float32 (make_tabpfn_regressor).
+        with get_autocast_context(x_full.device, enabled=reg.use_autocast_ or marginal_inference_amp()):
             logits = model(
                 out.x,
                 y_z.transpose(0, 1),

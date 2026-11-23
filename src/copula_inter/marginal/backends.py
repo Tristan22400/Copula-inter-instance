@@ -22,7 +22,30 @@ import numpy as np
 
 from copula_inter.backend_registry import MARGINAL_BACKENDS, batched_pit, get_backend
 
-__all__ = ["BackendMarginal", "make_regressor", "quantiles", "loo_pit"]
+__all__ = [
+    "BackendMarginal",
+    "configure_marginal_inference_amp",
+    "make_regressor",
+    "marginal_inference_amp",
+    "quantiles",
+    "loo_pit",
+]
+
+# Mixed-precision (CUDA autocast) forwards of the tabpfn35_fast and kumo_small marginals
+# (training.marginal_inference_amp); float32 by default. Process-global, set by the entrypoint,
+# as pit.configure_tabicl_inference_amp is for TabICL.
+_MARGINAL_INFERENCE_AMP = False
+
+
+def configure_marginal_inference_amp(use_amp: bool) -> None:
+    """Set the precision of every tabpfn35_fast / kumo_small forward: autocast if use_amp, else float32."""
+    global _MARGINAL_INFERENCE_AMP
+    _MARGINAL_INFERENCE_AMP = bool(use_amp)
+
+
+def marginal_inference_amp() -> bool:
+    """Whether tabpfn35_fast / kumo_small forwards run under CUDA autocast."""
+    return _MARGINAL_INFERENCE_AMP
 
 
 @dataclass(frozen=True)
