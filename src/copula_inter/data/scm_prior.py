@@ -27,6 +27,7 @@ available.
 from __future__ import annotations
 
 import importlib
+import math
 import types
 from dataclasses import dataclass
 from functools import lru_cache
@@ -34,6 +35,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
+from sklearn.ensemble import ExtraTreesRegressor
 from torch import Tensor
 
 from copula_inter.type_aliases import Device, HasDataConfig
@@ -52,8 +54,7 @@ GP_EPISODE_PRIOR_CODE = -1
 MEAN_FAMILY_SCM = 3
 # Learned marginals the SCM prior can train with; "analytic" would leak g through m.
 _ANALYTIC_SOURCES = ("analytic",)
-# Redraws of one episode whose table loses a feature (constant column), is degenerate or is
-# filtered as unpredictable, before it is marked invalid and left to generate_gp_batch's top-up.
+# Redraws of a degenerate graph table before the episode is left to generate_gp_batch's top-up.
 _MAX_TABLE_ATTEMPTS = 8
 # graph_lib PriorConfig of TabICLv2's regressor pretraining, identical in its three stages
 # (tabicl_upstream/scripts/train_v2_reg_stage{1,2,3}.sh); other fields keep PriorConfig's defaults.
@@ -70,7 +71,6 @@ V2_TRAIN_FRAC_MAX = 0.9
 V2_REGRESSOR_PRIOR_CONFIG: dict[str, Any] = {
     "add_gaussian_noise": False,  # --graph_noise False
     "filter_unpredictable_graphs": True,
-    "filter_unpredictable_datasets": True,
     "allow_act_warping": False,
     "min_n_nodes": 2,
     "max_n_nodes": 32,
@@ -101,6 +101,8 @@ class ScmResidualSettings:
     prior_P_dist: str = "loguniform"
     mean_amp_lognormal_loc: float = 0.0
     mean_amp_lognormal_scale: float = 1.5
+    min_query_mse_gain: float | None = 0.01
+    min_copula_information: float | None = 0.01
 
     @classmethod
     def from_cfg(cls, cfg: HasDataConfig) -> ScmResidualSettings:
@@ -109,9 +111,13 @@ class ScmResidualSettings:
         if block is None:
             return cls()
 
-        def get(key: str, default: Any) -> Any:
+        def get(key: str, default: Any, *, preserve_none: bool = False) -> Any:
             value = block.get(key, default) if hasattr(block, "get") else getattr(block, key, default)
-            return default if value is None else value
+            return default if value is None and not preserve_none else value
+
+        def threshold(key: str, default: float | None) -> float | None:
+            value = get(key, default, preserve_none=True)
+            return None if value is None else float(value)
 
         return cls(
             enabled=bool(get("enabled", cls.enabled)),
@@ -127,6 +133,8 @@ class ScmResidualSettings:
             prior_P_dist=str(get("prior_P_dist", cls.prior_P_dist)),
             mean_amp_lognormal_loc=float(get("mean_amp_lognormal_loc", cls.mean_amp_lognormal_loc)),
             mean_amp_lognormal_scale=float(get("mean_amp_lognormal_scale", cls.mean_amp_lognormal_scale)),
+            min_query_mse_gain=threshold("min_query_mse_gain", cls.min_query_mse_gain),
+            min_copula_information=threshold("min_copula_information", cls.min_copula_information),
         )
 
 
@@ -183,6 +191,15 @@ def validate_scm_settings(cfg: HasDataConfig, settings: ScmResidualSettings) -> 
         )
     if settings.mean_amp_lognormal_scale < 0.0:
         raise ValueError("data.scm_residual.mean_amp_lognormal_scale must be non-negative.")
+    gain = settings.min_query_mse_gain
+    if gain is not None and not 0.0 <= gain < 1.0:
+        raise ValueError("data.scm_residual.min_query_mse_gain must lie in [0, 1) or be null.")
+    info = settings.min_copula_information
+    if info is not None:
+        if not math.isfinite(info) or info < 0.0:
+            raise ValueError("data.scm_residual.min_copula_information must be finite and non-negative or null.")
+        if p0 == 1.0 and settings.prob > 0.0:
+            raise ValueError("data.scm_residual.lambda_p0=1 requires min_copula_information=null.")
     source = str(getattr(cfg.data, "z_train_source", "analytic"))
     if source in _ANALYTIC_SOURCES and not settings.allow_analytic_pit:
         raise ValueError(
@@ -270,7 +287,7 @@ class ScmDraw:
 
     X: Tensor  # (B, T, d)
     g: Tensor  # (B, T) SCM target, standardized over the T rows
-    valid: Tensor  # (B,) bool: every feature non-constant, finite, g non-constant, predictable
+    valid: Tensor  # (B,) bool: every feature and the target are finite and non-constant
     prior_type: Tensor  # (B,) long, SCM_PRIOR_CODES
 
 
@@ -281,13 +298,7 @@ def _v2_prior_config() -> Any:
 
 
 def _draw_table(T: int, d: int) -> tuple[Tensor, Tensor, bool]:
-    """One (X (T, d), y (T,)) graph-SCM table and whether TabICLv2's generator would keep it.
-
-    Mirrors GraphPrior.generate_dataset for one regression dataset: GraphSCM (outlier removal
-    and standard scaling of X and y inside), then should_filter (an ExtraTrees whose OOB error
-    does not beat the mean is unpredictable). TabICLv2 drops constant columns instead; here a
-    dropped column would change d, which every episode of a call shares, so the table is redrawn.
-    """
+    """Draw a graph-SCM table and check that every requested column is usable."""
     config = _v2_prior_config()
     scm = _prior_module("_graph_scm").GraphSCM(
         regression=True,
@@ -303,10 +314,27 @@ def _draw_table(T: int, d: int) -> tuple[Tensor, Tensor, bool]:
     X, y = X.float(), y.float()
     finite = bool(torch.isfinite(X).all()) and bool(torch.isfinite(y).all())
     all_features = all(int(torch.unique(X[:, j]).numel()) > 1 for j in range(d))
-    if not (finite and all_features and float(y.std()) > 1e-6):
-        return X, y, False
-    predictable = not _prior_module("_dataset").should_filter(X, y, config, is_classif=False)
-    return X, y, predictable
+    return X, y, finite and all_features and float(y.std()) > 1e-6
+
+
+def reject_unpredictable_queries(
+    x_train: Tensor, y_train: Tensor, x_test: Tensor, y_test: Tensor, eligible: Tensor, min_gain: float
+) -> Tensor:
+    """Flag eligible episodes that fail to beat the context mean on their final query targets."""
+    indices = torch.where(eligible)[0]
+    X_train = x_train[indices].detach().cpu().numpy()
+    Y_train = y_train[indices].detach().cpu().numpy().astype(np.float64, copy=False)
+    X_test = x_test[indices].detach().cpu().numpy()
+    Y_test = y_test[indices].detach().cpu().numpy().astype(np.float64, copy=False)
+    rejected = np.ones(len(indices), dtype=bool)
+    for i, (xt, yt, xq, yq) in enumerate(zip(X_train, Y_train, X_test, Y_test, strict=True)):
+        if not all(np.isfinite(values).all() for values in (xt, yt, xq, yq)):
+            continue
+        baseline_mse = np.mean((yq - yt.mean()) ** 2)
+        forest = ExtraTreesRegressor(n_estimators=25, max_depth=6, bootstrap=True, n_jobs=1, random_state=1)
+        model_mse = np.mean((yq - forest.fit(xt, yt).predict(xq)) ** 2)
+        rejected[i] = not (model_mse < baseline_mse and model_mse <= (1.0 - min_gain) * baseline_mse)
+    return torch.zeros_like(eligible).index_copy_(0, indices, torch.from_numpy(rejected).to(eligible.device))
 
 
 @torch.no_grad()

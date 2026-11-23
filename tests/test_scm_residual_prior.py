@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from copula_inter.data.scm_prior import (
     MEAN_FAMILY_SCM,
     SCM_PRIOR_CODES,
     ScmResidualSettings,
+    reject_unpredictable_queries,
     sample_amplitudes,
     sample_scm_tables,
     sample_v2_train_test_sizes,
@@ -62,7 +64,14 @@ def _cfg(seed: int = 7, P: int = 12, N: int = 6, d: int = 4, **scm: Any) -> Dict
         "systematic_composition": False,
         "kernel": "rbf",
         "z_train_source": "tabicl",
-        "scm_residual": {"enabled": True, "prior_type": "graph_scm", "prior_shapes": False, **scm},
+        "scm_residual": {
+            "enabled": True,
+            "prior_type": "graph_scm",
+            "prior_shapes": False,
+            "min_query_mse_gain": None,
+            "min_copula_information": None,
+            **scm,
+        },
     }
     return OmegaConf.create({"seed": seed, "data": OmegaConf.merge(data, overrides)})
 
@@ -252,23 +261,52 @@ def test_same_seed_same_episodes() -> None:
     assert torch.equal(first.X, second.X) and torch.equal(first.g, second.g)
 
 
-def test_graph_tables_are_filtered_like_tabiclv2(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A table TabICLv2's should_filter rejects is redrawn, and an always-rejected episode is invalid."""
+def test_degenerate_graph_tables_are_redrawn(monkeypatch: pytest.MonkeyPatch) -> None:
     import copula_inter.data.scm_prior as scm_prior
 
-    dataset = scm_prior._prior_module("_dataset")
+    graph_scm = scm_prior._prior_module("_graph_scm")
     calls: list[int] = []
 
-    def reject_all(*args: Any, **kwargs: Any) -> bool:
-        calls.append(1)
-        return True
+    def draw_constant(**kwargs: Any) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
+        calls.append(kwargs["seq_len"])
+        return lambda: (torch.zeros(40, 3), torch.arange(40))
 
-    monkeypatch.setattr(dataset, "should_filter", reject_all)
+    monkeypatch.setattr(graph_scm, "GraphSCM", draw_constant)
     seed_everything(0)
     draw = sample_scm_tables(2, 40, 3, "graph_scm", device="cpu")
     assert not bool(draw.valid.any())
-    assert len(calls) <= 2 * scm_prior._MAX_TABLE_ATTEMPTS
+    assert calls == [40] * (2 * scm_prior._MAX_TABLE_ATTEMPTS)
     assert torch.isfinite(draw.X).all() and torch.isfinite(draw.g).all()
+
+
+def test_extratrees_gate_checks_held_out_targets() -> None:
+    x = torch.tensor([-1.0, 1.0]).repeat(16).reshape(1, 32, 1).expand(3, -1, -1)
+    target = x.squeeze(-1)
+    query = torch.stack((target[0], -target[1], -target[2]))
+    rejected = reject_unpredictable_queries(x, target, x, query, torch.tensor([True, True, False]), 0.01)
+    assert rejected.tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize("mode", ["random", "axis"])
+def test_scm_episode_gates_use_final_split_and_posterior(mode: str) -> None:
+    cfg = _cfg(seed=11, P=24, N=24, min_query_mse_gain=0.01, min_copula_information=0.01, lambda_p0=0.5)
+    cfg.data.split_mode_probs = {"random": float(mode == "random"), "axis": float(mode == "axis")}
+    episodes = generate_gp_batch(cfg, 4, return_kernel_metadata=True)
+    assert len(episodes) == 4
+    for ep in episodes:
+        assert float(ep["kernel_scale"]) > 0.0
+        R = gp_analytical_posterior(ep)["R_post"].double()
+        assert float(-torch.linalg.slogdet(R).logabsdet / (2 * len(R))) >= 0.01 - 1e-5
+        assert not bool(
+            reject_unpredictable_queries(
+                ep["x_norm_train"].unsqueeze(0),
+                ep["y_train"].unsqueeze(0),
+                ep["x_norm_test"].unsqueeze(0),
+                ep["y_test"].unsqueeze(0),
+                torch.tensor([True]),
+                0.01,
+            )[0]
+        )
 
 
 def test_fixed_sets_synthesize_scm_episodes_in_float64() -> None:

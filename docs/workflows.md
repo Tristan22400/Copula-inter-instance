@@ -250,10 +250,20 @@ python -m debug.scm_residual_sweep experiment=scm_residual
 `data.scm_residual.prob` mixes SCM and GP episodes per generation call, and the
 `lambda_*` keys set the residual-share mixture. The tables come from TabICLv2's graph SCM
 prior (`prior_type: graph_scm`, the only option) with its regressor's pretraining settings:
-2-32 node Cauchy DAGs, no node noise, unpredictable graphs and datasets filtered
+2-32 node Cauchy DAGs, no node noise, unpredictable graphs filtered
 (`V2_REGRESSOR_PRIOR_CONFIG` in `src/copula_inter/data/scm_prior.py`). The graph's target
 node may have feature descendants; the GP residual is added to it as a new leaf, so the
 oracle stays exact (module docstring).
+
+After splitting and adding the GP residual and noise, SCM episodes must clear two gates.
+`data.scm_residual.min_copula_information` defaults to 0.01 nats per query and requires
+positive oracle copula information, measured as `-log det(R_post) / (2N)`. Set
+`data.scm_residual.lambda_p0=0` to skip drawing the no-residual branch altogether.
+`data.scm_residual.min_query_mse_gain` defaults to 0.01 and requires ExtraTrees, fit on the
+context, to beat the context mean by at least 1% in query MSE. Set either threshold to
+`null` to disable its gate. For a pilot run, `hydra.verbose=copula_inter.data.gp_episodes`
+logs how many episodes each gate checks and rejects by split mode and context size.
+Use a new dataset directory when generating shards with these gates.
 
 ### Fine-tune on real ERA5
 

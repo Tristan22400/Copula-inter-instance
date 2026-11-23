@@ -14,6 +14,7 @@ from copula_inter.artifacts import artifact_identity, canonical_digest, file_dig
 from copula_inter.backend_registry import TABICL_Z_TRAIN_SOURCES
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dict
+from copula_inter.data.scm_prior import ScmResidualSettings
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -45,8 +46,12 @@ def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
     if split is None or all(float(v or 0.0) == 0.0 for k, v in dict(split).items() if k != "random"):
         data.pop("split_mode_probs", None)
     scm = data.get("scm_residual")
-    if isinstance(scm, dict) and not scm.get("enabled", False):
-        data.pop("scm_residual")
+    if isinstance(scm, dict):
+        if scm.get("enabled", False):
+            scm.setdefault("min_query_mse_gain", ScmResidualSettings.min_query_mse_gain)
+            scm.setdefault("min_copula_information", ScmResidualSettings.min_copula_information)
+        else:
+            data.pop("scm_residual")
     return {
         "schema": SCHEMA,
         "seed": OmegaConf.select(cfg, "seed"),

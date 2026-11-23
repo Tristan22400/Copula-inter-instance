@@ -14,6 +14,7 @@ structural_warps.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import random
 import warnings
@@ -54,6 +55,7 @@ from copula_inter.data.scm_prior import (
     GP_EPISODE_PRIOR_CODE,
     MEAN_FAMILY_SCM,
     ScmResidualSettings,
+    reject_unpredictable_queries,
     sample_amplitudes,
     sample_scm_tables,
     sample_v2_num_features,
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
 
 # Force exact Cholesky solves for every covariance up to this size (gpytorch uses CG above max_cholesky_size).
 _MAX_CHOLESKY = 8192
+logger = logging.getLogger(__name__)
 
 
 # Kernel construction: _sample_episode_kernel samples B episodes' kernels;
@@ -531,6 +534,7 @@ class _GPDraw:
     mean_all: Optional[Tensor] = None
     kernel_scale: Optional[Tensor] = None
     kernel_diag_mean: Optional[Tensor] = None
+    copula_information: Optional[Tensor] = None  # (B,) oracle nats per query
 
 
 @dataclass
@@ -552,6 +556,8 @@ def _draw_gp(
     feats: _Features,
     device: Device,
     residual: Optional[_ResidualMean] = None,
+    *,
+    measure_copula_information: bool = False,
 ) -> Optional[_GPDraw]:
     """Sample y jointly from each episode's GP; None when kernel evaluation fails for the whole batch.
 
@@ -589,6 +595,14 @@ def _draw_gp(
     # K_all = L_all L_all^T from a PSD-repaired Cholesky, so the sample y_all and the
     # reported covariances come from the same PSD matrix.
     L_all, failed_all = _psd_safe_batch(K_all_raw)
+    copula_information = None
+    if measure_copula_information:
+        # The query diagonal block of the joint Cholesky is already the conditional
+        # Cholesky. Rescale its rows to unit marginal variance to get log det R_post.
+        L_query = L_all[:, P : P + N, P : P + N]
+        log_sd = 0.5 * L_query.square().sum(dim=-1).double().log()
+        log_chol_diag = L_query.diagonal(dim1=-2, dim2=-1).double().log()
+        copula_information = (log_sd - log_chol_diag).mean(dim=-1).clamp_min(0.0)
     K_all = L_all @ L_all.mT  # (B, T, T), PSD by construction
     y_all = (L_all @ torch.randn(B, T, 1, device=device)).squeeze(-1)  # zero-mean GP sample
 
@@ -685,6 +699,7 @@ def _draw_gp(
         mean_all=None if residual is None else torch.cat([mean_train, mean_test], dim=1),
         kernel_scale=kernel_scale,
         kernel_diag_mean=diag_mean,
+        copula_information=copula_information,
     )
 
 
@@ -738,6 +753,46 @@ def _degenerate_episodes(draw: _GPDraw, shape: _CallShape, x_norm: Tensor) -> Te
             RuntimeWarning,
         )
     return degen | degenerate_active_col
+
+
+def _scm_episode_rejections(
+    draw: _GPDraw, settings: ScmResidualSettings, eligible: Tensor, modes: Tensor | None, P: int
+) -> Tensor:
+    """Apply the oracle and ExtraTrees gates to the completed SCM episodes."""
+    weak_copula = torch.zeros_like(eligible)
+    if settings.min_copula_information is not None:
+        information = draw.copula_information
+        assert information is not None and draw.kernel_scale is not None
+        weak_copula = eligible & (
+            (draw.kernel_scale == 0)
+            | ~information.isfinite()
+            | (information <= 0.0)
+            | (information < settings.min_copula_information)
+        )
+
+    tree_eligible = eligible & ~weak_copula
+    weak_prediction = torch.zeros_like(eligible)
+    if settings.min_query_mse_gain is not None:
+        weak_prediction = reject_unpredictable_queries(
+            draw.x_norm_train, draw.y_train, draw.x_norm_test, draw.y_test, tree_eligible, settings.min_query_mse_gain
+        )
+    if logger.isEnabledFor(logging.DEBUG):
+        if modes is None:
+            modes = torch.zeros_like(eligible, dtype=torch.long)
+        for i, mode in enumerate(SPLIT_MODES):
+            mask = modes == i
+            checked = int((eligible & mask).sum())
+            if checked:
+                logger.debug(
+                    "SCM split=%s P=%d eligible=%d rejected_copula=%d checked_extratrees=%d rejected_extratrees=%d",
+                    mode,
+                    P,
+                    checked,
+                    int((weak_copula & mask).sum()),
+                    int((tree_eligible & mask).sum()) if settings.min_query_mse_gain is not None else 0,
+                    int((weak_prediction & mask).sum()),
+                )
+    return weak_copula | weak_prediction
 
 
 def _marginal_pit(
@@ -1083,9 +1138,10 @@ def _generate_gp_batch_raw(
         else:
             feats = _sample_features(cfg, shape, device, with_gates=return_kernel_metadata)
         split_probs = split_mode_probs(cfg)
+        modes = None
         if split_probs is not None:
             # Non-random context/query split, chosen from the kernel's view of the features only.
-            order, _ = _split_order(feats.x_kernel, shape.P, shape.N, shape.kernel_cols, split_probs)
+            order, modes = _split_order(feats.x_kernel, shape.P, shape.N, shape.kernel_cols, split_probs)
             feats = _Features(
                 _reorder_rows(feats.x_norm, order),
                 _reorder_rows(feats.x_kernel, order),
@@ -1094,12 +1150,23 @@ def _generate_gp_batch_raw(
             )
             if residual is not None:
                 residual = _ResidualMean(mean=_reorder_rows(residual.mean, order), kernel_factor=residual.kernel_factor)
-        synthesized = _draw_gp(cfg, shape, priors, feats, device, residual)
+        synthesized = _draw_gp(
+            cfg,
+            shape,
+            priors,
+            feats,
+            device,
+            residual,
+            measure_copula_information=use_scm and scm.min_copula_information is not None,
+        )
         if synthesized is None:
             return []
         discard = synthesized.discard | _degenerate_episodes(synthesized, shape, feats.x_norm)
         if use_scm:
             discard = discard | ~tables.valid.to(discard.device)
+            discard = discard | _scm_episode_rejections(synthesized, scm, ~discard, modes, shape.P)
+            if bool(discard.all()):
+                return []
     convert = synthesis_dtype is not None or (pit_device is not None and pit_device != device)
     if pit_device is None:
         pit_device = device
@@ -1240,17 +1307,26 @@ def generate_gp_batch(
         pn_fixed = episode_shape(episodes[0])
     else:
         d_fixed = d_override
-    max_rounds = 20
+    scm = ScmResidualSettings.from_cfg(cfg)
+    filters_enabled = (
+        scm.enabled
+        and scm.prob > 0.0
+        and (scm.min_query_mse_gain is not None or scm.min_copula_information is not None)
+    )
+    max_rounds = 64 if filters_enabled else 20
     for round_idx in range(1, max_rounds + 1):
         if len(episodes) >= B:
             break
         shortfall = B - len(episodes)
+        # With the SCM gates, the last slot can take many draws on a hard split.
+        # Try several candidates together, within the original batch's memory budget.
+        retry_size = max(shortfall, min(B, 8)) if filters_enabled else shortfall
         if base_seed is not None:
             # Offset the seed per round so retries draw new kernels.
             setattr(cfg, "seed", base_seed + round_idx * 104_729)
         new_episodes = _generate_gp_batch_raw(
             cfg,
-            shortfall,
+            retry_size,
             device,
             return_kernel_metadata=return_kernel_metadata,
             d_override=d_fixed,
@@ -1276,8 +1352,8 @@ def generate_gp_batch(
     if len(episodes) < B:
         raise RuntimeError(
             f"generate_gp_batch: could not assemble {B} valid episodes after "
-            f"{max_rounds} top-up rounds ({len(episodes)} obtained) — the kernel/config "
-            f"combination in this call appears to be persistently non-PSD."
+            f"{max_rounds} top-up rounds ({len(episodes)} obtained). Check the kernel settings "
+            "and any enabled SCM episode filters."
         )
     return episodes[:B]
 

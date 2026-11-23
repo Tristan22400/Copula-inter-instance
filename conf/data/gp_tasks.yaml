@@ -606,6 +606,8 @@ scm_residual:
   lambda_p0: 0.2             # probability of an i.i.d. TabICLv2 episode (no residual, a_g = 1)
   lambda_p1: 0.2             # probability of a zero-mean GP episode (a_g = 0)
   allow_analytic_pit: false  # diagnostics only: analytic z uses g and leaks it
+  min_query_mse_gain: 0.01   # relative MSE gain over the context mean on final query targets; null disables
+  min_copula_information: 0.01  # oracle nats per query; 0 excludes exact nulls, null disables the gate
   # y = a_g g~ + GP(0, K) + eps with a_g^2 ~ LogNormal(loc, scale^2) and the kernel's own
   # amplitude (alpha2 prior), independently; the share lambda = mean_i K_ii / (a_g^2 + mean_i K_ii)
   # and the relative noise are induced. (The coupled amplitude mode was removed.)

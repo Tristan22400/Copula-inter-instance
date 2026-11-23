@@ -93,6 +93,9 @@ def main() -> None:
         amp_cfg.data.scm_residual.prob = 1.0
         for key, value in _amp_overrides(a2).items():
             amp_cfg.data.scm_residual[key] = value
+        if math.isinf(a2):
+            # The i.i.d. endpoint intentionally has zero oracle copula information.
+            amp_cfg.data.scm_residual.min_copula_information = None
         rows.append((f"SCM a_g^2={a2:g}", _sweep_row(amp_cfg, base_seed)))
     prior_cfg = merge_configs(cfg)
     prior_cfg.data.scm_residual.enabled = True
