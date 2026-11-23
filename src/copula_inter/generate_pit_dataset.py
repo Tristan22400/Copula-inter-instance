@@ -44,7 +44,7 @@ from copula_inter.backend_registry import (
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
 from copula_inter.data.contracts import validate_episode
-from copula_inter.data.gp_episodes import episode_shape, generate_gp_batch
+from copula_inter.data.gp_episodes import episode_shape, generate_gp_batch, subsample_query_rows
 from copula_inter.data.manifest import (
     contiguous_shard_counts,
     ensure_manifest,
@@ -53,6 +53,7 @@ from copula_inter.data.manifest import (
     stat_identity,
     verified_shard_digest,
 )
+from copula_inter.marginal.pit import gp_analytical_posterior
 
 _MAX_CUSOLVER_RETRIES = 8
 
@@ -88,6 +89,7 @@ def _generate_shard_with_oom_retry(
     marginal_backend: str | None = None,
     marginal_regressor: Any = None,
     max_chunk: int | None = None,
+    return_kernel_metadata: bool = False,
 ) -> list:
     """Generate n_this episodes for one shard in chunks of at most max_chunk, halving on CUDA OOM.
 
@@ -122,6 +124,7 @@ def _generate_shard_with_oom_retry(
                 tabicl_split_calib_frac=tabicl_split_calib_frac,
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
+                return_kernel_metadata=return_kernel_metadata,
             )
             if d_fixed is None and new_episodes:
                 d_fixed = int(new_episodes[0]["x_norm_train"].shape[-1])
@@ -162,6 +165,45 @@ def _generate_shard_with_oom_retry(
     if base_seed is not None:
         cfg.seed = base_seed
     return episodes
+
+
+# Fields of a saved episode under data.store_posterior_oracle: the standard schema, the SCM
+# prior's per-episode scalars and the posterior oracle (the kernel metadata it came from is dropped).
+_POSTERIOR_SHARD_KEYS = (
+    "x_norm_train",
+    "x_norm_test",
+    "y_train",
+    "y_test",
+    "z_train",
+    "z_test",
+    "log_pdf_test",
+    "R_star",
+    "R_prior",
+    "Sigma_star",
+    "mu_star",
+    "sigma_star",
+    "n_train",
+    "n_test",
+    "lambda_resid",
+    "scm_prior_type",
+    "kernel_scale",
+    "nugget",
+)
+
+
+def with_posterior_oracle(episode: dict[str, Any]) -> dict[str, Any]:
+    """An episode generated with kernel metadata -> its saved fields plus the exact posterior oracle.
+
+    mu_post, sigma_post and R_post are the GP posterior of the query rows given the context
+    (gp_analytical_posterior, float64), conditional on the SCM mean: the oracle copula the model
+    is scored against. R_star / mu_star / sigma_star stay the prior quantities they always are.
+    """
+    post = gp_analytical_posterior(episode)
+    out = {key: episode[key] for key in _POSTERIOR_SHARD_KEYS if key in episode}
+    out["mu_post"] = post["mu_post"].float().cpu()
+    out["sigma_post"] = post["Sigma_post"].diagonal().clamp_min(0.0).sqrt().float().cpu()
+    out["R_post"] = post["R_post"].float().cpu()
+    return out
 
 
 def _write_meta(pit_dir: str, n_total: int, shard_size: int, manifest_digest: str) -> None:
@@ -332,6 +374,9 @@ def main(cfg: DictConfig) -> None:
                     pbar.update(n_this)
                     continue
 
+            # data.store_posterior_oracle: save the exact posterior oracle (mu_post, sigma_post,
+            # R_post), computed from the kernel metadata, which is then dropped.
+            store_posterior = bool(cfg.data.get("store_posterior_oracle", False))
             # Per-shard seed from the global shard index.
             if base_seed is not None:
                 cfg.seed = base_seed + shard_idx
@@ -345,11 +390,20 @@ def main(cfg: DictConfig) -> None:
                 marginal_backend=marginal_backend,
                 marginal_regressor=marginal_regressor,
                 max_chunk=cfg.data.get("generate_chunk_size", None),
+                return_kernel_metadata=store_posterior,
             )
+            if store_posterior:
+                episodes = [with_posterior_oracle(ep) for ep in episodes]
             # Don't store R_prior and Sigma_star (reconstructed at load), nor R_star when
             # data.store_r_star=false (N x N floats, ~96% of an N=256 episode; training never
             # reads it, only oracle diagnostics do).
             store_r_star = bool(cfg.data.get("store_r_star", True))
+            # data.query_rows: keep that many query rows per episode (an evaluation grid's fixed
+            # N from prior-shaped tables, whose split geometry needs all the rows at generation).
+            query_rows = cfg.data.get("query_rows", None)
+            if query_rows is not None:
+                rows_rng = torch.Generator().manual_seed((base_seed or 0) + shard_idx)
+                episodes = [subsample_query_rows(ep, int(query_rows), rows_rng) for ep in episodes]
             for ep in episodes:
                 ep.pop("R_prior", None)
                 ep.pop("Sigma_star", None)

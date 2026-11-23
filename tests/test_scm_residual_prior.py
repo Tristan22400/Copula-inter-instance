@@ -21,6 +21,7 @@ from copula_inter.data.gp_episodes import (
     generate_fixed_gp_batch,
     generate_gp_batch,
     sigma_to_correlation,
+    subsample_query_rows,
 )
 from copula_inter.data.manifest import generation_spec
 from copula_inter.data.scm_prior import (
@@ -32,6 +33,7 @@ from copula_inter.data.scm_prior import (
     sample_v2_train_test_sizes,
     saved_mean_at,
 )
+from copula_inter.generate_pit_dataset import with_posterior_oracle
 from copula_inter.marginal.pit import (
     _kernel_fn_from_task,
     _mean_train_from_task,
@@ -418,3 +420,52 @@ def test_split_modes_keep_the_oracle_and_the_default_dataset_identity() -> None:
     bad.data.split_mode_probs = {"random": 1.0, "spiral": 1.0}
     with pytest.raises(ValueError, match="unknown modes"):
         split_mode_probs(bad)
+
+
+def test_query_subsample_keeps_the_posterior_sub_block() -> None:
+    """data.query_rows: the kept rows' fields are the episode's at those rows, R_star its sub-block."""
+    ep = generate_gp_batch(_cfg(seed=3, N=10), 1, return_kernel_metadata=True)[0]
+    sub = subsample_query_rows(ep, 4, torch.Generator().manual_seed(0))
+    keep = torch.randperm(10, generator=torch.Generator().manual_seed(0))[:4].sort().values
+    assert torch.equal(sub["R_star"], ep["R_star"][keep][:, keep])
+    for key in (
+        "x_norm_test",
+        "y_test",
+        "z_test",
+        "log_pdf_test",
+        "mu_star",
+        "sigma_star",
+        "x_kernel_test",
+        "mean_test",
+    ):
+        assert torch.equal(sub[key], ep[key][keep]), key
+    for key in ("x_norm_train", "y_train", "z_train", "x_kernel_train", "mean_train"):
+        assert torch.equal(sub[key], ep[key]), key
+    assert int(sub["n_test"]) == 4
+    validate_episode(sub)
+    with pytest.raises(ValueError, match="query_rows=11"):
+        subsample_query_rows(ep, 11, torch.Generator())
+
+
+def test_manifest_identity_ignores_unset_query_rows() -> None:
+    base = OmegaConf.create({"seed": 1, "data": {"P_min": 4, "z_train_source": "analytic"}})
+    unset = merge_configs(base, {"data": {"query_rows": None}})
+    kept = merge_configs(base, {"data": {"query_rows": 128}})
+    assert generation_spec(base, None) == generation_spec(unset, None)
+    assert generation_spec(kept, None) != generation_spec(base, None)
+
+
+def test_posterior_oracle_fields_survive_the_query_subsample() -> None:
+    """store_posterior_oracle: saved mu_post / sigma_post / R_post are the posterior, and subsample exactly."""
+    ep = generate_gp_batch(_cfg(seed=5, N=10), 1, return_kernel_metadata=True)[0]
+    saved = with_posterior_oracle(ep)
+    post = gp_analytical_posterior(ep)
+    assert torch.allclose(saved["R_post"], post["R_post"].float())
+    assert torch.allclose(saved["sigma_post"] ** 2, post["Sigma_post"].diagonal().float(), rtol=1e-5)
+    assert "x_kernel_train" not in saved and "_L_ff" not in saved and saved["R_star"].shape == (10, 10)
+    sub = subsample_query_rows(saved, 4, torch.Generator().manual_seed(1))
+    keep = torch.randperm(10, generator=torch.Generator().manual_seed(1))[:4].sort().values
+    assert torch.equal(sub["R_post"], saved["R_post"][keep][:, keep])
+    assert torch.equal(sub["mu_post"], saved["mu_post"][keep]) and torch.equal(
+        sub["sigma_post"], saved["sigma_post"][keep]
+    )

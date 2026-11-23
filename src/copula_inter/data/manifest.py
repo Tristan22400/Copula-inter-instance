@@ -31,6 +31,12 @@ def generation_spec(cfg: DictConfig, marginal_checkpoint: str | None) -> dict:
     # store_r_star=true (the default) is the historical format, so it stays out too.
     if data.get("store_r_star", True) is True:
         data.pop("store_r_star", None)
+    # No posterior oracle saved (false) is the historical format.
+    if not data.get("store_posterior_oracle", False):
+        data.pop("store_posterior_oracle", None)
+    # Every query row kept (null) is the historical format.
+    if data.get("query_rows") is None:
+        data.pop("query_rows", None)
     # The all-random split is the historical prior: it stays out of the identity too.
     split = data.get("split_mode_probs")
     if split is None or all(float(v or 0.0) == 0.0 for k, v in dict(split).items() if k != "random"):

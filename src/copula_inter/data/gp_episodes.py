@@ -1273,3 +1273,32 @@ def generate_fixed_gp_batch(
         synthesis_dtype=FIXED_SET_SYNTHESIS_DTYPE,
         **kwargs,
     )
+
+
+# Per-episode fields indexed by query row, and the N x N query matrices (both axes).
+_QUERY_ROW_KEYS = ("mu_star", "sigma_star", "mu_post", "sigma_post")
+_QUERY_MATRIX_KEYS = ("R_star", "R_prior", "Sigma_star", "R_post")
+
+
+def subsample_query_rows(episode: Dict[str, Any], n: int, generator: torch.Generator) -> Dict[str, Any]:
+    """The episode restricted to n query rows drawn without replacement (kept in their order).
+
+    Exact for the oracle (mu_star, sigma_star and R_star of a row subset are the sub-blocks of
+    the Gaussian posterior given the context) and for a marginal whose query predictions are
+    independent given the context (TabICL, TabPFN): the P context rows are untouched.
+    """
+    N = int(episode["x_norm_test"].shape[0])
+    if not 1 <= n <= N:
+        raise ValueError(f"data.query_rows={n}; the episode has {N} query rows.")
+    keep = torch.randperm(N, generator=generator)[:n].sort().values
+    out = dict(episode)
+    for key, value in episode.items():
+        if not isinstance(value, Tensor) or value.dim() == 0:
+            continue
+        if key in _QUERY_MATRIX_KEYS:
+            out[key] = value[keep][:, keep]
+        elif key.endswith("_test") or key in _QUERY_ROW_KEYS:
+            out[key] = value[keep]
+    if "n_test" in episode:
+        out["n_test"] = torch.tensor(n)
+    return out

@@ -621,6 +621,14 @@ scm_residual:
   mean_amp_lognormal_loc: 0.0
   mean_amp_lognormal_scale: 1.5
 
+# Query rows kept per saved episode (generate_pit_dataset), a random subset in row order; null keeps
+# all. Exact for the oracle and for a marginal predicting queries independently given the context.
+query_rows: null
+# Save the exact GP posterior oracle of the query rows given the context (mu_post, sigma_post, R_post)
+# in on-disk shards: R_star / mu_star / sigma_star are prior quantities, and the kernel metadata the
+# posterior is rebuilt from is not saved. For evaluation sets (oracle headroom, exact-z copula score).
+store_posterior_oracle: false
+
 # Save the oracle correlation R_star (N x N) in on-disk shards (generate_pit_dataset). false cuts
 # an N=256 episode from ~270 KB to ~12 KB; training never reads R_star.
 store_r_star: true
