@@ -204,20 +204,25 @@ class CopulaDataset(Dataset):
             return self._get_individual(idx)
         return self._get_sharded(idx)
 
+    def get_exact(self, idx: int) -> dict:
+        """Read this index without substituting another episode, for paired evaluations."""
+        ep = self._load_individual(idx) if self._mode == "individual" else self._load_shard_entry(idx)
+        if not _episode_is_finite(ep):
+            raise ValueError(f"episode at idx {idx} has non-finite context or query values")
+        return ep
+
+    def _load_individual(self, idx: int) -> dict:
+        ep = torch.load(self._files[idx], map_location="cpu", weights_only=True, mmap=True)
+        return _add_derived_fields(ep)
+
     def _get_individual(self, idx: int) -> dict:
         try:
-            ep = torch.load(self._files[idx], map_location="cpu", weights_only=True, mmap=True)
+            return self._load_individual(idx)
         except FileNotFoundError:
             candidates = [i for i in range(len(self._files)) if i != idx]
             if not candidates:
                 raise
-            ep = torch.load(
-                self._files[random.choice(candidates)],
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )
-        return _add_derived_fields(ep)
+            return self._load_individual(random.choice(candidates))
 
     _MAX_INVALID_RETRIES = 8
 

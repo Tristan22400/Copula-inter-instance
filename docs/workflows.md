@@ -369,18 +369,36 @@ hyperprior, the fit's objective) is the optimizer failure rate.
 python -m eval.runners.gp_wellspecified_diag out_json=eval/results/gp_diag/d1_d2.json
 ```
 
-### The fixed evaluation grid
+### Synthetic evaluation sets
 
-Copula checkpoints on the 25-cell grid (Kumo stage 1 and the four TabICLv2 split modes at
-P in {10, 32, 100, 316, 896}, N = 128, 128 episodes per cell, exact GP posterior stored):
-total / marginal / copula NLL, gain over independence and gap to the oracle per cell, and each
-checkpoint's paired difference to the first. A copula trained on another marginal's PIT reads the
-grid through that marginal's overlay (`pit_overlay_root`, from `copula_inter.repit_dataset`).
+| Evaluation | Episodes and geometry | Entry point and saved results |
+|---|---|---|
+| Systematic GP prior | Legacy variable-shape benchmark with P from 8 to 128 and N from 16 to 512 | `eval_checkpoint config=conf/eval_varshape_systematic.yaml`. Historical runs are under `eval/results/gp_posterior_full/` (constant GP mean) and `eval/results/gp_posterior_full_linear/` (linear GP mean). |
+| Archived fixed grid | Four TabICLv2 graph SCM + GP residual splits and a Kumo stage-1 group. Each group has P in {10, 32, 100, 316, 896} and N = 128. | `grid_score grid_dir=data/archive/eval_grid_v1`. Saved scores are under `results/grid/`. |
+| TabICLv2 variable holdout | 256 episodes per split (random, block, halfspace, axis). P varies and N = 1024 − P. | `grid_score grid_dir=data/eval_varshape_v2`. The per-cell manifests and dataset README describe the generation. |
+
+`grid_score` reads saved episodes with an exact posterior in `<grid_dir>/<group>/<cell>/pit`.
+It reports joint, marginal, and copula NLL, gain over independence, the gap to the stored
+oracle, and the paired difference to the first checkpoint. The stored oracle for the SCM
+prior conditions on the generating SCM mean and GP parameters. Use `eval_checkpoint` for
+context-fitted GP baselines with the standard MAP, BIC, and Laplace settings.
+
+Select fixed-P cells and vary the number of queries on the same episodes to isolate query size.
+Each size uses a nested subset drawn from one deterministic permutation per episode. The runner
+keeps the context unchanged and reruns the copula at each size. Every size in a cell is
+scored on the same episodes, eligible at the largest requested size. Leave `query_sizes`
+empty to score all saved queries.
 
 ```bash
-python -m eval.runners.grid_score grid_dir=/home/trmartin/thoth_storage/copula-inter/data/eval_grid_v1 \
-    ckpts=[<a.pt>,<b.pt>] out_json=results/grid/a_vs_b.json
+python -m eval.runners.grid_score grid_dir=data/archive/eval_grid_v1 \
+    'cells=[tabiclv2_random/P32,tabiclv2_random/P100,tabiclv2_random/P316]' \
+    'ckpts=[<a.pt>,<b.pt>]' 'query_sizes=[16,32,64,128]' out_json=results/grid/query_sizes.json
 ```
+
+Create matching PIT overlays with `copula_inter.repit_dataset` for checkpoints that use a
+different marginal. `pit_overlay_root` applies one overlay to every checkpoint.
+`pit_overlay_roots=[null,<overlay_root>]` selects the saved PIT for the first checkpoint
+and the overlay for the second. Overlay roots mirror the grid's relative cell paths.
 
 ### Real ERA5 episodes
 

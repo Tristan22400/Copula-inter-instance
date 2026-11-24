@@ -126,6 +126,7 @@ Subpackages:
 |---|---|
 | `runners/` | One Hydra entry point per runner (`python -m eval.runners.<name>`), each with a typed dataclass config composed from `conf/eval/<name>.yaml` |
 | `runners/eval_checkpoint.py` | The main comparison: model vs. classical baselines, synthetic or real-ERA5 episodes |
+| `runners/grid_score.py` | Paired checkpoint comparisons on saved synthetic grids, with PIT overlays, a stored GP oracle and optional nested query-size sweeps |
 | `baselines/` | Baseline tables (`classical.py`, with its per-episode cache), CV best-of-baselines (`prefit.py`), the autoregressive row |
 | `data/era5_episodes.py` | Real-ERA5 evaluation episodes |
 | `data/episode_packaging.py` | The PIT / autoregressive chain / `standardize_y` packaging shared by ERA5 and every real dataset |
