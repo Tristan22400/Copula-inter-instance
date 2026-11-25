@@ -26,7 +26,8 @@ _CONF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 
 def _compose(model_name: str) -> DictConfig:
     with hydra.initialize_config_dir(config_dir=_CONF_DIR, version_base=None):
-        return hydra.compose(config_name="config", overrides=[f"model={model_name}"])
+        # experiment=gp: the model preset alone, without the default prior's tabicl.pit_ckpt.
+        return hydra.compose(config_name="config", overrides=[f"model={model_name}", "experiment=gp"])
 
 
 def test_copula_prod_resolves_pretrained_backbone() -> None:

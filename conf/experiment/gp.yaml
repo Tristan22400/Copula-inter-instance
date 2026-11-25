@@ -1,0 +1,5 @@
+# @package _global_
+# The plain GP prior, generated live: conf/config.yaml and conf/data/gp_tasks.yaml as they are,
+# without the default scm_residual preset.
+#
+#   python -m copula_inter.train experiment=gp

@@ -1,16 +1,39 @@
 # @package _global_
-# SCM + GP residual prior (see conf/data/gp_tasks.yaml, scm_residual): features and a
-# mainstream regression function from TabICL's SCM prior (MLP and tree SCMs mixed, as
-# TabICL pretrains), a lambda-weighted GP residual for the dependence between rows.
-# Trained live with a learned TabICL marginal, since the analytic PIT would hand the
-# copula the SCM mechanism.
+# SCM + GP residual prior, the default training prior (conf/config.yaml defaults list; see
+# conf/data/gp_tasks.yaml, scm_residual): tables, features and a mainstream regression
+# function from TabICLv2's graph SCM prior, plus a lambda-weighted GP residual for the
+# dependence between rows. The PIT comes from a learned TabICL marginal, since the analytic
+# PIT would hand the copula the SCM mechanism.
 #
-#   python -m copula_inter.train experiment=scm_residual
+#   python -m copula_inter.train                      # this preset (the default)
+#   python -m copula_inter.train experiment=gp      # plain GP prior, live
+#   python -m copula_inter.train training.live_generation=true   # this prior, generated live
+#
+# Training reads the largest saved dataset of this prior with a TabICL PIT:
+# tabiclv2_logp_split4_filtered, 3125 shards x 256 = 800k episodes, PIT from the base
+# TabICLv2 regressor (10 folds), and its held-out set tabiclv2_val_split4_filtered. The data.*
+# keys below are the settings those datasets were generated with, so live generation and
+# regeneration draw from the same prior.
 data:
   z_train_source: tabicl
+  split_mode_probs:
+    random: 0.25
+    block: 0.25
+    halfspace: 0.25
+    axis: 0.25
+  store_r_star: false
   scm_residual:
     enabled: true
+    lambda_p0: 0.0
+    prior_P_min: 10
+    prior_P_max: 1000
+
+# The frozen marginal of the validation probes is the one that PIT-ed the dataset.
+tabicl:
+  pit_ckpt: tabicl-regressor-v2-20260212.ckpt
 
 training:
-  live_generation: true
+  live_generation: false
   live_source: gp
+  dataset_dir: ./data/tabiclv2_logp_split4_filtered/pit
+  val_dataset_dir: ./data/tabiclv2_val_split4_filtered/pit

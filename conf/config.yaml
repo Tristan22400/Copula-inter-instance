@@ -20,8 +20,10 @@ defaults:
   - _self_
   - model: copula_prod
   - data: gp_tasks
-  # Optional preset over everything above, e.g. experiment=finetune_era5.
-  - experiment: null
+  # Preset over everything above. Default: the TabICLv2 graph SCM + GP residual prior on its
+  # on-disk dataset (conf/experiment/scm_residual.yaml). experiment=gp trains on the plain
+  # GP prior; experiment=finetune_era5 replaces it.
+  - experiment: scm_residual
 
 seed: 42
 

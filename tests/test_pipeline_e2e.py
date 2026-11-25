@@ -48,6 +48,7 @@ def test_generate_train_eval_pipeline(tmp_path: Path) -> None:
     _run(
         [
             "copula_inter.generate_pit_dataset",
+            "experiment=gp",
             "data.n_tasks=4",
             f"data.dataset_dir={data_dir}",
             "data.z_train_source=analytic",
@@ -63,6 +64,7 @@ def test_generate_train_eval_pipeline(tmp_path: Path) -> None:
     _run(
         [
             "copula_inter.train",
+            "experiment=gp",
             "model=copula_nano",
             "training.live_generation=false",
             f"training.dataset_dir={data_dir / 'pit'}",

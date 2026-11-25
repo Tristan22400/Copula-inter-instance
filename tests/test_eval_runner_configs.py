@@ -156,11 +156,17 @@ def test_finetune_era5_preset_requires_a_checkpoint() -> None:
         prepare_training_inputs(cfg)
 
 
-def test_scm_residual_preset_trains_live_with_a_learned_marginal() -> None:
-    cfg = _compose_train(["experiment=scm_residual"])
+def test_scm_residual_prior_is_the_default_on_its_saved_dataset() -> None:
+    cfg = _compose_train([])
+    assert cfg == _compose_train(["experiment=scm_residual"])
     assert cfg.data.scm_residual.enabled and cfg.data.z_train_source == "tabicl"
-    assert cfg.training.live_generation and cfg.training.live_source == "gp"
-    assert not _compose_train([]).data.scm_residual.enabled
+    assert not cfg.training.live_generation
+    assert cfg.training.dataset_dir.endswith("tabiclv2_logp_split4_filtered/pit")
+    assert cfg.training.val_dataset_dir.endswith("tabiclv2_val_split4_filtered/pit")
+    assert cfg.tabicl.pit_ckpt == "tabicl-regressor-v2-20260212.ckpt"
+    gp = _compose_train(["experiment=gp"])
+    assert not gp.data.scm_residual.enabled and gp.training.live_generation
+    assert not _compose_train(["experiment=finetune_era5"]).data.scm_residual.enabled
 
 
 def test_finetune_inputs_are_checked_before_startup(tmp_path: Path) -> None:

@@ -240,16 +240,22 @@ of time-slicing; `CUDA_MPS=0` turns it off.
 
 ### Train on the SCM + GP residual prior
 
-`experiment=scm_residual` swaps the synthetic prior for one between TabICL's SCM
-prior and the GP prior (glossary: *SCM residual prior*). It trains live with the
-TabICL marginal; the analytic PIT is refused because it would use the SCM mechanism.
+The default prior is `experiment=scm_residual` (the `conf/config.yaml` defaults list).
+It sits between TabICLv2's SCM prior and the GP prior (glossary: *SCM residual prior*).
+Training reads `data/tabiclv2_logp_split4_filtered/pit` (800k episodes, PIT from the base
+TabICLv2 regressor) and validates on `data/tabiclv2_val_split4_filtered/pit`. The PIT comes
+from the TabICL marginal: the analytic PIT is refused because it would use the SCM
+mechanism. `experiment=gp` goes back to the plain GP prior, generated live.
 
 ```bash
 # Pilot: a small on-disk dataset, then a bounded run on it
-python -m copula_inter.generate_pit_dataset experiment=scm_residual data.n_tasks=512 data.dataset_dir=./data/scm_pilot
-python -m copula_inter.train experiment=scm_residual training.live_generation=false training.dataset_dir=./data/scm_pilot/pit training.steps=500
-# Live training on Grid5000
-oarsub -S "./scripts/train.sh experiment=scm_residual"
+python -m copula_inter.generate_pit_dataset data.n_tasks=512 data.dataset_dir=./data/scm_pilot
+python -m copula_inter.train training.dataset_dir=./data/scm_pilot/pit training.val_dataset_dir=null training.steps=500
+# Default training on Grid5000 (saved dataset), or the same prior generated live
+oarsub -S "./scripts/train.sh"
+oarsub -S "./scripts/train.sh training.live_generation=true"
+# Plain GP prior
+oarsub -S "./scripts/train.sh experiment=gp"
 # Lambda sweep: copula information, discards and throughput per residual share
 python -m debug.scm_residual_sweep experiment=scm_residual
 ```
