@@ -818,7 +818,7 @@ python -m eval.runners.wandb_report filter=_PN_ since=2026-11-09
 python -m eval.runners.wandb_report ids=[splmz6y3,0jkldstb] sort_by=grid out=report.json
 ```
 
-The `.claude/skills/wandb-results` skill explains how to read the tables.
+The `.agents/skills/wandb-results` skill explains how to read the tables.
 
 ## Debug pipeline
 
