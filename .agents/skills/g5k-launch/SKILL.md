@@ -43,6 +43,10 @@ python3 scripts/g5k_gpus.py submit --walltime 40 -- scripts/train.sh model=copul
 python3 scripts/g5k_gpus.py submit --dry-run --walltime 12 -- scripts/eval_checkpoint.sh ckpt=<ckpt>
 ```
 
+- For a training run (`train.sh`, `finetune_marginal`), pass `wandb.name=<name>`:
+  a short snake_case name for what the run tests (e.g. `lora_r16_vs_r8`). No
+  hyperparameter lists in the name; the config holds them. Use the same name for
+  `training.ckpt_dir` when you set one.
 - `submit` takes the job's default `-n`, `gpu=` and `walltime=` from the script's
   `#OAR` lines and ignores the rest (`-q p1`, `-p`).
 - It submits to the best target and reads OAR's predicted start. If the job

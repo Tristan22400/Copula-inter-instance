@@ -227,6 +227,13 @@ DataLoader workers. Useful overrides:
   to log the parent checkpoint's scores at step 0 of a post-training run;
 - `WANDB_MODE=disabled` to run offline.
 
+**Run names.** Set `wandb.name=<name>` on every launch: a short snake_case name
+for what the run tests (e.g. `lora_r16_vs_r8`, `scm_lambda0.3`, `era5_ft_from_nano`),
+chosen by whoever launches it. Do not encode hyperparameters in the name; wandb
+already stores the full config. Without `wandb.name`, the run takes the basename
+of `training.ckpt_dir`, else wandb's random name. Phase A
+(`copula_inter.finetune_marginal`) reads the same key.
+
 `scripts/train.sh` starts a private CUDA MPS daemon for the job (`start_cuda_mps`
 in `scripts/_env.sh`) so the workers' kernels share the GPU concurrently instead
 of time-slicing; `CUDA_MPS=0` turns it off.

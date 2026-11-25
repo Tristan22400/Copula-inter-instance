@@ -31,6 +31,9 @@ wandb:
   # comparable.
   project: copula-inter-marginal
   entity: null
+  # Run name, set at launch to say what the run tests (e.g. wandb.name=lora_r16_vs_r8).
+  # Settings are in the run's config, not the name. null: wandb's random name.
+  name: null
   mode: online          # "disabled" for a local smoke run
 
 marginal:

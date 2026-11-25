@@ -173,23 +173,6 @@ def resolve_train_device(cfg: DictConfig) -> tuple[str, float | None]:
     return device, gpu_peak_flops
 
 
-def dataset_name(t: DictConfig, data_cfg: DictConfig, live_generation: bool) -> str:
-    """Run-name prefix: live runs are named from cfg.data and ckpt_dir (dataset_dir is unused), disk runs from dataset_dir."""
-    if live_generation:
-        ckpt_dir = t.get("ckpt_dir", None)
-        ckpt_str = f"_ckpt-{os.path.basename(os.path.normpath(ckpt_dir))}" if ckpt_dir else ""
-        return "live" + _live_data_segment(data_cfg) + ckpt_str
-    dataset_path = os.path.normpath(t.dataset_dir)
-    # Include the parent folder in the dataset name.
-    parent_name = os.path.basename(os.path.dirname(dataset_path))
-    shard_name = os.path.basename(dataset_path)
-    overlay_dir = t.get("pit_overlay_dir", None)
-    if overlay_dir:
-        # The marginal model that produced the PIT, named by its overlay's folder.
-        shard_name += "+" + os.path.basename(os.path.dirname(os.path.normpath(overlay_dir)))
-    return f"{parent_name}/{shard_name}" if parent_name else shard_name
-
-
 def get_gpu_peak_flops(device: int = 0) -> float:
     """Peak dense FP16/BF16 tensor-core FLOPs of the current GPU, from _GPU_PEAK_TFLOPS (default with a warning)."""
     if not torch.cuda.is_available():
@@ -261,61 +244,6 @@ def _reserve_gpu_headroom_for_live_tabicl(cfg: DictConfig, t: DictConfig, device
         "headroom) so its allocator can't silently starve them; any excess is "
         "handled by the existing per-step OOM-skip path."
     )
-
-
-def _fmt_run_value(value: object) -> str:
-    if isinstance(value, bool):
-        return str(value).lower()
-    if isinstance(value, float):
-        return f"{value:g}"
-    if isinstance(value, (list, tuple)):
-        return "+".join(_fmt_run_value(v) for v in value)
-    return str(value).replace(" ", "")
-
-
-def _run_segments(cfg: DictConfig, prefix: str, keys: list[tuple[str, str]]) -> str:
-    parts = []
-    for cfg_key, label in keys:
-        value = cfg.get(cfg_key, None)
-        if value is not None:
-            parts.append(f"_{prefix}{label}={_fmt_run_value(value)}")
-    return "".join(parts)
-
-
-def _live_data_segment(data_cfg: DictConfig) -> str:
-    """Run-name segment summarizing cfg.data's composition, correlation and warp settings for live generation."""
-    if bool(data_cfg.get("systematic_composition", False)):
-        lo = data_cfg.get("composite_num_kernels_min", 1)
-        hi = data_cfg.get("composite_num_kernels_max", 1)
-        kernel_str = f"syscomp{lo}-{hi}"
-    elif data_cfg.get("kernels", None) is not None:
-        kernel_str = f"mix{len(data_cfg.kernels)}"
-    else:
-        kernel_str = str(data_cfg.get("kernel", "rbf"))
-
-    dfeat_str = (
-        "logN" if data_cfg.get("d_features_lognormal_loc", None) is not None else str(data_cfg.get("d_features", 10))
-    )
-
-    tags = []
-    sign_comp = float(data_cfg.get("sign_modulation_component_prob", 0.0) or 0.0)
-    sign_outer = float(data_cfg.get("sign_modulation_outer_prob", 0.0) or 0.0)
-    if sign_comp > 0 or sign_outer > 0:
-        tags.append("sgn")
-    if bool(data_cfg.get("mlp_mixing_enabled", False)):
-        tags.append("mlp")
-    if bool(data_cfg.get("structural_warp_enabled", False)):
-        tags.append("struct")
-    if bool(data_cfg.get("mean_fn_enabled", False)):
-        tags.append("mean")
-    if bool(data_cfg.get("z_train_corruption_enabled", False)):
-        tags.append("zcorrupt")
-    oracle = data_cfg.get("oracle_mode", None)
-    if oracle is not None and oracle != "prior":
-        tags.append(f"oracle-{oracle}")
-
-    parts = [kernel_str, dfeat_str] + tags
-    return "_d_" + "-".join(parts)
 
 
 def build_model_and_optimizer(cfg: DictConfig, device: str, resume_ckpt: str | None, t: DictConfig) -> ModelBundle:
@@ -607,59 +535,20 @@ def build_validation_probes(
     )
 
 
-def init_wandb_run(cfg: DictConfig, dataset_name: str, t: DictConfig) -> None:
-    """Name the run from its model/training settings and start wandb."""
-    lora_cfg = cfg.get("lora", None)
-    lora_enabled = bool(lora_cfg and lora_cfg.get("enabled", False))
-    if lora_enabled:
-        lora_stages = "+".join(lora_cfg.get("stages", ["icl", "row", "col"]))
-        lora_str = f"_lora-r{lora_cfg.get('rank', 8)}-a{lora_cfg.get('alpha', 16.0)}-{lora_stages}"
-    else:
-        lora_str = "_nolora"
-    unfreeze = bool(cfg.model.get("unfreeze_backbone", False))
-    model_hparams = _run_segments(
-        cfg.model,
-        "m_",
-        [
-            ("rank", "r"),
-            ("sigma_jitter", "jit"),
-            ("d_model", "dm"),
-            ("n_heads", "h"),
-            ("n_layers_s1", "s1"),
-            ("n_layers_s2", "s2"),
-            ("n_layers_s3", "s3"),
-            ("n_inducing", "ind"),
-            ("n_cls", "cls"),
-            ("p_max", "pmax"),
-            ("d_max", "dmax"),
-            ("dropout", "drop"),
-        ],
-    )
-    training_hparams = _run_segments(
-        t,
-        "tr_",
-        [
-            ("batch_size", "bs"),
-            ("steps", "steps"),
-            ("warmup_steps", "wu"),
-            ("muon_lr", "lr"),
-            ("muon_lr_min", "lrmin"),
-            ("muon_weight_decay", "wd"),
-            ("muon_momentum", "mom"),
-            ("muon_matched_adamw_rms", "rms"),
-            ("muon_ns_steps", "ns"),
-            ("clip_grad_norm", "clip"),
-            ("nll_weight", "nll"),
-            ("compile", "compile"),
-        ],
-    )
-    resume_ckpt = t.get("resume_ckpt", None)
-    resume_str = "_resumed" if resume_ckpt else ""
-    run_name = f"{dataset_name}{model_hparams}{training_hparams}_unfreeze={unfreeze}{lora_str}{resume_str}"
+def init_wandb_run(cfg: DictConfig, t: DictConfig) -> None:
+    """Start wandb under wandb.name, else the basename of training.ckpt_dir, else wandb's own random name.
+
+    The name is chosen at launch (by whoever launches the run) to say what the run tests; the
+    settings themselves live in the run's config, so they are not encoded in the name.
+    """
+    name = cfg.wandb.get("name", None)
+    ckpt_dir = t.get("ckpt_dir", None)
+    if not name and ckpt_dir:
+        name = os.path.basename(os.path.normpath(str(ckpt_dir)))
     wandb.init(
         project=cfg.wandb.project,
         entity=cfg.wandb.entity if cfg.wandb.entity else None,
-        name=run_name,
+        name=str(name) if name else None,
         config=config_dict(cfg),
     )
 

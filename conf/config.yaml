@@ -37,6 +37,9 @@ num_workers: 1
 wandb:
   project: copula-inter-instance
   entity: null   # override with your wandb username/org
+  # Run name, set at launch to say what the run tests (e.g. wandb.name=lora_r16_vs_r8).
+  # Settings are in the run's config, not the name. null: basename of training.ckpt_dir.
+  name: null
 
 training:
   device: auto

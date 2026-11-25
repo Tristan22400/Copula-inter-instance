@@ -538,6 +538,7 @@ def _init_wandb(cfg: DictConfig, model: _PhaseAModel) -> Any:
     run = wandb.init(
         project=str(cfg.wandb.project),
         entity=cfg.wandb.entity,
+        name=cfg.wandb.get("name", None),
         config=config_dict(cfg),
         mode=cfg.wandb.mode,
     )

@@ -33,7 +33,6 @@ from copula_inter.training.setup import (
     build_data_loaders,
     build_model_and_optimizer,
     build_validation_probes,
-    dataset_name,
     init_wandb_run,
     prepare_training_inputs,
     resolve_train_device,
@@ -427,7 +426,7 @@ def main(cfg: DictConfig) -> None:
         print("[train] tabpfn35_fast / kumo_small marginal inference AMP=on")
     live_generation = bool(t.get("live_generation", False))
     live_source = str(t.get("live_source", "gp"))
-    init_wandb_run(cfg=cfg, dataset_name=dataset_name(t, cfg.data, live_generation), t=t)
+    init_wandb_run(cfg=cfg, t=t)
 
     data = build_data_loaders(cfg=cfg, device=device, live_generation=live_generation, live_source=live_source, t=t)
     probes = build_validation_probes(
