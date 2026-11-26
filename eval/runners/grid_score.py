@@ -20,7 +20,8 @@ own PIT). Checkpoints after the first also get the paired per-episode
 difference to the first (same episodes), with its standard error.
 
 A copula trained on another marginal's PIT reads the grid through that marginal's
-PIT overlay (copula_inter.repit_dataset), with the same relative cell paths as the grid.
+PIT overlay (copula_inter.repit_dataset), <grid_dir>/<group>/<cell>/overlays/<name>,
+selected by name (pit_overlay, or pit_overlays per checkpoint).
 
 Usage:
     python -m eval.runners.grid_score grid_dir=<data>/eval_grid_v1 ckpts=[<a.pt>,<b.pt>] \\
@@ -61,10 +62,10 @@ class GridScoreSpec:
     ckpts: list[str] = field(default_factory=list)
     # Cells to score, as "<group>/<cell>" (empty: every cell under grid_dir).
     cells: list[str] = field(default_factory=list)
-    # Shared PIT overlay root, with the grid's relative cell paths. Null uses the stored PIT.
-    pit_overlay_root: str | None = None
-    # Optional root per checkpoint in ckpts order. A null entry uses the stored PIT.
-    pit_overlay_roots: list[str | None] = field(default_factory=list)
+    # PIT overlay name for every checkpoint (<cell>/overlays/<name>). Null uses the stored PIT.
+    pit_overlay: str | None = None
+    # Optional overlay name per checkpoint in ckpts order. A null entry uses the stored PIT.
+    pit_overlays: list[str | None] = field(default_factory=list)
     # Score nested query subsets on episodes large enough for the largest size. Empty scores all rows.
     query_sizes: list[int] = field(default_factory=list)
     # Leave out the episodes whose context features are all constant (scored by TabPFN / Kumo
@@ -190,22 +191,21 @@ def run(spec: GridScoreSpec) -> None:
         raise ValueError("batch_size must be positive")
     if any(n < 1 for n in spec.query_sizes) or len(set(spec.query_sizes)) != len(spec.query_sizes):
         raise ValueError("query_sizes must contain distinct positive integers")
-    if spec.pit_overlay_roots and (spec.pit_overlay_root is not None or len(spec.pit_overlay_roots) != len(spec.ckpts)):
-        raise ValueError("pit_overlay_roots must have one entry per checkpoint and excludes pit_overlay_root")
+    if spec.pit_overlays and (spec.pit_overlay is not None or len(spec.pit_overlays) != len(spec.ckpts)):
+        raise ValueError("pit_overlays must have one entry per checkpoint and excludes pit_overlay")
     device = spec.device if torch.cuda.is_available() else "cpu"
     cells = grid_cells(spec.grid_dir, spec.cells)
     query_sizes = sorted(spec.query_sizes)
     sizes: list[int | None] = list(query_sizes) if query_sizes else [None]
     score_cells = [cell if size is None else f"{cell}/N{size}" for cell in cells for size in sizes]
-    roots = spec.pit_overlay_roots or [spec.pit_overlay_root] * len(spec.ckpts)
+    overlays = spec.pit_overlays or [spec.pit_overlay] * len(spec.ckpts)
     per_episode: dict[str, dict[str, dict[str, np.ndarray]]] = {}
     eligible: dict[str, list[int] | None] = {}
-    for ckpt, root in zip(spec.ckpts, roots, strict=True):
+    for ckpt, overlay in zip(spec.ckpts, overlays, strict=True):
         model, cfg = load_copula_model(ckpt, device=device)
         per_episode[ckpt] = {}
         for cell in cells:
-            overlay = None if root is None else os.path.join(root, cell, "pit")
-            dataset = CopulaDataset(episode_dir=os.path.join(spec.grid_dir, cell, "pit"), pit_overlay_dir=overlay)
+            dataset = CopulaDataset(episode_dir=os.path.join(spec.grid_dir, cell, "pit"), pit_overlay=overlay)
             if not len(dataset):
                 raise ValueError(f"{cell} has no episodes")
             if "R_post" not in dataset.get_exact(0):
@@ -232,14 +232,14 @@ def run(spec: GridScoreSpec) -> None:
     reference = spec.ckpts[0]
     result: dict[str, Any] = {
         "grid_dir": spec.grid_dir,
-        "pit_overlay_root": spec.pit_overlay_root,
+        "pit_overlay": spec.pit_overlay,
         "drop_constant_context": spec.drop_constant_context,
         "cells": {},
     }
     if query_sizes:
         result["query_sizes"] = query_sizes
-    if spec.pit_overlay_roots:
-        result["pit_overlay_roots"] = dict(zip(spec.ckpts, spec.pit_overlay_roots, strict=True))
+    if spec.pit_overlays:
+        result["pit_overlays"] = dict(zip(spec.ckpts, spec.pit_overlays, strict=True))
     for cell in score_cells:
         row: dict[str, Any] = {}
         for ckpt in spec.ckpts:

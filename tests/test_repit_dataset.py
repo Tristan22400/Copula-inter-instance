@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 import copula_inter.repit_dataset as repit
-from copula_inter.data.dataset import PIT_OVERLAY_META, CopulaDataset
+from copula_inter.data.dataset import PIT_OVERLAY_META, CopulaDataset, pit_overlay_dir
 
 
 def _episode(P: int, N: int, d: int, offset: float) -> dict[str, Tensor]:
@@ -58,8 +58,8 @@ def _write_dataset(root: Path, n_shards: int, shard_size: int, digest: str) -> P
     return pit
 
 
-def _write_overlay(root: Path, source: Path, n_shards: int, shard_size: int, digest: str) -> Path:
-    out = root / "overlay" / "pit"
+def _write_overlay(source: Path, n_shards: int, shard_size: int, digest: str, name: str = "stub") -> Path:
+    out = Path(pit_overlay_dir(str(source), name))
     out.mkdir(parents=True)
     for s in range(n_shards):
         episodes = torch.load(source / f"shard_{s:06d}.pt", weights_only=False)
@@ -71,9 +71,9 @@ def _write_overlay(root: Path, source: Path, n_shards: int, shard_size: int, dig
 def test_overlay_replaces_the_pit_and_keeps_the_tables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(repit, "marginal_pit_tables", _fake_pit)
     source = _write_dataset(tmp_path, n_shards=2, shard_size=3, digest="abc")
-    overlay = _write_overlay(tmp_path, source, n_shards=2, shard_size=3, digest="abc")
+    _write_overlay(source, n_shards=2, shard_size=3, digest="abc")
     plain = CopulaDataset(episode_dir=str(source))
-    over = CopulaDataset(episode_dir=str(source), pit_overlay_dir=str(overlay))
+    over = CopulaDataset(episode_dir=str(source), pit_overlay="stub")
     assert len(over) == len(plain) == 6
     for i in range(6):
         a, b = plain[i], over[i]
@@ -85,13 +85,31 @@ def test_overlay_replaces_the_pit_and_keeps_the_tables(tmp_path: Path, monkeypat
 def test_overlay_of_another_dataset_or_incomplete_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(repit, "marginal_pit_tables", _fake_pit)
     source = _write_dataset(tmp_path, n_shards=2, shard_size=3, digest="abc")
-    overlay = _write_overlay(tmp_path, source, n_shards=2, shard_size=3, digest="other")
+    overlay = _write_overlay(source, n_shards=2, shard_size=3, digest="other")
     with pytest.raises(ValueError, match="another dataset"):
-        CopulaDataset(episode_dir=str(source), pit_overlay_dir=str(overlay))
+        CopulaDataset(episode_dir=str(source), pit_overlay="stub")
     (overlay / PIT_OVERLAY_META).write_text(json.dumps({"source_digest": "abc", "shard_size": 3}))
     (overlay / "shard_000001.pt").unlink()
     with pytest.raises(ValueError, match="lacks 1 of 2 shards"):
-        CopulaDataset(episode_dir=str(source), pit_overlay_dir=str(overlay))
+        CopulaDataset(episode_dir=str(source), pit_overlay="stub")
+
+
+def test_overlay_lives_beside_the_tables_under_its_name(tmp_path: Path) -> None:
+    pit = tmp_path / "data" / "scm" / "pit"
+    assert pit_overlay_dir(str(pit), "tabpfn35") == str(tmp_path / "data" / "scm" / "overlays" / "tabpfn35")
+    assert pit_overlay_dir(str(pit) + "/", "kumo_small_era5ft").endswith("scm/overlays/kumo_small_era5ft")
+    for bad in ("", "../x", "a/b", ".hidden"):
+        with pytest.raises(ValueError, match="must match"):
+            pit_overlay_dir(str(pit), bad)
+
+
+def test_unknown_overlay_name_lists_the_existing_ones(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(repit, "marginal_pit_tables", _fake_pit)
+    source = _write_dataset(tmp_path, n_shards=1, shard_size=2, digest="abc")
+    _write_overlay(source, n_shards=1, shard_size=2, digest="abc", name="tabpfn35")
+    with pytest.raises(ValueError, match=r"overlays here: \['tabpfn35'\]"):
+        CopulaDataset(episode_dir=str(source), pit_overlay="kumo_small")
+    assert len(CopulaDataset(episode_dir=str(source), pit_overlay="tabpfn35")) == 2
 
 
 def test_overlay_meta_refuses_a_second_marginal(tmp_path: Path) -> None:
@@ -109,7 +127,7 @@ def test_manifest_identity_ignores_the_repit_source() -> None:
 
     base = OmegaConf.create({"seed": 1, "data": {"P_min": 4, "z_train_source": "analytic"}})
     with_source = OmegaConf.create(
-        {"seed": 1, "data": {"P_min": 4, "z_train_source": "analytic", "repit_source_dir": "x"}}
+        {"seed": 1, "data": {"P_min": 4, "z_train_source": "analytic", "repit_source_dir": "x", "repit_overlay": "y"}}
     )
     assert generation_spec(base, None) == generation_spec(with_source, None)
 
@@ -117,13 +135,13 @@ def test_manifest_identity_ignores_the_repit_source() -> None:
 def test_max_shards_keeps_the_first_shards_and_their_overlay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(repit, "marginal_pit_tables", _fake_pit)
     source = _write_dataset(tmp_path, n_shards=3, shard_size=2, digest="abc")
-    overlay = _write_overlay(tmp_path, source, n_shards=3, shard_size=2, digest="abc")
+    overlay = _write_overlay(source, n_shards=3, shard_size=2, digest="abc")
     (overlay / "shard_000002.pt").unlink()  # an overlay of the first 2 shards only
-    first = CopulaDataset(episode_dir=str(source), pit_overlay_dir=str(overlay), max_shards=2)
+    first = CopulaDataset(episode_dir=str(source), pit_overlay="stub", max_shards=2)
     assert len(first) == 4
     assert torch.equal(first[3]["z_train"], first[3]["y_train"] * 2)
     with pytest.raises(ValueError, match="lacks 1 of 3 shards"):
-        CopulaDataset(episode_dir=str(source), pit_overlay_dir=str(overlay))
+        CopulaDataset(episode_dir=str(source), pit_overlay="stub")
 
 
 def test_float32_overlay_identity_has_no_precision_key(tmp_path: Path) -> None:

@@ -278,6 +278,23 @@ context, to beat the context mean by at least 1% in query MSE. Set either thresh
 logs how many episodes each gate checks and rejects by split mode and context size.
 Use a new dataset directory when generating shards with these gates.
 
+#### Train on another marginal's PIT (overlays)
+
+An overlay recomputes `z_train`, `z_test` and `log_pdf_test` of a saved dataset with another
+frozen marginal and keeps the tables. It is stored next to the tables and named after the
+marginal: `<dataset>/overlays/<name>/`. Its `overlay.json` records the backend, checkpoint, K
+and precision, so encode none of them in the name. Compute the same overlay name for the
+training set and its validation set, then pick it with `training.pit_overlay=<name>`.
+`scripts/generate_dataset.sh` runs the workers with `GEN_MODULE=copula_inter.repit_dataset`
+and resumes from the count sidecars. A grown dataset (same manifest) only needs its new shards
+re-PIT. A regenerated dataset (new digest) needs new overlays.
+
+```bash
+python -m copula_inter.repit_dataset data.repit_source_dir=./data/tabiclv2_val_split4_filtered/pit \
+    data.repit_overlay=tabpfn35 data.z_train_source=tabpfn35_fast data.z_train_tabicl_k_folds=5
+python -m copula_inter.train training.pit_overlay=tabpfn35
+```
+
 ### Fine-tune on real ERA5
 
 Instead of synthetic GP kernels, this samples a random region and grid
@@ -408,10 +425,11 @@ python -m eval.runners.grid_score grid_dir=data/archive/eval_grid_v1 \
     'ckpts=[<a.pt>,<b.pt>]' 'query_sizes=[16,32,64,128]' out_json=results/grid/query_sizes.json
 ```
 
-Create matching PIT overlays with `copula_inter.repit_dataset` for checkpoints that use a
-different marginal. `pit_overlay_root` applies one overlay to every checkpoint.
-`pit_overlay_roots=[null,<overlay_root>]` selects the saved PIT for the first checkpoint
-and the overlay for the second. Overlay roots mirror the grid's relative cell paths.
+For checkpoints that use a different marginal, compute an overlay of each cell's `pit/`
+with `copula_inter.repit_dataset`, under the same `data.repit_overlay` name in every cell.
+`pit_overlay=<name>` reads `<cell>/overlays/<name>` for every checkpoint.
+`pit_overlays=[null,<name>]` uses the saved PIT for the first checkpoint and the overlay for
+the second.
 
 ### Real ERA5 episodes
 

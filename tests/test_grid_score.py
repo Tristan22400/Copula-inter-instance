@@ -95,7 +95,7 @@ def test_query_sweep_keeps_episodes_paired(tmp_path: Path, monkeypatch: pytest.M
         [
             f"grid_dir={tmp_path}",
             "ckpts=[a.pt,b.pt]",
-            "pit_overlay_roots=[null,null]",
+            "pit_overlays=[null,null]",
             "query_sizes=[2,4]",
             f"out_json={output}",
             "device=cpu",
@@ -103,7 +103,7 @@ def test_query_sweep_keeps_episodes_paired(tmp_path: Path, monkeypatch: pytest.M
     )
     grid_score.run(spec)
     result = json.loads(output.read_text())
-    assert result["pit_overlay_roots"] == {"a.pt": None, "b.pt": None}
+    assert result["pit_overlays"] == {"a.pt": None, "b.pt": None}
     for n in (2, 4):
         row = result["cells"][f"random/variable/N{n}"]
         assert row["a.pt"]["n"] == row["b.pt"]["n"] == 3

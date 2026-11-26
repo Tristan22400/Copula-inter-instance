@@ -632,8 +632,11 @@ query_rows: null
 # posterior is rebuilt from is not saved. For evaluation sets (oracle headroom, exact-z copula score).
 store_posterior_oracle: false
 # copula_inter.repit_dataset: the pit/ directory of a dataset whose PIT is recomputed with the
-# marginal set by z_train_source into a PIT overlay at pit_dir (read by training.pit_overlay_dir).
+# marginal set by z_train_source, into the PIT overlay <dataset>/overlays/<repit_overlay> (read by
+# training.pit_overlay=<repit_overlay>). Name it after the marginal (tabpfn35, kumo_small_era5ft);
+# its settings are recorded in overlay.json.
 repit_source_dir: null
+repit_overlay: null
 # Re-PIT only the first repit_max_shards shards of repit_source_dir (null: all).
 repit_max_shards: null
 

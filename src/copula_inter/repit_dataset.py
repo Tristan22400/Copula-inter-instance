@@ -2,23 +2,24 @@
 
 The tables of a sharded dataset (x_norm_train, y_train, x_norm_test, y_test) stay
 as they are; only the marginal changes. For each source shard this writes an
-overlay shard of the same name holding, per episode, z_train (the K-fold PIT of the
+overlay shard of the same name, in <dataset>/overlays/<data.repit_overlay>, holding, per episode, z_train (the K-fold PIT of the
 context rows), z_test and log_pdf_test (the query rows given every context row)
 under the marginal set by data.z_train_source (+ tabicl.pit_ckpt or
 data.z_train_marginal_ckpt), computed exactly as generate_pit_dataset computes
 them at generation (gp_episodes.marginal_pit_tables). Training reads it with
-training.pit_overlay_dir (CopulaDataset), so copulas trained on the PIT of
-different marginals see the same tables.
+training.pit_overlay=<name> (CopulaDataset), so copulas trained on the PIT of
+different marginals see the same tables. Name an overlay after its marginal
+(tabpfn35, kumo_small_era5ft); its settings go in overlay.json.
 
 overlay.json records the source dataset's manifest digest and the marginal; a
-rerun with another marginal into the same directory is refused. Shards are
+rerun with another marginal under the same name is refused. Shards are
 split among workers by worker_id / num_workers and resumed from their count
 sidecars, as in generate_pit_dataset (scripts/generate_dataset.sh runs either
 module through GEN_MODULE).
 
 Usage:
     python -m copula_inter.repit_dataset data.repit_source_dir=<dataset>/pit \\
-        data.dataset_dir=<overlay> data.z_train_source=tabpfn35_fast
+        data.repit_overlay=tabpfn35 data.z_train_source=tabpfn35_fast
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ from copula_inter.backend_registry import (
 )
 from copula_inter.backend_registry import z_train_source as z_train_source_of
 from copula_inter.config_path import config_dir
-from copula_inter.data.dataset import PIT_OVERLAY_KEYS, PIT_OVERLAY_META
+from copula_inter.data.dataset import PIT_OVERLAY_KEYS, PIT_OVERLAY_META, pit_overlay_dir
 from copula_inter.data.gp_episodes import marginal_pit_tables
 from copula_inter.data.manifest import shard_count_path
 
@@ -178,9 +179,10 @@ def main(cfg: DictConfig) -> None:
     if not source_dir:
         raise ValueError("data.repit_source_dir must name the pit/ directory of the dataset to re-PIT.")
     source_dir = str(source_dir)
-    out_dir = str(cfg.data.pit_dir)
-    if os.path.normpath(out_dir) == os.path.normpath(source_dir):
-        raise ValueError("data.pit_dir must differ from data.repit_source_dir (the overlay goes beside the tables).")
+    name = cfg.data.get("repit_overlay", None)
+    if not name:
+        raise ValueError("data.repit_overlay must name the overlay, after its marginal (e.g. tabpfn35).")
+    out_dir = pit_overlay_dir(source_dir, str(name))
     os.makedirs(out_dir, exist_ok=True)
     worker_id = int(getattr(cfg, "worker_id", 0))
     num_workers = int(getattr(cfg, "num_workers", 1))
